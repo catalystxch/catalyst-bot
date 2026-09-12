@@ -8967,6 +8967,14 @@
         <!-- Main Content Area -->
         <div class="v4-main-content">
 
+            <!-- Always-visible market authority strip. Keeping this outside the
+                 individual views makes Follow/Bootstrap state visible while the
+                 operator checks Offers, P&L, Market Intel, Logs, Help, or About. -->
+            <div id="bootstrapGlobalStatus" role="status" aria-live="polite"
+                 style="display:none; margin: 10px 18px 0; padding: 8px 12px; border: 1px solid rgba(96,165,250,0.28); border-radius: 8px; background: rgba(15,23,42,0.86); color: var(--text-secondary); font-size: var(--text-xs); line-height: 1.45;">
+                Follow mode · no active Bootstrap campaign
+            </div>
+
             <!-- ===== DASHBOARD VIEW ===== -->
             <div class="v4-view active" id="v4View-dashboard">
                 <div class="container">
@@ -8978,6 +8986,11 @@
                             <div class="v4-tab-token-pill"><img class="cc-token-icon cc-token-icon-sm" src="" alt="" onerror="if(this.dataset.fallbackSrc&&this.src!==this.dataset.fallbackSrc){this.src=this.dataset.fallbackSrc;}else{this.style.display='none';}" style="display:none;"><span class="v4-tab-token-name"></span><span class="v4-tab-token-xch">&nbsp;/ XCH</span></div>
                         </div>
                         <div id="dataFreshnessIndicator" class="data-freshness-warn" style="display:none;"></div>
+                    </div>
+
+                    <div id="bootstrapDashboardStatus"
+                         style="display:none; margin-bottom: var(--space-4); padding: 12px 16px; background: rgba(96,165,250,0.08); border: 1px solid rgba(96,165,250,0.28); border-radius: 9px; color: var(--text-secondary); font-size: var(--text-sm); line-height: 1.55;">
+                        No active Bootstrap campaign.
                     </div>
 
                     <!-- Liquidity-mode strip: surfaces the current mode and a parked-state
@@ -10644,6 +10657,78 @@
                                 <option value="" disabled selected>-- Choose a Trading Pair --</option>
                             </select>
                             <div class="v4-settings-hint">This is the same pair used by the dashboard, market intel, coin prep, and bot start flow.</div>
+                        </div>
+                    </div>
+
+                    <!-- ══ SECTION: Market authority ══ -->
+                    <div class="v4-settings-section v4-settings-blue" id="bootstrapWizardSection">
+                        <div class="v4-settings-section-title" style="color: var(--info-300);">
+                            Market Mode
+                            <span class="cc-help">?<span class="cc-tooltip" style="min-width:340px; text-align:left;">Follow quotes an established offer book. Bootstrap creates a strictly budgeted, seven-day maximum campaign for a new or illiquid CAT. Bootstrap starts at 10% capacity and cannot escape its fixed 0.5×–2× price corridor.</span></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="bootstrapModeSelect">Authority</label>
+                            <select id="bootstrapModeSelect" onchange="bootstrapModeChanged()">
+                                <option value="follow">Follow established market</option>
+                                <option value="bootstrap">Bootstrap a market</option>
+                            </select>
+                            <div class="v4-settings-hint">Use Bootstrap only when you deliberately want to seed a bounded offer book from an exact valuation anchor.</div>
+                        </div>
+
+                        <div id="bootstrapWizardFields" style="display:none;">
+                            <div style="padding: 10px 12px; margin-bottom: 12px; border-radius: 8px; background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.28); color: var(--warning-300); font-size: 0.82em; line-height: 1.5;">
+                                Bootstrap is deliberately conservative: three offers per funded side, fixed budgets, 5% loss stop, 5-minute adverse-fill cooldown, 80% fee-creation ceiling, and a protected 20% cancellation reserve.
+                            </div>
+                            <div style="display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;">
+                                <div class="form-group">
+                                    <label for="bootstrapAnchorPrice">Anchor price (XCH per CAT)</label>
+                                    <input id="bootstrapAnchorPrice" type="number" min="0" step="any" placeholder="0.001" oninput="bootstrapReviewChanged()">
+                                </div>
+                                <div class="form-group">
+                                    <label for="bootstrapExpiryDays">Expiry (days, maximum 7)</label>
+                                    <input id="bootstrapExpiryDays" type="number" min="1" max="7" step="1" value="7" oninput="bootstrapReviewChanged()">
+                                </div>
+                                <div class="form-group">
+                                    <label for="bootstrapXchBudget">XCH market budget</label>
+                                    <input id="bootstrapXchBudget" type="number" min="0" step="any" placeholder="0" oninput="bootstrapReviewChanged()">
+                                </div>
+                                <div class="form-group">
+                                    <label for="bootstrapCatBudget">CAT market budget</label>
+                                    <input id="bootstrapCatBudget" type="number" min="0" step="any" placeholder="0" oninput="bootstrapReviewChanged()">
+                                </div>
+                                <div class="form-group">
+                                    <label for="bootstrapFeeBudget">Fee budget (XCH)</label>
+                                    <input id="bootstrapFeeBudget" type="number" min="0" step="any" value="0.05" oninput="bootstrapReviewChanged()">
+                                </div>
+                                <div class="form-group">
+                                    <label for="bootstrapSubsidyBudget">Optional subsidy budget (XCH)</label>
+                                    <label style="display:flex; align-items:center; gap:7px; margin-bottom:6px; font-size:0.82em; color:var(--text-secondary);">
+                                        <input id="bootstrapSubsidyEnabled" type="checkbox" style="width:auto;" onchange="bootstrapSubsidyChanged()">
+                                        Explicitly opt in
+                                    </label>
+                                    <input id="bootstrapSubsidyBudget" type="number" min="0" step="any" value="0" disabled oninput="bootstrapReviewChanged()">
+                                </div>
+                            </div>
+                            <label style="display:flex; align-items:flex-start; gap:9px; padding: 10px 12px; border-radius:8px; background:rgba(239,68,68,0.06); border:1px solid rgba(239,68,68,0.22); font-size:0.82em; line-height:1.45; cursor:pointer;">
+                                <input id="bootstrapExactAssetConfirm" type="checkbox" style="width:auto; margin-top:2px;" onchange="bootstrapConfirmationChanged()">
+                                <span>I have verified the full 64-character CAT asset ID shown in the preview and accept these exact local budgets. A ticker or token name is not sufficient.</span>
+                            </label>
+                            <label style="display:flex; align-items:center; gap:9px; margin-top:10px; font-size:0.82em; color:var(--text-tertiary);">
+                                <input id="bootstrapPartialOffers" type="checkbox" disabled style="width:auto;">
+                                <span>Partial offers — unavailable (<code>PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN</code>; <code>disabled_until_capability_proven</code>)</span>
+                            </label>
+                            <div id="bootstrapStatusPanel" role="status" aria-live="polite"
+                                 style="margin-top:12px; padding:10px 12px; min-height:42px; border-radius:8px; background:rgba(15,23,42,0.42); border:1px solid rgba(148,163,184,0.18); color:var(--text-secondary); font-size:0.82em; line-height:1.55;">
+                                Choose Bootstrap, enter an anchor and fixed budgets, then Preview.
+                            </div>
+                            <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:12px;">
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapPreviewBtn" onclick="bootstrapPreviewCampaign()">Preview</button>
+                                <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapManifestExportBtn" onclick="bootstrapExportManifest()" disabled>Export / Sign Manifest</button>
+                                <button type="button" class="btn btn-config btn-secondary" onclick="document.getElementById('bootstrapManifestImportInput').click()">Import Signed Manifest</button>
+                                <input id="bootstrapManifestImportInput" type="file" accept="application/json,.json" style="display:none;" onchange="bootstrapImportManifest(event)">
+                            </div>
                         </div>
                     </div>
 
@@ -13226,6 +13311,15 @@
             var alreadyOnView = (_v4CurrentView === viewName);
             _v4CurrentView = viewName;
 
+            // Market authority is intentionally visible across every tab.
+            // Refresh on navigation so a completed stop/start cannot leave a
+            // stale Bootstrap badge while the operator audits another view.
+            try {
+                if (typeof bootstrapRefreshStatus === 'function') {
+                    bootstrapRefreshStatus();
+                }
+            } catch (_) {}
+
             if (alreadyOnView && viewName !== 'settings') return;
 
             // If leaving the settings view, cancel any pending debounced
@@ -15127,6 +15221,16 @@
             if (m === 'GET'  && clean === 'settings/defaults')  return 'get_settings_defaults';
             if (m === 'POST' && clean === 'settings/validate')  return 'validate_settings';
             if (m === 'GET'  && clean.startsWith('smart-defaults')) return 'get_smart_defaults';
+
+            // --- Market Bootstrap ---
+            if (m === 'GET'  && clean === 'bootstrap/status') return 'get_bootstrap_status';
+            if (m === 'POST' && clean === 'bootstrap/preview') return 'preview_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/start') return 'start_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/stop') return 'stop_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/renew') return 'renew_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/manifest/export') return 'export_bootstrap_manifest';
+            if (m === 'POST' && clean === 'bootstrap/manifest/import') return 'import_bootstrap_manifest';
+            if (m === 'GET'  && (clean === 'bootstrap/partial-capability' || clean === 'bootstrap/capabilities/partial-offers')) return 'get_bootstrap_partial_offer_capability';
 
             // --- Dashboard / Stats ---
             if (m === 'GET'  && clean === 'dashboard')          return 'get_dashboard';
@@ -37423,6 +37527,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Fetch Command Centre dashboard data immediately
     fetchDashboard();
+    bootstrapRefreshStatus();
+    bootstrapRefreshPartialCapability();
+    setInterval(() => { bootstrapRefreshStatus(); }, 30000);
     loadInitialSystemLogs();
     startSystemLogBackfillPolling();
     // Refresh dashboard every 120 seconds as backup (SSE is primary)
@@ -38287,6 +38394,327 @@ document.addEventListener('DOMContentLoaded', () => {
 })();
 </script>
 <script>
+let _bootstrapPreviewDigest = '';
+let _bootstrapPreviewBody = null;
+let _bootstrapActiveCampaign = null;
+
+function _bootstrapCanonicalDecimal(value, fallback = '') {
+    let text = String(value == null || value === '' ? fallback : value).trim();
+    if (/^[0-9]+(?:\.[0-9]+)?$/.test(text)) {
+        let [whole, fraction = ''] = text.split('.');
+        whole = whole.replace(/^0+(?=\d)/, '') || '0';
+        fraction = fraction.replace(/0+$/, '');
+        return fraction ? whole + '.' + fraction : whole;
+    }
+    const number = Number(text);
+    if (!Number.isFinite(number) || number < 0) throw new Error('Enter ordinary non-negative decimal values (no exponent notation).');
+    text = number.toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
+    return text || '0';
+}
+
+function _bootstrapText(id, value) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = String(value == null ? '' : value);
+}
+
+function _bootstrapSelectedPair() {
+    const pair = (typeof getDashboardSelectedPair === 'function')
+        ? getDashboardSelectedPair({ requireExplicit: true })
+        : { selected: false };
+    if (!pair || !pair.selected || !pair.asset_id) {
+        throw new Error('Choose and verify a CAT trading pair first.');
+    }
+    let ticker = String(pair.ticker || currentCAT?.ticker || currentCAT?.name || 'CAT')
+        .toUpperCase().replace(/[^A-Z0-9._-]/g, '');
+    if (!ticker || ticker.length > 16) ticker = 'CAT';
+    return { asset_id: String(pair.asset_id).toLowerCase(), ticker };
+}
+
+function _bootstrapBuildReviewBody() {
+    const pair = _bootstrapSelectedPair();
+    const days = Number(document.getElementById('bootstrapExpiryDays')?.value || 0);
+    if (!Number.isInteger(days) || days < 1 || days > 7) {
+        throw new Error('Bootstrap expiry must be a whole number from 1 to 7 days.');
+    }
+    const xchBalance = Math.max(0, Number(getWalletBalance('xch') || 0));
+    const catBalance = Math.max(0, Number(getWalletBalance('cat') || 0));
+    const feeEnabled = !!document.getElementById('configTransactionFeeEnabled')?.checked;
+    const feeInput = feeEnabled
+        ? (document.getElementById('configTransactionFeeXch')?.value || '0')
+        : '0';
+    const feeCoinInput = document.getElementById('configFeeCoinSizeXch')?.value || '0.001';
+    return {
+        ...pair,
+        anchor_price: _bootstrapCanonicalDecimal(document.getElementById('bootstrapAnchorPrice')?.value),
+        xch_budget: _bootstrapCanonicalDecimal(document.getElementById('bootstrapXchBudget')?.value, '0'),
+        cat_budget: _bootstrapCanonicalDecimal(document.getElementById('bootstrapCatBudget')?.value, '0'),
+        fee_budget_xch: _bootstrapCanonicalDecimal(document.getElementById('bootstrapFeeBudget')?.value, '0'),
+        subsidy_budget_xch: _bootstrapCanonicalDecimal(document.getElementById('bootstrapSubsidyBudget')?.value, '0'),
+        expires_in_seconds: days * 86400,
+        balances: {
+            xch_available: _bootstrapCanonicalDecimal(xchBalance),
+            cat_available: _bootstrapCanonicalDecimal(catBalance),
+            fee_spent_xch: '0',
+            subsidy_spent_xch: '0',
+            network_fee_xch: _bootstrapCanonicalDecimal(feeInput, '0'),
+            minimum_profit_xch: '0',
+            fee_coin_size_xch: _bootstrapCanonicalDecimal(feeCoinInput, '0.001'),
+            expected_cancel_requotes: 1
+        }
+    };
+}
+
+function bootstrapReviewChanged() {
+    _bootstrapPreviewDigest = '';
+    _bootstrapPreviewBody = null;
+    const start = document.getElementById('bootstrapStartBtn');
+    if (start) start.disabled = true;
+    _bootstrapText('bootstrapStatusPanel', 'Inputs changed. Preview the exact asset, corridor, budgets, and first-stage offers again.');
+}
+
+function bootstrapConfirmationChanged() {
+    const confirmed = !!document.getElementById('bootstrapExactAssetConfirm')?.checked;
+    const start = document.getElementById('bootstrapStartBtn');
+    if (start) start.disabled = !confirmed || !_bootstrapPreviewDigest;
+}
+
+function bootstrapSubsidyChanged() {
+    const enabled = !!document.getElementById('bootstrapSubsidyEnabled')?.checked;
+    const budget = document.getElementById('bootstrapSubsidyBudget');
+    if (budget) {
+        budget.disabled = !enabled;
+        if (!enabled) budget.value = '0';
+    }
+    bootstrapReviewChanged();
+}
+
+function bootstrapModeChanged() {
+    const bootstrap = document.getElementById('bootstrapModeSelect')?.value === 'bootstrap';
+    const fields = document.getElementById('bootstrapWizardFields');
+    if (fields) fields.style.display = bootstrap ? 'block' : 'none';
+    if (bootstrap) {
+        const xch = document.getElementById('bootstrapXchBudget');
+        const cat = document.getElementById('bootstrapCatBudget');
+        if (xch && !xch.value) xch.value = _bootstrapCanonicalDecimal(Number(getWalletBalance('xch') || 0) * 0.9);
+        if (cat && !cat.value) cat.value = _bootstrapCanonicalDecimal(Number(getWalletBalance('cat') || 0) * 0.9);
+        bootstrapRefreshPartialCapability();
+    }
+    bootstrapReviewChanged();
+}
+
+function _bootstrapRenderStatus(payload) {
+    const globalStatus = document.getElementById('bootstrapGlobalStatus');
+    const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
+    const stop = document.getElementById('bootstrapStopBtn');
+    const exporter = document.getElementById('bootstrapManifestExportBtn');
+    _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    let summary = 'Follow mode · no active Bootstrap campaign';
+    if (_bootstrapActiveCampaign) {
+        const campaign = _bootstrapActiveCampaign;
+        const expiryMs = Date.parse(campaign.expires_at || '');
+        const remainingHours = Number.isFinite(expiryMs)
+            ? Math.max(0, Math.ceil((expiryMs - Date.now()) / 3600000))
+            : null;
+        const cooldowns = Array.isArray(campaign.adverse_fill_times)
+            ? campaign.adverse_fill_times.length
+            : 0;
+        summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingHours == null ? 'expiry unknown' : remainingHours + 'h remaining'} · revision ${campaign.revision}`;
+        campaign._uiCooldownCount = cooldowns;
+    }
+    if (globalStatus) {
+        globalStatus.style.display = 'block';
+        globalStatus.textContent = summary;
+    }
+    if (dashboardStatus) {
+        dashboardStatus.style.display = 'block';
+        dashboardStatus.textContent = _bootstrapActiveCampaign
+            ? summary + ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/CAT · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} CAT · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
+            : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
+    }
+    if (stop) stop.disabled = !_bootstrapActiveCampaign;
+    if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
+}
+
+async function bootstrapRefreshStatus() {
+    try {
+        const response = await apiFetch('/api/bootstrap/status', { cache: 'no-store' });
+        const payload = await response.json();
+        if (payload?.success) _bootstrapRenderStatus(payload);
+    } catch (_) {
+        // A pair may not be selected during startup. That is a normal Follow state.
+    }
+}
+
+async function bootstrapRefreshPartialCapability() {
+    try {
+        const response = await apiFetch('/api/bootstrap/partial-capability', { cache: 'no-store' });
+        const payload = await response.json();
+        const control = document.getElementById('bootstrapPartialOffers');
+        if (control) {
+            control.checked = payload?.enabled === true;
+            control.disabled = true;
+            control.dataset.reasonCode = payload?.reason_code || 'PARTIAL_OFFERS_CAPABILITY_NOT_PROVEN';
+        }
+    } catch (_) {}
+}
+
+async function bootstrapPreviewCampaign() {
+    const button = document.getElementById('bootstrapPreviewBtn');
+    try {
+        if (button) { button.disabled = true; button.textContent = 'Reviewing…'; }
+        const body = _bootstrapBuildReviewBody();
+        const response = await apiFetch('/api/bootstrap/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap preview failed');
+        _bootstrapPreviewDigest = payload.preview_digest;
+        _bootstrapPreviewBody = body;
+        const campaign = payload.campaign || {};
+        const plan = payload.plan || {};
+        const buyLevels = plan.sides?.buy?.levels?.length || 0;
+        const sellLevels = plan.sides?.sell?.levels?.length || 0;
+        _bootstrapText(
+            'bootstrapStatusPanel',
+            `REVIEW ONLY — no wallet action. Asset ${campaign.asset_id}. Anchor ${campaign.anchor_price}; fixed corridor ${campaign.minimum_price}–${campaign.maximum_price}; first stage ${Number(plan.deployment_fraction || 0) * 100}%; ${buyLevels} buy / ${sellLevels} sell offers. Confirm the exact asset ID to enable Start Campaign.`
+        );
+        const start = document.getElementById('bootstrapStartBtn');
+        if (start) start.disabled = !document.getElementById('bootstrapExactAssetConfirm')?.checked;
+    } catch (error) {
+        _bootstrapPreviewDigest = '';
+        _bootstrapPreviewBody = null;
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Bootstrap preview failed');
+        showToast(error?.message || 'Bootstrap preview failed', 'error');
+    } finally {
+        if (button) { button.disabled = false; button.textContent = 'Preview'; }
+    }
+}
+
+async function bootstrapStartCampaign() {
+    try {
+        if (!_bootstrapPreviewDigest || !_bootstrapPreviewBody) throw new Error('Preview the campaign again before starting.');
+        if (!document.getElementById('bootstrapExactAssetConfirm')?.checked) throw new Error('Confirm the exact CAT asset ID first.');
+        const current = _bootstrapBuildReviewBody();
+        if (JSON.stringify(current) !== JSON.stringify(_bootstrapPreviewBody)) throw new Error('Inputs or wallet balances changed. Preview again.');
+        const response = await apiFetch('/api/bootstrap/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...current,
+                preview_digest: _bootstrapPreviewDigest,
+                exact_asset_warning_accepted: true
+            })
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap start failed');
+        _bootstrapPreviewDigest = '';
+        _bootstrapPreviewBody = null;
+        _bootstrapText('bootstrapStatusPanel', `Campaign ${payload.campaign_id} is durably saved. No wallet action was started. Run Coin Prep, then start the bot; every offer will be bound to this campaign revision.`);
+        showToast('Bootstrap campaign saved — run Coin Prep next', 'success', 7000);
+        await bootstrapRefreshStatus();
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Bootstrap start failed');
+        showToast(error?.message || 'Bootstrap start failed', 'error');
+    }
+}
+
+async function bootstrapStopCampaign() {
+    const campaign = _bootstrapActiveCampaign;
+    if (!campaign) return;
+    try {
+        const approved = await showStyledConfirm({
+            icon: '⏹',
+            title: 'Stop Bootstrap campaign?',
+            message: 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
+            confirmText: 'Stop and cancel',
+            cancelText: 'Keep running',
+            style: 'warning'
+        });
+        if (!approved) return;
+        const response = await apiFetch('/api/bootstrap/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ campaign_id: campaign.campaign_id, revision: campaign.revision })
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap stop failed');
+        _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
+        showToast('Bootstrap campaign stopped', 'success');
+        await bootstrapRefreshStatus();
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Bootstrap stop failed');
+        showToast(error?.message || 'Bootstrap stop failed', 'error');
+    }
+}
+
+function _bootstrapDownloadJson(value, filename) {
+    const blob = new Blob([JSON.stringify(value, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function bootstrapExportManifest() {
+    const campaign = _bootstrapActiveCampaign;
+    if (!campaign) return;
+    try {
+        const pair = _bootstrapSelectedPair();
+        const response = await apiFetch('/api/bootstrap/manifest/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ campaign_id: campaign.campaign_id, ticker: pair.ticker })
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Manifest export failed');
+        let documentValue = { manifest: payload.manifest, signature: null };
+        let suffix = 'unsigned';
+        if (payload.walletconnect_signing_available) {
+            documentValue = await signBootstrapManifest(payload.manifest);
+            suffix = 'signed';
+        }
+        _bootstrapDownloadJson(documentValue, `catalyst-bootstrap-${pair.ticker.toLowerCase()}-${suffix}.json`);
+        showToast(`Bootstrap manifest exported (${suffix})`, 'success');
+    } catch (error) {
+        showToast(error?.message || 'Manifest export failed', 'error');
+    }
+}
+
+async function bootstrapImportManifest(event) {
+    const input = event?.target;
+    const file = input?.files?.[0];
+    if (!file) return;
+    try {
+        const signedManifest = JSON.parse(await file.text());
+        const response = await apiFetch('/api/bootstrap/manifest/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ signed_manifest: signedManifest })
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Manifest import failed');
+        const manifest = payload.manifest || {};
+        document.getElementById('bootstrapModeSelect').value = 'bootstrap';
+        bootstrapModeChanged();
+        document.getElementById('bootstrapAnchorPrice').value = manifest.anchor_price || '';
+        document.getElementById('bootstrapExactAssetConfirm').checked = false;
+        bootstrapReviewChanged();
+        _bootstrapText('bootstrapStatusPanel', `Imported ${manifest.verification_status || 'verified'} public policy for asset ${manifest.asset_id}. It grants no wallet or budget authority. Enter fresh local budgets, Preview, and confirm the exact asset ID.`);
+        showToast('Manifest verified — local budget review is still required', 'info', 7000);
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Manifest import failed');
+        showToast(error?.message || 'Manifest import failed', 'error');
+    } finally {
+        if (input) input.value = '';
+    }
+}
+
 let _bootstrapSigningRequestId = null;
 
 function _setBootstrapSigningState(state, detail) {

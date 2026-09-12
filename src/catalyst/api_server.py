@@ -226,6 +226,9 @@ _MUTATING_API_ENDPOINTS = {
     "api_update_relaunch_intent",
     "boost.api_boost_activate",
     "boost.api_boost_deactivate",
+    "bootstrap.api_bootstrap_renew",
+    "bootstrap.api_bootstrap_start",
+    "bootstrap.api_bootstrap_stop",
     "bot.api_bot_start",
     "cat.api_cat_refresh",
     "cat.api_cat_select",
@@ -274,6 +277,9 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
     "api_bootstrap_manifest_sign_begin",
     "api_bootstrap_manifest_sign_complete",
     "api_bootstrap_manifest_sign_fail",
+    "bootstrap.api_bootstrap_manifest_export",
+    "bootstrap.api_bootstrap_manifest_import",
+    "bootstrap.api_bootstrap_preview",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
     # remain available while a wallet effect is being reconciled and must not
@@ -6275,6 +6281,17 @@ from blueprints.bot import (
     api_diagnostics_api_stats,
     api_bot_price,
 )
+from blueprints.bootstrap import (
+    bp as _bootstrap_bp,
+    api_bootstrap_manifest_export,
+    api_bootstrap_manifest_import,
+    api_bootstrap_partial_offer_capability,
+    api_bootstrap_preview,
+    api_bootstrap_renew,
+    api_bootstrap_start,
+    api_bootstrap_status,
+    api_bootstrap_stop,
+)
 
 app.register_blueprint(_splash_bp)
 app.register_blueprint(_diagnostics_bp)
@@ -6293,6 +6310,7 @@ app.register_blueprint(_offers_bp)
 app.register_blueprint(_dashboard_bp)
 app.register_blueprint(_smart_defaults_bp)
 app.register_blueprint(_bot_bp)
+app.register_blueprint(_bootstrap_bp)
 
 
 def _validate_write_route_classification() -> None:

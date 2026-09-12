@@ -406,7 +406,7 @@ Run: `python -m pytest tests/test_bootstrap_mutation_gate.py tests/test_bootstra
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit lifecycle enforcement**
+- [x] **Step 5: Commit lifecycle enforcement**
 
 ```powershell
 git add src/catalyst/mutation_gate.py src/catalyst/bot_loop.py src/catalyst/offer_manager.py src/catalyst/fill_tracker.py src/catalyst/offer_reconciliation.py tests/test_bootstrap_mutation_gate.py tests/test_bootstrap_live_lifecycle.py
@@ -426,7 +426,7 @@ git commit -m "feat: enforce bootstrap authority through lifecycle"
 **Interfaces:**
 - Produces: `GET /api/bootstrap/status`, `POST /api/bootstrap/preview`, `POST /api/bootstrap/start`, `POST /api/bootstrap/stop`, `POST /api/bootstrap/renew`, `POST /api/bootstrap/manifest/export`, `POST /api/bootstrap/manifest/import`, and `GET /api/bootstrap/partial-capability`.
 
-- [ ] **Step 1: Write failing route and no-mutation-preview tests**
+- [x] **Step 1: Write failing route and no-mutation-preview tests**
 
 Add route assertions that preview returns the exact plan with zero database and
 wallet mutations; start rejects changed identity or missing exact-asset warning
@@ -434,17 +434,17 @@ acceptance; import cannot start until fresh local budgets are supplied and
 accepted; and the Experimental Partial control is visible, disabled, and backed
 by stable missing-capability reason codes.
 
-- [ ] **Step 2: Run tests and observe 404/missing-contract failures**
+- [x] **Step 2: Run tests and observe 404/missing-contract failures**
 
 Run: `python -m pytest tests/test_bootstrap_api.py tests/test_bootstrap_ui_contract.py -q`
 
 Expected: FAIL because the blueprint and UI controls do not exist.
 
-- [ ] **Step 3: Implement routes with AppBridge-style error dictionaries**
+- [x] **Step 3: Implement routes with AppBridge-style error dictionaries**
 
 All mutation routes perform an immediate identity recheck and return an AppBridge-style failure containing stable `code` and `error` strings on rejection. Preview is pure. Start persists the accepted campaign before Coin Prep. Stop invokes existing authoritative Cancel All scoped to campaign offers. Renew requires a fresh anchor/corridor/budget review. Manifest/proof signing creates a non-financial WalletConnect request and requires explicit approval in Sage.
 
-- [ ] **Step 4: Add the UI flow across every relevant tab**
+- [x] **Step 4: Add the UI flow across every relevant tab**
 
 Settings shows Market Follow versus Bootstrap, exact asset verification, price-or-valuation input, fixed budgets, corridor, subsidy opt-in, loss/fee stops, manifest import/export, and the disabled Experimental Partial option. Dashboard shows mode, stage, deployed fraction, countdown, budgets, cooldown, and stop state. Offers, P&L, Market Intel, Logs, Data Reset, Help, About, and reload/restart surfaces use the same server snapshot and escaped text.
 
