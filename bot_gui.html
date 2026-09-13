@@ -23973,8 +23973,8 @@
         function formatTrustedRangePrice(value) {
             const price = Number(String(value ?? '').trim());
             if (!Number.isFinite(price) || price <= 0) return '';
-            if (price >= 0.00000001 && price < 0.001) return price.toFixed(8);
-            const decimals = price >= 1 ? 4 : price >= 0.001 ? 6 : 12;
+            const exponent = Math.floor(Math.log10(price));
+            const decimals = Math.max(0, Math.min(12, 2 - exponent));
             return price.toFixed(decimals)
                 .replace(/(\.\d*?[1-9])0+$/, '$1')
                 .replace(/\.0+$/, '');
@@ -24006,7 +24006,7 @@
             const displayAsk = formatTrustedRangePrice(ask);
             setText(
                 'marketTrustedRange',
-                displayBid && displayAsk ? `${displayBid} – ${displayAsk} XCH` : 'No tradable range'
+                displayBid && displayAsk ? `${displayBid} – ${displayAsk} XCH/CAT` : 'No tradable range'
             );
             const reasons = Array.isArray(confidence.reason_codes)
                 ? confidence.reason_codes.map(code => String(code).replaceAll('_', ' ')).join(' · ')

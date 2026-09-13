@@ -404,12 +404,12 @@ def test_dashboard_renders_attributable_confidence_depth(page):
         "bidDepth": "Bid: 12.25 XCH",
         "askDepth": "Ask: 9.75 XCH",
         "confidence": "GREEN",
-        "range": "0.00007343 – 0.00007860 XCH",
+        "range": "0.0000734 – 0.0000786 XCH/CAT",
     }
 
 
 def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
-    """Trusted CAT prices stay readable while the exact values remain internal."""
+    """Trusted CAT prices are compact and explicitly labelled as XCH per CAT."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -427,7 +427,7 @@ def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
     )
 
     expect(page.locator("#marketTrustedRange")).to_have_text(
-        "0.00037333 – 0.00038520 XCH"
+        "0.000373 – 0.000385 XCH/CAT"
     )
 
 
