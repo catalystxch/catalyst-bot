@@ -2309,7 +2309,9 @@ class BotLoop:
         except Exception:
             mid_price = Decimal("0")
         try:
-            targets = self._get_expected_offer_targets(mid_price)
+            targets = self._apply_market_follow_capacity(
+                self._get_expected_offer_targets(mid_price)
+            )
         except Exception:
             targets = {
                 "buy": int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 0) or 0),
@@ -2472,7 +2474,9 @@ class BotLoop:
         """Avoid splitting coins while risk logic intentionally disables quoting."""
         try:
             mid_price = Decimal(str(self._current_mid_price or "0"))
-            targets = self._get_expected_offer_targets(mid_price)
+            targets = self._apply_market_follow_capacity(
+                self._get_expected_offer_targets(mid_price)
+            )
         except Exception:
             return False
 
@@ -2644,6 +2648,30 @@ class BotLoop:
 
         self._last_adaptive_offer_targets = dict(targets)
         return targets
+
+    def _apply_market_follow_capacity(self, targets: Dict[str, int]) -> Dict[str, int]:
+        """Apply the current Follow confidence cap to a pair of targets."""
+        confidence = getattr(self, "_market_confidence_result", None)
+        return {
+            side: market_follow_offer_target(
+                int((targets or {}).get(side, 0) or 0), confidence
+            )
+            for side in ("buy", "sell")
+        }
+
+    def _get_effective_offer_targets(
+        self,
+        mid_price: Decimal,
+        current_buy_count: int = 0,
+        current_sell_count: int = 0,
+    ) -> Dict[str, int]:
+        """Return the actual live targets after inventory and market caps."""
+        adaptive = self._get_adaptive_offer_targets(
+            mid_price,
+            current_buy_count=current_buy_count,
+            current_sell_count=current_sell_count,
+        )
+        return self._apply_market_follow_capacity(adaptive)
 
     def _offer_age_seconds(self, offer: Dict, now_ts: float) -> float:
         created_at = str((offer or {}).get("created_at") or "").strip()
@@ -2897,7 +2925,7 @@ class BotLoop:
     ):
         """Enter or clear recovery mode based on persistent degraded state."""
         state = self._recovery_state
-        targets = self._get_adaptive_offer_targets(
+        targets = self._get_effective_offer_targets(
             mid_price,
             current_buy_count=current_buy_count,
             current_sell_count=current_sell_count,
@@ -13084,7 +13112,7 @@ class BotLoop:
         effective_buy_count += self.offer_manager.get_recently_created_count("buy")
         effective_sell_count = max(0, current_sell_count)
         effective_sell_count += self.offer_manager.get_recently_created_count("sell")
-        adaptive_targets = self._get_adaptive_offer_targets(
+        adaptive_targets = self._get_effective_offer_targets(
             mid_price,
             current_buy_count=current_buy_count,
             current_sell_count=current_sell_count,
@@ -13097,9 +13125,6 @@ class BotLoop:
                 self._clear_alert(f"{_side}_position_paused")
         buy_target = int(adaptive_targets.get("buy", 0) or 0)
         sell_target = int(adaptive_targets.get("sell", 0) or 0)
-        confidence = getattr(self, "_market_confidence_result", None)
-        buy_target = market_follow_offer_target(buy_target, confidence)
-        sell_target = market_follow_offer_target(sell_target, confidence)
         _buy_under = bool(
             cfg.ENABLE_BUY and not skip_buy and effective_buy_count < buy_target
         )

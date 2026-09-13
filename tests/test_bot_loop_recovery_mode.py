@@ -455,6 +455,29 @@ class RecoveryModeTests(unittest.TestCase):
             any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged)
         )
 
+    def test_follow_capacity_cap_is_not_misreported_as_recovery_shortfall(self):
+        """A deliberate single-provider cap is the live target, not book drift."""
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop._get_adaptive_offer_targets = lambda *args, **kwargs: {
+            "buy": 45,
+            "sell": 45,
+        }
+        loop._market_confidence_result = types.SimpleNamespace(
+            data_valid=True,
+            follow_capacity_fraction=Decimal("0.25"),
+        )
+
+        for _ in range(loop._recovery_under_target_cycles + 1):
+            loop._evaluate_recovery_mode(Decimal("1.0"), 11, 11)
+
+        self.assertFalse(loop._recovery_state["active"])
+        self.assertEqual(loop._recovery_state["buy_deficit"], 0)
+        self.assertEqual(loop._recovery_state["sell_deficit"], 0)
+        self.assertFalse(
+            any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged)
+        )
+
     def test_recovery_mode_enter_is_info_after_book_was_live(self):
         loop = bot_loop.BotLoop()
         loop._running = True
