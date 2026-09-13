@@ -1284,6 +1284,91 @@ def test_market_withdrawal_immediately_enters_durable_retry_for_unresolved_outco
     assert retries == [True]
 
 
+def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatches = []
+    retries = []
+    events = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: dispatches.append(tuple(ids))
+        or {trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids}
+    )
+    loop._run_cancel_retry_pass = lambda: retries.append(True) or True
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [{"trade_id": "inner", "tier": "inner"}],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event_type, message, data=None: events.append(
+            (level, event_type, message, data)
+        ),
+    )
+    decision = SimpleNamespace(
+        cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_INNER"
+    )
+
+    first = loop._apply_market_withdrawal(decision)
+    second = loop._apply_market_withdrawal(decision)
+
+    assert first == 0
+    assert second == 0
+    assert dispatches == [("inner",)]
+    assert retries == [True]
+    assert [event[1] for event in events] == [
+        "market_confidence_withdrawal_failed"
+    ]
+    assert "1 failed" in events[0][2]
+    assert events[0][3]["outcome_counts"] == {"CANCEL_FAILED": 1}
+
+
+def test_market_withdrawal_reports_unknown_dispatch_once_as_unresolved(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    events = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: {
+            trade_id: {"outcome": "CANCEL_UNKNOWN"} for trade_id in ids
+        }
+    )
+    loop._run_cancel_retry_pass = lambda: True
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [{"trade_id": "inner", "tier": "inner"}],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event_type, message, data=None: events.append(
+            (level, event_type, message, data)
+        ),
+    )
+    decision = SimpleNamespace(
+        cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_INNER"
+    )
+
+    assert loop._apply_market_withdrawal(decision) == 0
+    assert loop._apply_market_withdrawal(decision) == 0
+
+    assert [event[1] for event in events] == [
+        "market_confidence_withdrawal_unresolved"
+    ]
+    assert "1 unresolved" in events[0][2]
+    assert events[0][3]["outcome_counts"] == {"CANCEL_UNKNOWN": 1}
+
+
 def test_market_refresh_applies_withdrawal_before_publication_reconciliation(
     monkeypatch,
 ):

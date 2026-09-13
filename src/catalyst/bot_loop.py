@@ -490,6 +490,7 @@ class BotLoop:
         self._market_degraded_decision = None
         self._market_confidence_valid_until = None
         self._market_refresh_lock = threading.RLock()
+        self._market_withdrawal_attempted_trade_ids: set[str] = set()
         self._publication_discovery_pending = 0
         self._market_refresh_now = datetime.now(timezone.utc)
         self._splash_confidence_offers: Dict[str, Dict] = {}
@@ -1315,8 +1316,15 @@ class BotLoop:
     def _apply_market_withdrawal(self, decision) -> int:
         """Submit authoritative cancellation for the current withdrawal tiers."""
 
+        attempted_trade_ids = getattr(
+            self, "_market_withdrawal_attempted_trade_ids", None
+        )
+        if type(attempted_trade_ids) is not set:
+            attempted_trade_ids = set()
+            self._market_withdrawal_attempted_trade_ids = attempted_trade_ids
         requested = set(getattr(decision, "cancel_tiers", ()) or ())
         if not requested:
+            attempted_trade_ids.clear()
             return 0
         requested = {"mid" if tier == "middle" else tier for tier in requested}
         rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
@@ -1325,6 +1333,7 @@ class BotLoop:
             for row in rows
             if str(row.get("tier") or "").strip().lower() in requested
             and str(row.get("trade_id") or "").strip()
+            and str(row.get("trade_id") or "").strip() not in attempted_trade_ids
         ]
         if not trade_ids or not self._enter_runtime_effect_phase("cancel"):
             return 0
@@ -1333,6 +1342,17 @@ class BotLoop:
             reason=str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
             force_storm=True,
         )
+        attempted_trade_ids.update(trade_ids)
+        outcome_counts = {}
+        for trade_id in trade_ids:
+            result = (results or {}).get(trade_id)
+            outcome = (
+                str(result.get("outcome") or "").strip()
+                if type(result) is dict
+                else ""
+            )
+            outcome = outcome or "MISSING_RESULT"
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
         unresolved_outcomes = {
             "CANCEL_FAILED",
             "CANCEL_SUBMITTED_UNCONFIRMED",
@@ -1343,17 +1363,46 @@ class BotLoop:
             for result in (results or {}).values()
         ):
             self._run_cancel_retry_pass()
-        log_event(
-            "warning",
-            "market_confidence_withdrawal",
-            f"Market confidence withdrawal submitted for {len(trade_ids)} "
-            f"{','.join(sorted(requested))} offer(s)",
-            data={
-                "reason_code": str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
-                "trade_ids": trade_ids,
-            },
+        accepted = sum(
+            outcome_counts.get(outcome, 0)
+            for outcome in {"CANCEL_CONFIRMED", "CANCEL_SUBMITTED_UNCONFIRMED"}
         )
-        return len(trade_ids)
+        event_data = {
+            "reason_code": str(
+                getattr(decision, "reason_code", "MARKET_DEGRADED")
+            ),
+            "trade_ids": trade_ids,
+            "outcome_counts": outcome_counts,
+        }
+        if accepted:
+            log_event(
+                "warning",
+                "market_confidence_withdrawal",
+                f"Market confidence withdrawal initiated for {accepted} "
+                f"{','.join(sorted(requested))} offer(s)",
+                data=event_data,
+            )
+        failed = outcome_counts.get("CANCEL_FAILED", 0) + outcome_counts.get(
+            "MISSING_RESULT", 0
+        )
+        if failed:
+            log_event(
+                "error",
+                "market_confidence_withdrawal_failed",
+                f"Market confidence withdrawal incomplete: {failed} failed "
+                f"of {len(trade_ids)} {','.join(sorted(requested))} offer(s)",
+                data=event_data,
+            )
+        unresolved = outcome_counts.get("CANCEL_UNKNOWN", 0)
+        if unresolved:
+            log_event(
+                "warning",
+                "market_confidence_withdrawal_unresolved",
+                f"Market confidence withdrawal incomplete: {unresolved} unresolved "
+                f"of {len(trade_ids)} {','.join(sorted(requested))} offer(s)",
+                data=event_data,
+            )
+        return accepted
 
     def _reconcile_offer_publication_discovery(
         self,
