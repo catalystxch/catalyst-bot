@@ -859,13 +859,6 @@ def api_dashboard():
 
         links = {
             "dexie_orderbook": dexie_orderbook,
-            "tibetswap_pool": f"https://v2.tibetswap.io/pair/{quote(getattr(cfg, 'TIBET_PAIR_ID', '') or '')}"
-            if getattr(cfg, "TIBET_PAIR_ID", "")
-            else (
-                f"https://v2.tibetswap.io/?asset_id={quote(asset_id)}"
-                if asset_id
-                else "https://v2.tibetswap.io"
-            ),
             "spacescan_token": f"https://www.spacescan.io/cat2/{quote(asset_id)}"
             if asset_id
             else "",

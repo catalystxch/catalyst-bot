@@ -21,10 +21,12 @@ from api_test_support import permit_api_mutations
 
 try:
     import api_server
+    from blueprints import market as market_blueprint
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    market_blueprint = None
     _SKIP = str(exc)
 
 
@@ -265,6 +267,18 @@ class TestMarketIntel(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestMarketSummary(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        cache = getattr(market_blueprint, "_MARKET_SUMMARY_CACHE", None)
+        if isinstance(cache, dict):
+            cache.update(key=None, expires_at=0.0, payload={})
+
+    def tearDown(self):
+        cache = getattr(market_blueprint, "_MARKET_SUMMARY_CACHE", None)
+        if isinstance(cache, dict):
+            cache.update(key=None, expires_at=0.0, payload={})
+        super().tearDown()
+
     def test_reports_permanent_tibetswap_retirement(self):
         """A confirmed TibetSwap outage must be machine-readable to the UI."""
         bot = _make_bot()
@@ -357,6 +371,53 @@ class TestMarketSummary(_FlaskBase):
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
         self.assertEqual(tibet_calls, [])
+
+    def test_dashboard_clients_share_short_market_summary_cache(self):
+        """Several open UIs must not multiply outbound Dexie traffic."""
+        asset_id = "cache123cat"
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "CACHE_XCH",
+                "decimals": 3,
+                "name": "CACHE",
+            }
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((str(url), dict(params or {})))
+            if "prices/tickers" in str(url):
+                return FakeResponse({"tickers": []})
+            return FakeResponse({"offers": []})
+
+        try:
+            with patch("requests.get", side_effect=fake_get):
+                first = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                )
+                second = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                )
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.get_json(), second.get_json())
+        self.assertEqual(len(calls), 5)
 
 
 # ---------------------------------------------------------------------------

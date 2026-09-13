@@ -9196,6 +9196,70 @@ class BotLoop:
             )
         return True
 
+    def _get_cancel_retry_health(self) -> Dict[str, object]:
+        """Return retryable versus exhausted cancel failures for safety gating."""
+        manager = getattr(self, "offer_manager", None)
+        getter = getattr(manager, "get_cancel_retry_health", None)
+        if callable(getter):
+            try:
+                health = getter()
+                if type(health) is dict:
+                    return health
+            except Exception:
+                pass
+
+        retry_map = getattr(manager, "_pending_cancel_retries", {}) or {}
+        max_retries = getattr(manager, "_max_cancel_retries", 5)
+        retryable_trade_ids = []
+        exhausted_trade_ids = []
+        for trade_id, retry in retry_map.items():
+            attempt = retry.get("attempts") if type(retry) is dict else None
+            if (
+                type(attempt) is int
+                and not isinstance(attempt, bool)
+                and 0 <= attempt < max_retries
+            ):
+                retryable_trade_ids.append(trade_id)
+            else:
+                exhausted_trade_ids.append(trade_id)
+        retryable_trade_ids.sort()
+        exhausted_trade_ids.sort()
+        return {
+            "total": len(retryable_trade_ids) + len(exhausted_trade_ids),
+            "retryable": len(retryable_trade_ids),
+            "exhausted": len(exhausted_trade_ids),
+            "retryable_trade_ids": retryable_trade_ids,
+            "exhausted_trade_ids": exhausted_trade_ids,
+        }
+
+    def _apply_cancel_retry_health_alert(self, health: Dict[str, object]) -> bool:
+        """Report cancellation health and fence creation after retry exhaustion."""
+        exhausted = int(health.get("exhausted", 0) or 0)
+        retryable = int(health.get("retryable", 0) or 0)
+        if exhausted > 0:
+            self._emit_alert(
+                "cancel_retries",
+                "error",
+                f"{exhausted} cancellation retry limit(s) reached",
+                f"{exhausted} active offer cancellation(s) reached the retry limit. "
+                "New offer creation is paused while monitoring continues.",
+                action="stop_bot",
+                action_label="Stop Bot",
+            )
+            return True
+        if retryable > 0:
+            self._emit_alert(
+                "cancel_retries",
+                "warning",
+                f"{retryable} stuck cancel(s)",
+                "Some offers failed to cancel and are queued for retry.",
+                action="stop_bot",
+                action_label="Stop Bot",
+            )
+        else:
+            self._clear_alert("cancel_retries")
+        return False
+
     def can_defer_mutation_safety_stop(self, reason_code: str) -> bool:
         """Keep one exact cancel settlement worker alive behind a closed gate."""
 
@@ -9421,7 +9485,7 @@ class BotLoop:
             "info",
             "cycle_start",
             f"Cycle #{self._loop_count} — mid price: {mid_price:.8f} XCH, "
-            f"arb gap: {_bps_to_pct(arb_gap)}, spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
+            f"quote spread: {_bps_to_pct(self._bot_state.get('spread_bps', '0'))}",
         )
 
         # ---- Step 1b: Refresh market intelligence (NEW — ecosystem) ----
@@ -10137,19 +10201,12 @@ class BotLoop:
         if not self._run_cancel_retry_pass():
             return False
 
-        # Update cancel retry alert
-        pending_retries = len(self.offer_manager._pending_cancel_retries)
-        if pending_retries > 0:
-            self._emit_alert(
-                "cancel_retries",
-                "warning",
-                f"{pending_retries} stuck cancel(s)",
-                "Some offers failed to cancel and are queued for retry.",
-                action="stop_bot",
-                action_label="Stop Bot",
-            )
-        else:
-            self._clear_alert("cancel_retries")
+        # Retain exhausted failures as evidence, but never describe them as
+        # queued or let the book grow while cancellation control is impaired.
+        cancel_retry_health = self._get_cancel_retry_health()
+        cancel_retry_creation_blocked = self._apply_cancel_retry_health_alert(
+            cancel_retry_health
+        )
 
         self._maybe_finalize_graceful_migration(
             current_buy_ids=current_buy_ids,
@@ -11401,6 +11458,8 @@ class BotLoop:
 
         # ---- Step 10: Create new offers if needed ----
         self._set_cycle_step("step10_create_offers")
+        if cancel_retry_creation_blocked:
+            return
         # The configured limit is a hard live-book cap. Count every offer Sage
         # still reports open, including probes and pending-cancel offers. A
         # wallet-active offer remains fillable and must keep its slot until
@@ -17120,10 +17179,7 @@ class BotLoop:
                 "pending_cancel": len(self._pending_cancel_wallet_ids(side)),
             }
 
-        retry_map = (
-            getattr(getattr(self, "offer_manager", None), "_pending_cancel_retries", {})
-            or {}
-        )
+        retry_health = self._get_cancel_retry_health()
         return {
             "mid_price": str(mid_price),
             "thresholds": thresholds,
@@ -17132,7 +17188,9 @@ class BotLoop:
             "pending_cancel_total": sum(
                 int(v.get("pending_cancel", 0) or 0) for v in sides.values()
             ),
-            "pending_cancel_retries": len(retry_map),
+            "cancel_retry_total": int(retry_health.get("total", 0) or 0),
+            "pending_cancel_retries": int(retry_health.get("retryable", 0) or 0),
+            "exhausted_cancel_failures": int(retry_health.get("exhausted", 0) or 0),
             "sides": sides,
         }
 

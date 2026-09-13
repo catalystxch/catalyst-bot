@@ -359,7 +359,8 @@ def validate_config(cfg) -> ValidationReport:
     fee_coin_size = getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0"))
     sniper_size_check = getattr(cfg, "SNIPER_SIZE_XCH", Decimal("0"))
     if (
-        fee_coin_size > Decimal("0")
+        getattr(cfg, "SNIPER_ENABLED", False)
+        and fee_coin_size > Decimal("0")
         and sniper_size_check > Decimal("0")
         and fee_coin_size >= sniper_size_check
     ):

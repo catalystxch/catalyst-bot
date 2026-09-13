@@ -5255,6 +5255,13 @@ def test_retry_exhaustion_keeps_durable_failure_without_terminalizing(
     assert manager._pending_cancel_retries[TRADE_ID]["attempts"] == (
         manager._max_cancel_retries
     )
+    assert manager.get_cancel_retry_health() == {
+        "total": 1,
+        "retryable": 0,
+        "exhausted": 1,
+        "retryable_trade_ids": [],
+        "exhausted_trade_ids": [TRADE_ID],
+    }
     assert (
         database.get_all_coins_state()[database.norm_coin_id(COIN_ID)]["status"]
         == "locked"

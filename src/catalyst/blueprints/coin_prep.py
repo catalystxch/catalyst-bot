@@ -3276,7 +3276,6 @@ def api_coin_prep_cancel():
 @bp.route("/api/fills/export")
 def api_fills_export():
     """Export fill history as CSV."""
-    bot = api_server.bot
     try:
         asset_id = api_server._active_cat.get("asset_id") or getattr(
             cfg, "CAT_ASSET_ID", ""
@@ -3285,8 +3284,6 @@ def api_fills_export():
             return jsonify({"success": False, "error": "No active CAT selected"}), 400
 
         history = api_server._build_fill_history_for_gui(asset_id, limit=1000)
-        if not history:
-            return jsonify({"success": False, "error": "No fills to export"}), 404
 
         import csv
         import io

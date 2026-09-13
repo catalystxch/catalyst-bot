@@ -9042,6 +9042,31 @@ class OfferManager:
                     self._end_cancel_settlement(intent.operation_id)
         return 0
 
+    def get_cancel_retry_health(self) -> Dict[str, object]:
+        """Classify retained cancel failures without discarding safety evidence."""
+        retryable_trade_ids: List[str] = []
+        exhausted_trade_ids: List[str] = []
+        for trade_id, retry in self._pending_cancel_retries.items():
+            attempt = retry.get("attempts") if type(retry) is dict else None
+            if (
+                type(attempt) is int
+                and not isinstance(attempt, bool)
+                and 0 <= attempt < self._max_cancel_retries
+            ):
+                retryable_trade_ids.append(trade_id)
+            else:
+                # Malformed retry state cannot safely authorize a new offer.
+                exhausted_trade_ids.append(trade_id)
+        retryable_trade_ids.sort()
+        exhausted_trade_ids.sort()
+        return {
+            "total": len(retryable_trade_ids) + len(exhausted_trade_ids),
+            "retryable": len(retryable_trade_ids),
+            "exhausted": len(exhausted_trade_ids),
+            "retryable_trade_ids": retryable_trade_ids,
+            "exhausted_trade_ids": exhausted_trade_ids,
+        }
+
     def retry_failed_cancels(self) -> int:
         """Retry exact durable failures; memory is only a health-reporting cache."""
         # A batch deliberately aborts later members after one cancellation

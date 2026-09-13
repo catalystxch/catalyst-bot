@@ -172,6 +172,19 @@ def test_primary_nav_views_switch_without_wallet(app_page, label, view_id):
     expect(app_page.locator(f"#{view_id}")).to_have_class(re.compile(r"\bactive\b"))
 
 
+def test_settings_hidden_pair_selector_does_not_create_horizontal_overflow(page):
+    """The screen-reader-only pair select must not widen the Settings page."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("window.v4SwitchView('settings')")
+
+    overflow = page.evaluate(
+        "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 0
+
+
 def test_data_reset_button_opens_destructive_confirmation(app_page):
     """Data-reset actions should show a confirmation dialog before POSTing."""
     reveal_app_shell_for_nav(app_page)
@@ -184,6 +197,74 @@ def test_data_reset_button_opens_destructive_confirmation(app_page):
     )
     expect(app_page.locator("#confirmTitle")).to_have_text("Reset P&L Counters")
     expect(app_page.locator("#confirmOkBtn")).to_have_text("Reset P&L")
+
+
+def test_running_bot_disables_and_guards_pnl_reset_controls(page):
+    """P&L reset actions must be inert for the whole running-bot window."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """() => {
+            bot_state = { ...bot_state, running: true };
+            window.__pnlResetConfirmCalls = 0;
+            window.__pnlResetFetchCalls = 0;
+            showStyledConfirm = async () => {
+                window.__pnlResetConfirmCalls += 1;
+                return false;
+            };
+            apiFetch = async () => {
+                window.__pnlResetFetchCalls += 1;
+                return { json: async () => ({ success: true }) };
+            };
+            updateDataResetButtonState(true);
+        }"""
+    )
+
+    expect(page.locator("#btnPnlResetPosition")).to_be_disabled()
+    expect(page.locator("#btnPnlResetAllStats")).to_be_disabled()
+
+    page.evaluate(
+        """async () => {
+            await resetPosition();
+            await resetAllTradingStats();
+        }"""
+    )
+    assert page.evaluate("window.__pnlResetConfirmCalls") == 0
+    assert page.evaluate("window.__pnlResetFetchCalls") == 0
+
+
+def test_offer_detail_toggle_has_meaningful_icon_and_accessible_name(page):
+    """Offer expand/collapse controls must not render as anonymous question marks."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    reveal_app_shell_for_nav(page)
+    page.evaluate(
+        """() => {
+        v4SwitchView('offers');
+        updateOffers('buyOffers', [{
+            full_id: 'a'.repeat(64),
+            id: 'a'.repeat(18) + '...',
+            side: 'buy',
+            status: 'PENDING_ACCEPT',
+            size_xch: '0.0100',
+            size_cat: '10.000',
+            price: '0.001',
+            target_price: '0.001',
+            mid_price: '0.001',
+            spread_pct: '-1.0',
+            tier: 'inner',
+            created_datetime: '2026-09-13 12:00:00',
+        }]);
+        }"""
+    )
+
+    toggle = page.locator("#buyOffers .collapse-toggle")
+    expect(toggle).to_have_text("▾")
+    expect(toggle).to_have_attribute("aria-label", "Collapse offer details")
+
+    toggle.click()
+    expect(toggle).to_have_text("▸")
+    expect(toggle).to_have_attribute("aria-label", "Expand offer details")
 
 
 def test_opening_logs_view_reveals_latest_entry(page):
@@ -653,6 +734,55 @@ def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
     expect(page.locator("#mktVolume24h")).to_have_text("0.242")
     expect(page.locator("#mktPoolDepth")).to_have_text("15.00 XCH")
     expect(page.locator("#mktArbGap")).to_have_text("GREEN")
+
+
+def test_running_pair_clears_stale_select_pair_while_market_summary_loads(page):
+    """A restored live pair must not keep advertising that no pair is selected."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    stale_text = page.evaluate(
+        """async () => {
+            currentCAT = {};
+            bot_state = { running: false, current_cat: {} };
+            await fetchMarketSummary();
+
+            bot_state = {
+                running: true,
+                current_cat: {
+                    asset_id: 'a628c1c2c6fcb74d53746157e438e108eab5c0bb3e5c80ff9b1910b3e4832913',
+                    wallet_id: 2,
+                    ticker_id: 'SBX_XCH',
+                    name: 'Spacebucks',
+                    decimals: 3,
+                },
+            };
+            apiFetch = async (url) => {
+                if (String(url).includes('/market/confidence')) {
+                    return new Response(JSON.stringify({
+                        confidence: { state: 'AMBER', reason_codes: [] },
+                        metrics: {},
+                        evidence: { source_ids: ['dexie'] },
+                        providers: {},
+                    }), { status: 200 });
+                }
+                await new Promise(resolve => setTimeout(resolve, 3_000));
+                return new Response(JSON.stringify({
+                    has_data: true,
+                    best_bid: 0.00037543,
+                    best_ask: 0.00038520,
+                    volume_24h: 0,
+                    mid_price: 0.00038031,
+                }), { status: 200 });
+            };
+
+            window.__pendingMarketSummary = fetchMarketSummary();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            return document.getElementById('mktBestBid').textContent;
+        }"""
+    )
+
+    assert stale_text == "Loading..."
 
 
 def test_pair_pnl_reset_allows_identical_fill_snapshot_to_render_again(page):
@@ -1157,6 +1287,47 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     assert result["triggerCalls"] == 2
     assert any("Offer states confirmed terminal" in line for line in result["logs"])
     expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_bootstrap_coin_prep_uses_asset_precision_for_verified_sizes(page):
+    """Campaign preview must not expose JavaScript floating-point artefacts."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'a'.repeat(64),
+                name: 'Spacebucks',
+                decimals: 3,
+            };
+            _bootstrapActiveCampaign = { campaign_id: 'campaign-1', revision: 1 };
+            renderBootstrapCoinPrepConfirmation({
+                bootstrap_campaign_id: 'campaign-1',
+                bootstrap_campaign_revision: 1,
+                xch_needed_mojos: 1005999999999,
+                cat_needed_mojos: 2499999,
+                tiers: {
+                    inner: {
+                        needed: 1,
+                        xch_size: '0.3333333333333333',
+                        cat_size: '833.3333333333334',
+                    },
+                    fees: { needed: 6, xch_size: '0.001', cat_size: '0' },
+                },
+            }, 'Spacebucks');
+            return {
+                xchSize: document.getElementById('cpConfirmXchSize').textContent,
+                catSize: document.getElementById('cpConfirmCatSize').textContent,
+                catTotal: document.getElementById('cpConfirmCatTotal').textContent,
+            };
+        }"""
+    )
+
+    assert "0.333333333333" in result["xchSize"]
+    assert "0.3333333333333333" not in result["xchSize"]
+    assert result["catSize"] == "Near: 1 × 833.333"
+    assert result["catTotal"] == "2,499.999"
 
 
 def test_coin_prep_keeps_waiting_while_terminal_proof_propagates(page):

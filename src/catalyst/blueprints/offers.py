@@ -1815,6 +1815,15 @@ def api_purge_fills():
     slog("GUI_ACTION", ">>> BUTTON: Purge Fill Records")
 
     try:
+        if bot and bot.is_running():
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "bot_running",
+                    "message": "Stop the bot before resetting fill history.",
+                }
+            ), 409
+
         from database import guarded_reset_authoritative_state, log_event
 
         reset = guarded_reset_authoritative_state(
@@ -1966,6 +1975,15 @@ def api_pnl_reset():
     bot = api_server.bot
     slog("GUI_ACTION", ">>> BUTTON: Reset Trading Stats")
     try:
+        if bot and bot.is_running():
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "bot_running",
+                    "message": "Stop the bot before resetting trading statistics.",
+                }
+            ), 409
+
         payload = request.get_json(silent=True) or {}
         if (payload.get("confirm") or "").strip().upper() != "RESET":
             return jsonify(

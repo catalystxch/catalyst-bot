@@ -450,6 +450,36 @@ class ProbeAnchorTests(unittest.TestCase):
         self.assertEqual(stop_calls, [])
         self.assertTrue(loop._running)
 
+    def test_exhausted_cancel_retry_is_reported_and_blocks_offer_creation(self):
+        loop = bot_loop.BotLoop()
+        loop.offer_manager._max_cancel_retries = 5
+        loop.offer_manager._pending_cancel_retries = {
+            "retryable": {"attempts": 2, "first_failed": 1},
+            "exhausted": {"attempts": 5, "first_failed": 2},
+        }
+        alerts = []
+
+        with patch.object(
+            loop,
+            "_emit_alert",
+            side_effect=lambda *args, **kwargs: alerts.append((args, kwargs)),
+        ):
+            health = loop._get_cancel_retry_health()
+            blocked = loop._apply_cancel_retry_health_alert(health)
+
+        self.assertEqual(health["total"], 2)
+        self.assertEqual(health["retryable"], 1)
+        self.assertEqual(health["exhausted"], 1)
+        self.assertEqual(health["exhausted_trade_ids"], ["exhausted"])
+        self.assertTrue(blocked)
+        self.assertEqual(alerts[0][0][1], "error")
+        self.assertIn("retry limit", alerts[0][0][3])
+
+        diagnostics = loop._get_requote_diagnostics()
+        self.assertEqual(diagnostics["cancel_retry_total"], 2)
+        self.assertEqual(diagnostics["pending_cancel_retries"], 1)
+        self.assertEqual(diagnostics["exhausted_cancel_failures"], 1)
+
     def test_exact_cancel_settlement_window_is_the_only_deferred_safety_stop(self):
         import database as runtime_database
 

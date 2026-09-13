@@ -476,6 +476,11 @@ class TestDashboard(_FlaskBase):
         body = resp.get_json()
         self.assertIn("dexie_orderbook", body["links"])
 
+    def test_links_do_not_advertise_retired_tibetswap(self):
+        resp = self._get_dashboard()
+        body = resp.get_json()
+        self.assertNotIn("tibetswap_pool", body["links"])
+
     def test_current_cat_is_dict(self):
         resp = self._get_dashboard()
         body = resp.get_json()

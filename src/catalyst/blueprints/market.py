@@ -18,6 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 
 from flask import Blueprint, jsonify, request
 
@@ -42,6 +43,44 @@ _TIBET_PAIRS_CACHE_TTL_SECS = 60.0
 
 _STARTUP_PRICE_LOCK = threading.Lock()
 _STARTUP_PRICE_CACHE = {"key": None, "expires_at": 0.0, "price": {}}
+
+# Every open browser/WebView polls the dashboard independently. Share one short
+# market-summary snapshot per pair so additional windows cannot multiply five
+# outbound Dexie requests every 30 seconds. The lock also makes the refresh
+# single-flight when several clients arrive just after expiry.
+_MARKET_SUMMARY_LOCK = threading.RLock()
+_MARKET_SUMMARY_CACHE = {"key": None, "expires_at": 0.0, "payload": {}}
+_MARKET_SUMMARY_CACHE_TTL_SECS = 25.0
+
+
+def _cached_market_summary(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        active = api_server._active_cat
+        key = (
+            str(active.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")),
+            str(active.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")),
+            int(active.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)),
+            str(getattr(cfg, "DEXIE_API_BASE", "https://api.dexie.space")),
+        )
+        with _MARKET_SUMMARY_LOCK:
+            if (
+                _MARKET_SUMMARY_CACHE["key"] == key
+                and time.monotonic() < _MARKET_SUMMARY_CACHE["expires_at"]
+            ):
+                return jsonify(dict(_MARKET_SUMMARY_CACHE["payload"]))
+
+            response = func(*args, **kwargs)
+            payload = response.get_json(silent=True)
+            if isinstance(payload, dict):
+                _MARKET_SUMMARY_CACHE.update(
+                    key=key,
+                    expires_at=time.monotonic() + _MARKET_SUMMARY_CACHE_TTL_SECS,
+                    payload=dict(payload),
+                )
+            return response
+
+    return wrapper
 
 
 def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
@@ -931,6 +970,7 @@ def api_market_confidence():
 
 
 @bp.route("/api/market/summary")
+@_cached_market_summary
 def api_market_summary():
     """Lightweight market overview for the dashboard.
 

@@ -210,6 +210,8 @@ def test_bootstrap_coin_prep_confirmation_renders_exact_verified_plan():
     assert "verification.tiers" in block
     assert "Prepare Exact Campaign Coins" in block
     assert ".textContent" in block
+    assert "formatBootstrapCoinPrepAmount" in block
+    assert "${spec[`${side}_size`]}" not in block
 
     confirm_start = end
     confirm_end = GUI.index("function closeCoinPrepConfirm()", confirm_start)

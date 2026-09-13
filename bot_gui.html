@@ -3006,14 +3006,15 @@
 
         .v4-settings-hidden-select {
             position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
+            width: 1px !important;
+            max-width: 1px !important;
+            height: 1px !important;
+            padding: 0 !important;
             margin: -1px;
             overflow: hidden;
             clip: rect(0, 0, 0, 0);
             white-space: nowrap;
-            border: 0;
+            border: 0 !important;
             pointer-events: none;
         }
 
@@ -5860,6 +5861,7 @@
             border: 1px solid rgba(99,102,241,0.18);
             background: linear-gradient(135deg, rgba(99,102,241,0.08), rgba(16,185,129,0.05));
         }
+        .lc-manual-panel[hidden] { display: none !important; }
         .lc-manual-copy {
             flex: 1;
             min-width: 0;
@@ -9950,7 +9952,7 @@
                         </div>
                     </div>
                 </div>
-                <div id="fillEvidenceActivity" class="panel-context-note">PnL and fill totals include Confirmed evidence only. Observed and Probable activity remains non-economic until Sage or exact dual-chain evidence confirms it.</div>
+                <div id="fillEvidenceActivity" class="panel-context-note">PnL and fill totals include Confirmed evidence only. Observed and Probable activity remains non-economic until Sage confirms it. Exact external fill proof is unavailable in v1.4.</div>
 
                 <div class="pnl-terms-panel" aria-label="PnL summary">
                     <div class="pnl-term">
@@ -10102,8 +10104,8 @@
                         <span>+MAX (Long)</span>
                     </div>
                     <div style="margin-top: var(--space-3); text-align: center; display: flex; gap: var(--space-2); justify-content: center; flex-wrap: wrap;">
-                        <button class="btn" onclick="resetPosition()" style="background: transparent; border: 1px solid var(--border-subtle); color: var(--text-tertiary); font-size: var(--text-xs); padding: 4px 12px; cursor: pointer; border-radius: var(--radius-md);" title="Clear all fill history and reset position to zero. Use after a fresh start or if the inherited position is stale.">Reset Position</button>
-                        <button class="btn" onclick="resetAllTradingStats()" style="background: transparent; border: 1px solid rgba(239,68,68,0.35); color: var(--status-danger); font-size: var(--text-xs); padding: 4px 12px; cursor: pointer; border-radius: var(--radius-md);" title="Full wipe: fills, round-trips, price history, inventory snapshots, position baseline, and runtime stats. Coins and open offers are NOT touched.">⚠ Reset All Stats</button>
+                        <button id="btnPnlResetPosition" class="btn" onclick="resetPosition()" style="background: transparent; border: 1px solid var(--border-subtle); color: var(--text-tertiary); font-size: var(--text-xs); padding: 4px 12px; cursor: pointer; border-radius: var(--radius-md);" title="Clear all fill history and reset position to zero. Use after a fresh start or if the inherited position is stale.">Reset Position</button>
+                        <button id="btnPnlResetAllStats" class="btn" onclick="resetAllTradingStats()" style="background: transparent; border: 1px solid rgba(239,68,68,0.35); color: var(--status-danger); font-size: var(--text-xs); padding: 4px 12px; cursor: pointer; border-radius: var(--radius-md);" title="Full wipe: fills, round-trips, price history, inventory snapshots, position baseline, and runtime stats. Coins and open offers are NOT touched.">⚠ Reset All Stats</button>
                     </div>
 
                     <!-- Position history chart — shows inventory drift over session -->
@@ -24141,6 +24143,17 @@
                 if (gapSub) gapSub.textContent = '';
                 return;
             }
+            // A restored running session can learn its pair from /api/status
+            // several seconds before the market summary request completes. Do
+            // not keep showing the earlier no-pair prompt during that fetch.
+            ['mktBestBid','mktBestAsk','mktPoolDepth','mktArbGap','mktVolume24h'].forEach(function(id) {
+                const el = document.getElementById(id);
+                if (el && el.textContent.trim() === 'Select pair') {
+                    el.textContent = 'Loading...';
+                    el.style.fontSize = '';
+                    el.style.color = '';
+                }
+            });
             try {
                 fetchMarketConfidence();
                 const resp = await apiFetch(`${API_URL}/market/summary`, { signal: AbortSignal.timeout(15000) });
@@ -31048,7 +31061,15 @@
                         item.classList.remove('collapsed');
                     }
                     const toggle = item.querySelector('.collapse-toggle');
-                    if (toggle) toggle.textContent = _allCollapsed[side] ? '?' : '?';
+                    if (toggle) {
+                        toggle.textContent = _allCollapsed[side] ? '▸' : '▾';
+                        toggle.setAttribute(
+                            'aria-label',
+                            _allCollapsed[side]
+                                ? 'Expand offer details'
+                                : 'Collapse offer details'
+                        );
+                    }
                 });
             }
         }
@@ -31059,7 +31080,15 @@
                 const isNowCollapsed = !element.classList.contains('collapsed');
                 element.classList.toggle('collapsed');
                 const toggle = element.querySelector('.collapse-toggle');
-                if (toggle) toggle.textContent = isNowCollapsed ? '?' : '?';
+                if (toggle) {
+                    toggle.textContent = isNowCollapsed ? '▸' : '▾';
+                    toggle.setAttribute(
+                        'aria-label',
+                        isNowCollapsed
+                            ? 'Expand offer details'
+                            : 'Collapse offer details'
+                    );
+                }
                 
                 // Persist state — this is the ONLY source of truth
                 if (isNowCollapsed) {
@@ -31135,7 +31164,10 @@
                 }
                 const isCollapsed = _collapsedOffers.has(offer.full_id);
                 const collapsedClass = isCollapsed ? 'collapsed' : '';
-                const toggleIcon = isCollapsed ? '?' : '?';
+                const toggleIcon = isCollapsed ? '▸' : '▾';
+                const toggleLabel = isCollapsed
+                    ? 'Expand offer details'
+                    : 'Collapse offer details';
                 const _statusClassMap = { PENDING_ACCEPT: 'status-PENDING_ACCEPT', PENDING_CONFIRM: 'status-PENDING_CONFIRM', CONFIRMED: 'status-CONFIRMED', COMPLETED: 'status-COMPLETED', CANCELLED: 'status-CANCELLED', PENDING_CANCEL: 'status-PENDING_CANCEL', FAILED: 'status-FAILED', EXPIRED: 'status-EXPIRED' };
                 const statusClass = _statusClassMap[offer.status] || 'status-unknown';
                 const catName = offer.cat_name || currentCAT.name || 'CAT';
@@ -31234,7 +31266,7 @@
                                     ${escapeHtml(offer.size_xch)} XCH · ${escapeHtml(offer.size_cat)} ${escapeHtml(catName)} · @ ${escapeHtml(priceDisplay)}${offer.age ? ' · ' + escapeHtml(offer.age) : ''}
                                 </span>
                             </div>
-                            <button class="collapse-toggle" data-offer-id="${escapeHtml(offer.full_id)}" onclick="event.stopPropagation(); toggleOfferCollapse(this.dataset.offerId)">
+                            <button class="collapse-toggle" aria-label="${toggleLabel}" data-offer-id="${escapeHtml(offer.full_id)}" onclick="event.stopPropagation(); toggleOfferCollapse(this.dataset.offerId)">
                                 ${toggleIcon}
                             </button>
                         </div>
@@ -32191,6 +32223,7 @@
         }
 
         async function resetPosition() {
+            if (_dataResetBlockedWhileRunning()) return;
             const ok = await showStyledConfirm({
                 icon: '↺',
                 title: 'Reset Position?',
@@ -32248,6 +32281,7 @@
         //   1. showStyledConfirm shows the intent + actual counts up-front
         //   2. The backend requires {confirm: "RESET"} in the POST body
         async function resetAllTradingStats() {
+            if (_dataResetBlockedWhileRunning()) return;
             let summaryText = 'Clear all fills, round-trips, price history, inventory snapshots, and reset position baseline to zero?';
             try {
                 const r = await apiFetch(`${API_URL}/pnl/reset-preview`, { cache: 'no-store' });
@@ -34195,12 +34229,23 @@
         // 409 and we surface the message.
         function updateDataResetButtonState(isRunning) {
             const blocked = !!isRunning;
-            ['btnResetPnl', 'btnResetOfferHistory', 'btnResetFull'].forEach(id => {
+            [
+                'btnResetPnl',
+                'btnResetOfferHistory',
+                'btnResetFull',
+                'btnPnlResetPosition',
+                'btnPnlResetAllStats',
+            ].forEach(id => {
                 const btn = document.getElementById(id);
                 if (!btn) return;
+                if (btn.dataset.defaultTitle === undefined) {
+                    btn.dataset.defaultTitle = btn.title || '';
+                }
                 btn.disabled = blocked;
                 btn.setAttribute('aria-disabled', blocked ? 'true' : 'false');
-                btn.title = blocked ? 'Stop the bot before resetting data.' : '';
+                btn.title = blocked
+                    ? 'Stop the bot before resetting data.'
+                    : btn.dataset.defaultTitle;
                 btn.style.opacity = blocked ? '0.45' : '';
                 btn.style.cursor = blocked ? 'not-allowed' : '';
             });
@@ -35279,9 +35324,17 @@ function closeCtgErrorModal() {
 
             const tiers = verification.tiers || {};
             const labels = { inner: 'Near', mid: 'Middle', outer: 'Far', fees: 'Fees' };
+            const catDecimals = Math.max(0, Math.min(12, Number(currentCAT?.decimals ?? 3)));
+            const formatBootstrapCoinPrepAmount = (value, decimals) => {
+                const amount = Number(value || 0);
+                if (!Number.isFinite(amount)) return '--';
+                return amount.toLocaleString(undefined, {
+                    maximumFractionDigits: Math.max(0, Math.min(12, Number(decimals) || 0)),
+                });
+            };
             const rowsFor = (side) => Object.entries(tiers)
                 .filter(([, spec]) => Number(spec?.[`${side}_size`] || 0) > 0 && Number(spec?.needed || 0) > 0)
-                .map(([tier, spec]) => `${labels[tier] || tier}: ${Number(spec.needed)} × ${spec[`${side}_size`]}`);
+                .map(([tier, spec]) => `${labels[tier] || tier}: ${Number(spec.needed)} × ${formatBootstrapCoinPrepAmount(spec[`${side}_size`], side === 'xch' ? 12 : catDecimals)}`);
             const xchRows = rowsFor('xch');
             const catRows = rowsFor('cat');
             const xchCoins = Object.values(tiers).reduce(
@@ -35291,15 +35344,14 @@ function closeCtgErrorModal() {
                 (sum, spec) => sum + (Number(spec?.cat_size || 0) > 0 ? Number(spec?.needed || 0) : 0), 0
             );
             const xchTotal = Number(verification.xch_needed_mojos || 0) / 1e12;
-            const catDecimals = Number(currentCAT?.decimals || 3);
             const catTotal = Number(verification.cat_needed_mojos || 0) / (10 ** catDecimals);
 
             document.getElementById('cpConfirmXchCoins').textContent = String(xchCoins);
             document.getElementById('cpConfirmXchSize').textContent = xchRows.join(' · ');
-            document.getElementById('cpConfirmXchTotal').textContent = xchTotal.toLocaleString(undefined, { maximumFractionDigits: 12 });
+            document.getElementById('cpConfirmXchTotal').textContent = formatBootstrapCoinPrepAmount(xchTotal, 12);
             document.getElementById('cpConfirmCatCoins').textContent = String(catCoins);
             document.getElementById('cpConfirmCatSize').textContent = catRows.join(' · ');
-            document.getElementById('cpConfirmCatTotal').textContent = catTotal.toLocaleString(undefined, { maximumFractionDigits: catDecimals });
+            document.getElementById('cpConfirmCatTotal').textContent = formatBootstrapCoinPrepAmount(catTotal, catDecimals);
             document.getElementById('cpConfirmCatName').textContent = tokenName;
             return { buttonText: 'Yes, Prepare Exact Campaign Coins' };
         }

@@ -558,6 +558,16 @@ def test_live_settings_keeps_retired_sniper_control_out_of_accessibility_tree():
             + 120
         ]
     )
+    assert ".lc-manual-panel[hidden]" in html
+    assert (
+        "display: none !important"
+        in html[
+            html.index(".lc-manual-panel[hidden]") : html.index(
+                ".lc-manual-panel[hidden]"
+            )
+            + 120
+        ]
+    )
 
 
 def test_post_tibet_help_and_about_describe_provider_authority_truthfully():
@@ -572,6 +582,19 @@ def test_post_tibet_help_and_about_describe_provider_authority_truthfully():
     assert "historical TibetSwap data is retained as read-only history" in html
 
 
+def test_pnl_explains_v14_sage_only_fill_authority_truthfully():
+    html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "Observed and Probable activity remains non-economic until Sage confirms it."
+        in html
+    )
+    assert "Exact external fill proof is unavailable in v1.4." in html
+    assert "until Sage or exact dual-chain evidence confirms it" not in html
+
+
 def test_live_ui_does_not_poll_retired_tibetswap_endpoints():
     html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
         encoding="utf-8"
@@ -580,6 +603,17 @@ def test_live_ui_does_not_poll_retired_tibetswap_endpoints():
     assert "function pollAmmPrice" not in html
     assert "`${API_URL}/amm/price`" not in html
     assert "`${API_URL}/market/slippage`" not in html
+
+
+def test_live_cycle_log_uses_offer_book_language_not_retired_arb_gap():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "catalyst" / "bot_loop.py"
+    ).read_text(encoding="utf-8")
+    start = source.index('"cycle_start",')
+    cycle_log = source[start : start + 500]
+
+    assert "quote spread:" in cycle_log
+    assert "arb gap:" not in cycle_log
 
 
 def test_sage_fingerprint_start_tolerates_slow_busy_wallet_rpc():
