@@ -1294,8 +1294,10 @@ def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission
     retries = []
     events = []
     loop.offer_manager = SimpleNamespace(
-        cancel_offers=lambda ids, **kwargs: dispatches.append(tuple(ids))
-        or {trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids}
+        cancel_offers=lambda ids, **kwargs: (
+            dispatches.append(tuple(ids))
+            or {trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids}
+        )
     )
     loop._run_cancel_retry_pass = lambda: retries.append(True) or True
     monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
@@ -1323,9 +1325,7 @@ def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission
     assert second == 0
     assert dispatches == [("inner",)]
     assert retries == [True]
-    assert [event[1] for event in events] == [
-        "market_confidence_withdrawal_failed"
-    ]
+    assert [event[1] for event in events] == ["market_confidence_withdrawal_failed"]
     assert "1 failed" in events[0][2]
     assert events[0][3]["outcome_counts"] == {"CANCEL_FAILED": 1}
 
@@ -1362,9 +1362,7 @@ def test_market_withdrawal_reports_unknown_dispatch_once_as_unresolved(monkeypat
     assert loop._apply_market_withdrawal(decision) == 0
     assert loop._apply_market_withdrawal(decision) == 0
 
-    assert [event[1] for event in events] == [
-        "market_confidence_withdrawal_unresolved"
-    ]
+    assert [event[1] for event in events] == ["market_confidence_withdrawal_unresolved"]
     assert "1 unresolved" in events[0][2]
     assert events[0][3]["outcome_counts"] == {"CANCEL_UNKNOWN": 1}
 

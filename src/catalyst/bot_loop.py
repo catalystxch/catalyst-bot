@@ -1347,9 +1347,7 @@ class BotLoop:
         for trade_id in trade_ids:
             result = (results or {}).get(trade_id)
             outcome = (
-                str(result.get("outcome") or "").strip()
-                if type(result) is dict
-                else ""
+                str(result.get("outcome") or "").strip() if type(result) is dict else ""
             )
             outcome = outcome or "MISSING_RESULT"
             outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
@@ -1368,9 +1366,7 @@ class BotLoop:
             for outcome in {"CANCEL_CONFIRMED", "CANCEL_SUBMITTED_UNCONFIRMED"}
         )
         event_data = {
-            "reason_code": str(
-                getattr(decision, "reason_code", "MARKET_DEGRADED")
-            ),
+            "reason_code": str(getattr(decision, "reason_code", "MARKET_DEGRADED")),
             "trade_ids": trade_ids,
             "outcome_counts": outcome_counts,
         }
