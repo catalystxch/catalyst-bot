@@ -238,6 +238,9 @@ def test_cat_consolidation_journals_and_confirms_exact_post_view(monkeypatch):
     monkeypatch.setattr(
         manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
     )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
+    )
     owned_views = iter([pre_owned, post_owned])
     monkeypatch.setattr(
         manager,
@@ -323,6 +326,9 @@ def test_xch_pool_rebuild_journals_and_confirms_before_next_topup(monkeypatch):
     monkeypatch.setattr(manager, "_tx_fee_mojos", lambda: fee_mojos)
     monkeypatch.setattr(
         manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
+    )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
     )
     owned_views = iter([pre_owned, post_owned])
     monkeypatch.setattr(
@@ -585,6 +591,9 @@ def test_runtime_absorb_journals_and_confirms_exact_combined_output(monkeypatch)
     monkeypatch.setattr(manager, "_tx_fee_mojos", lambda: fee_mojos)
     monkeypatch.setattr(
         manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
+    )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
     )
     owned_views = iter([pre_owned, post_owned])
     monkeypatch.setattr(

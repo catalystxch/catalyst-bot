@@ -2194,6 +2194,11 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
             ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[],
+            ),
             patch.object(manager, "_record_topup_pool_refund"),
             patch.object(
                 manager,
@@ -2238,6 +2243,115 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self.assertEqual(second, "pending")
         combine.assert_called_once()
 
+    def test_recent_absorb_settlement_guard_is_per_wallet(self):
+        """Sage view rollback after an absorb must pause only that wallet."""
+        manager = self._make_manager()
+        manager._last_absorb_action_time = {"xch": 0.0, "cat": 1_000.0}
+
+        with patch.object(coin_manager.time, "time", return_value=1_120.0):
+            self.assertTrue(manager._topup_absorb_is_settling(is_cat=True))
+            self.assertFalse(manager._topup_absorb_is_settling(is_cat=False))
+
+        with patch.object(coin_manager.time, "time", return_value=1_181.0):
+            self.assertFalse(manager._topup_absorb_is_settling(is_cat=True))
+
+    def test_pending_absorb_is_not_treated_as_a_new_wallet_mutation(self):
+        """A debounced pending absorb must not starve the other wallet's top-up."""
+        manager = self._make_manager()
+
+        self.assertTrue(manager._topup_absorb_submitted_now(True))
+        self.assertFalse(
+            manager._topup_absorb_submitted_now(coin_manager._TOPUP_PENDING)
+        )
+        self.assertFalse(manager._topup_absorb_submitted_now(False))
+
+    def test_absorb_misfits_excludes_durably_protected_selectable_coins(self):
+        """Sage rollback views must not feed an old effect coin into top-up."""
+
+        manager = self._make_manager()
+        reserve_id = "0x" + "a3" * 32
+        protected_id = "0x" + "b3" * 32
+        safe_id = "0x" + "c3" * 32
+        output_id = "0x" + "d3" * 32
+        reserve = _record(reserve_id, 1_000_000_000)
+        protected = _record(protected_id, 200_000_000)
+        safe = _record(safe_id, 210_000_000)
+        inventory = {
+            "reserve": [reserve],
+            "small": [protected, safe],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+        }
+        tier_sizes = {
+            "inner": 500_000_000,
+            "mid": 250_000_000,
+            "outer": 125_000_000,
+            "extreme": 60_000_000,
+        }
+        free_result = {"confirmed_records": [reserve, protected, safe]}
+
+        def claimed_effect(_operation, callback, **_kwargs):
+            return coin_manager._PreparedWalletEffectReceipt(
+                result=callback(),
+                operation={"operation_id": "coin-prep:" + "e3" * 32},
+                dispatch_outcome="SUBMITTED",
+            )
+
+        with (
+            patch.object(coin_manager, "get_wallet_type", return_value="sage"),
+            patch.object(coin_manager, "_get_free_coins_rpc", return_value=free_result),
+            patch.object(manager, "_tx_fee_mojos", return_value=1),
+            patch.object(
+                manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[protected_id],
+                create=True,
+            ) as protected_query,
+            patch.object(manager, "_record_topup_pool_refund"),
+            patch.object(
+                manager,
+                "_get_owned_coin_amount_map",
+                side_effect=[
+                    {
+                        reserve_id: 1_000_000_000,
+                        protected_id: 200_000_000,
+                        safe_id: 210_000_000,
+                    },
+                    {output_id: 1_209_999_999},
+                ],
+            ),
+            patch.object(manager, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=claimed_effect,
+            ),
+            patch("database.set_setting", return_value=True),
+            patch(
+                "wallet.combine_coins",
+                return_value={
+                    "success": True,
+                    "transaction_id": "0xabsorbtx",
+                    "coin_spends": [{}, {}],
+                },
+            ) as combine,
+        ):
+            submitted = manager._absorb_misfits_to_reserve(
+                "XCH", 1, inventory, tier_sizes, is_cat=False
+            )
+
+        self.assertTrue(submitted)
+        protected_query.assert_called_once()
+        self.assertEqual(
+            combine.call_args.kwargs["coin_ids"],
+            [reserve_id, safe_id],
+        )
+
     def test_absorb_misfits_without_txid_and_no_pending_does_not_debounce_inputs(self):
         manager = self._make_manager()
         reserve_id = "0x" + "a2" * 32
@@ -2273,6 +2387,11 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             patch.object(manager, "_tx_fee_mojos", return_value=1),
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[],
             ),
             patch.object(
                 manager,
@@ -2483,6 +2602,73 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self.assertEqual(second, "pending")
         combine.assert_called_once()
 
+    def test_consolidate_coins_excludes_durably_protected_selectable_inputs(self):
+        """A Sage rollback view must not feed an old effect coin into combine."""
+
+        manager = self._make_manager()
+        safe_a = "0x" + "a4" * 32
+        protected = "0x" + "b4" * 32
+        safe_c = "0x" + "c4" * 32
+        output_id = "0x" + "d4" * 32
+
+        def claimed_effect(_operation, callback, **_kwargs):
+            return coin_manager._PreparedWalletEffectReceipt(
+                result=callback(),
+                operation={"operation_id": "coin-prep:" + "e4" * 32},
+                dispatch_outcome="SUBMITTED",
+            )
+
+        with (
+            patch.object(coin_manager, "get_wallet_type", return_value="sage"),
+            patch.object(manager, "_tx_fee_mojos", return_value=0),
+            patch.object(
+                manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[protected],
+            ) as protected_query,
+            patch.object(
+                coin_manager,
+                "authorize_wallet_effect_coin_ids",
+                side_effect=lambda ids: list(ids),
+            ),
+            patch.object(
+                manager,
+                "_get_owned_coin_amount_map",
+                side_effect=[
+                    {safe_a: 30, protected: 50, safe_c: 70},
+                    {output_id: 100},
+                ],
+            ),
+            patch.object(manager, "_confirm_runtime_topup_prep", return_value=True),
+            patch.object(
+                coin_manager,
+                "_run_claimed_wallet_effect",
+                side_effect=claimed_effect,
+            ),
+            patch(
+                "wallet.combine_coins",
+                return_value={
+                    "success": True,
+                    "transaction_id": "0xcombinetx",
+                    "coin_spends": [{}, {}],
+                },
+            ) as combine,
+        ):
+            result = manager._consolidate_coins(
+                "XCH-fees",
+                1,
+                150,
+                False,
+                source_coin_ids=[safe_a, protected, safe_c],
+            )
+
+        self.assertTrue(result)
+        protected_query.assert_called_once_with([safe_a, protected, safe_c])
+        combine.assert_called_once_with(coin_ids=[safe_a, safe_c], fee_mojos=0)
+
     def test_cat_consolidate_uses_exact_xch_fee_coin(self):
         manager = self._make_manager()
         source_ids = ["0x" + "11" * 32, "0x" + "22" * 32]
@@ -2504,6 +2690,11 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
             patch.object(manager.fee_pool, "reserve", return_value=fee_coin_id),
             patch.object(
                 manager, "_filter_out_protected_coin_ids", side_effect=lambda ids: ids
+            ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[],
             ),
             patch.object(
                 manager,
@@ -2706,6 +2897,72 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self.assertEqual(
             set(call.kwargs["source_coin_ids"]),
             {"0xreserve", "0xmida", "0xmidb"},
+        )
+
+    def test_pool_rebuild_plans_only_durably_authorized_excess_spares(self):
+        manager = self._make_manager()
+        protected_id = "0x" + "15" * 32
+        safe_a_id = "0x" + "25" * 32
+        safe_b_id = "0x" + "35" * 32
+        keep_id = "0x" + "45" * 32
+        protected = _record(protected_id, 400)
+        safe_a = _record(safe_a_id, 400)
+        safe_b = _record(safe_b_id, 400)
+        keep_mid = _record(keep_id, 400)
+        inventory = {
+            "reserve": [],
+            "small": [],
+            "inner": [],
+            "mid": [protected, safe_a, safe_b, keep_mid],
+            "outer": [],
+            "extreme": [],
+        }
+        fresh_result = {"confirmed_records": [protected, safe_a, safe_b, keep_mid]}
+
+        class _Conn:
+            def execute(self, *args, **kwargs):
+                return self
+
+            def fetchall(self):
+                return []
+
+        with (
+            patch.object(
+                coin_manager, "_get_free_coins_rpc", return_value=fresh_result
+            ),
+            patch.object(manager, "_configured_tier_sizes_xch", return_value={}),
+            patch.object(
+                coin_manager, "get_weighted_tier_prep_counts", return_value={"mid": 1}
+            ),
+            patch.object(
+                coin_manager,
+                "get_coin_reconciliation_protected_ids",
+                return_value=[protected_id],
+            ) as protected_query,
+            patch("database.get_connection", return_value=_Conn()),
+            patch.object(
+                manager, "_consolidate_coins", return_value=True
+            ) as consolidate,
+            patch.object(manager, "_record_topup_pool_refund"),
+        ):
+            result = manager._smart_topup_wallet(
+                "XCH-fees",
+                1,
+                inventory,
+                trading_size_mojos=350,
+                needed=2,
+                is_cat=False,
+                tier_is_empty=True,
+            )
+
+        self.assertEqual(result, "rebuild")
+        protected_query.assert_called_once()
+        consolidate.assert_called_once()
+        call = consolidate.call_args
+        self.assertEqual(call.args[:4], ("XCH-fees", 1, 800, False))
+        self.assertEqual(
+            set(call.kwargs["source_coin_ids"]),
+            {safe_a_id, safe_b_id},
         )
 
     def test_floor_priority_pool_rebuild_borrows_from_farther_spares(self):

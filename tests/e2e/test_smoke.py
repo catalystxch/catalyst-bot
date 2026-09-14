@@ -876,6 +876,37 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
+def test_smart_settings_snapshot_accepts_save_time_spread_floor_normalization(page):
+    """Save-time ladder-floor normalization must not falsely mark Smart Settings stale."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    is_dirty = page.evaluate(
+        """async () => {
+            const minEdge = document.getElementById('configMinEdgeBps');
+            const minSpread = document.getElementById('configMinSpreadBps');
+            minEdge.value = '10.1';
+            minSpread.value = '15.1';
+            markSmartSettingsApplied();
+            await new Promise(resolve => setTimeout(resolve, 0));
+
+            const config = {
+                min_edge_bps: 1010,
+                min_spread_bps: 1510,
+                max_spread_bps: 3000,
+            };
+            normalizeDynamicSpreadConfig(config);
+            return {
+                dirty: checkSmartSettingsDirty(),
+                minSpread: minSpread.value,
+            };
+        }"""
+    )
+
+    assert is_dirty == {"dirty": False, "minSpread": "15.15"}
+    expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
+
+
 def test_sparse_market_intel_sse_preserves_dashboard_competitor_count(page):
     """A sparse live orderbook push must not replace known competitors with zero."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

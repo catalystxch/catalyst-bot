@@ -11368,6 +11368,33 @@ def is_coin_reconciliation_protected(coin_id: str) -> bool:
     return bool(row["trade_id"] or normalized in _nonterminal_registry_coin_ids(conn))
 
 
+def get_coin_reconciliation_protected_ids(coin_ids: Any) -> List[str]:
+    """Return the exact subset fenced by durable wallet/offer authority.
+
+    Coin Prep plans from Sage's current selectable view.  A previously
+    submitted wallet effect can later expose one of its source coins again if
+    Sage rolls back an optimistic local transaction.  Such a coin must remain
+    unavailable to new planning until its original durable authority is
+    reconciled; otherwise the planner repeatedly selects a source that
+    :func:`claim_wallet_effect` is required to reject.
+
+    This bounded batch API gives planners the same protection decision used by
+    database mutations without opening the private SQL projection to callers.
+    """
+
+    if type(coin_ids) not in {list, tuple, set}:
+        raise ValueError("coin_ids must be a bounded collection")
+    if len(coin_ids) > 2048:
+        raise ValueError("coin reconciliation protection query exceeds hard limit")
+    normalized = sorted(
+        {norm_coin_id(_required_stability_text(value, "coin_id")) for value in coin_ids}
+    )
+    if not normalized:
+        return []
+    conn = get_connection()
+    return sorted(_batch_coin_terminal_mutation_protection(conn, normalized))
+
+
 def free_unreserved_locked_coin_for_reconciliation(coin_id: str) -> bool:
     """Release only legacy locked debris with no current registry owner.
 

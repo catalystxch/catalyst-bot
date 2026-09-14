@@ -333,6 +333,14 @@ def get_recoverable_coin_prep_operations(*args, **kwargs):
     return repository_call(*args, **kwargs)
 
 
+def get_coin_reconciliation_protected_ids(*args, **kwargs):
+    """Load durable coin fences without widening DB bootstrap coupling."""
+
+    from database import get_coin_reconciliation_protected_ids as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
 def prepare_coin_prep_operation(*args, **kwargs):
     """Load the Task 12 PREPARED API without widening DB bootstrap coupling."""
 
@@ -2216,12 +2224,14 @@ class CoinPrepWorker:
 
         from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
 
-        protected = set()
+        reserve_protected = set()
         if self._db_ready:
             for wallet_type in ("xch", "cat"):
                 for coin in get_reserve_coins(wallet_type) or []:
                     try:
-                        protected.add(self._canonical_coin_id(coin.get("coin_id")))
+                        reserve_protected.add(
+                            self._canonical_coin_id(coin.get("coin_id"))
+                        )
                     except (TypeError, ValueError):
                         continue
         snapshot = []
@@ -2233,6 +2243,22 @@ class CoinPrepWorker:
                 wallet_id, f"direct-batch-{asset}-selectable", selectable_only=True
             )
             if type(observed) is not list:
+                return None
+            try:
+                reconciliation_protected = {
+                    self._canonical_coin_id(coin_id)
+                    for coin_id in get_coin_reconciliation_protected_ids(
+                        [
+                            raw.get("coin_id") or raw.get("id")
+                            for raw in observed
+                            if raw.get("coin_id") or raw.get("id")
+                        ]
+                    )
+                }
+            except Exception as exc:
+                self.log(
+                    f"Direct batch could not prove its protected coin cohort: {exc}"
+                )
                 return None
             cohorts = {}
             for target in sorted(
@@ -2255,7 +2281,9 @@ class CoinPrepWorker:
                 amount = raw.get("amount_mojos", raw.get("amount"))
                 if type(amount) is not int or amount <= 0:
                     return None
-                is_protected = coin_id in protected
+                if coin_id in reconciliation_protected:
+                    continue
+                is_protected = coin_id in reserve_protected
                 cohort = cohorts.get(amount, [])
                 reusable = cohort.pop(0) if cohort and not is_protected else None
                 snapshot.append(
@@ -9637,6 +9665,11 @@ class CoinPrepWorker:
         next_progress_log_s = 30
         relay_rejection = None
         relay_rejected_at_s = None
+        normalized_transaction_id = (
+            str(transaction_id).strip().lower().removeprefix("0x")
+            if transaction_id
+            else ""
+        )
         while time.monotonic() - started_at < timeout_s:
             time.sleep(poll_interval_s)
             elapsed_s = int(time.monotonic() - started_at)
@@ -9665,7 +9698,36 @@ class CoinPrepWorker:
                         "Sage relay rejected submitted Coin Prep transaction "
                         f"{transaction_id}: {reason}"
                     )
-            observation = self._observe_coin_prep_post_effect(operation)
+            # Sage exposes optimistic owned/output views while an exact
+            # transaction is still pending.  Those views can later roll back,
+            # so they are not authoritative confirmation.  Require the exact
+            # submitted transaction to disappear from Sage's pending list
+            # before accepting the post-effect observation.  Unrelated pending
+            # transactions do not block this batch.
+            exact_transaction_absent = not normalized_transaction_id
+            if normalized_transaction_id:
+                try:
+                    pending_transactions = get_pending_transactions()
+                except Exception:
+                    pending_transactions = None
+                if isinstance(pending_transactions, list):
+                    pending_ids = {
+                        str(record.get("transaction_id") or record.get("id") or "")
+                        .strip()
+                        .lower()
+                        .removeprefix("0x")
+                        for record in pending_transactions
+                        if isinstance(record, dict)
+                    }
+                    exact_transaction_absent = (
+                        normalized_transaction_id not in pending_ids
+                    )
+
+            observation = (
+                self._observe_coin_prep_post_effect(operation)
+                if exact_transaction_absent
+                else None
+            )
             if type(observation) is dict:
                 if relay_rejection is not None:
                     observation = dict(observation)
@@ -9998,9 +10060,29 @@ class CoinPrepWorker:
                 )
             if any(len(purposes) != 1 for purposes in purposes_by_amount.values()):
                 return None
-            exact_amounts_match = len(new_coins) == len(outputs) and [
-                item["amount_mojos"] for item in new_coins
-            ] == [item["amount_mojos"] for item in outputs]
+            output_amounts = [item["amount_mojos"] for item in outputs]
+            exact_amounts_match = (
+                len(new_coins) == len(outputs)
+                and [item["amount_mojos"] for item in new_coins] == output_amounts
+            )
+            matched_new_coins = new_coins
+            if not exact_amounts_match:
+                # Sage can expose an unrelated transaction output only after the
+                # pre-effect snapshot even though both transactions confirmed in
+                # the same block.  Accept only a unique exact amount cohort for
+                # this operation; an extra coin with any target amount remains
+                # ambiguous and therefore fails closed.
+                target_amounts = set(output_amounts)
+                candidate_subset = [
+                    coin for coin in new_coins if coin["amount_mojos"] in target_amounts
+                ]
+                exact_amounts_match = (
+                    len(candidate_subset) == len(outputs)
+                    and [coin["amount_mojos"] for coin in candidate_subset]
+                    == output_amounts
+                )
+                if exact_amounts_match:
+                    matched_new_coins = candidate_subset
             if exact_amounts_match:
                 expected_outputs = [
                     {
@@ -10008,7 +10090,7 @@ class CoinPrepWorker:
                         "amount_mojos": coin["amount_mojos"],
                         "purpose": output["purpose"],
                     }
-                    for coin, output in zip(new_coins, outputs)
+                    for coin, output in zip(matched_new_coins, outputs)
                 ]
             else:
                 legacy_purpose = self._legacy_sage_even_split_recovery_purpose(

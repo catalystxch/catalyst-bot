@@ -1252,6 +1252,44 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     assert cancelled == ["inner", "mid"]
 
 
+def test_market_withdrawal_uses_sage_native_bulk_cancel_capacity(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatches = []
+
+    def cancel_offers(ids, **kwargs):
+        dispatches.append(tuple(ids))
+        return {trade_id: {"outcome": "CANCEL_CONFIRMED"} for trade_id in ids}
+
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=cancel_offers,
+        get_sage_bulk_cancel_capacity=lambda max_members: min(3, max_members),
+    )
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": f"inner-{index}", "tier": "inner"} for index in range(7)
+        ],
+        raising=False,
+    )
+
+    decision = SimpleNamespace(
+        cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_INNER"
+    )
+
+    assert loop._apply_market_withdrawal(decision) == 3
+    assert loop._apply_market_withdrawal(decision) == 3
+    assert loop._apply_market_withdrawal(decision) == 1
+    assert dispatches == [
+        ("inner-0", "inner-1", "inner-2"),
+        ("inner-3", "inner-4", "inner-5"),
+        ("inner-6",),
+    ]
+
+
 @pytest.mark.parametrize(
     "outcome",
     ["CANCEL_FAILED", "CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"],

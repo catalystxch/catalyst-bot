@@ -20809,6 +20809,22 @@
             return raw;
         }
 
+        function acceptSmartSettingsNormalization(id, previousValue) {
+            if (!_smartSettingsAppliedSnapshot) return;
+            const el = document.getElementById(id);
+            if (!el) return;
+            const previousNumeric = Number(previousValue);
+            const previousCanonical = el.type === 'number' && Number.isFinite(previousNumeric)
+                ? String(previousNumeric)
+                : String(previousValue ?? '');
+            // Only advance the baseline when the field still matched the
+            // Smart Settings result immediately before CATalyst normalized
+            // it. A genuine user edit must continue to show the stale banner.
+            if (_smartSettingsAppliedSnapshot[id] === previousCanonical) {
+                _smartSettingsAppliedSnapshot[id] = _readSmartWatchedValue(id);
+            }
+        }
+
         function snapshotSmartSettingsWatched() {
             const snap = {};
             for (const id of SMART_SETTINGS_WATCHED_INPUTS) {
@@ -34408,19 +34424,23 @@
             const requiredOuter = innerEdge > 0 ? Math.ceil(innerEdge * 1.5) : 0;
 
             if (requiredOuter > 0 && Number.isFinite(config.min_spread_bps) && config.min_spread_bps < requiredOuter) {
+                const previousMinSpread = document.getElementById('configMinSpreadBps')?.value;
                 config.min_spread_bps = requiredOuter;
                 const minSpreadInput = document.getElementById('configMinSpreadBps');
                 if (minSpreadInput) {
                     minSpreadInput.value = (requiredOuter / 100).toFixed(2).replace(/\.?0+$/, '');
+                    acceptSmartSettingsNormalization('configMinSpreadBps', previousMinSpread);
                 }
                 adjustments.push(`Min spread raised to ${(requiredOuter / 100).toFixed(2)}% to match the ladder floor.`);
             }
 
             if (requiredOuter > 0 && Number.isFinite(config.max_spread_bps) && config.max_spread_bps < requiredOuter) {
+                const previousMaxSpread = document.getElementById('configMaxSpreadBps')?.value;
                 config.max_spread_bps = requiredOuter;
                 const maxSpreadInput = document.getElementById('configMaxSpreadBps');
                 if (maxSpreadInput) {
                     maxSpreadInput.value = (requiredOuter / 100).toFixed(2).replace(/\.?0+$/, '');
+                    acceptSmartSettingsNormalization('configMaxSpreadBps', previousMaxSpread);
                 }
                 adjustments.push(`Max spread raised to ${(requiredOuter / 100).toFixed(2)}% to stay above the ladder floor.`);
             }
@@ -34430,10 +34450,12 @@
                 Number.isFinite(config.max_spread_bps) &&
                 config.max_spread_bps < config.min_spread_bps
             ) {
+                const previousMaxSpread = document.getElementById('configMaxSpreadBps')?.value;
                 config.max_spread_bps = config.min_spread_bps;
                 const maxSpreadInput = document.getElementById('configMaxSpreadBps');
                 if (maxSpreadInput) {
                     maxSpreadInput.value = (config.max_spread_bps / 100).toFixed(2).replace(/\.?0+$/, '');
+                    acceptSmartSettingsNormalization('configMaxSpreadBps', previousMaxSpread);
                 }
                 adjustments.push('Max spread was lifted to match min spread.');
             }

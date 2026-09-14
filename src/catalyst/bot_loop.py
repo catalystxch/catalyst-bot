@@ -1335,6 +1335,17 @@ class BotLoop:
             and str(row.get("trade_id") or "").strip()
             and str(row.get("trade_id") or "").strip() not in attempted_trade_ids
         ]
+        capacity_fn = getattr(self.offer_manager, "get_sage_bulk_cancel_capacity", None)
+        if (
+            trade_ids
+            and str(getattr(cfg, "WALLET_TYPE", "") or "").strip().lower() == "sage"
+            and callable(capacity_fn)
+        ):
+            try:
+                capacity = int(capacity_fn(len(trade_ids)))
+            except (TypeError, ValueError):
+                capacity = 1
+            trade_ids = trade_ids[: max(1, min(len(trade_ids), capacity))]
         if not trade_ids or not self._enter_runtime_effect_phase("cancel"):
             return 0
         results = self.offer_manager.cancel_offers(
