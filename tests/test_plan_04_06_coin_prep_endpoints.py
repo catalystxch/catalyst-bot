@@ -473,6 +473,9 @@ class TestCoinPrepVerify(_FlaskBase):
         self.assertEqual(body["bootstrap_campaign_revision"], 4)
         self.assertEqual(body["xch_needed_mojos"], 1_002_000_000_000)
         self.assertEqual(body["cat_needed_mojos"], 1_000_000)
+        self.assertEqual(body["xch_balance_mojos"], 2_000_000_000_000)
+        self.assertEqual(body["cat_balance_mojos"], 2_000_000)
+        self.assertTrue(body["balance_sufficient"])
         self.assertEqual(body["tiers"]["fees"]["needed"], 2)
         legacy_balance.assert_not_called()
         legacy_drift.assert_not_called()
@@ -747,6 +750,22 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
         self.assertEqual(resp.status_code, 401)
+
+    def test_bootstrap_trigger_does_not_expose_internal_exception_detail(self):
+        with patch.object(
+            coin_prep_blueprint,
+            "_active_bootstrap_coin_prep_worker_args",
+            side_effect=ValueError(
+                r"bootstrap_coin_prep_not_authorized:C:\Users\secret\trace.py"
+            ),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(body["error"], "bootstrap_coin_prep_not_authorized")
+        self.assertEqual(body["reason"], "bootstrap_coin_prep_not_authorized")
+        self.assertNotIn("secret", resp.get_data(as_text=True))
 
     def test_returns_200_immediately(self):
         # Trigger returns immediately; background thread spawns subprocess

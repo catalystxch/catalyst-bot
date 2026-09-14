@@ -261,6 +261,27 @@ def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
     return context["worker_args"] if context is not None else None
 
 
+def _bootstrap_coin_prep_public_error(exc: ValueError) -> str:
+    """Map internal bootstrap failures to stable, client-safe reason codes."""
+
+    internal_reason = str(exc)
+    if internal_reason == "bootstrap_campaign_authority_ambiguous":
+        return "bootstrap_campaign_authority_ambiguous"
+    if internal_reason == "bootstrap_coin_prep_confirmation_required":
+        return "bootstrap_coin_prep_confirmation_required"
+    if internal_reason == "bootstrap_wallet_identity_unavailable":
+        return "bootstrap_wallet_identity_unavailable"
+    if internal_reason == "bootstrap_xch_balance_unavailable":
+        return "bootstrap_xch_balance_unavailable"
+    if internal_reason == "bootstrap_cat_balance_unavailable":
+        return "bootstrap_cat_balance_unavailable"
+    if internal_reason == "bootstrap_network_fee_unavailable":
+        return "bootstrap_network_fee_unavailable"
+    if internal_reason.startswith("bootstrap_coin_prep_not_authorized:"):
+        return "bootstrap_coin_prep_not_authorized"
+    return "bootstrap_coin_prep_unavailable"
+
+
 def _wallet_open_offer_snapshot_before_prep() -> dict:
     """Return one complete, read-only view of every live wallet offer.
 
@@ -1718,9 +1739,15 @@ def api_coin_prep_verify():
         # Uses CONFIRMED (total) balance, NOT spendable, because coin prep's
         # first step is to cancel all existing offers — so locked coins WILL
         # become available during prep.
+        xch_balance_mojos = 0
+        cat_balance_mojos = 0
         if bootstrap_context is not None:
-            xch_balance_mojos = bootstrap_context["xch_balance_mojos"]
-            cat_balance_mojos = bootstrap_context["cat_balance_mojos"]
+            xch_balance_mojos = _safe_non_negative_int(
+                bootstrap_context["xch_balance_mojos"]
+            )
+            cat_balance_mojos = _safe_non_negative_int(
+                bootstrap_context["cat_balance_mojos"]
+            )
             with ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="bootstrap-prep-coins"
             ) as executor:
@@ -1742,8 +1769,6 @@ def api_coin_prep_verify():
                 WALLET_ID_XCH,
                 cat_wallet_id,
             )
-        xch_balance_mojos = 0
-        cat_balance_mojos = 0
         if (
             bootstrap_context is None
             and xch_bal_result
@@ -2165,7 +2190,7 @@ def _api_coin_prep_trigger_locked():
                 _prep_req_data
             )
         except ValueError as exc:
-            reason = str(exc)
+            reason = _bootstrap_coin_prep_public_error(exc)
             log_event(
                 "warning",
                 "bootstrap_coin_prep_blocked",
@@ -2175,7 +2200,7 @@ def _api_coin_prep_trigger_locked():
                 jsonify(
                     {
                         "success": False,
-                        "error": reason.split(":", 1)[0],
+                        "error": reason,
                         "reason": reason,
                     }
                 ),
