@@ -241,3 +241,31 @@ def test_smart_defaults_dbx_cap_runs_before_cat_budget_validation():
     assert source.index("DBX cap clamp") < source.index(
         "F65 FINAL SELL-SIDE CAT VERIFICATION"
     )
+
+
+def test_dbx_incentive_cap_is_not_offered_when_safe_spread_is_wider():
+    import api_server  # noqa: F401 - initialize blueprint dependencies first
+    from blueprints.smart_defaults import _dbx_cap_outcome
+
+    outcome = _dbx_cap_outcome(
+        pair_incentivized=True,
+        cap_bps=500,
+        required_spread_bps=2518,
+        requested=True,
+    )
+
+    assert outcome == {
+        "dbx_cap_feasible": False,
+        "dbx_cap_requested": True,
+        "dbx_cap_applied": False,
+        "dbx_cap_blocked_reason": (
+            "Safe offer-book policy requires a 25.2% spread, wider than "
+            "Dexie's 5.0% reward cap."
+        ),
+    }
+
+
+def test_frontend_only_prompts_for_a_feasible_dbx_incentive_cap():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "data.dbx_cap_feasible === true" in html

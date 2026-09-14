@@ -20033,7 +20033,8 @@
                 // of presenting a rewards choice that cannot be applied.
                 try {
                     const _dbxInfo = await _fetchDbxIncentiveInfo(selectedCAT.asset_id);
-                    if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0) {
+                    if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0
+                            && data.dbx_cap_feasible === true) {
                         const capPct = (_dbxInfo.max_spread_bps / 100).toFixed(1);
                         const aprPct = (_dbxInfo.estimated_apr * 100).toFixed(1);
                         const rewardToken = _dbxInfo.reward_token || 'DBX';
@@ -20601,6 +20602,17 @@
                         <div style="margin-top:3px;">Base <strong>${spreadPct}</strong> · Requote at <strong>${requotePct}</strong> · Auto-requote ${data.auto_requote ? '<span style="color:var(--success-200);">on</span>' : '<span style="color:var(--sell-color);">off</span>'}${data.dynamic_spread_enabled ? ' · Dynamic spreads <span style="color:var(--success-200);">on</span>' : ''}</div>
                     </div>` : '';
 
+                    const incentiveRow = data.pair_incentivized === true
+                            && data.dbx_cap_feasible === false
+                        ? `<div style="padding:7px 9px;border:1px solid rgba(251,191,36,0.35);border-radius:5px;background:rgba(251,191,36,0.08);color:var(--warning-200);">
+                               <strong>DBX reward cap not used.</strong> ${escapeHtml(data.dbx_cap_blocked_reason || 'The safe offer-book spread is wider than the current Dexie reward cap.')} Safety takes priority over incentive eligibility.
+                           </div>`
+                        : (data.dbx_cap_applied === true
+                            ? `<div style="padding:7px 9px;border:1px solid rgba(34,197,94,0.3);border-radius:5px;background:rgba(34,197,94,0.08);color:var(--success-200);">
+                                   <strong>DBX reward cap applied.</strong> The final safe spread remains reward-eligible.
+                               </div>`
+                            : '');
+
                     // A3: build "What changed" diff row
                     const _smartDiffAfter = snapshotSmartDiffFields();
                     const _diffParts = buildSmartDiff(_smartDiffBefore, _smartDiffAfter);
@@ -20621,7 +20633,7 @@
                     resultTitle.innerHTML = `\u2713 Smart Settings applied &nbsp;${qBadge}&nbsp;${profileBadge}`;
                     resultBody.innerHTML = `<div style="margin-bottom:8px;line-height:1.8;">${srcBadges}</div>
                         <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:8px;display:flex;flex-direction:column;gap:8px;">
-                            ${marketRow}${capitalRow}${ladderRow}${spreadRow}${diffRow}
+                            ${marketRow}${capitalRow}${ladderRow}${spreadRow}${incentiveRow}${diffRow}
                         </div>`;
                     resultBox.style.display = 'block';
 

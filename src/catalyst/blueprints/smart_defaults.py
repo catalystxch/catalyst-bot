@@ -740,6 +740,38 @@ def _smart_dbx_defaults(asset_id: str) -> dict:
     return out
 
 
+def _dbx_cap_outcome(
+    *,
+    pair_incentivized: bool | None,
+    cap_bps: int,
+    required_spread_bps: Decimal | int | float,
+    requested: bool,
+) -> dict:
+    """Describe whether Dexie's reward cap is compatible with safe pricing.
+
+    Incentive eligibility is never allowed to tighten the ladder below the
+    spread required by the attributable offer-book policy.  The frontend uses
+    this result to avoid offering a choice that the safety policy must undo.
+    """
+    cap = max(0, int(cap_bps or 0))
+    required = max(Decimal("0"), Decimal(str(required_spread_bps or 0)))
+    incentivized = pair_incentivized is True
+    feasible = incentivized and cap > 0 and required <= Decimal(cap)
+    reason = ""
+    if incentivized and cap > 0 and not feasible:
+        reason = (
+            f"Safe offer-book policy requires a {required / Decimal('100'):.1f}% "
+            f"spread, wider than Dexie's {Decimal(cap) / Decimal('100'):.1f}% "
+            "reward cap."
+        )
+    return {
+        "dbx_cap_feasible": feasible,
+        "dbx_cap_requested": requested is True,
+        "dbx_cap_applied": requested is True and feasible,
+        "dbx_cap_blocked_reason": reason,
+    }
+
+
 def _fetch_price_standalone(asset_id, decimals):
     """Lightweight price fetch when bot isn't running.
 
@@ -4013,7 +4045,8 @@ def _calculate_smart_defaults(
     # than the cap — otherwise the result already qualifies and we leave
     # everything alone. Keep this before F65 so the CAT budget verifier uses
     # the same final spread that gets returned to the GUI and worker.
-    _dbx_cap_meta = _smart_dbx_defaults(asset_id) if dbx_cap else None
+    _dbx_defaults = _smart_dbx_defaults(asset_id)
+    _dbx_cap_meta = _dbx_defaults if dbx_cap else None
     if dbx_cap and _dbx_cap_meta and _dbx_cap_meta.get("pair_incentivized"):
         _cap_bps = int(_dbx_cap_meta.get("dbx_max_spread_bps") or 0)
         if _cap_bps > 0:
@@ -4030,10 +4063,6 @@ def _calculate_smart_defaults(
             if _orig_base > _cap_bps and _orig_base > 0:
                 _scale = Decimal(str(_cap_bps)) / Decimal(str(_orig_base))
                 requote_bps = max(Decimal("25"), Decimal(str(requote_bps)) * _scale)
-            messages.append(
-                f"DBX cap applied: spread tightened to {_cap_bps / 100:.1f}% "
-                f"(from {_orig_base / 100:.1f}%) so all tiers stay reward-eligible"
-            )
 
     # ═══ F65 FINAL SELL-SIDE CAT VERIFICATION ═════════════════════════════
     # Belt-and-suspenders check: compute the EXACT coin-prep total using
@@ -4279,6 +4308,25 @@ def _calculate_smart_defaults(
             ),
         )
 
+    _dbx_cap_status = _dbx_cap_outcome(
+        pair_incentivized=_dbx_defaults.get("pair_incentivized"),
+        cap_bps=int(_dbx_defaults.get("dbx_max_spread_bps") or 0),
+        required_spread_bps=Decimal(str(base_spread_bps)),
+        requested=dbx_cap,
+    )
+    if _dbx_cap_status["dbx_cap_applied"]:
+        messages.append(
+            "DBX cap applied: the final safe spread remains inside Dexie's "
+            f"{Decimal(str(_dbx_defaults['dbx_max_spread_bps'])) / Decimal('100'):.1f}% "
+            "reward cap"
+        )
+    elif dbx_cap and _dbx_cap_status["dbx_cap_blocked_reason"]:
+        messages.append(
+            "DBX cap not applied: "
+            f"{_dbx_cap_status['dbx_cap_blocked_reason']} Safety takes priority "
+            "over incentive eligibility."
+        )
+
     _toxicity_defaults = _smart_toxicity_defaults(
         avail_xch=_avail_xch,
         avail_cat=_avail_cat,
@@ -4424,7 +4472,8 @@ def _calculate_smart_defaults(
         # actually publishes today, not the (broken) ticker-field check or a
         # hard-coded 5%.
         "competitor_aware_enabled": competitor_enabled,
-        **_smart_dbx_defaults(asset_id),
+        **_dbx_defaults,
+        **_dbx_cap_status,
         # Coin Prep (all market-derived)
         "coin_prep_multiplier": coin_prep_multiplier,
         "coin_prep_headroom_pct": coin_prep_headroom_pct,
