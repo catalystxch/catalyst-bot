@@ -867,6 +867,7 @@ class TestDashboard(_FlaskBase):
         bot.price_engine.get_last_price.return_value = (
             "0.0001318526026886049206032406980"
         )
+        bot._get_effective_offer_targets.return_value = {"buy": 11, "sell": 11}
 
         fake_stats = {
             "realised_pnl_xch": "0",
@@ -920,6 +921,8 @@ class TestDashboard(_FlaskBase):
         metrics = resp.get_json()["market_health"]["metrics"]
         self.assertEqual(metrics["our_best_bid"], str(live_edges["our_best_bid"]))
         self.assertEqual(metrics["our_best_ask"], str(live_edges["our_best_ask"]))
+        self.assertEqual(metrics["effective_buy_target"], 11)
+        self.assertEqual(metrics["effective_sell_target"], 11)
         expected_bps = (
             (live_edges["our_best_ask"] - live_edges["our_best_bid"])
             / api_server.Decimal(bot._bot_state["mid_price"])

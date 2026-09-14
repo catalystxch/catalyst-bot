@@ -809,6 +809,25 @@ def api_dashboard():
                     if getattr(bot, "_start_time", 0)
                     else 0
                 )
+
+                # The configured maxima are ceilings, not necessarily the live
+                # ladder targets. Follow mode can deliberately cap each side to
+                # the depth supported by current market confidence. Surface the
+                # same effective targets used by the bot so the dashboard does
+                # not falsely report a healthy confidence-capped book as still
+                # building toward the configured ceiling.
+                effective_targets = bot._get_effective_offer_targets(
+                    executable_mid,
+                    current_buy_count=live_open_buys,
+                    current_sell_count=live_open_sells,
+                )
+                metrics = market_health.setdefault("metrics", {})
+                metrics["effective_buy_target"] = max(
+                    0, int(effective_targets.get("buy", 0) or 0)
+                )
+                metrics["effective_sell_target"] = max(
+                    0, int(effective_targets.get("sell", 0) or 0)
+                )
             except Exception:
                 pass
 

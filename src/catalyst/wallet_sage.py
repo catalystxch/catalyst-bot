@@ -28,6 +28,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
+import glob
+import sys
 from collections import Counter
 from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal, ROUND_DOWN
@@ -45,6 +47,139 @@ from cancel_outcomes import (
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+_SAGE_RELAY_SUBMIT_RE = re.compile(
+    r"Submitting transaction with id ([0-9a-f]{64})(?::|\s)", re.IGNORECASE
+)
+_SAGE_RELAY_REJECT_RE = re.compile(
+    r'Transaction inclusion in mempool failed for all peers with status \d+ '
+    r'and error Some\("([A-Z][A-Z0-9_]{2,63})"\), removing transaction'
+)
+_SAGE_RELAY_SUCCESS = "Transaction inclusion in mempool successful"
+_MAX_SAGE_RELAY_LOG_BYTES = 2 * 1024 * 1024
+
+# Mainnet ConsensusConstants serialized by chia_rs 0.30.0. CATalyst's runtime
+# intentionally depends on chia_rs rather than the much larger chia-blockchain
+# package. Keeping the canonical streamable bytes here lets the packaged app
+# ask chia_rs for the exact mempool cost of a Sage-built unsigned bundle.
+_MAINNET_CONSENSUS_CONSTANTS_HEX = (
+    "000000201000000080400000000008000000000000000000000800000000000000000000"
+    "000000000007000000030000018000001200080400090520321c20025803000000780be3"
+    "b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855ccd5bb711"
+    "83532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbbbaf5d69c647c919"
+    "66170302d18521b0a85663433d161e72c826ed08677b53a74284fa2ef486c7a41cc29f"
+    "c99c9d08376161e93dd37817edb8219f42dca7592c4cda186a9cd030f7a130fae4500"
+    "5e81cae7a90e0fa205b75f6aebc0d598e0348e0f7d90dff0613e6901e24dae59f1e69"
+    "0f18b8f5fbdcf1bb192ac9deaf7de22ad585796bd90bb553c0430b87027ffee08d88aba"
+    "0162c6e1abbbcc6b583f2ae7f92ebfdae17b29d83bae476a25ea06f0c4bd57298faddb"
+    "bc3ec5ad29b9b86ce5dfd23da14695a188ae5708dd152263c4db883eb27edeb936178d"
+    "4d988b8f3ce5fc3d8765d3a597ec1d99663f6c9816d915b9f68613ac94009884c4adda"
+    "efcce6af400affffffffffffffff000000028fa6ae000000000000002ee002000003e800"
+    "00002000001400000f42400000020000000008c12278000053dcc0fffffffa0012000000"
+    "a0dbb000edea40013afcb802fffffffbfffffffcfffffffdfffffffeffffffff"
+)
+
+
+def _parse_transaction_relay_log_text(transaction_id: str, text: str) -> Dict[str, str]:
+    """Return Sage's terminal peer-relay outcome for one exact transaction.
+
+    Sage acknowledges ``submit_transaction`` before peer propagation finishes.
+    Its local log is the only currently exposed source for the later all-peer
+    rejection.  Terminal lines do not repeat the txid, so they are accepted
+    only inside the immediately preceding exact submission section.
+    """
+
+    safe_txid = str(transaction_id or "").strip().lower().removeprefix("0x")
+    if len(safe_txid) != 64 or re.fullmatch(r"[0-9a-f]{64}", safe_txid) is None:
+        return {"status": "unknown", "transaction_id": safe_txid}
+    if type(text) is not str:
+        return {"status": "unknown", "transaction_id": safe_txid}
+
+    active = False
+    outcome: Optional[Dict[str, str]] = None
+    for line in text.splitlines():
+        submitted = _SAGE_RELAY_SUBMIT_RE.search(line)
+        if submitted is not None:
+            active = submitted.group(1).lower() == safe_txid
+            continue
+        if not active:
+            continue
+        if _SAGE_RELAY_SUCCESS in line:
+            outcome = {"status": "accepted", "transaction_id": safe_txid}
+            active = False
+            continue
+        rejected = _SAGE_RELAY_REJECT_RE.search(line)
+        if rejected is not None:
+            outcome = {
+                "status": "rejected",
+                "transaction_id": safe_txid,
+                "reason_code": rejected.group(1),
+            }
+            active = False
+
+    if outcome is None:
+        return {"status": "unknown", "transaction_id": safe_txid}
+    outcome["evidence_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return outcome
+
+
+def _candidate_sage_relay_log_paths() -> List[str]:
+    """Find recent native Sage logs without importing UI/debug-bundle code."""
+
+    roots: List[str] = []
+    configured = str(getattr(cfg, "SAGE_DATA_DIR", "") or "").strip()
+    if configured:
+        roots.append(os.path.expandvars(os.path.expanduser(configured)))
+    if sys.platform == "win32":
+        for env_name in ("APPDATA", "LOCALAPPDATA"):
+            base = os.environ.get(env_name, "").strip()
+            if base:
+                roots.append(os.path.join(base, "com.rigidnetwork.sage"))
+    elif sys.platform == "darwin":
+        roots.extend(
+            [
+                os.path.expanduser("~/Library/Application Support/com.rigidnetwork.sage"),
+                os.path.expanduser("~/Library/Application Support/Sage"),
+            ]
+        )
+    else:
+        roots.extend(
+            [
+                os.path.expanduser("~/.config/com.rigidnetwork.sage"),
+                os.path.expanduser("~/.local/share/com.rigidnetwork.sage"),
+            ]
+        )
+
+    candidates: List[str] = []
+    for root in roots:
+        for directory in (root, os.path.join(root, "log"), os.path.join(root, "logs")):
+            candidates.extend(glob.glob(os.path.join(directory, "app.log*")))
+    unique = {os.path.normcase(os.path.realpath(path)): path for path in candidates if os.path.isfile(path)}
+    return sorted(unique.values(), key=lambda path: os.path.getmtime(path), reverse=True)[:4]
+
+
+def get_transaction_relay_outcome(transaction_id: str) -> Dict[str, str]:
+    """Read the newest exact native-Sage peer outcome for ``transaction_id``."""
+
+    safe_txid = str(transaction_id or "").strip().lower().removeprefix("0x")
+    unknown = {"status": "unknown", "transaction_id": safe_txid}
+    for path in _candidate_sage_relay_log_paths():
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as handle:
+                if size > _MAX_SAGE_RELAY_LOG_BYTES:
+                    handle.seek(-_MAX_SAGE_RELAY_LOG_BYTES, os.SEEK_END)
+                raw = handle.read(_MAX_SAGE_RELAY_LOG_BYTES)
+            text = raw.decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        result = _parse_transaction_relay_log_text(safe_txid, text)
+        if result.get("status") != "unknown":
+            result["source"] = "sage_native_log"
+            result["source_file"] = os.path.basename(path)
+            return result
+    return unknown
 
 
 def _console(msg: str, *, flush: bool = True) -> None:
@@ -2980,6 +3115,55 @@ def validate_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
         ).encode("utf-8")
     ).hexdigest()
     return sealed
+
+
+def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
+    """Return the exact mainnet mempool cost of a Sage unsigned transaction."""
+
+    if type(result) is not dict or type(result.get("coin_spends")) is not list:
+        return None
+    try:
+        from chia_rs import (
+            CoinSpend,
+            ConsensusConstants,
+            G2Element,
+            SpendBundle,
+            get_conditions_from_spendbundle,
+        )
+        from chia_rs.sized_ints import uint32
+
+        def prefixed_hex(value):
+            if isinstance(value, str) and not value.startswith("0x"):
+                return f"0x{value}"
+            return value
+
+        spends = []
+        for raw_spend in result["coin_spends"]:
+            if type(raw_spend) is not dict or type(raw_spend.get("coin")) is not dict:
+                return None
+            spend = dict(raw_spend)
+            coin = dict(spend["coin"])
+            coin["parent_coin_info"] = prefixed_hex(coin.get("parent_coin_info"))
+            coin["puzzle_hash"] = prefixed_hex(coin.get("puzzle_hash"))
+            spend["coin"] = coin
+            spend["puzzle_reveal"] = prefixed_hex(spend.get("puzzle_reveal"))
+            spend["solution"] = prefixed_hex(spend.get("solution"))
+            spends.append(CoinSpend.from_json_dict(spend))
+        if not spends:
+            return None
+        constants = ConsensusConstants.from_bytes(
+            bytes.fromhex(_MAINNET_CONSENSUS_CONSTANTS_HEX)
+        )
+        conditions = get_conditions_from_spendbundle(
+            SpendBundle(spends, G2Element()),
+            constants.MAX_BLOCK_COST_CLVM,
+            constants,
+            uint32(0xFFFFFFFF),
+        )
+        cost = int(conditions.cost)
+        return cost if cost > 0 else None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def submit_built_transaction_rpc(

@@ -42,6 +42,7 @@ from super_log import slog
 
 from wallet import (
     build_transaction_rpc,
+    estimate_unsigned_transaction_cost,
     get_all_offers,
     get_pending_transactions,
     get_wallet_sync_status,
@@ -95,6 +96,32 @@ _WORKER_DELEGATION_ENV_NAMES = (
     mutation_gate.DELEGATION_PARENT_EPOCH_ENV,
 )
 _worker_delegation_environment = None
+
+
+def get_transaction_relay_outcome(transaction_id: str) -> dict:
+    """Read optional native-wallet relay evidence without requiring adapters."""
+
+    try:
+        import wallet as wallet_facade
+
+        callback = getattr(wallet_facade, "get_transaction_relay_outcome", None)
+        if callable(callback):
+            result = callback(transaction_id)
+            if type(result) is dict:
+                return result
+    except Exception:
+        pass
+    return {"status": "unknown", "transaction_id": str(transaction_id or "")}
+
+
+def _relay_rejection_reason(value: dict) -> str:
+    if type(value) is not dict:
+        return "SAGE_RELAY_REJECTED"
+    return str(
+        value.get("error")
+        or value.get("reason_code")
+        or "SAGE_RELAY_REJECTED"
+    )
 
 
 def tier_requires_split(count: int) -> bool:
@@ -322,6 +349,26 @@ def record_coin_prep_operation_outcome(*args, **kwargs):
     """Load the Task 12 outcome API without widening DB bootstrap coupling."""
 
     from database import record_coin_prep_operation_outcome as repository_call
+
+    return repository_call(*args, **kwargs)
+
+
+def get_recoverable_legacy_sage_consolidations(*args, **kwargs):
+    """Load the narrow v1.3.21 XCH-combine recovery inventory."""
+
+    from database import (
+        get_recoverable_legacy_sage_consolidations as repository_call,
+    )
+
+    return repository_call(*args, **kwargs)
+
+
+def adopt_legacy_submitted_topup_coin_prep_operation(*args, **kwargs):
+    """Load the proof-bound legacy Task-12 adoption API."""
+
+    from database import (
+        adopt_legacy_submitted_topup_coin_prep_operation as repository_call,
+    )
 
     return repository_call(*args, **kwargs)
 
@@ -869,12 +916,23 @@ class CoinPrepWorker:
             # Prepared tier coins get extra headroom above the live offer size.
             # Per-side prep sizes are built from the per-side live sizes so
             # XCH coins are prepped at buy sizes and CAT coins at sell sizes.
+            # Fee coins are exact transaction-funding denominations rather
+            # than trade coins, so applying trade headroom to that tier would
+            # contradict FEE_COIN_SIZE_XCH and the Coin Prep preview.
             self.tier_xch_sizes_buy = {
-                tier_name: self._apply_prep_headroom_xch(size_xch)
+                tier_name: (
+                    size_xch
+                    if tier_name == get_fee_tier_name()
+                    else self._apply_prep_headroom_xch(size_xch)
+                )
                 for tier_name, size_xch in self.offer_tier_xch_sizes_buy.items()
             }
             self.tier_xch_sizes_sell = {
-                tier_name: self._apply_prep_headroom_xch(size_xch)
+                tier_name: (
+                    size_xch
+                    if tier_name == get_fee_tier_name()
+                    else self._apply_prep_headroom_xch(size_xch)
+                )
                 for tier_name, size_xch in self.offer_tier_xch_sizes_sell.items()
             }
             # Legacy `tier_xch_sizes` for back-compat — defaults to the
@@ -2281,6 +2339,56 @@ class CoinPrepWorker:
             actions.append({"type": "fee", "amount": str(target["fee_mojos"])})
         return actions
 
+    def _direct_batch_relay_safe_fee_mojos(self, plan) -> int:
+        """Scale an enabled Sage batch fee to its conservative CLVM cost.
+
+        Sage TEST 7 accepted a 43-action final-output split carrying the
+        configured 13,079,100-mojo fee, but every peer rejected it with
+        ``INVALID_FEE_TOO_CLOSE_TO_ZERO``.  Direct final-output batches vary
+        substantially in both input and CREATE_COIN counts, so a flat
+        standard-transaction fee is not a meaningful relay price.
+
+        The estimate deliberately uses conservative rounded costs and six
+        mojos per cost (one mojo above Chia's five-mojos-per-cost zero-fee
+        boundary).  An explicitly configured zero remains zero.
+        """
+
+        configured = max(0, int(self._tx_fee_mojos()))
+        if configured == 0:
+            return 0
+        source_count = max(1, len(tuple(plan.source_coin_ids)))
+        output_count = max(1, len(tuple(plan.outputs)))
+        xch_input_count = source_count if plan.asset == "xch" else 0
+        cat_input_count = source_count if plan.asset == "cat" else 0
+        if plan.fee_source_id:
+            xch_input_count += 1
+        estimated_cost = (
+            20_000_000
+            + (xch_input_count * 12_000_000)
+            + (cat_input_count * 31_000_000)
+            + (output_count * 2_000_000)
+        )
+        return max(configured, 100_000_000, estimated_cost * 6)
+
+    def _direct_batch_exact_relay_safe_fee_mojos(self, plan, address: str) -> int:
+        """Price a direct batch from Sage's exact unsigned spend bundle."""
+
+        if max(0, int(self._tx_fee_mojos())) == 0:
+            return 0
+        target = self._direct_batch_target_contract(plan, address)
+        selected_ids = list(plan.source_coin_ids)
+        if plan.fee_source_id:
+            selected_ids.append(plan.fee_source_id)
+        unsigned = build_transaction_rpc(
+            selected_ids, self._direct_batch_actions(target)
+        )
+        exact_cost = estimate_unsigned_transaction_cost(unsigned)
+        if type(exact_cost) is not int or exact_cost <= 0:
+            raise CoinPrepAuthorityUnresolved(
+                "direct batch mempool cost could not be proven before signing"
+            )
+        return max(plan.fee_mojos, exact_cost * 6)
+
     def _submit_direct_batch_plan(self, plan, address: str) -> bool:
         """Journal, validate, sign and reconcile one exact Sage batch."""
 
@@ -2441,9 +2549,17 @@ class CoinPrepWorker:
                 with self.status_lock:
                     self.status.compatibility_reason = compatibility_reason
             return False
+        transaction_id = None
+        if type(result) is dict:
+            transaction_id = result.get("transaction_id") or result.get("tx_id")
+            if not transaction_id and type(result.get("result")) is dict:
+                transaction_id = result["result"].get("transaction_id") or result[
+                    "result"
+                ].get("tx_id")
         started = time.monotonic()
         observation = self._wait_for_coin_prep_post_effect(
             prepared,
+            transaction_id=transaction_id,
             timeout_s=self._submitted_split_verify_timeout_seconds(),
             poll_interval_s=5,
         )
@@ -2452,6 +2568,50 @@ class CoinPrepWorker:
         if type(observation) is not dict:
             raise CoinPrepAuthorityUnresolved(
                 "submitted direct batch remained unresolved; coin prep stopped without replay"
+            )
+        relay_rejection = observation.get("relay_rejection")
+        no_effect_view = observation.get("no_effect_view")
+        if type(no_effect_view) is dict:
+            reason = (
+                _relay_rejection_reason(relay_rejection)
+                if type(relay_rejection) is dict
+                else "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
+            )
+            record_coin_prep_operation_outcome(
+                prepared["operation_id"],
+                outcome="FAILED",
+                evidence_json={
+                    "reason_code": "AUTHORITATIVE_NO_EFFECT_CONFIRMED",
+                    "relay_rejection_reason": reason,
+                    "relay_rejection": relay_rejection,
+                    "effect_claim_token": prepared["effect_claim_token"],
+                    "effect_claim_generation": prepared["effect_claim_generation"],
+                    "dispatch_outcome": "RELEASED_NO_EFFECT",
+                    "effect_attempted": False,
+                    "source_coin_ids": list(plan.source_coin_ids),
+                    "fee_coin_ids": fee_coin_ids,
+                    "authoritative_view": no_effect_view,
+                    "expected_wallet_identity": json.loads(
+                        prepared["wallet_identity_json"]
+                    ),
+                },
+            )
+            self.log(
+                "Sage relay rejection was reconciled with an authoritative "
+                f"no-effect wallet view ({reason})"
+            )
+            return False
+        if type(relay_rejection) is dict:
+            reason = _relay_rejection_reason(relay_rejection)
+            message = (
+                "Sage relay rejected the Coin Prep transaction; exact source "
+                "unlock is still being reconciled"
+            )
+            error = f"SAGE_RELAY_REJECTED: {reason}"
+            self.log(error)
+            self.update_status(PrepPhase.ERROR, 0.99, message, error=error)
+            raise CoinPrepAuthorityUnresolved(
+                f"Sage relay rejected direct batch ({reason}); exact source unlock remains unresolved"
             )
         return self._verify_authoritative_post_operation_view(
             operation_id=prepared["operation_id"],
@@ -2518,6 +2678,49 @@ class CoinPrepWorker:
                 self.status.compatibility_reason = "DIRECT_BATCH_SNAPSHOT_UNAVAILABLE"
                 return False
             plan = plan_batch(snapshot, targets, constraints)
+            # Replan against the same authoritative snapshot when the
+            # transaction's actual input/output shape requires more than the
+            # configured standard-transaction fee.  Increasing monotonically
+            # avoids oscillation if the larger fee changes the selected source
+            # or removes a change output.
+            fee_converged = False
+            for _fee_pass in range(4):
+                if not isinstance(plan, BatchPlan) or not plan.transaction_required:
+                    fee_converged = True
+                    break
+                relay_safe_fee = max(
+                    plan.fee_mojos,
+                    self._direct_batch_relay_safe_fee_mojos(plan),
+                    self._direct_batch_exact_relay_safe_fee_mojos(plan, address),
+                )
+                if relay_safe_fee == plan.fee_mojos:
+                    fee_converged = True
+                    break
+                self.log(
+                    "Direct Sage batch fee scaled for relay safety: "
+                    f"{plan.fee_mojos:,} -> {relay_safe_fee:,} mojos "
+                    f"({len(plan.source_coin_ids)} asset inputs, "
+                    f"{1 if plan.fee_source_id else 0} fee inputs, "
+                    f"{len(plan.outputs)} outputs)"
+                )
+                scaled_constraints = BatchConstraints(
+                    reserve_floors=constraints.reserve_floors,
+                    fee_mojos=relay_safe_fee,
+                    max_asset_inputs=constraints.max_asset_inputs,
+                    max_outputs=constraints.max_outputs,
+                    allow_bounded_prerequisite=(
+                        constraints.allow_bounded_prerequisite
+                    ),
+                )
+                plan = plan_batch(snapshot, targets, scaled_constraints)
+            if (
+                not fee_converged
+                and isinstance(plan, BatchPlan)
+                and plan.transaction_required
+            ):
+                raise CoinPrepAuthorityUnresolved(
+                    "direct batch fee did not converge before the bounded signing gate"
+                )
             if isinstance(plan, BatchRefusal):
                 if effects_confirmed:
                     raise CoinPrepAuthorityUnresolved(
@@ -9430,6 +9633,7 @@ class CoinPrepWorker:
         self,
         operation: dict,
         *,
+        transaction_id: str | None = None,
         timeout_s: int,
         poll_interval_s: int,
     ):
@@ -9437,6 +9641,8 @@ class CoinPrepWorker:
 
         started_at = time.monotonic()
         next_progress_log_s = 30
+        relay_rejection = None
+        relay_rejected_at_s = None
         while time.monotonic() - started_at < timeout_s:
             time.sleep(poll_interval_s)
             elapsed_s = int(time.monotonic() - started_at)
@@ -9446,10 +9652,38 @@ class CoinPrepWorker:
             # progress during a slow Sage/network confirmation instead of
             # appearing frozen at the first observed value.
             self.update_status()
+            if transaction_id and relay_rejection is None:
+                relay_outcome = get_transaction_relay_outcome(transaction_id)
+                if (
+                    type(relay_outcome) is dict
+                    and relay_outcome.get("status") == "rejected"
+                ):
+                    relay_rejection = dict(relay_outcome)
+                    relay_rejected_at_s = elapsed_s
+                    reason = _relay_rejection_reason(relay_rejection)
+                    with self.status_lock:
+                        self.status.message = (
+                            "Sage relay rejected Coin Prep ("
+                            f"{reason}); proving exact source unlock before stopping"
+                        )
+                    self.update_status()
+                    self.log(
+                        "Sage relay rejected submitted Coin Prep transaction "
+                        f"{transaction_id}: {reason}"
+                    )
             observation = self._observe_coin_prep_post_effect(operation)
             if type(observation) is dict:
+                if relay_rejection is not None:
+                    observation = dict(observation)
+                    observation["relay_rejection"] = relay_rejection
                 return observation
-            if elapsed_s >= next_progress_log_s:
+            if (
+                relay_rejection is not None
+                and relay_rejected_at_s is not None
+                and elapsed_s - relay_rejected_at_s >= min(60, timeout_s)
+            ):
+                return {"relay_rejection": relay_rejection}
+            if relay_rejection is None and elapsed_s >= next_progress_log_s:
                 self.log(
                     "      Waiting for authoritative confirmation of submitted "
                     f"split ({elapsed_s}s)"
@@ -11127,20 +11361,225 @@ def _run_sage_rpc_smoke() -> int:
         return 1
 
 
-def recover_coin_prep_operations_at_startup() -> bool:
-    """Resolve prior prep effects from exact wallet observations, never replay."""
+def _recover_legacy_sage_consolidation(worker: CoinPrepWorker) -> bool:
+    """Adopt one exact v1.3.21 XCH combine from read-only wallet proof.
+
+    This never calls a wallet mutation.  It requires two fresh, consistent
+    Sage identity snapshots, no pending transactions, confirmed disappearance
+    of every exact input, and one uniquely matching confirmed output that was
+    first recorded only after the durable dispatch.
+    """
 
     try:
-        if not get_recoverable_coin_prep_operations():
+        candidates = get_recoverable_legacy_sage_consolidations()
+        if not candidates:
             return False
+        if len(candidates) != 1 or worker.is_sage is not True:
+            return False
+        candidate = candidates[0]
+        first = get_wallet_identity()
+        required = {
+            "success",
+            "backend",
+            "name",
+            "fingerprint",
+            "network_id",
+            "kind",
+            "has_secrets",
+            "observed_at_utc",
+        }
+        if type(first) is not dict or not required.issubset(first):
+            return False
+        if (
+            first["success"] is not True
+            or first["backend"] != "sage"
+            or type(first["name"]) is not str
+            or not first["name"].strip()
+            or type(first["fingerprint"]) is not int
+            or type(first["network_id"]) is not str
+            or type(first["kind"]) is not str
+            or first["has_secrets"] is not True
+            or type(first["observed_at_utc"]) is not str
+        ):
+            return False
+        from config import cfg
+
+        maximum_age = getattr(cfg, "WALLET_IDENTITY_MAX_AGE_SECONDS", 30)
+        binding = mutation_gate.WalletIdentityBinding(
+            backend="sage",
+            name=first["name"],
+            fingerprint=first["fingerprint"],
+            network_id=first["network_id"],
+            kind=first["kind"],
+            has_secrets=True,
+            bound_at_utc=first["observed_at_utc"],
+            maximum_age_seconds=maximum_age,
+        )
+        if (
+            mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+            != candidate["wallet_fingerprint_hash"]
+            or binding.network_id != str(candidate["network"]).lower()
+        ):
+            return False
+        identity_decision = {"allowed": False, "reason": "identity_unobserved"}
+        for attempt in range(3):
+            second = get_wallet_identity()
+            if type(second) is not dict or second.get("success") is not True:
+                return False
+            identity_decision = mutation_gate.validate_wallet_identity(binding, second)
+            if identity_decision.get("allowed") is True:
+                break
+            if identity_decision.get("reason") != "WALLET_IDENTITY_STALE":
+                return False
+            if attempt < 2:
+                time.sleep(0.002)
+        if identity_decision.get("allowed") is not True:
+            return False
+        pending = get_pending_transactions()
+        if type(pending) is not list or pending:
+            return False
+        observed = worker._get_confirmed_owned_coins_via_rpc(
+            worker.xch_wallet_id, "legacy-v13121-xch-consolidation-recovery"
+        )
+        if type(observed) is not list:
+            return False
+        by_id = {}
+        for coin in observed:
+            if type(coin) is not dict:
+                return False
+            coin_id = worker._canonical_coin_id(coin.get("coin_id") or coin.get("id"))
+            amount = coin.get("amount_mojos", coin.get("amount"))
+            if (
+                not coin_id
+                or type(amount) is not int
+                or amount <= 0
+                or coin_id in by_id
+            ):
+                return False
+            by_id[coin_id] = amount
+        sources = sorted(
+            worker._canonical_coin_id(value)
+            for value in candidate["source_coin_ids"]
+        )
+        fees = sorted(
+            worker._canonical_coin_id(value) for value in candidate["fee_coin_ids"]
+        )
+        if len(sources) < 2 or sources != fees or set(sources).intersection(by_id):
+            return False
+        fee_mojos = get_effective_transaction_fee_mojos()
+        source_amount = candidate["source_amount_mojos"]
+        if (
+            type(fee_mojos) is not int
+            or fee_mojos <= 0
+            or type(source_amount) is not int
+            or source_amount <= fee_mojos
+        ):
+            return False
+        expected_amount = source_amount - fee_mojos
+        def _stored_utc(value: str) -> datetime:
+            if type(value) is not str:
+                raise ValueError("legacy recovery timestamp must be text")
+            text = value.strip().replace(" ", "T", 1)
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+        dispatched_at = _stored_utc(candidate["dispatched_at"])
+        durable_outputs = {}
+        for item in candidate["output_candidates"]:
+            if (
+                type(item) is not dict
+                or type(item.get("coin_id")) is not str
+                or type(item.get("amount_mojos")) is not int
+                or item["amount_mojos"] != expected_amount
+                or _stored_utc(item.get("first_seen")) <= dispatched_at
+            ):
+                continue
+            durable_outputs[worker._canonical_coin_id(item["coin_id"])] = item
+        matching = sorted(
+            coin_id
+            for coin_id, item in durable_outputs.items()
+            if by_id.get(coin_id) == item["amount_mojos"]
+        )
+        if len(matching) != 1:
+            return False
+        output = {
+            "coin_id": matching[0],
+            "amount_mojos": expected_amount,
+            "purpose": "top_up",
+        }
+        identity = mutation_gate.wallet_identity_binding_payload(binding)
+        observed_text = identity_decision["observed_at_utc"]
+        observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
+        expires_at = observed_at + timedelta(seconds=binding.maximum_age_seconds)
+        authoritative_view = {
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": identity,
+            "observed_at": observed_text,
+            "expires_at": expires_at.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+            "coins": [output],
+        }
+        adopted = adopt_legacy_submitted_topup_coin_prep_operation(
+            operation_kind="combine",
+            purpose="top_up",
+            source_coin_ids=sources,
+            target_contract={
+                "wallet_type": "xch",
+                "outputs": [
+                    {
+                        "output_index": 0,
+                        "amount_mojos": expected_amount,
+                        "purpose": "top_up",
+                    }
+                ],
+            },
+            wallet_identity_json=identity,
+            evidence_json={
+                "pre_view_coin_ids": sources,
+                "fee_reconciliation": {
+                    "source_coin_ids": fees,
+                    "expected_outputs": [output],
+                    "authoritative_view": authoritative_view,
+                },
+            },
+            effect_claim_token=candidate["claim_token"],
+            effect_claim_generation=candidate["generation"],
+        )
+        operation_id = adopted["operation"]["operation_id"]
+        record_coin_prep_operation_outcome(
+            operation_id,
+            outcome="CONFIRMED",
+            evidence_json={
+                "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+                "effect_claim_token": candidate["claim_token"],
+                "effect_claim_generation": candidate["generation"],
+                "source_coin_ids": sources,
+                "expected_outputs": [output],
+                "authoritative_view": authoritative_view,
+                "expected_wallet_identity": identity,
+            },
+        )
+        worker.log(
+            "Recovered v1.3.21 unjournaled Sage XCH consolidation from exact "
+            "confirmed wallet evidence; no wallet action was replayed"
+        )
+        return True
     except Exception as exc:
-        slog(
-            "COIN_PREP",
-            "Startup coin-prep recovery inventory was unavailable",
-            {"error_type": type(exc).__name__},
-            level="warning",
+        worker.log(
+            "Legacy v1.3.21 Sage XCH consolidation remains unresolved: "
+            f"{type(exc).__name__}"
         )
         return False
+
+
+def recover_coin_prep_operations_at_startup() -> bool:
+    """Resolve prior prep effects from exact wallet observations, never replay."""
 
     worker = CoinPrepWorker.__new__(CoinPrepWorker)
     worker.wallet_type = os.getenv("WALLET_TYPE", "sage").lower().strip()
@@ -11162,6 +11601,18 @@ def recover_coin_prep_operations_at_startup() -> bool:
 
     worker.log = _recovery_log
     worker.update_status = lambda *_args, **_kwargs: None
+    legacy_recovered = _recover_legacy_sage_consolidation(worker)
+    try:
+        if not get_recoverable_coin_prep_operations():
+            return legacy_recovered
+    except Exception as exc:
+        slog(
+            "COIN_PREP",
+            "Startup coin-prep recovery inventory was unavailable",
+            {"error_type": type(exc).__name__},
+            level="warning",
+        )
+        return False
     try:
         return worker._recover_coin_prep_operations_read_only(
             worker._observe_recoverable_coin_prep_operation

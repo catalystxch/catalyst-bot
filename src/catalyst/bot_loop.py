@@ -4877,6 +4877,34 @@ class BotLoop:
             }
             sell_counts = dict(buy_counts)
 
+        # The configured tier counts describe the full ladder ceiling, but
+        # inventory and market-confidence controls can deliberately cap the
+        # live book below that ceiling.  Audit the effective live target that
+        # CoinManager received from this cycle; otherwise a healthy capped
+        # ladder accumulates a false persistent count-mismatch warning.
+        def _counts_for_live_target(tier_counts, target):
+            remaining = max(0, int(target or 0))
+            capped = {}
+            for tier in ("inner", "mid", "outer", "extreme"):
+                configured = max(0, int(tier_counts.get(tier, 0) or 0))
+                capped[tier] = min(configured, remaining)
+                remaining -= capped[tier]
+            return capped
+
+        try:
+            live_targets = self.coin_manager._get_live_offer_targets()
+            if isinstance(live_targets, dict):
+                buy_counts = _counts_for_live_target(
+                    buy_counts, live_targets.get("buy", sum(buy_counts.values()))
+                )
+                sell_counts = _counts_for_live_target(
+                    sell_counts, live_targets.get("sell", sum(sell_counts.values()))
+                )
+        except Exception:
+            # If the current target snapshot is unavailable, retain the
+            # configured counts so the watchdog continues to fail visibly.
+            pass
+
         # Wallet + inventory totals (for the invariant checks).
         # Snapshot under the coin_manager lock to avoid torn reads while
         # coin_manager is mid-update on another thread.
@@ -13897,6 +13925,24 @@ class BotLoop:
         2. needs_topup() — FREE coins low → lightweight split
         3. check_runtime_health() — every 5 loops, independent free coin check
         """
+        try:
+            mid_price = Decimal(str(self._current_mid_price or "0"))
+            live_targets = self._get_effective_offer_targets(
+                mid_price,
+                current_buy_count=active_buy_count,
+                current_sell_count=active_sell_count,
+            )
+            self.coin_manager.set_live_offer_targets(
+                buy=int(live_targets.get("buy", 0) or 0),
+                sell=int(live_targets.get("sell", 0) or 0),
+            )
+        except Exception as target_err:
+            log_event(
+                "debug",
+                "coin_live_target_sync_failed",
+                f"Could not sync effective offer targets into coin health: {target_err}",
+            )
+
         if not allow_legacy_topup:
             status = self.coin_manager.check_coin_prep_status()
             if status.get("cancelled_ids"):

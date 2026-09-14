@@ -3119,6 +3119,178 @@ def test_submitted_legacy_runtime_absorb_can_be_adopted_with_exact_output_proof(
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
+def test_submitted_legacy_xch_consolidation_can_be_adopted_with_exact_output_proof(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    """Recover v1.3.21's unjournaled XCH combine without replaying it."""
+
+    import mutation_gate
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    sources = [
+        hashlib.sha256(b"legacy-xch-consolidate-a").hexdigest(),
+        hashlib.sha256(b"legacy-xch-consolidate-b").hexdigest(),
+    ]
+    combined = hashlib.sha256(b"legacy-xch-consolidate-output").hexdigest()
+    assert database.upsert_coin(sources[0], "xch", 1000, purpose="top_up")
+    assert database.upsert_coin(sources[1], "xch", 200, purpose="replacement")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.consolidate_sage",
+        source_coin_ids=sources,
+        fee_coin_ids=sources,
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=sources,
+        fee_coin_ids=sources,
+        dispatched_at=AT,
+    )
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=True, success=True
+        )
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch, result=result, resolved_at=AT
+        )
+        == "SUBMITTED"
+    )
+
+    identity = mutation_gate.wallet_identity_binding_payload(
+        runtime._wallet_identity_binding
+    )
+    expected_outputs = [
+        {"coin_id": combined, "amount_mojos": 1187, "purpose": "top_up"}
+    ]
+    authoritative_view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-20T12:00:00.000000Z",
+        "expires_at": "2026-08-20T12:00:15.000000Z",
+        "coins": expected_outputs,
+    }
+    adopted = database.adopt_legacy_submitted_topup_coin_prep_operation(
+        operation_kind="combine",
+        purpose="top_up",
+        source_coin_ids=sources,
+        target_contract={
+            "wallet_type": "xch",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 1187,
+                    "purpose": "top_up",
+                }
+            ],
+        },
+        wallet_identity_json=identity,
+        evidence_json={
+            "pre_view_coin_ids": sources,
+            "fee_reconciliation": {
+                "source_coin_ids": sources,
+                "expected_outputs": expected_outputs,
+                "authoritative_view": authoritative_view,
+            },
+        },
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    assert adopted["operation"]["outcome"] == "SUBMITTED_UNKNOWN"
+
+    confirmed = database.record_coin_prep_operation_outcome(
+        adopted["operation"]["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+            "effect_claim_token": claim["claim_token"],
+            "effect_claim_generation": claim["generation"],
+            "source_coin_ids": sources,
+            "expected_outputs": expected_outputs,
+            "authoritative_view": authoritative_view,
+            "expected_wallet_identity": identity,
+        },
+    )
+    assert confirmed["operation"]["outcome"] == "CONFIRMED"
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_legacy_xch_consolidation_inventory_is_exact_and_bounded(
+    active_wallet_effect_runtime,
+    monkeypatch,
+):
+    """Expose only the precise v1.3.21 unjournaled XCH combine for recovery."""
+
+    runtime, _clock, _wallet_hash = active_wallet_effect_runtime
+    sources = [
+        hashlib.sha256(b"inventory-xch-consolidate-a").hexdigest(),
+        hashlib.sha256(b"inventory-xch-consolidate-b").hexdigest(),
+    ]
+    output = hashlib.sha256(b"inventory-xch-consolidate-output").hexdigest()
+    assert database.upsert_coin(sources[0], "xch", 1000, purpose="top_up")
+    assert database.upsert_coin(sources[1], "xch", 200, purpose="replacement")
+    claim = database.claim_wallet_effect(
+        operation_id="coin_manager.consolidate_sage",
+        source_coin_ids=sources,
+        fee_coin_ids=sources,
+    )
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=claim["operation_id"],
+        source_coin_ids=sources,
+        fee_coin_ids=sources,
+        dispatched_at=AT,
+    )
+    with database.wallet_effect_adapter_dispatch_authority(dispatch):
+        result = _wallet_effect_real_facade_result(
+            runtime, monkeypatch, attempted=True, success=True
+        )
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch, result=result, resolved_at=AT
+        )
+        == "SUBMITTED"
+    )
+    monkeypatch.setattr(database, "_now", lambda: AFTER)
+    assert database.upsert_coin(output, "xch", 1187, purpose=None)
+    output_row = database.get_connection().execute(
+        "SELECT coin_id, wallet_type, amount_mojos, status, trade_id, first_seen "
+        "FROM coins WHERE coin_id=?",
+        (database.norm_coin_id(output),),
+    ).fetchone()
+    assert dict(output_row) == {
+        "coin_id": database.norm_coin_id(output),
+        "wallet_type": "xch",
+        "amount_mojos": 1187,
+        "status": "free",
+        "trade_id": None,
+        "first_seen": AFTER,
+    }
+
+    candidates = database.get_recoverable_legacy_sage_consolidations(limit=2)
+
+    assert len(candidates) == 1
+    assert candidates[0]["claim_token"] == claim["claim_token"]
+    assert candidates[0]["source_coin_ids"] == sorted(
+        database.norm_coin_id(value) for value in sources
+    )
+    assert candidates[0]["fee_coin_ids"] == sorted(
+        database.norm_coin_id(value) for value in sources
+    )
+    assert candidates[0]["source_amount_mojos"] == 1200
+    assert candidates[0]["output_candidates"] == [
+        {
+            "coin_id": database.norm_coin_id(output),
+            "amount_mojos": 1187,
+            "first_seen": AFTER,
+        }
+    ]
+
+
 def test_submitted_legacy_cat_consolidation_can_be_adopted_with_separate_fee_proof(
     active_wallet_effect_runtime,
     monkeypatch,

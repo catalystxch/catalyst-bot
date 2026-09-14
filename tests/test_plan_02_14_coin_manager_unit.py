@@ -489,6 +489,20 @@ class TestFeeCoinPool(unittest.TestCase):
         pool.reserve()
         self.assertEqual(pool.total_count, 2)
 
+    def test_reserve_minimum_amount_skips_undersized_fee_coins(self):
+        pool = FeeCoinPool()
+        pool.refresh(
+            [
+                self._rec("a" * 64, 700_000_000),
+                self._rec("b" * 64, 1_120_000_000),
+            ]
+        )
+
+        self.assertEqual(
+            pool.reserve(minimum_amount_mojos=1_000_000_000), "0x" + "b" * 64
+        )
+        self.assertEqual(pool.largest_available_amount, 700_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

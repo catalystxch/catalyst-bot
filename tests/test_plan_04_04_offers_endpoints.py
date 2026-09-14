@@ -190,6 +190,22 @@ def test_cancel_all_deadline_bounds_bulk_proof_recording_without_multi_hour_wait
     assert offers._cancel_all_deadline_seconds(71, 90) == 880.0
     assert offers._cancel_all_deadline_seconds(500, 90) == 3_600.0
     assert offers._cancel_all_deadline_seconds(1, 240) == 480.0
+    assert (
+        offers._cancel_all_deadline_seconds(22, 90, batch_count=6) == 1_290.0
+    )
+
+
+def test_cancel_all_balances_fee_safe_batches_without_single_member_tail():
+    from blueprints import offers
+
+    trade_ids = [f"{index:064x}" for index in range(22)]
+
+    batches = offers._balanced_cancel_batches(trade_ids, 4)
+
+    assert [len(batch) for batch in batches] == [4, 4, 4, 4, 3, 3]
+    assert [trade_id for batch in batches for trade_id in batch] == trade_ids
+    assert [len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:10], 4)] == [4, 3, 3]
+    assert [len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:5], 4)] == [3, 2]
 
 
 def test_cancel_all_gui_timeout_honours_backend_authoritative_deadline():
@@ -722,7 +738,7 @@ class TestCancelAllPost(_FlaskBase):
         }
         reconciled = {"done": False}
 
-        def finish_retries():
+        def finish_retries(_batch):
             reconciled["done"] = True
             return 0
 
@@ -765,7 +781,7 @@ class TestCancelAllPost(_FlaskBase):
             response = self._post("/api/offers/cancel_all")
 
         self.assertEqual(response.status_code, 200)
-        stopped.offer_manager.retry_failed_cancels.assert_called_once_with()
+        stopped.offer_manager.retry_failed_cancels.assert_called_once_with(trade_ids)
         status = self.client.get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
@@ -840,7 +856,7 @@ class TestCancelAllPost(_FlaskBase):
         trade_id = "a" * 64
         reconciled = {"done": False}
 
-        def finish_retries():
+        def finish_retries(_batch):
             reconciled["done"] = True
             return 0
 
@@ -957,7 +973,7 @@ class TestCancelAllPost(_FlaskBase):
                 if candidate in records
             }
 
-        def finish_retries():
+        def finish_retries(_batch):
             # One exact proof, one mismatched proof and one mere submission.
             records.update(
                 {
@@ -1029,7 +1045,7 @@ class TestCancelAllPost(_FlaskBase):
         ).get_json()
         self.assertTrue(final["complete"])
         self.assertFalse(final["running"])
-        stopped.offer_manager.retry_failed_cancels.assert_called_once_with()
+        stopped.offer_manager.retry_failed_cancels.assert_called_once_with(trade_ids)
 
     def test_stopped_cancel_all_retries_exact_durable_failed_attempt(self):
         stopped = _make_bot()
@@ -1163,6 +1179,140 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["cancelled"], 500)
         self.assertEqual(status["pending"], 0)
         self.assertEqual(status["failed"], 0)
+
+    def test_stopped_cancel_all_sequences_balanced_fee_safe_sage_batches(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 4
+        trade_ids = [f"{index:064x}" for index in range(1, 11)]
+        terminal_ids = set()
+        submitted_batches = []
+
+        def cancel_batch(batch, **_kwargs):
+            submitted_batches.append(list(batch))
+            terminal_ids.update(batch)
+            return {
+                trade_id: {
+                    "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                    "success": True,
+                }
+                for trade_id in batch
+            }
+
+        stopped.offer_manager.cancel_offers.side_effect = cancel_batch
+
+        def terminal_records(candidates):
+            return {
+                trade_id: {
+                    "intent_id": f"intent:{trade_id}",
+                    "sage_trade_id": trade_id,
+                    "outcome": "CANCELLED_PROVEN",
+                }
+                for trade_id in candidates
+                if trade_id in terminal_ids
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                ],
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                side_effect=terminal_records,
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([len(batch) for batch in submitted_batches], [4, 3, 3])
+        self.assertEqual(
+            [trade_id for batch in submitted_batches for trade_id in batch],
+            trade_ids,
+        )
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["batch_size"], 4)
+        self.assertEqual(status["total_batches"], 3)
+        self.assertEqual(status["current_batch"], 3)
+        self.assertEqual(status["cancelled"], 10)
+
+    def test_stopped_cancel_all_retries_only_the_current_fee_safe_batch(self):
+        """An older failed cancel outside the batch must never steal its retry slot."""
+
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 2
+        trade_ids = [f"{index:064x}" for index in range(1, 5)]
+        terminal_ids = set()
+        retried_batches = []
+
+        stopped.offer_manager.cancel_offers.side_effect = lambda batch, **_kwargs: {
+            trade_id: {
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "success": True,
+            }
+            for trade_id in batch
+        }
+
+        def retry_current_batch(batch):
+            retried_batches.append(list(batch))
+            terminal_ids.update(batch)
+            return 0
+
+        stopped.offer_manager.retry_failed_cancels.side_effect = retry_current_batch
+
+        def terminal_records(candidates):
+            return {
+                trade_id: {
+                    "intent_id": f"intent:{trade_id}",
+                    "sage_trade_id": trade_id,
+                    "outcome": "CANCELLED_PROVEN",
+                }
+                for trade_id in candidates
+                if trade_id in terminal_ids
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                ],
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                side_effect=terminal_records,
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(retried_batches, [trade_ids[:2], trade_ids[2:]])
+        status = self.client.get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertTrue(status["complete"])
+        self.assertIsNone(status["error"])
+        self.assertEqual(status["current_batch"], 2)
+        self.assertEqual(status["cancelled"], 4)
 
     def test_uninitialised_bot_denial_clears_state_and_allows_coordinator_retry(self):
         trade_id = "a" * 64

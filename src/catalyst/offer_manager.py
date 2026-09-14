@@ -6237,6 +6237,50 @@ class OfferManager:
             return False
         return True
 
+    @staticmethod
+    def _sage_bulk_cancel_fee_mojos(member_count: int) -> int:
+        """Return the relay-safe fee for one native Sage cancel cohort."""
+
+        if (
+            type(member_count) is not int
+            or isinstance(member_count, bool)
+            or member_count < 1
+        ):
+            raise ValueError("Sage bulk cancel member count must be positive")
+        configured_fee_mojos = get_effective_transaction_fee_mojos()
+        if (
+            type(configured_fee_mojos) is not int
+            or isinstance(configured_fee_mojos, bool)
+            or configured_fee_mojos <= 0
+        ):
+            raise ValueError("configured cancellation fee is invalid")
+        input_count = member_count + 1
+        estimated_cost = 20_000_000 + (input_count * 31_000_000)
+        return max(configured_fee_mojos, estimated_cost * 6)
+
+    def get_sage_bulk_cancel_capacity(self, max_members: int = 500) -> int:
+        """Return the largest cohort supportable by one available fee coin."""
+
+        if (
+            type(max_members) is not int
+            or isinstance(max_members, bool)
+            or max_members < 1
+        ):
+            raise ValueError("Sage bulk cancel capacity bound must be positive")
+        if get_wallet_type() != "sage" or self._fee_pool is None:
+            return 1
+        largest = self._fee_pool.largest_available_amount
+        if type(largest) is not int or isinstance(largest, bool) or largest <= 0:
+            return 1
+        for member_count in range(max_members, 1, -1):
+            try:
+                required_fee = self._sage_bulk_cancel_fee_mojos(member_count)
+            except (TypeError, ValueError):
+                return 1
+            if required_fee <= largest:
+                return member_count
+        return 1
+
     def _plan_sage_bulk_cancel(self, members: list[tuple]) -> Optional[dict]:
         """Select exact roots for Sage's one-transaction bulk cancel path."""
 
@@ -6259,12 +6303,13 @@ class OfferManager:
         if len(set(source_coin_ids)) != len(source_coin_ids):
             return None
         try:
-            fee_mojos = get_effective_transaction_fee_mojos()
+            # Sage submits the offer roots plus one explicit XCH fee input.
+            # TEST7 proved that a flat 35M-cost fee is rejected when this
+            # combined spend is larger (INVALID_FEE_TOO_CLOSE_TO_ZERO).
+            fee_mojos = self._sage_bulk_cancel_fee_mojos(len(members))
         except Exception:
             return None
-        if type(fee_mojos) is not int or isinstance(fee_mojos, bool) or fee_mojos <= 0:
-            return None
-        fee_coin_id = self._fee_pool.reserve()
+        fee_coin_id = self._fee_pool.reserve(minimum_amount_mojos=fee_mojos)
         fee_coin_id = str(fee_coin_id or "").strip().lower().removeprefix("0x")
         try:
             valid_fee_coin = len(fee_coin_id) == 64 and bool(bytes.fromhex(fee_coin_id))
@@ -6660,28 +6705,56 @@ class OfferManager:
             if not events:
                 raise ValueError("cancellation journal has an invalid event count")
             latest_attempt = events[-1]["attempt"]
-            if latest_attempt < 1 or len(events) not in {
-                latest_attempt * 2 - 1,
-                latest_attempt * 2,
-            }:
+            if latest_attempt < 1:
                 raise ValueError("cancellation journal has an invalid event count")
+            grouped = {
+                attempt: [event for event in events if event["attempt"] == attempt]
+                for attempt in range(1, latest_attempt + 1)
+            }
+            if any(not grouped[attempt] for attempt in grouped):
+                raise ValueError("cancellation attempts are not contiguous")
             for prior_attempt in range(1, latest_attempt):
-                prior_prepared, prior_finalized = events[
-                    (prior_attempt - 1) * 2 : prior_attempt * 2
-                ]
+                prior_group = grouped[prior_attempt]
+                if len(prior_group) not in {2, 3}:
+                    raise ValueError("cancellation attempts are not contiguous failures")
+                prior_prepared, prior_finalized = prior_group[:2]
                 if (
                     prior_prepared["attempt"] != prior_attempt
                     or prior_prepared["phase"] != "PREPARED"
                     or prior_prepared["outcome"] != "PREPARED"
                     or prior_finalized["attempt"] != prior_attempt
                     or prior_finalized["phase"] != "FINALIZED"
-                    or prior_finalized["outcome"] != CANCEL_FAILED
-                    or prior_finalized["blocks_mutation"] != 0
                 ):
                     raise ValueError(
                         "cancellation attempts are not contiguous failures"
                     )
-            events = events[(latest_attempt - 1) * 2 :]
+                if len(prior_group) == 2:
+                    if (
+                        prior_finalized["outcome"] != CANCEL_FAILED
+                        or prior_finalized["blocks_mutation"] != 0
+                    ):
+                        raise ValueError(
+                            "cancellation attempts are not contiguous failures"
+                        )
+                else:
+                    reconciled = prior_group[2]
+                    if (
+                        prior_finalized["outcome"]
+                        not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+                        or prior_finalized["blocks_mutation"] != 1
+                        or reconciled["phase"] != "RECONCILED"
+                        or reconciled["outcome"] != CANCEL_FAILED
+                        or reconciled["blocks_mutation"] != 0
+                        or reconciled["reason_code"] != "SAGE_RELAY_REJECTED"
+                        or reconciled["transaction_id"]
+                        != prior_finalized["transaction_id"]
+                    ):
+                        raise ValueError(
+                            "cancellation attempts are not contiguous failures"
+                        )
+            events = grouped[latest_attempt]
+            if len(events) not in {1, 2, 3}:
+                raise ValueError("cancellation journal has an invalid event count")
             prepared = events[0]
             journal = json.loads(prepared["wallet_identity_json"])
             journal, _run_id, wallet_hash, network = (
@@ -6870,7 +6943,7 @@ class OfferManager:
                     latch_binding=(wallet_hash, network),
                     authoritative=False,
                 )
-            finalized = events[1]
+            finalized = events[-1]
             final_evidence = json.loads(finalized["evidence_json"])
             if type(final_evidence) is not dict:
                 raise ValueError("cancellation final evidence is not exact")
@@ -6886,22 +6959,31 @@ class OfferManager:
             is_batch_abort = result["method"] == "batch_abort_ambiguous"
             if is_batch_abort:
                 final_evidence_keys.add("aborted_by_operation_id")
+            is_relay_rejection = finalized["phase"] == "RECONCILED"
+            if is_relay_rejection:
+                final_evidence_keys.add("relay_rejection")
             expected_blocks = int(
                 result["outcome"] in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
             )
+            expected_suffix = "reconciled" if is_relay_rejection else "finalized"
             if (
                 finalized["event_id"]
-                != f"{intent.operation_id}:attempt:{latest_attempt}:finalized"
+                != f"{intent.operation_id}:attempt:{latest_attempt}:{expected_suffix}"
                 or finalized["operation_id"] != intent.operation_id
                 or finalized["intent_id"] != intent.intent_id
                 or finalized["operation_type"] != "CANCEL"
                 or finalized["attempt"] != latest_attempt
-                or finalized["phase"] != "FINALIZED"
+                or finalized["phase"]
+                != ("RECONCILED" if is_relay_rejection else "FINALIZED")
                 or finalized["outcome"] != result["outcome"]
                 or finalized["transaction_id"] != (result["transaction_id"] or None)
                 or finalized["spend_identity"] != (result["spend_identity"] or None)
                 or finalized["blocks_mutation"] != expected_blocks
                 or finalized["reason_code"] != result["outcome"]
+                and not (
+                    is_relay_rejection
+                    and finalized["reason_code"] == "SAGE_RELAY_REJECTED"
+                )
                 or finalized["request_timestamp"] != finalized["created_at"]
                 or finalized["wallet_identity_json"] != prepared["wallet_identity_json"]
                 or type(final_evidence) is not dict
@@ -6912,6 +6994,19 @@ class OfferManager:
                 or final_evidence.get("member_id") != member_id
                 or type(final_evidence.get("effect_attempted")) is not bool
                 or final_evidence.get("cancel_result") != result
+                or (
+                    is_relay_rejection
+                    and (
+                        len(events) != 3
+                        or events[1]["phase"] != "FINALIZED"
+                        or events[1]["outcome"]
+                        not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+                        or events[1]["blocks_mutation"] != 1
+                        or events[1]["transaction_id"]
+                        != finalized["transaction_id"]
+                        or type(final_evidence.get("relay_rejection")) is not dict
+                    )
+                )
                 or (
                     is_batch_abort
                     and (
@@ -8556,6 +8651,132 @@ class OfferManager:
         return manifest
 
     @staticmethod
+    def _settle_sage_bulk_relay_rejection(
+        manifest: dict,
+        blockers: list[dict],
+        *,
+        generation: int,
+    ) -> Optional[bool]:
+        """Resolve an exact Sage all-peer rejection, or return ``None``.
+
+        The local Sage API acknowledges submission before it propagates to
+        peers. We accept its later rejection log only together with two
+        independent no-effect checks: every claimed input is still unspent and
+        the exact transaction is absent from Sage's pending set.
+        """
+
+        try:
+            exact_manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+            finalized = [database.validate_offer_operation_event(row) for row in blockers]
+            transaction_ids = {event["transaction_id"] for event in finalized}
+            if len(transaction_ids) != 1 or None in transaction_ids:
+                return None
+            transaction_id = transaction_ids.pop()
+            relay = wallet.get_transaction_relay_outcome(transaction_id)
+            if type(relay) is not dict or relay.get("status") != "rejected":
+                return None
+            if relay.get("transaction_id") != transaction_id:
+                return False
+
+            prepared = database.get_offer_cancel_cohort_prepared_events(
+                exact_manifest["cohort_id"]
+            )
+            if type(prepared) is not list or len(prepared) != exact_manifest["member_count"]:
+                return False
+            prepared_by_operation = {
+                event["operation_id"]: database.validate_offer_operation_event(event)
+                for event in prepared
+            }
+            first_member = exact_manifest["members"][0]
+            first_prepared = prepared_by_operation[first_member["operation_id"]]
+            first_evidence = json.loads(first_prepared["evidence_json"])
+            batch = first_evidence["wallet_effect"]["batch"]
+            if not OfferManager._is_exact_cancel_wallet_effect(
+                first_evidence["wallet_effect"],
+                cohort_size=exact_manifest["member_count"],
+            ):
+                return False
+            source_ids = list(batch["source_coin_ids"])
+            fee_coin_id = batch["fee_coin_id"]
+            claimed_ids = [*source_ids, fee_coin_id]
+            records = wallet.get_coins_by_ids(claimed_ids)
+            expected_record_ids = {"0x" + coin_id for coin_id in claimed_ids}
+            if type(records) is not dict or not expected_record_ids.issubset(records):
+                return False
+            if any(records[coin_id].get("spent_height") is not None for coin_id in expected_record_ids):
+                return False
+            for trade_id, source_id in zip(batch["trade_ids"], source_ids):
+                offer_id = records["0x" + source_id].get("offer_id")
+                normalized_offer = str(offer_id or "").lower().removeprefix("0x")
+                if normalized_offer != trade_id:
+                    return False
+            if records["0x" + fee_coin_id].get("offer_id") not in {None, ""}:
+                return False
+
+            pending = wallet.get_pending_transactions()
+            if type(pending) is not list:
+                return False
+            for item in pending:
+                if type(item) is not dict:
+                    return False
+                pending_id = str(
+                    item.get("transaction_id") or item.get("tx_id") or item.get("id") or ""
+                ).lower().removeprefix("0x")
+                if pending_id == transaction_id:
+                    return False
+
+            representative = _CanonicalOfferCancelIntent(
+                trade_id=first_member["trade_id"],
+                intent_id=first_member["intent_id"],
+                operation_id=first_member["operation_id"],
+            )
+            journal = json.loads(first_prepared["wallet_identity_json"])
+            _journal, _run_id, wallet_hash, network = (
+                OfferManager._verified_continuation_journal(
+                    journal,
+                    representative,
+                    trade_id=representative.trade_id,
+                    allowed_backends=frozenset({"sage"}),
+                )
+            )
+            database.reconcile_rejected_offer_cancel_cohort(
+                manifest_json=exact_manifest,
+                transaction_id=transaction_id,
+                relay_evidence_json=relay,
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            runtime = mutation_gate.current_runtime()
+            if runtime is None:
+                return False
+            operation_ids = [member["operation_id"] for member in exact_manifest["members"]]
+            released = runtime.release_resolved(generation, operation_ids)
+            runtime_status = runtime.status()
+            resolved = bool(
+                released.get("released") is True
+                or (
+                    database.get_runtime_safety_latch().get("state") == "resolved"
+                    and type(runtime_status) is dict
+                    and runtime_status.get("allowed") is True
+                )
+            )
+            if resolved:
+                log_event(
+                    "warning",
+                    "sage_bulk_cancel_peer_rejected",
+                    "Sage rejected the submitted bulk cancellation at every peer; "
+                    "the exact no-effect cohort was released for a fee-safe retry",
+                    data={
+                        "transaction_id": transaction_id,
+                        "reason_code": relay.get("reason_code"),
+                        "offer_count": exact_manifest["member_count"],
+                    },
+                )
+            return resolved
+        except Exception:
+            return False
+
+    @staticmethod
     def _settle_submitted_sage_bulk_cancel(
         manifest: dict,
         blocking_operation_ids: list[str],
@@ -8582,6 +8803,14 @@ class OfferManager:
                 return False
         except (KeyError, TypeError, ValueError):
             return False
+
+        relay_resolution = OfferManager._settle_sage_bulk_relay_rejection(
+            exact_manifest,
+            blockers,
+            generation=generation,
+        )
+        if relay_resolution is not None:
+            return relay_resolution
 
         max_wait = max(0.0, float(cfg.CANCEL_MAX_WAIT_SECS))
         poll_interval = max(0.05, float(cfg.CANCEL_POLL_INTERVAL_SECS))
@@ -9067,8 +9296,22 @@ class OfferManager:
             "exhausted_trade_ids": exhausted_trade_ids,
         }
 
-    def retry_failed_cancels(self) -> int:
-        """Retry exact durable failures; memory is only a health-reporting cache."""
+    def retry_failed_cancels(self, trade_ids: Optional[List[str]] = None) -> int:
+        """Retry exact durable failures; optionally constrain them to one batch.
+
+        A stopped Cancel All workflow sequences fee-safe Sage cohorts.  Its
+        reconciliation loop must never let an older durable failure outside the
+        current cohort initiate a wallet effect and close the mutation gate.
+        Ordinary bot-cycle callers omit ``trade_ids`` and retain the global
+        recovery behaviour.
+        """
+        allowed_trade_ids = None
+        if trade_ids is not None:
+            if type(trade_ids) is not list or any(
+                type(trade_id) is not str or not trade_id for trade_id in trade_ids
+            ):
+                raise ValueError("cancel retry batch is invalid")
+            allowed_trade_ids = set(trade_ids)
         # A batch deliberately aborts later members after one cancellation
         # crosses the submitted-but-unconfirmed boundary. Reconcile that exact
         # blocker before reading or retrying failed peers; otherwise the retry
@@ -9091,6 +9334,8 @@ class OfferManager:
         for candidate in candidates:
             try:
                 trade_id = candidate["trade_id"]
+                if allowed_trade_ids is not None and trade_id not in allowed_trade_ids:
+                    continue
                 attempt = candidate["attempt"]
                 intent = self._canonical_cancel_intent(trade_id)
                 if (
@@ -9535,3 +9780,61 @@ class OfferManager:
             )
 
         return open_buy, open_sell, closed
+
+
+def recover_sage_bulk_cancel_peer_rejection_at_startup() -> dict[str, int]:
+    """Release an exact no-effect Sage bulk-cancel rejection during startup.
+
+    A normal running manager owns a mutation runtime and can reconcile this
+    outcome in its retry pass. After a restart, however, the submitted cohort
+    itself blocks runtime acquisition. This bounded bootstrap performs only
+    the same read-only Sage proof and durable reconciliation; it never submits
+    or retries a wallet action.
+    """
+
+    latch = database.get_runtime_safety_latch()
+    blockers = database.get_unresolved_offer_operation_blockers()
+    blocker_ids = [row.get("operation_id") for row in blockers]
+    generation = latch.get("generation")
+    latched_ids = latch.get("blocking_operation_ids")
+    if type(latched_ids) is not list:
+        try:
+            latched_ids = json.loads(latch.get("blocking_operation_ids_json") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            latched_ids = None
+    if (
+        latch.get("state") != "tripped"
+        or type(generation) is not int
+        or isinstance(generation, bool)
+        or generation < 1
+        or type(latched_ids) is not list
+        or not blocker_ids
+        or sorted(blocker_ids) != sorted(latched_ids)
+    ):
+        return {
+            "examined": len(blocker_ids),
+            "recovered": 0,
+            "remaining": len(blocker_ids),
+        }
+
+    manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)
+    if manifest is None:
+        return {
+            "examined": len(blocker_ids),
+            "recovered": 0,
+            "remaining": len(blocker_ids),
+        }
+
+    OfferManager._settle_sage_bulk_relay_rejection(
+        manifest,
+        blockers,
+        generation=generation,
+    )
+    remaining_rows = database.get_unresolved_offer_operation_blockers()
+    remaining_ids = {row.get("operation_id") for row in remaining_rows}
+    recovered = sum(operation_id not in remaining_ids for operation_id in blocker_ids)
+    return {
+        "examined": len(blocker_ids),
+        "recovered": recovered,
+        "remaining": len(remaining_rows),
+    }

@@ -16911,8 +16911,20 @@
             const netPos = parseFloat(perf.net_position || 0);
             const positionLoadPct = parseFloat(mhMetrics.position_pct ?? 0) || 0;
             const maxPos = parseFloat(s.inventory && s.inventory.max_position_xch || 5);
-            const targetOpenBuys = parseInt(trading.max_active_buy ?? 0, 10) || 0;
-            const targetOpenSells = parseInt(trading.max_active_sell ?? 0, 10) || 0;
+            const configuredTargetOpenBuys = parseInt(trading.max_active_buy ?? 0, 10) || 0;
+            const configuredTargetOpenSells = parseInt(trading.max_active_sell ?? 0, 10) || 0;
+            // Follow mode may deliberately cap live depth below the configured
+            // ceiling when market confidence cannot support the full book.
+            // Compare against the bot's effective targets so a complete,
+            // confidence-capped ladder is not shown as perpetually building.
+            const targetOpenBuys = parseInt(
+                mhMetrics.effective_buy_target ?? configuredTargetOpenBuys,
+                10
+            ) || 0;
+            const targetOpenSells = parseInt(
+                mhMetrics.effective_sell_target ?? configuredTargetOpenSells,
+                10
+            ) || 0;
             const liveOpenBuys = parseInt(perf.open_buys ?? 0, 10) || 0;
             const liveOpenSells = parseInt(perf.open_sells ?? 0, 10) || 0;
             const ladderTargetsKnown = targetOpenBuys > 0 || targetOpenSells > 0;
@@ -35236,9 +35248,11 @@ function closeCtgErrorModal() {
                     }
                     const feeSize = Number(config.fee_coin_size_xch || 0);
                     const feeCount = parseInt(config.fee_prep_count || 0);
-                    const preparedFeeXch = feeSize * prepFactor;
                     if (feeSize > 0 && feeCount > 0) {
-                        params.set('fees_xch', String(preparedFeeXch));
+                        // Fee coins are exact transaction-funding
+                        // denominations. Trade-coin headroom must not change
+                        // either the worker target or this readiness check.
+                        params.set('fees_xch', String(feeSize));
                         params.set('fees_count', String(feeCount));
                     }
                 } else {

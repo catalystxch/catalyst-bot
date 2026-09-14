@@ -1842,6 +1842,27 @@ def _initialize_startup_ownership() -> dict:
             # app in diagnostics mode with its durable reason intact.
             pass
     authorization = _recover_startup_publication_claims(api_server, authorization)
+    if (
+        authorization.get("allowed") is False
+        and authorization.get("failed_check") == "unresolved_operations"
+        and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+    ):
+        try:
+            from offer_manager import (
+                recover_sage_bulk_cancel_peer_rejection_at_startup,
+            )
+
+            recovery = recover_sage_bulk_cancel_peer_rejection_at_startup()
+            if recovery.get("recovered", 0) > 0:
+                authorization = api_server.initialize_mutation_runtime()
+                authorization = _recover_startup_publication_claims(
+                    api_server, authorization
+                )
+        except Exception:
+            # This path is proof-only: an exact Sage terminal rejection plus
+            # unchanged unspent inputs and an absent pending transaction are
+            # all required. Any ambiguity preserves the original blocker.
+            pass
     legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",

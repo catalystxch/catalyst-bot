@@ -3706,6 +3706,68 @@ def test_expired_dead_owner_takeover_revokes_crashed_parent_delegations(
     assert _active_delegation_row(handoff, environment, clock()) is None
 
 
+def test_startup_can_retire_expired_dead_lease_for_coin_prep_recovery(
+    isolated_gate_database,
+):
+    """A recoverable prep latch must not deadlock behind its crashed owner."""
+
+    _path, clock = isolated_gate_database
+    crashed = _gate(clock, run_id="crashed-prep-owner", pid=111)
+    acquired = crashed.acquire()
+    assert acquired["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="COIN_PREP_RECOVERY_REQUIRED",
+        blocking_operation_ids=["coin-prep:recover-after-crash"],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    clock.advance(31)
+    lease = database.get_runtime_mutation_lease()
+
+    retired = database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=clock(),
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=True,
+    )
+
+    assert retired["retired"] is True
+    assert database.get_runtime_mutation_lease()["active"] == 0
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert latch["reason_code"] == "COIN_PREP_RECOVERY_REQUIRED"
+
+
+def test_startup_keeps_expired_dead_lease_for_non_recovery_safety_latch(
+    isolated_gate_database,
+):
+    """Dead-owner retirement remains forbidden for unrelated safety stops."""
+
+    _path, clock = isolated_gate_database
+    crashed = _gate(clock, run_id="crashed-unsafe-owner", pid=111)
+    acquired = crashed.acquire()
+    assert acquired["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="CREATE_UNKNOWN",
+        blocking_operation_ids=["create:unsafe-after-crash"],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    clock.advance(31)
+    lease = database.get_runtime_mutation_lease()
+
+    retained = database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=clock(),
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=True,
+    )
+
+    assert retained["retired"] is False
+    assert retained["reason"] == "safety_latch_not_resolved"
+    assert database.get_runtime_mutation_lease()["active"] == 1
+
+
 def test_terminal_fence_overrides_an_existing_latch_mirror(
     isolated_gate_database, monkeypatch
 ):
@@ -7092,6 +7154,61 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(
         "database",
         "authorize",
         "legacy_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_retries_startup_after_exact_sage_bulk_peer_rejection(
+    monkeypatch,
+):
+    """A Sage all-peer rejection must not strand restart in diagnostics."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "UNRESOLVED_OPERATIONS",
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "offer_manager",
+        SimpleNamespace(
+            recover_sage_bulk_cancel_peer_rejection_at_startup=lambda: (
+                events.append("sage_peer_rejection_recovery")
+                or {"examined": 22, "recovered": 22, "remaining": 0}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 0, "recovered": 0, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "sage_peer_rejection_recovery",
         "authorize",
     ]
 

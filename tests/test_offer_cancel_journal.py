@@ -1642,18 +1642,20 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     reserved = []
     manager = OfferManager()
     manager._fee_pool = SimpleNamespace(
-        reserve=lambda: reserved.append(fee_coin_id) or fee_coin_id
+        reserve=lambda minimum_amount_mojos=0: (
+            reserved.append(minimum_amount_mojos) or fee_coin_id
+        )
     )
 
     results = manager.cancel_offers(trade_ids, force_storm=True)
 
-    assert reserved == [fee_coin_id]
+    assert reserved == [678_000_000]
     assert batch_effects == [
         {
             "trade_ids": trade_ids,
             "secure": True,
             "max_workers": 1,
-            "fee_mojos": 13_079_100,
+            "fee_mojos": 678_000_000,
             "skip_confirmation": False,
             "source_coin_ids": source_coin_ids,
             "fee_coin_id": fee_coin_id,
@@ -1678,7 +1680,7 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
         {
             "secure": True,
             "timeout": 60,
-            "fee_mojos": 13_079_100,
+            "fee_mojos": 678_000_000,
             "batch": {
                 "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
                 "trade_ids": trade_ids,
@@ -1689,7 +1691,7 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
         {
             "secure": True,
             "timeout": 60,
-            "fee_mojos": 13_079_100,
+            "fee_mojos": 678_000_000,
             "batch": {
                 "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
                 "trade_ids": trade_ids,
@@ -1701,6 +1703,20 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     assert json.loads(
         database.get_runtime_safety_latch()["blocking_operation_ids_json"]
     ) == [f"cancel:{trade_id}" for trade_id in trade_ids]
+
+
+def test_sage_bulk_cancel_capacity_is_bounded_by_largest_fee_coin(monkeypatch):
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 13_079_100,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(largest_available_amount=1_120_000_000)
+
+    assert manager.get_sage_bulk_cancel_capacity() == 4
+    assert manager._sage_bulk_cancel_fee_mojos(4) == 1_050_000_000
+    assert manager._sage_bulk_cancel_fee_mojos(5) == 1_236_000_000
 
 
 def _confirmed_sage_bulk_cancel_evidence(
@@ -1793,8 +1809,20 @@ def _confirmed_sage_bulk_cancel_evidence(
             [source_coin_id], separators=(",", ":")
         )
 
-    fee_input = 20_000_000
-    fee_mojos = 13_079_100
+    prepared_evidence = json.loads(
+        database.get_offer_operation_events(f"cancel:{trade_ids[0]}")[0][
+            "evidence_json"
+        ]
+    )
+    journaled_fee_mojos = prepared_evidence["wallet_effect"]["fee_mojos"]
+    fee_mojos = (
+        journaled_fee_mojos
+        if type(journaled_fee_mojos) is int
+        and not isinstance(journaled_fee_mojos, bool)
+        and journaled_fee_mojos > 0
+        else 13_079_100
+    )
+    fee_input = fee_mojos + 6_920_900
     spent.append(
         {
             "coin_id": fee_coin_id,
@@ -2071,7 +2099,9 @@ def test_sage_bulk_cancel_accepts_exact_height_evidence_when_sage_omits_txid(
         lambda: 13_079_100,
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda minimum_amount_mojos=0: fee_coin_id
+    )
     submitted = manager.cancel_offers(trade_ids, force_storm=True)
     assert all(
         result["transaction_id"] == submitted_transaction_id
@@ -2188,7 +2218,9 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         lambda: 13_079_100,
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda minimum_amount_mojos=0: fee_coin_id
+    )
     submitted = manager.cancel_offers(trade_ids, force_storm=True)
     assert all(
         result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
@@ -2262,6 +2294,91 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         )
 
 
+def test_retry_failed_cancels_resolves_exact_sage_all_peer_rejection(
+    isolated_database,
+    monkeypatch,
+):
+    trade_ids = ["8" * 64, "9" * 64]
+    source_coin_ids = ["a" * 64, "b" * 64]
+    fee_coin_id = "c" * 64
+    transaction_id = "d" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"sage-bulk-rejected-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    def batch_effect(selected_trade_ids, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offers")
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": transaction_id},
+            transaction_id=transaction_id,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=8,
+    )
+    monkeypatch.setattr(
+        offer_manager, "get_effective_transaction_fee_mojos", lambda: 13_079_100
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda minimum_amount_mojos=0: fee_coin_id
+    )
+    manager.cancel_offers(trade_ids, force_storm=True)
+
+    relay = {
+        "status": "rejected",
+        "transaction_id": transaction_id,
+        "reason_code": "INVALID_FEE_TOO_CLOSE_TO_ZERO",
+        "evidence_sha256": "e" * 64,
+        "source": "sage_native_log",
+        "source_file": "app.log.2026-09-13",
+    }
+    monkeypatch.setattr(wallet, "get_transaction_relay_outcome", lambda _txid: relay)
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    unspent = {
+        "0x" + coin_id: {
+            "amount": 1_120_000_000,
+            "offer_id": trade_ids[index] if index < 2 else None,
+            "spent_height": None,
+            "created_height": 1,
+            "transaction_id": None,
+        }
+        for index, coin_id in enumerate([*source_coin_ids, fee_coin_id])
+    }
+    monkeypatch.setattr(wallet, "get_coins_by_ids", lambda _coin_ids: unspent)
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+
+    assert manager.reconcile_submitted_cancels_only() == 0
+    assert database.get_unresolved_offer_operation_blockers() == []
+    assert [
+        database.get_offer_operation_events(f"cancel:{trade_id}")[-1]["phase"]
+        for trade_id in trade_ids
+    ] == ["RECONCILED", "RECONCILED"]
+
+
 def test_retry_failed_cancels_recovers_after_partial_bulk_settlement_crash(
     isolated_database,
     monkeypatch,
@@ -2312,7 +2429,9 @@ def test_retry_failed_cancels_recovers_after_partial_bulk_settlement_crash(
         lambda: 13_079_100,
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(reserve=lambda: fee_coin_id)
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda minimum_amount_mojos=0: fee_coin_id
+    )
     submitted = manager.cancel_offers(trade_ids, force_storm=True)
     assert all(
         result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
@@ -3277,6 +3396,116 @@ def test_finalize_cancel_cohort_is_atomic_after_one_shared_wallet_effect(
         CANCEL_SUBMITTED_UNCONFIRMED,
         CANCEL_SUBMITTED_UNCONFIRMED,
     ]
+
+
+def test_all_peer_rejected_bulk_cancel_is_reconciled_and_retryable(
+    isolated_database,
+):
+    trade_ids = ["3" * 64, "4" * 64]
+    manifest = database.canonical_offer_cancel_cohort_manifest(
+        [
+            {
+                "trade_id": trade_id,
+                "operation_id": f"cancel:{trade_id}",
+                "intent_id": f"cancel-target:{trade_id}",
+                "attempt": 1,
+                "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
+            }
+            for trade_id in trade_ids
+        ]
+    )
+    wallet_identity = {"snapshot_sha256": "5" * 64}
+    database.prepare_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=[
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": 1,
+                "wallet_identity_json": wallet_identity,
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "intent_id": member["intent_id"],
+                    "operation_id": member["operation_id"],
+                    "attempt": 1,
+                    "cohort_id": manifest["cohort_id"],
+                    "cohort_size": 2,
+                    "member_id": member["member_id"],
+                    "reason": "bulk_cancel_rejection_test",
+                    "continuation_journal_sha256": "5" * 64,
+                    "wallet_effect": {"secure": True, "fee_mojos": 13_079_100},
+                    "effect_claim_protocol": "durable_cohort_claim_v1",
+                },
+            }
+            for member in manifest["members"]
+        ],
+        prepared_at=AT,
+    )
+    database.claim_offer_cancel_cohort_effects(
+        manifest_json=manifest,
+        claimed_at="2026-08-16T12:00:01Z",
+    )
+    transaction_id = "6" * 64
+    submitted = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="sage_native_cancel_offers",
+        raw_response={"success": True, "transaction_id": transaction_id},
+        transaction_id=transaction_id,
+    )
+    database.finalize_offer_cancel_cohort(
+        manifest_json=manifest,
+        member_requests_json=[
+            {
+                "operation_id": member["operation_id"],
+                "event_id": f"{member['operation_id']}:attempt:1:finalized",
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": 1,
+                "cancel_result": submitted,
+                "wallet_identity_json": wallet_identity,
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "cohort_id": manifest["cohort_id"],
+                    "effect_attempted": True,
+                    "cancel_result": submitted,
+                },
+            }
+            for member in manifest["members"]
+        ],
+        finalized_at="2026-08-16T12:00:02Z",
+    )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        reason="test",
+        blocking_operation_ids=[member["operation_id"] for member in manifest["members"]],
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+    )
+
+    reconciled = database.reconcile_rejected_offer_cancel_cohort(
+        manifest_json=manifest,
+        transaction_id=transaction_id,
+        relay_evidence_json={
+            "status": "rejected",
+            "transaction_id": transaction_id,
+            "reason_code": "INVALID_FEE_TOO_CLOSE_TO_ZERO",
+            "evidence_sha256": "7" * 64,
+            "source": "sage_native_log",
+            "source_file": "app.log.2026-09-13",
+        },
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+        reconciled_at="2026-08-16T12:00:03Z",
+    )
+
+    assert [event["phase"] for event in reconciled["events"]] == [
+        "RECONCILED",
+        "RECONCILED",
+    ]
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert [row["trade_id"] for row in database.get_retryable_failed_offer_cancels()] == trade_ids
 
 
 def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(

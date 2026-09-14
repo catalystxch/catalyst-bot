@@ -97,6 +97,13 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         self._wallet_effect_authority.enter_context(
             patch.object(
                 coin_manager,
+                "authorize_wallet_effect_coin_ids",
+                side_effect=lambda coin_ids: list(coin_ids),
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager,
                 "claim_wallet_effect",
                 return_value={"claim_token": "a" * 64, "generation": 1},
             )
@@ -172,6 +179,27 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                         ],
                     },
                     "pre_view_coin_ids": ["01" * 32],
+                },
+            )
+        )
+        self._wallet_effect_authority.enter_context(
+            patch.object(
+                coin_manager.CoinManager,
+                "_build_runtime_absorb_prep_contract",
+                return_value={
+                    "operation_kind": "combine",
+                    "purpose": "top_up",
+                    "target_contract": {
+                        "wallet_type": "cat",
+                        "outputs": [
+                            {
+                                "output_index": 0,
+                                "amount_mojos": 1,
+                                "purpose": "top_up",
+                            }
+                        ],
+                    },
+                    "pre_view_coin_ids": ["01" * 32, "02" * 32],
                 },
             )
         )
@@ -1862,6 +1890,146 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
                 patch("database.get_open_offers", side_effect=open_offers)
             )
             manager._topup_worker(active_buy=45, active_sell=44)
+
+        self.assertEqual(absorb_calls, ["XCH"])
+        self.assertNotIn(
+            "topup_missing_offers_prioritized",
+            [call.args[1] for call in log_event.call_args_list],
+        )
+
+    def test_topup_uses_live_follow_capacity_before_misfit_absorption(self):
+        """A capped 11/45 Follow book is full, not 34 missing slots per side."""
+        manager = self._make_manager()
+        manager._topup_is_drip = True
+        manager.set_live_offer_targets(buy=11, sell=11)
+
+        def _coins(n, prefix):
+            return [_record(f"0x{prefix}{i}", 1_000_000) for i in range(n)]
+
+        xch_inv = {
+            "reserve": [_record("0xxchreserve", 10_000_000_000_000)],
+            "small": [_record("0xxchmisfit", 500_000_000_000)],
+            "inner": _coins(100, "xi"),
+            "mid": _coins(100, "xm"),
+            "outer": _coins(100, "xo"),
+            "extreme": _coins(100, "xe"),
+            "sniper": [],
+            "fees": _coins(50, "xf"),
+        }
+        cat_inv = {
+            "reserve": [_record("0xcatreserve", 500_000_000)],
+            "small": [],
+            "inner": _coins(100, "ci"),
+            "mid": _coins(100, "cm"),
+            "outer": _coins(100, "co"),
+            "extreme": _coins(100, "ce"),
+            "sniper": [],
+            "fees": [],
+        }
+
+        def classify(_records, wallet_type, _tier_sizes):
+            return xch_inv if wallet_type == "xch" else cat_inv
+
+        def open_offers(side=None, cat_asset_id=None, **_kwargs):
+            del cat_asset_id
+            if side in {"buy", "sell"}:
+                return [{"side": side, "tier": "inner"} for _ in range(11)]
+            return []
+
+        fake_wallet = types.ModuleType("wallet")
+        fake_wallet.get_wallet_sync_status = lambda: {
+            "synced": True,
+            "reachable": True,
+        }
+        prepared_counts = {
+            "inner": 100,
+            "mid": 100,
+            "outer": 100,
+            "extreme": 100,
+        }
+        tier_sizes = {
+            "inner": 26_000_000,
+            "mid": 13_000_000,
+            "outer": 6_500_000,
+            "extreme": 3_250_000,
+        }
+        absorb_calls = []
+
+        def absorb(name, *_args, **_kwargs):
+            absorb_calls.append(name)
+            return name == "XCH"
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {"wallet": fake_wallet}))
+            for name, value in {
+                "TIER_ENABLED": True,
+                "ENABLE_BUY": True,
+                "ENABLE_SELL": True,
+                "BUY_LADDER_REVERSED": True,
+                "MAX_ACTIVE_BUY_OFFERS": 45,
+                "MAX_ACTIVE_SELL_OFFERS": 45,
+                "BUY_INNER_TIER_COUNT": 14,
+                "BUY_MID_TIER_COUNT": 13,
+                "BUY_OUTER_TIER_COUNT": 11,
+                "BUY_EXTREME_TIER_COUNT": 7,
+                "SELL_INNER_TIER_COUNT": 14,
+                "SELL_MID_TIER_COUNT": 13,
+                "SELL_OUTER_TIER_COUNT": 11,
+                "SELL_EXTREME_TIER_COUNT": 7,
+                "WALLET_ID_XCH": 1,
+                "CAT_WALLET_ID": 2,
+                "CAT_ASSET_ID": "a" * 64,
+                "CAT_DECIMALS": 3,
+                "COIN_PREP_MULTIPLIER": Decimal("1"),
+            }.items():
+                stack.enter_context(patch.object(coin_manager.cfg, name, value))
+            stack.enter_context(
+                patch.object(
+                    coin_manager,
+                    "get_weighted_tier_prep_counts",
+                    return_value=prepared_counts,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    coin_manager,
+                    "_get_free_coins_rpc",
+                    return_value={"confirmed_records": [_record("0xwalletcoin", 1)]},
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_classify_coins_by_designation",
+                    side_effect=classify,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_get_tier_sizes_mojos",
+                    return_value=tier_sizes,
+                )
+            )
+            stack.enter_context(
+                patch.object(manager, "get_trading_pace", return_value="normal")
+            )
+            stack.enter_context(patch.object(manager, "update_coin_counts"))
+            stack.enter_context(
+                patch.object(
+                    manager,
+                    "_absorb_misfits_to_reserve",
+                    side_effect=absorb,
+                )
+            )
+            stack.enter_context(
+                patch.object(manager, "_smart_topup_wallet", return_value=True)
+            )
+            log_event = stack.enter_context(patch.object(coin_manager, "log_event"))
+            stack.enter_context(
+                patch("database.get_open_offers", side_effect=open_offers)
+            )
+            manager._topup_worker(active_buy=11, active_sell=11)
 
         self.assertEqual(absorb_calls, ["XCH"])
         self.assertNotIn(

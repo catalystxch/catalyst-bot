@@ -249,8 +249,8 @@ def test_coin_prep_reload_restores_and_balance_caps_cat_topup_coin():
     assert "topupPoolCat: parseFloat(config.topup_pool_cat) || 0" in modal_block
 
 
-def test_coin_prep_preflight_verifies_prepared_buy_sizes_with_headroom():
-    """The wallet preflight must compare against the coins prep actually creates."""
+def test_coin_prep_preflight_verifies_trade_headroom_but_exact_fee_size():
+    """Trade tiers use headroom; the configured fee denomination does not."""
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
     check_start = html.index("async function checkIfCoinPrepNeeded(config)")
@@ -261,8 +261,8 @@ def test_coin_prep_preflight_verifies_prepared_buy_sizes_with_headroom():
     assert "params.set(`${t}_xch`, String(preparedBuyXch));" in check_block
     assert "const preparedSniperXch = sniperSize * prepFactor;" in check_block
     assert "params.set('sniper_xch', String(preparedSniperXch));" in check_block
-    assert "const preparedFeeXch = feeSize * prepFactor;" in check_block
-    assert "params.set('fees_xch', String(preparedFeeXch));" in check_block
+    assert "const preparedFeeXch = feeSize * prepFactor;" not in check_block
+    assert "params.set('fees_xch', String(feeSize));" in check_block
     assert "const xch = Number(config[sizeKey(t)] || sellXch || 0);" not in check_block
 
 

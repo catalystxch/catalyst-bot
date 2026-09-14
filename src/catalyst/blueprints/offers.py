@@ -52,6 +52,25 @@ _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
 
 
+def _balanced_cancel_batches(trade_ids, capacity: int) -> list[list[str]]:
+    """Split targets into ordered, near-even cohorts no larger than capacity."""
+
+    exact_trade_ids = list(trade_ids)
+    if not exact_trade_ids:
+        return []
+    if type(capacity) is not int or isinstance(capacity, bool) or capacity < 1:
+        raise ValueError("cancel batch capacity must be a positive integer")
+    batch_count = (len(exact_trade_ids) + capacity - 1) // capacity
+    base_size, larger_batches = divmod(len(exact_trade_ids), batch_count)
+    batches = []
+    cursor = 0
+    for index in range(batch_count):
+        size = base_size + (1 if index < larger_batches else 0)
+        batches.append(exact_trade_ids[cursor : cursor + size])
+        cursor += size
+    return batches
+
+
 def _confirmed_fill_authority(fill_id) -> dict:
     """Expose the immutable receipt behind an economically visible fill."""
 
@@ -815,54 +834,134 @@ def api_cancel_all():
                     )
                     if callable(refresh_fee_pool):
                         refresh_fee_pool()
-                    _cancel_kwargs = {
-                        "reason": "manual_cancel_all",
-                        "force_storm": True,
-                    }
-                    if _retry_failed_attempts:
-                        _cancel_kwargs["_retry_failed_attempts"] = (
-                            _retry_failed_attempts
-                        )
-                    durable_manager.cancel_offers(_cancel_open_ids, **_cancel_kwargs)
+                    capacity_reader = getattr(
+                        durable_manager, "get_sage_bulk_cancel_capacity", None
+                    )
+                    raw_capacity = (
+                        capacity_reader(len(_cancel_open_ids))
+                        if callable(capacity_reader)
+                        else None
+                    )
+                    _batch_capacity = (
+                        raw_capacity
+                        if type(raw_capacity) is int
+                        and not isinstance(raw_capacity, bool)
+                        and 1 <= raw_capacity <= len(_cancel_open_ids)
+                        else len(_cancel_open_ids)
+                    )
+                    _cancel_batches = _balanced_cancel_batches(
+                        _cancel_open_ids, _batch_capacity
+                    )
                     _deadline_seconds = _cancel_all_deadline_seconds(
                         len(_cancel_open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
+                        batch_count=len(_cancel_batches),
                     )
                     _deadline = time.monotonic() + _deadline_seconds
-                    _terminal_ids = _authoritatively_terminal_offer_ids(
-                        _cancel_open_ids
+                    # The wallet just proved these offers active. Do not let a
+                    # stale local terminal row suppress a requested wallet
+                    # cancellation before the first submission attempt.
+                    _terminal_ids = set()
+                    _set_cancel_all_state(
+                        batch_size=_batch_capacity,
+                        total_batches=len(_cancel_batches),
+                        current_batch=1,
+                        pending=len(_cancel_open_ids) - len(_terminal_ids),
                     )
-                    while len(_terminal_ids) < len(_cancel_open_ids):
-                        durable_manager.retry_failed_cancels()
-                        _terminal_ids = _authoritatively_terminal_offer_ids(
-                            _cancel_open_ids
-                        )
-                        _remaining_count = len(_cancel_open_ids) - len(_terminal_ids)
+                    for _batch_index, _cancel_batch in enumerate(
+                        _cancel_batches, start=1
+                    ):
+                        _batch_targets = [
+                            trade_id
+                            for trade_id in _cancel_batch
+                            if trade_id not in _terminal_ids
+                        ]
+                        if not _batch_targets:
+                            continue
                         _set_cancel_all_state(
                             running=True,
                             complete=False,
                             error=None,
-                            phase="reconciling",
-                            total=len(_cancel_open_ids),
+                            phase="running",
+                            current_batch=_batch_index,
+                            batch_cancelled=0,
+                            batch_failed=0,
                             cancelled=len(_terminal_ids),
                             confirmed=len(_terminal_ids),
-                            pending=_remaining_count,
-                            failed=0,
+                            pending=len(_cancel_open_ids) - len(_terminal_ids),
                             message=(
-                                "Waiting for authoritative cancellation proof: "
-                                f"{len(_terminal_ids)}/{len(_cancel_open_ids)} "
-                                "offers terminal."
+                                f"Submitting cancellation batch {_batch_index}/"
+                                f"{len(_cancel_batches)} with "
+                                f"{len(_batch_targets)} offer(s)..."
                             ),
                         )
-                        _remaining_seconds = _deadline - time.monotonic()
-                        if not _remaining_count:
-                            break
-                        if _remaining_seconds <= 0:
-                            raise TimeoutError(
-                                "Cancel all is still awaiting authoritative Sage "
-                                f"proof for {_remaining_count} offer(s)."
+                        _cancel_kwargs = {
+                            "reason": "manual_cancel_all",
+                            "force_storm": True,
+                        }
+                        _batch_retry_attempts = {
+                            trade_id: _retry_failed_attempts[trade_id]
+                            for trade_id in _batch_targets
+                            if trade_id in _retry_failed_attempts
+                        }
+                        if _batch_retry_attempts:
+                            _cancel_kwargs["_retry_failed_attempts"] = (
+                                _batch_retry_attempts
                             )
-                        time.sleep(min(1.0, _remaining_seconds))
+                        durable_manager.cancel_offers(
+                            _batch_targets, **_cancel_kwargs
+                        )
+                        _batch_terminal_ids = _authoritatively_terminal_offer_ids(
+                            _batch_targets
+                        )
+                        while len(_batch_terminal_ids) < len(_batch_targets):
+                            # Restrict durable retries to this fee-safe cohort.
+                            # A global retry can submit an older unrelated
+                            # cancellation, trip the mutation latch, and make the
+                            # next cohort fail with UNRESOLVED_OPERATIONS.
+                            durable_manager.retry_failed_cancels(_batch_targets)
+                            _batch_terminal_ids = (
+                                _authoritatively_terminal_offer_ids(_batch_targets)
+                            )
+                            _terminal_ids = _authoritatively_terminal_offer_ids(
+                                _cancel_open_ids
+                            )
+                            _remaining_count = len(_cancel_open_ids) - len(
+                                _terminal_ids
+                            )
+                            _set_cancel_all_state(
+                                running=True,
+                                complete=False,
+                                error=None,
+                                phase="reconciling",
+                                total=len(_cancel_open_ids),
+                                batch_size=_batch_capacity,
+                                total_batches=len(_cancel_batches),
+                                current_batch=_batch_index,
+                                batch_cancelled=len(_batch_terminal_ids),
+                                cancelled=len(_terminal_ids),
+                                confirmed=len(_terminal_ids),
+                                pending=_remaining_count,
+                                failed=0,
+                                message=(
+                                    "Waiting for authoritative cancellation proof: "
+                                    f"{len(_terminal_ids)}/{len(_cancel_open_ids)} "
+                                    f"offers terminal (batch {_batch_index}/"
+                                    f"{len(_cancel_batches)})."
+                                ),
+                            )
+                            _remaining_seconds = _deadline - time.monotonic()
+                            if len(_batch_terminal_ids) == len(_batch_targets):
+                                break
+                            if _remaining_seconds <= 0:
+                                raise TimeoutError(
+                                    "Cancel all is still awaiting authoritative Sage "
+                                    f"proof for {_remaining_count} offer(s)."
+                                )
+                            time.sleep(min(1.0, _remaining_seconds))
+                        _terminal_ids = _authoritatively_terminal_offer_ids(
+                            _cancel_open_ids
+                        )
                     durable_manager.expect_empty_wallet_offer_book(
                         "manual_cancel_all_confirmed"
                     )
@@ -881,10 +980,10 @@ def api_cancel_all():
                         error=None,
                         phase="complete",
                         total=len(_cancel_open_ids),
-                        batch_size=len(_cancel_open_ids),
-                        total_batches=1,
-                        current_batch=1,
-                        batch_cancelled=len(_terminal_ids),
+                        batch_size=_batch_capacity,
+                        total_batches=len(_cancel_batches),
+                        current_batch=len(_cancel_batches),
+                        batch_cancelled=len(_cancel_batches[-1]),
                         batch_failed=0,
                         cancelled=len(_terminal_ids),
                         confirmed=len(_terminal_ids),
@@ -960,6 +1059,7 @@ def api_cancel_all():
                     "timeout_seconds": _cancel_all_deadline_seconds(
                         len(open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
+                        batch_count=len(open_ids),
                     ),
                     "message": f"Cancelling {len(open_ids)} offers in background...",
                 }
@@ -2339,18 +2439,19 @@ def api_pnl():
         return server._api_exception(request.path)
 
 
-def _cancel_all_deadline_seconds(offer_count, per_offer_wait_seconds):
-    """Bound one native bulk cancel plus authoritative reconciliation."""
-    # Sage's native ``cancel_offers`` call puts every member in one transaction,
-    # but CATalyst still commits one durable terminal proof per member. Allow a
-    # small bounded record budget without reverting to the old assumption that
-    # every offer needs its own on-chain confirmation window.
+def _cancel_all_deadline_seconds(
+    offer_count, per_offer_wait_seconds, *, batch_count=1
+):
+    """Bound sequential native batches plus authoritative reconciliation."""
+    # Each fee-safe Sage cohort needs its own confirmation window, while every
+    # offer still needs an individual durable terminal-proof commit.
     count = max(0, int(offer_count))
+    cohorts = max(1, int(batch_count))
     confirmation_wait = max(1.0, float(per_offer_wait_seconds))
     record_budget = max(0, count - 1) * 10.0
     return max(
         180.0,
-        min(3_600.0, confirmation_wait * 2.0 + record_budget),
+        min(3_600.0, confirmation_wait * 2.0 * cohorts + record_budget),
     )
 
 

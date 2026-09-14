@@ -790,6 +790,32 @@ class TestTierSizeDriftTopup(_PatchedCfg):
 
 
 class TestCoinTopupPriority(_PatchedCfg):
+    def test_coin_health_receives_effective_follow_capacity_targets(self):
+        loop = _make_loop()
+        loop._current_mid_price = Decimal("1")
+        synced_targets = []
+
+        class TargetAwareCoinManager:
+            def set_live_offer_targets(self, *, buy, sell):
+                synced_targets.append({"buy": buy, "sell": sell})
+
+            def check_coin_prep_status(self):
+                return {}
+
+        loop.coin_manager = TargetAwareCoinManager()
+        loop._get_effective_offer_targets = lambda *_args, **_kwargs: {
+            "buy": 11,
+            "sell": 11,
+        }
+
+        loop._handle_coins(
+            active_buy_count=11,
+            active_sell_count=11,
+            allow_legacy_topup=False,
+        )
+
+        self.assertEqual(synced_targets, [{"buy": 11, "sell": 11}])
+
     def test_proactive_topup_does_not_defer_for_spares_in_wrong_tiers(self):
         loop = _make_loop()
 

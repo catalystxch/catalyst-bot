@@ -20706,25 +20706,49 @@ def _prepare_offer_cancel_in_transaction(
             if prior_events:
                 raise ValueError("cancellation attempt must follow exact prior failed")
         else:
-            expected_count = (safe_attempt - 1) * 2
-            if len(prior_events) != expected_count:
-                raise ValueError("cancellation attempt must follow exact prior failed")
+            cursor = 0
             for prior_attempt in range(1, safe_attempt):
-                prepared_prior, finalized_prior = prior_events[
-                    (prior_attempt - 1) * 2 : prior_attempt * 2
-                ]
+                if cursor + 2 > len(prior_events):
+                    raise ValueError("cancellation attempt must follow exact prior failed")
+                prepared_prior, finalized_prior = prior_events[cursor : cursor + 2]
+                cursor += 2
                 if (
                     prepared_prior["attempt"] != prior_attempt
                     or prepared_prior["phase"] != "PREPARED"
                     or prepared_prior["outcome"] != "PREPARED"
                     or finalized_prior["attempt"] != prior_attempt
                     or finalized_prior["phase"] != "FINALIZED"
-                    or finalized_prior["outcome"] != "CANCEL_FAILED"
-                    or finalized_prior["blocks_mutation"] != 0
                 ):
                     raise ValueError(
                         "cancellation attempt must follow exact prior failed"
                     )
+                direct_failure = bool(
+                    finalized_prior["outcome"] == "CANCEL_FAILED"
+                    and finalized_prior["blocks_mutation"] == 0
+                )
+                if direct_failure:
+                    continue
+                if cursor >= len(prior_events):
+                    raise ValueError("cancellation attempt must follow exact prior failed")
+                reconciled_prior = prior_events[cursor]
+                cursor += 1
+                if (
+                    finalized_prior["outcome"]
+                    not in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+                    or finalized_prior["blocks_mutation"] != 1
+                    or reconciled_prior["attempt"] != prior_attempt
+                    or reconciled_prior["phase"] != "RECONCILED"
+                    or reconciled_prior["outcome"] != "CANCEL_FAILED"
+                    or reconciled_prior["blocks_mutation"] != 0
+                    or reconciled_prior["reason_code"] != "SAGE_RELAY_REJECTED"
+                    or reconciled_prior["transaction_id"]
+                    != finalized_prior["transaction_id"]
+                ):
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+            if cursor != len(prior_events):
+                raise ValueError("cancellation attempt must follow exact prior failed")
         if legacy_offer is not None:
             prior_lifecycle_state = str(
                 legacy_offer["lifecycle_state"] or "open"
@@ -21730,6 +21754,166 @@ def finalize_offer_cancel_cohort(
         conn.close()
 
 
+def reconcile_rejected_offer_cancel_cohort(
+    *,
+    manifest_json: Any,
+    transaction_id: str,
+    relay_evidence_json: Any,
+    wallet_fingerprint_hash: str,
+    network: str,
+    reconciled_at: Any = None,
+) -> Dict[str, Any]:
+    """Resolve a submitted Sage cohort after exact all-peer rejection proof.
+
+    Sage's submit RPC returns before peer propagation completes. A later
+    native-log terminal record can prove that a transaction CATalyst
+    journalled as submitted was rejected by every peer and removed. The offers
+    remain open, the attempt becomes retryable, and only the exact cohort
+    blockers are released.
+    """
+
+    from cancel_outcomes import CANCEL_FAILED, cancellation_result
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    safe_txid = _required_stability_text(transaction_id, "transaction_id").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", safe_txid) is None:
+        raise ValueError("transaction_id must be exact 32-byte hex")
+    relay_text = _canonical_json_text(
+        relay_evidence_json,
+        "relay_evidence_json",
+        expected_type=dict,
+        max_bytes=4096,
+    )
+    relay = json.loads(relay_text)
+    if set(relay) != {
+        "status",
+        "transaction_id",
+        "reason_code",
+        "evidence_sha256",
+        "source",
+        "source_file",
+    }:
+        raise ValueError("relay rejection evidence fields are invalid")
+    reason = relay.get("reason_code")
+    source_file = relay.get("source_file")
+    if (
+        relay.get("status") != "rejected"
+        or relay.get("transaction_id") != safe_txid
+        or relay.get("source") != "sage_native_log"
+        or type(reason) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", reason) is None
+        or type(relay.get("evidence_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", relay["evidence_sha256"]) is None
+        or type(source_file) is not str
+        or not 1 <= len(source_file) <= 128
+        or os.path.basename(source_file) != source_file
+    ):
+        raise ValueError("relay rejection evidence is not exact")
+    safe_wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
+    rejection_result = cancellation_result(
+        CANCEL_FAILED,
+        method="sage_peer_rejection",
+        raw_response={
+            "success": False,
+            "error": "CANCEL_REJECTED",
+            "transaction_id": safe_txid,
+        },
+        error="CANCEL_REJECTED",
+        transaction_id=safe_txid,
+    )
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        events = []
+        for member in manifest["members"]:
+            prepared_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            finalized_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+                "AND attempt=? AND phase='FINALIZED'",
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            if prepared_row is None or finalized_row is None:
+                raise ValueError("relay rejection lacks submitted cohort lineage")
+            prepared = validate_offer_operation_event(dict(prepared_row))
+            finalized = validate_offer_operation_event(dict(finalized_row))
+            validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+            finalized_evidence = json.loads(finalized["evidence_json"])
+            if (
+                finalized["operation_type"] != "CANCEL"
+                or finalized["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+                or finalized["blocks_mutation"] != 1
+                or finalized["transaction_id"] != safe_txid
+                or finalized_evidence.get("trade_id") != member["trade_id"]
+                or finalized_evidence.get("cohort_id") != manifest["cohort_id"]
+                or finalized_evidence.get("effect_attempted") is not True
+            ):
+                raise ValueError("relay rejection contradicts submitted cohort")
+            member_evidence = {
+                "trade_id": member["trade_id"],
+                "attempt": member["attempt"],
+                "cohort_id": manifest["cohort_id"],
+                "member_id": member["member_id"],
+                "effect_attempted": True,
+                "cancel_result": rejection_result,
+                "relay_rejection": relay,
+            }
+            journal = _journal_values(
+                event_id=(
+                    f"{member['operation_id']}:attempt:{member['attempt']}:reconciled"
+                ),
+                operation_id=member["operation_id"],
+                intent_id=member["intent_id"],
+                operation_type="CANCEL",
+                attempt=member["attempt"],
+                phase="RECONCILED",
+                outcome=CANCEL_FAILED,
+                request_timestamp=when,
+                wallet_identity_json=json.loads(finalized["wallet_identity_json"]),
+                transaction_id=safe_txid,
+                spend_identity=None,
+                evidence_json=member_evidence,
+                evidence_sha256=None,
+                reason_code="SAGE_RELAY_REJECTED",
+                blocks_mutation=False,
+                created_at=when,
+            )
+            events.append(_insert_offer_operation_event(conn, journal))
+            prepared_evidence = json.loads(prepared["evidence_json"])
+            prior_state = prepared_evidence.get("prior_lifecycle_state") or "open"
+            conn.execute(
+                "UPDATE offers SET lifecycle_state=? WHERE trade_id=? AND status='open'",
+                (prior_state, member["trade_id"]),
+            )
+
+        operation_ids = [member["operation_id"] for member in manifest["members"]]
+        _reconciliation_latch_update(
+            conn,
+            operation_id=operation_ids[0],
+            additionally_resolved=operation_ids[1:],
+            wallet_fingerprint_hash=safe_wallet_hash,
+            network=safe_network,
+            reason_code="SAGE_RELAY_REJECTED",
+            reason="Sage rejected the exact submitted cancellation cohort at every peer",
+            reconciled_at=when,
+            blocking=False,
+        )
+        conn.commit()
+        return {"manifest": manifest, "events": events}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _canonical_coin_prep_wallet_identity(value: Any) -> tuple[str, str, str]:
     """Return canonical Task 5 identity payload, fingerprint hash, and network."""
 
@@ -22243,6 +22427,7 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
             in {
                 "coin_manager.absorb_sage",
                 "coin_manager.absorb_cat_sage",
+                "coin_manager.consolidate_sage",
                 "coin_manager.consolidate_cat_sage",
             }
             and exact_combine_shape
@@ -22403,6 +22588,147 @@ def adopt_legacy_submitted_topup_coin_prep_operation(
         raise
     finally:
         conn.close()
+
+
+def get_recoverable_legacy_sage_consolidations(
+    *, limit: int = 4
+) -> List[Dict[str, Any]]:
+    """Return only v1.3.21 XCH combines missing their Task-12 journal.
+
+    The old runtime claimed and dispatched ``coin_manager.consolidate_sage``
+    before a durable ``coin_prep_operations`` row existed.  This inventory is
+    deliberately read-only and narrow: the exact wallet-effect blocker must
+    still be active, the dispatch and submitted/unknown resolution must be
+    present, the fee cohort must equal the XCH source cohort, and every source
+    amount must still be available in CATalyst's durable coin history.
+    """
+
+    safe_limit = _exact_integer(
+        limit, "legacy Sage consolidation recovery limit", minimum=1
+    )
+    if safe_limit > 8:
+        raise ValueError("legacy Sage consolidation recovery limit exceeds hard limit")
+    conn = get_connection()
+    latch_row = conn.execute(
+        "SELECT state, reason_code, blocking_operation_ids_json "
+        "FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    if latch_row is None or latch_row["state"] != "tripped":
+        return []
+    if latch_row["reason_code"] not in {
+        "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+        "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+    }:
+        return []
+    try:
+        blockers = set(json.loads(latch_row["blocking_operation_ids_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    rows = conn.execute(
+        """
+        SELECT claim.*, dispatch.dispatch_token, dispatch.dispatched_at,
+               resolution.outcome AS resolution_outcome,
+               resolution.resolved_at
+          FROM wallet_effect_claims AS claim
+          JOIN wallet_effect_claim_authorities AS authority
+            ON authority.claim_token=claim.claim_token
+          JOIN wallet_effect_dispatches AS dispatch
+            ON dispatch.claim_token=claim.claim_token
+           AND dispatch.generation=claim.generation
+           AND dispatch.authority_sha256=authority.authority_sha256
+           AND dispatch.adapter_operation=claim.operation_id
+          JOIN wallet_effect_claim_resolutions AS resolution
+            ON resolution.claim_token=claim.claim_token
+           AND resolution.generation=claim.generation
+          LEFT JOIN coin_prep_operations AS prep
+            ON prep.effect_claim_token=claim.claim_token
+           AND prep.effect_claim_generation=claim.generation
+         WHERE claim.operation_id='coin_manager.consolidate_sage'
+           AND claim.operation_contract='EXPLICIT_COIN_COHORT_V1'
+           AND resolution.outcome IN ('SUBMITTED', 'UNKNOWN')
+           AND prep.operation_id IS NULL
+         ORDER BY claim.claim_sequence
+         LIMIT ?
+        """,
+        (safe_limit + 1,),
+    ).fetchall()
+    if len(rows) > safe_limit:
+        raise RuntimeError("legacy Sage consolidation recovery inventory is ambiguous")
+
+    candidates: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        if f"wallet-effect:{row['claim_token']}" not in blockers:
+            continue
+        try:
+            source_ids = sorted(
+                norm_coin_id(value) for value in json.loads(row["source_coin_ids_json"])
+            )
+            fee_ids = sorted(
+                norm_coin_id(value) for value in json.loads(row["fee_coin_ids_json"])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            len(source_ids) < 2
+            or len(source_ids) != len(set(source_ids))
+            or source_ids != fee_ids
+        ):
+            continue
+        placeholders = ",".join("?" for _ in source_ids)
+        source_rows = conn.execute(
+            f"SELECT coin_id, wallet_type, amount_mojos, first_seen FROM coins "
+            f"WHERE coin_id IN ({placeholders}) ORDER BY coin_id",
+            tuple(source_ids),
+        ).fetchall()
+        if (
+            len(source_rows) != len(source_ids)
+            or [item["coin_id"] for item in source_rows] != source_ids
+            or any(
+                item["wallet_type"] != "xch" or int(item["amount_mojos"]) <= 0
+                for item in source_rows
+            )
+        ):
+            continue
+        output_rows = conn.execute(
+            f"SELECT coin_id, amount_mojos, first_seen FROM coins "
+            f"WHERE wallet_type='xch' AND status IN ('free', 'gone') "
+            f"AND trade_id IS NULL AND amount_mojos>0 "
+            f"AND julianday(first_seen)>julianday(?) "
+            f"AND coin_id NOT IN ({placeholders}) "
+            f"ORDER BY first_seen, coin_id LIMIT 129",
+            (row["dispatched_at"], *source_ids),
+        ).fetchall()
+        if len(output_rows) > 128:
+            raise RuntimeError(
+                "legacy Sage consolidation output inventory exceeds hard limit"
+            )
+        candidates.append(
+            {
+                "claim_token": row["claim_token"],
+                "generation": int(row["generation"]),
+                "wallet_fingerprint_hash": row["wallet_fingerprint_hash"],
+                "network": row["network"],
+                "source_coin_ids": source_ids,
+                "fee_coin_ids": fee_ids,
+                "source_amount_mojos": sum(
+                    int(item["amount_mojos"]) for item in source_rows
+                ),
+                "claimed_at": row["claimed_at"],
+                "dispatched_at": row["dispatched_at"],
+                "resolution_outcome": row["resolution_outcome"],
+                "resolved_at": row["resolved_at"],
+                "output_candidates": [
+                    {
+                        "coin_id": item["coin_id"],
+                        "amount_mojos": int(item["amount_mojos"]),
+                        "first_seen": item["first_seen"],
+                    }
+                    for item in output_rows
+                ],
+            }
+        )
+    return candidates
 
 
 def record_coin_prep_operation_outcome(
@@ -26946,7 +27272,7 @@ def get_retryable_failed_offer_cancels() -> List[Dict[str, Any]]:
               ON latest.operation_id = journal.operation_id
              AND latest.latest_sequence = journal.sequence
             WHERE journal.operation_type='CANCEL'
-              AND journal.phase='FINALIZED'
+              AND journal.phase IN ('FINALIZED', 'RECONCILED')
               AND journal.outcome='CANCEL_FAILED'
               AND journal.blocks_mutation=0
             ORDER BY journal.sequence
@@ -26965,7 +27291,7 @@ def get_retryable_failed_offer_cancels() -> List[Dict[str, Any]]:
             event_id=event["event_id"],
             trade_id=evidence.get("trade_id"),
             attempt=event["attempt"],
-            phase="FINALIZED",
+            phase=event["phase"],
         )
         candidates.append({**event, "trade_id": trade_id})
     return candidates
@@ -29466,7 +29792,8 @@ def retire_expired_dead_runtime_lease_at_startup(
     Hard termination can leave the durable lease marked active even though its
     owner no longer exists. Startup recovery cannot safely mutate publication
     or wallet journals while that stale bit remains set. This transition is
-    deliberately narrow: the safety latch must be resolved, the lease must be
+    deliberately narrow: the safety latch must be resolved or identify one of
+    the exact read-only-observable Coin Prep recovery states, the lease must be
     expired, the caller must have decisive OS liveness evidence, and every
     predecessor field is compare-and-set under the same write transaction.
     """
@@ -29482,7 +29809,7 @@ def retire_expired_dead_runtime_lease_at_startup(
     try:
         conn.execute("BEGIN IMMEDIATE")
         latch = conn.execute(
-            "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
+            "SELECT state, reason_code FROM runtime_safety_latch WHERE singleton_id=1"
         ).fetchone()
         lease_row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
@@ -29497,7 +29824,17 @@ def retire_expired_dead_runtime_lease_at_startup(
 
         if prior_owner_liveness_proven_dead is not True:
             return unchanged("prior_owner_liveness_unproven")
-        if latch["state"] != "resolved":
+        recovery_latch_reasons = {
+            "COIN_PREP_EFFECT_UNKNOWN",
+            "COIN_PREP_RECOVERY_REQUIRED",
+            "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
+            "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+        }
+        latch_permits_recovery_takeover = (
+            latch["state"] == "tripped"
+            and latch["reason_code"] in recovery_latch_reasons
+        )
+        if latch["state"] != "resolved" and not latch_permits_recovery_takeover:
             return unchanged("safety_latch_not_resolved")
         if not bool(current.get("active")):
             return unchanged("lease_not_active")
@@ -29532,8 +29869,22 @@ def retire_expired_dead_runtime_lease_at_startup(
             WHERE singleton_id=1 AND active=1 AND lease_version=?
               AND owner_run_id=? AND owner_pid=? AND owner_host=?
               AND expires_at=?
-              AND (SELECT state FROM runtime_safety_latch
-                   WHERE singleton_id=1)='resolved'
+              AND EXISTS (
+                  SELECT 1 FROM runtime_safety_latch
+                  WHERE singleton_id=1
+                    AND (
+                        state='resolved'
+                        OR (
+                            state='tripped'
+                            AND reason_code IN (
+                                'COIN_PREP_EFFECT_UNKNOWN',
+                                'COIN_PREP_RECOVERY_REQUIRED',
+                                'WALLET_EFFECT_SUBMITTED_UNRECONCILED',
+                                'WALLET_EFFECT_UNKNOWN_UNRECONCILED'
+                            )
+                        )
+                    )
+              )
             """,
             (
                 at,

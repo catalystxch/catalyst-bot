@@ -63,6 +63,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         ].get_spendable_coin_count(wallet_id)
         fake_wallet.get_pending_transactions = lambda: []
         fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
+        fake_wallet.estimate_unsigned_transaction_cost = lambda *args, **kwargs: None
         fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
             "success": True
         }

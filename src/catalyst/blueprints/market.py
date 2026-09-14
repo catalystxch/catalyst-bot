@@ -1036,6 +1036,44 @@ def api_market_summary():
     except Exception:
         pass
 
+    # While the bot is running, MarketIntel already owns a current,
+    # attributable Dexie v1 snapshot.  Reuse it for the dashboard instead of
+    # issuing four duplicate offer-book requests every 30 seconds.  The
+    # ticker request above remains useful for 24h volume and last-trade price.
+    cached_orderbook_used = False
+    try:
+        bot = api_server.bot
+        market_intel = bot.market_intel if bot and bot.is_running() else None
+        if market_intel is not None:
+            cached = market_intel.get_market_summary() or {}
+            refreshes = int(cached.get("orderbook_refreshes", 0) or 0)
+            age = float(cached.get("orderbook_age_secs"))
+            refresh_interval = float(
+                getattr(market_intel, "_orderbook_refresh_interval", 30) or 30
+            )
+            if refreshes > 0 and 0 <= age <= max(60.0, refresh_interval * 3):
+                bid = Decimal(
+                    str(cached.get("overall_best_bid") or cached.get("best_bid") or 0)
+                )
+                ask = Decimal(
+                    str(cached.get("overall_best_ask") or cached.get("best_ask") or 0)
+                )
+                buy_depth = Decimal(
+                    str(cached.get("dexie_total_buy_depth_xch") or 0)
+                )
+                sell_depth = Decimal(
+                    str(cached.get("dexie_total_sell_depth_xch") or 0)
+                )
+                if bid.is_finite() and bid > 0:
+                    result["best_bid"] = float(bid)
+                if ask.is_finite() and ask > 0:
+                    result["best_ask"] = float(ask)
+                if buy_depth.is_finite() and sell_depth.is_finite():
+                    result["dexie_depth_xch"] = float(buy_depth + sell_depth)
+                cached_orderbook_used = True
+    except (AttributeError, InvalidOperation, TypeError, ValueError):
+        cached_orderbook_used = False
+
     def _extract_xch_per_cat(offer, cat_id):
         """Extract XCH/CAT price from a Dexie v1 offer's amounts."""
         xch_amt = 0.0
@@ -1052,86 +1090,87 @@ def api_market_summary():
             return xch_amt / cat_amt
         return 0.0
 
-    try:
-        _record_api_call("dexie", "/v1/offers")
-        resp = _req.get(
-            f"{dexie_base}/v1/offers",
-            params={
-                "offered": asset_id,
-                "requested": "xch",
-                "status": 0,
-                "page_size": 3,
-                "sort": "price_asc",
-            },
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            for offer in resp.json().get("offers", []):
-                p = _extract_xch_per_cat(offer, asset_id)
-                if p > 0:
-                    result["best_ask"] = p
-                    break
+    if not cached_orderbook_used:
+        try:
+            _record_api_call("dexie", "/v1/offers")
+            resp = _req.get(
+                f"{dexie_base}/v1/offers",
+                params={
+                    "offered": asset_id,
+                    "requested": "xch",
+                    "status": 0,
+                    "page_size": 3,
+                    "sort": "price_asc",
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for offer in resp.json().get("offers", []):
+                    p = _extract_xch_per_cat(offer, asset_id)
+                    if p > 0:
+                        result["best_ask"] = p
+                        break
 
-        _record_api_call("dexie", "/v1/offers")
-        resp = _req.get(
-            f"{dexie_base}/v1/offers",
-            params={
-                "offered": "xch",
-                "requested": asset_id,
-                "status": 0,
-                "page_size": 3,
-                "sort": "price_asc",
-            },
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            for offer in resp.json().get("offers", []):
-                p = _extract_xch_per_cat(offer, asset_id)
-                if p > 0:
-                    result["best_bid"] = p
-                    break
-    except Exception:
-        pass
+            _record_api_call("dexie", "/v1/offers")
+            resp = _req.get(
+                f"{dexie_base}/v1/offers",
+                params={
+                    "offered": "xch",
+                    "requested": asset_id,
+                    "status": 0,
+                    "page_size": 3,
+                    "sort": "price_asc",
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for offer in resp.json().get("offers", []):
+                    p = _extract_xch_per_cat(offer, asset_id)
+                    if p > 0:
+                        result["best_bid"] = p
+                        break
+        except Exception:
+            pass
 
-    try:
-        dexie_total_xch = 0.0
-        _record_api_call("dexie", "/v1/offers")
-        resp = _req.get(
-            f"{dexie_base}/v1/offers",
-            params={
-                "offered": asset_id,
-                "requested": "xch",
-                "status": 0,
-                "page_size": 50,
-            },
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            for offer in resp.json().get("offers", []):
-                for asset in offer.get("requested", []):
-                    if str(asset.get("code", "")).upper() == "XCH":
-                        dexie_total_xch += float(asset.get("amount", 0) or 0)
+        try:
+            dexie_total_xch = 0.0
+            _record_api_call("dexie", "/v1/offers")
+            resp = _req.get(
+                f"{dexie_base}/v1/offers",
+                params={
+                    "offered": asset_id,
+                    "requested": "xch",
+                    "status": 0,
+                    "page_size": 50,
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for offer in resp.json().get("offers", []):
+                    for asset in offer.get("requested", []):
+                        if str(asset.get("code", "")).upper() == "XCH":
+                            dexie_total_xch += float(asset.get("amount", 0) or 0)
 
-        _record_api_call("dexie", "/v1/offers")
-        resp = _req.get(
-            f"{dexie_base}/v1/offers",
-            params={
-                "offered": "xch",
-                "requested": asset_id,
-                "status": 0,
-                "page_size": 50,
-            },
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            for offer in resp.json().get("offers", []):
-                for asset in offer.get("offered", []):
-                    if str(asset.get("code", "")).upper() == "XCH":
-                        dexie_total_xch += float(asset.get("amount", 0) or 0)
+            _record_api_call("dexie", "/v1/offers")
+            resp = _req.get(
+                f"{dexie_base}/v1/offers",
+                params={
+                    "offered": "xch",
+                    "requested": asset_id,
+                    "status": 0,
+                    "page_size": 50,
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for offer in resp.json().get("offers", []):
+                    for asset in offer.get("offered", []):
+                        if str(asset.get("code", "")).upper() == "XCH":
+                            dexie_total_xch += float(asset.get("amount", 0) or 0)
 
-        result["dexie_depth_xch"] = round(dexie_total_xch, 2)
-    except Exception:
-        pass
+            result["dexie_depth_xch"] = round(dexie_total_xch, 2)
+        except Exception:
+            pass
 
     bb = result["best_bid"]
     ba = result["best_ask"]

@@ -1234,6 +1234,124 @@ def test_ambiguous_equal_amount_purposes_stay_latched_with_zero_capacity(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
+def test_startup_recovers_exact_v13121_unjournaled_xch_consolidation(monkeypatch):
+    """Startup adopts and confirms the old XCH combine without replaying it."""
+
+    import coin_prep_worker
+
+    fingerprint = 123456789
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    sources = sorted(
+        [
+            hashlib.sha256(b"startup-legacy-source-a").hexdigest(),
+            hashlib.sha256(b"startup-legacy-source-b").hexdigest(),
+        ]
+    )
+    output = hashlib.sha256(b"startup-legacy-output").hexdigest()
+    candidate = {
+        "claim_token": "c" * 64,
+        "generation": 1,
+        "wallet_fingerprint_hash": wallet_hash,
+        "network": "mainnet",
+        "source_coin_ids": sources,
+        "fee_coin_ids": sources,
+        "source_amount_mojos": 1200,
+        "dispatched_at": "2026-08-21T11:59:59.000000Z",
+        "resolution_outcome": "SUBMITTED",
+        "output_candidates": [
+            {
+                "coin_id": output,
+                "amount_mojos": 1187,
+                "first_seen": "2026-08-21 12:00:00.500000",
+            }
+        ],
+    }
+    snapshots = iter(
+        [
+            {
+                "success": True,
+                "backend": "sage",
+                "name": "Task 12 Wallet",
+                "fingerprint": fingerprint,
+                "network_id": "mainnet",
+                "kind": "bls",
+                "has_secrets": True,
+                "observed_at_utc": "2026-08-21T12:00:00.000000Z",
+            },
+            {
+                "success": True,
+                "backend": "sage",
+                "name": "Task 12 Wallet",
+                "fingerprint": fingerprint,
+                "network_id": "mainnet",
+                "kind": "bls",
+                "has_secrets": True,
+                "observed_at_utc": "2026-08-21T12:00:00.000000Z",
+            },
+            {
+                "success": True,
+                "backend": "sage",
+                "name": "Task 12 Wallet",
+                "fingerprint": fingerprint,
+                "network_id": "mainnet",
+                "kind": "bls",
+                "has_secrets": True,
+                "observed_at_utc": "2026-08-21T12:00:01.000000Z",
+            },
+        ]
+    )
+    recorded = []
+    monkeypatch.setattr(
+        mutation_gate,
+        "_utc_now",
+        lambda: datetime(2026, 8, 21, 12, 0, 1, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "get_recoverable_legacy_sage_consolidations",
+        lambda: [candidate],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        coin_prep_worker, "get_wallet_identity", lambda: next(snapshots)
+    )
+    monkeypatch.setattr(coin_prep_worker, "get_pending_transactions", lambda: [])
+    monkeypatch.setattr(
+        coin_prep_worker, "get_effective_transaction_fee_mojos", lambda: 13
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "adopt_legacy_submitted_topup_coin_prep_operation",
+        lambda **kwargs: {
+            "operation": {"operation_id": "coin-prep:legacy-xch-combine"}
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "record_coin_prep_operation_outcome",
+        lambda operation_id, **kwargs: recorded.append((operation_id, kwargs)) or {},
+    )
+    worker = coin_prep_worker.CoinPrepWorker.__new__(
+        coin_prep_worker.CoinPrepWorker
+    )
+    worker.is_sage = True
+    worker.xch_wallet_id = 1
+    worker.log = lambda *_args, **_kwargs: None
+    worker._get_confirmed_owned_coins_via_rpc = lambda *_args: [
+        {"coin_id": output, "amount_mojos": 1187, "created_height": 123}
+    ]
+
+    assert coin_prep_worker._recover_legacy_sage_consolidation(worker) is True
+    assert recorded[0][0] == "coin-prep:legacy-xch-combine"
+    assert recorded[0][1]["outcome"] == "CONFIRMED"
+    evidence = recorded[0][1]["evidence_json"]
+    assert evidence["source_coin_ids"] == sources
+    assert evidence["expected_outputs"] == [
+        {"coin_id": output, "amount_mojos": 1187, "purpose": "top_up"}
+    ]
+
+
 def test_reserving_selected_coins_derives_one_exact_non_null_purpose(
     isolated_database,
 ):

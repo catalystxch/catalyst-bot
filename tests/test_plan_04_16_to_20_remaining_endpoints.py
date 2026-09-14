@@ -419,6 +419,77 @@ class TestMarketSummary(_FlaskBase):
         self.assertEqual(first.get_json(), second.get_json())
         self.assertEqual(len(calls), 5)
 
+    def test_running_bot_reuses_fresh_orderbook_instead_of_four_extra_dexie_calls(self):
+        """Dashboard polling must reuse the bot's already-fetched attributable book."""
+        asset_id = "runningcache123cat"
+        original_cat = dict(api_server._active_cat)
+        original_cache = dict(market_blueprint._MARKET_SUMMARY_CACHE)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "RUNNING_XCH",
+                "decimals": 3,
+                "name": "RUNNING",
+            }
+        )
+        market_blueprint._MARKET_SUMMARY_CACHE.update(
+            key=None, expires_at=0.0, payload={}
+        )
+
+        bot = _make_bot()
+        bot.market_intel.get_market_summary.return_value = {
+            "overall_best_bid": "0.010",
+            "overall_best_ask": "0.014",
+            "dexie_total_buy_depth_xch": "5.25",
+            "dexie_total_sell_depth_xch": "6.75",
+            "orderbook_refreshes": 3,
+            "orderbook_age_secs": 2.0,
+        }
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "tickers": [
+                        {
+                            "current_avg_price": "0.011",
+                            "target_volume": "42.5",
+                            "bid": "0.009",
+                            "ask": "0.015",
+                        }
+                    ]
+                }
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((str(url), dict(params or {})))
+            return FakeResponse()
+
+        try:
+            with (
+                patch.object(api_server, "bot", bot),
+                patch("requests.get", side_effect=fake_get),
+            ):
+                body = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                ).get_json()
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+            market_blueprint._MARKET_SUMMARY_CACHE.clear()
+            market_blueprint._MARKET_SUMMARY_CACHE.update(original_cache)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/v2/prices/tickers", calls[0][0])
+        self.assertEqual(body["best_bid"], 0.01)
+        self.assertEqual(body["best_ask"], 0.014)
+        self.assertEqual(body["mid_price"], 0.012)
+        self.assertEqual(body["dexie_depth_xch"], 12.0)
+        self.assertEqual(body["volume_24h"], 42.5)
+
 
 # ---------------------------------------------------------------------------
 # 04-17: GET /api/spacescan/status + POST /api/spacescan/setup

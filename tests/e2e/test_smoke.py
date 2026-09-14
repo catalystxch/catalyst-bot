@@ -512,6 +512,57 @@ def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
     )
 
 
+def test_smart_advisor_accepts_confidence_capped_ladder_as_complete(page):
+    """Advisor compares live depth with effective targets, not configured ceilings."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            bot_state = {
+                running: true,
+                pricing: { mid: '0.0001' },
+                chia_health: { wallet_reachable: true },
+            };
+            window.saUpdateAdvisor({
+                settings: {
+                    trading: { max_active_buy: 45, max_active_sell: 45 },
+                    spreads: {
+                        base_spread_bps: '800',
+                        min_spread_bps: '100',
+                        max_spread_bps: '1500',
+                    },
+                    safety: { xch_reserve: '0', cat_reserve: '0' },
+                    inventory: { max_position_xch: '5' },
+                    features: { inventory_mgmt: true },
+                },
+                performance: {
+                    loop_count: 6,
+                    open_buys: 11,
+                    open_sells: 11,
+                    uptime_secs: 600,
+                    total_fills: 0,
+                },
+                market_health: {
+                    status: 'green',
+                    message: 'Market healthy — bot operating normally',
+                    metrics: {
+                        effective_buy_target: 11,
+                        effective_sell_target: 11,
+                        market_intel_state: 'ready',
+                        buy_spread_bps: '400',
+                        sell_spread_bps: '400',
+                    },
+                },
+                wallet: {},
+                coins: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#saList")).not_to_contain_text("Building the live ladder")
+
+
 def test_dashboard_market_health_uses_authoritative_confidence_snapshot(page):
     """Health cards must use the durable confidence snapshot, not legacy AMM fields."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
