@@ -117,11 +117,7 @@ def get_transaction_relay_outcome(transaction_id: str) -> dict:
 def _relay_rejection_reason(value: dict) -> str:
     if type(value) is not dict:
         return "SAGE_RELAY_REJECTED"
-    return str(
-        value.get("error")
-        or value.get("reason_code")
-        or "SAGE_RELAY_REJECTED"
-    )
+    return str(value.get("error") or value.get("reason_code") or "SAGE_RELAY_REJECTED")
 
 
 def tier_requires_split(count: int) -> bool:
@@ -2708,9 +2704,7 @@ class CoinPrepWorker:
                     fee_mojos=relay_safe_fee,
                     max_asset_inputs=constraints.max_asset_inputs,
                     max_outputs=constraints.max_outputs,
-                    allow_bounded_prerequisite=(
-                        constraints.allow_bounded_prerequisite
-                    ),
+                    allow_bounded_prerequisite=(constraints.allow_bounded_prerequisite),
                 )
                 plan = plan_batch(snapshot, targets, scaled_constraints)
             if (
@@ -11458,8 +11452,7 @@ def _recover_legacy_sage_consolidation(worker: CoinPrepWorker) -> bool:
                 return False
             by_id[coin_id] = amount
         sources = sorted(
-            worker._canonical_coin_id(value)
-            for value in candidate["source_coin_ids"]
+            worker._canonical_coin_id(value) for value in candidate["source_coin_ids"]
         )
         fees = sorted(
             worker._canonical_coin_id(value) for value in candidate["fee_coin_ids"]
@@ -11476,6 +11469,7 @@ def _recover_legacy_sage_consolidation(worker: CoinPrepWorker) -> bool:
         ):
             return False
         expected_amount = source_amount - fee_mojos
+
         def _stored_utc(value: str) -> datetime:
             if type(value) is not str:
                 raise ValueError("legacy recovery timestamp must be text")

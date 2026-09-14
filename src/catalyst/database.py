@@ -20709,7 +20709,9 @@ def _prepare_offer_cancel_in_transaction(
             cursor = 0
             for prior_attempt in range(1, safe_attempt):
                 if cursor + 2 > len(prior_events):
-                    raise ValueError("cancellation attempt must follow exact prior failed")
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
                 prepared_prior, finalized_prior = prior_events[cursor : cursor + 2]
                 cursor += 2
                 if (
@@ -20729,7 +20731,9 @@ def _prepare_offer_cancel_in_transaction(
                 if direct_failure:
                     continue
                 if cursor >= len(prior_events):
-                    raise ValueError("cancellation attempt must follow exact prior failed")
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
                 reconciled_prior = prior_events[cursor]
                 cursor += 1
                 if (

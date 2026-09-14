@@ -908,9 +908,7 @@ def api_cancel_all():
                             _cancel_kwargs["_retry_failed_attempts"] = (
                                 _batch_retry_attempts
                             )
-                        durable_manager.cancel_offers(
-                            _batch_targets, **_cancel_kwargs
-                        )
+                        durable_manager.cancel_offers(_batch_targets, **_cancel_kwargs)
                         _batch_terminal_ids = _authoritatively_terminal_offer_ids(
                             _batch_targets
                         )
@@ -920,8 +918,8 @@ def api_cancel_all():
                             # cancellation, trip the mutation latch, and make the
                             # next cohort fail with UNRESOLVED_OPERATIONS.
                             durable_manager.retry_failed_cancels(_batch_targets)
-                            _batch_terminal_ids = (
-                                _authoritatively_terminal_offer_ids(_batch_targets)
+                            _batch_terminal_ids = _authoritatively_terminal_offer_ids(
+                                _batch_targets
                             )
                             _terminal_ids = _authoritatively_terminal_offer_ids(
                                 _cancel_open_ids
@@ -2439,9 +2437,7 @@ def api_pnl():
         return server._api_exception(request.path)
 
 
-def _cancel_all_deadline_seconds(
-    offer_count, per_offer_wait_seconds, *, batch_count=1
-):
+def _cancel_all_deadline_seconds(offer_count, per_offer_wait_seconds, *, batch_count=1):
     """Bound sequential native batches plus authoritative reconciliation."""
     # Each fee-safe Sage cohort needs its own confirmation window, while every
     # offer still needs an individual durable terminal-proof commit.

@@ -190,9 +190,7 @@ def test_cancel_all_deadline_bounds_bulk_proof_recording_without_multi_hour_wait
     assert offers._cancel_all_deadline_seconds(71, 90) == 880.0
     assert offers._cancel_all_deadline_seconds(500, 90) == 3_600.0
     assert offers._cancel_all_deadline_seconds(1, 240) == 480.0
-    assert (
-        offers._cancel_all_deadline_seconds(22, 90, batch_count=6) == 1_290.0
-    )
+    assert offers._cancel_all_deadline_seconds(22, 90, batch_count=6) == 1_290.0
 
 
 def test_cancel_all_balances_fee_safe_batches_without_single_member_tail():
@@ -204,8 +202,12 @@ def test_cancel_all_balances_fee_safe_batches_without_single_member_tail():
 
     assert [len(batch) for batch in batches] == [4, 4, 4, 4, 3, 3]
     assert [trade_id for batch in batches for trade_id in batch] == trade_ids
-    assert [len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:10], 4)] == [4, 3, 3]
-    assert [len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:5], 4)] == [3, 2]
+    assert [
+        len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:10], 4)
+    ] == [4, 3, 3]
+    assert [
+        len(batch) for batch in offers._balanced_cancel_batches(trade_ids[:5], 4)
+    ] == [3, 2]
 
 
 def test_cancel_all_gui_timeout_honours_backend_authoritative_deadline():
@@ -1221,8 +1223,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch(
@@ -1292,8 +1293,7 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"}
-                    for trade_id in trade_ids
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
                 ],
             ),
             patch(

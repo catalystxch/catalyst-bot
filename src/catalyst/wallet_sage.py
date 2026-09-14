@@ -53,7 +53,7 @@ _SAGE_RELAY_SUBMIT_RE = re.compile(
     r"Submitting transaction with id ([0-9a-f]{64})(?::|\s)", re.IGNORECASE
 )
 _SAGE_RELAY_REJECT_RE = re.compile(
-    r'Transaction inclusion in mempool failed for all peers with status \d+ '
+    r"Transaction inclusion in mempool failed for all peers with status \d+ "
     r'and error Some\("([A-Z][A-Z0-9_]{2,63})"\), removing transaction'
 )
 _SAGE_RELAY_SUCCESS = "Transaction inclusion in mempool successful"
@@ -139,7 +139,9 @@ def _candidate_sage_relay_log_paths() -> List[str]:
     elif sys.platform == "darwin":
         roots.extend(
             [
-                os.path.expanduser("~/Library/Application Support/com.rigidnetwork.sage"),
+                os.path.expanduser(
+                    "~/Library/Application Support/com.rigidnetwork.sage"
+                ),
                 os.path.expanduser("~/Library/Application Support/Sage"),
             ]
         )
@@ -155,8 +157,14 @@ def _candidate_sage_relay_log_paths() -> List[str]:
     for root in roots:
         for directory in (root, os.path.join(root, "log"), os.path.join(root, "logs")):
             candidates.extend(glob.glob(os.path.join(directory, "app.log*")))
-    unique = {os.path.normcase(os.path.realpath(path)): path for path in candidates if os.path.isfile(path)}
-    return sorted(unique.values(), key=lambda path: os.path.getmtime(path), reverse=True)[:4]
+    unique = {
+        os.path.normcase(os.path.realpath(path)): path
+        for path in candidates
+        if os.path.isfile(path)
+    }
+    return sorted(
+        unique.values(), key=lambda path: os.path.getmtime(path), reverse=True
+    )[:4]
 
 
 def get_transaction_relay_outcome(transaction_id: str) -> Dict[str, str]:

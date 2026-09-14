@@ -1058,12 +1058,8 @@ def api_market_summary():
                 ask = Decimal(
                     str(cached.get("overall_best_ask") or cached.get("best_ask") or 0)
                 )
-                buy_depth = Decimal(
-                    str(cached.get("dexie_total_buy_depth_xch") or 0)
-                )
-                sell_depth = Decimal(
-                    str(cached.get("dexie_total_sell_depth_xch") or 0)
-                )
+                buy_depth = Decimal(str(cached.get("dexie_total_buy_depth_xch") or 0))
+                sell_depth = Decimal(str(cached.get("dexie_total_sell_depth_xch") or 0))
                 if bid.is_finite() and bid > 0:
                     result["best_bid"] = float(bid)
                 if ask.is_finite() and ask > 0:

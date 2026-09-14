@@ -3479,7 +3479,9 @@ def test_all_peer_rejected_bulk_cancel_is_reconciled_and_retryable(
     database.trip_runtime_safety_latch(
         reason_code="UNRESOLVED_OPERATIONS",
         reason="test",
-        blocking_operation_ids=[member["operation_id"] for member in manifest["members"]],
+        blocking_operation_ids=[
+            member["operation_id"] for member in manifest["members"]
+        ],
         wallet_fingerprint_hash="f" * 64,
         network="mainnet",
     )
@@ -3505,7 +3507,9 @@ def test_all_peer_rejected_bulk_cancel_is_reconciled_and_retryable(
         "RECONCILED",
     ]
     assert database.get_runtime_safety_latch()["state"] == "resolved"
-    assert [row["trade_id"] for row in database.get_retryable_failed_offer_cancels()] == trade_ids
+    assert [
+        row["trade_id"] for row in database.get_retryable_failed_offer_cancels()
+    ] == trade_ids
 
 
 def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(

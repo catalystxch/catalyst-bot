@@ -491,9 +491,7 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
             "purpose": "top_up",
         }
     ]
-    assert designated == [
-        ((CHANGE, "reserve", "none"), {"purpose": "top_up"})
-    ]
+    assert designated == [((CHANGE, "reserve", "none"), {"purpose": "top_up"})]
 
 
 def test_top_up_purpose_repairs_stale_tier_designation(monkeypatch):
@@ -535,9 +533,7 @@ def test_top_up_purpose_repairs_stale_tier_designation(monkeypatch):
 
     assert inventory["reserve"] == [record]
     assert inventory["inner"] == []
-    assert designated == [
-        ((coin_id, "reserve", "none"), {"purpose": "top_up"})
-    ]
+    assert designated == [((coin_id, "reserve", "none"), {"purpose": "top_up"})]
 
 
 def test_runtime_absorb_journals_and_confirms_exact_combined_output(monkeypatch):

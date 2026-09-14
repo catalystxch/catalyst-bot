@@ -765,7 +765,11 @@ class FeeCoinPool:
 
         with self._lock:
             return max(
-                (amount for cid, amount in self._available if cid not in self._reserved),
+                (
+                    amount
+                    for cid, amount in self._available
+                    if cid not in self._reserved
+                ),
                 default=0,
             )
 
@@ -4263,9 +4267,7 @@ class CoinManager:
             # ---- Refresh fee coin pool for this cycle ----
             # Must happen AFTER classification so _xch_inventory["fees"] is current.
             self.fee_pool.refresh(
-                _authoritative_fee_reserve_records(
-                    self._xch_inventory.get("fees", [])
-                )
+                _authoritative_fee_reserve_records(self._xch_inventory.get("fees", []))
             )
 
         except Exception as e:
@@ -5186,9 +5188,7 @@ class CoinManager:
         if self._fee_pool_enabled():
             fee_target = get_fee_pool_count()
             fee_have = len(
-                _authoritative_fee_reserve_records(
-                    self._xch_inventory.get("fees", [])
-                )
+                _authoritative_fee_reserve_records(self._xch_inventory.get("fees", []))
             )
             # F67: Count locked fee coins too — same as snipers, a fee coin
             # locked in an active offer is still part of the pool.
@@ -6294,20 +6294,12 @@ class CoinManager:
         return {
             "buy": max(
                 0,
-                int(
-                    targets.get(
-                        "buy", getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 0)
-                    )
-                    or 0
-                ),
+                int(targets.get("buy", getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 0)) or 0),
             ),
             "sell": max(
                 0,
                 int(
-                    targets.get(
-                        "sell", getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0)
-                    )
-                    or 0
+                    targets.get("sell", getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0)) or 0
                 ),
             ),
         }
@@ -6604,9 +6596,7 @@ class CoinManager:
             if cfg.TIER_ENABLED:
                 live_offer_targets = self._get_live_offer_targets()
                 max_buy_for_priority = int(live_offer_targets.get("buy", 0) or 0)
-                max_sell_for_priority = int(
-                    live_offer_targets.get("sell", 0) or 0
-                )
+                max_sell_for_priority = int(live_offer_targets.get("sell", 0) or 0)
                 xch_dist_for_priority = get_tier_distribution(
                     max_buy_for_priority, side="xch"
                 )

@@ -3257,11 +3257,15 @@ def test_legacy_xch_consolidation_inventory_is_exact_and_bounded(
     )
     monkeypatch.setattr(database, "_now", lambda: AFTER)
     assert database.upsert_coin(output, "xch", 1187, purpose=None)
-    output_row = database.get_connection().execute(
-        "SELECT coin_id, wallet_type, amount_mojos, status, trade_id, first_seen "
-        "FROM coins WHERE coin_id=?",
-        (database.norm_coin_id(output),),
-    ).fetchone()
+    output_row = (
+        database.get_connection()
+        .execute(
+            "SELECT coin_id, wallet_type, amount_mojos, status, trade_id, first_seen "
+            "FROM coins WHERE coin_id=?",
+            (database.norm_coin_id(output),),
+        )
+        .fetchone()
+    )
     assert dict(output_row) == {
         "coin_id": database.norm_coin_id(output),
         "wallet_type": "xch",

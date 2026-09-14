@@ -1281,10 +1281,14 @@ def get_transaction_relay_outcome(transaction_id: str):
         result = callback(transaction_id)
     except Exception:
         return {"status": "unknown", "transaction_id": str(transaction_id or "")}
-    return result if type(result) is dict else {
-        "status": "unknown",
-        "transaction_id": str(transaction_id or ""),
-    }
+    return (
+        result
+        if type(result) is dict
+        else {
+            "status": "unknown",
+            "transaction_id": str(transaction_id or ""),
+        }
+    )
 
 
 def get_next_address(wallet_id: int = WALLET_ID_XCH, new_address: bool = True):

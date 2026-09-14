@@ -1332,9 +1332,7 @@ def test_startup_recovers_exact_v13121_unjournaled_xch_consolidation(monkeypatch
         "record_coin_prep_operation_outcome",
         lambda operation_id, **kwargs: recorded.append((operation_id, kwargs)) or {},
     )
-    worker = coin_prep_worker.CoinPrepWorker.__new__(
-        coin_prep_worker.CoinPrepWorker
-    )
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
     worker.is_sage = True
     worker.xch_wallet_id = 1
     worker.log = lambda *_args, **_kwargs: None

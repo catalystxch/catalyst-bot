@@ -221,8 +221,8 @@ def test_direct_batch_replans_with_relay_safe_fee_for_many_actions(monkeypatch):
         )
     )
     worker._direct_batch_snapshot = lambda _targets: next(snapshots)
-    worker._direct_batch_exact_relay_safe_fee_mojos = (
-        lambda _plan, _address: 3_881_141_382
+    worker._direct_batch_exact_relay_safe_fee_mojos = lambda _plan, _address: (
+        3_881_141_382
     )
     submitted = []
     worker._submit_direct_batch_plan = lambda plan, _address: (
@@ -264,8 +264,8 @@ def test_direct_batch_never_submits_when_exact_fee_does_not_converge(monkeypatch
 
     monkeypatch.setattr(coin_prep_batch_plan, "plan_batch", changing_plan)
     worker._direct_batch_relay_safe_fee_mojos = lambda plan: plan.fee_mojos
-    worker._direct_batch_exact_relay_safe_fee_mojos = (
-        lambda plan, _address: plan.fee_mojos + 1
+    worker._direct_batch_exact_relay_safe_fee_mojos = lambda plan, _address: (
+        plan.fee_mojos + 1
     )
     submitted = []
     worker._submit_direct_batch_plan = lambda plan, _address: submitted.append(plan)

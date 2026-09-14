@@ -6716,7 +6716,9 @@ class OfferManager:
             for prior_attempt in range(1, latest_attempt):
                 prior_group = grouped[prior_attempt]
                 if len(prior_group) not in {2, 3}:
-                    raise ValueError("cancellation attempts are not contiguous failures")
+                    raise ValueError(
+                        "cancellation attempts are not contiguous failures"
+                    )
                 prior_prepared, prior_finalized = prior_group[:2]
                 if (
                     prior_prepared["attempt"] != prior_attempt
@@ -7002,8 +7004,7 @@ class OfferManager:
                         or events[1]["outcome"]
                         not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
                         or events[1]["blocks_mutation"] != 1
-                        or events[1]["transaction_id"]
-                        != finalized["transaction_id"]
+                        or events[1]["transaction_id"] != finalized["transaction_id"]
                         or type(final_evidence.get("relay_rejection")) is not dict
                     )
                 )
@@ -8667,7 +8668,9 @@ class OfferManager:
 
         try:
             exact_manifest = database.validate_offer_cancel_cohort_manifest(manifest)
-            finalized = [database.validate_offer_operation_event(row) for row in blockers]
+            finalized = [
+                database.validate_offer_operation_event(row) for row in blockers
+            ]
             transaction_ids = {event["transaction_id"] for event in finalized}
             if len(transaction_ids) != 1 or None in transaction_ids:
                 return None
@@ -8681,7 +8684,10 @@ class OfferManager:
             prepared = database.get_offer_cancel_cohort_prepared_events(
                 exact_manifest["cohort_id"]
             )
-            if type(prepared) is not list or len(prepared) != exact_manifest["member_count"]:
+            if (
+                type(prepared) is not list
+                or len(prepared) != exact_manifest["member_count"]
+            ):
                 return False
             prepared_by_operation = {
                 event["operation_id"]: database.validate_offer_operation_event(event)
@@ -8703,7 +8709,10 @@ class OfferManager:
             expected_record_ids = {"0x" + coin_id for coin_id in claimed_ids}
             if type(records) is not dict or not expected_record_ids.issubset(records):
                 return False
-            if any(records[coin_id].get("spent_height") is not None for coin_id in expected_record_ids):
+            if any(
+                records[coin_id].get("spent_height") is not None
+                for coin_id in expected_record_ids
+            ):
                 return False
             for trade_id, source_id in zip(batch["trade_ids"], source_ids):
                 offer_id = records["0x" + source_id].get("offer_id")
@@ -8719,9 +8728,16 @@ class OfferManager:
             for item in pending:
                 if type(item) is not dict:
                     return False
-                pending_id = str(
-                    item.get("transaction_id") or item.get("tx_id") or item.get("id") or ""
-                ).lower().removeprefix("0x")
+                pending_id = (
+                    str(
+                        item.get("transaction_id")
+                        or item.get("tx_id")
+                        or item.get("id")
+                        or ""
+                    )
+                    .lower()
+                    .removeprefix("0x")
+                )
                 if pending_id == transaction_id:
                     return False
 
@@ -8749,7 +8765,9 @@ class OfferManager:
             runtime = mutation_gate.current_runtime()
             if runtime is None:
                 return False
-            operation_ids = [member["operation_id"] for member in exact_manifest["members"]]
+            operation_ids = [
+                member["operation_id"] for member in exact_manifest["members"]
+            ]
             released = runtime.release_resolved(generation, operation_ids)
             runtime_status = runtime.status()
             resolved = bool(
