@@ -9220,7 +9220,7 @@
                     <!-- ===== HERO STRIP: Key numbers at a glance ===== -->
                     <div class="v4-hero-strip" id="heroStrip">
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label">Trusted Mid Price <span class="cc-help">?<span class="cc-tooltip">Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.</span></span></div>
+                            <div class="v4-hero-label" id="heroMidPriceLabel">Trusted Mid Price <span class="cc-help">?<span class="cc-tooltip" id="heroMidPriceTooltip">Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.</span></span></div>
                             <div class="v4-hero-value data-pending" id="heroMidPrice">—</div>
                             <div class="v4-hero-sub data-pending" id="heroSpread">spread —</div>
                             <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 6px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
@@ -12423,7 +12423,7 @@
                     <div class="v4-modal-panel v4-modal-panel--info">
                         <div class="v4-modal-panel-title">What the app does</div>
                         <div class="v4-modal-panel-copy">
-                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, updates confirmed PnL, and progressively withdraws exposure when attributable market evidence degrades. TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives live trading.
+                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, and updates confirmed PnL. Follow mode progressively withdraws exposure when attributable market evidence degrades; an explicitly approved, budget-bound Bootstrap campaign can remain active inside its signed corridor. TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives live trading.
                         </div>
                     </div>
                     <div class="v4-modal-panel">
@@ -12432,7 +12432,7 @@
                             <strong>Public beta release flow</strong> - The website, installer metadata, and in-app update badge now track the current release so testers can download the latest build from one place.<br>
                             <strong>Sage wallet selection</strong> - Startup asks testers to choose the Sage signing wallet/fingerprint on every launch, then runs RPC, version, Spacescan, Splash, Smart Settings, coin prep, and start-guard checks against that wallet.<br>
                             <strong>Offer-book Smart Settings</strong> - Smart Settings derives spread, attributable depth, movement persistence, manipulation limits, reserves, tier sizes, fees, and profitability floors from Dexie, Splash, Sage, and corroborating chain evidence.<br>
-                            <strong>Confidence and degraded recovery</strong> - Green, amber, and red confidence states prevent new exposure when evidence is weak and withdraw inner, middle, then outer offers on a durable 0/3/10-minute schedule.<br>
+                            <strong>Confidence and degraded recovery</strong> - Green, amber, and red confidence states prevent new Follow-mode exposure when evidence is weak and withdraw inner, middle, then outer Follow offers on a durable 0/3/10-minute schedule. Bootstrap remains limited to the exact approved campaign budget, corridor, wallet, asset, and revision.<br>
                             <strong>Coin prep and topup improvements</strong> - Prepared XCH/CAT pools, dedicated fee coins, reserve coins, and topup outputs are classified immediately so live topup does not churn useful coins back into reserve.<br>
                             <strong>Publication discovery</strong> - A submission response is only an acknowledgement. CATalyst requires exact rediscovery through Dexie or Splash before treating an offer as public and active.<br>
                             <strong>Beta feedback and diagnostics</strong> - Debug Bundle, crash reports, and public issue forms are ready for early testers to report bugs or rough edges in the bot repo.<br>
@@ -12579,7 +12579,7 @@
                     <h3 style="color: var(--accent-primary-hover); margin-top: 0;">What does this bot do?</h3>
                     <p>This bot provides automated offer-book liquidity for Chia CAT tokens. Sage is the wallet and transaction authority; Dexie is the primary attributable offer book; Splash supplies optional peer publication and discovery evidence; Coinset and Spacescan provide corroborating chain context.</p>
                     <h3 style="color: var(--accent-primary-hover);">How it works — the cycle</h3>
-                    <p>The bot runs a complete cycle on the configured interval and refreshes attributable offers, publication discovery, Sage state, and corroborating chain evidence. Confidence transitions can freeze creation immediately and progressively withdraw the book without trusting an indexer to mutate the wallet.</p>
+                    <p>The bot runs a complete cycle on the configured interval and refreshes attributable offers, publication discovery, Sage state, and corroborating chain evidence. Confidence transitions can freeze Follow-mode creation immediately and progressively withdraw Follow exposure without trusting an indexer to mutate the wallet. An active Bootstrap campaign follows its separately approved, identity-bound budget and price corridor.</p>
                     <p>Each cycle runs these steps:</p>
                     <ol style="padding-left: 20px;">
                         <li><strong>Build a trusted book</strong> from fresh attributable Dexie and Splash offers, excluding CATalyst's own offers</li>
@@ -23375,6 +23375,25 @@
             const xchWarningEl = document.getElementById('xchReserveWarning');
             const catWarningEl = document.getElementById('catReserveWarning');
 
+            const activeBootstrapMatchesPair = (
+                typeof _bootstrapActiveCampaign !== 'undefined'
+                && _bootstrapActiveCampaign
+                && String(_bootstrapActiveCampaign.asset_id || '').toLowerCase()
+                    === String(settingsCAT?.asset_id || '').toLowerCase()
+            );
+            if (activeBootstrapMatchesPair) {
+                // The durable campaign is the sole sizing authority.  Its exact
+                // XCH/CAT/fee caps are verified by the Bootstrap Coin Prep
+                // preflight, so the obsolete Follow ladder must not reintroduce
+                // reserve blockers after the campaign preview has replaced it.
+                for (const warningEl of [xchWarningEl, catWarningEl]) {
+                    if (!warningEl) continue;
+                    warningEl.style.display = 'none';
+                    warningEl.dataset.critical = 'false';
+                }
+                return;
+            }
+
             if (!pairReady) {
                 if (xchWarningEl) {
                     xchWarningEl.style.display = 'none';
@@ -24009,11 +24028,29 @@
                 .replace(/\.0+$/, '');
         }
 
+        function updateHeroPriceProvenance(confidence = {}) {
+            const label = document.getElementById('heroMidPriceLabel');
+            const tooltip = document.getElementById('heroMidPriceTooltip');
+            if (!label || !tooltip) return;
+            const trustedMid = Number(confidence.trusted_mid || 0);
+            const trustedBid = Number(confidence.trusted_bid || 0);
+            const trustedAsk = Number(confidence.trusted_ask || 0);
+            const hasTrustedMarketPrice = trustedMid > 0 || (trustedBid > 0 && trustedAsk > 0);
+            const usesBootstrapAnchor = !!_bootstrapActiveCampaign && !hasTrustedMarketPrice;
+            label.firstChild.nodeValue = usesBootstrapAnchor
+                ? 'Bootstrap Anchor Price '
+                : 'Trusted Mid Price ';
+            tooltip.textContent = usesBootstrapAnchor
+                ? 'The approved campaign anchor used for bounded Bootstrap offers while no trusted external market price is available.'
+                : 'Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.';
+        }
+
         function renderMarketConfidence(data = {}) {
             _lastMarketConfidence = data;
             const confidence = data.confidence || {};
             const metrics = data.metrics || {};
             const state = String(confidence.state || 'RED').toUpperCase();
+            updateHeroPriceProvenance(confidence);
             const stateColor = state === 'GREEN'
                 ? 'var(--status-success)'
                 : state === 'AMBER'
@@ -24061,7 +24098,9 @@
                 const seconds = Math.max(0, Number(timeline.seconds_until_next_stage) || 0);
                 countdown = `${timeline.next_stage} in ${Math.floor(seconds / 60)}m ${seconds % 60}s`;
             } else if (timeline && timeline.current_stage === 'ALL') {
-                countdown = 'All exposure withdrawn';
+                countdown = _bootstrapActiveCampaign
+                    ? 'Follow exposure withdrawn; bounded Bootstrap offers remain active'
+                    : 'All exposure withdrawn';
             }
             setText('marketConfidenceCountdown', countdown);
             const migration = data.migration || {};
@@ -24496,9 +24535,11 @@
         }
 
         let _statusRequestGeneration = 0;
+        let _statusRequestInFlight = false;
 
         async function fetchStatus() {
-            if (isWalletSwitchBusy()) return null;
+            if (isWalletSwitchBusy() || _statusRequestInFlight) return null;
+            _statusRequestInFlight = true;
             const requestGeneration = ++_statusRequestGeneration;
             try {
                 const controller = new AbortController();
@@ -24688,6 +24729,8 @@
                     debugError('Failed to fetch status:', error);
                 }
                 return null;
+            } finally {
+                _statusRequestInFlight = false;
             }
         }
 
@@ -27495,7 +27538,9 @@
             }
             const healthMessage = confidenceIsStricter
                 ? (confidenceState === 'red'
-                    ? 'Market blocked — offer-book confidence is RED'
+                    ? (_bootstrapActiveCampaign
+                        ? 'Bounded Bootstrap active — Follow mode is blocked by RED confidence'
+                        : 'Market blocked — offer-book confidence is RED')
                     : 'Market restricted — offer-book confidence is AMBER')
                 : (
                     isRecoveryGuidanceActive()
@@ -38965,6 +39010,10 @@ function _bootstrapRenderStatus(payload) {
     const stop = document.getElementById('bootstrapStopBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    updateHeroPriceProvenance((_lastMarketConfidence || {}).confidence || {});
+    const bootstrapTicker = String(
+        payload?.identity?.ticker || currentCAT?.ticker_id || currentCAT?.ticker || 'CAT'
+    ).replace(/_XCH$/i, '').replace(/\/XCH$/i, '').trim() || 'CAT';
     if (_bootstrapActiveCampaign) syncBootstrapCampaignPairIntoSelectors(payload);
     hydrateBootstrapCampaignControls(_bootstrapActiveCampaign);
     let summary = 'Follow mode · no active Bootstrap campaign';
@@ -38987,7 +39036,7 @@ function _bootstrapRenderStatus(payload) {
     if (dashboardStatus) {
         dashboardStatus.style.display = 'block';
         dashboardStatus.textContent = _bootstrapActiveCampaign
-            ? summary + ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/CAT · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} CAT · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
+            ? summary + ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
             : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
     }
     if (stop) stop.disabled = !_bootstrapActiveCampaign;
@@ -38997,16 +39046,15 @@ function _bootstrapRenderStatus(payload) {
 }
 
 async function bootstrapRefreshStatus() {
-    if (!currentCAT?.asset_id && !bot_state?.current_cat?.asset_id) {
-        _bootstrapRenderStatus({ success: true, active: false, campaign: null });
-        return;
-    }
     try {
         const response = await apiFetch('/api/bootstrap/status', { cache: 'no-store' });
         const payload = await response.json();
         if (payload?.success) _bootstrapRenderStatus(payload);
     } catch (_) {
-        // A pair may not be selected during startup. That is a normal Follow state.
+        // Keep the last rendered authority state. During reload the durable
+        // campaign is the source of truth even before currentCAT/bot_state has
+        // hydrated; painting a synthetic Follow state here can mislabel a live
+        // Bootstrap ladder until the next 30-second poll.
     }
 }
 

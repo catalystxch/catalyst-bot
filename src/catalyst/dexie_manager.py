@@ -349,7 +349,7 @@ class DexieManager:
                 continue
             if self._durable_dispatch_authorizer is not None:
                 try:
-                    authorized = self._durable_dispatch_authorizer() is True
+                    authorized = self._durable_dispatch_authorizer(dispatched) is True
                 except Exception as exc:
                     authorized = False
                     log_event(

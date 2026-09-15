@@ -2426,11 +2426,13 @@ def test_durable_bulk_flush_reauthorizes_before_each_external_post(
     transport_calls = []
     clock = {"now": LATER}
 
-    def authorize():
-        authorization_calls.append(True)
+    def authorize(claim):
+        authorization_calls.append(claim)
         rows = isolated_database.list_publication_outbox(publisher=publisher)
         claimed = [row for row in rows if row["state"] == "claimed"]
         assert len(claimed) == 1
+        assert claim["publication_id"] == claimed[0]["publication_id"]
+        assert claim["intent_id"] == claimed[0]["intent_id"]
         authorization_snapshots.append(claimed[0])
         assert claimed[0]["dispatch_started_at"] is not None
         assert claimed[0]["request_sha256"] is not None
@@ -2893,8 +2895,9 @@ def test_bot_binds_market_authority_to_each_durable_publication_dispatch(
 
     assert len(captured) == 2
     assert all(callable(item["dispatch_authorizer"]) for item in captured)
-    assert captured[0]["dispatch_authorizer"]() is True
-    assert captured[1]["dispatch_authorizer"]() is True
+    claim = {"intent_id": "intent-1"}
+    assert captured[0]["dispatch_authorizer"](claim) is True
+    assert captured[1]["dispatch_authorizer"](claim) is True
     assert phases == ["publication", "publication"]
 
 

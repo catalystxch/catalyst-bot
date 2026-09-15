@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from flask import Flask
 import pytest
@@ -10,6 +11,35 @@ import database
 
 ASSET_ID = "b8" * 32
 OTHER_ASSET_ID = "cd" * 32
+
+
+def test_bootstrap_identity_uses_configured_ticker_id_not_display_name(monkeypatch):
+    from blueprints import bootstrap
+    import wallet
+
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "has_secrets": True,
+            "fingerprint": 736588221,
+            "network_id": "mainnet",
+        },
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "cfg",
+        SimpleNamespace(
+            CAT_ASSET_ID=ASSET_ID,
+            CAT_WALLET_ID=2,
+            CAT_TICKER_ID="MZ_XCH",
+            CAT_NAME="Monkeyzoo Token",
+        ),
+    )
+
+    assert bootstrap._read_bootstrap_identity()["ticker"] == "MZ"
 
 
 @pytest.fixture
@@ -298,6 +328,31 @@ def test_partial_offer_capability_is_explicitly_disabled(bootstrap_api):
         ],
         "providers": ["dexie", "sage", "splash"],
         "policy": "disabled_until_capability_proven",
+    }
+
+
+def test_status_reports_temporarily_unavailable_identity_without_http_conflict(
+    bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    monkeypatch.setattr(
+        bootstrap,
+        "_read_bootstrap_identity",
+        lambda: (_ for _ in ()).throw(
+            bootstrap.BootstrapApiError("bootstrap_asset_not_selected", 409)
+        ),
+    )
+
+    response = client.get("/api/bootstrap/status")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "success": False,
+        "active": None,
+        "campaign": None,
+        "identity": None,
+        "code": "bootstrap_asset_not_selected",
+        "error": "bootstrap_asset_not_selected",
     }
 
 

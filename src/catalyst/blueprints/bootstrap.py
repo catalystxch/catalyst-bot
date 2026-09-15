@@ -163,7 +163,10 @@ def _read_bootstrap_identity() -> dict[str, Any]:
     wallet_id = getattr(cfg, "CAT_WALLET_ID", 0)
     if type(wallet_id) is not int or wallet_id <= 0:
         raise BootstrapApiError("invalid_cat_wallet_id", 409)
-    ticker = str(getattr(cfg, "CAT_NAME", "CAT") or "CAT").strip().upper()
+    ticker_id = str(getattr(cfg, "CAT_TICKER_ID", "") or "").strip().upper()
+    ticker = ticker_id.removesuffix("_XCH")
+    if not ticker:
+        ticker = str(getattr(cfg, "CAT_NAME", "CAT") or "CAT").strip().upper()
     if _TICKER_RE.fullmatch(ticker) is None:
         ticker = "CAT"
     return {
@@ -358,6 +361,21 @@ def api_bootstrap_status():
                     "campaign": active,
                 }
             )
+        )
+    except BootstrapApiError as exc:
+        # Status is a read-only hydration endpoint called before startup has
+        # necessarily selected a Sage wallet and CAT.  Report that temporary
+        # absence in-band so a normal first load does not emit an HTTP 409 or
+        # overwrite any last-known durable campaign shown by the frontend.
+        return jsonify(
+            {
+                "success": False,
+                "active": None,
+                "campaign": None,
+                "identity": None,
+                "code": exc.code,
+                "error": exc.code,
+            }
         )
     except Exception as exc:
         return _error(exc)

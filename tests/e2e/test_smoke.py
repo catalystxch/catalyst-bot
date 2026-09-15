@@ -637,6 +637,155 @@ def test_dashboard_health_cannot_claim_healthy_when_authoritative_confidence_is_
     expect(page.locator("#ccConditions")).to_contain_text("market evidence expired")
 
 
+def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
+    page,
+):
+    """RED blocks Follow exposure without claiming Bootstrap was withdrawn."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-1',
+                revision: 4,
+                stage: 'bootstrap',
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Bounded Bootstrap active — Follow mode is blocked by RED confidence"
+    )
+    expect(page.locator("#marketConfidenceCountdown")).to_have_text(
+        "Follow exposure withdrawn; bounded Bootstrap offers remain active"
+    )
+
+
+def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
+    """A RED Bootstrap anchor must not be presented as trusted market evidence."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-1',
+                revision: 4,
+                stage: 'bootstrap',
+                anchor_price: '0.0001',
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    trusted_bid: null,
+                    trusted_ask: null,
+                    trusted_mid: null,
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text(
+        "Bootstrap Anchor Price"
+    )
+    expect(page.locator("#heroMidPriceTooltip")).to_contain_text(
+        "approved campaign anchor"
+    )
+
+
+def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
+    """Reload must not paint Follow mode while a durable campaign is active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const assetId = 'b8'.repeat(32);
+            currentCAT = {};
+            bot_state = {};
+            _bootstrapActiveCampaign = null;
+            let requestCount = 0;
+            apiFetch = async () => {
+                requestCount += 1;
+                return new Response(JSON.stringify({
+                    success: true,
+                    active: true,
+                    identity: {
+                        asset_id: assetId,
+                        wallet_id: 2,
+                        wallet_fingerprint: 736588221,
+                        network: 'mainnet',
+                        ticker: 'MZ_XCH',
+                    },
+                    campaign: {
+                        campaign_id: 'campaign-live',
+                        revision: 0,
+                        asset_id: assetId,
+                        stage: 'bootstrap',
+                        deployment_fraction: '0.10',
+                        expires_at: '2099-01-01T00:00:00Z',
+                        minimum_price: '0.00005',
+                        maximum_price: '0.0002',
+                        xch_budget: '72.8943',
+                        cat_budget: '351421.735',
+                        fee_budget_xch: '0.01',
+                        subsidy_budget_xch: '0',
+                        anchor_price: '0.0001',
+                        adverse_fill_times: [],
+                    },
+                }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+
+            await bootstrapRefreshStatus();
+            return {
+                requestCount,
+                campaignId: _bootstrapActiveCampaign?.campaign_id || null,
+                globalStatus: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboardStatus: document.getElementById('bootstrapDashboardStatus').textContent,
+            };
+        }"""
+    )
+
+    assert result["requestCount"] == 1
+    assert result["campaignId"] == "campaign-live"
+    assert result["globalStatus"].startswith("Bootstrap active")
+    assert "corridor 0.00005–0.0002 XCH/MZ" in result["dashboardStatus"]
+    assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
+
+
 def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
     """Confidence arriving after dashboard data must immediately reconcile the card."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -1811,6 +1960,62 @@ def test_cancel_all_completion_clears_stale_resume_dashboard(page):
     }
 
 
+def test_slow_status_poll_is_single_flight_and_applies_valid_response(page):
+    """A slow Sage-backed status response must not be invalidated by the next poll."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let resolveStatus;
+            const statusGate = new Promise(resolve => { resolveStatus = resolve; });
+            let requestCount = 0;
+            const payload = {
+                running: false,
+                offers: { buy: [], sell: [] },
+                balances: {
+                    xch: { spendable: 145.8, total: 145.8 },
+                    cat: { spendable: 702843.47, total: 702843.47 },
+                },
+                runtime_safety: { allowed: true, reason_code: '' },
+                current_cat: {},
+            };
+            apiFetch = async () => {
+                requestCount += 1;
+                await statusGate;
+                return new Response(JSON.stringify(payload), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            updateUI = () => {};
+            syncCommandCentreFromStatus = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateWalletPickerAvailability = () => {};
+
+            const first = fetchStatus();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const second = fetchStatus();
+            resolveStatus();
+            const [firstResult, secondResult] = await Promise.all([first, second]);
+            return {
+                requestCount,
+                firstApplied: firstResult?.runtime_safety?.allowed === true,
+                secondSkipped: secondResult === null,
+                stateApplied: bot_state?.runtime_safety?.allowed === true,
+            };
+        }"""
+    )
+
+    assert result == {
+        "requestCount": 1,
+        "firstApplied": True,
+        "secondSkipped": True,
+        "stateApplied": True,
+    }
+
+
 def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
     """A previous completion must not prematurely finish a new wallet request."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -1871,8 +2076,8 @@ def test_cancel_all_discards_status_from_older_operation_generation(page):
     assert result["phase"] == "current"
 
 
-def test_status_refresh_discards_older_response_that_finishes_last(page):
-    """A slow pre-cancel status response must not restore cancelled offers."""
+def test_status_refresh_coalesces_concurrent_requests(page):
+    """A slow status refresh must not allow a second stale request to race it."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -1887,27 +2092,19 @@ def test_status_refresh_discards_older_response_that_finishes_last(page):
             syncCommandCentreFromStatus = () => {};
             updateWalletPickerAvailability = () => {};
 
-            const staleRequest = fetchStatus();
+            const firstRequest = fetchStatus();
             await Promise.resolve();
-            const currentRequest = fetchStatus();
-            await Promise.resolve();
-
-            pending[1](new Response(JSON.stringify({
-                running: false,
-                offers: { buy: [], sell: [] },
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-            await currentRequest;
+            const concurrentResult = await fetchStatus();
 
             pending[0](new Response(JSON.stringify({
                 running: false,
-                offers: {
-                    buy: Array.from({ length: 36 }, (_, i) => ({ trade_id: `buy-${i}` })),
-                    sell: Array.from({ length: 36 }, (_, i) => ({ trade_id: `sell-${i}` })),
-                },
+                offers: { buy: [], sell: [] },
             }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-            await staleRequest;
+            await firstRequest;
 
             return {
+                requestCount: pending.length,
+                concurrentResult,
                 finalOfferCount: (bot_state.offers?.buy?.length || 0)
                     + (bot_state.offers?.sell?.length || 0),
                 appliedOfferCounts,
@@ -1915,7 +2112,12 @@ def test_status_refresh_discards_older_response_that_finishes_last(page):
         }"""
     )
 
-    assert result == {"finalOfferCount": 0, "appliedOfferCounts": [0]}
+    assert result == {
+        "requestCount": 1,
+        "concurrentResult": None,
+        "finalOfferCount": 0,
+        "appliedOfferCounts": [0],
+    }
 
 
 def test_cancel_all_timeout_is_visible_and_releases_latch(page):

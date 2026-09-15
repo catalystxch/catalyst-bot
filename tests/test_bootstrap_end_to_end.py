@@ -681,6 +681,9 @@ def test_live_bot_routes_bootstrap_before_follow_creation_and_requote():
     create_source = inspect.getsource(BotLoop._create_offers_if_needed)
     requote_source = inspect.getsource(BotLoop._handle_requoting)
     assert create_source.index("_route_bootstrap_creation_if_active") < (
+        create_source.index("_enter_runtime_effect_phase")
+    )
+    assert create_source.index("_route_bootstrap_creation_if_active") < (
         create_source.index("unsuspend_slots_if_coins_available")
     )
     assert "_bootstrap_campaign_blocks_follow_mutations" in requote_source
@@ -884,6 +887,74 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     ) >= Decimal("0.00104")
     assert queued_dexie == [("offer1bootstrap", "61" * 32)]
     assert queued_splash == queued_dexie
+
+
+def test_red_market_authorizes_only_current_bootstrap_publication_claim(monkeypatch):
+    import bot_loop
+
+    loop = BotLoop.__new__(BotLoop)
+    loop._enter_runtime_effect_phase = lambda phase: False
+    loop._runtime_recovery_cycle_boundary = lambda: True
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": {"campaign_id": "campaign-1", "revision": 4},
+    }
+    intents = {
+        "current": {
+            "intent_id": "current",
+            "purpose": "bootstrap:campaign-1:revision:4",
+            "lifecycle_state": "confirmed",
+        },
+        "stale": {
+            "intent_id": "stale",
+            "purpose": "bootstrap:campaign-1:revision:3",
+            "lifecycle_state": "confirmed",
+        },
+        "follow": {
+            "intent_id": "follow",
+            "purpose": "ladder",
+            "lifecycle_state": "confirmed",
+        },
+    }
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intent",
+        lambda intent_id: intents.get(intent_id),
+    )
+
+    assert loop._authorize_publication_claim({"intent_id": "current"}) is True
+    assert loop._authorize_publication_claim({"intent_id": "stale"}) is False
+    assert loop._authorize_publication_claim({"intent_id": "follow"}) is False
+    assert loop._authorize_publication_claim({}) is False
+
+
+def test_red_market_still_drains_current_bootstrap_publication_queues(monkeypatch):
+    import bot_loop
+
+    flushed = []
+    loop = BotLoop.__new__(BotLoop)
+    loop._enter_runtime_effect_phase = lambda phase: False
+    loop._runtime_recovery_cycle_boundary = lambda: True
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": {"campaign_id": "campaign-1", "revision": 4},
+    }
+    loop._set_cycle_step = lambda step: None
+    loop._reclaim_oversized_locked_offers = lambda: False
+    loop.dexie_manager = SimpleNamespace(
+        _queue=[], flush_queue=lambda: flushed.append("dexie") or {"posted": 1}
+    )
+    loop.splash_manager = SimpleNamespace(
+        _queue=[], flush_queue=lambda: flushed.append("splash") or {"posted": 1}
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", True, raising=False)
+
+    loop._flush_public_offer_queues()
+
+    assert flushed == ["dexie", "splash"]
 
 
 def test_live_bot_finalizes_automatic_bootstrap_stop_after_offer_clearance(monkeypatch):

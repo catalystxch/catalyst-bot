@@ -1252,6 +1252,57 @@ def test_market_withdrawal_cancels_only_requested_tiers(monkeypatch):
     assert cancelled == ["inner", "mid"]
 
 
+def test_market_withdrawal_preserves_current_bootstrap_campaign_offers(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: {
+            trade_id: {"outcome": "CANCEL_CONFIRMED"} for trade_id in ids
+        }
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": {"campaign_id": "campaign-1", "revision": 4},
+    }
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "sage_trade_id": "bootstrap-sell",
+                "purpose": "bootstrap:campaign-1:revision:4",
+                "lifecycle_state": "confirmed",
+            },
+            {
+                "sage_trade_id": "follow-buy",
+                "purpose": "ladder",
+                "lifecycle_state": "confirmed",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "bootstrap-sell", "tier": "inner"},
+            {"trade_id": "follow-buy", "tier": "inner"},
+        ],
+        raising=False,
+    )
+
+    result = loop._apply_market_withdrawal(
+        SimpleNamespace(
+            cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_ALL"
+        )
+    )
+
+    assert result == 1
+    assert loop._market_withdrawal_attempted_trade_ids == {"follow-buy"}
+
+
 def test_market_withdrawal_uses_sage_native_bulk_cancel_capacity(monkeypatch):
     import bot_loop
 

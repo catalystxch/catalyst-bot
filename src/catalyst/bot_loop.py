@@ -1016,14 +1016,66 @@ class BotLoop:
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
-            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
+            dispatch_authorizer=self._authorize_publication_claim,
         )
         self.splash_manager.enable_durable_outbox(
             owner_run_id=owner + ":splash",
             network=network,
             now_provider=observed_at,
             lease_expires_provider=lease_expires,
-            dispatch_authorizer=lambda: self._enter_runtime_effect_phase("publication"),
+            dispatch_authorizer=self._authorize_publication_claim,
+        )
+
+    def _authorize_publication_claim(self, claim: dict) -> bool:
+        """Authorize one exact durable publication at its effect boundary.
+
+        Follow-mode publication still requires normal market authority.  An
+        active Bootstrap campaign may publish while confidence is RED, but
+        only when the claimed intent belongs to the campaign's current exact
+        revision.  This keeps stale revisions and unrelated ladder offers
+        fail-closed.
+        """
+
+        if self._enter_runtime_effect_phase("publication"):
+            return True
+        if type(claim) is not dict or not self._runtime_recovery_cycle_boundary():
+            return False
+        context = self._bootstrap_campaign_context()
+        if context.get("active") is not True or context.get("blocked") is not False:
+            return False
+        campaign = context.get("campaign") or {}
+        expected_purpose = (
+            f"bootstrap:{campaign.get('campaign_id')}:"
+            f"revision:{campaign.get('revision')}"
+        )
+        intent_id = str(claim.get("intent_id") or "").strip()
+        if not intent_id:
+            return False
+        try:
+            intent = database.get_offer_intent(intent_id)
+        except Exception:
+            return False
+        return bool(
+            type(intent) is dict
+            and str(intent.get("purpose") or "") == expected_purpose
+            and str(intent.get("lifecycle_state") or "").lower()
+            in {"confirmed", "created", "visible"}
+        )
+
+    def _enter_publication_flush_phase(self) -> bool:
+        """Allow a queue pass for an active bounded Bootstrap campaign.
+
+        Per-claim authorization remains mandatory inside each publisher, so
+        entering the queue pass cannot publish stale or Follow-mode claims.
+        """
+
+        if self._enter_runtime_effect_phase("publication"):
+            return True
+        if not self._runtime_recovery_cycle_boundary():
+            return False
+        context = self._bootstrap_campaign_context()
+        return bool(
+            context.get("active") is True and context.get("blocked") is False
         )
 
     def set_runtime_recovery_coordinator(self, coordinator) -> None:
@@ -1328,6 +1380,26 @@ class BotLoop:
             attempted_trade_ids.clear()
             return 0
         requested = {"mid" if tier == "middle" else tier for tier in requested}
+        protected_bootstrap_trade_ids: set[str] = set()
+        try:
+            context = self._bootstrap_campaign_context()
+            if context.get("active") is True and context.get("blocked") is False:
+                campaign = context.get("campaign") or {}
+                expected_purpose = (
+                    f"bootstrap:{campaign.get('campaign_id')}:"
+                    f"revision:{campaign.get('revision')}"
+                )
+                protected_bootstrap_trade_ids = {
+                    str(intent.get("sage_trade_id") or "").strip()
+                    for intent in database.get_offer_intents_for_registry()
+                    if str(intent.get("purpose") or "") == expected_purpose
+                    and str(intent.get("sage_trade_id") or "").strip()
+                }
+        except Exception:
+            # Failure to prove exact current-campaign ownership must not weaken
+            # normal RED-market withdrawal.
+            protected_bootstrap_trade_ids = set()
+
         rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
         trade_ids = [
             str(row.get("trade_id") or "").strip()
@@ -1335,6 +1407,8 @@ class BotLoop:
             if str(row.get("tier") or "").strip().lower() in requested
             and str(row.get("trade_id") or "").strip()
             and str(row.get("trade_id") or "").strip() not in attempted_trade_ids
+            and str(row.get("trade_id") or "").strip()
+            not in protected_bootstrap_trade_ids
         ]
         capacity_fn = getattr(self.offer_manager, "get_sage_bulk_cancel_capacity", None)
         if (
@@ -7957,6 +8031,88 @@ class BotLoop:
                 f"Coinset Sage chain-truth wiring failed: {e} - using wallet RPC only",
             )
 
+    def _set_startup_requote_baseline(self) -> None:
+        """Seed requote state from trusted evidence or active Bootstrap authority."""
+
+        try:
+            startup_market = self._refresh_offer_book_market()
+            startup_mid = (
+                startup_market.confidence.trusted_midpoint
+                if startup_market is not None
+                else None
+            )
+            baseline_source = "attributable offer-book evidence"
+            baseline_event = "startup_baseline_price"
+
+            if startup_mid is None or startup_mid <= 0:
+                bootstrap_context = self._bootstrap_campaign_context()
+                campaign = bootstrap_context.get("campaign") or {}
+                try:
+                    bootstrap_anchor = Decimal(
+                        str(
+                            campaign.get("current_anchor_price")
+                            or campaign.get("anchor_price")
+                            or "0"
+                        )
+                    )
+                    bootstrap_minimum = Decimal(
+                        str(campaign.get("minimum_price") or "0")
+                    )
+                    bootstrap_maximum = Decimal(
+                        str(campaign.get("maximum_price") or "0")
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    bootstrap_anchor = Decimal("0")
+                    bootstrap_minimum = Decimal("0")
+                    bootstrap_maximum = Decimal("0")
+                if (
+                    bootstrap_context.get("active") is True
+                    and bootstrap_context.get("blocked") is not True
+                    and bootstrap_anchor > 0
+                    and bootstrap_minimum > 0
+                    and bootstrap_minimum
+                    <= bootstrap_anchor
+                    <= bootstrap_maximum
+                ):
+                    startup_mid = bootstrap_anchor
+                    baseline_source = "the active identity-bound Bootstrap anchor"
+                    baseline_event = "startup_bootstrap_baseline_price"
+
+            if startup_mid is None or startup_mid <= 0:
+                log_event(
+                    "warning",
+                    "startup_baseline_zero",
+                    "No authorized startup price is available — requoting remains disabled",
+                )
+                return
+
+            self._last_quoted_price["buy"] = startup_mid
+            self._last_quoted_price["sell"] = startup_mid
+            self._last_quoted_plain_mid["buy"] = startup_mid
+            self._last_quoted_plain_mid["sell"] = startup_mid
+            self._current_mid_price = startup_mid
+            with self._probe_lock:
+                if self._probe_state.get("confirmed_price") in (
+                    None,
+                    Decimal("0"),
+                ):
+                    self._probe_state["confirmed_price"] = startup_mid
+            log_event(
+                "info",
+                baseline_event,
+                f"📌 Requote baseline set from {baseline_source}: "
+                f"{startup_mid:.8f} XCH",
+            )
+        except Exception as e:
+            self._enforce_market_refresh_failure(
+                now=datetime.now(timezone.utc), error=e
+            )
+            log_event(
+                "warning",
+                "startup_baseline_failed",
+                f"[WARN] Could not set baseline price: {e}",
+            )
+
     def _startup_sync(self):
         """Sync state from the Chia wallet on startup.
 
@@ -8899,43 +9055,7 @@ class BotLoop:
             # Critical: without this, _last_quoted_price stays at 0 after restart
             # and ALL requoting (normal + emergency) is disabled because the
             # "if last_price <= 0: continue" check skips both sides.
-            try:
-                startup_market = self._refresh_offer_book_market()
-                startup_mid = (
-                    startup_market.confidence.trusted_midpoint
-                    if startup_market is not None
-                    else None
-                )
-                if startup_mid is not None and startup_mid > 0:
-                    self._last_quoted_price["buy"] = startup_mid
-                    self._last_quoted_price["sell"] = startup_mid
-                    # F67: plain mid == startup mid at this point (no probe yet)
-                    self._last_quoted_plain_mid["buy"] = startup_mid
-                    self._last_quoted_plain_mid["sell"] = startup_mid
-                    self._current_mid_price = startup_mid
-                    with self._probe_lock:
-                        if self._probe_state.get("confirmed_price") in (
-                            None,
-                            Decimal("0"),
-                        ):
-                            self._probe_state["confirmed_price"] = startup_mid
-                    baseline_msg = (
-                        f"📌 Requote baseline set: {startup_mid:.8f} XCH "
-                        f"(enables requoting + emergency requote)"
-                    )
-                    log_event("info", "startup_baseline_price", baseline_msg)
-                else:
-                    log_event(
-                        "warning",
-                        "startup_baseline_zero",
-                        "mid_price was 0 — requoting will be disabled until offers are created",
-                    )
-            except Exception as e:
-                self._enforce_market_refresh_failure(
-                    now=datetime.now(timezone.utc), error=e
-                )
-                err_msg = f"[WARN] Could not set baseline price: {e}"
-                log_event("warning", "startup_baseline_failed", err_msg)
+            self._set_startup_requote_baseline()
 
             # ---- V3: Initialize Coinset puzzle hash cache ----
             # Coinset requires a full node for puzzle hashes — skip for Sage light wallet
@@ -9448,6 +9568,53 @@ class BotLoop:
         )
 
         if price_data is None:
+            bootstrap_context = self._bootstrap_campaign_context()
+            campaign = bootstrap_context.get("campaign") or {}
+            try:
+                bootstrap_anchor = Decimal(
+                    str(
+                        campaign.get("current_anchor_price")
+                        or campaign.get("anchor_price")
+                        or "0"
+                    )
+                )
+                bootstrap_minimum = Decimal(str(campaign.get("minimum_price") or "0"))
+                bootstrap_maximum = Decimal(str(campaign.get("maximum_price") or "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                bootstrap_anchor = Decimal("0")
+                bootstrap_minimum = Decimal("0")
+                bootstrap_maximum = Decimal("0")
+            if (
+                bootstrap_context.get("active") is True
+                and bootstrap_context.get("blocked") is not True
+                and bootstrap_anchor > 0
+                and bootstrap_minimum > 0
+                and bootstrap_minimum <= bootstrap_anchor <= bootstrap_maximum
+            ):
+                price_data = {
+                    "mid_price": str(bootstrap_anchor),
+                    "dexie_price": "",
+                    "tibet_price": "",
+                    "arb_gap_bps": "0",
+                    "source": "bootstrap_campaign_anchor",
+                }
+                if not getattr(self, "_bootstrap_anchor_price_logged", False):
+                    log_event(
+                        "info",
+                        "bootstrap_anchor_price_active",
+                        "Market Bootstrap is using its identity-bound campaign anchor "
+                        "because no attributable trusted offer-book price is available",
+                        data={
+                            "campaign_id": campaign.get("campaign_id"),
+                            "revision": campaign.get("revision"),
+                            "anchor_price": str(bootstrap_anchor),
+                            "minimum_price": str(bootstrap_minimum),
+                            "maximum_price": str(bootstrap_maximum),
+                        },
+                    )
+                    self._bootstrap_anchor_price_logged = True
+
+        if price_data is None:
             try:
                 from bot_health import run_runtime_checks as _no_market_health
 
@@ -9468,6 +9635,8 @@ class BotLoop:
                 self._market_no_trusted_price_warned = True
             return
 
+        if price_data.get("source") != "bootstrap_campaign_anchor":
+            self._bootstrap_anchor_price_logged = False
         self._market_no_trusted_price_warned = False
 
         mid_price = Decimal(str(price_data.get("mid_price", 0)))
@@ -13013,14 +13182,14 @@ class BotLoop:
         skip_sell: bool = False,
     ):
         """Create new offers if we're below target count."""
-        if not self._enter_runtime_effect_phase("create"):
-            return False
         bootstrap_result = self._route_bootstrap_creation_if_active(
             current_buy_ids=set(current_buy_ids or set()),
             current_sell_ids=set(current_sell_ids or set()),
         )
         if bootstrap_result is not None:
             return bootstrap_result
+        if not self._enter_runtime_effect_phase("create"):
+            return False
         recovery_active = self._recovery_is_active()
 
         # Fix F: check if suspended slots can be unsuspended (coins available)
@@ -13768,7 +13937,7 @@ class BotLoop:
 
     def _flush_public_offer_queues(self):
         """Flush public offer queues after reclaiming unsafe locked coins."""
-        if not self._enter_runtime_effect_phase("publication"):
+        if not self._enter_publication_flush_phase():
             return False
         self._set_cycle_step("step11_dexie_post")
 
@@ -13807,7 +13976,7 @@ class BotLoop:
                 log_event(
                     "debug", "dexie_flush_start", f"Flushing {q_len} offers to Dexie..."
                 )
-            if not self._enter_runtime_effect_phase("publication"):
+            if not self._enter_publication_flush_phase():
                 return False
             result = self.dexie_manager.flush_queue()
             if q_len > 0:
@@ -13835,7 +14004,7 @@ class BotLoop:
                         "splash_flush_start",
                         f"Submitting {splash_q} offers to local Splash node...",
                     )
-                if not self._enter_runtime_effect_phase("publication"):
+                if not self._enter_publication_flush_phase():
                     return False
                 result = self.splash_manager.flush_queue()
                 if splash_q > 0:

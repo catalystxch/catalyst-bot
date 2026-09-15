@@ -219,6 +219,59 @@ def test_coin_prep_pool_exceeding_post_reserve_balance_blocks_save(page):
     assert "Bot will still work" not in result["warning"]
 
 
+def test_active_bootstrap_campaign_bypasses_legacy_reserve_warning_on_save(page):
+    """A funded Bootstrap campaign must not be blocked by the obsolete Follow ladder."""
+    _ready_setup(page, "allowed")
+    result = page.evaluate(
+        """() => {
+            _pairDataReadyAssetId = currentCAT.asset_id;
+            _catSwitchTargetAssetId = '';
+            bot_state.balances = mergeVerifiedWalletBalances({
+                xch: {total: 145.8086, confirmed: 145.8086, spendable: 145.8086},
+                cat: {total: 702843.47, confirmed: 702843.47, spendable: 702843.47},
+            }, currentCAT.asset_id);
+            bot_state.pricing = {mid: 0.0000835};
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-live-regression',
+                revision: 0,
+                asset_id: currentCAT.asset_id,
+                xch_budget: '72.8943',
+                cat_budget: '351421.735',
+                fee_budget_xch: '0.01',
+            };
+
+            // This legacy Follow plan cannot fit, but it is not the active authority.
+            document.getElementById('configTradeXch').value = '2';
+            document.getElementById('configMaxBuy').value = '45';
+            document.getElementById('configMaxSell').value = '45';
+            document.getElementById('configTierEnabled').checked = false;
+            document.getElementById('configXchReserve').value = '15';
+            document.getElementById('configCatReserve').value = '46000';
+
+            updateCoinPrepPreview();
+            const valid = validateSettingsForm();
+            return {
+                valid,
+                impossible: tradingSettingsImpossible,
+                xchCritical: document.getElementById('xchReserveWarning').dataset.critical,
+                catCritical: document.getElementById('catReserveWarning').dataset.critical,
+                preview: document.getElementById('coinPrepWarning').textContent,
+            };
+        }"""
+    )
+
+    assert result == {
+        "valid": True,
+        "impossible": False,
+        "xchCritical": "false",
+        "catCritical": "false",
+        "preview": (
+            "Bootstrap campaign active: Coin Prep is bound to the exact saved "
+            "campaign revision and budgets; the legacy Smart Settings coin plan is bypassed."
+        ),
+    }
+
+
 def test_coin_prep_pool_rejects_verified_zero_balance(page):
     """A verified zero balance is authoritative, not an unknown-balance sentinel."""
     _ready_setup(page, "allowed")
