@@ -1294,9 +1294,7 @@ def test_market_withdrawal_preserves_current_bootstrap_campaign_offers(monkeypat
     )
 
     result = loop._apply_market_withdrawal(
-        SimpleNamespace(
-            cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_ALL"
-        )
+        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_ALL")
     )
 
     assert result == 1

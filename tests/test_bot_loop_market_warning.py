@@ -96,8 +96,8 @@ def test_active_bootstrap_campaign_uses_its_bound_anchor_when_market_has_no_trus
     loop._set_cycle_step = lambda _step: None
     loop._process_authoritative_sweep_events = lambda: None
     cycle_stop_steps = []
-    loop._cycle_stop_requested = lambda step: cycle_stop_steps.append(step) or (
-        step == "price_fetch"
+    loop._cycle_stop_requested = lambda step: (
+        cycle_stop_steps.append(step) or (step == "price_fetch")
     )
     loop.offer_manager = SimpleNamespace(clear_cycle_coins=lambda: None)
     loop._refresh_offer_book_market = lambda: SimpleNamespace(

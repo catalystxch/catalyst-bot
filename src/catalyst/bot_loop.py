@@ -1074,9 +1074,7 @@ class BotLoop:
         if not self._runtime_recovery_cycle_boundary():
             return False
         context = self._bootstrap_campaign_context()
-        return bool(
-            context.get("active") is True and context.get("blocked") is False
-        )
+        return bool(context.get("active") is True and context.get("blocked") is False)
 
     def set_runtime_recovery_coordinator(self, coordinator) -> None:
         """Inject the API-owned read-only Task 10 recovery coordinator."""
@@ -8070,9 +8068,7 @@ class BotLoop:
                     and bootstrap_context.get("blocked") is not True
                     and bootstrap_anchor > 0
                     and bootstrap_minimum > 0
-                    and bootstrap_minimum
-                    <= bootstrap_anchor
-                    <= bootstrap_maximum
+                    and bootstrap_minimum <= bootstrap_anchor <= bootstrap_maximum
                 ):
                     startup_mid = bootstrap_anchor
                     baseline_source = "the active identity-bound Bootstrap anchor"

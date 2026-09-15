@@ -715,9 +715,7 @@ def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
         }"""
     )
 
-    expect(page.locator("#heroMidPriceLabel")).to_contain_text(
-        "Bootstrap Anchor Price"
-    )
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Bootstrap Anchor Price")
     expect(page.locator("#heroMidPriceTooltip")).to_contain_text(
         "approved campaign anchor"
     )
