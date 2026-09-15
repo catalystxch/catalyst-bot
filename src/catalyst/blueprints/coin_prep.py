@@ -25,12 +25,13 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from types import SimpleNamespace
 
 from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
 
 import api_server
+from amount_utils import cat_display_amount_to_mojos_ceil
 from coin_prep_policy import exclude_retired_sniper_pools
 from config import cfg
 from database import (
@@ -1775,8 +1776,13 @@ def api_coin_prep_verify():
             and isinstance(xch_bal_result, dict)
         ):
             wb = xch_bal_result.get("wallet_balance") or xch_bal_result
+            projected = wb.get("unconfirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("confirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("spendable_balance", 0)
             xch_balance_mojos = _safe_non_negative_int(
-                wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
+                projected
             )
         if (
             bootstrap_context is None
@@ -1784,8 +1790,13 @@ def api_coin_prep_verify():
             and isinstance(cat_bal_result, dict)
         ):
             wb = cat_bal_result.get("wallet_balance") or cat_bal_result
+            projected = wb.get("unconfirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("confirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("spendable_balance", 0)
             cat_balance_mojos = _safe_non_negative_int(
-                wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
+                projected
             )
 
         xch_coins = []
@@ -1821,6 +1832,38 @@ def api_coin_prep_verify():
                 3,
             )
         )
+        def _xch_display_to_mojos_ceil(value) -> int:
+            return int(
+                (
+                    _safe_non_negative_decimal(value) * Decimal(10**12)
+                ).to_integral_value(rounding=ROUND_CEILING)
+            )
+
+        if bootstrap_context is not None:
+            # Bootstrap's authorized plan is purpose-separated and exact. Its
+            # worker disables legacy reserves/top-up pools, so ordinary saved
+            # configuration must not alter verification of campaign outputs.
+            xch_reserve_mojos = 0
+            cat_reserve_mojos = 0
+            topup_pool_xch_mojos = 0
+            topup_pool_cat_mojos = 0
+        else:
+            xch_reserve_mojos = _xch_display_to_mojos_ceil(
+                request.args.get("xch_reserve", "0")
+            )
+            cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
+                _safe_non_negative_decimal(request.args.get("cat_reserve", "0")),
+                cat_decimals,
+            )
+            topup_pool_xch_mojos = _xch_display_to_mojos_ceil(
+                request.args.get("topup_pool_xch", "0")
+            )
+            topup_pool_cat_mojos = cat_display_amount_to_mojos_ceil(
+                _safe_non_negative_decimal(request.args.get("topup_pool_cat", "0")),
+                cat_decimals,
+            )
+        xch_available_mojos = max(0, xch_balance_mojos - xch_reserve_mojos)
+        cat_available_mojos = max(0, cat_balance_mojos - cat_reserve_mojos)
 
         def count_matching(coins_list, target_mojos, tol):
             """Count coins within tolerance of target size."""
@@ -1892,11 +1935,11 @@ def api_coin_prep_verify():
             for tier in exact_tiers:
                 xch_count = exact_xch_counts.get(tier, 0)
                 cat_count = exact_cat_counts.get(tier, 0)
-                if xch_count > 0 and cat_count > 0 and xch_count != cat_count:
-                    raise ValueError("bootstrap_coin_prep_plan_invalid")
                 bootstrap_tier_specs[tier] = {
                     "xch_size": exact_xch.get(tier, Decimal("0")),
                     "cat_size": exact_cat.get(tier, Decimal("0")),
+                    "xch_needed": xch_count,
+                    "cat_needed": cat_count,
                     "needed": max(xch_count, cat_count),
                 }
 
@@ -1915,7 +1958,7 @@ def api_coin_prep_verify():
                     ]
                     if any(
                         request.args.get(f"{tier}_{suffix}") is not None
-                        for suffix in ("xch", "cat", "count")
+                        for suffix in ("xch", "cat", "count", "xch_count", "cat_count")
                     )
                 ]
             if not tiers:
@@ -1931,7 +1974,8 @@ def api_coin_prep_verify():
                 if exact_spec is not None:
                     xch_amount = exact_spec["xch_size"]
                     cat_amount = exact_spec["cat_size"]
-                    needed = exact_spec["needed"]
+                    xch_needed = exact_spec["xch_needed"]
+                    cat_needed = exact_spec["cat_needed"]
                 else:
                     xch_amount = _safe_non_negative_decimal(
                         request.args.get(f"{tier}_xch", "0")
@@ -1939,7 +1983,16 @@ def api_coin_prep_verify():
                     cat_amount = _safe_non_negative_decimal(
                         request.args.get(f"{tier}_cat", "0")
                     )
-                    needed = int(request.args.get(f"{tier}_count", "0"))
+                    common_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_count", "0")
+                    )
+                    xch_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_xch_count", common_needed)
+                    )
+                    cat_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_cat_count", common_needed)
+                    )
+                needed = max(xch_needed, cat_needed)
                 is_xch_only_tier = tier == "fees" or cat_amount <= 0
 
                 xch_mojos = int(xch_amount * Decimal(10**12))
@@ -1948,14 +2001,16 @@ def api_coin_prep_verify():
                     "xch_size": float(xch_amount),
                     "cat_size": float(cat_amount),
                     "needed": needed,
+                    "xch_needed": xch_needed,
+                    "cat_needed": cat_needed,
                     "xch_mojos": xch_mojos,
                     "cat_mojos": cat_mojos,
                     "xch_only": is_xch_only_tier,
                 }
-                if xch_mojos > 0 and needed > 0:
-                    xch_requests.append((tier, xch_mojos, needed))
-                if not is_xch_only_tier and cat_mojos > 0 and needed > 0:
-                    cat_requests.append((tier, cat_mojos, needed))
+                if xch_mojos > 0 and xch_needed > 0:
+                    xch_requests.append((tier, xch_mojos, xch_needed))
+                if not is_xch_only_tier and cat_mojos > 0 and cat_needed > 0:
+                    cat_requests.append((tier, cat_mojos, cat_needed))
 
             strict_xch_tiers = (
                 frozenset(
@@ -1985,23 +2040,25 @@ def api_coin_prep_verify():
             for tier in tiers:
                 spec = tier_specs[tier]
                 needed = spec["needed"]
+                xch_needed = spec["xch_needed"]
+                cat_needed = spec["cat_needed"]
                 xch_have = xch_allocated.get(tier, 0) if spec["xch_mojos"] > 0 else 0
                 cat_have = cat_allocated.get(tier, 0) if spec["cat_mojos"] > 0 else 0
                 needs_xch = (
                     spec["xch_mojos"] > 0
-                    and needed > 0
+                    and xch_needed > 0
                     and (liquidity_mode != "sell_only" or tier == "fees")
                 )
                 needs_cat = (
                     not spec["xch_only"]
                     and spec["cat_mojos"] > 0
-                    and needed > 0
+                    and cat_needed > 0
                     and liquidity_mode != "buy_only"
                 )
                 sufficient = (
                     (
-                        ((not needs_xch) or xch_have >= needed)
-                        and ((not needs_cat) or cat_have >= needed)
+                        ((not needs_xch) or xch_have >= xch_needed)
+                        and ((not needs_cat) or cat_have >= cat_needed)
                     )
                     if needed > 0
                     else True
@@ -2013,6 +2070,8 @@ def api_coin_prep_verify():
                     "xch_size": spec["xch_size"],
                     "cat_size": spec["cat_size"],
                     "needed": needed,
+                    "xch_needed": xch_needed,
+                    "cat_needed": cat_needed,
                     "xch_have": xch_have,
                     "cat_have": cat_have,
                     "xch_only": spec["xch_only"],
@@ -2025,18 +2084,26 @@ def api_coin_prep_verify():
             total_cat_needed_mojos = 0
             for tier in tiers:
                 spec = tier_specs[tier]
-                needed = spec["needed"]
                 if liquidity_mode != "sell_only" or tier == "fees":
-                    total_xch_needed_mojos += spec["xch_mojos"] * needed
+                    total_xch_needed_mojos += (
+                        spec["xch_mojos"] * spec["xch_needed"]
+                    )
                 if (
                     liquidity_mode != "buy_only"
                     and tier != "fees"
                     and spec["cat_mojos"] > 0
                 ):
-                    total_cat_needed_mojos += spec["cat_mojos"] * needed
+                    total_cat_needed_mojos += (
+                        spec["cat_mojos"] * spec["cat_needed"]
+                    )
 
-            xch_balance_sufficient = xch_balance_mojos >= total_xch_needed_mojos
-            cat_balance_sufficient = cat_balance_mojos >= total_cat_needed_mojos
+            if liquidity_mode != "sell_only":
+                total_xch_needed_mojos += topup_pool_xch_mojos
+            if liquidity_mode != "buy_only":
+                total_cat_needed_mojos += topup_pool_cat_mojos
+
+            xch_balance_sufficient = xch_available_mojos >= total_xch_needed_mojos
+            cat_balance_sufficient = cat_available_mojos >= total_cat_needed_mojos
 
             balance_warnings = _coin_prep_balance_warnings(
                 xch_balance_sufficient,
@@ -2068,6 +2135,8 @@ def api_coin_prep_verify():
                 "cat_total": len(cat_coins),
                 "xch_balance_mojos": xch_balance_mojos,
                 "cat_balance_mojos": cat_balance_mojos,
+                "xch_available_mojos": xch_available_mojos,
+                "cat_available_mojos": cat_available_mojos,
                 "xch_needed_mojos": total_xch_needed_mojos,
                 "cat_needed_mojos": total_cat_needed_mojos,
                 "balance_sufficient": xch_balance_sufficient and cat_balance_sufficient,
@@ -2108,11 +2177,17 @@ def api_coin_prep_verify():
             cat_right_size = count_matching(cat_coins, cat_mojos, tolerance)
 
             # --- Balance sufficiency check (flat mode) ---
-            total_xch_needed_mojos = xch_mojos * max_buy
-            total_cat_needed_mojos = cat_mojos * max_sell
-
-            xch_balance_sufficient = xch_balance_mojos >= total_xch_needed_mojos
-            cat_balance_sufficient = cat_balance_mojos >= total_cat_needed_mojos
+            combined_count = max_buy + max_sell
+            xch_needed_count = combined_count if max_buy > 0 else 0
+            cat_needed_count = combined_count if max_sell > 0 else 0
+            total_xch_needed_mojos = xch_mojos * xch_needed_count
+            total_cat_needed_mojos = cat_mojos * cat_needed_count
+            if max_buy > 0:
+                total_xch_needed_mojos += topup_pool_xch_mojos
+            if max_sell > 0:
+                total_cat_needed_mojos += topup_pool_cat_mojos
+            xch_balance_sufficient = xch_available_mojos >= total_xch_needed_mojos
+            cat_balance_sufficient = cat_available_mojos >= total_cat_needed_mojos
 
             balance_warnings = _coin_prep_balance_warnings(
                 xch_balance_sufficient,
@@ -2129,15 +2204,18 @@ def api_coin_prep_verify():
                 "liquidity_mode": _safe_liquidity_mode(liquidity_mode),
                 "xch_coins_right_size": _safe_non_negative_int(xch_right_size),
                 "cat_coins_right_size": _safe_non_negative_int(cat_right_size),
-                "xch_needed": _safe_non_negative_int(max_buy),
-                "cat_needed": _safe_non_negative_int(max_sell),
+                "xch_needed": _safe_non_negative_int(xch_needed_count),
+                "cat_needed": _safe_non_negative_int(cat_needed_count),
                 "all_sufficient": (
-                    xch_right_size >= max_buy and cat_right_size >= max_sell
+                    xch_right_size >= xch_needed_count
+                    and cat_right_size >= cat_needed_count
                 ),
                 "xch_total": _safe_non_negative_int(len(xch_coins)),
                 "cat_total": _safe_non_negative_int(len(cat_coins)),
                 "xch_balance_mojos": _safe_non_negative_int(xch_balance_mojos),
                 "cat_balance_mojos": _safe_non_negative_int(cat_balance_mojos),
+                "xch_available_mojos": _safe_non_negative_int(xch_available_mojos),
+                "cat_available_mojos": _safe_non_negative_int(cat_available_mojos),
                 "xch_needed_mojos": _safe_non_negative_int(total_xch_needed_mojos),
                 "cat_needed_mojos": _safe_non_negative_int(total_cat_needed_mojos),
                 "balance_sufficient": xch_balance_sufficient and cat_balance_sufficient,

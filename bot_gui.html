@@ -23034,21 +23034,20 @@
             let coinPrepImpossible = false;
             let coinPrepImpossibleReasons = [];
 
-            // F76: allow 0.5% tolerance to absorb float precision + 4-decimal
-            // truncation at the API boundary. A plan that's 0.5% over balance
-            // is almost certainly a rounding artefact, not a real over-spend.
-            const _xchPreflightTolerance = xchBalance * 0.005;
-            const _catPreflightTolerance = catBalance * 0.005;
-            if (_botXchForCoinPrep > xchBalance + _xchPreflightTolerance && xchBalance > 0 && tradeSize > 0 && maxBuy > 0) {
+            // Mirror coin_prep_worker's pool_exceeds_avail preflight: reserves
+            // are unavailable to the worker, and it does not partially prepare
+            // an oversized pool. Treat the same plan as blocking here so the
+            // GUI cannot promise a slower-but-working run that will always fail.
+            if (_botXchForCoinPrep > xchAvailable && tradeSize > 0 && maxBuy > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
-                    `XCH: coin prep needs ${_botXchForCoinPrep.toFixed(4)} XCH across ${xchCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but total balance is only ${xchBalance.toFixed(4)} XCH.`
+                    `XCH: coin prep needs ${_botXchForCoinPrep.toFixed(4)} XCH across ${xchCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${xchAvailable.toFixed(4)} XCH is available after reserve.`
                 );
             }
-            if (_botCatForCoinPrep > catBalance + _catPreflightTolerance && catBalance > 0 && catPerCoin > 0 && maxSell > 0) {
+            if (_botCatForCoinPrep > catAvailable && catPerCoin > 0 && maxSell > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
-                    `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but total balance is only ${Math.floor(catBalance).toLocaleString()}.`
+                    `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${Math.floor(catAvailable).toLocaleString()} is available after reserve.`
                 );
             }
 
@@ -23059,24 +23058,6 @@
             } else if (tradingSettingsImpossible) {
                 showInputWarning(coinPrepWarn, 'critical',
                     `? <strong>Cannot proceed:</strong> Your settings require more funds than you have. Reduce trade size, number of offers, headroom, or reserves.`);
-            } else {
-                let coinPrepLimited = [];
-                const xchReserveAmount = parseFloat(document.getElementById('configXchReserve').value) || 0;
-                const catReserveAmount = parseFloat(document.getElementById('configCatReserve').value) || 0;
-
-                if (_botXchForCoinPrep > xchAvailable && _botXchForCoinPrep <= xchBalance && tradeSize > 0 && maxBuy > 0) {
-                    coinPrepLimited.push(
-                        `⚠️ <strong>Limited coin prep (XCH):</strong> Coin prep needs ${_botXchForCoinPrep.toFixed(4)} but only ${xchAvailable.toFixed(4)} is available after reserve.<br>Your wallet has ${xchBalance.toFixed(4)} XCH total, with ${xchReserveAmount.toFixed(4)} held back as reserve.<br>💡 Lower your XCH reserve in the 💰 Reserves section above to use more of your balance.<br>Bot will still work but may requote slower.`
-                    );
-                }
-                if (_botCatForCoinPrep > catAvailable && _botCatForCoinPrep <= catBalance && catPerCoin > 0 && maxSell > 0) {
-                    coinPrepLimited.push(
-                        `⚠️ <strong>Limited coin prep (${tokenName}):</strong> Coin prep needs ~${_botCatForCoinPrep.toLocaleString()} but only ${Math.floor(catAvailable).toLocaleString()} is available after reserve.<br>Your wallet has ${Math.floor(catBalance).toLocaleString()} ${tokenName} total, with ${Math.floor(catReserveAmount).toLocaleString()} held back as reserve.<br>💡 Lower your ${tokenName} reserve in the 💰 Reserves section above to use more of your balance.<br>Bot will still work but may requote slower.`
-                    );
-                }
-                if (coinPrepLimited.length > 0) {
-                    showInputWarning(coinPrepWarn, 'warning', coinPrepLimited.join('<br><br>'));
-                }
             }
 
             // Color the totals against the FULL wallet balance now that they
@@ -34387,6 +34368,9 @@
                 clearTimeout(_settingsUpdateTimer);
                 _settingsUpdateTimer = null;
             }
+            // Validation reads the derived coin-prep gate. Recompute it from
+            // the current inputs so a Save click cannot outrun the debounce.
+            updateCoinPrepPreview();
             if (!validateSettingsForm()) {
                 // Build list of what's missing
                 const missing = [];
@@ -35223,6 +35207,10 @@ function closeCtgErrorModal() {
                 const params = new URLSearchParams();
                 params.set('tier_enabled', tierEnabled ? 'true' : 'false');
                 params.set('liquidity_mode', liquidityMode);
+                params.set('xch_reserve', String(Math.max(0, Number(config.xch_reserve || 0))));
+                params.set('cat_reserve', String(Math.max(0, Number(config.cat_reserve || 0))));
+                const configuredTopupXch = Math.max(0, Number(config.topup_pool_xch || 0));
+                const configuredTopupCat = Math.max(0, Number(config.topup_pool_cat || 0));
 
                 if (bootstrapCampaign) {
                     params.set('bootstrap_campaign_id', bootstrapCampaign.campaign_id);
@@ -35251,26 +35239,55 @@ function closeCtgErrorModal() {
                         sellTierSizes: sellTierSizesForVerify,
                     });
                     const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
+                    const coinPrepMultiplier = clampCoinPrepMultiplier(config.coin_prep_multiplier);
+                    const configuredBuyCounts = getConfiguredTierCountsFromConfigXch(config);
+                    const configuredSellCounts = getConfiguredTierCountsFromConfig(config);
+                    const configuredBuySpares = getConfiguredTierSpareCountsFromConfigXch(config);
+                    const configuredSellSpares = getConfiguredTierSpareCountsFromConfig(config);
+                    const configuredMaxBuy = parseInt(config.max_active_buy || config.MAX_ACTIVE_BUY_OFFERS || 0)
+                        || tiers.reduce((sum, t) => sum + (parseInt(configuredBuyCounts[t]) || 0), 0);
+                    const preparedBuyCounts = getCoinPrepPreparedTierCounts(
+                        configuredMaxBuy,
+                        coinPrepMultiplier,
+                        Object.fromEntries(tiers.map(t => [t, Number(config[`buy_${t}_size_xch`] || config[sizeKey(t)] || 0)])),
+                        configuredBuyCounts,
+                        configuredBuySpares
+                    );
+                    const preparedSellCounts = getCoinPrepPreparedTierCounts(
+                        configuredMaxSell,
+                        coinPrepMultiplier,
+                        sellTierSizesForVerify,
+                        configuredSellCounts,
+                        configuredSellSpares
+                    );
+                    let plannedXchForVerify = 0;
+                    let plannedCatForVerify = 0;
                     for (const t of tiers) {
                         const buyXch = Number(config[`buy_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const sellXch = Number(config[`sell_${t}_size_xch`] || config[sizeKey(t)] || 0);
                         const preparedBuyXch = buyXch * prepFactor;
-                        const buyCnt = parseInt(config[`buy_${t}_tier_count`] || config[countKey(t)] || 0);
-                        const sellCnt = parseInt(config[`sell_${t}_tier_count`] || config[countKey(t)] || 0);
+                        const buyCnt = preparedBuyCounts[t] || 0;
+                        const sellCnt = preparedSellCounts[t] || 0;
                         const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
+                        const preparedSellCat = sellCatSize > 0
+                            ? Math.round(sellCatSize * prepFactor) : 0;
                         if (liquidityMode === 'buy_only') {
                             if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
-                            if (buyCnt > 0) params.set(`${t}_count`, String(buyCnt));
+                            if (buyCnt > 0) params.set(`${t}_xch_count`, String(buyCnt));
+                            plannedXchForVerify += preparedBuyXch * buyCnt;
                         } else if (liquidityMode === 'sell_only') {
-                            if (sellCatSize > 0) params.set(`${t}_cat`, String(sellCatSize * prepFactor));
-                            if (sellCnt > 0) params.set(`${t}_count`, String(sellCnt));
+                            if (preparedSellCat > 0) params.set(`${t}_cat`, String(preparedSellCat));
+                            if (sellCnt > 0) params.set(`${t}_cat_count`, String(sellCnt));
+                            plannedCatForVerify += preparedSellCat * sellCnt;
                         } else {
-                            const cnt = parseInt(config[countKey(t)] || sellCnt || 0);
                             if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
-                            if (cnt > 0) params.set(`${t}_count`, String(cnt));
-                            if (sellCatSize > 0) {
-                                params.set(`${t}_cat`, String(sellCatSize * prepFactor));
+                            if (buyCnt > 0) params.set(`${t}_xch_count`, String(buyCnt));
+                            if (sellCnt > 0) params.set(`${t}_cat_count`, String(sellCnt));
+                            if (preparedSellCat > 0) {
+                                params.set(`${t}_cat`, String(preparedSellCat));
                             }
+                            plannedXchForVerify += preparedBuyXch * buyCnt;
+                            plannedCatForVerify += preparedSellCat * sellCnt;
                         }
                     }
                     const sniperSize = Number(config.sniper_size_xch || 0);
@@ -35278,7 +35295,15 @@ function closeCtgErrorModal() {
                     const preparedSniperXch = sniperSize * prepFactor;
                     if (liquidityMode === 'two_sided' && config.sniper_enabled && sniperSize > 0 && sniperCount > 0) {
                         params.set('sniper_xch', String(preparedSniperXch));
-                        params.set('sniper_count', String(sniperCount));
+                        if (midPrice > 0) {
+                            params.set('sniper_cat', String(Math.round((sniperSize / midPrice) * prepFactor)));
+                        }
+                        params.set('sniper_xch_count', String(sniperCount));
+                        params.set('sniper_cat_count', String(sniperCount));
+                        plannedXchForVerify += preparedSniperXch * sniperCount;
+                        if (midPrice > 0) {
+                            plannedCatForVerify += Math.round((sniperSize / midPrice) * prepFactor) * sniperCount;
+                        }
                     }
                     const feeSize = Number(config.fee_coin_size_xch || 0);
                     const feeCount = parseInt(config.fee_prep_count || 0);
@@ -35287,7 +35312,47 @@ function closeCtgErrorModal() {
                         // denominations. Trade-coin headroom must not change
                         // either the worker target or this readiness check.
                         params.set('fees_xch', String(feeSize));
-                        params.set('fees_count', String(feeCount));
+                        params.set('fees_xch_count', String(feeCount));
+                        plannedXchForVerify += feeSize * feeCount;
+                    }
+                    // buildCoinPrepPlan caps the saved top-up budget to the
+                    // live residual after reserves, prepared tiers, and the
+                    // XCH safety margin. Verify that effective output rather
+                    // than the stale configured ceiling.
+                    const liveXchBalance = Number(bot_state?.balances?.xch?.total || 0);
+                    const liveCatBalance = Number(
+                        typeof getWalletBalance === 'function'
+                            ? getWalletBalance('cat')
+                            : (bot_state?.balances?.cat?.total || 0)
+                    );
+                    const smartXchBalance = Number(window._smartXchBalance || 0);
+                    const effectiveXchBalance = smartXchBalance > 0
+                        ? (liveXchBalance > 0
+                            ? Math.min(smartXchBalance, liveXchBalance)
+                            : smartXchBalance)
+                        : liveXchBalance;
+                    let effectiveTopupXch = configuredTopupXch;
+                    let effectiveTopupCat = configuredTopupCat;
+                    if (effectiveXchBalance > 0) {
+                        effectiveTopupXch = Math.max(0,
+                            effectiveXchBalance - Math.max(0, Number(config.xch_reserve || 0))
+                            - plannedXchForVerify - (effectiveXchBalance * 0.005));
+                    }
+                    if (liveCatBalance > 0) {
+                        const catDecimals = Math.max(0, Math.min(12,
+                            parseInt(currentCAT?.decimals ?? 3, 10) || 0));
+                        const catScale = 10 ** catDecimals;
+                        const residual = Math.max(0,
+                            liveCatBalance - Math.max(0, Number(config.cat_reserve || 0))
+                            - plannedCatForVerify);
+                        effectiveTopupCat = Math.floor(
+                            (residual + Number.EPSILON) * catScale) / catScale;
+                    }
+                    if (liquidityMode !== 'sell_only' && effectiveTopupXch > 0) {
+                        params.set('topup_pool_xch', String(effectiveTopupXch));
+                    }
+                    if (liquidityMode !== 'buy_only' && effectiveTopupCat > 0) {
+                        params.set('topup_pool_cat', String(effectiveTopupCat));
                     }
                 } else {
                     const tradeSize = Number(config.default_trade_xch || 0);
@@ -35297,8 +35362,14 @@ function closeCtgErrorModal() {
                         1 + (parseFloat(config.coin_prep_headroom_pct || 10) / 100));
                     if (tradeSize > 0) params.set('trade_size', String(tradeSize));
                     if (tradeSize > 0) params.set('prepared_xch_size', String(tradeSize * headroom));
+                    const midPrice = Number(bot_state?.pricing?.mid || 0);
+                    if (tradeSize > 0 && midPrice > 0) {
+                        params.set('prepared_cat_size', String(Math.round((tradeSize / midPrice) * headroom)));
+                    }
                     if (maxBuy > 0) params.set('max_buy', String(maxBuy));
                     if (maxSell > 0) params.set('max_sell', String(maxSell));
+                    if (configuredTopupXch > 0) params.set('topup_pool_xch', String(configuredTopupXch));
+                    if (configuredTopupCat > 0) params.set('topup_pool_cat', String(configuredTopupCat));
                 }
 
                 const verifyController = typeof AbortController === 'function'
@@ -35329,9 +35400,10 @@ function closeCtgErrorModal() {
                 // depending on whether prep is required. If the wallet already has
                 // matching coins, mark prep as done and close the modal. Otherwise
                 // populate the real confirm view so the user can decide.
-                const ready = result?.all_sufficient === true
+                const denominationsReady = result?.all_sufficient === true
                     || result?.sufficient === true
                     || result?.tier_status === 'sufficient';
+                const ready = denominationsReady && result?.balance_sufficient !== false;
                 if (ready) {
                     dismissCoinPrepConfirmLoading();
                     setCoinPrepStatus('done');
@@ -35492,7 +35564,7 @@ function closeCtgErrorModal() {
             }
 
             const reasonEl = document.getElementById('cpReasonBanner');
-            const isError = reason === 'error';
+            const isError = reason === 'error' || verification?.balance_sufficient === false;
             if (reasonEl) {
                 if (reason && reasonMessage) {
                     const isMust = reason.startsWith('must');
