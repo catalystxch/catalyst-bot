@@ -232,21 +232,24 @@ class TestTibetSwap5xxFallback(unittest.TestCase):
             pairs = engine._get_tibet_pairs()
         self.assertEqual(pairs, [])
 
-    def test_repeated_tibet_5xx_across_engines_logs_one_warning(self):
-        """A sustained Tibet outage must not flood logs across bot lifecycles."""
+    def test_retired_tibet_reader_never_logs_or_calls_network(self):
+        """The retired compatibility reader is a quiet, network-free stub."""
         engines = [self._make_engine() for _ in range(3)]
+        network_calls = []
         with patch("price_engine.log_event") as log_event:
             for engine in engines:
                 with patch.object(
                     engine._session, "get", return_value=self._fail_resp(502)
-                ):
+                ) as get:
                     self.assertEqual(engine._get_tibet_pairs(), [])
+                    network_calls.append(get)
 
-        self.assertEqual(log_event.call_count, 1)
-        self.assertEqual(log_event.call_args.args[1], "tibet_error")
+        self.assertEqual(log_event.call_count, 0)
+        for get in network_calls:
+            get.assert_not_called()
 
-    def test_tibet_5xx_falls_back_to_stale_cache(self):
-        """When cache is within max_stale_secs, stale pairs are returned."""
+    def test_retired_tibet_reader_rejects_stale_cache(self):
+        """Legacy cached pool rows can never re-enter live pricing."""
         engine = self._make_engine()
         with _tibet_lock:
             _tibet_cache["pairs"] = [{"asset_id": "abc", "xch_reserve": 1000}]
@@ -254,7 +257,7 @@ class TestTibetSwap5xxFallback(unittest.TestCase):
 
         with patch.object(engine._session, "get", return_value=self._fail_resp()):
             pairs = engine._get_tibet_pairs()
-        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs, [])
 
     def test_tibet_5xx_does_not_raise(self):
         """5xx must be caught — _get_tibet_pairs never propagates exceptions."""
@@ -451,9 +454,8 @@ class TestClockJump(unittest.TestCase):
             result = mgr._post_single("offer1ok", "tok")
         self.assertTrue(result.get("success"))
 
-    def test_tibet_cache_negative_stale_age_does_not_crash(self):
-        """Clock jumped backward → fetched_at > now → stale_age is negative.
-        The stale-cache guard (age <= max_stale_secs) still evaluates correctly."""
+    def test_retired_tibet_cache_is_ignored_across_clock_jump(self):
+        """A future legacy timestamp cannot revive retired cached pool data."""
         engine = PriceEngine()
         with _tibet_lock:
             _tibet_cache["pairs"] = [{"test": True}]
@@ -467,9 +469,8 @@ class TestClockJump(unittest.TestCase):
                 pairs = engine._get_tibet_pairs()
         except Exception as exc:
             self.fail(f"Clock-jump stale-cache check raised: {exc}")
-        # Negative age (-9999) <= max_stale_secs (300) → True → stale pairs returned
         self.assertIsInstance(pairs, list)
-        self.assertTrue(len(pairs) >= 1)
+        self.assertEqual(pairs, [])
 
         with _tibet_lock:
             _tibet_cache["pairs"] = []

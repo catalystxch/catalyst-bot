@@ -27,11 +27,18 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 import api_server
 from config import cfg
-from database import log_event, backup_database, get_stats
+from database import (
+    backup_database,
+    get_post_tibet_migration_report,
+    log_event,
+)
 from super_log import slog
 
-# Shared helper defined in the offers blueprint — used by /api/status.
-from blueprints.offers import _build_fill_history_for_gui
+# Shared helpers defined in the offers blueprint — used by /api/status.
+from blueprints.offers import (
+    _build_fill_history_for_gui,
+    _offers_with_durable_authority,
+)
 
 try:
     from api_call_tracker import record as _record_api_call
@@ -42,6 +49,48 @@ except Exception:
 
 
 bp = Blueprint("bot", __name__)
+
+
+def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
+    """Prove legacy open-offer ownership before the first v1.4 bot start.
+
+    The migration is deliberately read-only and is persisted only after a
+    fresh, structurally valid wallet offer snapshot has been obtained.  A
+    transport or schema failure must remain retryable and must never be
+    mistaken for an empty authoritative offer set.
+    """
+    from market_evidence import migrate_post_tibet_state
+    from wallet import get_all_offers
+
+    existing = get_post_tibet_migration_report(asset_id)
+    if existing is not None and existing.get("can_start") is True:
+        return existing
+
+    wallet_offers = get_all_offers(include_completed=False, start=0, end=500)
+    if type(wallet_offers) is not list or any(
+        type(offer) is not dict for offer in wallet_offers
+    ):
+        return {
+            "asset_id": str(asset_id).strip().lower(),
+            "migration_version": 1,
+            "can_start": False,
+            "reason_code": "POST_TIBET_SAGE_OFFERS_UNAVAILABLE",
+            "retained_offer_ids": [],
+            "unsafe_offer_ids": [],
+            "tibet_live_features": "retired",
+        }
+
+    authoritative_ids = {
+        str(offer.get("trade_id") or offer.get("offer_id") or "").strip()
+        for offer in wallet_offers
+    }
+    authoritative_ids.discard("")
+    return migrate_post_tibet_state(
+        asset_id=asset_id,
+        authoritative_open_trade_ids=authoritative_ids,
+        ownership_proven=True,
+        now=datetime.now(timezone.utc),
+    )
 
 
 def _api_server():
@@ -345,6 +394,38 @@ def api_bot_start():
                     "reason": reason,
                     "errors": [error],
                     "warnings": warnings,
+                }
+            ), 400
+
+    # First v1.4 start must reconcile persisted legacy offers against a fresh
+    # authoritative Sage snapshot.  This comes after identity preflight so the
+    # evidence cannot be accepted from an unverified wallet.
+    if not errors:
+        try:
+            migration = _enforce_post_tibet_start_migration(cfg.CAT_ASSET_ID)
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Post-TibetSwap startup migration failed closed",
+                {"error": str(exc)[:256]},
+                level="error",
+            )
+            migration = {
+                "can_start": False,
+                "reason_code": "POST_TIBET_MIGRATION_FAILED",
+            }
+        if migration.get("can_start") is not True:
+            reason = str(migration.get("reason_code") or "POST_TIBET_MIGRATION_FAILED")
+            error = "Post-TibetSwap offer ownership reconciliation blocked bot start"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "error": error,
+                    "reason": reason,
+                    "errors": [error],
+                    "warnings": warnings,
+                    "migration": migration,
                 }
             ), 400
 
@@ -693,11 +774,9 @@ def api_status():
             cat_bal = {"spendable": 0, "total": 0}
 
             # Pre-start pricing cache. Without this, every /api/status poll
-            # (every 5 s) fires a live TibetSwap and Dexie fetch AND writes
-            # a price_lookup / price_found log row — opening the dashboard
-            # before the bot started generated ~720 log rows per hour and
-            # put pointless load on the oracles. Cache the lookup result
-            # for 60 s so log entries and HTTP calls drop to 1 per minute.
+            # (every 5 s) fires a Dexie lookup and writes a price event.
+            # Cache the result for 60 s and remain quiet until an operator
+            # actually selects a pair.
             global _prebot_price_cache  # noqa: PLW0603
             if "_prebot_price_cache" not in globals():
                 _prebot_price_cache = {
@@ -753,183 +832,36 @@ def api_status():
                     f"Looking up price for {api_server._active_cat.get('name', 'unknown')}",
                 )
             if pricing_asset_id:
-                import requests as _req
+                from blueprints.market import _get_startup_price_cached
 
-                mid = 0
-
-                # --- Try TibetSwap ---
-                try:
-                    from blueprints.market import _get_tibet_pairs_cached
-
-                    pairs = _get_tibet_pairs_cached(
-                        getattr(cfg, "TIBET_API_BASE", "https://api.v2.tibetswap.io"),
-                        timeout=8,
-                    )
-                    norm_id = pricing_asset_id.lower().strip().replace("0x", "")
-                    for p in pairs:
-                        p_id = (
-                            str(p.get("asset_id", "")).lower().strip().replace("0x", "")
-                        )
-                        if p_id == norm_id:
-                            xr = Decimal(str(p.get("xch_reserve", 0))) / Decimal(
-                                "1000000000000"
-                            )
-                            tr = Decimal(str(p.get("token_reserve", 0))) / (
-                                Decimal(10) ** int(cat_dec)
-                            )
-                            if tr > 0:
-                                mid = xr / tr
-                                pricing = {
-                                    "bid": mid,
-                                    "mid": mid,
-                                    "ask": mid,
-                                    "tibet_price": mid,
-                                    "tibet_enabled": True,
-                                    "source": "tibetswap",
-                                    "liquidity": {
-                                        "xch_reserve": str(xr),
-                                        "token_reserve": str(tr),
-                                    },
-                                }
-                                print(f"[STATUS] TibetSwap price: {mid}", flush=True)
-                                log_event(
-                                    "success",
-                                    "price_found",
-                                    f"TibetSwap price: {mid:.8f} XCH",
-                                )
-                            break
-                except Exception as e:
-                    print(f"[STATUS] TibetSwap failed: {e}")
-                    slog(
-                        "API_STATUS",
-                        f"TibetSwap price lookup failed: {e!r}",
-                        level="debug",
-                    )
+                ticker_id = (
+                    api_server._active_cat.get("ticker_id")
+                    or getattr(cfg, "CAT_TICKER_ID", "")
+                    or ""
+                )
+                snapshot = _get_startup_price_cached(
+                    pricing_asset_id, ticker_id, int(cat_dec)
+                )
+                mid = Decimal(str(snapshot.get("mid") or 0))
+                if mid > 0:
+                    pricing = {
+                        "bid": mid,
+                        "mid": mid,
+                        "ask": mid,
+                        "dexie_price": mid,
+                        "tibet_enabled": False,
+                        "tibet_status": "retired",
+                        "source": snapshot.get("source", "dexie_bid_ask"),
+                    }
                     log_event(
-                        "warning", "price_lookup", "TibetSwap price lookup failed"
+                        "success",
+                        "price_found",
+                        f"Dexie executable-book price: {mid:.8f} XCH",
                     )
-
-                # --- Fallback to Dexie if TibetSwap had no match ---
-                if mid == 0:
-                    print("[STATUS] No TibetSwap price, trying Dexie...", flush=True)
-                    log_event(
-                        "info",
-                        "price_lookup",
-                        "No TibetSwap price, trying Dexie fallback",
-                    )
-                    try:
-                        ticker_id = (
-                            api_server._active_cat.get("ticker_id")
-                            or getattr(cfg, "CAT_TICKER_ID", "")
-                            or ""
-                        )
-                        # Dexie ticker format is "{CAT}_XCH" e.g. "SBX_XCH" (V1 confirmed)
-                        if ticker_id and "_" not in ticker_id:
-                            ticker_id = f"{ticker_id}_XCH"
-                        dexie_base = getattr(
-                            cfg, "DEXIE_API_BASE", "https://api.dexie.space"
-                        )
-                        if ticker_id:
-                            _record_api_call("dexie", "/v2/prices/tickers")
-                            resp = _req.get(
-                                f"{dexie_base}/v2/prices/tickers",
-                                params={"ticker_id": ticker_id},
-                                timeout=8,
-                            )
-                            if resp.status_code == 200:
-                                tickers = resp.json().get("tickers", [])
-                                if tickers:
-                                    tk = tickers[0]
-                                    tk_bid = Decimal(
-                                        str(tk.get("bid") or tk.get("best_bid") or 0)
-                                    )
-                                    tk_ask = Decimal(
-                                        str(tk.get("ask") or tk.get("best_ask") or 0)
-                                    )
-                                    if tk_bid > 0 and tk_ask > 0 and tk_bid <= tk_ask:
-                                        mid = (tk_bid + tk_ask) / 2
-                                        pricing = {
-                                            "bid": tk_bid,
-                                            "mid": mid,
-                                            "ask": tk_ask,
-                                            "dexie_price": mid,
-                                            "tibet_enabled": False,
-                                            "source": "dexie_bid_ask",
-                                        }
-                                        print(
-                                            f"[STATUS] Dexie live bid/ask price: {mid}"
-                                        )
-                                        log_event(
-                                            "success",
-                                            "price_found",
-                                            f"Dexie live bid/ask price: {mid:.8f} XCH",
-                                        )
-                                    else:
-                                        log_event(
-                                            "info",
-                                            "dexie_ticker_unusable",
-                                            "Dexie ticker had no sane live bid/ask; ignoring historical price fields",
-                                        )
-                        # If no ticker_id or no result, try orderbook
-                        if mid == 0:
-                            _record_api_call("dexie", "/v1/offers")
-                            resp = _req.get(
-                                f"{dexie_base}/v1/offers",
-                                params={
-                                    "offered": pricing_asset_id,
-                                    "requested": "xch",
-                                    "status": 0,
-                                    "page_size": 1,
-                                    "sort": "price_asc",
-                                },
-                                timeout=8,
-                            )
-                            if resp.status_code == 200:
-                                offers = resp.json().get("offers", [])
-                                if offers:
-                                    best_ask = Decimal(str(offers[0].get("price", 0)))
-                                    if best_ask > 0:
-                                        mid = best_ask
-                                        pricing = {
-                                            "bid": mid,
-                                            "mid": mid,
-                                            "ask": mid,
-                                            "dexie_price": mid,
-                                            "tibet_enabled": False,
-                                            "source": "dexie_orderbook",
-                                        }
-                                        print(f"[STATUS] Dexie orderbook price: {mid}")
-                                        log_event(
-                                            "success",
-                                            "price_found",
-                                            f"Dexie orderbook price: {mid:.8f} XCH",
-                                        )
-                    except Exception as e:
-                        print(f"[STATUS] Dexie fallback failed: {e}")
-                        slog(
-                            "API_STATUS",
-                            f"Dexie fallback price lookup failed: {e!r}",
-                            level="debug",
-                        )
-                        log_event(
-                            "warning",
-                            "price_lookup",
-                            "Dexie fallback price lookup failed",
-                        )
-
-                if mid == 0:
-                    print("[STATUS] No price from any source")
+                else:
                     log_event(
                         "error", "price_lookup", "No price available from any source"
                     )
-            elif not active_asset_id:
-                print("[STATUS] No asset_id available for pricing", flush=True)
-                log_event(
-                    "warning",
-                    "price_lookup",
-                    "No asset_id configured — cannot fetch price",
-                )
-
             # Compute actual bid/ask from mid using configured spread
             try:
                 _mid_for_spread = Decimal(str(pricing.get("mid", 0)))
@@ -1323,6 +1255,7 @@ def api_status():
 
         # --- Offers ---
         is_running = raw.get("running", False)
+        used_wallet_snapshot = False
         if is_running:
             # Bot running — use database records (kept in sync by bot loop)
             try:
@@ -1338,7 +1271,6 @@ def api_status():
             # produced a fresh wallet-authoritative snapshot, though. Prefer
             # that snapshot so an externally filled/cancelled offer is not
             # resurrected in the UI by an older durable DB row.
-            used_wallet_snapshot = False
             try:
                 offer_manager = getattr(bot, "offer_manager", None)
                 snapshot_getter = getattr(
@@ -1553,6 +1485,16 @@ def api_status():
 
         enriched_buy = [_enrich_offer(o) for o in offers_buy]
         enriched_sell = [_enrich_offer(o) for o in offers_sell]
+        # The Offers tab renders this five-second status payload, not the
+        # standalone /api/offers response. Attach the same durable provider
+        # authority here so an omitted field cannot be rendered as the false
+        # claims "not queued" or "not observed" after exact Dexie discovery.
+        buy_count = len(enriched_buy)
+        authoritative_offers = _offers_with_durable_authority(
+            enriched_buy + enriched_sell
+        )
+        enriched_buy = authoritative_offers[:buy_count]
+        enriched_sell = authoritative_offers[buy_count:]
 
         fills_data = raw.get("fills") or {}
         history_out = _build_fill_history_for_gui(
@@ -1679,6 +1621,38 @@ def api_status():
                 "xch_topup_pool_amount": inv.get("xch_reserve_total", "0"),
                 "cat_topup_pool_amount": inv.get("cat_reserve_total", "0"),
             }
+
+        # A fresh stopped-state Sage snapshot is authoritative for offer
+        # membership. When it proves the book empty, do not pair that empty
+        # offer view with legacy DB rows that still label the same coins locked.
+        if (
+            not is_running
+            and used_wallet_snapshot
+            and not offers_buy
+            and not offers_sell
+        ):
+            xch_owned = max(
+                int(coin_tracking.get("xch_spendable", 0) or 0),
+                int(coin_tracking.get("xch_total", 0) or 0),
+            )
+            cat_owned = max(
+                int(coin_tracking.get("cat_spendable", 0) or 0),
+                int(coin_tracking.get("cat_total", 0) or 0),
+            )
+            coin_tracking.update(
+                {
+                    "xch_spendable": xch_owned,
+                    "xch_free": xch_owned,
+                    "xch_locked": 0,
+                    "xch_total": xch_owned,
+                    "cat_spendable": cat_owned,
+                    "cat_free": cat_owned,
+                    "cat_locked": 0,
+                    "cat_total": cat_owned,
+                    "xch_locked_amount": "0.0000",
+                    "cat_locked_amount": "0.00",
+                }
+            )
 
         # If coin tracking is all zeros (bot hasn't run), query Sage directly.
         # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
@@ -1903,7 +1877,7 @@ def api_runtime_diagnostics():
 
 @bp.route("/api/diagnostics/api-stats")
 def api_diagnostics_api_stats():
-    """F45 (2026-04-08): unified usage stats for all 3 external APIs.
+    """Return live provider usage and explicit retired-provider status.
 
     Returns counters for Spacescan (paid call budget), Coinset (hit
     rate vs wallet RPC fallback) and Dexie (post queue, v3 cache),
@@ -2115,6 +2089,17 @@ def api_diagnostics_api_stats():
         if _direct:
             payload["dexie"]["direct_calls"] = _direct
             payload["dexie"]["direct_calls_by_endpoint"] = _tracker_endpoints("dexie")
+        price_engine = getattr(bot, "price_engine", None) if bot is not None else None
+        payload["dexie"]["price_fetches"] = int(
+            getattr(price_engine, "_dexie_price_fetches", 0) or 0
+        )
+        try:
+            payload["dexie"]["orderbook_refreshes"] = int(
+                (getattr(bot, "_bot_state", {}) or {}).get("orderbook_refreshes", 0)
+                or 0
+            )
+        except (AttributeError, TypeError, ValueError):
+            payload["dexie"]["orderbook_refreshes"] = 0
 
     # --- Splash (P2P offer broadcast) ---------------------------------
     # Splash has its own /api/splash/stats endpoint, but callers of the
@@ -2153,100 +2138,13 @@ def api_diagnostics_api_stats():
     except Exception as e:
         payload["splash"] = {"available": False, "error": str(e)}
 
-    # --- TibetSwap / AMM Monitor --------------------------------------
-    try:
-        if bot is not None and getattr(bot, "amm_monitor", None):
-            amm_stats = bot.amm_monitor.get_stats() or {}
-            # Also grab price engine stats
-            _pe = getattr(bot, "price_engine", None)
-            _tibet_cache_age = None
-            _pe_tibet_fetches = 0
-            _pe_dexie_fetches = 0
-            if _pe:
-                with getattr(
-                    _pe,
-                    "_price_lock",
-                    type(
-                        "_", (), {"__enter__": lambda s: s, "__exit__": lambda *a: None}
-                    )(),
-                ):
-                    _last_tibet_ts = getattr(_pe, "_last_tibet_price_time", 0) or 0
-                    if _last_tibet_ts > 0:
-                        _tibet_cache_age = round(time.time() - _last_tibet_ts, 1)
-                _pe_tibet_fetches = getattr(_pe, "_tibet_price_fetches", 0)
-                _pe_dexie_fetches = getattr(_pe, "_dexie_price_fetches", 0)
-            # Orderbook refresh count from bot loop
-            _ob_refreshes = 0
-            try:
-                _ob_refreshes = int(bot._bot_state.get("orderbook_refreshes", 0) or 0)
-            except Exception:
-                pass
-            payload["tibetswap"] = {
-                "available": bool(amm_stats.get("available", False)),
-                "amm_price": amm_stats.get("amm_price"),
-                "drift_bps": amm_stats.get("drift_bps"),
-                "arb_pressure": amm_stats.get("arb_pressure", 0),
-                "arb_pressure_label": amm_stats.get("arb_pressure_label", "unknown"),
-                "total_polls": int(amm_stats.get("total_polls", 0) or 0),
-                "failed_polls": int(amm_stats.get("failed_polls", 0) or 0),
-                "consecutive_failures": int(
-                    amm_stats.get("consecutive_failures", 0) or 0
-                ),
-                "last_success_ago_secs": amm_stats.get("last_success_ago_secs"),
-                "price_cache_age_secs": _tibet_cache_age,
-                "pair_id": amm_stats.get("pair_id", ""),
-                "price_fetches": _pe_tibet_fetches,
-            }
-            # Add mempool watcher's Tibet API calls
-            try:
-                import mempool_watcher as _mw2
-
-                _watcher2 = getattr(_mw2, "_watcher_instance", None)
-                if _watcher2:
-                    _mw_tibet2 = getattr(_watcher2, "_tibet_api_calls", 0)
-                    payload["tibetswap"]["mempool_watcher_calls"] = _mw_tibet2
-                    payload["tibetswap"]["price_fetches"] = (
-                        _pe_tibet_fetches + _mw_tibet2
-                    )
-            except Exception:
-                pass
-            # Add Dexie read counters to the Dexie section
-            if payload["dexie"].get("available"):
-                payload["dexie"]["price_fetches"] = _pe_dexie_fetches
-                payload["dexie"]["orderbook_refreshes"] = _ob_refreshes
-            # Dynamic buffer stats if available
-            dyn = amm_stats.get("dynamic_buffer", {})
-            if dyn:
-                payload["tibetswap"]["sweep_count_in_window"] = dyn.get(
-                    "sweep_count_in_window", 0
-                )
-                payload["tibetswap"]["buffer_widened"] = (
-                    dyn.get("current_buffer_bps") is not None
-                )
-        else:
-            payload["tibetswap"] = {"available": False}
-    except Exception as e:
-        payload["tibetswap"] = {"available": False, "error": str(e)}
-
-    # Merge "direct" TibetSwap calls (token discovery, /pairs lookups
-    # from cat_resolver, smart_defaults, market intel, etc.) — these
-    # bypass amm_monitor so they're invisible to its stats. Always
-    # surface the counter; if amm_monitor isn't running we still want
-    # the direct counts to show up.
-    _tibet_direct = int(_tracker_get_count("tibetswap"))
-    if _tibet_direct:
-        if not isinstance(payload.get("tibetswap"), dict):
-            payload["tibetswap"] = {"available": False}
-        # Even when amm_monitor is offline (available=False), expose
-        # the direct calls so the modal can render *something*.
-        payload["tibetswap"]["direct_calls"] = _tibet_direct
-        payload["tibetswap"]["direct_calls_by_endpoint"] = _tracker_endpoints(
-            "tibetswap"
-        )
-        # Promote to "available" if at least one direct call landed —
-        # the panel becomes meaningful even without the AMM monitor.
-        if not payload["tibetswap"].get("available"):
-            payload["tibetswap"]["available_via_direct"] = True
+    # One-release compatibility marker. TibetSwap has shut down permanently;
+    # historical counters are not promoted into live provider health.
+    payload["tibetswap"] = {
+        "available": False,
+        "status": "retired",
+        "capabilities": [],
+    }
 
     # --- CoinGecko (XCH/USD price) ------------------------------------
     # Used by Smart Settings to display USD-denominated values and to

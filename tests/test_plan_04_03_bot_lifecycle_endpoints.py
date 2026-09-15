@@ -83,6 +83,12 @@ class _FlaskBase(unittest.TestCase):
         )
         self._wallet_sync_read.start()
         self.addCleanup(self._wallet_sync_read.stop)
+        self._post_tibet_migration = patch(
+            "blueprints.bot._enforce_post_tibet_start_migration",
+            return_value={"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
+        )
+        self._post_tibet_migration.start()
+        self.addCleanup(self._post_tibet_migration.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -110,7 +116,7 @@ def _make_bot(running=False, start_returns=True):
     return bot
 
 
-def _fake_cfg(cat_asset_id="abc123", spread_bps=200):
+def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
     return types.SimpleNamespace(
         CAT_ASSET_ID=cat_asset_id,
         SPREAD_BPS=spread_bps,

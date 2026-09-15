@@ -57,6 +57,11 @@ class CoinManagerFeePoolTests(unittest.TestCase):
             SNIPER_PREP_COUNT=0,
             COIN_PREP_HEADROOM_PCT=Decimal("10"),
             CAT_COIN_SIZE=Decimal("4000"),
+            MAX_ACTIVE_BUY_OFFERS=0,
+            MAX_ACTIVE_SELL_OFFERS=0,
+            ENABLE_BUY=False,
+            ENABLE_SELL=False,
+            COIN_PREP_MULTIPLIER=Decimal("1.0"),
             TRANSACTION_FEE_MODE="manual",
             TRANSACTION_FEE_XCH=Decimal("0.00000050"),
             TRANSACTION_FEE_TARGET_SECS=300,
@@ -75,6 +80,8 @@ class CoinManagerFeePoolTests(unittest.TestCase):
 
         fake_database = types.ModuleType("database")
         fake_database.log_event = lambda *args, **kwargs: None
+        fake_database.get_free_coins = lambda *args, **kwargs: []
+        fake_database.get_locked_coins = lambda *args, **kwargs: []
         fake_database.authorize_wallet_effect_coin_ids = lambda coin_ids: tuple(
             coin_ids
         )
@@ -146,6 +153,112 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         self.assertIn("fees", xch_sizes)
         self.assertEqual(xch_sizes["fees"], 100_000_000)
         self.assertNotIn("fees", cat_sizes)
+
+    def test_inventory_counts_only_authoritative_fee_reserve_coins(self):
+        """Legacy size matches must not be reported as dedicated fee coins.
+
+        A live TEST 7 wallet contained 221 records in the ``fees`` size bucket,
+        but only 50 were outputs from Coin Prep carrying the durable
+        ``fee_reserve`` purpose.  Reporting all 221 made the dashboard and logs
+        claim that ordinary legacy XCH coins were dedicated fee inventory.
+        """
+        authoritative = {
+            "coin_id": "0x" + "aa" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": "fee_reserve",
+        }
+        legacy_size_match = {
+            "coin_id": "0x" + "bb" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": None,
+        }
+        replacement_size_match = {
+            "coin_id": "0x" + "cc" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": "replacement",
+        }
+        empty = {
+            "reserve": [],
+            "inner": [],
+            "mid": [],
+            "outer": [],
+            "extreme": [],
+            "sniper": [],
+            "fees": [],
+            "small": [],
+        }
+        self.manager._xch_inventory = {
+            **empty,
+            "fees": [authoritative, legacy_size_match, replacement_size_match],
+        }
+        self.manager._cat_inventory = dict(empty)
+        self.manager._xch_locked_coins = 0
+        self.manager._xch_locked_amount = 0
+        self.manager._cat_locked_coins = 0
+        self.manager._cat_locked_amount = 0
+        self.manager._xch_total_coins = 3
+        self.manager._cat_total_coins = 0
+
+        summary = self.manager.get_inventory_summary()
+
+        self.assertEqual(summary["xch_fees"], 1)
+
+    def test_readiness_counts_only_authoritative_fee_reserve_coins(self):
+        authoritative = {
+            "coin_id": "0x" + "aa" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": "fee_reserve",
+        }
+        legacy_size_match = {
+            "coin_id": "0x" + "bb" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": None,
+        }
+        replacement_size_match = {
+            "coin_id": "0x" + "cc" * 32,
+            "coin": {"amount": 100_000_000},
+            "_catalyst_policy_purpose": "replacement",
+        }
+        self.manager._xch_inventory["fees"] = [
+            authoritative,
+            legacy_size_match,
+            replacement_size_match,
+        ]
+
+        report = self.manager.coin_readiness_report()
+
+        self.assertEqual(report["tiers"]["fees"]["xch_available"], 1)
+
+    def test_quick_fee_pool_refresh_rejects_unpurposed_size_matches(self):
+        authoritative_id = "0x" + "aa" * 32
+        legacy_id = "0x" + "bb" * 32
+        records = [
+            {"coin_id": authoritative_id, "coin": {"amount": 100_000_000}},
+            {"coin_id": legacy_id, "coin": {"amount": 100_000_000}},
+        ]
+        database = sys.modules["database"]
+        database.get_free_coins = lambda wallet_type: [
+            {
+                "coin_id": authoritative_id,
+                "assigned_tier": "fees",
+                "purpose": "fee_reserve",
+            },
+            {
+                "coin_id": legacy_id,
+                "assigned_tier": "fees",
+                "purpose": None,
+            },
+        ]
+        self.coin_manager.get_exact_spendable_coins_rpc = lambda wallet_id: {
+            "success": True,
+            "records": records,
+        }
+
+        self.manager.refresh_fee_pool_from_wallet()
+
+        self.assertEqual(self.manager.fee_pool.available_count, 1)
+        self.assertEqual(self.manager.fee_pool.reserve(), authoritative_id)
+        self.assertIsNone(self.manager.fee_pool.reserve())
 
 
 if __name__ == "__main__":

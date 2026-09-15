@@ -21,10 +21,12 @@ from api_test_support import permit_api_mutations
 
 try:
     import api_server
+    from blueprints import market as market_blueprint
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    market_blueprint = None
     _SKIP = str(exc)
 
 
@@ -215,15 +217,21 @@ class TestMarketIntel(_FlaskBase):
         self.assertEqual(Decimal(payload["our_spread_bps"]), expected)
         self.assertEqual(payload["live_book_source"], "wallet_sync")
 
-    def test_slippage_endpoint_defaults_to_one_xch(self):
+    def test_slippage_endpoint_is_retired_without_wallet_or_provider_call(self):
         bot = _make_bot()
-        bot.price_engine.get_tibet_quote.return_value = {"slippage_bps": "10"}
         with patch.object(api_server, "bot", bot):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        bot.price_engine.get_tibet_quote.assert_called_once_with(
-            amount_xch=Decimal("1"), side="buy"
+        bot.price_engine.get_tibet_quote.assert_not_called()
+        self.assertEqual(
+            resp.get_json(),
+            {
+                "available": False,
+                "provider": "tibetswap",
+                "status": "retired",
+                "reason": "TIBETSWAP_SHUTDOWN",
+            },
         )
 
     def test_slippage_endpoint_reports_provider_unavailable_without_http_error(self):
@@ -234,17 +242,11 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.get_json(),
-            {
-                "available": False,
-                "error": "TibetSwap quote unavailable",
-                "provider": "tibetswap",
-            },
-        )
+        self.assertEqual(resp.get_json()["status"], "retired")
+        bot.price_engine.get_tibet_quote.assert_not_called()
 
-    def test_slippage_endpoint_identifies_confirmed_tibetswap_outage(self):
-        """A TibetSwap HTTP failure must not be presented as an absent pool."""
+    def test_slippage_endpoint_ignores_obsolete_tibetswap_health_state(self):
+        """Historical outage state cannot reactivate a retired provider."""
         bot = _make_bot()
         bot._startup_self_test_results = {
             "tibet": {
@@ -259,26 +261,25 @@ class TestMarketIntel(_FlaskBase):
             resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(
-            resp.get_json(),
-            {
-                "available": False,
-                "error": "TibetSwap quote unavailable",
-                "message": (
-                    "TibetSwap outage (HTTP 502): pool depth and slippage are "
-                    "unavailable. CATalyst is using Dexie-only pricing; AMM drift "
-                    "protection is unavailable."
-                ),
-                "provider": "tibetswap",
-                "reason": "provider_outage",
-                "status_code": 502,
-            },
-        )
+        self.assertEqual(resp.get_json()["status"], "retired")
+        self.assertEqual(resp.get_json()["reason"], "TIBETSWAP_SHUTDOWN")
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestMarketSummary(_FlaskBase):
-    def test_identifies_tibetswap_outage_instead_of_zero_pool_and_gap(self):
+    def setUp(self):
+        super().setUp()
+        cache = getattr(market_blueprint, "_MARKET_SUMMARY_CACHE", None)
+        if isinstance(cache, dict):
+            cache.update(key=None, expires_at=0.0, payload={})
+
+    def tearDown(self):
+        cache = getattr(market_blueprint, "_MARKET_SUMMARY_CACHE", None)
+        if isinstance(cache, dict):
+            cache.update(key=None, expires_at=0.0, payload={})
+        super().tearDown()
+
+    def test_reports_permanent_tibetswap_retirement(self):
         """A confirmed TibetSwap outage must be machine-readable to the UI."""
         bot = _make_bot()
         bot._startup_self_test_results = {
@@ -309,7 +310,6 @@ class TestMarketSummary(_FlaskBase):
             with (
                 patch.object(api_server, "bot", bot),
                 patch("requests.get", return_value=EmptyResponse()),
-                patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
             ):
                 body = self.client.get(
                     "/api/market/summary", environ_base=self._LOOPBACK
@@ -319,17 +319,11 @@ class TestMarketSummary(_FlaskBase):
             api_server._active_cat.update(original_cat)
 
         self.assertIs(body["tibet_available"], False)
-        self.assertEqual(body["tibet_reason"], "provider_outage")
-        self.assertEqual(body["tibet_status_code"], 502)
+        self.assertEqual(body["tibet_reason"], "TIBETSWAP_SHUTDOWN")
+        self.assertEqual(body["tibet_status"], "retired")
+        self.assertIsNone(body["tibet_status_code"])
 
-    def test_reuses_tibet_pairs_for_immediate_dashboard_polls(self):
-        from blueprints import market as market_routes
-
-        with market_routes._TIBET_PAIRS_CACHE_LOCK:
-            market_routes._TIBET_PAIRS_CACHE.update(
-                {"base": "", "fetched_at": 0.0, "pairs": []}
-            )
-
+    def test_dashboard_polls_never_contact_retired_tibetswap(self):
         asset_id = "abc123cat"
         original_cat = dict(api_server._active_cat)
         api_server._active_cat.update(
@@ -376,7 +370,125 @@ class TestMarketSummary(_FlaskBase):
             api_server._active_cat.update(original_cat)
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
-        self.assertEqual(len(tibet_calls), 1)
+        self.assertEqual(tibet_calls, [])
+
+    def test_dashboard_clients_share_short_market_summary_cache(self):
+        """Several open UIs must not multiply outbound Dexie traffic."""
+        asset_id = "cache123cat"
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "CACHE_XCH",
+                "decimals": 3,
+                "name": "CACHE",
+            }
+        )
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((str(url), dict(params or {})))
+            if "prices/tickers" in str(url):
+                return FakeResponse({"tickers": []})
+            return FakeResponse({"offers": []})
+
+        try:
+            with patch("requests.get", side_effect=fake_get):
+                first = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                )
+                second = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                )
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.get_json(), second.get_json())
+        self.assertEqual(len(calls), 5)
+
+    def test_running_bot_reuses_fresh_orderbook_instead_of_four_extra_dexie_calls(self):
+        """Dashboard polling must reuse the bot's already-fetched attributable book."""
+        asset_id = "runningcache123cat"
+        original_cat = dict(api_server._active_cat)
+        original_cache = dict(market_blueprint._MARKET_SUMMARY_CACHE)
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "ticker_id": "RUNNING_XCH",
+                "decimals": 3,
+                "name": "RUNNING",
+            }
+        )
+        market_blueprint._MARKET_SUMMARY_CACHE.update(
+            key=None, expires_at=0.0, payload={}
+        )
+
+        bot = _make_bot()
+        bot.market_intel.get_market_summary.return_value = {
+            "overall_best_bid": "0.010",
+            "overall_best_ask": "0.014",
+            "dexie_total_buy_depth_xch": "5.25",
+            "dexie_total_sell_depth_xch": "6.75",
+            "orderbook_refreshes": 3,
+            "orderbook_age_secs": 2.0,
+        }
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "tickers": [
+                        {
+                            "current_avg_price": "0.011",
+                            "target_volume": "42.5",
+                            "bid": "0.009",
+                            "ask": "0.015",
+                        }
+                    ]
+                }
+
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((str(url), dict(params or {})))
+            return FakeResponse()
+
+        try:
+            with (
+                patch.object(api_server, "bot", bot),
+                patch("requests.get", side_effect=fake_get),
+            ):
+                body = self.client.get(
+                    "/api/market/summary", environ_base=self._LOOPBACK
+                ).get_json()
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+            market_blueprint._MARKET_SUMMARY_CACHE.clear()
+            market_blueprint._MARKET_SUMMARY_CACHE.update(original_cache)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/v2/prices/tickers", calls[0][0])
+        self.assertEqual(body["best_bid"], 0.01)
+        self.assertEqual(body["best_ask"], 0.014)
+        self.assertEqual(body["mid_price"], 0.012)
+        self.assertEqual(body["dexie_depth_xch"], 12.0)
+        self.assertEqual(body["volume_24h"], 42.5)
 
 
 # ---------------------------------------------------------------------------

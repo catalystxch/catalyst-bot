@@ -7758,6 +7758,8 @@ def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
     fill = _commit_fill_without_draining_hooks(monkeypatch)
     monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
     monkeypatch.setattr(database, "_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS", 0.09)
+    hook_clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: hook_clock["now"])
     callback_started = threading.Event()
     heartbeat_seen = threading.Event()
     release_callback = threading.Event()
@@ -7766,6 +7768,10 @@ def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
     original_heartbeat = database.heartbeat_offer_fill_hook
 
     def heartbeat(*args, **kwargs):
+        # Advance beyond the original claim's lease before renewing it.  Keeping
+        # the subsequent competing claim at this same instant makes the lease
+        # assertion deterministic under slow parallel coverage runs.
+        hook_clock["now"] = "2026-08-20T12:10:01.000000Z"
         held = original_heartbeat(*args, **kwargs)
         if held:
             heartbeat_seen.set()

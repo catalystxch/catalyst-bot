@@ -23,13 +23,16 @@ import sys
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from types import SimpleNamespace
 
 from flask import Blueprint, Response, current_app, g, jsonify, request, send_file
 
 import api_server
+from amount_utils import cat_display_amount_to_mojos_ceil
+from coin_prep_policy import exclude_retired_sniper_pools
 from config import cfg
 from database import (
     backup_database,
@@ -39,6 +42,7 @@ from database import (
     get_open_offers,
     get_stats,
     guarded_reset_authoritative_state,
+    list_active_bootstrap_campaigns_for_asset,
     log_event,
 )
 from pc_diagnostics import collect_pc_diagnostics as _collect_pc_diagnostics
@@ -54,6 +58,229 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bp = Blueprint("coin_prep", __name__)
 
 _coin_prep_trigger_lock = threading.Lock()
+
+
+def _coin_prep_wallet_snapshot(
+    get_wallet_balance,
+    get_spendable_coins,
+    xch_wallet_id: int,
+    cat_wallet_id: int,
+) -> tuple:
+    """Fetch independent Sage balance/coin views concurrently.
+
+    Each Sage RPC has its own bounded timeout.  Serial execution made the
+    preflight UI wait for the sum of four network calls, which could leave the
+    operator on an apparently frozen ``Checking...`` screen for nearly a
+    minute.  Result order stays deterministic for the caller.
+    """
+
+    with ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="coin-prep-verify"
+    ) as executor:
+        futures = (
+            executor.submit(get_wallet_balance, xch_wallet_id),
+            executor.submit(get_wallet_balance, cat_wallet_id),
+            executor.submit(get_spendable_coins, xch_wallet_id),
+            executor.submit(get_spendable_coins, cat_wallet_id),
+        )
+        return tuple(future.result() for future in futures)
+
+
+def bootstrap_coin_prep_requirements(plan: dict) -> dict:
+    """Return only purpose-separated outputs from an authorized Bootstrap plan."""
+
+    if type(plan) is not dict or plan.get("authorized") is not True:
+        raise ValueError("authorized Bootstrap plan is required")
+    prep = plan.get("coin_prep")
+    if type(prep) is not dict:
+        raise ValueError("Bootstrap Coin Prep requirements are missing")
+    required = {
+        "campaign_asset_id",
+        "xch_offer_coins",
+        "cat_offer_coins",
+        "fee_coins",
+        "excluded_xch",
+        "excluded_purposes",
+    }
+    if set(prep) != required:
+        raise ValueError("Bootstrap Coin Prep requirements are not purpose-separated")
+    return {
+        "campaign_asset_id": prep["campaign_asset_id"],
+        "xch_offer_coins": list(prep["xch_offer_coins"]),
+        "cat_offer_coins": list(prep["cat_offer_coins"]),
+        "fee_coins": list(prep["fee_coins"]),
+        "excluded_xch": dict(prep["excluded_xch"]),
+        "excluded_purposes": tuple(prep["excluded_purposes"]),
+    }
+
+
+def bootstrap_coin_prep_worker_args(plan: dict) -> dict:
+    """Translate one authorized Bootstrap plan into exact worker overrides."""
+
+    prep = bootstrap_coin_prep_requirements(plan)
+    level_to_tier = {"near": "inner", "middle": "mid", "far": "outer"}
+
+    def _sizes(rows: list, amount_key: str) -> dict[str, Decimal]:
+        values: dict[str, Decimal] = {}
+        for row in rows:
+            if type(row) is not dict or row.get("level") not in level_to_tier:
+                raise ValueError("Bootstrap Coin Prep level is invalid")
+            amount = Decimal(str(row.get(amount_key)))
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError("Bootstrap Coin Prep amount is invalid")
+            tier = level_to_tier[row["level"]]
+            if tier in values:
+                raise ValueError("Bootstrap Coin Prep level is duplicated")
+            values[tier] = amount
+        return values
+
+    xch_sizes = _sizes(prep["xch_offer_coins"], "amount_xch")
+    cat_sizes = _sizes(prep["cat_offer_coins"], "amount_cat")
+    fee_sizes = {
+        Decimal(str(row.get("amount_xch")))
+        for row in prep["fee_coins"]
+        if type(row) is dict
+    }
+    if prep["fee_coins"] and (len(fee_sizes) != 1 or next(iter(fee_sizes)) <= 0):
+        raise ValueError("Bootstrap fee coin sizes must be one positive amount")
+    if prep["fee_coins"]:
+        xch_sizes["fees"] = next(iter(fee_sizes))
+
+    tier_order = ("inner", "mid", "outer", "fees")
+
+    def _spec(values: dict[str, Decimal | int]) -> str:
+        return ",".join(
+            f"{tier}={values[tier]}" for tier in tier_order if tier in values
+        )
+
+    xch_counts = {tier: 1 for tier in xch_sizes if tier != "fees"}
+    if prep["fee_coins"]:
+        xch_counts["fees"] = len(prep["fee_coins"])
+    cat_counts = {tier: 1 for tier in cat_sizes}
+    return {
+        "xch_target": sum(xch_counts.values()),
+        "cat_target": sum(cat_counts.values()),
+        "buy_tier_sizes": _spec(xch_sizes),
+        "cat_tier_sizes": _spec(cat_sizes),
+        "tier_counts_xch": _spec(xch_counts),
+        "tier_counts_cat": _spec(cat_counts),
+        "prep_headroom_pct": "0",
+    }
+
+
+def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
+    """Resolve exact Coin Prep inputs and balances for an active campaign."""
+
+    asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+    if len(asset_id) != 64:
+        return None
+    active = list_active_bootstrap_campaigns_for_asset(asset_id)
+    if not active:
+        return None
+    if len(active) != 1:
+        raise ValueError("bootstrap_campaign_authority_ambiguous")
+    campaign = active[0]
+    if body.get("bootstrap_campaign_id") != campaign.get("campaign_id") or body.get(
+        "bootstrap_campaign_revision"
+    ) != campaign.get("revision"):
+        raise ValueError("bootstrap_coin_prep_confirmation_required")
+
+    from blueprints.bootstrap import BootstrapApiError, _read_bootstrap_identity
+    from bootstrap_runtime import derive_bootstrap_runtime
+    from tx_fees import get_effective_transaction_fee_mojos
+    from wallet import get_wallet_balance
+
+    try:
+        identity = _read_bootstrap_identity()
+    except BootstrapApiError as exc:
+        raise ValueError("bootstrap_wallet_identity_unavailable") from exc
+    xch_wallet_id = int(getattr(cfg, "WALLET_ID_XCH", 1) or 1)
+    with ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="bootstrap-prep-balance"
+    ) as executor:
+        xch_future = executor.submit(get_wallet_balance, xch_wallet_id)
+        cat_future = executor.submit(get_wallet_balance, int(campaign["wallet_id"]))
+        xch = xch_future.result()
+        cat = cat_future.result()
+
+    def _confirmed(result: dict, label: str) -> int:
+        if type(result) is not dict or result.get("success") is not True:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        wallet_balance = result.get("wallet_balance")
+        if type(wallet_balance) is not dict:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        value = wallet_balance.get("confirmed_wallet_balance")
+        if type(value) is not int or value < 0:
+            raise ValueError(f"bootstrap_{label}_balance_unavailable")
+        return value
+
+    cat_decimals = int(getattr(cfg, "CAT_DECIMALS", 3) or 3)
+    effective_fee_mojos = get_effective_transaction_fee_mojos()
+    if type(effective_fee_mojos) is not int or effective_fee_mojos < 0:
+        raise ValueError("bootstrap_network_fee_unavailable")
+    xch_balance_mojos = _confirmed(xch, "xch")
+    cat_balance_mojos = _confirmed(cat, "cat")
+    balances = {
+        "xch_available": Decimal(xch_balance_mojos) / Decimal(10**12),
+        "cat_available": Decimal(cat_balance_mojos) / Decimal(10**cat_decimals),
+        "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
+        "subsidy_spent_xch": Decimal("0"),
+        "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),
+        "minimum_profit_xch": Decimal(
+            str(getattr(cfg, "MINIMUM_PROFIT_XCH", "0") or "0")
+        ),
+        "fee_coin_size_xch": Decimal(
+            str(getattr(cfg, "FEE_COIN_SIZE_XCH", "0.001") or "0.001")
+        ),
+        "expected_cancel_requotes": int(
+            getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 1) or 1
+        ),
+    }
+    runtime = derive_bootstrap_runtime(
+        campaign_record=campaign,
+        identity=identity,
+        balances=balances,
+        now=datetime.now(timezone.utc),
+    )
+    plan = runtime["plan"]
+    if plan.get("authorized") is not True:
+        reasons = ",".join(plan.get("reason_codes") or ("not_authorized",))
+        raise ValueError(f"bootstrap_coin_prep_not_authorized:{reasons}")
+    return {
+        "campaign": campaign,
+        "worker_args": bootstrap_coin_prep_worker_args(plan),
+        "xch_balance_mojos": xch_balance_mojos,
+        "cat_balance_mojos": cat_balance_mojos,
+        "cat_decimals": cat_decimals,
+    }
+
+
+def _active_bootstrap_coin_prep_worker_args(body: dict) -> dict | None:
+    """Resolve exact Coin Prep worker inputs for the active campaign."""
+
+    context = _active_bootstrap_coin_prep_context(body)
+    return context["worker_args"] if context is not None else None
+
+
+def _bootstrap_coin_prep_public_error(exc: ValueError) -> str:
+    """Map internal bootstrap failures to stable, client-safe reason codes."""
+
+    internal_reason = str(exc)
+    if internal_reason == "bootstrap_campaign_authority_ambiguous":
+        return "bootstrap_campaign_authority_ambiguous"
+    if internal_reason == "bootstrap_coin_prep_confirmation_required":
+        return "bootstrap_coin_prep_confirmation_required"
+    if internal_reason == "bootstrap_wallet_identity_unavailable":
+        return "bootstrap_wallet_identity_unavailable"
+    if internal_reason == "bootstrap_xch_balance_unavailable":
+        return "bootstrap_xch_balance_unavailable"
+    if internal_reason == "bootstrap_cat_balance_unavailable":
+        return "bootstrap_cat_balance_unavailable"
+    if internal_reason == "bootstrap_network_fee_unavailable":
+        return "bootstrap_network_fee_unavailable"
+    if internal_reason.startswith("bootstrap_coin_prep_not_authorized:"):
+        return "bootstrap_coin_prep_not_authorized"
+    return "bootstrap_coin_prep_unavailable"
 
 
 def _wallet_open_offer_snapshot_before_prep() -> dict:
@@ -1194,7 +1421,13 @@ def api_coin_prep_status():
                                     else []
                                 )
 
-                                def _alloc_match(coins_list, requests, tol):
+                                def _alloc_match(
+                                    coins_list,
+                                    requests,
+                                    tol,
+                                    *,
+                                    minimum_target_tiers=frozenset(),
+                                ):
                                     """Allocate coins disjointly to tiers."""
                                     remaining = list(coins_list)
                                     allocated = {}
@@ -1210,6 +1443,10 @@ def api_coin_prep_status():
                                             i
                                             for i, a in enumerate(remaining)
                                             if lo <= a <= hi
+                                            and not (
+                                                tier in minimum_target_tiers
+                                                and a < target_m
+                                            )
                                         ]
                                         take = min(needed, len(hits))
                                         allocated[tier] = take
@@ -1219,7 +1456,13 @@ def api_coin_prep_status():
 
                                 _all_ok = True
                                 if _last.get("tier_enabled"):
-                                    _tsxch = _last.get("tier_sizes_xch", {})
+                                    _offer_tsxch = _last.get("offer_tier_sizes_xch")
+                                    _tsxch = (
+                                        _offer_tsxch
+                                        if isinstance(_offer_tsxch, dict)
+                                        and _offer_tsxch
+                                        else _last.get("tier_sizes_xch", {})
+                                    )
                                     _tscat = _last.get("tier_sizes_cat", {})
                                     _legacy_counts = _last.get("tier_counts", {})
                                     _tcxch = _last.get("tier_counts_xch")
@@ -1254,8 +1497,35 @@ def api_coin_prep_status():
                                                     _cnt,
                                                 )
                                             )
-                                    _xa = _alloc_match(_xch_coins, _xreqs, _tol)
-                                    _ca = _alloc_match(_cat_coins, _creqs, _tol)
+                                    # Bootstrap persists the exact offer spend
+                                    # amounts separately from any presentation-
+                                    # rounded preparation sizes.  A non-fee
+                                    # coin below that exact spend is unusable,
+                                    # even when it lies within the historical
+                                    # five-percent reuse tolerance.
+                                    _strict_bootstrap = bool(
+                                        isinstance(_offer_tsxch, dict) and _offer_tsxch
+                                    )
+                                    _xa = _alloc_match(
+                                        _xch_coins,
+                                        _xreqs,
+                                        _tol,
+                                        minimum_target_tiers=(
+                                            frozenset(_tcxch) - {"fees"}
+                                            if _strict_bootstrap
+                                            else frozenset()
+                                        ),
+                                    )
+                                    _ca = _alloc_match(
+                                        _cat_coins,
+                                        _creqs,
+                                        _tol,
+                                        minimum_target_tiers=(
+                                            frozenset(_tccat)
+                                            if _strict_bootstrap
+                                            else frozenset()
+                                        ),
+                                    )
                                     for _t, _cnt in _tcxch.items():
                                         _cnt = int(_cnt or 0)
                                         if _cnt <= 0:
@@ -1443,30 +1713,87 @@ def api_coin_prep_verify():
             or getattr(cfg, "LIQUIDITY_MODE", "two_sided")
             or "two_sided"
         )
+        bootstrap_context = None
+        bootstrap_campaign_id = str(
+            request.args.get("bootstrap_campaign_id") or ""
+        ).strip()
+        if bootstrap_campaign_id:
+            try:
+                bootstrap_revision = int(
+                    request.args.get("bootstrap_campaign_revision", "")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("bootstrap_coin_prep_confirmation_required") from exc
+            bootstrap_context = _active_bootstrap_coin_prep_context(
+                {
+                    "bootstrap_campaign_id": bootstrap_campaign_id,
+                    "bootstrap_campaign_revision": bootstrap_revision,
+                }
+            )
+            if bootstrap_context is None:
+                raise ValueError("bootstrap_coin_prep_confirmation_required")
+            tier_enabled = True
+            liquidity_mode = "two_sided"
         tolerance = 0.05  # 5% tolerance for matching coin sizes
 
         # Fetch wallet balances for sufficiency check
         # Uses CONFIRMED (total) balance, NOT spendable, because coin prep's
         # first step is to cancel all existing offers — so locked coins WILL
         # become available during prep.
-        xch_bal_result = get_wallet_balance(WALLET_ID_XCH)
-        cat_bal_result = get_wallet_balance(cat_wallet_id)
         xch_balance_mojos = 0
         cat_balance_mojos = 0
-        if xch_bal_result and isinstance(xch_bal_result, dict):
-            wb = xch_bal_result.get("wallet_balance") or xch_bal_result
+        if bootstrap_context is not None:
             xch_balance_mojos = _safe_non_negative_int(
-                wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
+                bootstrap_context["xch_balance_mojos"]
             )
-        if cat_bal_result and isinstance(cat_bal_result, dict):
-            wb = cat_bal_result.get("wallet_balance") or cat_bal_result
             cat_balance_mojos = _safe_non_negative_int(
-                wb.get("confirmed_wallet_balance", 0) or wb.get("spendable_balance", 0)
+                bootstrap_context["cat_balance_mojos"]
             )
-
-        # Fetch all spendable coins
-        xch_result = get_spendable_coins_rpc(WALLET_ID_XCH)
-        cat_result = get_spendable_coins_rpc(cat_wallet_id)
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="bootstrap-prep-coins"
+            ) as executor:
+                xch_future = executor.submit(get_spendable_coins_rpc, WALLET_ID_XCH)
+                cat_future = executor.submit(get_spendable_coins_rpc, cat_wallet_id)
+                xch_result = xch_future.result()
+                cat_result = cat_future.result()
+            xch_bal_result = None
+            cat_bal_result = None
+        else:
+            (
+                xch_bal_result,
+                cat_bal_result,
+                xch_result,
+                cat_result,
+            ) = _coin_prep_wallet_snapshot(
+                get_wallet_balance,
+                get_spendable_coins_rpc,
+                WALLET_ID_XCH,
+                cat_wallet_id,
+            )
+        if (
+            bootstrap_context is None
+            and xch_bal_result
+            and isinstance(xch_bal_result, dict)
+        ):
+            wb = xch_bal_result.get("wallet_balance") or xch_bal_result
+            projected = wb.get("unconfirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("confirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("spendable_balance", 0)
+            xch_balance_mojos = _safe_non_negative_int(projected)
+        if (
+            bootstrap_context is None
+            and cat_bal_result
+            and isinstance(cat_bal_result, dict)
+        ):
+            wb = cat_bal_result.get("wallet_balance") or cat_bal_result
+            projected = wb.get("unconfirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("confirmed_wallet_balance")
+            if projected is None:
+                projected = wb.get("spendable_balance", 0)
+            cat_balance_mojos = _safe_non_negative_int(projected)
 
         xch_coins = []
         if xch_result and xch_result.get("success"):
@@ -1492,10 +1819,48 @@ def api_coin_prep_verify():
                 if amt > 0:
                     cat_coins.append(amt)
 
-        cat_decimals = _safe_non_negative_int(
-            api_server._active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3),
-            3,
+        cat_decimals = (
+            int(bootstrap_context["cat_decimals"])
+            if bootstrap_context is not None
+            else _safe_non_negative_int(
+                api_server._active_cat.get("decimals")
+                or getattr(cfg, "CAT_DECIMALS", 3),
+                3,
+            )
         )
+
+        def _xch_display_to_mojos_ceil(value) -> int:
+            return int(
+                (_safe_non_negative_decimal(value) * Decimal(10**12)).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+
+        if bootstrap_context is not None:
+            # Bootstrap's authorized plan is purpose-separated and exact. Its
+            # worker disables legacy reserves/top-up pools, so ordinary saved
+            # configuration must not alter verification of campaign outputs.
+            xch_reserve_mojos = 0
+            cat_reserve_mojos = 0
+            topup_pool_xch_mojos = 0
+            topup_pool_cat_mojos = 0
+        else:
+            xch_reserve_mojos = _xch_display_to_mojos_ceil(
+                request.args.get("xch_reserve", "0")
+            )
+            cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
+                _safe_non_negative_decimal(request.args.get("cat_reserve", "0")),
+                cat_decimals,
+            )
+            topup_pool_xch_mojos = _xch_display_to_mojos_ceil(
+                request.args.get("topup_pool_xch", "0")
+            )
+            topup_pool_cat_mojos = cat_display_amount_to_mojos_ceil(
+                _safe_non_negative_decimal(request.args.get("topup_pool_cat", "0")),
+                cat_decimals,
+            )
+        xch_available_mojos = max(0, xch_balance_mojos - xch_reserve_mojos)
+        cat_available_mojos = max(0, cat_balance_mojos - cat_reserve_mojos)
 
         def count_matching(coins_list, target_mojos, tol):
             """Count coins within tolerance of target size."""
@@ -1503,7 +1868,13 @@ def api_coin_prep_verify():
             high = int(target_mojos * (1 + tol))
             return sum(1 for c in coins_list if low <= c <= high)
 
-        def allocate_matching_counts(coins_list, requests, tol):
+        def allocate_matching_counts(
+            coins_list,
+            requests,
+            tol,
+            *,
+            minimum_target_tiers=frozenset(),
+        ):
             """Allocate matching coins disjointly across tiers.
 
             This avoids double-counting when multiple tiers intentionally share
@@ -1522,7 +1893,10 @@ def api_coin_prep_verify():
                 low = int(target_mojos * (1 - tol))
                 high = int(target_mojos * (1 + tol))
                 matched_positions = [
-                    idx for idx, amt in enumerate(remaining) if low <= amt <= high
+                    idx
+                    for idx, amt in enumerate(remaining)
+                    if low <= amt <= high
+                    and not (tier in minimum_target_tiers and amt < target_mojos)
                 ]
                 consume = min(needed, len(matched_positions))
                 allocated[tier] = consume
@@ -1531,15 +1905,59 @@ def api_coin_prep_verify():
 
             return allocated
 
-        if tier_enabled:
-            tiers = [
+        bootstrap_tier_specs = {}
+        if bootstrap_context is not None:
+            worker_args = bootstrap_context["worker_args"]
+
+            def _assignments(value: str, cast):
+                parsed = {}
+                for item in str(value or "").split(","):
+                    if not item:
+                        continue
+                    tier, separator, raw = item.partition("=")
+                    if not separator or not tier:
+                        raise ValueError("bootstrap_coin_prep_plan_invalid")
+                    parsed[tier] = cast(raw)
+                return parsed
+
+            exact_xch = _assignments(worker_args["buy_tier_sizes"], Decimal)
+            exact_cat = _assignments(worker_args["cat_tier_sizes"], Decimal)
+            exact_xch_counts = _assignments(worker_args["tier_counts_xch"], int)
+            exact_cat_counts = _assignments(worker_args["tier_counts_cat"], int)
+            exact_tiers = tuple(
                 tier
-                for tier in ["inner", "mid", "outer", "extreme", "sniper", "fees"]
-                if any(
-                    request.args.get(f"{tier}_{suffix}") is not None
-                    for suffix in ("xch", "cat", "count")
-                )
-            ]
+                for tier in ("inner", "mid", "outer", "fees")
+                if tier in exact_xch or tier in exact_cat
+            )
+            for tier in exact_tiers:
+                xch_count = exact_xch_counts.get(tier, 0)
+                cat_count = exact_cat_counts.get(tier, 0)
+                bootstrap_tier_specs[tier] = {
+                    "xch_size": exact_xch.get(tier, Decimal("0")),
+                    "cat_size": exact_cat.get(tier, Decimal("0")),
+                    "xch_needed": xch_count,
+                    "cat_needed": cat_count,
+                    "needed": max(xch_count, cat_count),
+                }
+
+        if tier_enabled:
+            tiers = list(bootstrap_tier_specs)
+            if not tiers:
+                tiers = [
+                    tier
+                    for tier in [
+                        "inner",
+                        "mid",
+                        "outer",
+                        "extreme",
+                        "sniper",
+                        "fees",
+                    ]
+                    if any(
+                        request.args.get(f"{tier}_{suffix}") is not None
+                        for suffix in ("xch", "cat", "count", "xch_count", "cat_count")
+                    )
+                ]
             if not tiers:
                 tiers = ["inner", "mid", "outer", "extreme"]
             result_tiers = {}
@@ -1549,49 +1967,95 @@ def api_coin_prep_verify():
             cat_requests = []
 
             for tier in tiers:
-                xch_size = float(request.args.get(f"{tier}_xch", "0"))
-                cat_size = float(request.args.get(f"{tier}_cat", "0"))
-                needed = int(request.args.get(f"{tier}_count", "0"))
-                is_xch_only_tier = tier == "fees" or cat_size <= 0
+                exact_spec = bootstrap_tier_specs.get(tier)
+                if exact_spec is not None:
+                    xch_amount = exact_spec["xch_size"]
+                    cat_amount = exact_spec["cat_size"]
+                    xch_needed = exact_spec["xch_needed"]
+                    cat_needed = exact_spec["cat_needed"]
+                else:
+                    xch_amount = _safe_non_negative_decimal(
+                        request.args.get(f"{tier}_xch", "0")
+                    )
+                    cat_amount = _safe_non_negative_decimal(
+                        request.args.get(f"{tier}_cat", "0")
+                    )
+                    common_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_count", "0")
+                    )
+                    xch_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_xch_count", common_needed)
+                    )
+                    cat_needed = _safe_non_negative_int(
+                        request.args.get(f"{tier}_cat_count", common_needed)
+                    )
+                needed = max(xch_needed, cat_needed)
+                is_xch_only_tier = tier == "fees" or cat_amount <= 0
 
-                xch_mojos = int(xch_size * 1e12)
-                cat_mojos = int(cat_size * (10**cat_decimals))
+                xch_mojos = int(xch_amount * Decimal(10**12))
+                cat_mojos = int(cat_amount * Decimal(10**cat_decimals))
                 tier_specs[tier] = {
-                    "xch_size": xch_size,
-                    "cat_size": cat_size,
+                    "xch_size": float(xch_amount),
+                    "cat_size": float(cat_amount),
                     "needed": needed,
+                    "xch_needed": xch_needed,
+                    "cat_needed": cat_needed,
                     "xch_mojos": xch_mojos,
                     "cat_mojos": cat_mojos,
                     "xch_only": is_xch_only_tier,
                 }
-                if xch_mojos > 0 and needed > 0:
-                    xch_requests.append((tier, xch_mojos, needed))
-                if not is_xch_only_tier and cat_mojos > 0 and needed > 0:
-                    cat_requests.append((tier, cat_mojos, needed))
+                if xch_mojos > 0 and xch_needed > 0:
+                    xch_requests.append((tier, xch_mojos, xch_needed))
+                if not is_xch_only_tier and cat_mojos > 0 and cat_needed > 0:
+                    cat_requests.append((tier, cat_mojos, cat_needed))
 
-            xch_allocated = allocate_matching_counts(xch_coins, xch_requests, tolerance)
-            cat_allocated = allocate_matching_counts(cat_coins, cat_requests, tolerance)
+            strict_xch_tiers = (
+                frozenset(
+                    tier for tier, _amount, _needed in xch_requests if tier != "fees"
+                )
+                if bootstrap_context is not None
+                else frozenset()
+            )
+            strict_cat_tiers = (
+                frozenset(tier for tier, _amount, _needed in cat_requests)
+                if bootstrap_context is not None
+                else frozenset()
+            )
+            xch_allocated = allocate_matching_counts(
+                xch_coins,
+                xch_requests,
+                tolerance,
+                minimum_target_tiers=strict_xch_tiers,
+            )
+            cat_allocated = allocate_matching_counts(
+                cat_coins,
+                cat_requests,
+                tolerance,
+                minimum_target_tiers=strict_cat_tiers,
+            )
 
             for tier in tiers:
                 spec = tier_specs[tier]
                 needed = spec["needed"]
+                xch_needed = spec["xch_needed"]
+                cat_needed = spec["cat_needed"]
                 xch_have = xch_allocated.get(tier, 0) if spec["xch_mojos"] > 0 else 0
                 cat_have = cat_allocated.get(tier, 0) if spec["cat_mojos"] > 0 else 0
                 needs_xch = (
                     spec["xch_mojos"] > 0
-                    and needed > 0
+                    and xch_needed > 0
                     and (liquidity_mode != "sell_only" or tier == "fees")
                 )
                 needs_cat = (
                     not spec["xch_only"]
                     and spec["cat_mojos"] > 0
-                    and needed > 0
+                    and cat_needed > 0
                     and liquidity_mode != "buy_only"
                 )
                 sufficient = (
                     (
-                        ((not needs_xch) or xch_have >= needed)
-                        and ((not needs_cat) or cat_have >= needed)
+                        ((not needs_xch) or xch_have >= xch_needed)
+                        and ((not needs_cat) or cat_have >= cat_needed)
                     )
                     if needed > 0
                     else True
@@ -1603,6 +2067,8 @@ def api_coin_prep_verify():
                     "xch_size": spec["xch_size"],
                     "cat_size": spec["cat_size"],
                     "needed": needed,
+                    "xch_needed": xch_needed,
+                    "cat_needed": cat_needed,
                     "xch_have": xch_have,
                     "cat_have": cat_have,
                     "xch_only": spec["xch_only"],
@@ -1614,18 +2080,23 @@ def api_coin_prep_verify():
             total_xch_needed_mojos = 0
             total_cat_needed_mojos = 0
             for tier in tiers:
-                xch_size = float(request.args.get(f"{tier}_xch", "0"))
-                cat_size = float(request.args.get(f"{tier}_cat", "0"))
-                needed = int(request.args.get(f"{tier}_count", "0"))
+                spec = tier_specs[tier]
                 if liquidity_mode != "sell_only" or tier == "fees":
-                    total_xch_needed_mojos += int(xch_size * 1e12) * needed
-                if liquidity_mode != "buy_only" and tier != "fees" and cat_size > 0:
-                    total_cat_needed_mojos += (
-                        int(cat_size * (10**cat_decimals)) * needed
-                    )
+                    total_xch_needed_mojos += spec["xch_mojos"] * spec["xch_needed"]
+                if (
+                    liquidity_mode != "buy_only"
+                    and tier != "fees"
+                    and spec["cat_mojos"] > 0
+                ):
+                    total_cat_needed_mojos += spec["cat_mojos"] * spec["cat_needed"]
 
-            xch_balance_sufficient = xch_balance_mojos >= total_xch_needed_mojos
-            cat_balance_sufficient = cat_balance_mojos >= total_cat_needed_mojos
+            if liquidity_mode != "sell_only":
+                total_xch_needed_mojos += topup_pool_xch_mojos
+            if liquidity_mode != "buy_only":
+                total_cat_needed_mojos += topup_pool_cat_mojos
+
+            xch_balance_sufficient = xch_available_mojos >= total_xch_needed_mojos
+            cat_balance_sufficient = cat_available_mojos >= total_cat_needed_mojos
 
             balance_warnings = _coin_prep_balance_warnings(
                 xch_balance_sufficient,
@@ -1635,10 +2106,11 @@ def api_coin_prep_verify():
             )
 
             tier_drift = []
-            try:
-                tier_drift = _tier_size_drift_findings()
-            except Exception:
-                tier_drift = []
+            if bootstrap_context is None:
+                try:
+                    tier_drift = _tier_size_drift_findings()
+                except Exception:
+                    tier_drift = []
             if tier_drift:
                 all_sufficient = False
 
@@ -1656,12 +2128,18 @@ def api_coin_prep_verify():
                 "cat_total": len(cat_coins),
                 "xch_balance_mojos": xch_balance_mojos,
                 "cat_balance_mojos": cat_balance_mojos,
+                "xch_available_mojos": xch_available_mojos,
+                "cat_available_mojos": cat_available_mojos,
                 "xch_needed_mojos": total_xch_needed_mojos,
                 "cat_needed_mojos": total_cat_needed_mojos,
                 "balance_sufficient": xch_balance_sufficient and cat_balance_sufficient,
                 "balance_warnings": balance_warnings,
                 "tier_size_drift": tier_drift,
             }
+            if bootstrap_context is not None:
+                campaign = bootstrap_context["campaign"]
+                response["bootstrap_campaign_id"] = campaign["campaign_id"]
+                response["bootstrap_campaign_revision"] = campaign["revision"]
             if tier_drift:
                 _mark_payload_needs_coin_prep_for_drift(response, tier_drift)
             # Response fields are derived from numeric wallet balances and
@@ -1692,11 +2170,17 @@ def api_coin_prep_verify():
             cat_right_size = count_matching(cat_coins, cat_mojos, tolerance)
 
             # --- Balance sufficiency check (flat mode) ---
-            total_xch_needed_mojos = xch_mojos * max_buy
-            total_cat_needed_mojos = cat_mojos * max_sell
-
-            xch_balance_sufficient = xch_balance_mojos >= total_xch_needed_mojos
-            cat_balance_sufficient = cat_balance_mojos >= total_cat_needed_mojos
+            combined_count = max_buy + max_sell
+            xch_needed_count = combined_count if max_buy > 0 else 0
+            cat_needed_count = combined_count if max_sell > 0 else 0
+            total_xch_needed_mojos = xch_mojos * xch_needed_count
+            total_cat_needed_mojos = cat_mojos * cat_needed_count
+            if max_buy > 0:
+                total_xch_needed_mojos += topup_pool_xch_mojos
+            if max_sell > 0:
+                total_cat_needed_mojos += topup_pool_cat_mojos
+            xch_balance_sufficient = xch_available_mojos >= total_xch_needed_mojos
+            cat_balance_sufficient = cat_available_mojos >= total_cat_needed_mojos
 
             balance_warnings = _coin_prep_balance_warnings(
                 xch_balance_sufficient,
@@ -1713,15 +2197,18 @@ def api_coin_prep_verify():
                 "liquidity_mode": _safe_liquidity_mode(liquidity_mode),
                 "xch_coins_right_size": _safe_non_negative_int(xch_right_size),
                 "cat_coins_right_size": _safe_non_negative_int(cat_right_size),
-                "xch_needed": _safe_non_negative_int(max_buy),
-                "cat_needed": _safe_non_negative_int(max_sell),
+                "xch_needed": _safe_non_negative_int(xch_needed_count),
+                "cat_needed": _safe_non_negative_int(cat_needed_count),
                 "all_sufficient": (
-                    xch_right_size >= max_buy and cat_right_size >= max_sell
+                    xch_right_size >= xch_needed_count
+                    and cat_right_size >= cat_needed_count
                 ),
                 "xch_total": _safe_non_negative_int(len(xch_coins)),
                 "cat_total": _safe_non_negative_int(len(cat_coins)),
                 "xch_balance_mojos": _safe_non_negative_int(xch_balance_mojos),
                 "cat_balance_mojos": _safe_non_negative_int(cat_balance_mojos),
+                "xch_available_mojos": _safe_non_negative_int(xch_available_mojos),
+                "cat_available_mojos": _safe_non_negative_int(cat_available_mojos),
                 "xch_needed_mojos": _safe_non_negative_int(total_xch_needed_mojos),
                 "cat_needed_mojos": _safe_non_negative_int(total_cat_needed_mojos),
                 "balance_sufficient": xch_balance_sufficient and cat_balance_sufficient,
@@ -1769,6 +2256,27 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
+        try:
+            _bootstrap_worker_args = _active_bootstrap_coin_prep_worker_args(
+                _prep_req_data
+            )
+        except ValueError as exc:
+            reason = _bootstrap_coin_prep_public_error(exc)
+            log_event(
+                "warning",
+                "bootstrap_coin_prep_blocked",
+                f"Bootstrap Coin Prep blocked safely: {reason}",
+            )
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": reason,
+                        "reason": reason,
+                    }
+                ),
+                409,
+            )
         # Historical flag: full_reset=True means "Start Fresh" and requests
         # the broad legacy reset. The authoritative-state guard refuses it
         # without mutation when fills, protected offers, intents, or locks
@@ -2170,7 +2678,45 @@ def _api_coin_prep_trigger_locked():
                 max_sell = getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 25)
                 trade_xch = str(getattr(cfg, "DEFAULT_TRADE_XCH", "0.5"))
 
-                if getattr(cfg, "TIER_ENABLED", False):
+                if _bootstrap_worker_args is not None:
+                    exact = _bootstrap_worker_args
+                    total_coins = exact["xch_target"] + exact["cat_target"]
+                    cmd = [
+                        *worker_cmd,
+                        "--xch-target",
+                        str(exact["xch_target"]),
+                        "--cat-target",
+                        str(exact["cat_target"]),
+                        "--buy-tier-sizes",
+                        exact["buy_tier_sizes"],
+                        "--sell-tier-sizes",
+                        exact["buy_tier_sizes"],
+                        "--cat-tier-sizes",
+                        exact["cat_tier_sizes"],
+                        "--tier-counts-xch",
+                        exact["tier_counts_xch"],
+                        "--tier-counts-cat",
+                        exact["tier_counts_cat"],
+                        "--prep-headroom-pct",
+                        exact["prep_headroom_pct"],
+                        "--run-id",
+                        run_id,
+                    ]
+                    log_event(
+                        "info",
+                        "bootstrap_coin_prep_config",
+                        "Bootstrap Coin Prep is using exact campaign-bound XCH, "
+                        "CAT, and fee-coin outputs with zero sizing headroom",
+                        data={
+                            "campaign_id": _prep_req_data.get("bootstrap_campaign_id"),
+                            "campaign_revision": _prep_req_data.get(
+                                "bootstrap_campaign_revision"
+                            ),
+                            "xch_target": exact["xch_target"],
+                            "cat_target": exact["cat_target"],
+                        },
+                    )
+                elif getattr(cfg, "TIER_ENABLED", False):
                     # Tier-aware coin prep with PER-SIDE counts. Buy ladder is XCH-funded
                     # (BUY_*_TIER_COUNT + spares); sell ladder is CAT-funded (SELL_*_TIER_COUNT
                     # + spares). The worker uses these independently, so asymmetric ladders
@@ -2329,23 +2875,19 @@ def _api_coin_prep_trigger_locked():
                     elif _liquidity_mode == "sell_only":
                         xch_tier_counts = {}
 
-                    # Sniper needs BOTH sides: buy snipers lock XCH coins, sell snipers
-                    # lock CAT coins. preferred_tier="sniper" strict on both sides, so a
-                    # missing CAT sniper pool silently kills sell-side probes and leaves
-                    # the ladder anchored to one-sided probe data only. Fees are XCH-only.
-                    sniper_count = int(getattr(cfg, "SNIPER_PREP_COUNT", 0) or 0)
-                    sniper_size = Decimal(
-                        str(getattr(cfg, "SNIPER_SIZE_XCH", "0") or "0")
+                    # TibetSwap-backed sniping is retired in v1.4.  Apply a
+                    # server-side compatibility fence so stale hidden settings
+                    # from an upgraded installation cannot create obsolete
+                    # sniper cohorts or extra wallet transactions.
+                    (
+                        xch_tier_counts,
+                        cat_tier_counts,
+                        tier_sizes,
+                    ) = exclude_retired_sniper_pools(
+                        xch_tier_counts,
+                        cat_tier_counts,
+                        tier_sizes,
                     )
-                    if (
-                        _liquidity_mode == "two_sided"
-                        and getattr(cfg, "SNIPER_ENABLED", False)
-                        and sniper_count > 0
-                        and sniper_size > 0
-                    ):
-                        xch_tier_counts["sniper"] = sniper_count
-                        cat_tier_counts["sniper"] = sniper_count
-                        tier_sizes["sniper"] = sniper_size
 
                     fee_status = api_server.get_fee_settings_snapshot()
                     fee_count = int(fee_status.get("fee_prep_count", 0) or 0)
@@ -2830,7 +3372,6 @@ def api_coin_prep_cancel():
 @bp.route("/api/fills/export")
 def api_fills_export():
     """Export fill history as CSV."""
-    bot = api_server.bot
     try:
         asset_id = api_server._active_cat.get("asset_id") or getattr(
             cfg, "CAT_ASSET_ID", ""
@@ -2839,8 +3380,6 @@ def api_fills_export():
             return jsonify({"success": False, "error": "No active CAT selected"}), 400
 
         history = api_server._build_fill_history_for_gui(asset_id, limit=1000)
-        if not history:
-            return jsonify({"success": False, "error": "No fills to export"}), 404
 
         import csv
         import io
@@ -3020,6 +3559,7 @@ def api_logs_download():
             "SAGE_KEY_PATH",
             "FULL_NODE_CERT_PATH",
             "FULL_NODE_KEY_PATH",
+            "SAGE_FINGERPRINT",
             "SPACESCAN_API_KEY",
             "BOT_LOCAL_WRITE_TOKEN",
         )

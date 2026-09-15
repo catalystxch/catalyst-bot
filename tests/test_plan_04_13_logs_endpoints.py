@@ -586,6 +586,41 @@ class TestLogsDownload(_FlaskBase):
         self.assertNotIn("header_api_key_secret_123456", bundle_text)
         self.assertNotIn("password_secret_123456", bundle_text)
 
+    def test_bundle_redacts_configured_fingerprint_when_log_omits_label(self):
+        fingerprint = "123456789"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "bot_superlog.log")
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write(f"Confirmed: logged in as 'TEST 7' ({fingerprint})\n")
+
+            with (
+                patch.object(api_server.cfg, "SAGE_FINGERPRINT", fingerprint),
+                patch.object(api_server, "bot", None),
+                patch("database.get_recent_events", return_value=[]),
+                patch("database.get_open_offers", return_value=[]),
+                patch("database.get_fills", return_value=[]),
+                patch("database.get_live_tier_group_counts", return_value={}),
+                patch("database.get_coin_summary", return_value={}),
+                patch("database.get_config_history", return_value=[]),
+                patch("database.get_all_settings", return_value=[]),
+                patch("super_log.get_archive_summary", return_value=[]),
+                patch("super_log.get_log_path", return_value=log_path),
+                patch("super_log.get_log_stats", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/logs/download", environ_base=self._LOOPBACK
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(resp.data)) as zf:
+            bundle_text = "\n".join(
+                zf.read(name).decode("utf-8", errors="replace")
+                for name in zf.namelist()
+            )
+
+        self.assertNotIn(fingerprint, bundle_text)
+        self.assertIn("<secret-redacted>", bundle_text)
+
     def test_bundle_redacts_tls_paths_from_log_tails(self):
         sage_cert = r"C:\Users\Alice\AppData\Roaming\Sage\mainnet\ssl\wallet.crt"
         sage_key = r"C:\Users\Alice\AppData\Roaming\Sage\mainnet\ssl\wallet.key"

@@ -11,7 +11,9 @@ can still inspect it.
 
 from __future__ import annotations
 
+import json
 import sys
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -48,6 +50,49 @@ def _decimal_or_none(value) -> Decimal | None:
 
 _CANCEL_PENDING_LIFECYCLES = {"cancel_requested", "cancel_sent"}
 _TERMINAL_OFFER_STATES = {"cancelled", "filled", "expired", "failed"}
+
+
+def _balanced_cancel_batches(trade_ids, capacity: int) -> list[list[str]]:
+    """Split targets into ordered, near-even cohorts no larger than capacity."""
+
+    exact_trade_ids = list(trade_ids)
+    if not exact_trade_ids:
+        return []
+    if type(capacity) is not int or isinstance(capacity, bool) or capacity < 1:
+        raise ValueError("cancel batch capacity must be a positive integer")
+    batch_count = (len(exact_trade_ids) + capacity - 1) // capacity
+    base_size, larger_batches = divmod(len(exact_trade_ids), batch_count)
+    batches = []
+    cursor = 0
+    for index in range(batch_count):
+        size = base_size + (1 if index < larger_batches else 0)
+        batches.append(exact_trade_ids[cursor : cursor + size])
+        cursor += size
+    return batches
+
+
+def _confirmed_fill_authority(fill_id) -> dict:
+    """Expose the immutable receipt behind an economically visible fill."""
+
+    try:
+        receipt = database.get_authoritative_fill_by_id(int(fill_id))
+    except (TypeError, ValueError):
+        receipt = None
+    except Exception as exc:
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load confirmed fill authority for UI",
+            {"fill_id": fill_id, "error": type(exc).__name__},
+            level="warning",
+        )
+        receipt = None
+    if not receipt:
+        return {}
+    return {
+        "spent_block_height": receipt.get("spent_block_height"),
+        "transaction_id": receipt.get("transaction_id"),
+        "evidence_sha256": receipt.get("evidence_sha256"),
+    }
 
 
 def _durable_failed_cancel_retry_attempts(open_ids) -> dict[str, int]:
@@ -197,6 +242,95 @@ def _calculate_pnl_breakdown(
     return realised, unrealised, total
 
 
+def _offers_with_durable_authority(wallet_offers: list) -> list:
+    """Attach bounded publication/discovery truth to wallet offer rows."""
+
+    serialized = api_server._serialize_offers(wallet_offers)
+    if not serialized:
+        return []
+    trade_ids = [
+        str(item.get("trade_id") or "").strip()
+        for item in serialized
+        if str(item.get("trade_id") or "").strip()
+    ]
+    try:
+        authority_snapshot = database.get_offer_ui_authority_by_trade_ids(trade_ids)
+    except Exception:
+        authority_snapshot = {}
+    for item in serialized:
+        trade_id = str(item.get("trade_id") or "").strip()
+        snapshot = authority_snapshot.get(trade_id) or {}
+        intent = snapshot.get("intent")
+        if not intent:
+            item["authority"] = None
+            item["discovery"] = {
+                "state": "untracked",
+                "provider_identity": None,
+                "first_visible_at": None,
+                "providers": {},
+            }
+            item["publication"] = {}
+            continue
+
+        intent_id = str(intent.get("intent_id") or "")
+        if not str(item.get("coin_id") or "").strip():
+            try:
+                selected_coin_ids = json.loads(
+                    str(intent.get("selected_coin_ids_json") or "[]")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                selected_coin_ids = []
+            if len(selected_coin_ids) == 1:
+                coin_id = str(selected_coin_ids[0]).strip()
+                if (
+                    len(coin_id) == 64
+                    and coin_id == coin_id.lower()
+                    and all(character in "0123456789abcdef" for character in coin_id)
+                ):
+                    item["coin_id"] = coin_id
+                    item["coin_id_short"] = coin_id[:18] + "..."
+        item["authority"] = {
+            "intent_id": intent_id,
+            "lifecycle_state": intent.get("lifecycle_state"),
+            "generation": intent.get("generation"),
+            "parent_intent_id": intent.get("parent_intent_id"),
+            "child_intent_id": intent.get("child_intent_id"),
+            "updated_at": intent.get("updated_at"),
+        }
+        discovery_providers = {}
+        discovery_rows = snapshot.get("discoveries") or []
+        for row in discovery_rows:
+            provider = str(row.get("provider") or "").strip().lower()
+            if provider not in {"dexie", "splash"}:
+                continue
+            discovery_providers[provider] = {
+                "state": row.get("state"),
+                "deadline_at": row.get("deadline_at"),
+                "first_observed_at": row.get("first_observed_at"),
+                "observed_identity": row.get("observed_identity"),
+            }
+        item["discovery"] = {
+            "state": ("visible" if intent.get("first_visible_at") else "pending"),
+            "provider_identity": intent.get("publication_identity"),
+            "first_visible_at": intent.get("first_visible_at"),
+            "providers": discovery_providers,
+        }
+        provider_rows = {}
+        publications = snapshot.get("publications") or []
+        for row in publications:
+            publisher = str(row.get("publisher") or "").strip().lower()
+            if publisher not in {"dexie", "splash"}:
+                continue
+            provider_rows[publisher] = {
+                "state": row.get("state"),
+                "queued_at": row.get("queued_at"),
+                "updated_at": row.get("updated_at"),
+                "terminal_at": row.get("terminal_at"),
+            }
+        item["publication"] = provider_rows
+    return serialized
+
+
 def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
     """Return DB-backed fill history in the shape the Offers history tab expects."""
     if not asset_id:
@@ -235,6 +369,13 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
                 history_by_trade_id[trade_id]["dexie_link"] = dexie_link
             return
 
+        authority = _confirmed_fill_authority(row.get("fill_id"))
+        if not authority:
+            # A historical offers.status='filled' row is not economic proof.
+            # Only an immutable authoritative fill receipt may enter the
+            # confirmed history and downstream P&L/accounting surfaces.
+            return
+
         filled_at = (
             row.get("filled_at") or row.get("timestamp") or row.get("created_at") or ""
         )
@@ -252,6 +393,8 @@ def _build_fill_history_for_gui(asset_id: str, limit: int = 20) -> list:
             "age": api_server._history_age_label(filled_at),
             "filled_at": filled_at,
             "dexie_link": dexie_link,
+            "fill_confidence": "Confirmed",
+            "fill_authority": authority,
             "_sort_key": str(filled_at),
         }
 
@@ -296,8 +439,8 @@ def api_offers():
 
     return jsonify(
         {
-            "buys": api_server._serialize_offers(open_buys),
-            "sells": api_server._serialize_offers(open_sells),
+            "buys": _offers_with_durable_authority(open_buys),
+            "sells": _offers_with_durable_authority(open_sells),
             "buy_count": len(open_buys),
             "sell_count": len(open_sells),
         }
@@ -352,6 +495,138 @@ def api_cancel_all():
                 "requires_stop": True,
             }
         ), 409
+
+    gate_status = api_server.mutation_gate.read_only_status()
+    if getattr(gate_status, "allowed", False) is not True:
+        reason = str(getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED")
+        durable_manager = (
+            getattr(bot, "offer_manager", None) if bot is not None else None
+        )
+        if reason != "UNRESOLVED_OPERATIONS" or durable_manager is None:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "mutation_gate_blocked",
+                        "reason": reason,
+                    }
+                ),
+                423,
+            )
+
+        state = _get_cancel_all_state()
+        if state.get("running"):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Cancel reconciliation is already in progress.",
+                        "reason": reason,
+                        "reconciliation_only": True,
+                    }
+                ),
+                409,
+            )
+
+        blocker_ids = tuple(getattr(gate_status, "blocking_operation_ids", ()) or ())
+        _reset_cancel_all_state(
+            running=True,
+            complete=False,
+            error=None,
+            phase="reconciling",
+            total=len(blocker_ids),
+            pending=len(blocker_ids),
+            message=(
+                "An earlier cancellation is awaiting authoritative Sage proof. "
+                "Checking it now without submitting another transaction..."
+            ),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=None,
+        )
+
+        def _reconcile_existing_cancel():
+            result = durable_manager.reconcile_submitted_cancels_only()
+            refreshed = api_server.mutation_gate.read_only_status()
+            allowed = getattr(refreshed, "allowed", False) is True
+            refreshed_reason = str(
+                getattr(refreshed, "reason_code", "")
+                or ("" if allowed else "UNRESOLVED_OPERATIONS")
+            )
+            if result == 0 and allowed:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=True,
+                    error=None,
+                    phase="reconciled",
+                    pending=0,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message=(
+                        "The earlier cancellation is authoritatively resolved. "
+                        "Cancel All can now be run again for any remaining offers."
+                    ),
+                )
+                return
+            _set_cancel_all_state(
+                running=False,
+                complete=False,
+                error="awaiting_authoritative_cancel_proof",
+                phase="awaiting_authoritative_proof",
+                pending=len(blocker_ids),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                message=(
+                    "No second cancellation was submitted. The earlier request "
+                    "is still awaiting authoritative Sage confirmation."
+                ),
+            )
+            log_event(
+                "warning",
+                "cancel_all_awaiting_authoritative_proof",
+                "Cancel All remains blocked while the earlier Sage cancellation "
+                "awaits authoritative proof",
+                data={"reason_code": refreshed_reason},
+            )
+
+        recovery_thread = threading.Thread(
+            target=_reconcile_existing_cancel,
+            name="cancel-all-proof-reconciliation",
+            daemon=True,
+        )
+        recovery_thread.start()
+        api_server._cancel_all_thread = recovery_thread
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "async": True,
+                    "reason": reason,
+                    "reconciliation_only": True,
+                    "message": (
+                        "Checking the earlier cancellation for authoritative "
+                        "Sage confirmation; no new transaction was submitted."
+                    ),
+                }
+            ),
+            202,
+        )
+
+    try:
+        mutation_permit = api_server.mutation_gate.enter_mutation(
+            "api:offers.api_cancel_all"
+        )
+    except api_server.mutation_gate.MutationBlocked as exc:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": "mutation_gate_blocked",
+                    "reason": exc.reason_code,
+                }
+            ),
+            423,
+        )
+    from flask import g
+
+    g._mutation_permit = mutation_permit
 
     state = _get_cancel_all_state()
     if state.get("running"):
@@ -559,54 +834,132 @@ def api_cancel_all():
                     )
                     if callable(refresh_fee_pool):
                         refresh_fee_pool()
-                    _cancel_kwargs = {
-                        "reason": "manual_cancel_all",
-                        "force_storm": True,
-                    }
-                    if _retry_failed_attempts:
-                        _cancel_kwargs["_retry_failed_attempts"] = (
-                            _retry_failed_attempts
-                        )
-                    durable_manager.cancel_offers(_cancel_open_ids, **_cancel_kwargs)
+                    capacity_reader = getattr(
+                        durable_manager, "get_sage_bulk_cancel_capacity", None
+                    )
+                    raw_capacity = (
+                        capacity_reader(len(_cancel_open_ids))
+                        if callable(capacity_reader)
+                        else None
+                    )
+                    _batch_capacity = (
+                        raw_capacity
+                        if type(raw_capacity) is int
+                        and not isinstance(raw_capacity, bool)
+                        and 1 <= raw_capacity <= len(_cancel_open_ids)
+                        else len(_cancel_open_ids)
+                    )
+                    _cancel_batches = _balanced_cancel_batches(
+                        _cancel_open_ids, _batch_capacity
+                    )
                     _deadline_seconds = _cancel_all_deadline_seconds(
                         len(_cancel_open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
+                        batch_count=len(_cancel_batches),
                     )
                     _deadline = time.monotonic() + _deadline_seconds
-                    _terminal_ids = _authoritatively_terminal_offer_ids(
-                        _cancel_open_ids
+                    # The wallet just proved these offers active. Do not let a
+                    # stale local terminal row suppress a requested wallet
+                    # cancellation before the first submission attempt.
+                    _terminal_ids = set()
+                    _set_cancel_all_state(
+                        batch_size=_batch_capacity,
+                        total_batches=len(_cancel_batches),
+                        current_batch=1,
+                        pending=len(_cancel_open_ids) - len(_terminal_ids),
                     )
-                    while len(_terminal_ids) < len(_cancel_open_ids):
-                        durable_manager.retry_failed_cancels()
-                        _terminal_ids = _authoritatively_terminal_offer_ids(
-                            _cancel_open_ids
-                        )
-                        _remaining_count = len(_cancel_open_ids) - len(_terminal_ids)
+                    for _batch_index, _cancel_batch in enumerate(
+                        _cancel_batches, start=1
+                    ):
+                        _batch_targets = [
+                            trade_id
+                            for trade_id in _cancel_batch
+                            if trade_id not in _terminal_ids
+                        ]
+                        if not _batch_targets:
+                            continue
                         _set_cancel_all_state(
                             running=True,
                             complete=False,
                             error=None,
-                            phase="reconciling",
-                            total=len(_cancel_open_ids),
+                            phase="running",
+                            current_batch=_batch_index,
+                            batch_cancelled=0,
+                            batch_failed=0,
                             cancelled=len(_terminal_ids),
                             confirmed=len(_terminal_ids),
-                            pending=_remaining_count,
-                            failed=0,
+                            pending=len(_cancel_open_ids) - len(_terminal_ids),
                             message=(
-                                "Waiting for authoritative cancellation proof: "
-                                f"{len(_terminal_ids)}/{len(_cancel_open_ids)} "
-                                "offers terminal."
+                                f"Submitting cancellation batch {_batch_index}/"
+                                f"{len(_cancel_batches)} with "
+                                f"{len(_batch_targets)} offer(s)..."
                             ),
                         )
-                        _remaining_seconds = _deadline - time.monotonic()
-                        if not _remaining_count:
-                            break
-                        if _remaining_seconds <= 0:
-                            raise TimeoutError(
-                                "Cancel all is still awaiting authoritative Sage "
-                                f"proof for {_remaining_count} offer(s)."
+                        _cancel_kwargs = {
+                            "reason": "manual_cancel_all",
+                            "force_storm": True,
+                        }
+                        _batch_retry_attempts = {
+                            trade_id: _retry_failed_attempts[trade_id]
+                            for trade_id in _batch_targets
+                            if trade_id in _retry_failed_attempts
+                        }
+                        if _batch_retry_attempts:
+                            _cancel_kwargs["_retry_failed_attempts"] = (
+                                _batch_retry_attempts
                             )
-                        time.sleep(min(1.0, _remaining_seconds))
+                        durable_manager.cancel_offers(_batch_targets, **_cancel_kwargs)
+                        _batch_terminal_ids = _authoritatively_terminal_offer_ids(
+                            _batch_targets
+                        )
+                        while len(_batch_terminal_ids) < len(_batch_targets):
+                            # Restrict durable retries to this fee-safe cohort.
+                            # A global retry can submit an older unrelated
+                            # cancellation, trip the mutation latch, and make the
+                            # next cohort fail with UNRESOLVED_OPERATIONS.
+                            durable_manager.retry_failed_cancels(_batch_targets)
+                            _batch_terminal_ids = _authoritatively_terminal_offer_ids(
+                                _batch_targets
+                            )
+                            _terminal_ids = _authoritatively_terminal_offer_ids(
+                                _cancel_open_ids
+                            )
+                            _remaining_count = len(_cancel_open_ids) - len(
+                                _terminal_ids
+                            )
+                            _set_cancel_all_state(
+                                running=True,
+                                complete=False,
+                                error=None,
+                                phase="reconciling",
+                                total=len(_cancel_open_ids),
+                                batch_size=_batch_capacity,
+                                total_batches=len(_cancel_batches),
+                                current_batch=_batch_index,
+                                batch_cancelled=len(_batch_terminal_ids),
+                                cancelled=len(_terminal_ids),
+                                confirmed=len(_terminal_ids),
+                                pending=_remaining_count,
+                                failed=0,
+                                message=(
+                                    "Waiting for authoritative cancellation proof: "
+                                    f"{len(_terminal_ids)}/{len(_cancel_open_ids)} "
+                                    f"offers terminal (batch {_batch_index}/"
+                                    f"{len(_cancel_batches)})."
+                                ),
+                            )
+                            _remaining_seconds = _deadline - time.monotonic()
+                            if len(_batch_terminal_ids) == len(_batch_targets):
+                                break
+                            if _remaining_seconds <= 0:
+                                raise TimeoutError(
+                                    "Cancel all is still awaiting authoritative Sage "
+                                    f"proof for {_remaining_count} offer(s)."
+                                )
+                            time.sleep(min(1.0, _remaining_seconds))
+                        _terminal_ids = _authoritatively_terminal_offer_ids(
+                            _cancel_open_ids
+                        )
                     durable_manager.expect_empty_wallet_offer_book(
                         "manual_cancel_all_confirmed"
                     )
@@ -625,10 +978,10 @@ def api_cancel_all():
                         error=None,
                         phase="complete",
                         total=len(_cancel_open_ids),
-                        batch_size=len(_cancel_open_ids),
-                        total_batches=1,
-                        current_batch=1,
-                        batch_cancelled=len(_terminal_ids),
+                        batch_size=_batch_capacity,
+                        total_batches=len(_cancel_batches),
+                        current_batch=len(_cancel_batches),
+                        batch_cancelled=len(_cancel_batches[-1]),
                         batch_failed=0,
                         cancelled=len(_terminal_ids),
                         confirmed=len(_terminal_ids),
@@ -704,6 +1057,7 @@ def api_cancel_all():
                     "timeout_seconds": _cancel_all_deadline_seconds(
                         len(open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
+                        batch_count=len(open_ids),
                     ),
                     "message": f"Cancelling {len(open_ids)} offers in background...",
                 }
@@ -878,7 +1232,28 @@ def api_fills():
         limit=limit,
         since=api_server._get_run_history_cutoff(),
     )
-    return jsonify({"fills": api_server._serialize_list(fills)})
+    for fill in fills:
+        fill["fill_confidence"] = "Confirmed"
+        fill["fill_authority"] = _confirmed_fill_authority(fill.get("fill_id"))
+    try:
+        activity = database.get_fill_confidence_assessments(
+            cfg.CAT_ASSET_ID,
+            limit=min(max(limit * 3, 20), 200),
+        )
+    except Exception as exc:
+        activity = []
+        slog(
+            "FILL_AUTHORITY",
+            "Could not load fill confidence activity for UI",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+    return jsonify(
+        {
+            "fills": api_server._serialize_list(fills),
+            "activity": api_server._serialize_list(activity),
+        }
+    )
 
 
 @bp.route("/api/fills/classified")
@@ -1538,6 +1913,15 @@ def api_purge_fills():
     slog("GUI_ACTION", ">>> BUTTON: Purge Fill Records")
 
     try:
+        if bot and bot.is_running():
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "bot_running",
+                    "message": "Stop the bot before resetting fill history.",
+                }
+            ), 409
+
         from database import guarded_reset_authoritative_state, log_event
 
         reset = guarded_reset_authoritative_state(
@@ -1689,6 +2073,15 @@ def api_pnl_reset():
     bot = api_server.bot
     slog("GUI_ACTION", ">>> BUTTON: Reset Trading Stats")
     try:
+        if bot and bot.is_running():
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "bot_running",
+                    "message": "Stop the bot before resetting trading statistics.",
+                }
+            ), 409
+
         payload = request.get_json(silent=True) or {}
         if (payload.get("confirm") or "").strip().upper() != "RESET":
             return jsonify(
@@ -2044,18 +2437,17 @@ def api_pnl():
         return server._api_exception(request.path)
 
 
-def _cancel_all_deadline_seconds(offer_count, per_offer_wait_seconds):
-    """Bound one native bulk cancel plus authoritative reconciliation."""
-    # Sage's native ``cancel_offers`` call puts every member in one transaction,
-    # but CATalyst still commits one durable terminal proof per member. Allow a
-    # small bounded record budget without reverting to the old assumption that
-    # every offer needs its own on-chain confirmation window.
+def _cancel_all_deadline_seconds(offer_count, per_offer_wait_seconds, *, batch_count=1):
+    """Bound sequential native batches plus authoritative reconciliation."""
+    # Each fee-safe Sage cohort needs its own confirmation window, while every
+    # offer still needs an individual durable terminal-proof commit.
     count = max(0, int(offer_count))
+    cohorts = max(1, int(batch_count))
     confirmation_wait = max(1.0, float(per_offer_wait_seconds))
     record_budget = max(0, count - 1) * 10.0
     return max(
         180.0,
-        min(3_600.0, confirmation_wait * 2.0 + record_budget),
+        min(3_600.0, confirmation_wait * 2.0 * cohorts + record_budget),
     )
 
 

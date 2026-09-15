@@ -131,6 +131,12 @@ class TestDashboard(_FlaskBase):
         ):
             self.assertIn(key, body)
 
+    def test_active_features_omit_retired_amm_sniper(self):
+        resp = self._get_dashboard()
+
+        features = resp.get_json()["settings"]["features"]
+        self.assertNotIn("sniper", features)
+
     def test_response_has_fiat_price_summary(self):
         fake_stats = {
             "realised_pnl_xch": "0",
@@ -364,7 +370,7 @@ class TestDashboard(_FlaskBase):
             "Market conditions healthy — bot stopped",
         )
 
-    def test_market_health_reports_tibetswap_outage_as_degraded(self):
+    def test_retired_tibetswap_check_does_not_degrade_offer_book_health(self):
         risk_manager = MagicMock()
         risk_manager.get_inventory_state.return_value = {}
         risk_manager.get_circuit_breaker_blocked_side.return_value = ""
@@ -440,13 +446,13 @@ class TestDashboard(_FlaskBase):
 
         self.assertEqual(resp.status_code, 200)
         market_health = resp.get_json()["market_health"]
-        self.assertEqual(market_health["status"], "amber")
-        self.assertIn("TibetSwap", market_health["message"])
-        self.assertIn("Dexie-only", market_health["message"])
-        self.assertTrue(
+        self.assertEqual(market_health["status"], "green")
+        self.assertEqual(
+            market_health["message"], "Market healthy — bot operating normally"
+        )
+        self.assertFalse(
             any(
-                condition.get("level") == "amber"
-                and "AMM drift protection" in condition.get("text", "")
+                "TibetSwap" in condition.get("text", "")
                 for condition in market_health["conditions"]
             )
         )
@@ -469,6 +475,11 @@ class TestDashboard(_FlaskBase):
         resp = self._get_dashboard()
         body = resp.get_json()
         self.assertIn("dexie_orderbook", body["links"])
+
+    def test_links_do_not_advertise_retired_tibetswap(self):
+        resp = self._get_dashboard()
+        body = resp.get_json()
+        self.assertNotIn("tibetswap_pool", body["links"])
 
     def test_current_cat_is_dict(self):
         resp = self._get_dashboard()
@@ -856,6 +867,7 @@ class TestDashboard(_FlaskBase):
         bot.price_engine.get_last_price.return_value = (
             "0.0001318526026886049206032406980"
         )
+        bot._get_effective_offer_targets.return_value = {"buy": 11, "sell": 11}
 
         fake_stats = {
             "realised_pnl_xch": "0",
@@ -909,6 +921,8 @@ class TestDashboard(_FlaskBase):
         metrics = resp.get_json()["market_health"]["metrics"]
         self.assertEqual(metrics["our_best_bid"], str(live_edges["our_best_bid"]))
         self.assertEqual(metrics["our_best_ask"], str(live_edges["our_best_ask"]))
+        self.assertEqual(metrics["effective_buy_target"], 11)
+        self.assertEqual(metrics["effective_sell_target"], 11)
         expected_bps = (
             (live_edges["our_best_ask"] - live_edges["our_best_bid"])
             / api_server.Decimal(bot._bot_state["mid_price"])

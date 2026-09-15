@@ -172,6 +172,19 @@ def test_primary_nav_views_switch_without_wallet(app_page, label, view_id):
     expect(app_page.locator(f"#{view_id}")).to_have_class(re.compile(r"\bactive\b"))
 
 
+def test_settings_hidden_pair_selector_does_not_create_horizontal_overflow(page):
+    """The screen-reader-only pair select must not widen the Settings page."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.set_viewport_size({"width": 1280, "height": 720})
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("window.v4SwitchView('settings')")
+
+    overflow = page.evaluate(
+        "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+    )
+    assert overflow <= 0
+
+
 def test_data_reset_button_opens_destructive_confirmation(app_page):
     """Data-reset actions should show a confirmation dialog before POSTing."""
     reveal_app_shell_for_nav(app_page)
@@ -184,6 +197,74 @@ def test_data_reset_button_opens_destructive_confirmation(app_page):
     )
     expect(app_page.locator("#confirmTitle")).to_have_text("Reset P&L Counters")
     expect(app_page.locator("#confirmOkBtn")).to_have_text("Reset P&L")
+
+
+def test_running_bot_disables_and_guards_pnl_reset_controls(page):
+    """P&L reset actions must be inert for the whole running-bot window."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """() => {
+            bot_state = { ...bot_state, running: true };
+            window.__pnlResetConfirmCalls = 0;
+            window.__pnlResetFetchCalls = 0;
+            showStyledConfirm = async () => {
+                window.__pnlResetConfirmCalls += 1;
+                return false;
+            };
+            apiFetch = async () => {
+                window.__pnlResetFetchCalls += 1;
+                return { json: async () => ({ success: true }) };
+            };
+            updateDataResetButtonState(true);
+        }"""
+    )
+
+    expect(page.locator("#btnPnlResetPosition")).to_be_disabled()
+    expect(page.locator("#btnPnlResetAllStats")).to_be_disabled()
+
+    page.evaluate(
+        """async () => {
+            await resetPosition();
+            await resetAllTradingStats();
+        }"""
+    )
+    assert page.evaluate("window.__pnlResetConfirmCalls") == 0
+    assert page.evaluate("window.__pnlResetFetchCalls") == 0
+
+
+def test_offer_detail_toggle_has_meaningful_icon_and_accessible_name(page):
+    """Offer expand/collapse controls must not render as anonymous question marks."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    reveal_app_shell_for_nav(page)
+    page.evaluate(
+        """() => {
+        v4SwitchView('offers');
+        updateOffers('buyOffers', [{
+            full_id: 'a'.repeat(64),
+            id: 'a'.repeat(18) + '...',
+            side: 'buy',
+            status: 'PENDING_ACCEPT',
+            size_xch: '0.0100',
+            size_cat: '10.000',
+            price: '0.001',
+            target_price: '0.001',
+            mid_price: '0.001',
+            spread_pct: '-1.0',
+            tier: 'inner',
+            created_datetime: '2026-09-13 12:00:00',
+        }]);
+        }"""
+    )
+
+    toggle = page.locator("#buyOffers .collapse-toggle")
+    expect(toggle).to_have_text("▾")
+    expect(toggle).to_have_attribute("aria-label", "Collapse offer details")
+
+    toggle.click()
+    expect(toggle).to_have_text("▸")
+    expect(toggle).to_have_attribute("aria-label", "Expand offer details")
 
 
 def test_opening_logs_view_reveals_latest_entry(page):
@@ -254,182 +335,549 @@ def test_returning_to_logs_fetches_fresh_events_immediately(page):
     assert page.evaluate("window.__logsRequestCount") == 1
 
 
-def test_inactive_amm_monitor_is_not_shown_as_still_gathering(page):
-    """A resolved inactive monitor state must not look like an endless fetch."""
+def test_logs_backfill_includes_latest_non_debug_info_event(page):
+    """The Logs tab must not keep stale rows when the newest event is ordinary info."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    log_panel = page.locator("#logsContainer")
+    page.evaluate(
+        """() => {
+            window.apiFetch = async (path) => {
+                if (!String(path).includes('/logs?limit=2000')) {
+                    throw new Error(`Unexpected test request: ${path}`);
+                }
+                return new Response(JSON.stringify({
+                    logs: [{
+                        id: 3,
+                        timestamp: '2026-09-11 03:31:33',
+                        severity: 'info',
+                        event_type: 'cat_selected',
+                        message: 'Trading pair selected: Monkeyzoo Token (wallet 2)',
+                        data: null,
+                    }],
+                }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            document.getElementById('logsContainer').innerHTML = '<div>stale-startup-entry</div>';
+            window.v4SwitchView('dashboard');
+        }"""
+    )
+
+    page.evaluate("window.v4SwitchView('logs')")
+
+    expect(log_panel).to_contain_text("Trading pair selected", timeout=2_000)
+    expect(log_panel).not_to_contain_text("stale-startup-entry")
+
+
+def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
+    """A resolved confidence snapshot must replace the warming placeholder."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
         """() => {
-            window.updateAmmStatusBar({
-                available: false,
-                amm_price: null,
-                xch_reserve: null,
-                token_reserve: null,
-                fetched_at: 0,
-                pair_id: '',
-                total_polls: 0,
-                failed_polls: 0,
-                consecutive_failures: 0,
-                last_success_ago_secs: null,
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_attributable_depth'],
+                },
+                evidence: { source_ids: [] },
+                providers: {},
+                metrics: {},
             });
         }"""
     )
 
-    expect(page.locator("#ammPlaceholder")).to_contain_text(
-        "TibetSwap monitor inactive"
+    expect(page.locator("#marketConfidencePlaceholder")).to_be_hidden()
+    expect(page.locator("#marketConfidenceState")).to_have_text("RED")
+    expect(page.locator("#marketConfidenceReasons")).to_have_text(
+        "insufficient attributable depth"
     )
-    expect(
-        page.locator("#ammPlaceholder .v4-data-strip-placeholder-dots")
-    ).to_be_hidden()
 
 
-def test_market_intel_names_confirmed_tibetswap_outage(page):
-    """Market Intel must distinguish a TibetSwap outage from an absent pool."""
+def test_market_intel_explains_tibetswap_retirement(page):
+    """Market Intel must explain that TibetSwap is historical-only in v1.4."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    page.evaluate(
-        """() => {
-            window.renderTibetSlippageContext({
-                available: false,
-                error: 'TibetSwap quote unavailable',
-                message: 'TibetSwap outage (HTTP 502): pool depth and slippage are unavailable. CATalyst is using Dexie-only pricing; AMM drift protection is unavailable.',
-                provider: 'tibetswap',
-                reason: 'provider_outage',
-                status_code: 502,
-            });
-        }"""
-    )
 
     expect(page.locator("#intelTibetContext")).to_have_text(
-        "TibetSwap outage (HTTP 502): pool depth and slippage are unavailable. "
-        "CATalyst is using Dexie-only pricing; AMM drift protection is unavailable."
+        "TibetSwap shut down; historical TibetSwap data is retained as read-only "
+        "history and never drives a live decision."
     )
-    expect(page.locator("#intelSlippage")).to_have_text("Unavailable")
-    expect(page.locator("#intelPoolRatio")).to_have_text("Unavailable")
+    expect(page.locator("#intelSlippage")).to_be_hidden()
+    expect(page.locator("#intelPoolRatio")).to_be_hidden()
 
 
-def test_dashboard_diagnostics_do_not_render_false_tibet_values_during_outage(page):
-    """The TibetSwap outage must not look like a zero pool or zero arb gap."""
+def test_dashboard_confidence_does_not_invent_tradable_depth(page):
+    """Red confidence must not turn absent attributable depth into zero-valued safety."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
     page.evaluate(
         """() => {
-            window.renderMarketSummaryVenueState({
-                has_data: true,
-                dexie_depth_xch: 420,
-                pool_xch: 0,
-                arb_gap_bps: 0,
-                tibet_available: false,
-                tibet_reason: 'provider_outage',
-                tibet_status_code: 502,
-            });
-            window.updateIntelDiagnostics({
-                pricing: { bid: 0.00006723, ask: 0.00006792 },
-                arb_gap_bps: 0,
-                chia_health: { status: 'healthy' },
-                diagnostics: { spacescan_enabled: true },
-            });
-        }"""
-    )
-
-    expect(page.locator("#mktTibetDepth")).to_have_text("Tibet: unavailable")
-    expect(page.locator("#mktArbGap")).to_have_text("Unavailable")
-    expect(page.locator("#mktArbSub")).to_have_text("TibetSwap outage — Dexie-only")
-    expect(page.locator("#coverageTibet")).to_have_text("outage")
-    expect(page.locator("#intelArbGapTrend")).to_have_text("Unavailable")
-    expect(page.locator("#intelArbGapTrendSub")).to_have_text(
-        "TibetSwap outage — Dexie-only"
-    )
-
-
-def test_dashboard_diagnostics_do_not_render_false_tibet_values_without_pool(page):
-    """A reachable TibetSwap API with no pool cannot supply depth or arb data."""
-    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
-    page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    rendered = page.evaluate(
-        """() => {
-            window.renderMarketSummaryVenueState({
-                has_data: true,
-                dexie_depth_xch: 128.35,
-                pool_xch: 0,
-                tibet_price: 0,
-                arb_gap_bps: 0,
-                tibet_available: true,
-                tibet_reason: 'no_pool',
-            });
-            window.updateMarketHealth({
-                status: 'green',
-                message: 'Market healthy — bot operating normally',
-                metrics: { arb_gap_bps: '0', pool_depth_ratio: '0' },
-            });
-            window.updateIntelDiagnostics({
-                pricing: { bid: 0.00007343, ask: 0.00007860 },
-                arb_gap_bps: 0,
-                chia_health: { status: 'healthy' },
-                diagnostics: { spacescan_enabled: true },
-            });
-            return {
-                depth: document.getElementById('mktTibetDepth').textContent,
-                gap: document.getElementById('mktArbGap').textContent,
-                sub: document.getElementById('mktArbSub').textContent,
-                healthGap: document.getElementById('ccArbGap').textContent,
-                healthPool: document.getElementById('ccPoolDepth').textContent,
-                intelCoverage: document.getElementById('coverageTibet').textContent,
-                intelGap: document.getElementById('intelArbGapTrend').textContent,
-                intelGapSub: document.getElementById('intelArbGapTrendSub').textContent,
-            };
-        }"""
-    )
-
-    assert rendered == {
-        "depth": "Tibet: no pool",
-        "gap": "Unavailable",
-        "sub": "No TibetSwap pool — Dexie-only",
-        "healthGap": "Unavailable",
-        "healthPool": "Unavailable",
-        "intelCoverage": "none",
-        "intelGap": "Unavailable",
-        "intelGapSub": "No TibetSwap pool — Dexie-only",
-    }
-
-
-def test_dashboard_market_health_marks_tibet_metrics_unavailable_during_outage(page):
-    """The TibetSwap outage must not render AMM-only health metrics as zero."""
-    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
-    page.goto(gui.as_uri(), wait_until="domcontentloaded")
-
-    page.evaluate(
-        """() => {
-            window.updateMarketHealth({
-                status: 'amber',
-                message: 'Market degraded — TibetSwap unavailable; Dexie-only pricing active without AMM drift protection',
-                conditions: [{
-                    level: 'amber',
-                    text: 'TibetSwap API unavailable — Dexie-only pricing; AMM drift protection and reference price unavailable',
-                }],
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    trusted_bid: null,
+                    trusted_ask: null,
+                    reason_codes: ['stale_provider_evidence'],
+                },
                 metrics: {
-                    pricing_mode: 'dexie_only',
-                    tibetswap_available: false,
-                    tibetswap_status_code: 502,
-                    arb_gap_bps: '0',
-                    pool_depth_ratio: '0',
+                    independent_bid_depth_xch: 0,
+                    independent_ask_depth_xch: 0,
+                },
+                evidence: { source_ids: [] },
+                providers: {
+                    dexie: { status: 'stale', reason_codes: ['evidence_expired'] },
                 },
             });
         }"""
     )
 
+    expect(page.locator("#mktPoolDepth")).to_have_text("—")
+    expect(page.locator("#mktArbGap")).to_have_text("RED")
+    expect(page.locator("#mktArbSub")).to_have_text("stale provider evidence")
+    expect(page.locator("#marketTrustedRange")).to_have_text("No tradable range")
+    expect(page.locator("#marketProviderHealth")).to_contain_text(
+        "dexie stale (evidence expired)"
+    )
+
+
+def test_dashboard_renders_attributable_confidence_depth(page):
+    """A coherent confidence snapshot drives trusted range and independent depth."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    rendered = page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'GREEN',
+                    trusted_bid: '0.00007343',
+                    trusted_ask: '0.00007860',
+                    reason_codes: [],
+                },
+                metrics: {
+                    independent_bid_depth_xch: 12.25,
+                    independent_ask_depth_xch: 9.75,
+                    required_depth_xch: 2,
+                },
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {
+                    dexie: { status: 'fresh', reason_codes: [] },
+                    splash: { status: 'fresh', reason_codes: [] },
+                },
+            });
+            return {
+                depth: document.getElementById('mktPoolDepth').textContent,
+                bidDepth: document.getElementById('mktDexieDepth').textContent,
+                askDepth: document.getElementById('mktAskDepth').textContent,
+                confidence: document.getElementById('mktArbGap').textContent,
+                range: document.getElementById('marketTrustedRange').textContent,
+            };
+        }"""
+    )
+
+    assert rendered == {
+        "depth": "22.00 XCH",
+        "bidDepth": "Bid: 12.25 XCH",
+        "askDepth": "Ask: 9.75 XCH",
+        "confidence": "GREEN",
+        "range": "0.0000734 – 0.0000786 XCH/CAT",
+    }
+
+
+def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
+    """Trusted CAT prices are compact and explicitly labelled as XCH per CAT."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => window.renderMarketConfidence({
+            confidence: {
+                state: 'AMBER',
+                trusted_bid: '0.0003733333333333333333333333333',
+                trusted_ask: '0.0003852000000000000000000000000',
+                reason_codes: ['single_provider_dependency'],
+            },
+            metrics: {},
+            providers: {},
+        })"""
+    )
+
+    expect(page.locator("#marketTrustedRange")).to_have_text(
+        "0.000373 – 0.000385 XCH/CAT"
+    )
+
+
+def test_smart_advisor_accepts_confidence_capped_ladder_as_complete(page):
+    """Advisor compares live depth with effective targets, not configured ceilings."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            bot_state = {
+                running: true,
+                pricing: { mid: '0.0001' },
+                chia_health: { wallet_reachable: true },
+            };
+            window.saUpdateAdvisor({
+                settings: {
+                    trading: { max_active_buy: 45, max_active_sell: 45 },
+                    spreads: {
+                        base_spread_bps: '800',
+                        min_spread_bps: '100',
+                        max_spread_bps: '1500',
+                    },
+                    safety: { xch_reserve: '0', cat_reserve: '0' },
+                    inventory: { max_position_xch: '5' },
+                    features: { inventory_mgmt: true },
+                },
+                performance: {
+                    loop_count: 6,
+                    open_buys: 11,
+                    open_sells: 11,
+                    uptime_secs: 600,
+                    total_fills: 0,
+                },
+                market_health: {
+                    status: 'green',
+                    message: 'Market healthy — bot operating normally',
+                    metrics: {
+                        effective_buy_target: 11,
+                        effective_sell_target: 11,
+                        market_intel_state: 'ready',
+                        buy_spread_bps: '400',
+                        sell_spread_bps: '400',
+                    },
+                },
+                wallet: {},
+                coins: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#saList")).not_to_contain_text("Building the live ladder")
+
+
+def test_dashboard_market_health_uses_authoritative_confidence_snapshot(page):
+    """Health cards must use the durable confidence snapshot, not legacy AMM fields."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'AMBER',
+                    reason_codes: ['single_provider_evidence'],
+                },
+                metrics: { required_depth_xch: 1.25 },
+                evidence: { source_ids: ['dexie'] },
+                providers: { dexie: { status: 'fresh', reason_codes: [] } },
+            });
+            window.updateMarketHealth({
+                status: 'amber',
+                message: 'Market restricted — independent evidence is incomplete',
+                conditions: [{
+                    level: 'amber',
+                    text: 'Only one attributable provider currently confirms the book',
+                }],
+                metrics: {},
+            });
+        }"""
+    )
+
     expect(page.locator("#ccHealthMsg")).to_have_text(
-        "Market degraded — TibetSwap unavailable; Dexie-only pricing active without AMM drift protection"
+        "Market restricted — independent evidence is incomplete"
     )
-    expect(page.locator("#ccArbGap")).to_have_text("Unavailable")
-    expect(page.locator("#ccPoolDepth")).to_have_text("Unavailable")
+    expect(page.locator("#ccArbGap")).to_have_text("AMBER")
+    expect(page.locator("#ccPoolDepth")).to_have_text("1.2500 XCH / side")
     expect(page.locator("#ccConditions")).to_contain_text(
-        "TibetSwap API unavailable — Dexie-only pricing"
+        "Only one attributable provider currently confirms the book"
     )
+
+
+def test_dashboard_health_cannot_claim_healthy_when_authoritative_confidence_is_red(
+    page,
+):
+    """The legacy health card must not contradict the durable RED safety truth."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['market_evidence_expired'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: { withdrawal_stage: 'ALL' },
+                metrics: {},
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy — bot stopped',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthDot")).to_have_class(re.compile(r"cc-light-red"))
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Market blocked — offer-book confidence is RED"
+    )
+    expect(page.locator("#ccConditions")).to_contain_text("market evidence expired")
+
+
+def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
+    page,
+):
+    """RED blocks Follow exposure without claiming Bootstrap was withdrawn."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-1',
+                revision: 4,
+                stage: 'bootstrap',
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Bounded Bootstrap active — Follow mode is blocked by RED confidence"
+    )
+    expect(page.locator("#marketConfidenceCountdown")).to_have_text(
+        "Follow exposure withdrawn; bounded Bootstrap offers remain active"
+    )
+
+
+def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
+    """A RED Bootstrap anchor must not be presented as trusted market evidence."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-1',
+                revision: 4,
+                stage: 'bootstrap',
+                anchor_price: '0.0001',
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    trusted_bid: null,
+                    trusted_ask: null,
+                    trusted_mid: null,
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Bootstrap Anchor Price")
+    expect(page.locator("#heroMidPriceTooltip")).to_contain_text(
+        "approved campaign anchor"
+    )
+
+
+def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
+    """Reload must not paint Follow mode while a durable campaign is active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const assetId = 'b8'.repeat(32);
+            currentCAT = {};
+            bot_state = {};
+            _bootstrapActiveCampaign = null;
+            let requestCount = 0;
+            apiFetch = async () => {
+                requestCount += 1;
+                return new Response(JSON.stringify({
+                    success: true,
+                    active: true,
+                    identity: {
+                        asset_id: assetId,
+                        wallet_id: 2,
+                        wallet_fingerprint: 736588221,
+                        network: 'mainnet',
+                        ticker: 'MZ_XCH',
+                    },
+                    campaign: {
+                        campaign_id: 'campaign-live',
+                        revision: 0,
+                        asset_id: assetId,
+                        stage: 'bootstrap',
+                        deployment_fraction: '0.10',
+                        expires_at: '2099-01-01T00:00:00Z',
+                        minimum_price: '0.00005',
+                        maximum_price: '0.0002',
+                        xch_budget: '72.8943',
+                        cat_budget: '351421.735',
+                        fee_budget_xch: '0.01',
+                        subsidy_budget_xch: '0',
+                        anchor_price: '0.0001',
+                        adverse_fill_times: [],
+                    },
+                }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+
+            await bootstrapRefreshStatus();
+            return {
+                requestCount,
+                campaignId: _bootstrapActiveCampaign?.campaign_id || null,
+                globalStatus: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboardStatus: document.getElementById('bootstrapDashboardStatus').textContent,
+            };
+        }"""
+    )
+
+    assert result["requestCount"] == 1
+    assert result["campaignId"] == "campaign-live"
+    assert result["globalStatus"].startswith("Bootstrap active")
+    assert "corridor 0.00005–0.0002 XCH/MZ" in result["dashboardStatus"]
+    assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
+
+
+def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
+    """Confidence arriving after dashboard data must immediately reconcile the card."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _dashboardData = {
+                market_health: {
+                    status: 'green',
+                    message: 'Market conditions healthy — bot stopped',
+                    conditions: [],
+                    metrics: {},
+                },
+            };
+            window.updateMarketHealth(_dashboardData.market_health);
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['market_evidence_expired'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: { withdrawal_stage: 'ALL' },
+                metrics: {},
+                evidence: { source_ids: ['dexie', 'splash'] },
+                providers: {},
+            });
+        }"""
+    )
+
+    expect(page.locator("#ccHealthDot")).to_have_class(re.compile(r"cc-light-red"))
+    expect(page.locator("#ccHealthMsg")).to_have_text(
+        "Market blocked — offer-book confidence is RED"
+    )
+
+
+def test_market_intel_refreshes_splash_node_after_supervisor_restart(
+    flask_server, page
+):
+    """A visible Market Intel tab must replace a dead Splash PID without reload."""
+    page.goto(flask_server, wait_until="domcontentloaded")
+    reveal_app_shell_for_nav(page)
+    page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+        }"""
+    )
+
+    page.route(
+        "**/api/market/intel",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "splash_node": {
+                        "process_running": True,
+                        "api_reachable": True,
+                        "binary_found": True,
+                        "pid": 14488,
+                        "uptime_seconds": 845,
+                        "restart_count": 0,
+                    }
+                }
+            ),
+        ),
+    )
+    page.route(
+        "**/api/splash/node",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "process_running": True,
+                    "api_reachable": True,
+                    "binary_found": True,
+                    "pid": 48156,
+                    "uptime_seconds": 20,
+                    "restart_count": 1,
+                }
+            ),
+        ),
+    )
+
+    page.locator('[data-view="intel"]').click()
+    expect(page.locator("#splashNodePid")).to_have_text("14488")
+    expect(page.locator("#splashNodePid")).to_have_text("48156", timeout=8_000)
+    expect(page.locator("#splashNodeStatus")).to_have_text("Running")
 
 
 def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
@@ -450,19 +898,30 @@ def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
                     decimals: 3,
                 },
             };
-            apiFetch = async () => new Response(JSON.stringify({
-                has_data: true,
-                best_bid: 0.0000672337521645723,
-                best_ask: 0.0000679213506120472,
-                volume_24h: 0.242291699794,
-                dexie_depth_xch: 420,
-                pool_xch: 0,
-                arb_gap_bps: 0,
-                mid_price: 0.0000675775515,
-                tibet_available: false,
-                tibet_reason: 'provider_outage',
-                tibet_status_code: 502,
-            }), { status: 200 });
+            apiFetch = async (url) => new Response(JSON.stringify(
+                String(url).includes('/market/confidence')
+                    ? {
+                        confidence: {
+                            state: 'GREEN',
+                            trusted_bid: '0.0000672337521645723',
+                            trusted_ask: '0.0000679213506120472',
+                            reason_codes: [],
+                        },
+                        metrics: {
+                            independent_bid_depth_xch: 8,
+                            independent_ask_depth_xch: 7,
+                        },
+                        evidence: { source_ids: ['dexie', 'splash'] },
+                        providers: {},
+                    }
+                    : {
+                        has_data: true,
+                        best_bid: 0.0000672337521645723,
+                        best_ask: 0.0000679213506120472,
+                        volume_24h: 0.242291699794,
+                        mid_price: 0.0000675775515,
+                    }
+            ), { status: 200 });
 
             await fetchMarketSummary();
         }"""
@@ -471,8 +930,57 @@ def test_running_status_pair_drives_market_cards_before_cat_list_hydrates(page):
     expect(page.locator("#mktBestBid")).to_have_text("0.00006723")
     expect(page.locator("#mktBestAsk")).to_have_text("0.00006792")
     expect(page.locator("#mktVolume24h")).to_have_text("0.242")
-    expect(page.locator("#mktTibetDepth")).to_have_text("Tibet: unavailable")
-    expect(page.locator("#mktArbGap")).to_have_text("Unavailable")
+    expect(page.locator("#mktPoolDepth")).to_have_text("15.00 XCH")
+    expect(page.locator("#mktArbGap")).to_have_text("GREEN")
+
+
+def test_running_pair_clears_stale_select_pair_while_market_summary_loads(page):
+    """A restored live pair must not keep advertising that no pair is selected."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    stale_text = page.evaluate(
+        """async () => {
+            currentCAT = {};
+            bot_state = { running: false, current_cat: {} };
+            await fetchMarketSummary();
+
+            bot_state = {
+                running: true,
+                current_cat: {
+                    asset_id: 'a628c1c2c6fcb74d53746157e438e108eab5c0bb3e5c80ff9b1910b3e4832913',
+                    wallet_id: 2,
+                    ticker_id: 'SBX_XCH',
+                    name: 'Spacebucks',
+                    decimals: 3,
+                },
+            };
+            apiFetch = async (url) => {
+                if (String(url).includes('/market/confidence')) {
+                    return new Response(JSON.stringify({
+                        confidence: { state: 'AMBER', reason_codes: [] },
+                        metrics: {},
+                        evidence: { source_ids: ['dexie'] },
+                        providers: {},
+                    }), { status: 200 });
+                }
+                await new Promise(resolve => setTimeout(resolve, 3_000));
+                return new Response(JSON.stringify({
+                    has_data: true,
+                    best_bid: 0.00037543,
+                    best_ask: 0.00038520,
+                    volume_24h: 0,
+                    mid_price: 0.00038031,
+                }), { status: 200 });
+            };
+
+            window.__pendingMarketSummary = fetchMarketSummary();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            return document.getElementById('mktBestBid').textContent;
+        }"""
+    )
+
+    assert stale_text == "Loading..."
 
 
 def test_pair_pnl_reset_allows_identical_fill_snapshot_to_render_again(page):
@@ -512,6 +1020,37 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     )
 
     assert is_dirty is False
+    expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
+
+
+def test_smart_settings_snapshot_accepts_save_time_spread_floor_normalization(page):
+    """Save-time ladder-floor normalization must not falsely mark Smart Settings stale."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    is_dirty = page.evaluate(
+        """async () => {
+            const minEdge = document.getElementById('configMinEdgeBps');
+            const minSpread = document.getElementById('configMinSpreadBps');
+            minEdge.value = '10.1';
+            minSpread.value = '15.1';
+            markSmartSettingsApplied();
+            await new Promise(resolve => setTimeout(resolve, 0));
+
+            const config = {
+                min_edge_bps: 1010,
+                min_spread_bps: 1510,
+                max_spread_bps: 3000,
+            };
+            normalizeDynamicSpreadConfig(config);
+            return {
+                dirty: checkSmartSettingsDirty(),
+                minSpread: minSpread.value,
+            };
+        }"""
+    )
+
+    assert is_dirty == {"dirty": False, "minSpread": "15.15"}
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
@@ -782,6 +1321,155 @@ def test_reload_restores_completed_coin_prep_for_same_asset_only(page):
     }
 
 
+def test_manual_cat_refresh_preserves_selected_pair_and_setup_state(page):
+    """Refreshing the active wallet's CAT list must not discard its live selection."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const assetId = 'ab'.repeat(32);
+            const cat = {
+                asset_id: assetId,
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+                category: 'ready',
+                decimals: 3,
+            };
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `<option value="${assetId}" data-wallet="2" selected>MZ</option>`;
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            settingsReviewed = true;
+            coinPrepStatus = 'done';
+
+            apiFetch = async (path) => {
+                const url = String(path);
+                if (url.includes('/cat/refresh')) {
+                    return new Response(JSON.stringify({ success: true }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                if (url.endsWith('/cats')) {
+                    return new Response(JSON.stringify({ cats: [cat] }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                if (url.endsWith('/status')) {
+                    return new Response(JSON.stringify({
+                        running: false,
+                        current_cat: cat,
+                    }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                throw new Error(`Unexpected test request: ${url}`);
+            };
+            refreshBalances = async () => {};
+            fetchStatus = async () => {};
+            updateFingerprint = async () => {};
+
+            await refreshCATs(true);
+            return {
+                selectedAssetId: selector.value,
+                currentAssetId: currentCAT.asset_id || '',
+                pairSelectedByUser: _pairSelectedByUser,
+                settingsReviewed,
+                coinPrepStatus,
+            };
+        }"""
+    )
+
+    assert result == {
+        "selectedAssetId": "ab" * 32,
+        "currentAssetId": "ab" * 32,
+        "pairSelectedByUser": True,
+        "settingsReviewed": True,
+        "coinPrepStatus": "done",
+    }
+
+
+def test_idle_reload_does_not_render_persisted_pair_as_selected(page):
+    """An unconfirmed persisted pair must not leak stale dashboard data after reload."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'ab'.repeat(32);
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `
+                <option value="" disabled selected>-- Choose a Trading Pair --</option>
+                <option value="${assetId}">Monkeyzoo Token</option>`;
+            selector.value = '';
+            currentCAT = {};
+            _pairSelectedByUser = false;
+            bot_state = { running: false };
+            _dashboardData = {
+                current_cat: {
+                    asset_id: assetId,
+                    wallet_id: 2,
+                    name: 'Monkeyzoo Token',
+                    ticker_id: 'MZ_XCH',
+                },
+                market_health: {
+                    status: 'green',
+                    message: 'Stale MZ market is healthy',
+                    conditions: [],
+                    metrics: {
+                        market_spread_bps: 10420,
+                        competitor_count: 37,
+                    },
+                },
+                wallet: {
+                    xch_spendable: 10,
+                    xch_total: 10,
+                    cat_spendable: 700000,
+                    cat_total: 700000,
+                },
+                coins: { tier_counts: { enabled: false, xch: {}, cat: {} } },
+                performance: {},
+                links: {
+                    dexie_orderbook: 'https://dexie.space/offers/MZ/XCH',
+                    spacescan_token: `https://spacescan.io/cat2/${assetId}`,
+                },
+            };
+            updateCommandCentre(_dashboardData);
+
+            syncCommandCentreFromStatus({
+                running: false,
+                current_cat: _dashboardData.current_cat,
+                balances: {
+                    xch: { spendable: 10, total: 10 },
+                    cat: { spendable: 700000, total: 700000 },
+                },
+            });
+
+            return {
+                health: document.getElementById('ccHealthMsg')?.textContent || '',
+                spread: document.getElementById('ccMarketSpread')?.textContent || '',
+                competitors: document.getElementById('ccCompetitors')?.textContent || '',
+                catRows: document.getElementById('catBalanceRows')?.style.display || '',
+                cacheCleared: _dashboardData === null,
+            };
+        }"""
+    )
+
+    assert result == {
+        "health": "Choose a trading pair to load balances and market data.",
+        "spread": "loading",
+        "competitors": "loading",
+        "catRows": "none",
+        "cacheCleared": True,
+    }
+
+
 def test_final_startup_dismiss_keeps_start_disabled_without_verified_prep(page):
     """Completing the startup overlay must not bypass Coin Prep readiness."""
 
@@ -904,6 +1592,47 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     assert result["triggerCalls"] == 2
     assert any("Offer states confirmed terminal" in line for line in result["logs"])
     expect(page.locator("#coinPrepProgressView")).to_be_visible()
+
+
+def test_bootstrap_coin_prep_uses_asset_precision_for_verified_sizes(page):
+    """Campaign preview must not expose JavaScript floating-point artefacts."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'a'.repeat(64),
+                name: 'Spacebucks',
+                decimals: 3,
+            };
+            _bootstrapActiveCampaign = { campaign_id: 'campaign-1', revision: 1 };
+            renderBootstrapCoinPrepConfirmation({
+                bootstrap_campaign_id: 'campaign-1',
+                bootstrap_campaign_revision: 1,
+                xch_needed_mojos: 1005999999999,
+                cat_needed_mojos: 2499999,
+                tiers: {
+                    inner: {
+                        needed: 1,
+                        xch_size: '0.3333333333333333',
+                        cat_size: '833.3333333333334',
+                    },
+                    fees: { needed: 6, xch_size: '0.001', cat_size: '0' },
+                },
+            }, 'Spacebucks');
+            return {
+                xchSize: document.getElementById('cpConfirmXchSize').textContent,
+                catSize: document.getElementById('cpConfirmCatSize').textContent,
+                catTotal: document.getElementById('cpConfirmCatTotal').textContent,
+            };
+        }"""
+    )
+
+    assert "0.333333333333" in result["xchSize"]
+    assert "0.3333333333333333" not in result["xchSize"]
+    assert result["catSize"] == "Near: 1 × 833.333"
+    assert result["catTotal"] == "2,499.999"
 
 
 def test_coin_prep_keeps_waiting_while_terminal_proof_propagates(page):
@@ -1229,6 +1958,62 @@ def test_cancel_all_completion_clears_stale_resume_dashboard(page):
     }
 
 
+def test_slow_status_poll_is_single_flight_and_applies_valid_response(page):
+    """A slow Sage-backed status response must not be invalidated by the next poll."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            let resolveStatus;
+            const statusGate = new Promise(resolve => { resolveStatus = resolve; });
+            let requestCount = 0;
+            const payload = {
+                running: false,
+                offers: { buy: [], sell: [] },
+                balances: {
+                    xch: { spendable: 145.8, total: 145.8 },
+                    cat: { spendable: 702843.47, total: 702843.47 },
+                },
+                runtime_safety: { allowed: true, reason_code: '' },
+                current_cat: {},
+            };
+            apiFetch = async () => {
+                requestCount += 1;
+                await statusGate;
+                return new Response(JSON.stringify(payload), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            updateUI = () => {};
+            syncCommandCentreFromStatus = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateWalletPickerAvailability = () => {};
+
+            const first = fetchStatus();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const second = fetchStatus();
+            resolveStatus();
+            const [firstResult, secondResult] = await Promise.all([first, second]);
+            return {
+                requestCount,
+                firstApplied: firstResult?.runtime_safety?.allowed === true,
+                secondSkipped: secondResult === null,
+                stateApplied: bot_state?.runtime_safety?.allowed === true,
+            };
+        }"""
+    )
+
+    assert result == {
+        "requestCount": 1,
+        "firstApplied": True,
+        "secondSkipped": True,
+        "stateApplied": True,
+    }
+
+
 def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
     """A previous completion must not prematurely finish a new wallet request."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -1289,8 +2074,8 @@ def test_cancel_all_discards_status_from_older_operation_generation(page):
     assert result["phase"] == "current"
 
 
-def test_status_refresh_discards_older_response_that_finishes_last(page):
-    """A slow pre-cancel status response must not restore cancelled offers."""
+def test_status_refresh_coalesces_concurrent_requests(page):
+    """A slow status refresh must not allow a second stale request to race it."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -1305,27 +2090,19 @@ def test_status_refresh_discards_older_response_that_finishes_last(page):
             syncCommandCentreFromStatus = () => {};
             updateWalletPickerAvailability = () => {};
 
-            const staleRequest = fetchStatus();
+            const firstRequest = fetchStatus();
             await Promise.resolve();
-            const currentRequest = fetchStatus();
-            await Promise.resolve();
-
-            pending[1](new Response(JSON.stringify({
-                running: false,
-                offers: { buy: [], sell: [] },
-            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-            await currentRequest;
+            const concurrentResult = await fetchStatus();
 
             pending[0](new Response(JSON.stringify({
                 running: false,
-                offers: {
-                    buy: Array.from({ length: 36 }, (_, i) => ({ trade_id: `buy-${i}` })),
-                    sell: Array.from({ length: 36 }, (_, i) => ({ trade_id: `sell-${i}` })),
-                },
+                offers: { buy: [], sell: [] },
             }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
-            await staleRequest;
+            await firstRequest;
 
             return {
+                requestCount: pending.length,
+                concurrentResult,
                 finalOfferCount: (bot_state.offers?.buy?.length || 0)
                     + (bot_state.offers?.sell?.length || 0),
                 appliedOfferCounts,
@@ -1333,7 +2110,12 @@ def test_status_refresh_discards_older_response_that_finishes_last(page):
         }"""
     )
 
-    assert result == {"finalOfferCount": 0, "appliedOfferCounts": [0]}
+    assert result == {
+        "requestCount": 1,
+        "concurrentResult": None,
+        "finalOfferCount": 0,
+        "appliedOfferCounts": [0],
+    }
 
 
 def test_cancel_all_timeout_is_visible_and_releases_latch(page):
@@ -1380,6 +2162,7 @@ def test_cancel_all_timeout_is_visible_and_releases_latch(page):
 def test_no_console_errors_on_initial_load(app_page):
     """Catch JS console errors that fire just from loading the dashboard."""
     errors: list[str] = []
+    client_errors: list[str] = []
     server_errors: list[str] = []
     app_page.on(
         "console",
@@ -1388,10 +2171,10 @@ def test_no_console_errors_on_initial_load(app_page):
     app_page.on(
         "response",
         lambda response: (
-            server_errors.append(
+            (server_errors if response.status >= 500 else client_errors).append(
                 f"{response.status} {response.request.method} {response.url}"
             )
-            if response.status >= 500
+            if response.status >= 400
             else None
         ),
     )
@@ -1411,5 +2194,6 @@ def test_no_console_errors_on_initial_load(app_page):
         and "ERR_NETWORK" not in e
     ]
     assert not real_errors, (
-        f"Unexpected JS console errors: {real_errors}; server errors: {server_errors}"
+        f"Unexpected JS console errors: {real_errors}; "
+        f"client errors: {client_errors}; server errors: {server_errors}"
     )

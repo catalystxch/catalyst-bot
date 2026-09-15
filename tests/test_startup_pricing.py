@@ -56,6 +56,7 @@ def test_tibetswap_outage_accepts_real_dexie_ticker_response_shape(prices):
         "mid": "0.00008",
         "source": "dexie_bid_ask",
         "tibet_available": False,
+        "tibet_status": "retired",
     }
 
 
@@ -95,7 +96,7 @@ def test_tibetswap_outage_and_dexie_failure_are_negative_cached(prices, monkeypa
     clock.return_value = 115
     assert market._get_startup_price_cached("aa", "MZ_XCH") == {}
     assert fetch.call_count == 2
-    assert market._get_tibet_pairs_cached.call_count == 2
+    market._get_tibet_pairs_cached.assert_not_called()
 
 
 def test_missing_packaged_ca_bundle_is_negative_cached(prices):
@@ -123,17 +124,19 @@ def test_tibetswap_outage_quote_cache_is_scoped_to_pair(prices, key_change):
     assert fetch.call_count == 2
 
 
-def test_available_tibetswap_pool_uses_decimal_reserves_including_zero_decimals(prices):
+def test_historical_tibetswap_pool_is_ignored_in_favour_of_dexie(prices):
     _, fetch = prices
     market._get_tibet_pairs_cached.return_value = [
         {"asset_id": "0xAA", "xch_reserve": "3000000000000", "token_reserve": "2"}
     ]
     assert market._get_startup_price_cached("aa", "MZ_XCH", 0) == {
-        "mid": "1.5",
-        "source": "tibetswap",
-        "tibet_available": True,
+        "mid": "0.00008",
+        "source": "dexie_bid_ask",
+        "tibet_available": False,
+        "tibet_status": "retired",
     }
-    fetch.assert_not_called()
+    fetch.assert_called_once()
+    market._get_tibet_pairs_cached.assert_not_called()
 
 
 def test_no_selected_asset_does_not_fetch(prices):

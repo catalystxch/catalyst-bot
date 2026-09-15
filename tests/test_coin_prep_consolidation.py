@@ -71,6 +71,15 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             "success": True,
             "transactions": [],
         }
+        fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
+        fake_wallet.estimate_unsigned_transaction_cost = lambda *args, **kwargs: None
+        fake_wallet.validate_unsigned_transaction_effect = lambda *args, **kwargs: {
+            "_catalyst_validated_unsigned": True,
+            "constructed_outputs": [],
+        }
+        fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
+            "success": True
+        }
         fake_wallet.split_coins_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.get_transaction = lambda *args, **kwargs: {"success": True}
         fake_wallet.wallet_mutation_succeeded = lambda result: (
@@ -153,6 +162,25 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             self.coin_prep_worker.CoinPrepWorker._submitted_split_verify_timeout_seconds(),
             900,
         )
+
+    def test_fee_tier_keeps_configured_coin_size_without_trade_headroom(self):
+        """Fee coins are exact funding coins, not variable-size trade coins."""
+        with patch.dict(
+            os.environ,
+            {
+                "_CLI_PREP_HEADROOM_PCT": "12",
+                "_CLI_BUY_TIER_SIZES": "inner=2,fees=0.001",
+                "_CLI_SELL_TIER_SIZES": "inner=1.5,fees=0.001",
+                "_CLI_TIER_COUNTS_XCH": "inner=1,fees=50",
+                "_CLI_TIER_COUNTS_CAT": "inner=1",
+            },
+            clear=False,
+        ):
+            worker = self.coin_prep_worker.CoinPrepWorker()
+
+        self.assertEqual(worker.offer_tier_xch_sizes_buy["fees"], Decimal("0.001"))
+        self.assertEqual(worker.tier_xch_sizes_buy["fees"], Decimal("0.001"))
+        self.assertEqual(worker.tier_xch_sizes["fees"], Decimal("0.001"))
 
     def test_sage_cat_combine_fee_scales_with_measured_large_bundle_cost(self):
         """Regression: v1.3.12 paid a standard-tx fee for a 51-spend CAT bundle."""

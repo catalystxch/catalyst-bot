@@ -63,6 +63,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         ].get_spendable_coin_count(wallet_id)
         fake_wallet.get_pending_transactions = lambda: []
         fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
+        fake_wallet.estimate_unsigned_transaction_cost = lambda *args, **kwargs: None
         fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
             "success": True
         }
@@ -2142,6 +2143,142 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             {item["purpose"] for item in observation["expected_outputs"]},
             {"replacement"},
         )
+
+    def test_recovery_ignores_disjoint_late_wallet_output(self):
+        """A late unrelated fee-change view must not strand an exact split."""
+
+        source = hashlib.sha256(b"late-wallet-source").hexdigest()
+        fee_outputs = [
+            hashlib.sha256(f"late-wallet-fee-{index}".encode()).hexdigest()
+            for index in range(4)
+        ]
+        remainder = hashlib.sha256(b"late-wallet-remainder").hexdigest()
+        unrelated = hashlib.sha256(b"late-wallet-unrelated").hexdigest()
+        now = datetime.now(timezone.utc)
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "maximum_age_seconds": 300,
+        }
+        operation = {
+            "operation_id": "coin-prep:" + "9" * 64,
+            "outcome": "SUBMITTED_UNKNOWN",
+            "source_coin_ids_json": json.dumps([source]),
+            "effect_fee_coin_ids_json": json.dumps([source]),
+            "target_contract_json": json.dumps(
+                {
+                    "wallet_type": "xch",
+                    "outputs": [
+                        {
+                            "output_index": index,
+                            "amount_mojos": 100,
+                            "purpose": "fee_reserve",
+                        }
+                        for index in range(4)
+                    ]
+                    + [
+                        {
+                            "output_index": 4,
+                            "amount_mojos": 895,
+                            "purpose": "top_up",
+                        }
+                    ],
+                }
+            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
+            "wallet_identity_json": json.dumps(identity),
+        }
+        self.worker.xch_wallet_id = 1
+        self.worker.cat_wallet_id = 2
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            **identity,
+            "success": True,
+            "observed_at_utc": now.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+        self.worker._get_confirmed_owned_coins_via_rpc = lambda *_args: [
+            *({"coin_id": coin_id, "amount_mojos": 100} for coin_id in fee_outputs),
+            {"coin_id": remainder, "amount_mojos": 895},
+            {"coin_id": unrelated, "amount_mojos": 87},
+        ]
+        self.worker._get_sage_selectable_coin_ids_for_recovery = lambda _wid: set()
+
+        observation = self.worker._observe_recoverable_coin_prep_operation(operation)
+
+        self.assertIsInstance(observation, dict)
+        self.assertEqual(
+            {item["coin_id"] for item in observation["expected_outputs"]},
+            {*fee_outputs, remainder},
+        )
+        self.assertNotIn(unrelated, str(observation))
+
+    def test_recovery_rejects_extra_output_with_target_amount(self):
+        """An extra same-value output is ambiguous and must remain fenced."""
+
+        source = hashlib.sha256(b"ambiguous-late-source").hexdigest()
+        outputs = [
+            hashlib.sha256(f"ambiguous-late-{index}".encode()).hexdigest()
+            for index in range(3)
+        ]
+        now = datetime.now(timezone.utc)
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "maximum_age_seconds": 300,
+        }
+        operation = {
+            "operation_id": "coin-prep:" + "8" * 64,
+            "outcome": "SUBMITTED_UNKNOWN",
+            "source_coin_ids_json": json.dumps([source]),
+            "effect_fee_coin_ids_json": "[]",
+            "target_contract_json": json.dumps(
+                {
+                    "wallet_type": "xch",
+                    "outputs": [
+                        {
+                            "output_index": index,
+                            "amount_mojos": 50,
+                            "purpose": "replacement",
+                        }
+                        for index in range(2)
+                    ],
+                }
+            ),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
+            "wallet_identity_json": json.dumps(identity),
+        }
+        self.worker.xch_wallet_id = 1
+        self.worker.cat_wallet_id = 2
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            **identity,
+            "success": True,
+            "observed_at_utc": now.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+        self.worker._get_confirmed_owned_coins_via_rpc = lambda *_args: [
+            {"coin_id": coin_id, "amount_mojos": 50} for coin_id in outputs
+        ]
+        self.worker._get_sage_selectable_coin_ids_for_recovery = lambda _wid: set()
+
+        observation = self.worker._observe_recoverable_coin_prep_operation(operation)
+
+        self.assertIsNone(observation)
 
     def test_recovery_observation_uses_fresh_read_only_identity_while_gate_is_blocked(
         self,

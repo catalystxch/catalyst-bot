@@ -97,6 +97,31 @@ def test_unsigned_builder_never_signs_or_submits(monkeypatch):
     post.assert_not_called()
 
 
+def test_unsigned_cost_uses_actual_chia_bundle_conditions():
+    """A fee planner must price the real bundle, not output-count heuristics."""
+
+    result = {
+        "coin_spends": [
+            {
+                "coin": {
+                    "parent_coin_info": "31" * 32,
+                    "puzzle_hash": (
+                        "a66b42db08e2951decefb2bfb1d0ed6254ac0293dbd2c06161106a194af24a95"
+                    ),
+                    "amount": 2000,
+                },
+                "puzzle_reveal": (
+                    "ff01ffff33ffa032323232323232323232323232323232323232323232323232"
+                    "32323232323232ff8203e88080"
+                ),
+                "solution": "80",
+            }
+        ]
+    }
+
+    assert wallet_sage.estimate_unsigned_transaction_cost(result) == 2_892_020
+
+
 def test_validated_summary_seals_exact_distinct_effect():
     result = wallet_sage.validate_unsigned_transaction_effect(response(), contract())
     assert result["success"] is True

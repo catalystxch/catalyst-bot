@@ -271,7 +271,6 @@ def api_dashboard():
                 "dynamic_limit_pct": str(cfg.DYNAMIC_LIMIT_PCT),
             },
             "features": {
-                "sniper": getattr(cfg, "SNIPER_ENABLED", True),
                 "competitor_aware": cfg.COMPETITOR_AWARE_ENABLED,
                 "splash": cfg.SPLASH_ENABLED,
                 "auto_requote": cfg.AUTO_REQUOTE,
@@ -336,29 +335,11 @@ def api_dashboard():
             if bot_running is False:
                 market_health["message"] = "Market conditions healthy — bot stopped"
         if bot:
-            startup_results = getattr(bot, "_startup_self_test_results", {}) or {}
-            tibet_health = startup_results.get("tibet") or {}
-            if tibet_health.get("ok") is False:
-                conditions = market_health.setdefault("conditions", [])
-                conditions.append(
-                    {
-                        "level": "amber",
-                        "text": (
-                            "TibetSwap API unavailable — Dexie-only pricing; "
-                            "AMM drift protection and reference price unavailable"
-                        ),
-                    }
-                )
-                metrics = market_health.setdefault("metrics", {})
-                metrics["tibetswap_available"] = False
-                metrics["tibetswap_status_code"] = tibet_health.get("status_code")
-                metrics["pricing_mode"] = "dexie_only"
-                if market_health.get("status") == "green":
-                    market_health["status"] = "amber"
-                    market_health["message"] = (
-                        "Market degraded — TibetSwap unavailable; Dexie-only "
-                        "pricing active without AMM drift protection"
-                    )
+            metrics = market_health.setdefault("metrics", {})
+            metrics["tibetswap_available"] = False
+            metrics["tibetswap_retired"] = True
+            metrics["tibetswap_reason"] = "TIBETSWAP_SHUTDOWN"
+            metrics["pricing_mode"] = "offer_book_confidence"
         if bot:
             try:
                 metrics = market_health.setdefault("metrics", {})
@@ -828,6 +809,25 @@ def api_dashboard():
                     if getattr(bot, "_start_time", 0)
                     else 0
                 )
+
+                # The configured maxima are ceilings, not necessarily the live
+                # ladder targets. Follow mode can deliberately cap each side to
+                # the depth supported by current market confidence. Surface the
+                # same effective targets used by the bot so the dashboard does
+                # not falsely report a healthy confidence-capped book as still
+                # building toward the configured ceiling.
+                effective_targets = bot._get_effective_offer_targets(
+                    executable_mid,
+                    current_buy_count=live_open_buys,
+                    current_sell_count=live_open_sells,
+                )
+                metrics = market_health.setdefault("metrics", {})
+                metrics["effective_buy_target"] = max(
+                    0, int(effective_targets.get("buy", 0) or 0)
+                )
+                metrics["effective_sell_target"] = max(
+                    0, int(effective_targets.get("sell", 0) or 0)
+                )
             except Exception:
                 pass
 
@@ -878,13 +878,6 @@ def api_dashboard():
 
         links = {
             "dexie_orderbook": dexie_orderbook,
-            "tibetswap_pool": f"https://v2.tibetswap.io/pair/{quote(getattr(cfg, 'TIBET_PAIR_ID', '') or '')}"
-            if getattr(cfg, "TIBET_PAIR_ID", "")
-            else (
-                f"https://v2.tibetswap.io/?asset_id={quote(asset_id)}"
-                if asset_id
-                else "https://v2.tibetswap.io"
-            ),
             "spacescan_token": f"https://www.spacescan.io/cat2/{quote(asset_id)}"
             if asset_id
             else "",

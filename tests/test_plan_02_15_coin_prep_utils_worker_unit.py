@@ -638,6 +638,45 @@ class TestPartitionCoinsForDesignation(unittest.TestCase):
         self.assertEqual(len(assigned["fees"]), 2)
         self.assertEqual([coin["coin_id"] for coin in unmatched], ["reserve"])
 
+    def test_xch_offer_coin_below_exact_spend_is_not_reused_by_fuzzy_match(self):
+        worker = object.__new__(CoinPrepWorker)
+        worker.tier_enabled = True
+        worker.tier_order = ["inner"]
+        worker.xch_tier_counts = {"inner": 1}
+        worker.cat_tier_counts = {}
+        worker.tier_xch_sizes = {"inner": Decimal("0.333333333333")}
+        worker.tier_cat_sizes = {}
+        worker.cat_decimals = 3
+        worker._tx_fee_mojos = lambda: 13_079_100
+
+        assigned, unmatched = CoinPrepWorker._partition_coins_for_designation(
+            worker,
+            [{"coin_id": "short", "amount": 333_333_330_000}],
+            "xch",
+        )
+
+        self.assertEqual(assigned, {})
+        self.assertEqual([coin["coin_id"] for coin in unmatched], ["short"])
+
+    def test_cat_offer_coin_below_exact_spend_is_not_reused_by_fuzzy_match(self):
+        worker = object.__new__(CoinPrepWorker)
+        worker.tier_enabled = True
+        worker.tier_order = ["inner"]
+        worker.xch_tier_counts = {}
+        worker.cat_tier_counts = {"inner": 1}
+        worker.tier_xch_sizes = {}
+        worker.tier_cat_sizes = {"inner": Decimal("833.334")}
+        worker.cat_decimals = 3
+
+        assigned, unmatched = CoinPrepWorker._partition_coins_for_designation(
+            worker,
+            [{"coin_id": "short-cat", "amount": 833_333}],
+            "cat",
+        )
+
+        self.assertEqual(assigned, {})
+        self.assertEqual([coin["coin_id"] for coin in unmatched], ["short-cat"])
+
 
 class TestWaitForExpectedLocalCoinCounts(unittest.TestCase):
     def _worker_with_counts(self, xch_counts, cat_counts):

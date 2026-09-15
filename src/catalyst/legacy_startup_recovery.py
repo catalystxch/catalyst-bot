@@ -124,6 +124,195 @@ def _canonical_utc(value: Any) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _wallet_identity_matches(identity: Any, wallet_hash: str, network: str) -> bool:
+    """Accept only the exact live Sage identity bound to the durable intent."""
+
+    if (
+        type(identity) is not dict
+        or identity.get("success") is not True
+        or type(identity.get("fingerprint")) is not int
+        or identity.get("network_id") != network
+    ):
+        return False
+    observed_hash = hashlib.sha256(
+        f"fingerprint:{identity['fingerprint']}".encode("utf-8")
+    ).hexdigest()
+    return observed_hash == wallet_hash
+
+
+def _prepared_creation_selected_coin(intent: Any) -> str:
+    if type(intent) is not dict or intent.get("lifecycle_state") != "prepared":
+        return ""
+    raw = intent.get("selected_coin_ids_json")
+    if type(raw) is not str or len(raw) > 4096:
+        return ""
+    try:
+        selected = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    if type(selected) is not list or len(selected) != 1:
+        return ""
+    return _hex_id(selected[0])
+
+
+def _recover_unlocked_prepared_creation(
+    blocker: Any,
+    *,
+    wallet_hash: str,
+    network: str,
+    wallet_facade: Any,
+    database_module: Any,
+) -> bool:
+    """Terminalize a PREPARED create only when Sage proves no live effect.
+
+    Sage offer creation is an off-chain lock.  If the exact selected coin is
+    still owned, unspent, and has no Sage offer_id, the interrupted operation
+    cannot have a live wallet effect.  Two matching identity reads bind the
+    observation to the configured wallet before the durable reservation is
+    released.
+    """
+
+    if type(blocker) is not dict:
+        return False
+    intent_id = blocker.get("intent_id")
+    operation_id = blocker.get("operation_id")
+    event_id = blocker.get("event_id")
+    if (
+        type(intent_id) is not str
+        or not intent_id
+        or operation_id != f"create:{intent_id}"
+        or event_id != f"{operation_id}:prepared"
+        or blocker.get("operation_type") != "CREATE"
+        or blocker.get("attempt") != 1
+        or blocker.get("phase") != "PREPARED"
+        or blocker.get("outcome") != "PREPARED"
+        or blocker.get("reason_code") != "INTENT_PREPARED"
+        or blocker.get("blocks_mutation") != 1
+    ):
+        return False
+    validator = getattr(database_module, "validate_offer_operation_event", None)
+    if not callable(validator):
+        return False
+    event = validator(blocker)
+    if type(event) is not dict or event.get("event_id") != event_id:
+        return False
+    intent = database_module.get_offer_intent(intent_id)
+    coin_id = _prepared_creation_selected_coin(intent)
+    if (
+        not coin_id
+        or intent.get("wallet_fingerprint_hash") != wallet_hash
+        or str(intent.get("network") or "").strip().lower() != network
+    ):
+        return False
+    backend_reader = getattr(wallet_facade, "get_wallet_backend_authority", None)
+    if not callable(backend_reader) or backend_reader() != "sage":
+        return False
+    identity_reader = getattr(wallet_facade, "get_wallet_identity", None)
+    coin_reader = getattr(wallet_facade, "get_coins_by_ids", None)
+    if not callable(identity_reader) or not callable(coin_reader):
+        return False
+    identity_before = identity_reader()
+    if not _wallet_identity_matches(identity_before, wallet_hash, network):
+        return False
+    raw_coins = coin_reader([coin_id])
+    if type(raw_coins) is dict and raw_coins.get("success") is True:
+        raw_coins = raw_coins.get("records")
+    if type(raw_coins) is not dict or len(raw_coins) > 16:
+        return False
+    matching = []
+    for raw_id, record in raw_coins.items():
+        if _hex_id(raw_id) == coin_id:
+            matching.append(record)
+        elif type(record) is dict and _hex_id(record.get("coin_id")) == coin_id:
+            matching.append(record)
+    if len(matching) != 1 or type(matching[0]) is not dict:
+        return False
+    coin = matching[0]
+    if (
+        type(coin.get("amount")) is not int
+        or coin["amount"] <= 0
+        or coin.get("offer_id") is not None
+        or coin.get("spent_height") not in {None, 0}
+    ):
+        return False
+    identity_after = identity_reader()
+    if (
+        not _wallet_identity_matches(identity_after, wallet_hash, network)
+        or identity_after.get("fingerprint") != identity_before.get("fingerprint")
+        or identity_after.get("network_id") != identity_before.get("network_id")
+    ):
+        return False
+    try:
+        prepared_wallet_identity = json.loads(event["wallet_identity_json"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if type(prepared_wallet_identity) is not dict:
+        return False
+    finalized_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    finalized = database_module.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:finalized:startup-unlocked",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        wallet_identity_json=prepared_wallet_identity,
+        evidence_json={
+            "effect_attempted": False,
+            "failure_stage": "startup_recovery",
+            "selected_coin_id": coin_id,
+            "sage_coin_owned": True,
+            "sage_coin_unspent": True,
+            "sage_offer_id": None,
+            "wallet_identity_before": {
+                "fingerprint": identity_before["fingerprint"],
+                "network_id": identity_before["network_id"],
+            },
+            "wallet_identity_after": {
+                "fingerprint": identity_after["fingerprint"],
+                "network_id": identity_after["network_id"],
+            },
+        },
+        reason_code="CREATE_PREPARED_INPUT_PROVEN_UNLOCKED",
+        finalized_at=finalized_at,
+        finalize_selected_coin_reservations=True,
+    )
+    return (
+        type(finalized) is dict
+        and finalized.get("lifecycle_state") == "creation_failed"
+    )
+
+
+def _resolve_cleared_startup_latch(database_module: Any) -> bool:
+    """Resolve a stale latch only through the database's journal proof gate."""
+
+    latch_reader = getattr(database_module, "get_runtime_safety_latch", None)
+    resolver = getattr(database_module, "resolve_runtime_safety_latch", None)
+    if not callable(latch_reader) or not callable(resolver):
+        return False
+    latch = latch_reader()
+    if type(latch) is not dict or latch.get("state") != "tripped":
+        return False
+    generation = latch.get("generation")
+    raw_ids = latch.get("blocking_operation_ids_json")
+    if type(generation) is not int or type(raw_ids) is not str or len(raw_ids) > 65536:
+        return False
+    try:
+        operation_ids = json.loads(raw_ids)
+    except (TypeError, ValueError):
+        return False
+    if (
+        type(operation_ids) is not list
+        or len(operation_ids) > 256
+        or any(type(value) is not str or not value for value in operation_ids)
+    ):
+        return False
+    resolved = resolver(
+        expected_generation=generation,
+        resolved_operation_ids=operation_ids,
+    )
+    return type(resolved) is dict and resolved.get("resolved") is True
+
+
 def _atomic_amount(value: Any, scale: Decimal, label: str) -> str:
     try:
         amount = Decimal(str(value)) * scale
@@ -133,6 +322,64 @@ def _atomic_amount(value: Any, scale: Decimal, label: str) -> str:
     if amount != integral or integral <= 0:
         raise ValueError(f"{label} is not an exact positive atomic amount")
     return str(int(integral))
+
+
+def _cancel_cohort_manifest(blocker: Any, database_module: Any) -> dict | None:
+    """Identify the exact durable cancellation cohort owning one blocker."""
+
+    if type(blocker) is not dict:
+        return None
+    try:
+        evidence = json.loads(blocker["evidence_json"])
+        cohort_id = evidence.get("cohort_id") if type(evidence) is dict else None
+        if type(cohort_id) is not str or not cohort_id:
+            return None
+        manifest = database_module.get_offer_cancel_cohort_manifest(cohort_id)
+        validator = getattr(
+            database_module, "validate_offer_cancel_cohort_manifest", None
+        )
+        if callable(validator):
+            manifest = validator(manifest)
+        if (
+            type(manifest) is not dict
+            or manifest.get("member_count", 0) < 2
+            or type(manifest.get("members")) is not list
+            or blocker.get("operation_id")
+            not in {member.get("operation_id") for member in manifest["members"]}
+        ):
+            return None
+        return manifest
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _native_bulk_cancel_manifest(blocker: Any, database_module: Any) -> dict | None:
+    """Identify the exact durable Sage bulk cohort owning one blocker."""
+
+    manifest = _cancel_cohort_manifest(blocker, database_module)
+    if manifest is None:
+        return None
+    try:
+        prepared = database_module.get_offer_cancel_cohort_prepared_events(
+            manifest["cohort_id"]
+        )
+        if type(prepared) is not list or len(prepared) != manifest["member_count"]:
+            return None
+        protocols = []
+        for event in prepared:
+            prepared_evidence = json.loads(event["evidence_json"])
+            wallet_effect = (
+                prepared_evidence.get("wallet_effect")
+                if type(prepared_evidence) is dict
+                else None
+            )
+            batch = wallet_effect.get("batch") if type(wallet_effect) is dict else None
+            protocols.append(batch.get("protocol") if type(batch) is dict else None)
+        if set(protocols) != {"sage_native_cancel_offers_zero_plus_fee_v1"}:
+            return None
+        return manifest
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _legacy_intent(
@@ -234,6 +481,7 @@ def recover_legacy_sage_reservations(
         parsed_candidates.append((candidate, synthetic))
         if synthetic is not None:
             seed_coin_ids.update(synthetic["selected_coin_ids"])
+    live_wallet_facade = wallet_facade
     wallet_facade = _CachedReadOnlyWallet(
         wallet_facade,
         seed_coin_ids=seed_coin_ids,
@@ -348,6 +596,34 @@ def recover_legacy_sage_reservations(
     blockers = blocker_reader() if callable(blocker_reader) else []
     if type(blockers) is not list or len(blockers) > 128:
         raise RuntimeError("startup offer operation inventory is malformed")
+    prepared_creations = [
+        blocker
+        for blocker in blockers
+        if type(blocker) is dict
+        and blocker.get("operation_type") == "CREATE"
+        and blocker.get("phase") == "PREPARED"
+        and blocker.get("outcome") == "PREPARED"
+        and blocker.get("blocks_mutation") == 1
+    ]
+    result["examined"] += len(prepared_creations)
+    for index, blocker in enumerate(prepared_creations):
+        if time.monotonic() >= deadline:
+            result["remaining"] += len(prepared_creations) - index
+            break
+        try:
+            if _recover_unlocked_prepared_creation(
+                blocker,
+                wallet_hash=wallet_hash,
+                network=safe_network,
+                wallet_facade=live_wallet_facade,
+                database_module=database_module,
+            ):
+                result["recovered"] += 1
+            else:
+                result["remaining"] += 1
+        except Exception:
+            result["remaining"] += 1
+
     submitted_cancels = [
         blocker
         for blocker in blockers
@@ -384,12 +660,58 @@ def recover_legacy_sage_reservations(
             observed_at = (
                 evidence.get("observed_at") if type(evidence) is dict else None
             )
-            cancel_context = reconciliation_module._derive_single_cancel_context(
-                intent,
-                evidence,
-                database_module=database_module,
-                observed_at=observed_at,
-            )
+            bulk_manifest = _native_bulk_cancel_manifest(blocker, database_module)
+            external_recovery_context = False
+            if bulk_manifest is not None:
+                manifest_operation_ids = {
+                    member["operation_id"] for member in bulk_manifest["members"]
+                }
+                current_blockers = (
+                    database_module.get_unresolved_offer_operation_blockers()
+                )
+                blocking_operation_ids = [
+                    row.get("operation_id")
+                    for row in current_blockers
+                    if type(row) is dict
+                    and row.get("operation_id") in manifest_operation_ids
+                    and row.get("blocks_mutation") == 1
+                ]
+                cancel_context = reconciliation_module._derive_sage_bulk_cancel_context(
+                    bulk_manifest,
+                    blocking_operation_ids,
+                    evidence,
+                    database_module=database_module,
+                    observed_at=observed_at,
+                )
+                if type(cancel_context) is not dict:
+                    result["remaining"] += 1
+                    continue
+            else:
+                cancel_context = None
+                cohort_manifest = _cancel_cohort_manifest(blocker, database_module)
+                derive_external = getattr(
+                    reconciliation_module,
+                    "_derive_aborted_cohort_recovery_cancel_context",
+                    None,
+                )
+                if cohort_manifest is not None and callable(derive_external):
+                    cancel_context = derive_external(
+                        cohort_manifest,
+                        [blocker["operation_id"]],
+                        evidence,
+                        database_module=database_module,
+                        observed_at=observed_at,
+                    )
+                    external_recovery_context = type(cancel_context) is dict
+                if cancel_context is None:
+                    cancel_context = (
+                        reconciliation_module._derive_single_cancel_context(
+                            intent,
+                            evidence,
+                            database_module=database_module,
+                            observed_at=observed_at,
+                        )
+                    )
             classification = reconciliation_module.classify_terminal_evidence(
                 intent,
                 evidence,
@@ -412,12 +734,45 @@ def recover_legacy_sage_reservations(
             ):
                 result["remaining"] += 1
                 continue
-            reconciled = reconciliation_module.reconcile_offer(
-                intent_id,
-                evidence=evidence,
-                cancel_context=cancel_context,
-                now=observed_at,
-            )
+            reconcile_intent_ids = [intent_id]
+            if (
+                external_recovery_context
+                and terminal_classification == reconciliation_module.CANCELLED_PROVEN
+            ):
+                reconcile_intent_ids = [
+                    member["intent_id"]
+                    for member in cancel_context["members"]
+                    if member["intent_id"] != intent_id
+                ] + [intent_id]
+            reconciled = None
+            for reconcile_intent_id in reconcile_intent_ids:
+                member_intent = database_module.get_offer_intent(reconcile_intent_id)
+                member_classification = (
+                    reconciliation_module.classify_terminal_evidence(
+                        member_intent,
+                        evidence,
+                        cancel_context=cancel_context,
+                        now=observed_at,
+                    )
+                )
+                if (
+                    type(member_classification) is not dict
+                    or member_classification.get("classification")
+                    != terminal_classification
+                ):
+                    raise ValueError("external cohort recovery proof differs by member")
+                reconciled = reconciliation_module.reconcile_offer(
+                    reconcile_intent_id,
+                    evidence=evidence,
+                    cancel_context=cancel_context,
+                    now=observed_at,
+                )
+                if (
+                    type(reconciled) is not dict
+                    or reconciled.get("applied") is not True
+                    or reconciled.get("classification") != terminal_classification
+                ):
+                    raise ValueError("external cohort recovery could not be committed")
             if (
                 type(reconciled) is dict
                 and reconciled.get("applied") is True
@@ -428,4 +783,10 @@ def recover_legacy_sage_reservations(
                 result["remaining"] += 1
         except Exception:
             result["remaining"] += 1
+    try:
+        _resolve_cleared_startup_latch(database_module)
+    except Exception:
+        # Reconciliation results above remain authoritative; latch cleanup is
+        # best-effort and the next startup pass will retry it.
+        pass
     return result
