@@ -850,6 +850,7 @@ class BotLoop:
         # ---- Connectivity recovery tracking (V1 parity) ----
         self._last_pricing_success_ts: float = 0
         self._connectivity_gap_threshold: int = 1800  # 30 min gap → repost to Dexie
+        self._market_no_trusted_price_warned: bool = False
 
         # ---- Defensive-cancel coordination (post-mortem 2026-04-22) ----
         # When the mempool watcher fires a defensive cancel on a tier, record
@@ -9457,13 +9458,17 @@ class BotLoop:
                     "no_market_self_heal_failed",
                     f"Self-heal during market confidence loss failed: {health_error}",
                 )
-            log_event(
-                "warning",
-                "market_confidence_no_trusted_price",
-                "No attributable trusted offer-book price is available; "
-                "new exposure and requotes remain blocked",
-            )
+            if not getattr(self, "_market_no_trusted_price_warned", False):
+                log_event(
+                    "warning",
+                    "market_confidence_no_trusted_price",
+                    "No attributable trusted offer-book price is available; "
+                    "new exposure and requotes remain blocked",
+                )
+                self._market_no_trusted_price_warned = True
             return
+
+        self._market_no_trusted_price_warned = False
 
         mid_price = Decimal(str(price_data.get("mid_price", 0)))
         if mid_price <= 0:
