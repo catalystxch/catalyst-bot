@@ -1781,9 +1781,7 @@ def api_coin_prep_verify():
                 projected = wb.get("confirmed_wallet_balance")
             if projected is None:
                 projected = wb.get("spendable_balance", 0)
-            xch_balance_mojos = _safe_non_negative_int(
-                projected
-            )
+            xch_balance_mojos = _safe_non_negative_int(projected)
         if (
             bootstrap_context is None
             and cat_bal_result
@@ -1795,9 +1793,7 @@ def api_coin_prep_verify():
                 projected = wb.get("confirmed_wallet_balance")
             if projected is None:
                 projected = wb.get("spendable_balance", 0)
-            cat_balance_mojos = _safe_non_negative_int(
-                projected
-            )
+            cat_balance_mojos = _safe_non_negative_int(projected)
 
         xch_coins = []
         if xch_result and xch_result.get("success"):
@@ -1832,11 +1828,12 @@ def api_coin_prep_verify():
                 3,
             )
         )
+
         def _xch_display_to_mojos_ceil(value) -> int:
             return int(
-                (
-                    _safe_non_negative_decimal(value) * Decimal(10**12)
-                ).to_integral_value(rounding=ROUND_CEILING)
+                (_safe_non_negative_decimal(value) * Decimal(10**12)).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
             )
 
         if bootstrap_context is not None:
@@ -2085,17 +2082,13 @@ def api_coin_prep_verify():
             for tier in tiers:
                 spec = tier_specs[tier]
                 if liquidity_mode != "sell_only" or tier == "fees":
-                    total_xch_needed_mojos += (
-                        spec["xch_mojos"] * spec["xch_needed"]
-                    )
+                    total_xch_needed_mojos += spec["xch_mojos"] * spec["xch_needed"]
                 if (
                     liquidity_mode != "buy_only"
                     and tier != "fees"
                     and spec["cat_mojos"] > 0
                 ):
-                    total_cat_needed_mojos += (
-                        spec["cat_mojos"] * spec["cat_needed"]
-                    )
+                    total_cat_needed_mojos += spec["cat_mojos"] * spec["cat_needed"]
 
             if liquidity_mode != "sell_only":
                 total_xch_needed_mojos += topup_pool_xch_mojos

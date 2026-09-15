@@ -716,9 +716,7 @@ class TestCoinPrepVerify(_FlaskBase):
             "records": [{"coin": {"amount": 1_000}} for _ in range(4)],
         }
         with (
-            patch(
-                "wallet.get_spendable_coins_rpc", side_effect=[xch_coins, cat_coins]
-            ),
+            patch("wallet.get_spendable_coins_rpc", side_effect=[xch_coins, cat_coins]),
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):

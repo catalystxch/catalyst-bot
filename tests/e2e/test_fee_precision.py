@@ -26,6 +26,4 @@ def test_fee_status_hint_preserves_all_meaningful_xch_decimals(page):
         }"""
     )
 
-    expect(page.locator("#feeStatusHint")).to_contain_text(
-        "0.0000130791 XCH"
-    )
+    expect(page.locator("#feeStatusHint")).to_contain_text("0.0000130791 XCH")
