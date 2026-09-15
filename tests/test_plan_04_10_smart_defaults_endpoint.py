@@ -506,6 +506,59 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         wallet_balance.assert_not_called()
         clear_cache.assert_not_called()
 
+    def test_valid_but_wide_follow_book_requires_explicit_bootstrap(self):
+        from blueprints import smart_defaults
+
+        confidence = _green_market_confidence(bid="0.05", ask="0.15")
+        orderbook = {
+            "has_data": True,
+            "api_ok": True,
+            "provider_book": {
+                "bids": [
+                    {"offer_id": "wide-bid", "price": "0.05", "amount_mojos": 2_000}
+                ],
+                "asks": [
+                    {"offer_id": "wide-ask", "price": "0.15", "amount_mojos": 2_000}
+                ],
+            },
+        }
+
+        with (
+            patch("wallet.get_wallet_balance") as wallet_balance,
+            patch("database.clear_market_analysis_cache") as clear_cache,
+            patch.object(
+                smart_defaults,
+                "_fetch_dexie_orderbook_standalone",
+                return_value=orderbook,
+            ),
+            patch.object(
+                smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=confidence,
+            ),
+        ):
+            with api_server.app.test_request_context("/api/smart-defaults"):
+                response, status = smart_defaults._calculate_smart_defaults(
+                    asset_id=self._ASSET_ID,
+                    cat_wallet_id=2,
+                    cat_decimals=3,
+                    cat_ticker_id="MZ_XCH",
+                    cat_name="Monkeyzoo Token",
+                )
+
+        body = response.get_json()
+        self.assertEqual(status, 409)
+        self.assertEqual(body["code"], "BOOTSTRAP_SUGGESTED")
+        self.assertTrue(body["bootstrap_suggested"])
+        self.assertEqual(body["bootstrap_reason_codes"], ["wide_offer_book"])
+        wallet_balance.assert_not_called()
+        clear_cache.assert_not_called()
+
     def test_smart_budget_price_math_preserves_decimal_precision(self):
         import inspect
         from blueprints.smart_defaults import (
