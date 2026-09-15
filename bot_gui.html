@@ -21114,6 +21114,12 @@
 
         let feeStatusCache = null;
 
+        function formatTransactionFeeXch(value) {
+            const amount = Number(value);
+            if (!Number.isFinite(amount) || amount < 0) return '0';
+            return amount.toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
+        }
+
         function getFeeOptionsFromInputs() {
             const enabled = !!document.getElementById('configTransactionFeeEnabled')?.checked;
             const manualFeeXch = parseFloat(document.getElementById('configTransactionFeeXch')?.value) || 0;
@@ -21173,7 +21179,7 @@
                 : 'This fee amount is applied manually to wallet transactions.';
 
             hint.innerHTML = `
-                On-chain transactions will use <strong>${opts.effectiveFeeXch.toFixed(8)} XCH</strong> each.<br>
+                On-chain transactions will use <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong> each.<br>
                 ${sourceText} Offer creation stays fee-free. ${poolText}
             `;
         }
