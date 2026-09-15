@@ -27835,6 +27835,23 @@
         function syncCommandCentreFromStatus(data) {
             if (!data) return;
 
+            // A stopped server may retain the last configured CAT so it can
+            // offer an explicit resume choice.  That durable candidate is not
+            // the same thing as a pair selected in this browser window.  Do
+            // not let periodic /status payloads repopulate pair-scoped cards
+            // while the selector and currentCAT are deliberately blank after
+            // reload; otherwise the dashboard presents stale CAT balances and
+            // market metrics beside "Choose a Trading Pair".
+            if (shouldRequireExplicitPairSelection(data)) {
+                _dashboardData = null;
+                clearPairScopedDashboardState('selected pair');
+                updateCatBalanceVisibility(
+                    false,
+                    'Choose a CAT pair for this wallet.'
+                );
+                return;
+            }
+
             if (!_dashboardData) {
                 _dashboardData = {
                     settings: {},

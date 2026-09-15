@@ -1247,6 +1247,82 @@ def test_manual_cat_refresh_preserves_selected_pair_and_setup_state(page):
     }
 
 
+def test_idle_reload_does_not_render_persisted_pair_as_selected(page):
+    """An unconfirmed persisted pair must not leak stale dashboard data after reload."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'ab'.repeat(32);
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `
+                <option value="" disabled selected>-- Choose a Trading Pair --</option>
+                <option value="${assetId}">Monkeyzoo Token</option>`;
+            selector.value = '';
+            currentCAT = {};
+            _pairSelectedByUser = false;
+            bot_state = { running: false };
+            _dashboardData = {
+                current_cat: {
+                    asset_id: assetId,
+                    wallet_id: 2,
+                    name: 'Monkeyzoo Token',
+                    ticker_id: 'MZ_XCH',
+                },
+                market_health: {
+                    status: 'green',
+                    message: 'Stale MZ market is healthy',
+                    conditions: [],
+                    metrics: {
+                        market_spread_bps: 10420,
+                        competitor_count: 37,
+                    },
+                },
+                wallet: {
+                    xch_spendable: 10,
+                    xch_total: 10,
+                    cat_spendable: 700000,
+                    cat_total: 700000,
+                },
+                coins: { tier_counts: { enabled: false, xch: {}, cat: {} } },
+                performance: {},
+                links: {
+                    dexie_orderbook: 'https://dexie.space/offers/MZ/XCH',
+                    spacescan_token: `https://spacescan.io/cat2/${assetId}`,
+                },
+            };
+            updateCommandCentre(_dashboardData);
+
+            syncCommandCentreFromStatus({
+                running: false,
+                current_cat: _dashboardData.current_cat,
+                balances: {
+                    xch: { spendable: 10, total: 10 },
+                    cat: { spendable: 700000, total: 700000 },
+                },
+            });
+
+            return {
+                health: document.getElementById('ccHealthMsg')?.textContent || '',
+                spread: document.getElementById('ccMarketSpread')?.textContent || '',
+                competitors: document.getElementById('ccCompetitors')?.textContent || '',
+                catRows: document.getElementById('catBalanceRows')?.style.display || '',
+                cacheCleared: _dashboardData === null,
+            };
+        }"""
+    )
+
+    assert result == {
+        "health": "Choose a trading pair to load balances and market data.",
+        "spread": "loading",
+        "competitors": "loading",
+        "catRows": "none",
+        "cacheCleared": True,
+    }
+
+
 def test_final_startup_dismiss_keeps_start_disabled_without_verified_prep(page):
     """Completing the startup overlay must not bypass Coin Prep readiness."""
 
