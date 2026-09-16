@@ -301,6 +301,7 @@ CREATE TABLE approved_fee_reservations (
 def _install_legacy(ledger, approval_id, fee=123, schema=LEGACY_SCHEMA):
     conn = ledger.get_connection()
     conn.executescript(
+        "DROP TABLE coin_prep_fee_consents; DROP TABLE coin_prep_fee_previews; "
         "DROP TABLE approved_fee_outcomes; DROP TABLE approved_fee_reservations; DROP TABLE fee_approvals;"
         + schema
     )

@@ -1702,6 +1702,81 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'fee outcome lacks bound journal evidence');
 END;
+CREATE TABLE IF NOT EXISTS coin_prep_fee_previews (
+    preview_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(preview_id)=64 AND preview_id NOT GLOB '*[^0-9a-f]*'),
+    scope_sha256 TEXT NOT NULL CHECK(length(scope_sha256)=64),
+    plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256)=64),
+    scope_json TEXT NOT NULL
+        CHECK(json_valid(scope_json) AND json_type(scope_json)='object'),
+    plan_json TEXT NOT NULL
+        CHECK(json_valid(plan_json) AND json_type(plan_json)='object'),
+    request_options_json TEXT NOT NULL
+        CHECK(json_valid(request_options_json) AND json_type(request_options_json)='object'),
+    quote_json TEXT NOT NULL
+        CHECK(json_valid(quote_json) AND json_type(quote_json)='object'),
+    observed_at INTEGER NOT NULL CHECK(typeof(observed_at)='integer' AND observed_at>=0),
+    expires_at INTEGER NOT NULL
+        CHECK(typeof(expires_at)='integer' AND expires_at>observed_at AND expires_at<=observed_at+60)
+);
+CREATE INDEX IF NOT EXISTS idx_coin_prep_fee_previews_scope
+    ON coin_prep_fee_previews(scope_sha256, observed_at);
+CREATE TABLE IF NOT EXISTS coin_prep_fee_consents (
+    preview_id TEXT PRIMARY KEY NOT NULL REFERENCES coin_prep_fee_previews(preview_id),
+    approval_id TEXT NOT NULL UNIQUE REFERENCES fee_approvals(approval_id),
+    approved_at INTEGER NOT NULL CHECK(typeof(approved_at)='integer' AND approved_at>=0)
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_previews_no_update
+BEFORE UPDATE ON coin_prep_fee_previews BEGIN
+    SELECT RAISE(ABORT, 'fee previews are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_previews_no_delete
+BEFORE DELETE ON coin_prep_fee_previews BEGIN
+    SELECT RAISE(ABORT, 'fee previews are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_previews_no_replace
+BEFORE INSERT ON coin_prep_fee_previews
+WHEN EXISTS (SELECT 1 FROM coin_prep_fee_previews WHERE preview_id=NEW.preview_id)
+BEGIN
+    SELECT RAISE(ABORT, 'fee previews are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_previews_digest_guard
+BEFORE INSERT ON coin_prep_fee_previews
+WHEN catalyst_sha256(NEW.scope_json) IS NOT NEW.scope_sha256
+    OR catalyst_sha256(NEW.plan_json) IS NOT NEW.plan_sha256
+BEGIN
+    SELECT RAISE(ABORT, 'fee preview canonical digests differ');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_consents_no_update
+BEFORE UPDATE ON coin_prep_fee_consents BEGIN
+    SELECT RAISE(ABORT, 'fee consents are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_consents_no_delete
+BEFORE DELETE ON coin_prep_fee_consents BEGIN
+    SELECT RAISE(ABORT, 'fee consents are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_consents_no_replace
+BEFORE INSERT ON coin_prep_fee_consents
+WHEN EXISTS (
+    SELECT 1 FROM coin_prep_fee_consents
+        WHERE preview_id=NEW.preview_id OR approval_id=NEW.approval_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee consents are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_consents_binding_guard
+BEFORE INSERT ON coin_prep_fee_consents
+WHEN NOT EXISTS (
+    SELECT 1 FROM coin_prep_fee_previews AS preview
+    JOIN fee_approvals AS approval
+        ON approval.scope_sha256=preview.scope_sha256
+        AND approval.plan_sha256=preview.plan_sha256
+    WHERE preview.preview_id=NEW.preview_id AND approval.approval_id=NEW.approval_id
+        AND NEW.approved_at>=preview.observed_at AND NEW.approved_at<preview.expires_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee consent lacks matching current preview');
+END;
 """
 
 
@@ -3977,6 +4052,11 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "coin_prep_fee_previews": {
+        "preview_id", "scope_sha256", "plan_sha256", "scope_json", "plan_json",
+        "request_options_json", "quote_json", "observed_at", "expires_at",
+    },
+    "coin_prep_fee_consents": {"preview_id", "approval_id", "approved_at"},
     "fee_approvals": {
         "approval_id",
         "scope_sha256",
@@ -4614,6 +4694,9 @@ _STABILITY_REQUIRED_COLUMNS = {
 }
 
 _STABILITY_INDEXES = {
+    "idx_coin_prep_fee_previews_scope": (
+        "coin_prep_fee_previews", False, False, ("scope_sha256", "observed_at"), None,
+    ),
     "idx_approved_fee_reservations_scope": (
         "approved_fee_reservations",
         False,
@@ -5350,6 +5433,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
 
     _require_unique_key(conn, "offer_operation_journal", ("event_id",))
     _require_unique_key(conn, "fee_approvals", ("scope_sha256", "version"))
+    _require_unique_key(conn, "coin_prep_fee_consents", ("approval_id",))
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
     )
@@ -20295,6 +20379,34 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
     }
 
 
+def _insert_fee_approval(
+    conn: sqlite3.Connection, scope: str, plan: str, total: int, reserve: int
+) -> str:
+    """Insert an approval inside the caller's already serialized transaction."""
+    totals = _fee_scope_totals(conn, scope)
+    protected = conn.execute(
+        "SELECT cancellation_reserve_mojos FROM fee_approvals "
+        "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
+        (scope,),
+    ).fetchone()
+    if protected is not None and reserve < protected[0]:
+        raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
+    if totals["committed_fee_mojos"] > total or (
+        totals["noncancellation_committed_fee_mojos"] > total - reserve
+    ):
+        raise ValueError("FEE_BUDGET_EXCEEDED")
+    version = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM fee_approvals WHERE scope_sha256=?",
+        (scope,),
+    ).fetchone()[0]
+    approval_id = hashlib.sha256(f"{scope}:{plan}:{version}".encode()).hexdigest()
+    conn.execute(
+        "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
+        (approval_id, scope, plan, version, total, reserve),
+    )
+    return approval_id
+
+
 def create_fee_approval(
     *,
     scope_sha256: str,
@@ -20312,27 +20424,7 @@ def create_fee_approval(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        totals = _fee_scope_totals(conn, scope)
-        protected = conn.execute(
-            "SELECT cancellation_reserve_mojos FROM fee_approvals "
-            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
-            (scope,),
-        ).fetchone()
-        if protected is not None and reserve < protected[0]:
-            raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
-        if totals["committed_fee_mojos"] > total or (
-            totals["noncancellation_committed_fee_mojos"] > total - reserve
-        ):
-            raise ValueError("FEE_BUDGET_EXCEEDED")
-        version = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM fee_approvals WHERE scope_sha256=?",
-            (scope,),
-        ).fetchone()[0]
-        approval_id = hashlib.sha256(f"{scope}:{plan}:{version}".encode()).hexdigest()
-        conn.execute(
-            "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
-            (approval_id, scope, plan, version, total, reserve),
-        )
+        approval_id = _insert_fee_approval(conn, scope, plan, total, reserve)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -20340,6 +20432,148 @@ def create_fee_approval(
     finally:
         conn.close()
     return get_fee_approval(approval_id)
+
+
+def store_coin_prep_fee_preview(
+    *, scope_sha256: str, plan_sha256: str, scope_json: str, plan_json: str,
+    request_options_json: str, quote_json: str, observed_at: int, expires_at: int,
+) -> Dict[str, Any]:
+    """Persist a server-owned read-only estimate, without spending consent."""
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    observed = _fee_amount(observed_at)
+    expires = _fee_amount(expires_at)
+    if not observed < expires <= observed + 60:
+        raise ValueError("FEE_PREVIEW_STALE")
+    for encoded in (scope_json, plan_json, request_options_json, quote_json):
+        if type(encoded) is not str or type(json.loads(encoded)) is not dict:
+            raise ValueError("fee preview requires JSON objects")
+    if hashlib.sha256(scope_json.encode()).hexdigest() != scope or (
+        hashlib.sha256(plan_json.encode()).hexdigest() != plan
+    ):
+        raise ValueError("FEE_PREVIEW_CONTRACT_MISMATCH")
+    preview_id = os.urandom(32).hex()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO coin_prep_fee_previews VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (preview_id, scope, plan, scope_json, plan_json, request_options_json,
+             quote_json, observed, expires),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_coin_prep_fee_preview(preview_id)
+
+
+def get_coin_prep_fee_preview(preview_id: str) -> Dict[str, Any]:
+    preview_id = _fee_digest(preview_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM coin_prep_fee_previews WHERE preview_id=?", (preview_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_PREVIEW_REQUIRED")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def approve_coin_prep_fee_preview(
+    *, preview_id: str, scope_sha256: str, plan_sha256: str,
+    maximum_fee_mojos: int, cancellation_reserve_mojos: int, now: int,
+) -> Dict[str, Any]:
+    """Atomically bind one deliberate preview confirmation to one approval.
+
+    The service must re-observe wallet/plan/funding before calling this helper.
+    Duplicate consent returns accounting state, never permission to redispatch.
+    """
+    preview_id = _fee_digest(preview_id)
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    maximum = _fee_amount(maximum_fee_mojos)
+    reserve = _fee_amount(cancellation_reserve_mojos)
+    now = _fee_amount(now)
+    if reserve > maximum:
+        raise ValueError("FEE_BUDGET_INSUFFICIENT")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        preview = conn.execute(
+            "SELECT * FROM coin_prep_fee_previews WHERE preview_id=?", (preview_id,)
+        ).fetchone()
+        if preview is None:
+            raise ValueError("FEE_PREVIEW_REQUIRED")
+        if preview["scope_sha256"] != scope or preview["plan_sha256"] != plan:
+            raise ValueError("FEE_APPROVAL_STALE")
+        prior = conn.execute(
+            "SELECT approval.* FROM coin_prep_fee_consents AS consent "
+            "JOIN fee_approvals AS approval USING(approval_id) WHERE consent.preview_id=?",
+            (preview_id,),
+        ).fetchone()
+        if prior is not None:
+            if prior["total_fee_mojos"] != maximum or prior["cancellation_reserve_mojos"] != reserve:
+                raise ValueError("FEE_CONSENT_CONFLICT")
+            approval_id = prior["approval_id"]
+            idempotent = True
+        else:
+            if not preview["observed_at"] <= now < preview["expires_at"]:
+                raise ValueError("FEE_PREVIEW_STALE")
+            quote = json.loads(preview["quote_json"])
+            if quote.get("available") is not True:
+                raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+            prep = _fee_amount(quote.get("estimated_preparation_fee_mojos"))
+            cancellation = _fee_amount(quote.get("estimated_cancellation_fee_mojos"))
+            funding = _fee_amount(quote.get("fee_funding_mojos"))
+            totals = _fee_scope_totals(conn, scope)
+            if reserve < cancellation or (
+                maximum - reserve - totals["noncancellation_committed_fee_mojos"] < prep
+            ) or (
+                maximum - totals["committed_fee_mojos"] < prep + cancellation
+            ):
+                raise ValueError("FEE_BUDGET_INSUFFICIENT")
+            if maximum - totals["committed_fee_mojos"] > funding:
+                raise ValueError("FEE_FUNDING_INSUFFICIENT")
+            approval_id = _insert_fee_approval(conn, scope, plan, maximum, reserve)
+            conn.execute(
+                "INSERT INTO coin_prep_fee_consents VALUES (?, ?, ?)",
+                (preview_id, approval_id, now),
+            )
+            idempotent = False
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {**get_fee_approval(approval_id), "preview_id": preview_id, "idempotent": idempotent}
+
+
+def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:
+    """Read durable server plan/consent; generic ledger approvals are insufficient."""
+    approval_id = _fee_digest(approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT preview.*, consent.approval_id, consent.approved_at, approval.version, "
+            "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
+            "WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
+            "FROM coin_prep_fee_consents AS consent "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE consent.approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        return dict(row)
+    finally:
+        conn.close()
 
 
 def get_fee_approval(approval_id: str) -> Dict[str, Any]:

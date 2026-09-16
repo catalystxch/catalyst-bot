@@ -67,10 +67,53 @@ Branch: `codex/coin-prep-fee-approval`.
 Canonical server-owned scope/plan preview integration and full dispatch/recovery
 hook coverage remain outstanding. This is still groundwork, not live enforcement.
 
+## Canonical preview and durable consent core (continuation)
+
+- Observed missing-behavior failures before implementing canonical contracts,
+  preview/consent storage and staged estimation. Current trusted-input core is not
+  an HTTP authority boundary and cannot yet start a worker or authorize dispatch.
+- Canonical digests cover exact economic outputs and wallet/network/asset/session
+  identity, normalize Decimal representations and deterministic ordering, and
+  exclude transient estimates and intermediate selected coins.
+- Staged estimates distinguish exact unsigned from projected costs/count ranges,
+  price conservative upper counts, retain provider observation/expiry, recheck age
+  after transport and separate retained fee-coin principal from spending.
+- Immutable previews and consent are replacement-resistant. Concurrent duplicate
+  confirmation produces one approval/version; conflicting budgets fail. Missing,
+  stale or unavailable guidance and insufficient fee funding cannot create consent.
+- Expanded schema checks initially exposed UDF-dependent SQLite CHECK constraints:
+  ordinary `integrity_check` failed even on empty metadata tables. Digest validation
+  now uses insert guards; canonical schema and raw SQLite integrity checks pass.
+  The legacy fixture now accurately removes future-only preview metadata before
+  simulating the old PR #218 schema; no production history was removed.
+- Independent review reproduced a consent-budget gap when prior cancellation holds
+  exhausted total capacity. A literal regression failed before the fix. Confirmation
+  now checks preparation plus cancellation against total remaining as well as the
+  separately protected preparation allowance and available funding.
+- A failing signed-zero regression demonstrated equivalent zero headroom yielding
+  different digests. Zero Decimal values now normalize to `"0"`.
+- Fresh post-fix combined run passed 368 tests in 82.97 seconds. Ruff and
+  `git diff --check` passed. Independent re-review found no Critical/Important
+  core findings.
+- Thirteen consent-validation regressions failed before implementation. Read-only
+  validation now requires durable preview consent and current canonical contracts,
+  rejects changed/superseded approvals and generic ledger approvals, preserves holds
+  through restart/quote expiry and explicitly returns `dispatch_authorized=False`.
+  Focused validation/storage run: 31 passed in 10.76 seconds. Independent review
+  found no Critical/Important validator-core findings. Final expanded run passed
+  381 tests in 82.89 seconds, including validator, preview, ledger, authoritative
+  recovery, canonical schema, replacement capacity, estimation and direct planner
+  regressions. Ruff and `git diff --check` also passed.
+
+Actual runtime wallet/configuration collection, shared execution-plan factoring,
+unsigned construction, HTTP/native endpoints and all dispatch/GUI integration
+remain incomplete. Mocked trusted stage costs are not proof of unsigned construction.
+No wallet actions, package reload, main merge or release occurred in this continuation.
+
 ## Outstanding acceptance gates
 
-Durable approval ledger integration, canonical plan preview, HTTP/native bridge consent,
-all-path dispatch enforcement, authoritative settlement/recovery, GUI confirmation/E2E,
+Runtime canonical plan preview, HTTP/native bridge consent,
+all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,
 full regression testing, fresh Windows build and live operator-approved fee acceptance
 remain incomplete. These tests do not prove the entire feature ready.
 

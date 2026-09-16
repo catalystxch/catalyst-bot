@@ -65,6 +65,14 @@ Files: create src/catalyst/coin_prep_fee_approval.py; modify blueprints/coin_pre
 
 Interfaces: `preview_coin_prep_fees(request_options: dict) -> dict`, `approve_coin_prep_fees(preview_id: str, maximum_fee_mojos: int, cancellation_reserve_mojos: int) -> dict`, `validate_prep_fee_approval(approval_id: str, economic_plan: dict) -> dict`. Add `/api/coin-prep/fee-preview` and `/api/coin-prep/fee-approval` and equivalent bridge methods. No caller scope/hash is trusted.
 
+Verified core substeps (do not imply the runtime collector/routes below are complete):
+
+- [x] Canonical economic contracts bind wallet/network/asset/session or campaign, exact outputs, multiplier, reserves, target and cancellation policy; transient quotes/selected coins are excluded.
+- [x] Trusted staged-cost aggregation distinguishes projected counts from exact unsigned costs, preserves source observation age, separates retained fee-coin principal and blocks unavailable/insufficient estimates.
+- [x] Immutable preview/consent persistence provides atomic concurrent confirmation, fresh-preview checks, protected and total budget checks, reset/restart preservation and duplicate/conflicting-consent handling.
+- [x] Read-only current-economic consent validation rejects generic ledger approvals, changed contracts and superseded versions; quote expiry does not refund holds. Readback explicitly grants no dispatch authority.
+- [ ] Runtime collector must still derive these trusted inputs from current wallet/configuration and prove actual unsigned costs. No HTTP/native endpoint accepts caller-supplied scope, plan, stage costs or funding.
+
 - [ ] Write failing API/bridge tests that a preview leaves balances, resets, journals and worker launch untouched, and approval requires a current matching server-owned preview.
 
 ```python
@@ -131,4 +139,5 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] Existing isolated branch codex/coin-prep-fee-approval verified; untracked user/build artifacts preserved.
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.
 - [x] Task 1 strict estimation foundation verified and committed.
-- [ ] Task 2 integration remains open: database foundation and recovery/reset preservation verified; server-owned canonical scope/plan helpers will be added with the Task 3 preview service. Tasks 3–6 not yet implemented.
+- [x] Task 2 database foundation and canonical scope/plan helper core verified; live integration is still outstanding.
+- [ ] Task 3 core is partially implemented; runtime collector, actual unsigned construction and HTTP/native route integration remain open. Tasks 4–6 remain open.
