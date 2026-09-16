@@ -56,6 +56,98 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(plan["count"], 20)
         self.assertEqual(plan["coin_size_mojos"], 100_000_000)
 
+    def test_empty_node_estimate_falls_back_instead_of_becoming_zero(self):
+        self.cfg.COINSET_ENABLED = False
+        with (
+            patch.object(
+                self.tx_fees,
+                "get_wallet_fee_environment",
+                return_value={"supports_auto_estimate": True},
+            ),
+            patch.object(
+                self.tx_fees,
+                "_full_node_rpc",
+                return_value={"success": True, "estimates": []},
+            ),
+        ):
+            quote = self.tx_fees.get_suggested_transaction_fee(cost=20_000_000)
+        self.assertFalse(quote["available"])
+
+    def test_coinset_missing_estimate_is_not_available(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True}
+        )
+        with patch("requests.post", return_value=response):
+            self.assertIsNone(self.tx_fees._coinset_fee_estimate(300, 20_000_000))
+
+    def test_explicit_zero_target_is_sent_unchanged(self):
+        with (
+            patch.object(
+                self.tx_fees,
+                "get_wallet_fee_environment",
+                return_value={"supports_auto_estimate": True},
+            ),
+            patch.object(
+                self.tx_fees,
+                "_full_node_rpc",
+                return_value={"success": True, "estimates": [123]},
+            ) as rpc,
+        ):
+            quote = self.tx_fees.get_suggested_transaction_fee(
+                target_seconds=0, cost=20_000_000
+            )
+        self.assertEqual(rpc.call_args.args[1]["target_times"], [0])
+        self.assertEqual(quote["target_seconds"], 0)
+
+    def test_node_cache_keeps_original_observation_time(self):
+        with (
+            patch.object(
+                self.tx_fees,
+                "get_wallet_fee_environment",
+                return_value={"supports_auto_estimate": True},
+            ),
+            patch.object(
+                self.tx_fees,
+                "_full_node_rpc",
+                return_value={"success": True, "estimates": [123]},
+            ),
+            patch.object(self.tx_fees.time, "time", return_value=100),
+        ):
+            original = self.tx_fees.get_suggested_transaction_fee(cost=20_000_000)
+        with (
+            patch.object(self.tx_fees.time, "time", return_value=120),
+            patch.object(
+                self.tx_fees,
+                "_full_node_rpc",
+                side_effect=AssertionError("cache must not query transport"),
+            ),
+        ):
+            cached = self.tx_fees.get_suggested_transaction_fee(cost=20_000_000)
+        self.assertEqual(original["observed_at"], 100)
+        self.assertEqual(cached["observed_at"], 100)
+        self.assertEqual(cached["expires_at"], 160)
+
+    def test_coinset_cache_keeps_original_observation_time(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True, "estimates": [123]}
+        )
+        with (
+            patch("requests.post", return_value=response),
+            patch.object(self.tx_fees.time, "time", return_value=100),
+        ):
+            original = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+        with (
+            patch(
+                "requests.post",
+                side_effect=AssertionError("cache must not query transport"),
+            ),
+            patch.object(self.tx_fees.time, "time", return_value=150),
+        ):
+            cached = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+        self.assertEqual(original["observed_at"], 100)
+        self.assertEqual(cached["observed_at"], 100)
+        self.assertEqual(cached["expires_at"], 160)
+
     def test_sage_without_full_node_reports_manual_fallback_environment(self):
         # Disable coinset so the test exercises the pure sage/no-full-node fallback path.
         # (COINSET_ENABLED defaults to True globally, but this test verifies the

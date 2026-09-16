@@ -24,6 +24,7 @@ from decimal import Decimal, ROUND_UP
 from typing import Dict, Optional
 
 from config import cfg
+from fee_estimation import normalize_fee_response
 
 
 XCH_MOJOS = Decimal("1000000000000")
@@ -177,7 +178,7 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
     cache_key = (target_seconds, cost)
     now = time.time()
     cached = _COINSET_FEE_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS:
+    if cached and 0 <= (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS:
         return dict(cached[1])
 
     try:
@@ -220,24 +221,25 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
         if r is None or r.status_code != 200:
             return None
         data = r.json()
-        if not data.get("success"):
-            return None
-
-        estimates = data.get("estimates") or []
-        estimated = int(
-            Decimal(str(estimates[0] if estimates else 0)).to_integral_value(
-                rounding=ROUND_UP
-            )
+        observed_at = int(time.time())
+        quote = normalize_fee_response(
+            data,
+            cost=cost,
+            target_seconds=target_seconds,
+            source="coinset",
+            observed_at=observed_at,
+            now=observed_at,
         )
+        if not quote["available"]:
+            return None
         snapshot = {
+            **quote,
             "available": True,
             "source": "coinset",
             "reason": "coinset_api",
             "message": "Fee estimated via Coinset cloud API (mirrors full-node get_fee_estimate).",
             "target_seconds": target_seconds,
             "cost": cost,
-            "fee_mojos": max(0, estimated),
-            "fee_xch": format(mojos_to_xch(max(0, estimated)), "f"),
             "full_node_synced": bool(data.get("full_node_synced", False)),
             "mempool_size": int(data.get("mempool_size", 0) or 0),
             "mempool_fees": int(data.get("mempool_fees", 0) or 0),
@@ -252,7 +254,9 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
 
 def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) -> Dict:
     target = int(
-        target_seconds or getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300
+        target_seconds
+        if target_seconds is not None
+        else getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300
     )
     cost_val = int(
         cost or getattr(cfg, "TRANSACTION_FEE_ESTIMATE_COST", 20_000_000) or 20_000_000
@@ -263,7 +267,7 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
     now = time.time()
 
     cached = _SUGGESTED_FEE_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS:
+    if cached and 0 <= (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS:
         return dict(cached[1])
 
     env = get_wallet_fee_environment()
@@ -273,22 +277,24 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
         if env.get("supports_auto_estimate")
         else None
     )
-    if result and result.get("success"):
-        estimates = result.get("estimates") or []
-        estimated = int(
-            Decimal(str(estimates[0] if estimates else 0)).to_integral_value(
-                rounding=ROUND_UP
-            )
-        )
+    observed_at = int(time.time())
+    quote = normalize_fee_response(
+        result,
+        cost=cost_val,
+        target_seconds=target,
+        source="full_node_rpc",
+        observed_at=observed_at,
+        now=observed_at,
+    )
+    if quote["available"]:
         snapshot = {
+            **quote,
             "available": True,
             "source": "full_node_rpc",
             "reason": env.get("reason"),
             "message": env.get("message"),
             "target_seconds": target,
             "cost": cost_val,
-            "fee_mojos": max(0, estimated),
-            "fee_xch": str(mojos_to_xch(max(0, estimated))),
             "full_node_synced": bool(result.get("full_node_synced", False)),
             "raw": result,
         }

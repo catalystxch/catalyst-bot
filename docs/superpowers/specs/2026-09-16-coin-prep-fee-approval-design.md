@@ -1,6 +1,6 @@
 # Dynamic Coin Prep fees and explicit spending approval
 
-Status: chat design approved by the user on 16 September 2026; written specification awaiting review. Implementation must not begin before that review. Persistent goal and hourly continuation loop are active.
+Status: chat design and written specification explicitly approved by the user on 16 September 2026. Implementation is authorized. Persistent goal and hourly continuation loop are active.
 
 ## Purpose and scope
 
