@@ -2032,6 +2032,8 @@ def test_api_write_route_classification_is_exhaustive_and_explicit(monkeypatch):
         api_server._MUTATING_API_ENDPOINTS & api_server._READ_ONLY_WRITE_API_ENDPOINTS
     )
     assert "offers.api_cancel_offer" in api_server._MUTATING_API_ENDPOINTS
+    assert "offers.api_cancel_all" in api_server._CONTROL_WRITE_API_ENDPOINTS
+    assert "offers.api_cancel_all" not in api_server._MUTATING_API_ENDPOINTS
     assert "coin_prep.api_coin_prep_trigger" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_begin_startup" in api_server._MUTATING_API_ENDPOINTS
     assert "sage.api_wallet_retry_sage_connect" in api_server._MUTATING_API_ENDPOINTS
@@ -3702,6 +3704,68 @@ def test_expired_dead_owner_takeover_revokes_crashed_parent_delegations(
     assert takeover.acquire()["acquired"] is True
     assert parent.validate_worker_environment(environment)["allowed"] is False
     assert _active_delegation_row(handoff, environment, clock()) is None
+
+
+def test_startup_can_retire_expired_dead_lease_for_coin_prep_recovery(
+    isolated_gate_database,
+):
+    """A recoverable prep latch must not deadlock behind its crashed owner."""
+
+    _path, clock = isolated_gate_database
+    crashed = _gate(clock, run_id="crashed-prep-owner", pid=111)
+    acquired = crashed.acquire()
+    assert acquired["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="COIN_PREP_RECOVERY_REQUIRED",
+        blocking_operation_ids=["coin-prep:recover-after-crash"],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    clock.advance(31)
+    lease = database.get_runtime_mutation_lease()
+
+    retired = database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=clock(),
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=True,
+    )
+
+    assert retired["retired"] is True
+    assert database.get_runtime_mutation_lease()["active"] == 0
+    latch = database.get_runtime_safety_latch()
+    assert latch["state"] == "tripped"
+    assert latch["reason_code"] == "COIN_PREP_RECOVERY_REQUIRED"
+
+
+def test_startup_keeps_expired_dead_lease_for_non_recovery_safety_latch(
+    isolated_gate_database,
+):
+    """Dead-owner retirement remains forbidden for unrelated safety stops."""
+
+    _path, clock = isolated_gate_database
+    crashed = _gate(clock, run_id="crashed-unsafe-owner", pid=111)
+    acquired = crashed.acquire()
+    assert acquired["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="CREATE_UNKNOWN",
+        blocking_operation_ids=["create:unsafe-after-crash"],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=clock(),
+    )
+    clock.advance(31)
+    lease = database.get_runtime_mutation_lease()
+
+    retained = database.retire_expired_dead_runtime_lease_at_startup(
+        retired_at=clock(),
+        expected_lease_version=lease["lease_version"],
+        prior_owner_liveness_proven_dead=True,
+    )
+
+    assert retained["retired"] is False
+    assert retained["reason"] == "safety_latch_not_resolved"
+    assert database.get_runtime_mutation_lease()["active"] == 1
 
 
 def test_terminal_fence_overrides_an_existing_latch_mirror(
@@ -6863,6 +6927,14 @@ def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
     )
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
     monkeypatch.setattr(
+        database,
+        "recover_preprojection_publications_at_startup",
+        lambda: (
+            events.append("preprojection_publication_recovery")
+            or {"examined": 0, "recovered": 0, "remaining": 1}
+        ),
+    )
+    monkeypatch.setattr(
         api_server,
         "initialize_mutation_runtime",
         lambda: events.append("authorize") or next(authorizations),
@@ -6884,6 +6956,7 @@ def test_desktop_retries_startup_after_exact_dexie_publication_recovery(
     assert events == [
         "database",
         "authorize",
+        "preprojection_publication_recovery",
         "dexie_publication_recovery",
         "authorize",
     ]
@@ -6907,6 +6980,14 @@ def test_desktop_retries_startup_after_orphaned_publication_is_suppressed(
         ]
     )
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        database,
+        "recover_preprojection_publications_at_startup",
+        lambda: (
+            events.append("preprojection_publication_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
+    )
     monkeypatch.setattr(
         database,
         "recover_undispatched_publication_claims_at_startup",
@@ -6945,6 +7026,7 @@ def test_desktop_retries_startup_after_orphaned_publication_is_suppressed(
     assert events == [
         "database",
         "authorize",
+        "preprojection_publication_recovery",
         "undispatched_publication_recovery",
         "dexie_publication_recovery",
         "orphaned_publication_suppression",
@@ -6970,6 +7052,14 @@ def test_desktop_upgrade_restart_recovers_undispatched_publication_before_readba
         ]
     )
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        database,
+        "recover_preprojection_publications_at_startup",
+        lambda: (
+            events.append("preprojection_publication_recovery")
+            or {"examined": 0, "recovered": 0, "remaining": 1}
+        ),
+    )
     monkeypatch.setattr(
         database,
         "recover_undispatched_publication_claims_at_startup",
@@ -7008,12 +7098,18 @@ def test_desktop_upgrade_restart_recovers_undispatched_publication_before_readba
     assert events == [
         "database",
         "authorize",
+        "preprojection_publication_recovery",
         "undispatched_publication_recovery",
         "authorize",
     ]
 
 
-def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
+@pytest.mark.parametrize(
+    "blocked_reason", ["UNRESOLVED_OPERATIONS", "TASK8_BINDING_CONFLICT"]
+)
+def test_desktop_resumes_interrupted_legacy_reservation_recovery(
+    monkeypatch, blocked_reason
+):
     import api_server
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
@@ -7022,13 +7118,21 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
         [
             {
                 "allowed": False,
-                "reason_code": "UNRESOLVED_OPERATIONS",
+                "reason_code": blocked_reason,
                 "failed_check": "unresolved_operations",
             },
             {"allowed": True, "reason_code": "", "failed_check": None},
         ]
     )
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        database,
+        "recover_preprojection_publications_at_startup",
+        lambda: (
+            events.append("preprojection_publication_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
+    )
     monkeypatch.setattr(
         api_server,
         "initialize_mutation_runtime",
@@ -7050,6 +7154,196 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(monkeypatch):
         "database",
         "authorize",
         "legacy_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
+    monkeypatch,
+):
+    """A corrected reconciler must recheck its old fail-closed conflict on restart."""
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "REGISTRY_BLOCKED",
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("reconciliation_recovery")
+            or {"examined": 3, "recovered": 3, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "reconciliation_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_retries_startup_after_exact_sage_bulk_peer_rejection(
+    monkeypatch,
+):
+    """A Sage all-peer rejection must not strand restart in diagnostics."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "UNRESOLVED_OPERATIONS",
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "offer_manager",
+        SimpleNamespace(
+            recover_sage_bulk_cancel_peer_rejection_at_startup=lambda: (
+                events.append("sage_peer_rejection_recovery")
+                or {"examined": 22, "recovered": 22, "remaining": 0}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("legacy_recovery")
+            or {"examined": 0, "recovered": 0, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "sage_peer_rejection_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_recovers_publication_blocker_revealed_by_prepared_create(
+    monkeypatch,
+):
+    """One restart must complete each newly revealed ordered recovery check."""
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "UNRESOLVED_OPERATIONS",
+                "failed_check": "unresolved_operations",
+            },
+            {
+                "allowed": False,
+                "reason_code": "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
+                "failed_check": "publication_claims",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        database,
+        "recover_preprojection_publications_at_startup",
+        lambda: (
+            events.append("preprojection_publication_recovery")
+            or {"examined": 2, "recovered": 0, "remaining": 2}
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    recoveries = iter(
+        [
+            {"examined": 1, "recovered": 1, "remaining": 0},
+            {"examined": 0, "recovered": 0, "remaining": 0},
+        ]
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: events.append("legacy_recovery") or next(recoveries),
+    )
+    monkeypatch.setattr(
+        database,
+        "recover_undispatched_publication_claims_at_startup",
+        lambda: (
+            events.append("undispatched_publication_recovery")
+            or {"examined": 0, "recovered": 0, "remaining": 2}
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "dexie_manager",
+        SimpleNamespace(
+            recover_expired_dexie_publications_at_startup=lambda: (
+                events.append("dexie_publication_recovery")
+                or {"checked": 2, "recovered": 0, "remaining": 2}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "suppress_orphaned_dispatched_publications_at_startup",
+        lambda: (
+            events.append("orphaned_publication_suppression")
+            or {"examined": 2, "suppressed": 2, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "legacy_recovery",
+        "authorize",
+        "preprojection_publication_recovery",
+        "undispatched_publication_recovery",
+        "dexie_publication_recovery",
+        "orphaned_publication_suppression",
         "authorize",
     ]
 

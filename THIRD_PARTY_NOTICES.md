@@ -26,6 +26,15 @@ Third-party service names such as Dexie, Sage, TibetSwap, Spacescan, Splash, and
 Chia are used for compatibility and operator clarity. They remain the property
 of their respective owners.
 
+The locally bundled Bootstrap-signing client includes WalletConnect Sign Client
+2.23.4 and connects to Reown's WalletConnect gateway. Portions © 2025 Reown,
+Inc. All Rights Reserved. Its WalletConnect Community License Agreement is
+retained in `licenses/Reown-WalletConnect-Community-License.txt` and bundled
+with CATalyst releases. CATalyst requests only `chia_signMessageByAddress` and
+does not expose WalletConnect offer, spend, transfer, send, or cancel methods.
+The pairing QR image is generated locally by `qrcode` 1.5.4, Copyright (c)
+2012 Ryan Day, under the MIT License retained in `licenses/QRCode-MIT.txt`.
+
 If an asset owner asks for an image or name usage to be changed, replace the
 asset with a text label or a neutral local icon before the next release.
 

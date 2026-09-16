@@ -192,10 +192,10 @@ class TestApiLocalGuard(unittest.TestCase):
             api_server._fetch_dexie_orderbook_standalone("test-cat")
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][1].get("offered_asset_id"), "test-cat")
-        self.assertNotIn("offered", calls[0][1])
-        self.assertEqual(calls[1][1].get("requested_asset_id"), "test-cat")
-        self.assertNotIn("requested", calls[1][1])
+        self.assertEqual(calls[0][1].get("offered"), "test-cat")
+        self.assertNotIn("offered_asset_id", calls[0][1])
+        self.assertEqual(calls[1][1].get("requested"), "test-cat")
+        self.assertNotIn("requested_asset_id", calls[1][1])
 
     def test_setup_quote_setting_update_while_running_returns_next_restart_notice(self):
         headers = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}

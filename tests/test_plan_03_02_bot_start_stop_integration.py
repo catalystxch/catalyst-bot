@@ -129,6 +129,13 @@ class _TempDB(unittest.TestCase):
             patch.object(api_server, "bot", bot_mock),
             patch("api_server._get_sage_signing_block_reason", return_value=None),
             patch(
+                "blueprints.bot._enforce_post_tibet_start_migration",
+                return_value={
+                    "can_start": True,
+                    "reason_code": "POST_TIBET_MIGRATION_READY",
+                },
+            ),
+            patch(
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),

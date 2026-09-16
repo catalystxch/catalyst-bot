@@ -117,6 +117,14 @@ if WALLET_TYPE == "chia":
         """Chia backend stub — message signing for Dexie claims is Sage-only."""
         return {"success": False, "error": "claim_unsupported_on_chia_backend"}
 
+    def get_wallet_puzzle_hashes(
+        force: bool = False, max_derivations: int = 5000
+    ) -> set:
+        """Chia backend cannot prove the complete local address set here."""
+
+        del force, max_derivations
+        return set()
+
     def notify_cat_asset_id_changed(asset_id: str) -> None:
         """Chia backend compatibility stub for Sage active CAT cache updates."""
         return None
@@ -215,6 +223,7 @@ else:
         notify_cat_asset_id_changed,
         is_initialized,
         get_wallet_identity,
+        get_wallet_puzzle_hashes,
     )
 
 
@@ -1262,6 +1271,26 @@ def get_pending_transactions():
     return callback() if callable(callback) else None
 
 
+def get_transaction_relay_outcome(transaction_id: str):
+    """Return a read-only native-wallet peer-relay outcome when available."""
+
+    callback = getattr(_wallet_adapter, "get_transaction_relay_outcome", None)
+    if not callable(callback):
+        return {"status": "unknown", "transaction_id": str(transaction_id or "")}
+    try:
+        result = callback(transaction_id)
+    except Exception:
+        return {"status": "unknown", "transaction_id": str(transaction_id or "")}
+    return (
+        result
+        if type(result) is dict
+        else {
+            "status": "unknown",
+            "transaction_id": str(transaction_id or ""),
+        }
+    )
+
+
 def get_next_address(wallet_id: int = WALLET_ID_XCH, new_address: bool = True):
     """Guard derivation-state changes while keeping existing-address reads usable."""
 
@@ -1602,6 +1631,13 @@ def validate_unsigned_transaction_effect(result: dict, contract: dict):
     if WALLET_TYPE != "sage" or not callable(callback):
         return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
     return callback(result, contract)
+
+
+def estimate_unsigned_transaction_cost(result: dict):
+    callback = getattr(_wallet_adapter, "estimate_unsigned_transaction_cost", None)
+    if WALLET_TYPE != "sage" or not callable(callback):
+        return None
+    return callback(result)
 
 
 def submit_built_transaction_rpc(validated_result: dict):

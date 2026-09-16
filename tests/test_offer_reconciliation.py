@@ -3799,13 +3799,15 @@ def _persist_created_offer(
     *,
     coin_id: str = COIN,
     offered: str = "1000",
+    requested: str = "2000",
     coin_amount: int | None = None,
+    side: str = "buy",
     tier: str = "inner",
 ) -> dict:
     selected_amount = int(offered) if coin_amount is None else coin_amount
     assert database.upsert_coin(
         coin_id,
-        "xch",
+        "xch" if side == "buy" else "cat",
         selected_amount,
         tier=tier,
         designation="tier_active",
@@ -3820,13 +3822,13 @@ def _persist_created_offer(
         wallet_fingerprint_hash=WALLET,
         network=NETWORK,
         asset_id=ASSET,
-        side="buy",
+        side=side,
         tier=tier,
         purpose="normal_lifecycle",
         slot_key="slot:intent-task9",
         generation=0,
         offered_amount_atomic=offered,
-        requested_amount_atomic="2000",
+        requested_amount_atomic=requested,
         selected_coin_ids_json=[coin_id],
         wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
         evidence_json={"intent": "exact"},
@@ -3850,7 +3852,7 @@ def _persist_created_offer(
     assert economics is not None
     assert database.add_offer(
         TRADE,
-        "buy",
+        side,
         price_xch=database.Decimal(economics["price_xch"]),
         size_xch=database.Decimal(economics["size_xch"]),
         size_cat=database.Decimal(economics["size_cat"]),
@@ -3860,6 +3862,121 @@ def _persist_created_offer(
         fee_mojos_xch=economics["fee_mojos_xch"],
     )
     return database.get_offer_intent("intent-task9")
+
+
+def _live_mz_rounding_evidence(*, side: str = "buy") -> dict:
+    xch_atomic = 2_429_810_000_000
+    cat_atomic = 26_997_888
+    offered = xch_atomic if side == "buy" else cat_atomic
+    requested = cat_atomic if side == "buy" else xch_atomic
+    spent_asset = "xch" if side == "buy" else ASSET
+    received_asset = ASSET if side == "buy" else "xch"
+    return _evidence(
+        offers=[_offer(side=side, offered=offered, requested=requested)],
+        transactions=[
+            _transaction(
+                spent=[
+                    {
+                        "coin_id": COIN,
+                        "asset_id": spent_asset,
+                        "amount": offered,
+                        "address_kind": "offer",
+                    }
+                ],
+                created=[
+                    {
+                        "coin_id": RECEIVE,
+                        "asset_id": received_asset,
+                        "amount": requested,
+                        "address_kind": "own",
+                    }
+                ],
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id=spent_asset,
+                amount=offered,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RECEIVE: _coin(
+                RECEIVE,
+                asset_id=received_asset,
+                amount=requested,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_reconcile_accepts_legacy_projection_that_matches_exact_atomic_economics(
+    isolated_database,
+    side,
+):
+    """Display-derived MZ values must not contradict their exact PREPARED atoms."""
+
+    xch_atomic = "2429810000000"
+    cat_atomic = "26997888"
+    offered = xch_atomic if side == "buy" else cat_atomic
+    requested = cat_atomic if side == "buy" else xch_atomic
+    _persist_created_offer(
+        offered=offered,
+        requested=requested,
+        coin_amount=int(offered),
+        side=side,
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET price_xch=?, size_xch=?, size_cat=? WHERE trade_id=?",
+        ("0.000090", "2.429810", "26997.88888888888888888888889", TRADE),
+    )
+    conn.commit()
+
+    result = reconcile_offer(
+        "intent-task9", evidence=_live_mz_rounding_evidence(side=side), now=AFTER
+    )
+
+    assert result["applied"] is True
+    assert result["classification"] == FILLED_PROVEN
+    fill = database.get_fill_by_trade_id(TRADE)
+    assert fill is not None
+    assert database.Decimal(fill["size_xch"]) == database.Decimal("2.42981")
+    assert database.Decimal(fill["size_cat"]) == database.Decimal("26997.888")
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_reconcile_rejects_material_price_change_despite_matching_rounded_sizes(
+    isolated_database,
+):
+    """Atomic size compatibility cannot conceal a changed displayed price."""
+
+    offered = "2429810000000"
+    requested = "26997888"
+    _persist_created_offer(
+        offered=offered,
+        requested=requested,
+        coin_amount=int(offered),
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offers SET price_xch=?, size_xch=?, size_cat=? WHERE trade_id=?",
+        ("0.000089", "2.429810", "26997.88888888888888888888889", TRADE),
+    )
+    conn.commit()
+
+    result = reconcile_offer(
+        "intent-task9", evidence=_live_mz_rounding_evidence(), now=AFTER
+    )
+
+    assert result["applied"] is False
+    assert result["reason_code"] == "IMMUTABLE_ECONOMIC_AUTHORITY_CONFLICT"
+    assert database.get_fill_by_trade_id(TRADE) is None
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
 def test_reconcile_rejects_legacy_offer_economic_rebinding_before_terminal_journal(
@@ -7758,6 +7875,8 @@ def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
     fill = _commit_fill_without_draining_hooks(monkeypatch)
     monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
     monkeypatch.setattr(database, "_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS", 0.09)
+    hook_clock = {"now": "2026-08-20T12:10:00.000000Z"}
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: hook_clock["now"])
     callback_started = threading.Event()
     heartbeat_seen = threading.Event()
     release_callback = threading.Event()
@@ -7766,6 +7885,10 @@ def test_post_fill_runner_heartbeats_long_sink_and_prevents_live_claim_steal(
     original_heartbeat = database.heartbeat_offer_fill_hook
 
     def heartbeat(*args, **kwargs):
+        # Advance beyond the original claim's lease before renewing it.  Keeping
+        # the subsequent competing claim at this same instant makes the lease
+        # assertion deterministic under slow parallel coverage runs.
+        hook_clock["now"] = "2026-08-20T12:10:01.000000Z"
         held = original_heartbeat(*args, **kwargs)
         if held:
             heartbeat_seen.set()

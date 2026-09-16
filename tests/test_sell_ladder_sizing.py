@@ -1,7 +1,11 @@
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _sbx_counts():
@@ -181,6 +185,51 @@ def test_cat_tier_size_ssot_matches_coin_prep_sell_ladder_prices(monkeypatch):
     assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True) == expected
 
 
+def test_runtime_topup_cat_sizes_match_coin_prep_sell_ladder_prices(monkeypatch):
+    """Runtime top-up must recreate the exact CAT sizes Coin Prep produced.
+
+    A live SBX run prepared outer/extreme CAT coins from generated sell-ladder
+    prices, but ``CoinManager._get_tier_sizes_mojos`` recomputed them at the
+    mid price.  Runtime health then treated 28 valid prepared coins as
+    misfits, absorbed them into reserve, and could no longer grow the ladder
+    beyond its inner tier.
+    """
+    import coin_manager
+    import config
+
+    mid = Decimal("0.000383100192")
+    sizes = {
+        "inner": Decimal("2.0060"),
+        "mid": Decimal("1.6716"),
+        "outer": Decimal("1.2537"),
+        "extreme": Decimal("0.6687"),
+    }
+    counts = {"inner": 11, "mid": 17, "outer": 20, "extreme": 24}
+    stub = SimpleNamespace(
+        TIER_ENABLED=True,
+        BUY_LADDER_REVERSED=True,
+        COIN_PREP_HEADROOM_PCT=Decimal("12"),
+        CAT_DECIMALS=3,
+        CAT_COIN_SIZE=Decimal("4000"),
+        SPREAD_BPS=Decimal("2520"),
+        MIN_EDGE_BPS=Decimal("1010"),
+        MAX_ACTIVE_SELL_OFFERS=45,
+        LAST_QUOTED_MID=mid,
+        **{f"SELL_{tier.upper()}_TIER_COUNT": count for tier, count in counts.items()},
+        **{f"SELL_{tier.upper()}_SIZE_XCH": value for tier, value in sizes.items()},
+        **{f"{tier.upper()}_SIZE_XCH": Decimal("0") for tier in sizes},
+    )
+    monkeypatch.setattr(config, "cfg", stub)
+    monkeypatch.setattr(coin_manager, "cfg", stub)
+    monkeypatch.setenv("_CLI_LIVE_PRICE", str(mid))
+
+    expected = coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True)
+    manager = object.__new__(coin_manager.CoinManager)
+    manager._get_current_price = lambda: mid
+
+    assert manager._get_tier_sizes_mojos(is_cat=True) == expected
+
+
 def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
     from ladder_sizing import prepared_sell_ladder_cat_total
 
@@ -221,8 +270,7 @@ def test_smart_defaults_cat_prep_total_uses_generated_slot_prices():
 
 
 def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():
-    with open("bot_gui.html", encoding="utf-8") as f:
-        html = f.read()
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
 
     assert "function buildSellLadderCatPlan" in html
     assert "sellLadderCatPlan" in html
@@ -231,9 +279,38 @@ def test_frontend_coin_prep_uses_sell_ladder_slot_price_plan():
 
 
 def test_smart_defaults_dbx_cap_runs_before_cat_budget_validation():
-    with open("src/catalyst/blueprints/smart_defaults.py", encoding="utf-8") as f:
-        source = f.read()
+    source = (ROOT / "src" / "catalyst" / "blueprints" / "smart_defaults.py").read_text(
+        encoding="utf-8"
+    )
 
     assert source.index("DBX cap clamp") < source.index(
         "F65 FINAL SELL-SIDE CAT VERIFICATION"
     )
+
+
+def test_dbx_incentive_cap_is_not_offered_when_safe_spread_is_wider():
+    import api_server  # noqa: F401 - initialize blueprint dependencies first
+    from blueprints.smart_defaults import _dbx_cap_outcome
+
+    outcome = _dbx_cap_outcome(
+        pair_incentivized=True,
+        cap_bps=500,
+        required_spread_bps=2518,
+        requested=True,
+    )
+
+    assert outcome == {
+        "dbx_cap_feasible": False,
+        "dbx_cap_requested": True,
+        "dbx_cap_applied": False,
+        "dbx_cap_blocked_reason": (
+            "Safe offer-book policy requires a 25.2% spread, wider than "
+            "Dexie's 5.0% reward cap."
+        ),
+    }
+
+
+def test_frontend_only_prompts_for_a_feasible_dbx_incentive_cap():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "data.dbx_cap_feasible === true" in html

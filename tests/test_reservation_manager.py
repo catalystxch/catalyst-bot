@@ -1,10 +1,12 @@
 """Tests for reservation_manager.py — persistent capacity leases."""
 
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
 
 # Patch database module to use a temp DB before importing reservation_manager
 import database
@@ -56,6 +58,19 @@ class TestReservationManager(unittest.TestCase):
         self.assertEqual(totals["count"], 1)
 
         self.rm.release(result.reservation_id, "completed")
+        totals = self.rm.get_reserved_totals()
+        self.assertEqual(totals["count"], 0)
+
+    def test_release_does_not_reuse_contended_thread_local_connection(self):
+        result = self.rm.try_acquire("test_offer", xch_mojos=100000, lease_secs=60)
+        self.assertTrue(result.success)
+
+        with patch(
+            "reservation_manager.get_connection",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            self.rm.release(result.reservation_id, "completed")
+
         totals = self.rm.get_reserved_totals()
         self.assertEqual(totals["count"], 0)
 

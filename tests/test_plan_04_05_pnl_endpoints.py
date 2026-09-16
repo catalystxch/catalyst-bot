@@ -393,6 +393,19 @@ class TestPnlReset(_FlaskBase):
         resp = self._post("/api/pnl/reset", {"confirm": "yes"})
         self.assertEqual(resp.status_code, 400)
 
+    def test_running_bot_blocks_reset_before_session_mutation(self):
+        bot = MagicMock()
+        bot.is_running.return_value = True
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "_reset_fresh_run_session") as reset_session,
+        ):
+            resp = self._post("/api/pnl/reset", {"confirm": "RESET"})
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("error"), "bot_running")
+        reset_session.assert_not_called()
+
     def test_confirm_case_insensitive(self):
         # Handler does .strip().upper() — lowercase "reset" is accepted
         with patch.object(
@@ -507,6 +520,19 @@ class TestFillsPurge(_FlaskBase):
         resp = self._post("/api/fills/purge", auth=False)
         self.assertEqual(resp.status_code, 401)
 
+    def test_running_bot_blocks_purge_before_database_mutation(self):
+        bot = MagicMock()
+        bot.is_running.return_value = True
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("database.guarded_reset_authoritative_state") as guarded_reset,
+        ):
+            resp = self._post("/api/fills/purge")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("error"), "bot_running")
+        guarded_reset.assert_not_called()
+
     def test_returns_200_and_success(self):
         conn = _make_db_conn(fill_count=5, rt_count=2)
         with (
@@ -533,6 +559,7 @@ class TestFillsPurge(_FlaskBase):
     def test_resets_risk_manager_when_bot_set(self):
         conn = _make_db_conn()
         bot = MagicMock()
+        bot.is_running.return_value = False
         bot.risk_manager = MagicMock()
         with (
             patch("database.get_connection", return_value=conn),
@@ -554,6 +581,33 @@ class TestFillsPurge(_FlaskBase):
         ):
             resp = self._post("/api/fills/purge")
         self.assertEqual(resp.status_code, 200)
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestFillsExport(_FlaskBase):
+    def test_empty_history_downloads_valid_header_only_csv(self):
+        """An empty export is valid and must not create a browser 404 error."""
+        original_cat = dict(api_server._active_cat)
+        api_server._active_cat.update(
+            {"asset_id": "abc123cat", "ticker_id": "ABC_XCH", "decimals": 3}
+        )
+        try:
+            with patch.object(
+                api_server, "_build_fill_history_for_gui", return_value=[]
+            ):
+                response = self.client.get(
+                    "/api/fills/export", environ_base=self._LOOPBACK
+                )
+        finally:
+            api_server._active_cat.clear()
+            api_server._active_cat.update(original_cat)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.content_type.startswith("text/csv"))
+        self.assertEqual(
+            response.get_data(as_text=True),
+            "filled_at,side,price_xch,size_xch,size_cat,tier,trade_id,coin_id\r\n",
+        )
 
 
 if __name__ == "__main__":

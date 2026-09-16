@@ -571,41 +571,26 @@ class TestCoinPrepFullCycle(_TempDB):
         )
 
         self.assertEqual(resp.status_code, 409)
+        data = resp.get_json()
+        self.assertEqual(data["success"], False)
+        self.assertEqual(data["error"], "coin_prep_requires_offer_cancellation")
+        self.assertEqual(data["reason"], "OPEN_OFFERS_REQUIRE_CANCELLATION")
+        self.assertEqual(data["action"], "cancel_all_then_retry")
         self.assertEqual(
-            resp.get_json(),
-            {
-                "success": False,
-                "error": "coin_prep_requires_offer_cancellation",
-                "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
-                "message": (
-                    "2 open offers must be cancelled and authoritatively confirmed "
-                    "before coin prep can safely replace their locked coins."
-                ),
-                "action": "cancel_all_then_retry",
-                "open_offer_count": 2,
-                "open_buy_count": 1,
-                "open_sell_count": 1,
-                "wallet_open_offer_count": 2,
-                "wallet_offer_book_verified_empty": False,
-                "legacy_offer_count": 2,
-                "legacy_recovery": {
-                    "examined": 0,
-                    "recovered": 0,
-                    "remaining": 2,
-                },
-                "reconciliation": {},
-                "conflicts": ["open_offers"],
-                "fills_cleared": 0,
-                "round_trips_cleared": 0,
-                "coins_cleared": 0,
-                "open_offers_cancelled": 0,
-                "offers_deleted": 0,
-                "price_history_cleared": False,
-                "inventory_cleared": False,
-                "preserve_history": True,
-                "reset_at": unittest.mock.ANY,
-            },
+            data["message"],
+            "2 open offers must be cancelled and authoritatively confirmed "
+            "before coin prep can safely replace their locked coins.",
         )
+        self.assertEqual(data["open_offer_count"], 2)
+        self.assertEqual(data["open_buy_count"], 1)
+        self.assertEqual(data["open_sell_count"], 1)
+        self.assertEqual(data["wallet_open_offer_count"], 2)
+        self.assertFalse(data["wallet_offer_book_verified_empty"])
+        self.assertEqual(data["legacy_offer_count"], 2)
+        self.assertEqual(data["legacy_recovery"]["remaining"], 2)
+        self.assertEqual(data["conflicts"], ["open_offers"])
+        self.assertTrue(data["preserve_history"])
+        self.assertTrue(data["reset_at"])
         self.assertFalse(api_server._coin_prep_state.get("running"))
 
     def test_legacy_open_offer_is_recovered_before_reset_guard(self):

@@ -8,12 +8,14 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import coin_manager
+import database
 import mutation_gate
 import replacement_capacity
 
 
 SOURCE = "01" * 32
 MISFIT = "02" * 32
+FEE = "03" * 32
 TARGET = "11" * 32
 CHANGE = "22" * 32
 
@@ -130,6 +132,279 @@ def test_runtime_topup_persists_prepared_before_dispatch(monkeypatch):
     assert outcomes[0][1]["outcome"] == "SUBMITTED_UNKNOWN"
 
 
+def test_runtime_topup_retry_gets_a_distinct_durable_operation_id(monkeypatch):
+    """A proven no-effect retry must not collide with its immutable first attempt."""
+
+    operation_ids = []
+    monkeypatch.setattr(
+        coin_manager,
+        "claim_wallet_effect",
+        lambda **kwargs: operation_ids.append(kwargs["operation_id"]),
+    )
+    monkeypatch.setattr(coin_manager, "_current_coin_prep_wallet_identity", _identity)
+
+    for _attempt in range(2):
+        result = coin_manager._run_claimed_wallet_effect(
+            "coin_manager.topup_split_sage",
+            lambda: {"transaction_id": "0xunused"},
+            source_coin_ids=[SOURCE],
+            _prep_contract=_prep_contract(),
+        )
+        assert result is coin_manager._WALLET_EFFECT_DENIED
+
+    assert len(operation_ids) == 2
+    assert operation_ids[0] != operation_ids[1]
+
+
+def test_runtime_cat_consolidation_claims_dedicated_xch_fee_coin(monkeypatch):
+    claims = []
+    callbacks = []
+
+    monkeypatch.setattr(
+        coin_manager,
+        "claim_wallet_effect",
+        lambda **kwargs: (
+            claims.append(kwargs) or {"claim_token": "a" * 64, "generation": 1}
+        ),
+    )
+    monkeypatch.setattr(
+        coin_manager, "wallet_effect_claim_is_current", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        coin_manager, "begin_wallet_effect_dispatch", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(
+        coin_manager, "wallet_effect_adapter_dispatch_authority", nullcontext
+    )
+    monkeypatch.setattr(
+        coin_manager, "complete_wallet_effect_dispatch", lambda *_a, **_k: "SUBMITTED"
+    )
+
+    result = coin_manager._run_claimed_wallet_effect(
+        "coin_manager.consolidate_cat_sage",
+        lambda: callbacks.append(True) or {"transaction_id": "0xtx"},
+        source_coin_ids=[SOURCE, MISFIT],
+        fee_mojos=10,
+        fee_coin_ids=[FEE],
+    )
+
+    assert result == {"transaction_id": "0xtx"}
+    assert callbacks == [True]
+    assert claims == [
+        {
+            "operation_id": "coin_manager.consolidate_cat_sage",
+            "source_coin_ids": [SOURCE, MISFIT],
+            "fee_coin_ids": [FEE],
+        }
+    ]
+
+
+def test_cat_consolidation_journals_and_confirms_exact_post_view(monkeypatch):
+    """A submitted CAT reserve combine must be restart-recoverable."""
+
+    source_a = "0x" + SOURCE
+    source_b = "0x" + MISFIT
+    fee_coin = "0x" + FEE
+    output = "0x" + TARGET
+    pre_owned = {source_a: 40, source_b: 60, "0x" + CHANGE: 5}
+    post_owned = {output: 100, "0x" + CHANGE: 5}
+    captured = {}
+    confirmations = []
+    receipt = coin_manager._PreparedWalletEffectReceipt(
+        result={
+            "success": True,
+            "transaction_id": "0xcatcombine",
+            "coin_spends": [{}, {}, {}],
+        },
+        operation={"operation_id": "coin-prep:" + "c" * 64},
+        dispatch_outcome="SUBMITTED",
+    )
+
+    def exact_effect(**kwargs):
+        captured.update(kwargs)
+        return receipt
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    manager._recent_consolidate_submissions = {}
+    manager.fee_pool = SimpleNamespace(reserve=lambda: fee_coin)
+    monkeypatch.setattr(coin_manager, "get_wallet_type", lambda: "sage")
+    monkeypatch.setattr(
+        coin_manager,
+        "authorize_wallet_effect_coin_ids",
+        lambda coin_ids: list(coin_ids),
+    )
+    monkeypatch.setattr(manager, "_tx_fee_mojos", lambda: 10)
+    monkeypatch.setattr(manager, "_fee_pool_enabled", lambda: True)
+    monkeypatch.setattr(
+        manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
+    )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
+    )
+    owned_views = iter([pre_owned, post_owned])
+    monkeypatch.setattr(
+        manager,
+        "_get_owned_coin_amount_map",
+        lambda *_args, **_kwargs: next(owned_views),
+    )
+    monkeypatch.setattr(manager, "_run_exact_cat_combine_effect", exact_effect)
+    monkeypatch.setattr(
+        manager,
+        "_confirm_runtime_topup_prep",
+        lambda actual_receipt, *, owned_map: (
+            confirmations.append((actual_receipt, owned_map)) or True
+        ),
+    )
+
+    result = manager._consolidate_coins(
+        "CAT-inner", 2, 100, True, source_coin_ids=[source_a, source_b]
+    )
+
+    assert result is True
+    assert captured["prep_contract"] == {
+        "operation_kind": "combine",
+        "purpose": "top_up",
+        "target_contract": {
+            "wallet_type": "cat",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 100,
+                    "purpose": "top_up",
+                }
+            ],
+        },
+        "pre_view_coin_ids": sorted(
+            coin_id.removeprefix("0x") for coin_id in pre_owned
+        ),
+    }
+    assert confirmations == [(receipt, post_owned)]
+
+
+def test_xch_pool_rebuild_journals_and_confirms_before_next_topup(monkeypatch):
+    """An XCH pool rebuild must resolve its submitted claim before reuse.
+
+    This reproduces the 2026-09-13 live failure: a fee-pool rebuild submitted
+    successfully, but because the XCH combine had no Task 12 contract its
+    wallet-effect latch remained blocking.  The next top-up then stopped the
+    bot with ``MUTATION_GATE_SAFETY_STOP`` before it could spend the confirmed
+    rebuilt output.
+    """
+
+    source_a = "0x" + SOURCE
+    source_b = "0x" + MISFIT
+    output = "0x" + TARGET
+    fee_mojos = 10
+    pre_owned = {source_a: 40, source_b: 60, "0x" + CHANGE: 5}
+    post_owned = {output: 90, "0x" + CHANGE: 5}
+    captured = {}
+    confirmations = []
+    receipt = coin_manager._PreparedWalletEffectReceipt(
+        result={
+            "success": True,
+            "transaction_id": "0xxchcombine",
+            "coin_spends": [{}, {}],
+        },
+        operation={"operation_id": "coin-prep:" + "d" * 64},
+        dispatch_outcome="SUBMITTED",
+    )
+
+    def claimed_effect(operation, callback, **kwargs):
+        captured["operation"] = operation
+        captured.update(kwargs)
+        callback()
+        return receipt
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    manager._recent_consolidate_submissions = {}
+    monkeypatch.setattr(coin_manager, "get_wallet_type", lambda: "sage")
+    monkeypatch.setattr(
+        coin_manager,
+        "authorize_wallet_effect_coin_ids",
+        lambda coin_ids: list(coin_ids),
+    )
+    monkeypatch.setattr(manager, "_tx_fee_mojos", lambda: fee_mojos)
+    monkeypatch.setattr(
+        manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
+    )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
+    )
+    owned_views = iter([pre_owned, post_owned])
+    monkeypatch.setattr(
+        manager,
+        "_get_owned_coin_amount_map",
+        lambda *_args, **_kwargs: next(owned_views),
+    )
+    monkeypatch.setattr(coin_manager, "_run_claimed_wallet_effect", claimed_effect)
+    monkeypatch.setattr(
+        manager,
+        "_confirm_runtime_topup_prep",
+        lambda actual_receipt, *, owned_map: (
+            confirmations.append((actual_receipt, owned_map)) or True
+        ),
+    )
+    monkeypatch.setattr("wallet.combine_coins", lambda **_kwargs: {"success": True})
+
+    result = manager._consolidate_coins(
+        "XCH-fees", 1, 100, False, source_coin_ids=[source_a, source_b]
+    )
+
+    assert result is True
+    assert captured["operation"] == "coin_manager.consolidate_sage"
+    assert captured["_prep_contract"] == {
+        "operation_kind": "combine",
+        "purpose": "top_up",
+        "target_contract": {
+            "wallet_type": "xch",
+            "outputs": [
+                {
+                    "output_index": 0,
+                    "amount_mojos": 90,
+                    "purpose": "top_up",
+                }
+            ],
+        },
+        "pre_view_coin_ids": sorted(
+            coin_id.removeprefix("0x") for coin_id in pre_owned
+        ),
+    }
+    assert confirmations == [(receipt, post_owned)]
+
+
+def test_runtime_fee_topup_contract_purposes_new_coins_as_fee_reserve():
+    """Fee-tier refills must create authoritative fee capacity, not replacements."""
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    source = "0x" + SOURCE
+
+    contract = manager._build_runtime_topup_prep_contract(
+        pre_owned_map={source: 10_000},
+        source_coin_id=source,
+        num_to_create=4,
+        trading_size_mojos=1_000,
+        fee_mojos=10,
+        is_cat=False,
+        output_purpose="fee_reserve",
+    )
+
+    assert contract["purpose"] == "fee_reserve"
+    assert contract["target_contract"]["outputs"] == [
+        {
+            "output_index": index,
+            "amount_mojos": 1_000,
+            "purpose": "fee_reserve",
+        }
+        for index in range(4)
+    ] + [
+        {
+            "output_index": 4,
+            "amount_mojos": 5_990,
+            "purpose": "top_up",
+        }
+    ]
+
+
 def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
     """A fresh complete post-view clears the submitted latch with exact outputs."""
 
@@ -149,6 +424,8 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
         dispatch_outcome="SUBMITTED",
     )
     recorded = []
+    upserted = []
+    designated = []
     observed = datetime(2026, 8, 22, 20, 0, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
@@ -170,6 +447,16 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
         coin_manager,
         "record_coin_prep_operation_outcome",
         lambda *args, **kwargs: recorded.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        database,
+        "upsert_coin",
+        lambda **kwargs: upserted.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        database,
+        "set_coin_designation",
+        lambda *args, **kwargs: designated.append((args, kwargs)) or True,
     )
 
     manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
@@ -199,6 +486,60 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
     assert evidence["authoritative_view"]["expires_at"] == expected_expiry.isoformat(
         timespec="microseconds"
     ).replace("+00:00", "Z")
+    assert upserted == [
+        {
+            "coin_id": CHANGE,
+            "wallet_type": "cat",
+            "amount_mojos": 400,
+            "tier": "reserve",
+            "designation": "reserve",
+            "assigned_tier": "none",
+            "purpose": "top_up",
+        }
+    ]
+    assert designated == [((CHANGE, "reserve", "none"), {"purpose": "top_up"})]
+
+
+def test_top_up_purpose_repairs_stale_tier_designation(monkeypatch):
+    """Confirmed top-up capacity must remain reserve across later scans."""
+
+    coin_id = "0x" + CHANGE
+    record = {"coin_id": coin_id, "coin": {"amount": 3_094_659_619_179}}
+    stale_row = {
+        "coin_id": coin_id,
+        "amount_mojos": 3_094_659_619_179,
+        "status": "free",
+        "designation": "tier_spare",
+        "assigned_tier": "inner",
+        "purpose": "top_up",
+    }
+    designated = []
+
+    monkeypatch.setattr(database, "get_free_coins", lambda _wallet: [stale_row])
+    monkeypatch.setattr(database, "get_locked_coins", lambda _wallet: [])
+    monkeypatch.setattr(database, "get_tier_spare_counts", lambda _wallet: {})
+    monkeypatch.setattr(
+        database,
+        "set_coin_designation",
+        lambda *args, **kwargs: designated.append((args, kwargs)) or True,
+    )
+
+    manager = coin_manager.CoinManager.__new__(coin_manager.CoinManager)
+    inventory = manager._classify_coins_by_designation(
+        [record],
+        "xch",
+        {
+            "inner": 2_253_552_000_000,
+            "mid": 1_877_904_000_000,
+            "outer": 1_408_400_000_000,
+            "extreme": 751_184_000_000,
+            "fees": 1_000_000_000,
+        },
+    )
+
+    assert inventory["reserve"] == [record]
+    assert inventory["inner"] == []
+    assert designated == [((coin_id, "reserve", "none"), {"purpose": "top_up"})]
 
 
 def test_runtime_absorb_journals_and_confirms_exact_combined_output(monkeypatch):
@@ -250,6 +591,9 @@ def test_runtime_absorb_journals_and_confirms_exact_combined_output(monkeypatch)
     monkeypatch.setattr(manager, "_tx_fee_mojos", lambda: fee_mojos)
     monkeypatch.setattr(
         manager, "_filter_out_protected_coin_ids", lambda coin_ids: coin_ids
+    )
+    monkeypatch.setattr(
+        coin_manager, "get_coin_reconciliation_protected_ids", lambda _ids: []
     )
     owned_views = iter([pre_owned, post_owned])
     monkeypatch.setattr(

@@ -10,6 +10,7 @@ singleton latch state.
 """
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,31 @@ class TestAddOffer(_TempDB):
             "t1", "buy", Decimal("1.00"), Decimal("0.5"), Decimal("500"), "assetid1"
         )
         self.assertTrue(result)
+
+    def test_add_offer_does_not_reuse_contended_thread_local_connection(self):
+        """A wallet-created offer must survive a poisoned worker connection.
+
+        Ladder creation runs buy and sell workers concurrently.  A worker's
+        cached connection can be left contended by another writer; offer
+        persistence is the critical boundary after Sage has already created
+        the offer and therefore needs a fresh short-lived connection.
+        """
+        with patch.object(
+            _db,
+            "get_connection",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = _db.add_offer(
+                "t-contended",
+                "buy",
+                Decimal("1.00"),
+                Decimal("0.5"),
+                Decimal("500"),
+                "assetid1",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(_db.get_offer("t-contended")["status"], "open")
 
     def test_get_offer_returns_inserted(self):
         _db.add_offer(
@@ -624,6 +650,29 @@ class TestUpsertCoin(_TempDB):
         ids = [c["coin_id"] for c in coins]
         self.assertNotIn("0xabc2", ids)
 
+    def test_lock_coin_uses_post_wallet_critical_write_path(self):
+        _db.upsert_coin(
+            "0xcritical", "xch", 250_000_000_000, designation="mid", tier="mid"
+        )
+
+        with patch.object(
+            _db,
+            "_stability_connection",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            result = _db.lock_coin("0xcritical", "offer-critical")
+
+        self.assertTrue(result)
+        row = (
+            _db.get_connection()
+            .execute(
+                "SELECT status, trade_id FROM coins WHERE coin_id=?", ("0xcritical",)
+            )
+            .fetchone()
+        )
+        self.assertEqual(row["status"], "locked")
+        self.assertEqual(row["trade_id"], "offer-critical")
+
     def test_free_coin_restores_to_free_list(self):
         _db.upsert_coin("0xabc3", "xch", 250_000_000_000, designation="mid", tier="mid")
         _db.lock_coin("0xabc3", "offer-t2")
@@ -639,6 +688,22 @@ class TestUpsertCoin(_TempDB):
         match = next((c for c in coins if c["coin_id"] == "0xabc4"), None)
         self.assertIsNotNone(match)
         self.assertEqual(int(match["amount_mojos"]), 200_000_000_000)
+
+    def test_batch_upsert_snapshots_registry_protection_once(self):
+        coins = [
+            {"coin_id": f"0xbatch{i}", "amount_mojos": 1000 + i, "tier": "mid"}
+            for i in range(4)
+        ]
+        original = _db._nonterminal_registry_coin_ids
+        with patch.object(
+            _db,
+            "_nonterminal_registry_coin_ids",
+            wraps=original,
+        ) as protected_ids:
+            count = _db.batch_upsert_coins(coins, "xch")
+
+        self.assertEqual(count, 4)
+        self.assertEqual(protected_ids.call_count, 1)
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

@@ -491,6 +491,136 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     # -----------------------------------------------------------------------
+    # Market Bootstrap
+    # -----------------------------------------------------------------------
+
+    @_safe
+    def get_bootstrap_status(self):
+        """Get the current identity-bound Bootstrap campaign, if any."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/bootstrap/status"):
+            resp = api_server.api_bootstrap_status()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def get_bootstrap_partial_offer_capability(self):
+        """Report the deliberately disabled partial-offer capability."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/bootstrap/partial-capability"):
+            resp = api_server.api_bootstrap_partial_offer_capability()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def preview_bootstrap_campaign(self, body=None):
+        """Pure Bootstrap preview; does not persist or touch the wallet."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/preview",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:start_bootstrap_campaign")
+    def start_bootstrap_campaign(self, body=None):
+        """Persist reviewed campaign authority before any Coin Prep."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/start",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_start()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:stop_bootstrap_campaign")
+    def stop_bootstrap_campaign(self, body=None):
+        """Stop one exact campaign and cancel only its owned offers."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/stop",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_stop()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:renew_bootstrap_campaign")
+    def renew_bootstrap_campaign(self, body=None):
+        """Create a freshly reviewed successor to a stopped campaign."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/renew",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_renew()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def export_bootstrap_manifest(self, body=None):
+        """Export a descriptive public manifest without financial authority."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/manifest/export",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_manifest_export()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def import_bootstrap_manifest(self, body=None):
+        """Verify an imported manifest without accepting local budgets."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/manifest/import",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_manifest_import()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def export_bootstrap_participation(self, body=None):
+        """Export privacy-bounded campaign evidence for optional Sage signing."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/participation/export",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_participation_export()
+        return _unwrap_flask_response(resp)
+
+    # -----------------------------------------------------------------------
     # Dashboard
     # -----------------------------------------------------------------------
 
@@ -907,6 +1037,15 @@ class AppBridge:
 
         with api_server.app.test_request_context("/api/market/summary"):
             resp = api_server.api_market_summary()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def get_market_confidence(self):
+        """Get durable offer-book confidence. Maps to GET /api/market/confidence."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/market/confidence"):
+            resp = api_server.api_market_confidence()
         return _unwrap_flask_response(resp)
 
     @_safe
@@ -1757,6 +1896,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "live_config",
     "purge_fills",
     "refresh_cat",
+    "renew_bootstrap_campaign",
     "reload_config",
     "repost_dexie",
     "reset_coin_prep",
@@ -1769,12 +1909,14 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "setup_certs",
     "setup_spacescan",
     "start_bot",
+    "start_bootstrap_campaign",
     "start_splash_node",
     "start_update_install",
     "start_with_fingerprint",
     "trigger_coin_prep",
     "trigger_topup",
     "update_config",
+    "stop_bootstrap_campaign",
 }
 _APP_BRIDGE_CONTROL_METHODS = {
     "browse_sage_cert",
@@ -1800,6 +1942,8 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_app_info",
     "get_boost_state",
     "get_bot_state",
+    "get_bootstrap_partial_offer_capability",
+    "get_bootstrap_status",
     "get_cancel_all_status",
     "get_cats",
     "get_coin_prep_status",
@@ -1816,6 +1960,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_inventory",
     "get_logs",
     "get_market_intel",
+    "get_market_confidence",
     "get_market_orderbook",
     "get_market_slippage",
     "get_market_summary",
@@ -1843,8 +1988,12 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_update_status",
     "get_window_pos",
     "get_window_size",
+    "import_bootstrap_manifest",
     "is_sage_running",
     "read_clipboard",
+    "export_bootstrap_manifest",
+    "export_bootstrap_participation",
+    "preview_bootstrap_campaign",
     "refresh_balances",
     "run_doctor",
     "validate_config",

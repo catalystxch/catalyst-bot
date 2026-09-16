@@ -104,6 +104,7 @@ class _FakeBot:
         queue_size=0,
         sweep_protection=None,
         adaptive_targets=None,
+        effective_targets=None,
     ):
         self._startup_complete = _FakeEvent()
         self._running = True
@@ -126,7 +127,9 @@ class _FakeBot:
         self.alerts = []
         self.cleared = []
         self._adaptive_targets = adaptive_targets
+        self._effective_targets = effective_targets
         self.adaptive_target_calls = []
+        self.effective_target_calls = []
 
     def _emit_alert(self, alert_id, severity, title, message):
         self.alerts.append((alert_id, severity, title, message))
@@ -143,6 +146,20 @@ class _FakeBot:
         if self._adaptive_targets is not None:
             return dict(self._adaptive_targets)
         return {"buy": 24, "sell": 24}
+
+    def _get_effective_offer_targets(
+        self, mid_price, current_buy_count=0, current_sell_count=0
+    ):
+        self.effective_target_calls.append(
+            (mid_price, current_buy_count, current_sell_count)
+        )
+        if self._effective_targets is not None:
+            return dict(self._effective_targets)
+        return self._get_adaptive_offer_targets(
+            mid_price,
+            current_buy_count=current_buy_count,
+            current_sell_count=current_sell_count,
+        )
 
 
 def _open_offer_rows(buys, sells):
@@ -409,6 +426,57 @@ class RuntimeMonitorTests(unittest.TestCase):
         self.assertEqual(state["market"]["sell_target"], 20)
         self.assertEqual(state["market"]["full_sell_target"], 24)
         self.assertTrue(bot.adaptive_target_calls)
+        self.assertFalse(
+            any(
+                call.args[1] == "bot_health_book_under_target"
+                for call in log_event_mock.call_args_list
+            )
+        )
+
+    def test_follow_capacity_cap_is_the_health_monitor_target(self):
+        bot = _FakeBot(
+            wallet_buys=11,
+            wallet_sells=11,
+            adaptive_targets={"buy": 45, "sell": 45},
+            effective_targets={"buy": 11, "sell": 11},
+            market_snapshot={
+                "buy_count": 100,
+                "sell_count": 91,
+                "our_buy_count": 11,
+                "our_sell_count": 11,
+                "our_best_bid": "0.00011990",
+                "our_best_ask": "0.00012110",
+            },
+        )
+        monitor = RuntimeMonitor(bot)
+        monitor.reset_session()
+        monitor._last_post_activity_at = time.time() - 600
+
+        with (
+            patch("runtime_monitor.get_events_since", return_value=[]),
+            patch(
+                "runtime_monitor.get_open_offers",
+                return_value=_open_offer_rows(11, 11),
+            ),
+            patch("runtime_monitor.log_event") as log_event_mock,
+            patch.object(monitor, "_resolve_superlog_path", return_value=""),
+            patch("runtime_monitor.cfg.ENABLE_BUY", True),
+            patch("runtime_monitor.cfg.ENABLE_SELL", True),
+            patch("runtime_monitor.cfg.MAX_ACTIVE_BUY_OFFERS", 45),
+            patch("runtime_monitor.cfg.MAX_ACTIVE_SELL_OFFERS", 45),
+        ):
+            monitor._run_once()
+            monitor._run_once()
+
+        state = monitor.get_state()
+        active_codes = {item["code"] for item in state["active_conditions"]}
+        self.assertNotIn("book_under_target", active_codes)
+        self.assertEqual(state["market"]["buy_target"], 11)
+        self.assertEqual(state["market"]["sell_target"], 11)
+        self.assertEqual(state["market"]["full_buy_target"], 45)
+        self.assertEqual(state["market"]["full_sell_target"], 45)
+        self.assertTrue(state["market"]["adaptive_target_active"])
+        self.assertTrue(bot.effective_target_calls)
         self.assertFalse(
             any(
                 call.args[1] == "bot_health_book_under_target"

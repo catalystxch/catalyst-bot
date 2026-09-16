@@ -72,6 +72,8 @@ fake_database.init_database = lambda: None
 fake_database.log_event = lambda *args, **kwargs: None
 fake_database.get_stats = lambda *args, **kwargs: {}
 fake_database.get_offer = lambda *args, **kwargs: None
+fake_database.get_open_offers = lambda *args, **kwargs: []
+fake_database.get_active_offer_market_identities = lambda *args, **kwargs: set()
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.update_offer_lifecycle_state = lambda *args, **kwargs: None
@@ -365,6 +367,15 @@ class RecoveryModeTests(unittest.TestCase):
     def setUp(self):
         self.logged = []
         bot_loop.log_event = self._log_event
+        # Recovery-mode refill mechanics are exercised after the independent
+        # post-TibetSwap confidence gate, which has its own focused suite.
+        self._effect_gate_patcher = patch.object(
+            bot_loop.BotLoop, "_enter_runtime_effect_phase", return_value=True
+        )
+        self._effect_gate_patcher.start()
+
+    def tearDown(self):
+        self._effect_gate_patcher.stop()
 
     def _log_event(self, severity, event_type, message, data=None):
         self.logged.append((severity, event_type, message, data))
@@ -441,6 +452,29 @@ class RecoveryModeTests(unittest.TestCase):
         self.assertTrue(loop._recovery_state["active"])
         self.assertEqual(loop._bot_state["status"], "recovering")
         self.assertTrue(
+            any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged)
+        )
+
+    def test_follow_capacity_cap_is_not_misreported_as_recovery_shortfall(self):
+        """A deliberate single-provider cap is the live target, not book drift."""
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop._get_adaptive_offer_targets = lambda *args, **kwargs: {
+            "buy": 45,
+            "sell": 45,
+        }
+        loop._market_confidence_result = types.SimpleNamespace(
+            data_valid=True,
+            follow_capacity_fraction=Decimal("0.25"),
+        )
+
+        for _ in range(loop._recovery_under_target_cycles + 1):
+            loop._evaluate_recovery_mode(Decimal("1.0"), 11, 11)
+
+        self.assertFalse(loop._recovery_state["active"])
+        self.assertEqual(loop._recovery_state["buy_deficit"], 0)
+        self.assertEqual(loop._recovery_state["sell_deficit"], 0)
+        self.assertFalse(
             any(evt == "recovery_mode_enter" for _, evt, _, _ in self.logged)
         )
 

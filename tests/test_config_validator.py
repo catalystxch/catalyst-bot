@@ -20,6 +20,9 @@ def _make_cfg(**overrides):
         "DEFAULT_TRADE_XCH": Decimal("0.0275"),
         "SPREAD_BPS": Decimal("800"),
         "MIN_EDGE_BPS": Decimal("300"),
+        "MINIMUM_PROFIT_XCH": Decimal("0"),
+        "EXPECTED_CANCEL_REQUOTES": 0,
+        "COMPETITION_COOLDOWN_SECS": 60,
         "TIBET_SHOCK_CANCEL_TRIGGER_PCT": Decimal("3"),
         "DYNAMIC_SPREAD_ENABLED": False,
         "MIN_SPREAD_BPS": Decimal("300"),
@@ -149,6 +152,29 @@ class TestConfigValidator(unittest.TestCase):
         report = validate_config(_make_cfg(TIER_ENABLED=True))
         self.assertTrue(report.is_valid)
         self.assertTrue(any("TIER" in w.key for w in report.warnings))
+
+    def test_retired_sniper_size_does_not_trigger_fee_coin_warning(self):
+        """A stale sniper size is irrelevant once the feature is disabled."""
+        report = validate_config(
+            _make_cfg(
+                SNIPER_ENABLED=False,
+                SNIPER_SIZE_XCH=Decimal("0.001"),
+                FEE_COIN_SIZE_XCH=Decimal("0.001"),
+            )
+        )
+
+        self.assertFalse(any(w.key == "FEE_COIN_SIZE_XCH" for w in report.warnings))
+
+    def test_enabled_sniper_requires_smaller_fee_coins(self):
+        report = validate_config(
+            _make_cfg(
+                SNIPER_ENABLED=True,
+                SNIPER_SIZE_XCH=Decimal("0.001"),
+                FEE_COIN_SIZE_XCH=Decimal("0.001"),
+            )
+        )
+
+        self.assertTrue(any(w.key == "FEE_COIN_SIZE_XCH" for w in report.warnings))
 
     def test_tier_mode_ignores_legacy_max_trade_cap_for_ladder_sizes(self):
         report = validate_config(

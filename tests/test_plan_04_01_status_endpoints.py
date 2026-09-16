@@ -612,6 +612,64 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(offers["sell"], [])
         get_all_offers.assert_not_called()
 
+    def test_stopped_status_clears_stale_lock_counts_for_fresh_empty_wallet_book(self):
+        """Coin counts must follow the same fresh Sage offer view shown by the UI."""
+        asset_id = "ce" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        stopped_bot = _fake_bot_stopped()
+        stopped_bot.offer_manager = types.SimpleNamespace(
+            get_wallet_sync_snapshot=lambda: {
+                "buy": [],
+                "sell": [],
+                "closed": [],
+                "meta": {"fresh": True},
+            }
+        )
+        stale_coin_summary = {
+            "xch_free_count": 177,
+            "xch_locked_count": 33,
+            "xch_locked_mojos": 106_289_411_260_800,
+            "xch_total": 210,
+            "cat_free_count": 92,
+            "cat_locked_count": 35,
+            "cat_locked_mojos": 1_336_812_877,
+            "cat_total": 127,
+        }
+
+        with (
+            patch.object(api_server, "bot", stopped_bot),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_coin_summary", return_value=stale_coin_summary),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_events_since", return_value=[]),
+            patch("database.get_offer_lifecycle_summary", return_value={}),
+            patch("wallet.get_all_offers") as get_all_offers,
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        tracking = resp.get_json()["coin_tracking"]
+        self.assertEqual(tracking["xch_locked"], 0)
+        self.assertEqual(tracking["xch_locked_amount"], "0.0000")
+        self.assertEqual(tracking["xch_free"], 210)
+        self.assertEqual(tracking["xch_spendable"], 210)
+        self.assertEqual(tracking["xch_total"], 210)
+        self.assertEqual(tracking["cat_locked"], 0)
+        self.assertEqual(tracking["cat_locked_amount"], "0.00")
+        self.assertEqual(tracking["cat_free"], 127)
+        self.assertEqual(tracking["cat_spendable"], 127)
+        self.assertEqual(tracking["cat_total"], 127)
+        get_all_offers.assert_not_called()
+
     def test_stopped_status_enriches_zero_formatted_wallet_amounts_from_db(self):
         """Sage controls membership while CATalyst retains known display amounts."""
         asset_id = "ef" * 32
@@ -668,6 +726,71 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(offer["price"], "0.0000640000")
         self.assertEqual(offer["status"], "PENDING_ACCEPT")
 
+    def test_running_status_exposes_durable_offer_publication_authority(self):
+        """The live Offers UI must not invent negative provider states."""
+        asset_id = "ab" * 32
+        api_server._active_cat.update(
+            {
+                "asset_id": asset_id,
+                "wallet_id": 2,
+                "decimals": 3,
+                "ticker_id": "LIVE_XCH",
+                "name": "Live CAT",
+            }
+        )
+        durable_buy = {
+            "trade_id": "live-buy-id",
+            "side": "buy",
+            "price_xch": "0.000064",
+            "size_xch": "1.25",
+            "size_cat": "19531.250",
+            "status": "open",
+        }
+
+        def durable_open_offers(*, side=None, cat_asset_id=None, **_kwargs):
+            return [durable_buy] if side == "buy" else []
+
+        def attach_authority(rows):
+            return [
+                {
+                    **row,
+                    "authority": {
+                        "intent_id": "intent-1",
+                        "lifecycle_state": "visible",
+                    },
+                    "publication": {"dexie": {"state": "succeeded"}},
+                    "discovery": {
+                        "state": "visible",
+                        "providers": {"dexie": {"state": "exact"}},
+                    },
+                }
+                for row in rows
+            ]
+
+        with (
+            patch.object(api_server, "bot", _fake_bot_running()),
+            patch("database.get_open_offers", side_effect=durable_open_offers),
+            patch(
+                "blueprints.bot._offers_with_durable_authority",
+                side_effect=attach_authority,
+                create=True,
+            ) as enrich_authority,
+            patch.object(
+                api_server,
+                "_get_health_snapshot",
+                return_value={"status": "healthy"},
+            ),
+            patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        offer = resp.get_json()["offers"]["buy"][0]
+        self.assertEqual(offer["authority"]["intent_id"], "intent-1")
+        self.assertEqual(offer["publication"]["dexie"]["state"], "succeeded")
+        self.assertEqual(offer["discovery"]["providers"]["dexie"]["state"], "exact")
+        enrich_authority.assert_called_once()
+
     def test_stopped_bot_state_does_not_read_wallet_for_zero_db_snapshot(self):
         zero_bot = _fake_bot_stopped()
         zero_state = zero_bot.get_state()
@@ -694,14 +817,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
         self.assertEqual(resp.status_code, 200)
         get_spendable_coin_count.assert_not_called()
 
-    def test_stopped_status_reuses_tibet_pairs_for_immediate_polls(self):
-        from blueprints import market as market_routes
-
-        with market_routes._TIBET_PAIRS_CACHE_LOCK:
-            market_routes._TIBET_PAIRS_CACHE.update(
-                {"base": "", "fetched_at": 0.0, "pairs": []}
-            )
-
+    def test_stopped_status_never_contacts_retired_tibetswap(self):
         asset_id = "abc123cat"
         api_server._active_cat.update(
             {
@@ -743,7 +859,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
             api_server._active_cat.update(self._orig_cat)
 
         tibet_calls = [url for url in calls if "tibetswap" in url]
-        self.assertEqual(len(tibet_calls), 1)
+        self.assertEqual(tibet_calls, [])
 
     def test_cold_stopped_status_uses_dexie_during_tibetswap_outage(self):
         """TibetSwap outage must not deadlock setup waiting for its first price."""

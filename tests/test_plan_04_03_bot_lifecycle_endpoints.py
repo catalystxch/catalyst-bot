@@ -83,6 +83,12 @@ class _FlaskBase(unittest.TestCase):
         )
         self._wallet_sync_read.start()
         self.addCleanup(self._wallet_sync_read.stop)
+        self._post_tibet_migration = patch(
+            "blueprints.bot._enforce_post_tibet_start_migration",
+            return_value={"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
+        )
+        self._post_tibet_migration.start()
+        self.addCleanup(self._post_tibet_migration.stop)
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
@@ -110,7 +116,7 @@ def _make_bot(running=False, start_returns=True):
     return bot
 
 
-def _fake_cfg(cat_asset_id="abc123", spread_bps=200):
+def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
     return types.SimpleNamespace(
         CAT_ASSET_ID=cat_asset_id,
         SPREAD_BPS=spread_bps,
@@ -279,6 +285,110 @@ class TestBotStart(_FlaskBase):
         self.assertTrue(body.get("needs_coin_prep"))
         self.assertEqual(body.get("reason"), "tier_size_drift")
         self.assertEqual(body.get("tier_size_drift"), drift)
+        bot.start.assert_not_called()
+
+    def test_exact_active_bootstrap_prep_bypasses_legacy_tier_size_drift(self):
+        """Bootstrap coins are campaign-bound, not Smart Settings tier-bound."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        fake_cfg.WALLET_TYPE = "sage"
+        bot = _make_bot(running=False)
+        campaign_id = "cd" * 32
+        campaign = {
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_fingerprint": 123456789,
+            "wallet_id": 2,
+            "wallet_type": "sage",
+            "status": "active",
+        }
+        completed_prep = {
+            "running": False,
+            "complete": True,
+            "phase": "complete",
+            "error": None,
+            "bootstrap_campaign_id": campaign_id,
+            "bootstrap_campaign_revision": 0,
+        }
+        legacy_drift = [
+            {
+                "side": "cat",
+                "tier": "inner",
+                "ratio": 0.479,
+                "coin_count": 10,
+            }
+        ]
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.dict(api_server._coin_prep_state, completed_prep, clear=True),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "database.list_active_bootstrap_campaigns_for_asset",
+                return_value=[campaign],
+            ),
+            patch(
+                "coin_manager.check_tier_size_drift_standalone",
+                return_value=legacy_drift,
+            ) as drift_check,
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json().get("status"), "started")
+        drift_check.assert_not_called()
+        bot.start.assert_called_once_with()
+
+    def test_mismatched_bootstrap_identity_keeps_legacy_tier_drift_gate(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        bot = _make_bot(running=False)
+        drift = [
+            {
+                "side": "cat",
+                "tier": "inner",
+                "ratio": 0.479,
+                "coin_count": 10,
+            }
+        ]
+        mismatched_campaign = {
+            "campaign_id": "ef" * 32,
+            "revision": 0,
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_fingerprint": 999999999,
+            "wallet_id": 2,
+            "wallet_type": "sage",
+            "status": "active",
+        }
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "database.list_active_bootstrap_campaigns_for_asset",
+                return_value=[mismatched_campaign],
+            ),
+            patch(
+                "coin_manager.check_tier_size_drift_standalone",
+                return_value=drift,
+            ) as drift_check,
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json().get("reason"), "tier_size_drift")
+        drift_check.assert_called_once_with(
+            low_ratio=0.50, high_ratio=2.00, min_sample=2
+        )
         bot.start.assert_not_called()
 
     def test_failed_coin_prep_blocks_start(self):

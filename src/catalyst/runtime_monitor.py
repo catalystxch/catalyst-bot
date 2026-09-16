@@ -903,7 +903,12 @@ class RuntimeMonitor:
         buy_target = full_buy_target
         sell_target = full_sell_target
         try:
-            adaptive = self._bot._get_adaptive_offer_targets(
+            effective_target_getter = getattr(
+                self._bot, "_get_effective_offer_targets", None
+            )
+            if not callable(effective_target_getter):
+                effective_target_getter = self._bot._get_adaptive_offer_targets
+            adaptive = effective_target_getter(
                 _coerce_decimal(getattr(self._bot, "_current_mid_price", 0)),
                 current_buy_count=buy_visible,
                 current_sell_count=sell_visible,

@@ -25,6 +25,7 @@ from functools import wraps
 from typing import Any, Callable, Mapping, Optional
 
 import database
+from bootstrap_campaign import BootstrapDecision, CampaignStage
 
 try:
     from super_log import slog
@@ -140,6 +141,110 @@ _TERMINAL_PROCESS_FENCES = frozenset(
 # normal heartbeat starts one third into a 30-second lease, while letting a
 # short burst of bot shutdown writes drain without permanently fencing the run.
 _HEARTBEAT_MAX_ATTEMPTS = 4
+
+
+def _market_authority_failure(reason_code: str) -> dict[str, Any]:
+    return {"allowed": False, "mode": None, "reason_code": reason_code}
+
+
+def authorize_market_mutation(
+    *,
+    operation: str,
+    follow_authorized: bool,
+    identity: dict[str, Any],
+    asset_id: str,
+    bootstrap_campaign: Optional[dict[str, Any]],
+    bootstrap_decision: Optional[BootstrapDecision],
+    expected_campaign_id: Optional[str],
+    expected_revision: Optional[int],
+    now: datetime,
+) -> dict[str, Any]:
+    """Authorize Follow or one exact persisted Bootstrap revision.
+
+    This supplements the process/lease mutation gate; it never replaces wallet
+    identity, ownership, reservation, publication, or reconciliation checks.
+    """
+
+    if operation not in {"create", "requote"}:
+        return _market_authority_failure("MARKET_OPERATION_INVALID")
+    if type(follow_authorized) is not bool:
+        return _market_authority_failure("FOLLOW_AUTHORITY_INVALID")
+    if follow_authorized:
+        return {
+            "allowed": True,
+            "mode": "follow",
+            "reason_code": "FOLLOW_AUTHORIZED",
+        }
+    if bootstrap_campaign is None or bootstrap_decision is None:
+        return _market_authority_failure("MARKET_AUTHORITY_REQUIRED")
+    if type(bootstrap_campaign) is not dict or type(identity) is not dict:
+        return _market_authority_failure("BOOTSTRAP_AUTHORITY_INVALID")
+    if type(bootstrap_decision) is not BootstrapDecision:
+        return _market_authority_failure("BOOTSTRAP_DECISION_INVALID")
+    if type(now) is not datetime or now.tzinfo is None:
+        return _market_authority_failure("BOOTSTRAP_TIME_INVALID")
+
+    campaign_id = bootstrap_campaign.get("campaign_id")
+    revision = bootstrap_campaign.get("revision")
+    if (
+        type(campaign_id) is not str
+        or len(campaign_id) != 64
+        or any(character not in "0123456789abcdef" for character in campaign_id)
+    ):
+        return _market_authority_failure("BOOTSTRAP_AUTHORITY_INVALID")
+    if type(revision) is not int or revision < 0:
+        return _market_authority_failure("BOOTSTRAP_AUTHORITY_INVALID")
+    if expected_campaign_id != campaign_id:
+        return _market_authority_failure("BOOTSTRAP_CAMPAIGN_SUPERSEDED")
+    if expected_revision != revision:
+        return _market_authority_failure("BOOTSTRAP_REVISION_SUPERSEDED")
+    if bootstrap_campaign.get("status") != "active":
+        return _market_authority_failure("BOOTSTRAP_NOT_ACTIVE")
+
+    expiry = bootstrap_campaign.get("expires_at")
+    try:
+        if type(expiry) is not str or not expiry.endswith("Z"):
+            raise ValueError("noncanonical expiry")
+        expires_at = datetime.fromisoformat(expiry[:-1] + "+00:00")
+    except (TypeError, ValueError):
+        return _market_authority_failure("BOOTSTRAP_AUTHORITY_INVALID")
+    if now.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc):
+        return _market_authority_failure("BOOTSTRAP_EXPIRED")
+
+    exact_identity = {
+        "network": bootstrap_campaign.get("network"),
+        "wallet_type": bootstrap_campaign.get("wallet_type"),
+        "wallet_fingerprint": bootstrap_campaign.get("wallet_fingerprint"),
+        "wallet_id": bootstrap_campaign.get("wallet_id"),
+        "asset_id": bootstrap_campaign.get("asset_id"),
+    }
+    observed_identity = {
+        key: identity.get(key)
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "asset_id",
+        )
+    }
+    if observed_identity != exact_identity or asset_id != exact_identity["asset_id"]:
+        return _market_authority_failure("BOOTSTRAP_IDENTITY_MISMATCH")
+    if (
+        not bootstrap_decision.authorized
+        or bootstrap_decision.stage in {CampaignStage.STOPPED, CampaignStage.UNSAFE}
+        or bootstrap_decision.cancellation_required
+    ):
+        return _market_authority_failure("BOOTSTRAP_DECISION_BLOCKED")
+    if bootstrap_campaign.get("stage") != bootstrap_decision.stage.value:
+        return _market_authority_failure("BOOTSTRAP_STAGE_SUPERSEDED")
+    return {
+        "allowed": True,
+        "mode": "bootstrap",
+        "reason_code": "BOOTSTRAP_AUTHORIZED",
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+    }
 
 
 class MutationBlocked(RuntimeError):
@@ -3416,6 +3521,7 @@ __all__ = [
     "MutationGate",
     "WalletIdentityBinding",
     "WalletMutationPermit",
+    "authorize_market_mutation",
     "clear_worker_authority_environment",
     "acquire_exclusive_mutation",
     "enter_mutation",

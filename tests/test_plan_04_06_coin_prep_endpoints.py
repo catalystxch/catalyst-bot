@@ -227,6 +227,36 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body.get("tier_size_drift"), self._DRIFT)
         self.assertFalse(body.get("complete"))
 
+    def test_active_bootstrap_status_bypasses_legacy_tier_drift(self):
+        campaign = {
+            "campaign_id": "campaign-status-1",
+            "revision": 7,
+            "asset_id": "a" * 64,
+        }
+        with (
+            patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+            patch.object(
+                coin_prep_blueprint,
+                "list_active_bootstrap_campaigns_for_asset",
+                return_value=[campaign],
+            ),
+            patch.object(
+                coin_prep_blueprint,
+                "_tier_size_drift_findings",
+                return_value=self._DRIFT,
+            ) as legacy_drift,
+            patch("database.get_coin_summary", return_value={}),
+        ):
+            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertEqual(body["coin_prep_mode"], "bootstrap_exact")
+        self.assertEqual(body["bootstrap_campaign_id"], "campaign-status-1")
+        self.assertEqual(body["bootstrap_campaign_revision"], 7)
+        self.assertEqual(body["tier_size_drift"], [])
+        self.assertNotEqual(body.get("reason"), "tier_size_drift")
+        legacy_drift.assert_not_called()
+
     def test_completed_tier_prep_rehydrates_asymmetric_xch_and_cat_counts(self):
         """A restart must validate each asset against its own saved tier plan."""
 
@@ -310,6 +340,68 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body["xch_coins"], 3)
         self.assertEqual(body["cat_coins"], 1)
 
+    def test_completed_tier_prep_does_not_rehydrate_undersized_offer_coin(self):
+        """A restart must not call an offer coin ready when it cannot fund the spend."""
+
+        xch_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 333_333_330_000}}],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 833_333}}],
+        }
+        last_prep = {
+            "tier_enabled": True,
+            "tier_counts_xch": {"inner": 1},
+            "tier_counts_cat": {"inner": 1},
+            "tier_sizes_xch": {"inner": "0.33333333"},
+            "offer_tier_sizes_xch": {"inner": "0.333333333333"},
+            "tier_sizes_cat": {"inner": "833.333"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            last_path = os.path.join(temp_dir, "coin_prep_last.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"phase": "complete", "run_id": "old-run"}, handle)
+            with open(last_path, "w", encoding="utf-8") as handle:
+                json.dump(last_prep, handle)
+
+            def spendable(wallet_id):
+                return xch_records if int(wallet_id) == 1 else cat_records
+
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_last_file",
+                    return_value=last_path,
+                ),
+                patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(
+                    api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}
+                ),
+                patch("database.get_coin_summary", return_value={}),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_tier_size_drift_findings",
+                    return_value=[],
+                ),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertFalse(body["complete"])
+        self.assertFalse(body.get("previously_complete", False))
+
 
 # ---------------------------------------------------------------------------
 # 2. GET /api/coin-prep/verify
@@ -338,6 +430,139 @@ class TestCoinPrepVerify(_FlaskBase):
             "live_size_mojos": 100000,
         }
     ]
+
+    def test_wallet_snapshot_queries_independent_sage_views_concurrently(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def slow_result(wallet_id):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return {"wallet_id": wallet_id}
+
+        snapshot = coin_prep_blueprint._coin_prep_wallet_snapshot(
+            slow_result,
+            slow_result,
+            1,
+            2,
+        )
+
+        self.assertGreaterEqual(max_active, 2)
+        self.assertEqual(snapshot[0]["wallet_id"], 1)
+        self.assertEqual(snapshot[1]["wallet_id"], 2)
+        self.assertEqual(snapshot[2]["wallet_id"], 1)
+        self.assertEqual(snapshot[3]["wallet_id"], 2)
+
+    def test_bootstrap_verify_uses_exact_campaign_outputs_not_legacy_query(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 5,
+                "cat_target": 3,
+                "buy_tier_sizes": "inner=0.4,mid=0.3,outer=0.3,fees=0.001",
+                "cat_tier_sizes": "inner=400,mid=300,outer=300",
+                "tier_counts_xch": "inner=1,mid=1,outer=1,fees=2",
+                "tier_counts_cat": "inner=1,mid=1,outer=1",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 2_000_000_000_000,
+            "cat_balance_mojos": 2_000_000,
+            "cat_decimals": 3,
+        }
+        empty = {"success": True, "records": []}
+
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch("wallet.get_spendable_coins_rpc", return_value=empty),
+            patch("wallet.get_wallet_balance") as legacy_balance,
+            patch("wallet.WALLET_ID_XCH", 1),
+            patch.object(
+                coin_prep_blueprint,
+                "_tier_size_drift_findings",
+            ) as legacy_drift,
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4"
+                "&inner_xch=999&inner_cat=999999&inner_count=50"
+                "&xch_reserve=999&cat_reserve=999999"
+                "&topup_pool_xch=999&topup_pool_cat=999999",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["bootstrap_campaign_id"], "campaign-1")
+        self.assertEqual(body["bootstrap_campaign_revision"], 4)
+        self.assertEqual(body["xch_needed_mojos"], 1_002_000_000_000)
+        self.assertEqual(body["cat_needed_mojos"], 1_000_000)
+        self.assertEqual(body["xch_balance_mojos"], 2_000_000_000_000)
+        self.assertEqual(body["cat_balance_mojos"], 2_000_000)
+        self.assertTrue(body["balance_sufficient"])
+        self.assertEqual(body["tiers"]["fees"]["needed"], 2)
+        legacy_balance.assert_not_called()
+        legacy_drift.assert_not_called()
+
+    def test_bootstrap_verify_rejects_offer_coins_below_exact_spend(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 2,
+                "cat_target": 1,
+                "buy_tier_sizes": "inner=0.333333333333,fees=0.001",
+                "cat_tier_sizes": "inner=833.333",
+                "tier_counts_xch": "inner=1,fees=1",
+                "tier_counts_cat": "inner=1",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 1_000_000_000_000,
+            "cat_balance_mojos": 2_000_000,
+            "cat_decimals": 3,
+        }
+        xch_records = {
+            "success": True,
+            "records": [
+                {"coin": {"amount": 333_333_330_000}},
+                {"coin": {"amount": 1_000_000_000}},
+            ],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 833_333}}],
+        }
+
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch(
+                "wallet.get_spendable_coins_rpc",
+                side_effect=[xch_records, cat_records],
+            ),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertFalse(body["all_sufficient"])
+        self.assertTrue(body["needs_coin_prep"])
+        self.assertEqual(body["tiers"]["inner"]["xch_have"], 0)
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 1)
 
     def test_returns_200_flat_mode(self):
         with (
@@ -373,6 +598,194 @@ class TestCoinPrepVerify(_FlaskBase):
             "balance_sufficient",
         ):
             self.assertIn(key, body)
+
+    def test_flat_mode_balance_check_funds_both_side_requote_pools(self):
+        six_xch = {
+            "wallet_balance": {
+                "confirmed_wallet_balance": 6_000_000_000_000,
+                "spendable_balance": 6_000_000_000_000,
+            }
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=six_xch),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
+                "&prepared_cat_size=1&max_buy=4&max_sell=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_needed_mojos"], 8_000_000_000_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_flat_mode_balance_check_excludes_requested_reserve(self):
+        ten_xch = {
+            "wallet_balance": {
+                "confirmed_wallet_balance": 10_000_000_000_000,
+                "spendable_balance": 10_000_000_000_000,
+            }
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=ten_xch),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
+                "&prepared_cat_size=1&max_buy=4&max_sell=4&xch_reserve=3",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_available_mojos"], 7_000_000_000_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_balance_check_uses_projected_unconfirmed_wallet_total(self):
+        pending_outgoing = {
+            "wallet_balance": {
+                "confirmed_wallet_balance": 10_000_000_000_000,
+                "unconfirmed_wallet_balance": 3_000_000_000_000,
+                "spendable_balance": 3_000_000_000_000,
+            }
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=pending_outgoing),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false&liquidity_mode=buy_only"
+                "&prepared_xch_size=1&max_buy=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_balance_mojos"], 3_000_000_000_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_tier_mode_balance_check_excludes_reserves_and_topup_pools(self):
+        def balance(wallet_id):
+            amount = 10_000_000_000_000 if wallet_id == 1 else 10_000
+            return {
+                "wallet_balance": {
+                    "confirmed_wallet_balance": amount,
+                    "spendable_balance": amount,
+                }
+            }
+
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", side_effect=balance),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true&inner_xch=4&inner_cat=4"
+                "&inner_count=2&xch_reserve=1&cat_reserve=1"
+                "&topup_pool_xch=2&topup_pool_cat=2",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_needed_mojos"], 10_000_000_000_000)
+        self.assertEqual(body["cat_needed_mojos"], 10_000)
+        self.assertEqual(body["xch_available_mojos"], 9_000_000_000_000)
+        self.assertEqual(body["cat_available_mojos"], 9_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_flat_mode_balance_check_includes_topup_pool(self):
+        nine_xch = {
+            "wallet_balance": {
+                "confirmed_wallet_balance": 9_000_000_000_000,
+                "spendable_balance": 9_000_000_000_000,
+            }
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=nine_xch),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
+                "&prepared_cat_size=1&max_buy=4&max_sell=4&topup_pool_xch=2",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_needed_mojos"], 10_000_000_000_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_tier_mode_uses_separate_asymmetric_prepared_counts(self):
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true&inner_xch=2&inner_cat=1"
+                "&inner_xch_count=17&inner_cat_count=8",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["tiers"]["inner"]["xch_needed"], 17)
+        self.assertEqual(body["tiers"]["inner"]["cat_needed"], 8)
+        self.assertEqual(body["xch_needed_mojos"], 34_000_000_000_000)
+        self.assertEqual(body["cat_needed_mojos"], 8_000)
+        self.assertFalse(body["balance_sufficient"])
+
+    def test_flat_mode_matching_readiness_uses_combined_pool_count(self):
+        xch_coins = {
+            "success": True,
+            "records": [{"coin": {"amount": 1_000_000_000_000}} for _ in range(4)],
+        }
+        cat_coins = {
+            "success": True,
+            "records": [{"coin": {"amount": 1_000}} for _ in range(4)],
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", side_effect=[xch_coins, cat_coins]),
+            patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
+                "&prepared_cat_size=1&max_buy=4&max_sell=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_needed"], 8)
+        self.assertEqual(body["cat_needed"], 8)
+        self.assertFalse(body["all_sufficient"])
+
+    def test_reserve_conversion_never_rounds_available_balance_up(self):
+        one_mojo = {
+            "wallet_balance": {
+                "confirmed_wallet_balance": 1,
+                "spendable_balance": 1,
+            }
+        }
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=one_mojo),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=false"
+                "&xch_reserve=0.0000000000006&cat_reserve=0.0006"
+                "&topup_pool_xch=0.0000000000006&topup_pool_cat=0.0006"
+                "&max_buy=1&max_sell=1",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(body["xch_available_mojos"], 0)
+        self.assertEqual(body["cat_available_mojos"], 0)
+        self.assertEqual(body["xch_needed_mojos"], 1)
+        self.assertEqual(body["cat_needed_mojos"], 1)
 
     def test_flat_mode_tier_enabled_false(self):
         with (
@@ -557,6 +970,22 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
         self.assertEqual(resp.status_code, 401)
+
+    def test_bootstrap_trigger_does_not_expose_internal_exception_detail(self):
+        with patch.object(
+            coin_prep_blueprint,
+            "_active_bootstrap_coin_prep_worker_args",
+            side_effect=ValueError(
+                r"bootstrap_coin_prep_not_authorized:C:\Users\secret\trace.py"
+            ),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(body["error"], "bootstrap_coin_prep_not_authorized")
+        self.assertEqual(body["reason"], "bootstrap_coin_prep_not_authorized")
+        self.assertNotIn("secret", resp.get_data(as_text=True))
 
     def test_returns_200_immediately(self):
         # Trigger returns immediately; background thread spawns subprocess

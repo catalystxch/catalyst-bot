@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import ast
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -16,6 +18,32 @@ except ModuleNotFoundError as exc:
     wallet_sage is None, f"wallet_sage import unavailable: {_IMPORT_ERROR}"
 )
 class TestWalletSageStartupReadiness(unittest.TestCase):
+    def test_wallet_sage_routes_console_output_through_safe_wrapper(self):
+        source_path = Path(wallet_sage.__file__)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        unsafe_lines = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+            ):
+                continue
+            parent = parents.get(node)
+            while parent is not None and not isinstance(
+                parent, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                parent = parents.get(parent)
+            if parent is None or parent.name != "_console":
+                unsafe_lines.append(node.lineno)
+
+        self.assertEqual(unsafe_lines, [])
+
     def test_authoritative_offer_history_marks_sage_unfiltered_snapshot_complete(self):
         rows = [
             {"trade_id": "a" * 64, "offer": "offer1" + "secret" * 1000},
@@ -312,6 +340,96 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertGreaterEqual(len(result["wallets"]), 3)  # XCH + discovered CATs
+
+    def test_get_wallets_does_not_crash_on_emoji_ticker_in_cp1252_console(self):
+        wallet_sage._init_ok = True
+        wallet_sage._init_last_attempt = 0.0
+        sample_cats = {
+            "cats": [
+                {
+                    "asset_id": "a" * 64,
+                    "name": "S.E.C.",
+                    "ticker": "🪙",
+                }
+            ]
+        }
+
+        def cp1252_console(message, **kwargs):
+            str(message).encode("cp1252")
+
+        if hasattr(wallet_sage.get_wallets, "_discovery_logged"):
+            delattr(wallet_sage.get_wallets, "_discovery_logged")
+
+        with (
+            patch.object(wallet_sage, "_get_cat_asset_id", return_value=None),
+            patch.object(wallet_sage, "rpc", return_value=sample_cats),
+            patch("builtins.print", side_effect=cp1252_console),
+        ):
+            result = wallet_sage.get_wallets()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["wallets"][1]["name"], "S.E.C. (🪙)")
+
+    def test_resolve_asset_id_mismatch_warning_is_cp1252_safe(self):
+        def cp1252_console(message, **kwargs):
+            str(message).encode("cp1252")
+
+        warning_flag = "_mismatch_warned_1005"
+        if hasattr(wallet_sage._resolve_asset_id, warning_flag):
+            delattr(wallet_sage._resolve_asset_id, warning_flag)
+
+        with (
+            patch.object(wallet_sage, "_wallet_id_to_asset_id", {1005: "a" * 64}),
+            patch.object(wallet_sage, "_get_cat_asset_id", return_value="b" * 64),
+            patch("builtins.print", side_effect=cp1252_console),
+        ):
+            result = wallet_sage._resolve_asset_id(1005)
+
+        self.assertEqual(result, "a" * 64)
+
+    def test_get_all_offers_diagnostics_are_cp1252_safe(self):
+        def cp1252_console(message, **kwargs):
+            str(message).encode("cp1252")
+
+        for flag in (
+            "_format_logged",
+            "_offers_logged",
+            "_norm_logged",
+            "_filter_logged",
+        ):
+            if hasattr(wallet_sage.get_all_offers, flag):
+                delattr(wallet_sage.get_all_offers, flag)
+
+        response = {
+            "offers": [
+                {
+                    "offer_id": "offer-id",
+                    "status": "cancelled",
+                    "summary": {
+                        "maker": [
+                            {
+                                "asset": {"asset_id": None, "ticker": "XCH"},
+                                "amount": 1,
+                            }
+                        ],
+                        "taker": [
+                            {
+                                "asset": {"asset_id": "a" * 64, "ticker": "🪙"},
+                                "amount": 1,
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+        with (
+            patch.object(wallet_sage, "rpc", return_value=response),
+            patch("builtins.print", side_effect=cp1252_console),
+        ):
+            result = wallet_sage.get_all_offers(include_completed=False)
+
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":
