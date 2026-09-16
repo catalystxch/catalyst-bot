@@ -111,6 +111,19 @@ def test_fresh_identity_asset_and_integer_selectable_inventory_without_effects(l
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("reserved,recon,purpose", [(True, False, "reserve"),
+                                                  (False, True, "protected"), (True, True, "protected")])
+def test_reconciliation_claim_is_not_misclassified_as_permanent_reserve(live_reads, reserved, recon, purpose):
+    coin_id = live_reads["xch"][0]["coin_id"]
+    patch = live_reads["monkeypatch"]
+    patch.setattr(database, "get_reserve_coins", lambda asset: [{"coin_id": coin_id}]
+                  if reserved and asset == "xch" else [])
+    patch.setattr(database, "get_coin_reconciliation_protected_ids", lambda _ids: [coin_id] if recon else [])
+    coin = next(c for c in _collect(live_reads)["snapshot"].coins if c.coin_id == coin_id)
+    assert coin.purpose == purpose
+    assert coin.protected is True
+
+
 @pytest.mark.parametrize("cats", [None, {}, {"success": False, "cats": [{"asset_id": ASSET}]},
                                   {"cats": []}, {"cats": [{"asset_id": "37" * 32}]},
                                   {"cats": [{"asset_id": ASSET}, {"asset_id": ASSET}]}])
@@ -312,3 +325,107 @@ def test_explicit_campaign_choices_without_a_current_campaign_cannot_fall_back_t
     with pytest.raises(ValueError, match="FEE_PREP_CAMPAIGN_UNAVAILABLE"):
         _economic_collect(economic_reads, {"bootstrap_campaign_id": "38" * 32,
                                            "bootstrap_campaign_revision": 0})
+
+
+def _next_collect(state):
+    service = _service()
+    state["monkeypatch"].setattr(service, "cfg", state["config"])
+    collector = getattr(service, "read_next_prep_fee_snapshot", None)
+    assert callable(collector), "runtime funding and unsigned cost collection are missing"
+    return collector({})
+
+
+def _ready_inventory(state):
+    state["xch"] = [_coin(1, "110000000000"), _coin(2, "1000000000"), _coin(3, "1000000000")]
+    state["cat"] = [_coin(10001, "11000")]
+
+
+def test_underfunded_runtime_plan_cannot_build_unsigned_or_guess_a_fee(economic_reads):
+    result = _next_collect(economic_reads)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_PREP_PRINCIPAL_UNFUNDED"
+    assert result["funding"]["fee_funding_mojos"] == 0
+    assert result["dispatch_authorized"] is False
+    assert "inspection" not in result
+
+
+def test_ready_runtime_inventory_has_no_fake_prep_transactions_or_fee_spend(economic_reads):
+    _ready_inventory(economic_reads)
+    result = _next_collect(economic_reads)
+    assert result["available"] is True
+    assert result["pricing"]["transaction_required"] is False
+    assert result["funding"]["reused_target_count"] == 4
+    assert result["funding"]["fee_funding_mojos"] == 0
+    assert result["dispatch_authorized"] is False
+    for table in ("coin_prep_operations", "wallet_effect_claims", "approved_fee_reservations", "fee_approvals"):
+        assert database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_next_batch_fee_cannot_consume_principal_reserved_for_later_batches(economic_reads):
+    import coin_prep_fee_pricing
+    from coin_prep_batch_plan import BatchPlan, PlannedOutput
+    _ready_inventory(economic_reads)
+    economic_reads["xch"].append(_coin(4, "100"))
+    plan = BatchPlan("cat", (economic_reads["cat"][0]["coin_id"],),
+        economic_reads["xch"][0]["coin_id"], (PlannedOutput("cat", "replacement", 11000, 0),),
+        (), (), 101)
+    economic_reads["monkeypatch"].setattr(coin_prep_fee_pricing, "price_next_prep_batch", lambda **_kwargs: {
+        "available": True, "reason": "cost_fee_consistent", "plan": plan,
+        "transaction_required": True, "dispatch_authorized": False})
+    result = _next_collect(economic_reads)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_PREP_FUNDING_INSUFFICIENT"
+    assert result["funding"]["fee_funding_mojos"] == 100
+    assert "pricing" not in result
+
+
+def test_quote_expiring_during_final_wallet_recheck_is_no_longer_usable(economic_reads):
+    import coin_prep_fee_pricing
+    from coin_prep_batch_plan import BatchPlan, PlannedOutput
+    _ready_inventory(economic_reads)
+    economic_reads["xch"].append(_coin(4, "100"))
+    plan = BatchPlan("cat", (economic_reads["cat"][0]["coin_id"],), economic_reads["xch"][0]["coin_id"],
+        (PlannedOutput("cat", "replacement", 11000, 0),), (), (), 1)
+    quote = {"available": True, "source": "coinset", "cost": 42, "target_seconds": 300,
+             "fee_mojos": 1, "observed_at": 1000, "expires_at": 1060}
+    economic_reads["monkeypatch"].setattr(coin_prep_fee_pricing, "price_next_prep_batch", lambda **_kwargs: {
+        "available": True, "reason": "cost_fee_consistent", "plan": plan, "quote": quote,
+        "inspection": {"cost": 42}, "transaction_required": True, "dispatch_authorized": False})
+    clock = {"now": 1000, "reads": 0}
+    economic_reads["monkeypatch"].setattr(coin_prep_fee_pricing, "_now", lambda: clock["now"])
+    service = _service()
+    read_context = service.read_fee_economic_snapshot
+
+    def slow_recheck(options):
+        result = read_context(options)
+        clock["reads"] += 1
+        if clock["reads"] == 2:
+            clock["now"] = 1060
+        return result
+
+    economic_reads["monkeypatch"].setattr(service, "read_fee_economic_snapshot", slow_recheck)
+    result = _next_collect(economic_reads)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert "pricing" not in result
+
+
+@pytest.mark.parametrize("change", ["inventory", "configuration", "identity"])
+def test_runtime_change_after_cost_collection_cannot_return_a_confirmable_context(economic_reads, change):
+    import coin_prep_fee_pricing
+    _ready_inventory(economic_reads)
+    original = coin_prep_fee_pricing.price_next_prep_batch
+
+    def changed(**kwargs):
+        result = original(**kwargs)
+        if change == "inventory":
+            economic_reads["xch"] = [_coin(4, "112000000000")]
+        elif change == "configuration":
+            economic_reads["config"].COIN_PREP_HEADROOM_PCT = Decimal("20")
+        else:
+            economic_reads["identity"]["fingerprint"] = 12345
+        return result
+
+    economic_reads["monkeypatch"].setattr(coin_prep_fee_pricing, "price_next_prep_batch", changed)
+    with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
+        _next_collect(economic_reads)

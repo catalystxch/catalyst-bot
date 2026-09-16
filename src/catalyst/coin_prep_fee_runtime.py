@@ -179,8 +179,10 @@ def read_fee_wallet_snapshot() -> dict:
         reserves = {_hex(row["coin_id"]) for row in database.get_reserve_coins(asset)}
         for row in rows:
             protected = row["coin_id"] in reserves or row["coin_id"] in reconciliation
+            purpose = ("protected" if row["coin_id"] in reconciliation
+                       else "reserve" if row["coin_id"] in reserves else "")
             coins.append(SelectableCoin(asset, row["coin_id"], row["amount_mojos"],
-                                        "reserve" if protected else "", True, protected))
+                                        purpose, True, protected))
     return {"identity": {**identity, "wallet_id": config["CAT_WALLET_ID"],
                          "xch_wallet_id": config["WALLET_ID_XCH"], "asset_id": asset_id,
                          "ticker": config["CAT_TICKER_ID"]},
@@ -244,3 +246,46 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     return {**context, "recipe": recipe, "campaign": campaign,
             "request_options": options, "fee_pool": fee_pool, "dispatch_authorized": False}
+
+
+def read_next_prep_fee_snapshot(request_options: dict) -> dict:
+    """Collect retained funding and fresh exact cost/fee evidence for next batch.
+
+    This internal read-only input is not a full multistage preview/approval API.
+    Later stages still need honest projected costs/counts and cancellation cover;
+    no caller receives a consent, reservation or dispatch permission here.
+    """
+    from coin_prep_fee_funding import prepare_fee_inventory
+    from coin_prep_fee_pricing import is_current_fee_quote, price_next_prep_batch
+
+    context = read_fee_economic_snapshot(request_options)
+    recipe = context["recipe"]
+    floors = recipe["economic_plan"]["reserve_floors_mojos"]
+    funding = prepare_fee_inventory(context["snapshot"], recipe["targets"], floors)
+    if funding["principal_funded"] is not True:
+        return {**context, "funding": funding, "available": False,
+                "reason": "FEE_PREP_PRINCIPAL_UNFUNDED", "dispatch_authorized": False}
+    pricing = price_next_prep_batch(
+        snapshot=funding["snapshot"], targets=recipe["targets"], reserve_floors=floors,
+        receive_address=context["receive_address"], cat_asset_id=context["identity"]["asset_id"],
+        target_seconds=recipe["economic_plan"]["target_seconds"],
+    )
+    # Re-read actual inventory/protection, not just a total or configuration flag.
+    # A slow unsigned build/quote cannot leave a changed economic context usable.
+    try:
+        after = read_fee_economic_snapshot(context["request_options"])
+    except ValueError:
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED") from None
+    if any(after[key] != context[key] for key in (
+            "identity", "configuration", "receive_address", "snapshot", "recipe", "campaign", "fee_pool")):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    if pricing["available"] is True and pricing["transaction_required"] is True:
+        if pricing["plan"].fee_mojos > funding["fee_funding_mojos"]:
+            return {**context, "funding": funding, "available": False,
+                    "reason": "FEE_PREP_FUNDING_INSUFFICIENT", "dispatch_authorized": False}
+        if not is_current_fee_quote(pricing["quote"], pricing["inspection"]["cost"],
+                                    recipe["economic_plan"]["target_seconds"]):
+            return {**context, "funding": funding, "available": False,
+                    "reason": "FEE_ESTIMATE_UNAVAILABLE", "dispatch_authorized": False}
+    return {**context, "funding": funding, "pricing": pricing,
+            "available": pricing["available"], "reason": pricing["reason"], "dispatch_authorized": False}

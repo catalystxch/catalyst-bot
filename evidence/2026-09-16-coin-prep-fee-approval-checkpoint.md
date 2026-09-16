@@ -212,6 +212,37 @@ Primary schema evidence:
   do not prove frozen output ordering; execution must adopt that exact contract.
   No live package/wallet action, main merge or release occurred.
 
+## Exact next-batch pricing and retained funding (continuation)
+
+- The existing persistent goal and hourly heartbeat remain ACTIVE; full approved
+  scope is unchanged. No duplicate goal/automation, live action or release.
+- Added read-only four-round cost/fee convergence using actual validated unsigned
+  effects and fresh cost-specific guidance. Fee-induced input/change changes are
+  rebuilt; unavailable/oscillating paths return no usable bundle. Zero guidance
+  stays zero. A one-mojo unsigned-only collision seed is not a fee floor or a
+  spending authorization, and an unbuildable final zero fee still refuses.
+- Retained funding includes all requested principal and the greater physical or
+  declared reserve. Exact reusable denominations are assigned once. Dedicated
+  fee-coin face value is principal, not transaction spending. Journal-protected
+  funds cannot count toward reserve floors or fees; focused failures reproduced
+  the prior conflation with permanent reserve designations before correction.
+- Runtime collection rereads inventory/protection, identity, configuration,
+  economic recipe and campaign after unsigned pricing. Focused failing tests
+  exposed the need to recheck whole-plan fee capacity and original quote expiry
+  after that reread; both now fail closed without returning pricing evidence.
+- Independent bounded review found no Critical/Important/Minor defect in this
+  groundwork. It did not review or certify the unfinished full workflow.
+- The earlier expanded run passed 385 tests in 66.42s. An additional real CAT2
+  executable bundle with separate XCH fee input passes cost/fee repricing;
+  fresh pricing run: 25 passed in 0.89s. Fresh final expanded snapshot/funding/
+  pricing/unsigned/economics/worker/planner/preview/storage/consent/ledger/
+  recovery/estimation/transaction-fee run: 386 passed in 71.55s. Ruff and diff
+  checks passed. These are scoped receipts, not full-feature acceptance.
+- Full multistage projection, public HTTP/native APIs, operator confirmation,
+  exact holds and all-path dispatch enforcement, GUI/E2E, fresh Windows build
+  and genuine operator-budget live acceptance remain open. Available internal
+  evidence never grants dispatch permission. Current live package is preserved.
+
 ## Outstanding acceptance gates
 
 Runtime canonical plan preview, HTTP/native bridge consent,
