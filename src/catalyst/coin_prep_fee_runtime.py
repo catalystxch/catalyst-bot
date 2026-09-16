@@ -2,7 +2,8 @@
 
 Inventory is selectable-only and complete or unavailable. No configured asset
 fallback, balance-as-inventory assumption, claims, signing or prep launch occurs.
-Economic target/stage collection and HTTP/native integration follow this boundary.
+Economic recipes use the shared worker sizing. Staged cost/funding collection
+and HTTP/native integration follow this boundary.
 """
 
 import os
@@ -28,6 +29,8 @@ _CONTEXT_KEYS = (
     "BUY_OUTER_SIZE_XCH", "BUY_EXTREME_SIZE_XCH", "SELL_INNER_SIZE_XCH",
     "SELL_MID_SIZE_XCH", "SELL_OUTER_SIZE_XCH", "SELL_EXTREME_SIZE_XCH",
     "INNER_SIZE_XCH", "MID_SIZE_XCH", "OUTER_SIZE_XCH", "EXTREME_SIZE_XCH",
+    "TRANSACTION_FEE_MODE", "TRANSACTION_FEE_XCH", "MINIMUM_PROFIT_XCH",
+    "EXPECTED_CANCEL_REQUOTES",
 ) + tuple(f"{side}_{tier}_TIER{suffix}_COUNT" for side in ("BUY", "SELL")
           for tier in ("INNER", "MID", "OUTER", "EXTREME") for suffix in ("", "_SPARE"))
 
@@ -183,3 +186,61 @@ def read_fee_wallet_snapshot() -> dict:
                          "ticker": config["CAT_TICKER_ID"]},
             "configuration": config, "receive_address": address["address"],
             "snapshot": CoinSnapshot(tuple(coins))}
+
+
+def read_fee_economic_snapshot(request_options: dict) -> dict:
+    """Read a current trusted wallet/configuration/campaign economic recipe.
+
+    This boundary creates no approval, effect claim or spending authority. The
+    preview service still needs exact staged inspection, fresh quotes and funding;
+    execution must consume the frozen outputs instead of regenerating sizes.
+    """
+    from coin_prep_economics import (
+        build_exact_prep_economics, build_standard_prep_economics, normalize_fee_prep_options,
+        validate_fee_pool_configuration,
+    )
+
+    options = normalize_fee_prep_options(request_options)
+    context = read_fee_wallet_snapshot()
+    config, identity = context["configuration"], context["identity"]
+    from blueprints.coin_prep import _active_bootstrap_coin_prep_context
+    from tx_fees import get_fee_pool_plan
+    import api_server
+
+    validate_fee_pool_configuration(config)
+    fee_pool = get_fee_pool_plan()
+    bootstrap = _active_bootstrap_coin_prep_context(options)
+    campaign = None
+    if bootstrap is not None:
+        campaign = bootstrap["campaign"]
+        if (type(campaign) is not dict or campaign.get("status") != "active"
+                or campaign.get("network") != identity["network"]
+                or campaign.get("wallet_type") != identity["wallet_type"]
+                or campaign.get("wallet_fingerprint") != identity["wallet_fingerprint"]
+                or campaign.get("wallet_id") != identity["wallet_id"]
+                or campaign.get("asset_id") != identity["asset_id"]):
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        if options["coin_multiplier"] != "1":
+            raise ValueError("FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED")
+        recipe = build_exact_prep_economics(configuration=config, worker_args=bootstrap["worker_args"],
+                                            campaign_revision=campaign["revision"],
+                                            target_seconds=options["target_seconds"])
+    else:
+        if "bootstrap_campaign_id" in options:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        recipe = build_standard_prep_economics(configuration=config, fee_pool=fee_pool,
+                                               live_price=api_server._get_live_mid_price_str(),
+                                               coin_multiplier=options["coin_multiplier"],
+                                               target_seconds=options["target_seconds"])
+    if config != _configuration() or fee_pool != get_fee_pool_plan():
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    try:
+        after = _verified_identity(config)
+    except ValueError:
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED") from None
+    if any(after[key] != identity[key] for key in after):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    if campaign is not None and database.get_bootstrap_campaign(campaign["campaign_id"]) != campaign:
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    return {**context, "recipe": recipe, "campaign": campaign,
+            "request_options": options, "fee_pool": fee_pool, "dispatch_authorized": False}

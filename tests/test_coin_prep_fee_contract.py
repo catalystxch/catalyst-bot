@@ -164,3 +164,11 @@ def test_campaign_scope_uses_campaign_not_refresh_session():
     assert baseline["scope"]["campaign_id"] == "c" * 64
     with pytest.raises(ValueError):
         _contract({**scope, "session_id": "d" * 64})
+
+
+def test_fresh_bootstrap_revision_zero_is_bound_without_inventing_a_revision():
+    scope = {**_scope(), "campaign_id": "c" * 64, "session_id": None}
+    plan = {**_plan(), "campaign_revision": 0}
+    initial = _contract(scope, plan)
+    assert initial["plan"]["campaign_revision"] == 0
+    assert _contract(scope, {**plan, "campaign_revision": 1})["plan_sha256"] != initial["plan_sha256"]

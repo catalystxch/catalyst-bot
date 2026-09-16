@@ -178,7 +178,41 @@ Primary schema evidence:
 - https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage-api/src/requests/data.rs
 - https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage/src/endpoints/data.rs
 
-## Outstanding acceptance gates (unchanged)
+## Frozen economic recipe and runtime collection (continuation)
+
+- The persistent fee-approval goal and existing hourly heartbeat were verified
+  ACTIVE. No duplicate goal or automation was created; the approved full scope
+  remains unchanged.
+- Added shared exact economics for tiered/uniform settings, live counts and
+  spares, generated sell-ladder CAT sizing, reverse buy positions, one-sided
+  operation, reserves, headroom and retained dedicated fee-coin principal.
+  Worker CAT sizing and XCH headroom now consume the shared sizing helpers.
+  Tiered preparation retains its historical counts rather than claiming that
+  the optional uniform-mode coin multiplier changes those cohorts.
+- The read-only runtime economic collector derives these outputs from verified
+  current wallet/configuration snapshots, resolves existing Bootstrap authority,
+  rejects client economic authority and missing price/campaign fallback, and
+  rechecks configuration, fee pool, identity and campaign after collection.
+  It creates no approval, consent, hold, effect claim or wallet dispatch.
+- Two focused failures exposed a real Bootstrap contract mismatch: fresh
+  campaigns have authoritative revision 0, but fee contracts required revision
+  1 or later. The validator now accepts and binds revision 0 without inventing
+  a newer revision. Four additional failing regressions showed legacy fee-pool
+  helpers silently coerced invalid raw counts/sizes; the preview collector now
+  rejects those settings before using the legacy derived fee-pool plan.
+- Fresh economics/snapshot/contract/one-sided worker/direct batch/planner/preview/
+  storage/consent/ledger/recovery/estimation/transaction-fee regressions:
+  315 passed in 56.26s. Ruff and `git diff --check` passed. An earlier runtime
+  test queried a nonexistent table; correcting it to the real approval/consent
+  tables preserves the no-mutation assertion. These receipts are scoped tests,
+  not full feature, independent review, fresh build or live acceptance.
+- Runtime staged costs/funding, HTTP/native preview/consent endpoints, final
+  dispatch adoption and every-path fee holds, GUI confirmation/E2E, fresh
+  package and genuine-budget live acceptance remain open. CLI overrides alone
+  do not prove frozen output ordering; execution must adopt that exact contract.
+  No live package/wallet action, main merge or release occurred.
+
+## Outstanding acceptance gates
 
 Runtime canonical plan preview, HTTP/native bridge consent,
 all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,

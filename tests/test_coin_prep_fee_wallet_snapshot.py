@@ -219,3 +219,96 @@ def test_unstable_coin_order_cannot_supply_a_complete_inventory(live_reads):
     live_reads["reverse_page"] = True
     with pytest.raises(ValueError, match="FEE_WALLET_INVENTORY_UNAVAILABLE"):
         _collect(live_reads)
+
+
+@pytest.fixture
+def economic_reads(live_reads, monkeypatch):
+    import api_server
+    from blueprints import coin_prep
+    import tx_fees
+
+    configuration = live_reads["config"]
+    for key, value in {"TIER_ENABLED": True, "BUY_LADDER_REVERSED": False,
+                       "LIQUIDITY_MODE": "two_sided", "COIN_PREP_HEADROOM_PCT": Decimal("10"),
+                       "SPREAD_BPS": Decimal("10000"), "MIN_EDGE_BPS": Decimal("0"),
+                       "MAX_ACTIVE_BUY_OFFERS": 1, "MAX_ACTIVE_SELL_OFFERS": 1,
+                       "DEFAULT_TRADE_XCH": Decimal("0.1"), "FEE_PREP_COUNT": 2,
+                       "FEE_COIN_SIZE_XCH": Decimal("0.001"), "TRANSACTION_FEE_MODE": "manual",
+                       "TRANSACTION_FEE_XCH": Decimal("0.00001")}.items():
+        setattr(configuration, key, value)
+    for tier, size in (("INNER", "0.1"), ("MID", "0.075"), ("OUTER", "0.05"), ("EXTREME", "0.01")):
+        setattr(configuration, f"{tier}_SIZE_XCH", Decimal(size))
+        for side in ("BUY", "SELL"):
+            setattr(configuration, f"{side}_{tier}_SIZE_XCH", Decimal(size))
+            setattr(configuration, f"{side}_{tier}_TIER_COUNT", 1 if tier == "INNER" else 0)
+            setattr(configuration, f"{side}_{tier}_TIER_SPARE_COUNT", 0)
+    monkeypatch.setattr(tx_fees, "cfg", configuration)
+    monkeypatch.setattr(coin_prep, "cfg", configuration)
+
+    def price():
+        if live_reads.get("change_fee_configuration"):
+            configuration.TRANSACTION_FEE_XCH = Decimal("0.00002")
+        if live_reads.get("switch_on_price"):
+            live_reads["identity"]["fingerprint"] = 12345
+        return live_reads.get("live_price", "0.01")
+
+    monkeypatch.setattr(api_server, "_get_live_mid_price_str", price)
+    return live_reads
+
+
+def _economic_collect(state, options=None):
+    service = _service()
+    state["monkeypatch"].setattr(service, "cfg", state["config"])
+    collector = getattr(service, "read_fee_economic_snapshot", None)
+    assert callable(collector), "authoritative runtime economic collector is missing"
+    return collector({} if options is None else options)
+
+
+def test_runtime_economics_are_derived_from_current_wallet_settings_without_effects(economic_reads):
+    result = _economic_collect(economic_reads)
+    assert result["identity"]["wallet_fingerprint"] == 736588221
+    assert result["recipe"]["economic_plan"]["target_seconds"] == 300
+    assert [(o.asset, o.purpose, o.amount_mojos) for o in result["recipe"]["targets"]] == [
+        ("xch", "replacement", 110_000_000_000), ("xch", "fee_reserve", 1_000_000_000),
+        ("xch", "fee_reserve", 1_000_000_000), ("cat", "replacement", 11_000)]
+    assert result["campaign"] is None
+    assert result["dispatch_authorized"] is False
+    for table in ("coin_prep_operations", "wallet_effect_claims", "approved_fee_reservations", "fee_approvals",
+                  "coin_prep_fee_previews", "coin_prep_fee_consents"):
+        assert database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("options", [{"scope_sha256": "38" * 32}, {"cost": 1}, {"outputs": []},
+                                     {"coin_multiplier": True}, {"coin_multiplier": 1.5},
+                                     {"target_seconds": True}, {"bootstrap_campaign_id": "38" * 32}])
+def test_client_cannot_supply_economic_authority_or_malformed_choices(economic_reads, options):
+    with pytest.raises(ValueError, match="FEE_PREP_OPTIONS_INVALID"):
+        _economic_collect(economic_reads, options)
+    assert economic_reads["reads"] == []
+
+
+@pytest.mark.parametrize("flag", ["change_fee_configuration", "switch_on_price"])
+def test_fee_configuration_or_identity_change_during_economic_collection_is_rejected(economic_reads, flag):
+    economic_reads[flag] = True
+    with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
+        _economic_collect(economic_reads)
+
+
+def test_no_market_price_cannot_be_disguised_as_a_valid_runtime_plan(economic_reads):
+    economic_reads["live_price"] = None
+    with pytest.raises(ValueError, match="FEE_PREP_PRICE_UNAVAILABLE"):
+        _economic_collect(economic_reads)
+
+
+@pytest.mark.parametrize("key,value", [("FEE_PREP_COUNT", True), ("FEE_PREP_COUNT", 2.5),
+                                      ("FEE_PREP_COUNT", -1), ("FEE_COIN_SIZE_XCH", "not-a-fee")])
+def test_runtime_fee_pool_cannot_silently_coerce_invalid_settings(economic_reads, key, value):
+    setattr(economic_reads["config"], key, value)
+    with pytest.raises(ValueError, match="FEE_PREP_CONFIGURATION_INVALID"):
+        _economic_collect(economic_reads)
+
+
+def test_explicit_campaign_choices_without_a_current_campaign_cannot_fall_back_to_standard(economic_reads):
+    with pytest.raises(ValueError, match="FEE_PREP_CAMPAIGN_UNAVAILABLE"):
+        _economic_collect(economic_reads, {"bootstrap_campaign_id": "38" * 32,
+                                           "bootstrap_campaign_revision": 0})

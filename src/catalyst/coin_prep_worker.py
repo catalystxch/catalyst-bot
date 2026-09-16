@@ -71,7 +71,7 @@ from amount_utils import (
     format_cat_display_amount,
     round_cat_display_amount_up_to_mojo,
 )
-from ladder_sizing import TIER_ORDER, summarize_sell_ladder_cat
+from ladder_sizing import TIER_ORDER
 
 # Load environment
 from dotenv import load_dotenv
@@ -3277,28 +3277,15 @@ class CoinPrepWorker:
                     max_sell_offers = sum(sell_tier_counts.values())
             spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
             min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
-            ladder_summary = summarize_sell_ladder_cat(
-                mid_price=price,
-                spread_fraction=spread_fraction,
+            from coin_prep_economics import prepared_cat_sizes
+
+            result = prepared_cat_sizes(
+                live_sizes=live_sizes, price=price,
+                headroom_multiplier=self.coin_prep_headroom_multiplier,
+                cat_decimals=self.cat_decimals, sell_counts=sell_tier_counts,
                 max_offers=max_sell_offers,
-                tier_counts=sell_tier_counts,
-                tier_sizes_xch=live_sizes,
-                min_edge_bps=min_edge_bps,
+                spread_bps=spread_fraction * Decimal("10000"), min_edge_bps=min_edge_bps,
             )
-            for tier_name, xch_size in live_sizes.items():
-                if tier_name == get_fee_tier_name():
-                    result[tier_name] = Decimal("0")
-                    continue
-                cat_per_offer = ladder_summary.max_cat_per_tier.get(
-                    tier_name, Decimal("0")
-                )
-                if cat_per_offer <= 0:
-                    cat_per_offer = xch_size / price
-                cat_coin_size = round_cat_display_amount_up_to_mojo(
-                    cat_per_offer * self.coin_prep_headroom_multiplier,
-                    self.cat_decimals,
-                )
-                result[tier_name] = cat_coin_size
             self.log(
                 f"   Tier CAT sizes derived from generated SELL ladder prices "
                 f"at mid {price} with +{self.coin_prep_headroom_pct}% headroom"
@@ -3324,9 +3311,9 @@ class CoinPrepWorker:
         a stage budget) a few thousand mojos smaller than the exact offer
         spend, so Sage correctly refused to select them.
         """
-        return (live_size_xch * self.coin_prep_headroom_multiplier).quantize(
-            Decimal("0.000000000001")
-        )
+        from coin_prep_economics import prepared_xch_size
+
+        return prepared_xch_size(live_size_xch, self.coin_prep_headroom_multiplier)
 
     def _get_fingerprint(self) -> str:
         """Get wallet fingerprint — tries RPC first (fast), then CLI (slow fallback)."""

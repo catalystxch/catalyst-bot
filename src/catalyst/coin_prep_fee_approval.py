@@ -105,7 +105,7 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
     reserves = {asset: _exact_int(value) for asset, value in reserves.items()}
     revision = economic_plan["campaign_revision"]
     if revision is not None:
-        _exact_int(revision, 1)
+        _exact_int(revision, 0)
     outputs = economic_plan["outputs"]
     if type(outputs) is not list:
         raise ValueError("fee contract output collection is invalid")
