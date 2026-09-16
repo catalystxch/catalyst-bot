@@ -7158,6 +7158,50 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(
     ]
 
 
+def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
+    monkeypatch,
+):
+    """A corrected reconciler must recheck its old fail-closed conflict on restart."""
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    authorizations = iter(
+        [
+            {
+                "allowed": False,
+                "reason_code": "REGISTRY_BLOCKED",
+                "failed_check": "unresolved_operations",
+            },
+            {"allowed": True, "reason_code": "", "failed_check": None},
+        ]
+    )
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or next(authorizations),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: (
+            events.append("reconciliation_recovery")
+            or {"examined": 3, "recovered": 3, "remaining": 0}
+        ),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "reconciliation_recovery",
+        "authorize",
+    ]
+
+
 def test_desktop_retries_startup_after_exact_sage_bulk_peer_rejection(
     monkeypatch,
 ):

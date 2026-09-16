@@ -38,7 +38,9 @@ from database import (
     backup_database,
     get_offer_cancel_effect_claim,
     get_offer_intent_by_trade_id,
+    get_offer_intents_for_registry,
     get_offer_operation_events,
+    get_fills,
     get_open_offers,
     get_stats,
     guarded_reset_authoritative_state,
@@ -114,7 +116,9 @@ def bootstrap_coin_prep_requirements(plan: dict) -> dict:
     }
 
 
-def bootstrap_coin_prep_worker_args(plan: dict) -> dict:
+def bootstrap_coin_prep_worker_args(
+    plan: dict, *, replacement_waves: dict[str, int] | None = None
+) -> dict:
     """Translate one authorized Bootstrap plan into exact worker overrides."""
 
     prep = bootstrap_coin_prep_requirements(plan)
@@ -153,10 +157,27 @@ def bootstrap_coin_prep_worker_args(plan: dict) -> dict:
             f"{tier}={values[tier]}" for tier in tier_order if tier in values
         )
 
-    xch_counts = {tier: 1 for tier in xch_sizes if tier != "fees"}
+    if replacement_waves is None:
+        replacement_waves = {"buy": 1, "sell": 1}
+    if type(replacement_waves) is not dict or set(replacement_waves) != {
+        "buy",
+        "sell",
+    }:
+        raise ValueError("Bootstrap replacement wave counts are invalid")
+    for side, count in replacement_waves.items():
+        if type(count) is not int or count < 0:
+            raise ValueError(f"Bootstrap {side} replacement wave count is invalid")
+    if xch_sizes and replacement_waves["buy"] == 0:
+        raise ValueError("Bootstrap buy replacement capacity is exhausted")
+    if cat_sizes and replacement_waves["sell"] == 0:
+        raise ValueError("Bootstrap sell replacement capacity is exhausted")
+
+    xch_counts = {
+        tier: replacement_waves["buy"] for tier in xch_sizes if tier != "fees"
+    }
     if prep["fee_coins"]:
         xch_counts["fees"] = len(prep["fee_coins"])
-    cat_counts = {tier: 1 for tier in cat_sizes}
+    cat_counts = {tier: replacement_waves["sell"] for tier in cat_sizes}
     return {
         "xch_target": sum(xch_counts.values()),
         "cat_target": sum(cat_counts.values()),
@@ -186,7 +207,10 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         raise ValueError("bootstrap_coin_prep_confirmation_required")
 
     from blueprints.bootstrap import BootstrapApiError, _read_bootstrap_identity
-    from bootstrap_runtime import derive_bootstrap_runtime
+    from bootstrap_runtime import (
+        derive_bootstrap_coin_prep_wave_counts,
+        derive_bootstrap_runtime,
+    )
     from tx_fees import get_effective_transaction_fee_mojos
     from wallet import get_wallet_balance
 
@@ -246,9 +270,19 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
     if plan.get("authorized") is not True:
         reasons = ",".join(plan.get("reason_codes") or ("not_authorized",))
         raise ValueError(f"bootstrap_coin_prep_not_authorized:{reasons}")
+    replacement_waves = derive_bootstrap_coin_prep_wave_counts(
+        campaign_record=campaign,
+        plan=plan,
+        authoritative_fills=get_fills(cat_asset_id=asset_id, limit=10_000),
+        intents=get_offer_intents_for_registry(),
+        xch_available=balances["xch_available"],
+        cat_available=balances["cat_available"],
+    )
     return {
         "campaign": campaign,
-        "worker_args": bootstrap_coin_prep_worker_args(plan),
+        "worker_args": bootstrap_coin_prep_worker_args(
+            plan, replacement_waves=replacement_waves
+        ),
         "xch_balance_mojos": xch_balance_mojos,
         "cat_balance_mojos": cat_balance_mojos,
         "cat_decimals": cat_decimals,
@@ -1228,6 +1262,24 @@ def api_coin_prep_status():
     bot = api_server.bot
     try:
         result = {"success": True, **api_server._coin_prep_state}
+        bootstrap_campaign = None
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) == 64:
+            try:
+                active_campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+            except Exception:
+                active_campaigns = []
+            if len(active_campaigns) == 1:
+                bootstrap_campaign = active_campaigns[0]
+                result.update(
+                    {
+                        "coin_prep_mode": "bootstrap_exact",
+                        "bootstrap_campaign_id": bootstrap_campaign.get("campaign_id"),
+                        "bootstrap_campaign_revision": bootstrap_campaign.get(
+                            "revision"
+                        ),
+                    }
+                )
 
         def _refresh_finished_prep_coin_counts(payload: dict):
             """Backfill current coin counts after prep stops.
@@ -1633,7 +1685,7 @@ def api_coin_prep_status():
         # that here so Smart Settings and the coin-prep modal catch stale
         # tier coins before the user presses Start Bot.
         result["tier_size_drift"] = []
-        if not result.get("running"):
+        if not result.get("running") and bootstrap_campaign is None:
             try:
                 # This endpoint is polled every 1.5s by the progress view and
                 # every 2s by its visible log view.  Keep the status path local:

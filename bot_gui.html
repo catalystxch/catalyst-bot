@@ -26826,12 +26826,21 @@
             }
         }
 
+        function fiatCatTicker(currentCat = {}) {
+            const raw = currentCat?.ticker_id || currentCat?.ticker || currentCat?.name || 'CAT';
+            const label = String(raw)
+                .replace(/_XCH$/i, '')
+                .replace(/\/XCH$/i, '')
+                .trim();
+            return label || 'CAT';
+        }
+
         function resetFiatPriceSummary(currentCat = {}) {
             const section = document.getElementById('ccFiatPrices');
             if (section) section.style.display = 'none';
 
             const lowerCatLabel = currentCat?.name || currentCat?.ticker_id || 'CAT';
-            const snapshotCatLabel = currentCat?.ticker_id || currentCat?.name || 'CAT';
+            const snapshotCatLabel = fiatCatTicker(currentCat);
             const setText = (id, value) => {
                 const node = document.getElementById(id);
                 if (node) node.textContent = value;
@@ -26872,7 +26881,7 @@
             if (snapshotXchEl) snapshotXchEl.textContent = xchText || '—';
             if (snapshotCatEl) snapshotCatEl.textContent = catText || '—';
             if (snapshotCatLabelEl) {
-                snapshotCatLabelEl.textContent = (currentCat?.ticker_id || currentCat?.name || 'CAT') + '/USD';
+                snapshotCatLabelEl.textContent = fiatCatTicker(currentCat) + '/USD';
             }
 
             if (sourceEl) {
@@ -31939,6 +31948,10 @@
                 const _rs = _resumeSessionSummary || {};
                 const _rsCat = _rs.pair_name || currentCAT?.name || 'Previous pair';
                 const _rsTicker = _rs.active_cat?.ticker_id || currentCAT?.ticker_id || '';
+                const _rsPairTicker = String(_rsTicker)
+                    .replace(/_XCH$/i, '')
+                    .replace(/\/XCH$/i, '')
+                    .trim();
                 const _rsSpread = _rs.spread_bps ? (_rs.spread_bps / 100).toFixed(1) + '%' : '—';
                 const _rsSize = _rs.trade_xch ? _rs.trade_xch + ' XCH' : '—';
                 const _rsLastActive = _rs.last_active || 'Previous session';
@@ -31954,7 +31967,7 @@
 
                         <div style="background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:13px; padding:16px 18px; margin-bottom:16px;">
                             <div style="font-size:10px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--slate-600); margin-bottom:8px;">Trading Pair</div>
-                            <div style="font-size:17px; font-weight:700; color:var(--slate-200); margin-bottom:4px;">${escapeHtml(_rsCat)}${_rsTicker ? '&nbsp;<span style="color:var(--slate-500); font-size:13px; font-weight:500;">(' + escapeHtml(_rsTicker) + '/XCH)</span>' : ''}</div>
+                            <div style="font-size:17px; font-weight:700; color:var(--slate-200); margin-bottom:4px;">${escapeHtml(_rsCat)}${_rsPairTicker ? '&nbsp;<span style="color:var(--slate-500); font-size:13px; font-weight:500;">(' + escapeHtml(_rsPairTicker) + '/XCH)</span>' : ''}</div>
                             <div style="font-size:12px; color:var(--slate-500);">${escapeHtml(_rsLastActive)}</div>
                         </div>
 

@@ -3969,30 +3969,13 @@ def reconcile_offer(
             intent["intent_id"]
         )
         stored_offer = database.get_offer(intent["sage_trade_id"])
-        legacy_contradiction = False
-        if immutable_economics is None:
-            legacy_contradiction = True
-        elif type(stored_offer) is dict:
-            legacy_contradiction = (
-                any(
-                    stored_offer.get(key) != immutable_economics[value_key]
-                    for key, value_key in (
-                        ("side", "side"),
-                        ("cat_asset_id", "cat_asset_id"),
-                        ("tier", "tier"),
-                    )
-                )
-                or stored_offer.get("fee_mojos_xch")
-                != immutable_economics["fee_mojos_xch"]
+        legacy_contradiction = immutable_economics is None or (
+            type(stored_offer) is dict
+            and not database.offer_projection_matches_intent_economics(
+                stored_offer,
+                immutable_economics,
             )
-            try:
-                legacy_contradiction = legacy_contradiction or any(
-                    Decimal(str(stored_offer.get(key)))
-                    != Decimal(str(immutable_economics[key]))
-                    for key in ("price_xch", "size_xch", "size_cat")
-                )
-            except (InvalidOperation, TypeError, ValueError):
-                legacy_contradiction = True
+        )
         if legacy_contradiction:
             result = _conflict("IMMUTABLE_ECONOMIC_AUTHORITY_CONFLICT")
     destination, registry_evidence = _registry_evidence(intent, result, observed_at)

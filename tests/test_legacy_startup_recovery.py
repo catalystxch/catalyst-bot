@@ -435,6 +435,90 @@ def test_submitted_cancel_is_recovered_from_exact_authoritative_sage_proof(
     assert calls[2][2]["evidence"] is evidence
 
 
+def test_persisted_reconciliation_conflicts_are_rechecked_from_exact_sage_proof():
+    """A fixed reconciler must be able to recover its pre-fix durable latch."""
+    import legacy_startup_recovery
+
+    intent_ids = ["5" * 64, "6" * 64, "7" * 64]
+    operation_ids = [f"reconcile:{intent_id}" for intent_id in intent_ids]
+    intents = {
+        intent_id: {
+            "intent_id": intent_id,
+            "sage_trade_id": f"{index + 8:064x}",
+            "lifecycle_state": "conflicted" if index == 0 else "visible",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "asset_id": ASSET_ID,
+            "side": "buy",
+            "tier": "inner",
+            "selected_coin_ids": [f"{index + 20:064x}"],
+        }
+        for index, intent_id in enumerate(intent_ids)
+    }
+    active = set(operation_ids)
+    evidence = {"observed_at": AT, "wallet_identity": {"complete": True}}
+    calls = []
+
+    def get_latch():
+        return {
+            "state": "tripped",
+            "generation": 9,
+            "blocking_operation_ids_json": json.dumps(operation_ids),
+        }
+
+    def resolve_latch(**kwargs):
+        calls.append(("resolve_latch", kwargs))
+        assert kwargs["expected_generation"] == 9
+        assert set(kwargs["resolved_operation_ids"]) == set(operation_ids)
+        assert not active
+        return {"resolved": True}
+
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [],
+        get_unresolved_offer_operation_blockers=lambda: [],
+        get_runtime_safety_latch=get_latch,
+        resolve_runtime_safety_latch=resolve_latch,
+        get_offer_intent=lambda intent_id: intents.get(intent_id),
+    )
+
+    def reconcile(intent_id, **kwargs):
+        calls.append(("reconcile", intent_id, kwargs))
+        active.remove(f"reconcile:{intent_id}")
+        intents[intent_id]["lifecycle_state"] = "terminal"
+        return {"classification": "FILLED_PROVEN", "applied": True}
+
+    reconciliation = SimpleNamespace(
+        EXPIRED_PROVEN="EXPIRED_PROVEN",
+        CANCELLED_PROVEN="CANCELLED_PROVEN",
+        FILLED_PROVEN="FILLED_PROVEN",
+        load_authoritative_evidence=lambda target, wallet_facade=None: (
+            calls.append(("evidence", target["intent_id"], wallet_facade)) or evidence
+        ),
+        reconcile_offer=reconcile,
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=SimpleNamespace(),
+        database_module=database,
+        reconciliation_module=reconciliation,
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 3, "recovered": 3, "remaining": 0}
+    assert [call[0] for call in calls] == [
+        "evidence",
+        "reconcile",
+        "evidence",
+        "reconcile",
+        "evidence",
+        "reconcile",
+        "resolve_latch",
+    ]
+    assert {call[1] for call in calls if call[0] == "reconcile"} == set(intent_ids)
+
+
 def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart():
     """Startup must preserve the shared Sage transaction proof for every member."""
     import legacy_startup_recovery

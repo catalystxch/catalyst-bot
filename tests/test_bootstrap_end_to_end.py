@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
@@ -23,6 +24,7 @@ from bootstrap_proof import verify_participation_report
 from bootstrap_runtime import (
     active_bootstrap_levels,
     derive_bootstrap_authoritative_evidence,
+    derive_bootstrap_coin_prep_wave_counts,
     derive_bootstrap_runtime,
     plan_bootstrap_state_update,
     superseded_bootstrap_trade_ids,
@@ -345,6 +347,184 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
         "outer": Decimal("30"),
     }
     assert worker._derive_tier_cat_sizes() == worker.exact_tier_cat_sizes
+
+
+@pytest.mark.parametrize(
+    ("stage", "deployment_fraction", "expected_waves"),
+    [
+        (CampaignStage.BOOTSTRAP, Decimal("0.10"), 10),
+        (CampaignStage.DISCOVERY_25, Decimal("0.25"), 4),
+        (CampaignStage.DISCOVERY_50, Decimal("0.50"), 2),
+        (CampaignStage.ESTABLISHED, Decimal("1"), 1),
+    ],
+)
+def test_bootstrap_coin_prep_prepares_only_budget_bounded_replacement_waves(
+    bootstrap_app, stage, deployment_fraction, expected_waves
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    campaign = _campaign_from_record(record)
+    decision = replace(
+        evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=NOW),
+        stage=stage,
+        deployment_fraction=deployment_fraction,
+    )
+    balances = _balances()
+    plan = derive_bootstrap_plan(campaign, decision, balances)
+
+    counts = derive_bootstrap_coin_prep_wave_counts(
+        campaign_record=record,
+        plan=plan,
+        authoritative_fills=[],
+        intents=[],
+        xch_available=balances["xch_available"],
+        cat_available=balances["cat_available"],
+    )
+    args = bootstrap_coin_prep_worker_args(plan, replacement_waves=counts)
+
+    assert counts == {"buy": expected_waves, "sell": expected_waves}
+    assert args["tier_counts_xch"] == (
+        f"inner={expected_waves},mid={expected_waves},outer={expected_waves},fees=6"
+    )
+    assert args["tier_counts_cat"] == (
+        f"inner={expected_waves},mid={expected_waves},outer={expected_waves}"
+    )
+    assert args["xch_target"] == expected_waves * 3 + 6
+    assert args["cat_target"] == expected_waves * 3
+
+
+def test_bootstrap_coin_prep_reduces_only_the_filled_campaign_side_capacity(
+    bootstrap_app,
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    campaign = _campaign_from_record(record)
+    decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=NOW)
+    balances = _balances()
+    plan = derive_bootstrap_plan(campaign, decision, balances)
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    campaign_trade_ids = ["01" * 32, "02" * 32, "03" * 32]
+    intents = [
+        {"sage_trade_id": trade_id, "purpose": purpose, "asset_id": ASSET_ID}
+        for trade_id in campaign_trade_ids
+    ]
+    intents.append(
+        {
+            "sage_trade_id": "99" * 32,
+            "purpose": f"bootstrap:{'cd' * 32}:revision:0",
+            "asset_id": ASSET_ID,
+        }
+    )
+    fills = [
+        {
+            "trade_id": campaign_trade_ids[0],
+            "side": "buy",
+            "size_xch": "0.03333333333333333333333333333",
+            "size_cat": "33.33333333333333333333333333",
+        },
+        {
+            "trade_id": campaign_trade_ids[1],
+            "side": "buy",
+            "size_xch": "0.03333333333333333333333333333",
+            "size_cat": "33.33333333333333333333333333",
+        },
+        {
+            "trade_id": campaign_trade_ids[2],
+            "side": "buy",
+            "size_xch": "0.03333333333333333333333333334",
+            "size_cat": "33.33333333333333333333333334",
+        },
+        {
+            "trade_id": "99" * 32,
+            "side": "sell",
+            "size_xch": "100",
+            "size_cat": "100000",
+        },
+    ]
+
+    counts = derive_bootstrap_coin_prep_wave_counts(
+        campaign_record=record,
+        plan=plan,
+        authoritative_fills=fills,
+        intents=intents,
+        xch_available=balances["xch_available"],
+        cat_available=balances["cat_available"],
+    )
+
+    assert counts == {"buy": 9, "sell": 10}
+
+
+def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
+    bootstrap_app, monkeypatch
+):
+    from blueprints import coin_prep
+    import tx_fees
+    import wallet
+
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    monkeypatch.setattr(coin_prep.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+    monkeypatch.setattr(coin_prep.cfg, "WALLET_ID_XCH", 1, raising=False)
+    monkeypatch.setattr(coin_prep.cfg, "CAT_DECIMALS", 3, raising=False)
+    monkeypatch.setattr(
+        coin_prep.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"), raising=False
+    )
+    monkeypatch.setattr(
+        coin_prep.cfg, "MINIMUM_PROFIT_XCH", Decimal("0"), raising=False
+    )
+    monkeypatch.setattr(coin_prep.cfg, "EXPECTED_CANCEL_REQUOTES", 1, raising=False)
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_balance",
+        lambda wallet_id: {
+            "success": True,
+            "wallet_balance": {
+                "confirmed_wallet_balance": (
+                    2_000_000_000_000 if wallet_id == 1 else 2_000_000
+                )
+            },
+        },
+    )
+    monkeypatch.setattr(
+        tx_fees, "get_effective_transaction_fee_mojos", lambda: 10_000_000
+    )
+    monkeypatch.setattr(coin_prep, "get_fills", lambda **_kwargs: [])
+    monkeypatch.setattr(coin_prep, "get_offer_intents_for_registry", lambda: [])
+
+    args = _active_bootstrap_coin_prep_worker_args(
+        {
+            "bootstrap_campaign_id": started["campaign_id"],
+            "bootstrap_campaign_revision": 0,
+        }
+    )
+
+    assert args["tier_counts_xch"] == "inner=10,mid=10,outer=10,fees=6"
+    assert args["tier_counts_cat"] == "inner=10,mid=10,outer=10"
+    assert args["xch_target"] == 36
+    assert args["cat_target"] == 30
 
 
 def test_bootstrap_coin_prep_converts_unavailable_identity_to_stable_safe_block(
@@ -1281,6 +1461,103 @@ def test_authoritative_campaign_fills_and_current_independent_depth_drive_stage(
     )
     assert runtime["decision"].stage is CampaignStage.DISCOVERY_25
     assert runtime["decision"].deployment_fraction == Decimal("0.25")
+
+
+def test_campaign_state_persists_fill_evidence_before_stage_change(bootstrap_app):
+    bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    evidence = BootstrapEvidence(confirmed_fills=1, settlement_clusters=1)
+    decision = evaluate_bootstrap_campaign(
+        _campaign_from_record(record), evidence, now=NOW
+    )
+
+    assert decision.stage is CampaignStage.BOOTSTRAP
+
+    state_update = plan_bootstrap_state_update(
+        campaign_record=record,
+        evidence=evidence,
+        decision=decision,
+        now=NOW,
+    )
+
+    assert state_update is not None
+    assert state_update["confirmed_fills"] == 1
+    assert state_update["settlement_clusters"] == 1
+
+
+@pytest.mark.parametrize(
+    ("evidence_kwargs", "field", "expected"),
+    [
+        (
+            {"independent_depth_sides": frozenset({CampaignSide.BUY})},
+            "independent_depth_sides",
+            ["buy"],
+        ),
+        (
+            {"adverse_fill_times": ((CampaignSide.BUY, NOW - timedelta(minutes=1)),)},
+            "adverse_fill_times",
+            [
+                {
+                    "side": "buy",
+                    "occurred_at": "2026-09-12T11:59:00.000000Z",
+                }
+            ],
+        ),
+        ({"fee_spent_xch": Decimal("0.004")}, "fee_spent_xch", "0.004"),
+        (
+            {"realized_loss_xch": Decimal("0.002")},
+            "realized_loss_xch",
+            "0.002",
+        ),
+        (
+            {"marked_inventory_loss_xch": Decimal("0.003")},
+            "marked_inventory_loss_xch",
+            "0.003",
+        ),
+        (
+            {"current_anchor_price": Decimal("0.0011")},
+            "current_anchor_price",
+            "0.0011",
+        ),
+    ],
+)
+def test_campaign_state_persists_each_evidence_change_without_stage_change(
+    bootstrap_app, evidence_kwargs, field, expected
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    evidence = BootstrapEvidence(**evidence_kwargs)
+    decision = evaluate_bootstrap_campaign(
+        _campaign_from_record(record), evidence, now=NOW
+    )
+
+    assert decision.stage is CampaignStage.BOOTSTRAP
+
+    state_update = plan_bootstrap_state_update(
+        campaign_record=record,
+        evidence=evidence,
+        decision=decision,
+        now=NOW,
+    )
+
+    assert state_update is not None
+    assert state_update[field] == expected
 
 
 def test_superseded_revision_trade_ids_are_fenced_before_replacement():

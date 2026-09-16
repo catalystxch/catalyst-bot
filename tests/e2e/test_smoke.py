@@ -637,6 +637,26 @@ def test_dashboard_health_cannot_claim_healthy_when_authoritative_confidence_is_
     expect(page.locator("#ccConditions")).to_contain_text("market evidence expired")
 
 
+@pytest.mark.parametrize("has_price", [False, True])
+def test_dashboard_fiat_label_uses_cat_ticker_not_pair_id(page, has_price):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    fiat = {"xch_usd_price": "1.37", "cat_usd_price": "0.00009727"} if has_price else {}
+
+    page.evaluate(
+        """([fiat]) => {
+            window.updateFiatPriceSummary(
+                fiat,
+                { ticker_id: 'MZ_XCH', name: 'Monkeyzoo Token' },
+                {},
+            );
+        }""",
+        [fiat],
+    )
+
+    expect(page.locator("#snapshotCatUsdLabel")).to_have_text("MZ/USD")
+
+
 def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
     page,
 ):
@@ -1854,6 +1874,75 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
     assert still_latched is True
     page.evaluate("window.__cancelLatchPhase = 'complete'")
     page.wait_for_function("_cancelAllInProgress === false", timeout=2_000)
+
+
+def test_loaded_session_formats_internal_ticker_as_human_pair(page):
+    """Recovery must show MZ/XCH, never the internal MZ_XCH/XCH label."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    modal_text = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                decimals: 3,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            currentCAT = { ...cat };
+            setResumeSessionSummary({
+                can_resume: true,
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+                last_active: 'Just now',
+                active_cat: cat,
+                saved_settings: {
+                    cat_name: 'Monkeyzoo Token',
+                    trade_xch: '1.187',
+                    spread_bps: 2520,
+                },
+            });
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            checkSettingsReviewed = () => {};
+            fetchStatus = async () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => {
+                if (String(path).includes('/check-resume')) {
+                    return new Response(JSON.stringify({
+                        can_resume: true,
+                        buy_count: 3,
+                        sell_count: 3,
+                        offer_count: 6,
+                        last_active: 'Just now',
+                        active_cat: cat,
+                        saved_settings: {
+                            cat_name: 'Monkeyzoo Token',
+                            trade_xch: '1.187',
+                            spread_bps: 2520,
+                        },
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+
+            const restored = await resumeSession();
+            if (!restored) throw new Error('Test session did not restore');
+            return document.querySelector('#resumeSessionModal > div').innerText
+                .replace(/\u00a0/g, ' ');
+        }"""
+    )
+
+    assert "Monkeyzoo Token (MZ/XCH)" in modal_text
+    assert "MZ_XCH/XCH" not in modal_text
 
 
 def test_reload_restores_active_cancel_all_progress_before_resume_prompt(page):

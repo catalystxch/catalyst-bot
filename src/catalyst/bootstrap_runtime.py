@@ -119,6 +119,110 @@ def evidence_from_record(record: dict[str, Any]) -> BootstrapEvidence:
         raise ValueError("Bootstrap evidence record is invalid") from exc
 
 
+def _campaign_trade_ids(
+    *, campaign_id: str, asset_id: str, intents: list[dict[str, Any]]
+) -> frozenset[str]:
+    purpose_prefix = f"bootstrap:{campaign_id}:revision:"
+    return frozenset(
+        str(intent.get("sage_trade_id") or "")
+        for intent in intents
+        if type(intent) is dict
+        and intent.get("asset_id") == asset_id
+        and str(intent.get("purpose") or "").startswith(purpose_prefix)
+        and intent.get("sage_trade_id")
+    )
+
+
+def derive_bootstrap_coin_prep_wave_counts(
+    *,
+    campaign_record: dict[str, Any],
+    plan: dict[str, Any],
+    authoritative_fills: list[dict[str, Any]],
+    intents: list[dict[str, Any]],
+    xch_available: Decimal,
+    cat_available: Decimal,
+) -> dict[str, int]:
+    """Bound prepared replacement waves to campaign-only remaining principal."""
+
+    campaign = campaign_from_record(campaign_record)
+    if type(plan) is not dict or plan.get("authorized") is not True:
+        raise ValueError("authorized Bootstrap plan is required")
+    if type(authoritative_fills) is not list or type(intents) is not list:
+        raise TypeError("Bootstrap fill authority inputs must be lists")
+    prep = plan.get("coin_prep")
+    if type(prep) is not dict or prep.get("campaign_asset_id") != campaign.asset_id:
+        raise ValueError("Bootstrap Coin Prep campaign authority is invalid")
+    deployment_fraction = _decimal(
+        plan.get("deployment_fraction"), "deployment fraction"
+    )
+    if not Decimal("0") < deployment_fraction <= Decimal("1"):
+        raise ValueError("Bootstrap deployment fraction is invalid")
+    available = {
+        "buy": _decimal(xch_available, "available XCH"),
+        "sell": _decimal(cat_available, "available CAT"),
+    }
+
+    campaign_id = str(campaign_record.get("campaign_id") or "")
+    campaign_trade_ids = _campaign_trade_ids(
+        campaign_id=campaign_id,
+        asset_id=campaign.asset_id,
+        intents=intents,
+    )
+    net_xch_spent = Decimal("0")
+    net_cat_spent = Decimal("0")
+    for fill in authoritative_fills:
+        if type(fill) is not dict or fill.get("trade_id") not in campaign_trade_ids:
+            continue
+        side = fill.get("side")
+        if side not in _SIDES:
+            raise ValueError("Bootstrap campaign fill side is invalid")
+        size_xch = _decimal(fill.get("size_xch"), "fill XCH amount")
+        size_cat = _decimal(fill.get("size_cat"), "fill CAT amount")
+        if side == "buy":
+            net_xch_spent += size_xch
+            net_cat_spent -= size_cat
+        else:
+            net_xch_spent -= size_xch
+            net_cat_spent += size_cat
+
+    remaining = {
+        "buy": min(
+            campaign.xch_budget,
+            max(Decimal("0"), campaign.xch_budget - net_xch_spent),
+            available["buy"],
+        ),
+        "sell": min(
+            campaign.cat_budget,
+            max(Decimal("0"), campaign.cat_budget - net_cat_spent),
+            available["sell"],
+        ),
+    }
+    rows_by_side = {
+        "buy": prep.get("xch_offer_coins"),
+        "sell": prep.get("cat_offer_coins"),
+    }
+    budgets = {"buy": campaign.xch_budget, "sell": campaign.cat_budget}
+    maximum_waves = int(Decimal("1") // deployment_fraction)
+    counts: dict[str, int] = {}
+    for side in ("buy", "sell"):
+        rows = rows_by_side[side]
+        if type(rows) is not list:
+            raise ValueError("Bootstrap Coin Prep requirements are invalid")
+        if any(type(row) is not dict for row in rows):
+            raise ValueError("Bootstrap Coin Prep requirement is invalid")
+        wave_total = (
+            min(budgets[side] * deployment_fraction, available[side])
+            if rows
+            else Decimal("0")
+        )
+        counts[side] = (
+            0
+            if wave_total == 0
+            else min(maximum_waves, int(remaining[side] // wave_total))
+        )
+    return counts
+
+
 def derive_bootstrap_authoritative_evidence(
     *,
     campaign_record: dict[str, Any],
@@ -149,15 +253,11 @@ def derive_bootstrap_authoritative_evidence(
     now = now.astimezone(timezone.utc)
 
     campaign_id = str(campaign_record.get("campaign_id") or "")
-    purpose_prefix = f"bootstrap:{campaign_id}:revision:"
-    campaign_trade_ids = {
-        str(intent.get("sage_trade_id") or "")
-        for intent in intents
-        if type(intent) is dict
-        and intent.get("asset_id") == campaign.asset_id
-        and str(intent.get("purpose") or "").startswith(purpose_prefix)
-        and intent.get("sage_trade_id")
-    }
+    campaign_trade_ids = _campaign_trade_ids(
+        campaign_id=campaign_id,
+        asset_id=campaign.asset_id,
+        intents=intents,
+    )
     excluded_clusters = frozenset(
         str(cluster).strip().lower().removeprefix("0x")
         for cluster in own_participant_clusters | linked_participant_clusters
@@ -289,14 +389,36 @@ def plan_bootstrap_state_update(
     now = now.astimezone(timezone.utc)
     desired_stage = decision.stage.value
     desired_fraction = _decimal_text(decision.deployment_fraction)
+    desired_anchor = _decimal_text(decision.anchor_price)
     desired_stable_since = _utc_text(evidence.stable_since)
+    desired_depth_sides = sorted(
+        side.value for side in evidence.independent_depth_sides
+    )
+    desired_adverse_fills = [
+        {"side": side.value, "occurred_at": _utc_text(occurred_at)}
+        for side, occurred_at in evidence.adverse_fill_times
+    ]
+    desired_fee_spent = _decimal_text(evidence.fee_spent_xch)
+    desired_realized_loss = _decimal_text(evidence.realized_loss_xch)
+    desired_marked_loss = _decimal_text(evidence.marked_inventory_loss_xch)
     material_change = any(
         (
             campaign_record.get("stage") != desired_stage,
             str(campaign_record.get("deployment_fraction")) != desired_fraction,
+            str(campaign_record.get("current_anchor_price")) != desired_anchor,
             campaign_record.get("stable_since") != desired_stable_since,
+            int(campaign_record.get("confirmed_fills", 0)) != evidence.confirmed_fills,
+            int(campaign_record.get("settlement_clusters", 0))
+            != evidence.settlement_clusters,
+            (campaign_record.get("independent_depth_sides") or [])
+            != desired_depth_sides,
             bool(campaign_record.get("suspected_linked_activity"))
             != evidence.suspected_linked_activity,
+            (campaign_record.get("adverse_fill_times") or []) != desired_adverse_fills,
+            str(campaign_record.get("fee_spent_xch", "0")) != desired_fee_spent,
+            str(campaign_record.get("realized_loss_xch", "0")) != desired_realized_loss,
+            str(campaign_record.get("marked_inventory_loss_xch", "0"))
+            != desired_marked_loss,
         )
     )
     if not material_change:
@@ -304,21 +426,16 @@ def plan_bootstrap_state_update(
     return {
         "stage": desired_stage,
         "deployment_fraction": desired_fraction,
-        "current_anchor_price": _decimal_text(decision.anchor_price),
+        "current_anchor_price": desired_anchor,
         "stable_since": desired_stable_since,
         "confirmed_fills": evidence.confirmed_fills,
         "settlement_clusters": evidence.settlement_clusters,
-        "independent_depth_sides": sorted(
-            side.value for side in evidence.independent_depth_sides
-        ),
+        "independent_depth_sides": desired_depth_sides,
         "suspected_linked_activity": evidence.suspected_linked_activity,
-        "adverse_fill_times": [
-            {"side": side.value, "occurred_at": _utc_text(occurred_at)}
-            for side, occurred_at in evidence.adverse_fill_times
-        ],
-        "fee_spent_xch": _decimal_text(evidence.fee_spent_xch),
-        "realized_loss_xch": _decimal_text(evidence.realized_loss_xch),
-        "marked_inventory_loss_xch": _decimal_text(evidence.marked_inventory_loss_xch),
+        "adverse_fill_times": desired_adverse_fills,
+        "fee_spent_xch": desired_fee_spent,
+        "realized_loss_xch": desired_realized_loss,
+        "marked_inventory_loss_xch": desired_marked_loss,
         "updated_at": _utc_text(now),
     }
 

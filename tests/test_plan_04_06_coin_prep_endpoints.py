@@ -227,6 +227,36 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body.get("tier_size_drift"), self._DRIFT)
         self.assertFalse(body.get("complete"))
 
+    def test_active_bootstrap_status_bypasses_legacy_tier_drift(self):
+        campaign = {
+            "campaign_id": "campaign-status-1",
+            "revision": 7,
+            "asset_id": "a" * 64,
+        }
+        with (
+            patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+            patch.object(
+                coin_prep_blueprint,
+                "list_active_bootstrap_campaigns_for_asset",
+                return_value=[campaign],
+            ),
+            patch.object(
+                coin_prep_blueprint,
+                "_tier_size_drift_findings",
+                return_value=self._DRIFT,
+            ) as legacy_drift,
+            patch("database.get_coin_summary", return_value={}),
+        ):
+            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertEqual(body["coin_prep_mode"], "bootstrap_exact")
+        self.assertEqual(body["bootstrap_campaign_id"], "campaign-status-1")
+        self.assertEqual(body["bootstrap_campaign_revision"], 7)
+        self.assertEqual(body["tier_size_drift"], [])
+        self.assertNotEqual(body.get("reason"), "tier_size_drift")
+        legacy_drift.assert_not_called()
+
     def test_completed_tier_prep_rehydrates_asymmetric_xch_and_cat_counts(self):
         """A restart must validate each asset against its own saved tier plan."""
 

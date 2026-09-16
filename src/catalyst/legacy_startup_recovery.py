@@ -783,6 +783,79 @@ def recover_legacy_sage_reservations(
                 result["remaining"] += 1
         except Exception:
             result["remaining"] += 1
+
+    # A reconciliation implementation can fail closed after recording a
+    # conflict, then be corrected by a later build.  Recheck only the exact
+    # reconciliation operations named by the durable latch, using fresh
+    # read-only wallet evidence and the normal proof-bound commit path.  This
+    # also covers sibling intents that were named in the latch before the loop
+    # stopped at the first conflict and therefore have no journal blocker yet.
+    latch_reader = getattr(database_module, "get_runtime_safety_latch", None)
+    latch = latch_reader() if callable(latch_reader) else None
+    reconciliation_operations: list[tuple[str, str]] = []
+    if type(latch) is dict and latch.get("state") == "tripped":
+        raw_operation_ids = latch.get("blocking_operation_ids_json")
+        try:
+            operation_ids = json.loads(raw_operation_ids)
+        except (TypeError, ValueError):
+            operation_ids = None
+        if (
+            type(operation_ids) is not list
+            or len(operation_ids) > 256
+            or any(type(value) is not str or not value for value in operation_ids)
+        ):
+            raise RuntimeError("startup reconciliation latch inventory is malformed")
+        for operation_id in dict.fromkeys(operation_ids):
+            if not operation_id.startswith("reconcile:"):
+                continue
+            intent_id = operation_id.removeprefix("reconcile:")
+            if not intent_id or operation_id != f"reconcile:{intent_id}":
+                raise RuntimeError("startup reconciliation identity is malformed")
+            reconciliation_operations.append((operation_id, intent_id))
+
+    result["examined"] += len(reconciliation_operations)
+    terminal_outcomes = {
+        getattr(reconciliation_module, "CANCELLED_PROVEN", "CANCELLED_PROVEN"),
+        getattr(reconciliation_module, "FILLED_PROVEN", "FILLED_PROVEN"),
+        getattr(reconciliation_module, "EXPIRED_PROVEN", "EXPIRED_PROVEN"),
+    }
+    for index, (operation_id, intent_id) in enumerate(reconciliation_operations):
+        if time.monotonic() >= deadline:
+            result["remaining"] += len(reconciliation_operations) - index
+            break
+        try:
+            intent = database_module.get_offer_intent(intent_id)
+            if (
+                type(intent) is not dict
+                or intent.get("intent_id") != intent_id
+                or operation_id != f"reconcile:{intent_id}"
+                or intent.get("wallet_fingerprint_hash") != wallet_hash
+                or str(intent.get("network") or "").strip().lower() != safe_network
+            ):
+                raise ValueError("startup reconciliation authority binding is invalid")
+            if intent.get("lifecycle_state") == "terminal":
+                continue
+            evidence = reconciliation_module.load_authoritative_evidence(
+                intent, wallet_facade=wallet_facade
+            )
+            observed_at = (
+                evidence.get("observed_at") if type(evidence) is dict else None
+            )
+            reconciled = reconciliation_module.reconcile_offer(
+                intent_id,
+                evidence=evidence,
+                now=observed_at,
+            )
+            if (
+                type(reconciled) is dict
+                and reconciled.get("applied") is True
+                and reconciled.get("classification") in terminal_outcomes
+            ):
+                result["recovered"] += 1
+            else:
+                result["remaining"] += 1
+        except Exception:
+            result["remaining"] += 1
     try:
         _resolve_cleared_startup_latch(database_module)
     except Exception:

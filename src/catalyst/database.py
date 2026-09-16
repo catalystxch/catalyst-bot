@@ -503,6 +503,68 @@ def _canonical_intent_economics(
     )
 
 
+def offer_projection_matches_intent_economics(
+    projection: Any,
+    authority: Any,
+) -> bool:
+    """Return whether a legacy offer projection represents exact PREPARED atoms.
+
+    The offers table predates immutable intents and can contain the human quote
+    and pre-conversion sizes. Wallet creation truncates those values to XCH
+    mojos and the configured CAT precision. A projection is therefore
+    equivalent when each displayed size truncates to the immutable atomic
+    amount and the displayed price still reproduces the displayed XCH size to
+    within less than one mojo. This is an atomic equivalence check, not a
+    percentage tolerance: any economically observable difference is rejected.
+    """
+
+    if type(projection) is not dict or type(authority) is not dict:
+        return False
+    if any(
+        projection.get(column) != authority.get(column)
+        for column in ("side", "cat_asset_id", "tier")
+    ) or projection.get("fee_mojos_xch") != authority.get("fee_mojos_xch"):
+        return False
+    try:
+        side = authority["side"]
+        offered_text = authority["offered_amount_atomic"]
+        requested_text = authority["requested_amount_atomic"]
+        cat_decimals = authority["cat_decimals"]
+        canonical = _canonical_intent_economics(
+            side,
+            offered_text,
+            requested_text,
+            cat_decimals,
+        )
+        if canonical != tuple(
+            authority[column] for column in ("price_xch", "size_xch", "size_cat")
+        ):
+            return False
+        price_xch = Decimal(str(projection["price_xch"]))
+        size_xch = Decimal(str(projection["size_xch"]))
+        size_cat = Decimal(str(projection["size_cat"]))
+        if not all(
+            value.is_finite() and value > 0 for value in (price_xch, size_xch, size_cat)
+        ):
+            return False
+        offered_atomic = int(offered_text)
+        requested_atomic = int(requested_text)
+        exact_xch_atomic = offered_atomic if side == "buy" else requested_atomic
+        exact_cat_atomic = requested_atomic if side == "buy" else offered_atomic
+        xch_scale = Decimal(_XCH_MOJOS_PER_COIN)
+        cat_scale = Decimal(10) ** cat_decimals
+        if int(size_xch * xch_scale) != exact_xch_atomic:
+            return False
+        if int(size_cat * cat_scale) != exact_cat_atomic:
+            return False
+        one_mojo = Decimal(1) / xch_scale
+        if abs((price_xch * size_cat) - size_xch) >= one_mojo:
+            return False
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _authority_sql_intent_price(
     side: Any,
     offered_amount_atomic: Any,
@@ -25726,22 +25788,10 @@ def commit_offer_reconciliation(
         if legacy is not None and legacy["status"] != "open":
             raise ValueError("authoritative proof conflicts with legacy terminal state")
         if safe_classification == "FILLED_PROVEN" and legacy is not None:
-            projection_conflict = (
-                any(
-                    legacy.get(column) != immutable_economics[column]
-                    for column in ("side", "cat_asset_id", "tier")
-                )
-                or legacy.get("fee_mojos_xch") != immutable_economics["fee_mojos_xch"]
-            )
-            try:
-                projection_conflict = projection_conflict or any(
-                    _canonical_decimal_text(Decimal(str(legacy.get(column))))
-                    != immutable_economics[column]
-                    for column in ("price_xch", "size_xch", "size_cat")
-                )
-            except (ArithmeticError, TypeError, ValueError):
-                projection_conflict = True
-            if projection_conflict:
+            if not offer_projection_matches_intent_economics(
+                legacy,
+                immutable_economics,
+            ):
                 raise ValueError(
                     "legacy offer projection contradicts immutable economics"
                 )

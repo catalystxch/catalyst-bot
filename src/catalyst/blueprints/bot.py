@@ -106,6 +106,56 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
+def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
+    """Prove one active Bootstrap authority matches the live Sage identity.
+
+    Bootstrap offer sizes are derived from the immutable campaign plan, not
+    from the mutable legacy Smart Settings tier sizes.  The legacy drift gate
+    is therefore inapplicable only after this exact authority check succeeds.
+    Any missing, ambiguous, or stale evidence falls back to the legacy gate.
+    """
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    wallet_id = getattr(cfg_obj, "CAT_WALLET_ID", 0)
+    if len(asset_id) != 64 or type(wallet_id) is not int or wallet_id <= 0:
+        return False
+
+    try:
+        from database import list_active_bootstrap_campaigns_for_asset
+        from wallet import get_wallet_identity
+
+        campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+        if len(campaigns) != 1:
+            return False
+        campaign = campaigns[0]
+        identity = get_wallet_identity()
+    except Exception:
+        return False
+
+    if type(identity) is not dict or identity.get("success") is not True:
+        return False
+    if str(identity.get("backend") or "").strip().lower() != "sage":
+        return False
+    if identity.get("has_secrets") is not True:
+        return False
+
+    network = str(identity.get("network_id") or "").strip().lower()
+    if network.startswith("testnet"):
+        network = "testnet"
+    elif network != "mainnet":
+        return False
+
+    return all(
+        (
+            str(campaign.get("asset_id") or "").strip().lower() == asset_id,
+            str(campaign.get("network") or "").strip().lower() == network,
+            str(campaign.get("wallet_type") or "").strip().lower() == "sage",
+            campaign.get("wallet_fingerprint") == identity.get("fingerprint"),
+            campaign.get("wallet_id") == wallet_id,
+            str(campaign.get("status") or "").strip().lower() == "active",
+        )
+    )
+
+
 def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:
     """Only poll wallet RPC while an authorised bot run is active.
 
@@ -288,35 +338,43 @@ def api_bot_start():
     # split TX confirms. Coin prep's reclassify pass should have caught
     # this — if drift survives that, something's wrong and the bot
     # shouldn't trade until it's fixed.
-    try:
-        from coin_manager import check_tier_size_drift_standalone
-
-        _drift = (
-            check_tier_size_drift_standalone(
-                low_ratio=0.50, high_ratio=2.00, min_sample=2
-            )
-            or []
-        )
-        if _drift:
-            tier_size_drift = _drift
-            needs_coin_prep = True
-            coin_prep_reason = "tier_size_drift"
-            _summary = ", ".join(
-                f"{f['side']}/{f['tier']}={f['ratio']}× (n={f['coin_count']})"
-                for f in _drift
-            )
-            errors.append(
-                "Coin tier sizes don't match Smart Settings — "
-                "re-run Coin Prep before starting. Drift: " + _summary
-            )
-            coin_prep_error = errors[-1]
-    except Exception as _drift_err:
+    if _active_bootstrap_campaign_matches_wallet(cfg):
         log_event(
-            "warning",
-            "tier_drift_gate_failed",
-            f"Tier-drift gate skipped: {_drift_err}",
+            "info",
+            "bootstrap_tier_drift_not_applicable",
+            "Active Bootstrap campaign uses exact campaign-bound coin sizes; "
+            "legacy Smart Settings tier-drift gate is not applicable",
         )
-        warnings.append("Tier-drift gate skipped - check logs before trading")
+    else:
+        try:
+            from coin_manager import check_tier_size_drift_standalone
+
+            _drift = (
+                check_tier_size_drift_standalone(
+                    low_ratio=0.50, high_ratio=2.00, min_sample=2
+                )
+                or []
+            )
+            if _drift:
+                tier_size_drift = _drift
+                needs_coin_prep = True
+                coin_prep_reason = "tier_size_drift"
+                _summary = ", ".join(
+                    f"{f['side']}/{f['tier']}={f['ratio']}× (n={f['coin_count']})"
+                    for f in _drift
+                )
+                errors.append(
+                    "Coin tier sizes don't match Smart Settings — "
+                    "re-run Coin Prep before starting. Drift: " + _summary
+                )
+                coin_prep_error = errors[-1]
+        except Exception as _drift_err:
+            log_event(
+                "warning",
+                "tier_drift_gate_failed",
+                f"Tier-drift gate skipped: {_drift_err}",
+            )
+            warnings.append("Tier-drift gate skipped - check logs before trading")
 
     if getattr(cfg, "ENABLE_COIN_PREP", False):
         try:
