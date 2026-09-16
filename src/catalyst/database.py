@@ -1507,6 +1507,25 @@ CREATE INDEX IF NOT EXISTS idx_coin_prep_operations_recovery
     ON coin_prep_operations(outcome, prepared_at, operation_id);
 
 -- Simple key-value settings table (persists across restarts)
+-- Fee commitments are retained across approval versions and process restarts.
+CREATE TABLE IF NOT EXISTS fee_approvals (
+    approval_id TEXT PRIMARY KEY,
+    scope_sha256 TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    total_fee_mojos INTEGER NOT NULL CHECK(total_fee_mojos >= 0),
+    cancellation_reserve_mojos INTEGER NOT NULL CHECK(cancellation_reserve_mojos >= 0),
+    UNIQUE(scope_sha256, version)
+);
+CREATE TABLE IF NOT EXISTS approved_fee_reservations (
+    operation_id TEXT PRIMARY KEY,
+    approval_id TEXT NOT NULL REFERENCES fee_approvals(approval_id),
+    scope_sha256 TEXT NOT NULL,
+    plan_sha256 TEXT NOT NULL,
+    fee_mojos INTEGER NOT NULL CHECK(fee_mojos >= 0),
+    cancellation INTEGER NOT NULL CHECK(cancellation IN (0, 1))
+);
+
 CREATE TABLE IF NOT EXISTS bot_settings (
     key             TEXT PRIMARY KEY,
     value           TEXT NOT NULL,
@@ -19990,6 +20009,158 @@ def open_critical_write_connection(
     except BaseException:
         conn.close()
         raise
+
+
+def _fee_digest(value: Any) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ValueError("fee identity must be a lowercase SHA256 digest")
+    return value
+
+
+def _fee_amount(value: Any) -> int:
+    amount = _exact_integer(value, "fee_mojos")
+    if amount > 2**63 - 1:
+        raise ValueError("fee_mojos exceeds SQLite integer range")
+    return amount
+
+
+def create_fee_approval(
+    *,
+    scope_sha256: str,
+    plan_sha256: str,
+    total_fee_mojos: int,
+    cancellation_reserve_mojos: int,
+) -> Dict[str, Any]:
+    """Persist a new approval version; never discard earlier commitments."""
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    total = _fee_amount(total_fee_mojos)
+    reserve = _fee_amount(cancellation_reserve_mojos)
+    if reserve > total:
+        raise ValueError("cancellation reserve exceeds total fee ceiling")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        version = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM fee_approvals WHERE scope_sha256=?",
+            (scope,),
+        ).fetchone()[0]
+        approval_id = hashlib.sha256(f"{scope}:{plan}:{version}".encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
+            (approval_id, scope, plan, version, total, reserve),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_fee_approval(approval_id)
+
+
+def get_fee_approval(approval_id: str) -> Dict[str, Any]:
+    """Read approved ceiling and all held fees in its economic scope."""
+    approval_id = _fee_digest(approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        result = dict(row)
+        # Sum in Python to avoid SQLite SUM overflow for corrupt/large history.
+        result["committed_fee_mojos"] = sum(
+            item[0]
+            for item in conn.execute(
+                "SELECT fee_mojos FROM approved_fee_reservations WHERE scope_sha256=?",
+                (row["scope_sha256"],),
+            )
+        )
+        return result
+    finally:
+        conn.close()
+
+
+def reserve_approved_fee(
+    *,
+    approval_id: str,
+    scope_sha256: str,
+    plan_sha256: str,
+    operation_id: str,
+    fee_mojos: int,
+    cancellation: bool,
+) -> Dict[str, Any]:
+    """Atomically hold exact fees before dispatch; unknown effects stay held."""
+    approval_id = _fee_digest(approval_id)
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    operation = _fee_digest(operation_id)
+    fee = _fee_amount(fee_mojos)
+    if type(cancellation) is not bool:
+        raise ValueError("cancellation must be a boolean")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        approval = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if approval is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?", (scope,)
+        ).fetchone()[0]
+        if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
+            raise ValueError("FEE_APPROVAL_STALE")
+        existing = conn.execute(
+            "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["scope_sha256"] != scope
+                or existing["plan_sha256"] != plan
+                or existing["fee_mojos"] != fee
+                or existing["cancellation"] != int(cancellation)
+            ):
+                raise ValueError("FEE_OPERATION_CONFLICT")
+            conn.commit()
+            return dict(existing)
+        if approval["version"] != latest:
+            raise ValueError("FEE_APPROVAL_STALE")
+        reservations = conn.execute(
+            "SELECT fee_mojos, cancellation FROM approved_fee_reservations WHERE scope_sha256=?",
+            (scope,),
+        ).fetchall()
+        committed = sum(row[0] for row in reservations)
+        noncancel = sum(row[0] for row in reservations if not row[1])
+        if committed + fee > approval["total_fee_mojos"] or (
+            not cancellation
+            and noncancel + fee
+            > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
+        ):
+            raise ValueError("FEE_BUDGET_EXCEEDED")
+        conn.execute(
+            "INSERT INTO approved_fee_reservations VALUES (?, ?, ?, ?, ?, ?)",
+            (operation, approval_id, scope, plan, fee, int(cancellation)),
+        )
+        result = dict(
+            conn.execute(
+                "SELECT * FROM approved_fee_reservations WHERE operation_id=?",
+                (operation,),
+            ).fetchone()
+        )
+        conn.commit()
+        return result
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _stability_connection() -> sqlite3.Connection:
