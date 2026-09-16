@@ -59,17 +59,15 @@ def _canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
-    """Bind a trusted server snapshot to deterministic wallet/economic digests.
+_IDENTITY_FIELDS = (
+    "network", "wallet_type", "wallet_fingerprint", "wallet_id",
+    "xch_wallet_id", "asset_id", "ticker",
+)
 
-    This validator is not an HTTP authority boundary: callers must derive scope
-    and plan from the wallet/configuration, never accept them from a client.
-    A standalone session is server-persisted; a campaign uses its durable ID.
-    """
-    _closed_dict(scope, (
-        "network", "wallet_type", "wallet_fingerprint", "wallet_id",
-        "xch_wallet_id", "asset_id", "ticker", "session_id", "campaign_id",
-    ))
+
+def _canonical_fee_identity(scope: dict) -> dict:
+    """Validate the closed trusted wallet identity before persisting a session."""
+    _closed_dict(scope, _IDENTITY_FIELDS)
     if scope["wallet_type"] not in ("sage", "chia"):
         raise ValueError("fee contract wallet backend is unsupported")
     if type(scope["network"]) is not str or re.fullmatch(
@@ -84,6 +82,32 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
     _exact_int(scope["wallet_id"], 1)
     _exact_int(scope["xch_wallet_id"], 1)
     _digest(scope["asset_id"])
+    return dict(scope)
+
+
+def resolve_server_fee_scope(*, identity: dict, campaign_id: str | None = None) -> dict:
+    """Resolve durable ownership from trusted identity, never client authority.
+
+    Refresh and restart reuse a standalone session; campaigns retain their
+    existing durable identity. This does not create approval or wallet effects.
+    Session completion/new-generation transitions remain a separate open gate.
+    """
+    identity = _canonical_fee_identity(identity)
+    if campaign_id is not None:
+        return {**identity, "campaign_id": _digest(campaign_id), "session_id": None}
+    session = database.get_or_create_coin_prep_fee_session(identity_json=_canonical_json(identity))
+    return {**identity, "campaign_id": None, "session_id": session["session_id"]}
+
+
+def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
+    """Bind a trusted server snapshot to deterministic wallet/economic digests.
+
+    This validator is not an HTTP authority boundary: callers must derive scope
+    and plan from the wallet/configuration, never accept them from a client.
+    A standalone session is server-persisted; a campaign uses its durable ID.
+    """
+    _closed_dict(scope, (*_IDENTITY_FIELDS, "session_id", "campaign_id"))
+    _canonical_fee_identity({key: scope[key] for key in _IDENTITY_FIELDS})
     if (scope["session_id"] is None) == (scope["campaign_id"] is None):
         raise ValueError("fee contract requires exactly one economic scope identity")
     _digest(scope["session_id"] or scope["campaign_id"])
@@ -294,6 +318,12 @@ def approve_coin_prep_fees(
     persisted = canonical_fee_contract(
         json.loads(preview["scope_json"]), json.loads(preview["plan_json"])
     )
+    if persisted["scope"]["session_id"] is not None:
+        session = database.get_coin_prep_fee_session(persisted["scope"]["session_id"])
+        identity_json = _canonical_json({key: persisted["scope"][key] for key in _IDENTITY_FIELDS})
+        if (session["current_session_id"] != persisted["scope"]["session_id"]
+                or session["identity_json"] != identity_json):
+            raise ValueError("FEE_APPROVAL_STALE")
     from coin_prep_fee_funding import prepare_fee_inventory
     from coin_prep_fee_runtime import read_fee_economic_snapshot
 

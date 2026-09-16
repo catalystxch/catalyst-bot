@@ -1560,6 +1560,41 @@ CREATE INDEX IF NOT EXISTS idx_market_cache_type ON market_analysis_cache(analys
 
 
 FEE_SCHEMA_SQL = """
+-- A session owns a budget scope, not permission to dispatch any wallet effect.
+CREATE TABLE IF NOT EXISTS coin_prep_fee_sessions (
+    session_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(session_id)=64 AND session_id NOT GLOB '*[^0-9a-f]*'),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
+    generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>=1),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at)='integer' AND created_at>=0),
+    UNIQUE(identity_sha256, generation)
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_no_update
+BEFORE UPDATE ON coin_prep_fee_sessions BEGIN
+    SELECT RAISE(ABORT, 'fee sessions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_no_delete
+BEFORE DELETE ON coin_prep_fee_sessions BEGIN
+    SELECT RAISE(ABORT, 'fee sessions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_no_replace
+BEFORE INSERT ON coin_prep_fee_sessions
+WHEN EXISTS (SELECT 1 FROM coin_prep_fee_sessions WHERE session_id=NEW.session_id)
+BEGIN SELECT RAISE(ABORT, 'fee sessions cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_identity_guard
+BEFORE INSERT ON coin_prep_fee_sessions
+WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
+BEGIN SELECT RAISE(ABORT, 'fee session identity mismatch'); END;
+-- Later generations require a future journal-proven completion transition.
+-- Until that lifecycle is implemented, refresh/restart cannot renew a scope.
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_generation_guard
+BEFORE INSERT ON coin_prep_fee_sessions
+WHEN NEW.generation<>1 OR EXISTS (
+    SELECT 1 FROM coin_prep_fee_sessions WHERE identity_sha256=NEW.identity_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'fee session completion evidence required'); END;
 -- Approvals and exact fee holds are immutable; settlement is separate evidence.
 CREATE TABLE IF NOT EXISTS fee_approvals (
     approval_id TEXT PRIMARY KEY NOT NULL
@@ -4052,6 +4087,9 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "coin_prep_fee_sessions": {
+        "session_id", "identity_sha256", "identity_json", "generation", "created_at",
+    },
     "coin_prep_fee_previews": {
         "preview_id", "scope_sha256", "plan_sha256", "scope_json", "plan_json",
         "request_options_json", "quote_json", "observed_at", "expires_at",
@@ -5433,6 +5471,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
 
     _require_unique_key(conn, "offer_operation_journal", ("event_id",))
     _require_unique_key(conn, "fee_approvals", ("scope_sha256", "version"))
+    _require_unique_key(conn, "coin_prep_fee_sessions", ("identity_sha256", "generation"))
     _require_unique_key(conn, "coin_prep_fee_consents", ("approval_id",))
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
@@ -5990,6 +6029,31 @@ _BOOTSTRAP_SCHEMA_TABLES = frozenset(
         "bootstrap_participation",
     }
 )
+
+
+_FEE_APPROVAL_SCHEMA_MIGRATION_KEY = "coin-prep-fee-approval-schema"
+_FEE_APPROVAL_SCHEMA_VERSION = 1
+_FEE_APPROVAL_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"coin-prep-fee-approval-schema:v1:session-preview-consent-ledger"
+).hexdigest()
+_FEE_APPROVAL_SCHEMA_TABLES = frozenset({
+    "coin_prep_fee_sessions", "coin_prep_fee_previews", "coin_prep_fee_consents",
+    "fee_approvals", "approved_fee_reservations", "approved_fee_outcomes",
+})
+
+
+def _fee_approval_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?", (_FEE_APPROVAL_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (type(row["schema_version"]) is not int
+            or row["schema_version"] != _FEE_APPROVAL_SCHEMA_VERSION
+            or row["policy_sha256"] != _FEE_APPROVAL_SCHEMA_POLICY_SHA256):
+        raise RuntimeError("fee approval schema watermark contradicts schema policy")
+    return True
 
 
 def _stability_backfills_completed(conn: sqlite3.Connection) -> bool:
@@ -6862,6 +6926,9 @@ def _migrate_stability_schema() -> None:
         _normalize_existing_stability_timestamps(conn)
         backfills_completed = _stability_backfills_completed(conn)
         post_tibet_schema_completed = _post_tibet_schema_completed(conn)
+        fee_schema_completed = _fee_approval_schema_completed(conn)
+        if fee_schema_completed and missing_stability_tables & _FEE_APPROVAL_SCHEMA_TABLES:
+            raise RuntimeError("fee approval schema watermark contradicts schema")
         missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
         if post_tibet_schema_completed and missing_post_tibet_tables:
             raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
@@ -6892,6 +6959,7 @@ def _migrate_stability_schema() -> None:
             }
             | _POST_TIBET_SCHEMA_TABLES
             | _BOOTSTRAP_SCHEMA_TABLES
+            | _FEE_APPROVAL_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -6936,6 +7004,14 @@ def _migrate_stability_schema() -> None:
                     _POST_TIBET_SCHEMA_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
+            )
+        if not fee_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (_FEE_APPROVAL_SCHEMA_MIGRATION_KEY, _FEE_APPROVAL_SCHEMA_VERSION,
+                 _FEE_APPROVAL_SCHEMA_POLICY_SHA256, _stability_wall_clock()),
             )
         conn.commit()
     except Exception:
@@ -20432,6 +20508,62 @@ def create_fee_approval(
     finally:
         conn.close()
     return get_fee_approval(approval_id)
+
+
+def get_or_create_coin_prep_fee_session(*, identity_json: str) -> Dict[str, Any]:
+    """Resolve one durable server session without consent or wallet effects.
+
+    The trusted collector supplies a closed canonical wallet identity. A later
+    generation cannot be minted until journal-proven completion is implemented.
+    """
+    identity = json.loads(identity_json)
+    if (type(identity) is not dict or identity_json != json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), allow_nan=False)):
+        raise ValueError("fee session identity must be canonical")
+    digest = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM coin_prep_fee_sessions WHERE identity_sha256=? "
+            "ORDER BY generation DESC LIMIT 1", (digest,),
+        ).fetchone()
+        if row is None:
+            session_id = os.urandom(32).hex()
+            conn.execute(
+                "INSERT INTO coin_prep_fee_sessions VALUES (?, ?, ?, ?, ?)",
+                (session_id, digest, identity_json, 1, _fee_amount(int(time.time()))),
+            )
+        else:
+            if row["identity_json"] != identity_json:
+                raise ValueError("FEE_SESSION_IDENTITY_MISMATCH")
+            session_id = row["session_id"]
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_coin_prep_fee_session(session_id)
+
+
+def get_coin_prep_fee_session(session_id: str) -> Dict[str, Any]:
+    """Read canonical ownership; never grant spending or dispatch authority."""
+    session_id = _fee_digest(session_id)
+    conn = _stability_read_only_connection()
+    try:
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT session.*, (SELECT current.session_id FROM coin_prep_fee_sessions AS current "
+            "WHERE current.identity_sha256=session.identity_sha256 "
+            "ORDER BY current.generation DESC LIMIT 1) AS current_session_id "
+            "FROM coin_prep_fee_sessions AS session WHERE session.session_id=?", (session_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_SESSION_REQUIRED")
+        return dict(row)
+    finally:
+        conn.close()
 
 
 def store_coin_prep_fee_preview(

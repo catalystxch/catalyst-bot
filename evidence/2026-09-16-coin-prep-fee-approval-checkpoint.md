@@ -311,9 +311,45 @@ Primary schema evidence:
   enforcement. Full acceptance remains open. No live wallet mutation/package
   reload, Windows build, main merge or release occurred in this continuation.
 
+## Durable standalone session ownership (continuation)
+
+- Full approved scope, persistent goal and hourly heartbeat remain ACTIVE. Work
+  remains isolated on codex/coin-prep-fee-approval; unrelated artifacts and the
+  live package are preserved.
+- Closed canonical wallet identity resolves one server-generated standalone
+  session. BEGIN IMMEDIATE serializes concurrent collectors. Immutable ownership
+  records bind identity digests and survive refresh, genuine restart, terminal
+  history reset and observability-counter reset. Campaign scope does not mint a
+  standalone session. A changed plan in the same session retains earlier fee
+  commitments rather than resetting the allowance.
+- Confirmation requires current persisted standalone ownership before any
+  wallet read. Unknown or foreign session IDs cannot acquire consent. Ownership
+  readback validates canonical schema and grants no spending authority, worker,
+  fee hold or wallet effect.
+- Red receipts: initial missing-resolver assertions; a true restart of a pre-fee
+  installation reproduced `stability migration watermark contradicts schema`;
+  confirmation of an unowned preview failed to raise before the ownership gate.
+  Tests explicitly invalidate the init path cache for genuine migration restart.
+- Added a separate fee-schema completion watermark. Genuine upgrades preserve
+  old stability markers and held fees. Missing fee tables after marked migration
+  completion remain fatal; this is not permission to erase durable accounting.
+- Focused ownership/confirmation verification: 46 passed in 24.76s. Additional
+  unknown/foreign ownership cases: 2 passed in 3.16s. Expanded fee preview,
+  pricing, estimation, contracts, confirmation, HTTP/native, storage, consent,
+  ledger and recovery command: 300 passed in 88.52s. Ruff and git diff --check
+  passed. Independent bounded review found no Critical/Important/Minor finding
+  and independently reproduced the 46-test focused result.
+- Separate stability-schema, post-TibetSwap migration, database-unit and boost-
+  migration regressions: 205 passed in 84.91s.
+- Later-generation session completion is intentionally NOT implemented. A new
+  generation is refused until journal-proven completion transitions are added.
+  This is initial ownership groundwork, not the full lifecycle, public preview,
+  GUI or dispatch enforcement. No live wallet mutation, package reload, Windows
+  build, main merge or release occurred in this continuation.
+
 ## Outstanding acceptance gates
 
-Full staged runtime canonical plan preview and HTTP/native preview integration,
+Session completion lifecycle, full staged runtime canonical plan preview and HTTP/native preview integration,
 all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,
 full regression testing, fresh Windows build and live operator-approved fee acceptance
 remain incomplete. These tests do not prove the entire feature ready.

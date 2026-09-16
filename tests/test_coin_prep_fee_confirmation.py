@@ -54,6 +54,30 @@ def test_confirmation_uses_persisted_scope_and_current_wallet_economics(confirma
                          "approved_fee_reservations": 0, "coin_prep_operations": 0, "wallet_effect_claims": 0}
 
 
+@pytest.mark.parametrize("owner,reason", [("missing", "FEE_SESSION_REQUIRED"),
+                                         ("foreign", "FEE_APPROVAL_STALE")])
+def test_unowned_session_preview_cannot_be_confirmed(confirmation, owner, reason):
+    stored = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
+    scope = json.loads(stored["scope_json"])
+    scope["session_id"] = "d" * 64
+    if owner == "foreign":
+        identity = {key: scope[key] for key in (
+            "network", "wallet_type", "wallet_fingerprint", "wallet_id",
+            "xch_wallet_id", "asset_id", "ticker")}
+        identity["wallet_fingerprint"] = 3702373391
+        scope["session_id"] = service.resolve_server_fee_scope(identity=identity)["session_id"]
+    contract = service.canonical_fee_contract(scope, json.loads(stored["plan_json"]))
+    preview = database.store_coin_prep_fee_preview(
+        **{key: contract[key] for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")},
+        **{key: stored[key] for key in (
+            "request_options_json", "quote_json", "observed_at", "expires_at")},
+    )
+    with pytest.raises(ValueError, match=reason):
+        _confirm(confirmation, preview_id=preview["preview_id"])
+    assert confirmation["reads"] == []
+    assert all(count == 0 for count in _counts().values())
+
+
 @pytest.mark.parametrize("field,value", [("wallet_fingerprint", 3702373391),
                                           ("asset", "37" * 32), ("price", "0.02"), ("reserve", 1)])
 def test_changed_wallet_asset_price_or_reserve_cannot_confirm_old_plan(confirmation, field, value):

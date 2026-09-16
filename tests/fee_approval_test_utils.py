@@ -138,7 +138,7 @@ def confirmation(economic_reads, monkeypatch):
     state["xch"] = [_coin(1, str(112_000_001_000))]
     state["cat"] = [_coin(10001, "11000")]
     context = _economic_collect(state)
-    scope = {**context["identity"], "session_id": "d" * 64, "campaign_id": None}
+    scope = service.resolve_server_fee_scope(identity=context["identity"])
     monkeypatch.setattr(service, "_now", lambda: state.get("now", 1000))
     monkeypatch.setattr(database, "time", SimpleNamespace(time=lambda: state.get("now", 1000)))
     monkeypatch.setattr(service, "quote_fee", lambda cost, target_seconds: {
@@ -172,5 +172,4 @@ def _counts():
     return {table: database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("fee_approvals", "coin_prep_fee_consents", "approved_fee_reservations",
                           "coin_prep_operations", "wallet_effect_claims")}
-
 
