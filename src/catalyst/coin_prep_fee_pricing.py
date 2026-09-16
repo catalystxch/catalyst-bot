@@ -21,10 +21,11 @@ def _integer(value, minimum=0, maximum=MAX_ATOMIC_AMOUNT):
     return type(value) is int and minimum <= value <= maximum
 
 
-def is_current_fee_quote(quote, cost, target_seconds):
+def is_current_fee_quote(quote, cost, target_seconds, *, now=None):
     """Recheck original provenance/age without renewing a cached quote."""
     if type(quote) is not dict or quote.get("available") is not True:
         return False
+    now = _now() if now is None else now
     observed = quote.get("observed_at")
     expires = quote.get("expires_at")
     return (
@@ -34,7 +35,7 @@ def is_current_fee_quote(quote, cost, target_seconds):
         and quote.get("source") in ("coinset", "full_node_rpc")
         and _integer(observed) and _integer(expires)
         and expires == observed + QUOTE_MAX_AGE_SECONDS
-        and observed <= _now() < expires
+        and _integer(now) and observed <= now < expires
     )
 
 

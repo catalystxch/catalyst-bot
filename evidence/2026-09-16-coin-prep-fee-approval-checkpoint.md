@@ -282,6 +282,35 @@ Primary schema evidence:
   package and genuine operator-budget live acceptance remain incomplete. No
   live package reload, wallet mutation, main merge or release was performed.
 
+## Matched exact-effect quote preservation (continuation)
+
+- The existing persistent goal and hourly heartbeat remain ACTIVE; the full
+  approved scope is unchanged. No duplicate goal or automation was created.
+- The internal stage aggregator now accepts collector-owned matched quotes.
+  It preserves the fee/cost-consistent quote from exact unsigned pricing rather
+  than making a second request that could sever the inspected effect's fee from
+  its displayed cost. Remaining stages still request fresh network guidance.
+  Original source/observation/expiry survive aggregation and persistence.
+- Cost, target, source, exact integer fee and original 60-second lifetime are
+  revalidated. Invalid matched guidance makes the preview unconfirmable without
+  substituting another quote. Readback drops extra fields and derives XCH text
+  from integer mojos using Decimal. No effect authority or dispatch is created.
+- Red receipt: 15 new missing-interface failures, 13 prior preview tests passed.
+  Initial green preview receipt: 28 passed in 9.44s. Expanded verification then
+  exposed inconsistent clocks between aggregation and validation (11 failed,
+  263 passed). A single-case confirmation reproduced FEE_ESTIMATE_UNAVAILABLE.
+  The shared validator now accepts a trusted internal observation time and the
+  aggregator supplies its current clock per check; no client timestamp is accepted.
+- Corrected focused confirmation/preview/pricing receipt: 54 passed in 13.03s.
+  Fresh expanded preview/pricing/estimation/contracts/confirmation/HTTP-native/
+  storage/consent/ledger/recovery command: 274 passed in 62.09s. Ruff and git
+  diff --check passed. Independent bounded review found no Critical/Important/
+  Minor finding, including the observation-clock correction.
+- This is internal Task 3 groundwork, not a completed multistage runtime preview,
+  stable standalone-session lifecycle, public preview route, GUI or dispatch
+  enforcement. Full acceptance remains open. No live wallet mutation/package
+  reload, Windows build, main merge or release occurred in this continuation.
+
 ## Outstanding acceptance gates
 
 Full staged runtime canonical plan preview and HTTP/native preview integration,

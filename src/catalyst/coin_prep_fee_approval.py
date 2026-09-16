@@ -147,6 +147,7 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
 def estimate_coin_prep_fee_preview(
     *, scope: dict, economic_plan: dict, stages: list,
     fee_funding_mojos: int, request_options: dict,
+    stage_quotes: dict | None = None,
 ) -> dict:
     """Price trusted server-planned stages and persist an unapproved preview.
 
@@ -154,6 +155,9 @@ def estimate_coin_prep_fee_preview(
     and explicit projected costs/count ranges for future stages. This function
     never creates effect claims, consent, a worker, signatures or submissions.
     HTTP/native callers must use the server collector, not supply these inputs.
+    A collector can preserve a batch's cost/fee-consistent quote in stage_quotes;
+    replacing that quote would sever its relationship to the inspected effect.
+    Preserved guidance is revalidated, not refreshed or used as dispatch consent.
     """
     contract = canonical_fee_contract(scope, economic_plan)
     funding = _exact_int(fee_funding_mojos)
@@ -180,6 +184,10 @@ def estimate_coin_prep_fee_preview(
             raise ValueError("exact unsigned stage must have an exact count")
         if type(stage["cancellation"]) is not bool:
             raise ValueError("fee preview cancellation classification is invalid")
+    if stage_quotes is None:
+        stage_quotes = {}
+    if type(stage_quotes) is not dict or not set(stage_quotes) <= stage_ids:
+        raise ValueError("fee preview matched quotes have unsupported stage identities")
     now = _exact_int(_now())
     prep = cancel = minimum = 0
     count_min = count_max = 0
@@ -187,8 +195,25 @@ def estimate_coin_prep_fee_preview(
     priced_stages = []
     observations = []
     expiries = []
+    from coin_prep_fee_pricing import is_current_fee_quote
+
     for stage in stages:
-        quote = quote_fee(stage["cost"], target_seconds=contract["plan"]["target_seconds"])
+        quote = (stage_quotes[stage["stage_id"]] if stage["stage_id"] in stage_quotes else
+                 quote_fee(stage["cost"], target_seconds=contract["plan"]["target_seconds"]))
+        if not is_current_fee_quote(
+            quote, stage["cost"], contract["plan"]["target_seconds"], now=_now(),
+        ):
+            # Invalid matched guidance must not fall back to a different quote.
+            # Do not persist a malformed usable fee or untrusted extra fields.
+            quote = {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE",
+                     "fee_mojos": None}
+        else:
+            quote = {key: quote[key] for key in (
+                "available", "source", "cost", "target_seconds", "fee_mojos",
+                "observed_at", "expires_at",
+            )}
+            quote["reason"] = "network_fee_estimate"
+            quote["fee_xch"] = format(Decimal(quote["fee_mojos"]) / Decimal(10**12), "f")
         priced_stages.append({**stage, "quote": quote})
         if quote["available"] is not True:
             available = False
