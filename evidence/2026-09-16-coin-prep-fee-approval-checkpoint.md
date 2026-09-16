@@ -139,6 +139,45 @@ No wallet actions, package reload, main merge or release occurred in this contin
   acceptance remain open. The legacy cost-only helper is not effect proof, and
   the running package has not been changed. No main merge or release occurred.
 
+## Fresh Sage wallet snapshot boundary (continuation)
+
+- Confirmed the existing persistent goal and hourly heartbeat remain ACTIVE;
+  no duplicate goal or automation was created. Full approved scope is unchanged.
+- The new read-only collector verifies current identity before and after reads,
+  actual CAT metadata/precision, unchanged economic configuration, selectable
+  inventory and its declared total, stable coin-ID pagination, existing checked
+  receive address and DB reserve/reconciliation protection. It never signs,
+  submits, launches prep, resets counters or creates fee/effect reservations.
+- Official pinned Sage v0.13.0 `CoinRecord`, `Amount`, `TokenRecord`, request and
+  endpoint implementations exposed a fixture/collector mismatch: selectable
+  records carry P2 addresses and integer-or-string atomic amounts, not raw parent
+  and outer puzzle fields. Complete schema-correct fixtures reproduced rejection
+  of valid inventory before the correction. Raw coin/effect identity must still
+  be proven by the separate executable unsigned inspector before dispatch.
+- After the schema correction, 11 regressions failed because missing, malformed,
+  truncated or changed totals and unstable ordering were incorrectly accepted.
+  The collector now requires a bounded exact total, full page counts, consistent
+  totals and strictly ascending unique normalized IDs. Empty inventory is valid
+  only with a zero total. A further failing regression covered Sage's optional
+  native-asset metadata (`asset_id=null`); it no longer hides the actual CAT.
+- Expanded snapshot, unsigned, preview, consent, estimation, ledger/recovery,
+  storage/contract and planner run: 257 passed in 55.23s before the final optional
+  native-metadata correction. Fresh final snapshot run: 48 passed in 15.75s.
+  Ruff and `git diff --check` passed after that correction. These are scoped
+  regression receipts, not full-feature/build/live acceptance or independent
+  review of the whole implementation.
+- Runtime economics/stage collection, HTTP/native preview and consent endpoints,
+  all-path final-fee dispatch enforcement, GUI confirmation, fresh package and
+  genuine-budget live acceptance remain open. No live wallet/package action,
+  main merge or release occurred.
+
+Primary schema evidence:
+- https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage-api/src/records/coin.rs
+- https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage-api/src/types/amount.rs
+- https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage-api/src/records/token.rs
+- https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage-api/src/requests/data.rs
+- https://github.com/xch-dev/sage/blob/v0.13.0/crates/sage/src/endpoints/data.rs
+
 ## Outstanding acceptance gates (unchanged)
 
 Runtime canonical plan preview, HTTP/native bridge consent,

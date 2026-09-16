@@ -72,7 +72,8 @@ Verified core substeps (do not imply the runtime collector/routes below are comp
 - [x] Immutable preview/consent persistence provides atomic concurrent confirmation, fresh-preview checks, protected and total budget checks, reset/restart preservation and duplicate/conflicting-consent handling.
 - [x] Read-only current-economic consent validation rejects generic ledger approvals, changed contracts and superseded versions; quote expiry does not refund holds. Readback explicitly grants no dispatch authority.
 - [x] Pure atomic target conversion and exact batch descriptions/actions are shared with the worker. Real unsigned inspection binds executable inputs/additions/fee/CAT2 identity/destinations to the validated summary before exposing exact cost. This helper is not yet a runtime preview endpoint or dispatch guard.
-- [ ] Runtime collector must still derive these trusted inputs from current wallet/configuration and prove actual unsigned costs. No HTTP/native endpoint accepts caller-supplied scope, plan, stage costs or funding.
+- [x] Read-only wallet snapshot boundary verifies current Sage identity, actual CAT precision/metadata, complete selectable inventory totals and stable bounded pagination, current non-mutating receive address, configuration changes and protected DB coins. Sage v0.13 schemas are represented by complete fixtures. This inventory is not executable-effect proof.
+- [ ] Runtime economic collector must still derive the shared plan, staged funding/counts and actual unsigned costs from this snapshot. No HTTP/native endpoint accepts caller-supplied scope, plan, stage costs or funding.
 
 - [ ] Write failing API/bridge tests that a preview leaves balances, resets, journals and worker launch untouched, and approval requires a current matching server-owned preview.
 

@@ -1251,6 +1251,13 @@ def get_wallet_balance(wallet_id: int):
     return _wallet_adapter.get_wallet_balance(wallet_id)
 
 
+def get_cat_metadata_snapshot():
+    """Read actual Sage CAT metadata without configured discovery fallbacks."""
+    if WALLET_TYPE != "sage":
+        return {"success": False, "reason": "WALLET_BACKEND_UNSUPPORTED"}
+    return _wallet_adapter.rpc("get_cats", {}, timeout=10)
+
+
 def get_current_key():
     """Return the active key through the backend-neutral read-only facade."""
 
