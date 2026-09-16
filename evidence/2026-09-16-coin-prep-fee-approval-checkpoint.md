@@ -347,6 +347,40 @@ Primary schema evidence:
   GUI or dispatch enforcement. No live wallet mutation, package reload, Windows
   build, main merge or release occurred in this continuation.
 
+## Executable future-stage cost projection (continuation)
+
+- Added an internal standard-P2/CAT2 projection component for future stages
+  whose real input coins do not exist yet. It executes an explicit synthetic
+  CLVM profile through the wallet cost facade, without RPC, signing or submission.
+  Synthetic spends are never returned, persisted as effect evidence or treated
+  as dispatch authority. Exact real unsigned effects still require final pricing.
+- Closed count bounds and recognized module/key checks refuse unknown puzzles,
+  malformed profiles and unusable consensus costs. The disclosed assumptions
+  include maximum-width amounts, one 32-byte hint per output, concurrent-spend
+  mesh and linked CAT rings with maximum-width nonzero subtotals. This is an
+  envelope for the represented standard shape, not arbitrary delegated programs,
+  extra memos or wallet extensions; integration must enforce that distinction.
+- Initial missing-module tests observed 14 failures. Fixture investigation found
+  that uncurrying the published P2 module stripped its pre-curried constants;
+  reconstructing the complete module fixed the fixture. Initial model: 14 passed.
+  Boundary regressions then observed three failures (aggregate output limit,
+  over-consensus cost and output integer width), followed by 22 passing tests.
+- Independent review identified a valid linked CAT2 counterexample: 80,743,184
+  executable cost versus the independent-ring projection of 80,647,152. A focused
+  regression observed that underestimation before changing the model. Linked
+  rings and concentrated returns fix it, with a new explicit assumption.
+- Final focused verification: 32 passed in 1.69s, including independently rebuilt
+  first/last/distributed linked CAT returns with 2, 3 and 23 CAT inputs, smaller
+  actual native spends, maximum native/bulk-cancel profiles and fail-closed bounds.
+  Independent re-review reproduced 32 passing tests and found no remaining issue.
+- Ruff and git diff --check passed. This component is not yet wired to the staged
+  runtime collector or public preview; no full-feature readiness claim is made.
+  Fresh expanded projection, wallet snapshot, pricing, unsigned effect, batch
+  planner, funding, preview, confirmation and HTTP/native regressions after the
+  CAT correction: 285 passed in 70.73s.
+  No live wallet mutation, package reload, Windows build, main merge or release
+  occurred during this continuation. The full goal and hourly loop remain active.
+
 ## Outstanding acceptance gates
 
 Session completion lifecycle, full staged runtime canonical plan preview and HTTP/native preview integration,
