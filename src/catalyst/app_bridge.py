@@ -921,6 +921,19 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:approve_coin_prep_fees")
+    def approve_coin_prep_fees(self, body=None):
+        """Record consent through the shared HTTP handler, without prep launch."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/coin-prep/fee-approval", method="POST",
+            content_type="application/json", data=json.dumps(body),
+        ):
+            resp = api_server.api_coin_prep_fee_approval()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:trigger_coin_prep")
     def trigger_coin_prep(self, _body=None):
         """Trigger coin prep. Maps to POST /api/coin-prep/trigger."""
@@ -1883,6 +1896,7 @@ _APP_BRIDGE_API_PROPERTY = vars(AppBridge)["api"]
 _APP_BRIDGE_API_SLOT = vars(AppBridge)["_api"]
 _APP_BRIDGE_MUTATION_METHODS = {
     "activate_boost",
+    "approve_coin_prep_fees",
     "apply_config",
     "begin_startup",
     "cancel_all_offers",

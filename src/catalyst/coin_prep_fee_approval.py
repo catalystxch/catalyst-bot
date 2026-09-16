@@ -250,6 +250,53 @@ def estimate_coin_prep_fee_preview(
     return {**result, "preview_id": saved["preview_id"]}
 
 
+def approve_coin_prep_fees(
+    *, preview_id: str, maximum_fee_mojos: int, cancellation_reserve_mojos: int,
+) -> dict:
+    """Record deliberate confirmation against fresh server-owned economics.
+
+    Only the persisted preview supplies choices and its standalone session ID.
+    Current wallet/asset/campaign/outputs and retained funding are read again;
+    caller hashes, plans, costs or balances are never accepted. This creates
+    consent only, not a fee hold, effect claim, worker or dispatch permission.
+    """
+    _digest(preview_id)
+    _exact_int(maximum_fee_mojos)
+    _exact_int(cancellation_reserve_mojos)
+    if cancellation_reserve_mojos > maximum_fee_mojos:
+        raise ValueError("FEE_BUDGET_INSUFFICIENT")
+    preview = database.get_coin_prep_fee_preview(preview_id)
+    persisted = canonical_fee_contract(
+        json.loads(preview["scope_json"]), json.loads(preview["plan_json"])
+    )
+    from coin_prep_fee_funding import prepare_fee_inventory
+    from coin_prep_fee_runtime import read_fee_economic_snapshot
+
+    context = read_fee_economic_snapshot(json.loads(preview["request_options_json"]))
+    campaign = context["campaign"]
+    if (campaign is None) != (persisted["scope"]["campaign_id"] is None):
+        raise ValueError("FEE_APPROVAL_STALE")
+    scope = {**context["identity"],
+             "campaign_id": campaign["campaign_id"] if campaign is not None else None,
+             "session_id": persisted["scope"]["session_id"] if campaign is None else None}
+    current = canonical_fee_contract(scope, context["recipe"]["economic_plan"])
+    if any(current[key] != preview[key] for key in (
+            "scope_sha256", "plan_sha256", "scope_json", "plan_json")):
+        raise ValueError("FEE_APPROVAL_STALE")
+    funding = prepare_fee_inventory(
+        context["snapshot"], context["recipe"]["targets"],
+        current["plan"]["reserve_floors_mojos"],
+    )
+    result = database.approve_coin_prep_fee_preview(
+        preview_id=preview_id, scope_sha256=current["scope_sha256"],
+        plan_sha256=current["plan_sha256"], maximum_fee_mojos=maximum_fee_mojos,
+        cancellation_reserve_mojos=cancellation_reserve_mojos,
+        current_fee_funding_mojos=funding["fee_funding_mojos"],
+        current_principal_funded=funding["principal_funded"],
+    )
+    return {**result, "dispatch_authorized": False}
+
+
 def validate_fee_consent(*, approval_id: str, scope: dict, economic_plan: dict) -> dict:
     """Read consent against trusted current economics, never grant dispatch.
 

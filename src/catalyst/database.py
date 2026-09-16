@@ -20486,24 +20486,34 @@ def get_coin_prep_fee_preview(preview_id: str) -> Dict[str, Any]:
 
 def approve_coin_prep_fee_preview(
     *, preview_id: str, scope_sha256: str, plan_sha256: str,
-    maximum_fee_mojos: int, cancellation_reserve_mojos: int, now: int,
+    maximum_fee_mojos: int, cancellation_reserve_mojos: int, now: Optional[int] = None,
+    current_fee_funding_mojos: Optional[int] = None,
+    current_principal_funded: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Atomically bind one deliberate preview confirmation to one approval.
 
     The service must re-observe wallet/plan/funding before calling this helper.
     Duplicate consent returns accounting state, never permission to redispatch.
+    Runtime callers omit ``now`` so freshness is sampled after the write lock
+    is acquired. An explicit timestamp is for trusted deterministic callers.
     """
     preview_id = _fee_digest(preview_id)
     scope = _fee_digest(scope_sha256)
     plan = _fee_digest(plan_sha256)
     maximum = _fee_amount(maximum_fee_mojos)
     reserve = _fee_amount(cancellation_reserve_mojos)
-    now = _fee_amount(now)
+    now = _fee_amount(now) if now is not None else None
+    current_funding = (_fee_amount(current_fee_funding_mojos)
+                       if current_fee_funding_mojos is not None else None)
+    if current_principal_funded is not None and type(current_principal_funded) is not bool:
+        raise ValueError("principal funding must be an exact boolean")
     if reserve > maximum:
         raise ValueError("FEE_BUDGET_INSUFFICIENT")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if now is None:
+            now = _fee_amount(int(time.time()))
         preview = conn.execute(
             "SELECT * FROM coin_prep_fee_previews WHERE preview_id=?", (preview_id,)
         ).fetchone()
@@ -20522,6 +20532,8 @@ def approve_coin_prep_fee_preview(
             approval_id = prior["approval_id"]
             idempotent = True
         else:
+            if current_principal_funded is False:
+                raise ValueError("FEE_FUNDING_INSUFFICIENT")
             if not preview["observed_at"] <= now < preview["expires_at"]:
                 raise ValueError("FEE_PREVIEW_STALE")
             quote = json.loads(preview["quote_json"])
@@ -20537,7 +20549,9 @@ def approve_coin_prep_fee_preview(
                 maximum - totals["committed_fee_mojos"] < prep + cancellation
             ):
                 raise ValueError("FEE_BUDGET_INSUFFICIENT")
-            if maximum - totals["committed_fee_mojos"] > funding:
+            if maximum - totals["committed_fee_mojos"] > min(
+                funding, current_funding if current_funding is not None else funding
+            ):
                 raise ValueError("FEE_FUNDING_INSUFFICIENT")
             approval_id = _insert_fee_approval(conn, scope, plan, maximum, reserve)
             conn.execute(

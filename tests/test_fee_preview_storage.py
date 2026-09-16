@@ -81,6 +81,40 @@ def test_confirmation_creates_one_bound_durable_consent(ledger):
     assert context["plan_json"] == '{"outputs":[1000]}'
 
 
+def test_confirmation_checks_fresh_funding_inside_the_approval_transaction(ledger):
+    preview = _store(ledger)
+    with pytest.raises(ValueError, match="FEE_FUNDING_INSUFFICIENT"):
+        _approve(ledger, preview, current_fee_funding_mojos=79)
+    assert ledger.get_connection().execute("SELECT COUNT(*) FROM fee_approvals").fetchone()[0] == 0
+    result = _approve(ledger, preview, current_fee_funding_mojos=80)
+    assert result["remaining_fee_mojos"] == 80
+
+
+def test_unfunded_principal_blocks_new_consent_even_when_all_fees_are_zero(ledger):
+    preview = _store(ledger, quote_json='{"available":true,"estimated_preparation_fee_mojos":0,'
+                    '"estimated_cancellation_fee_mojos":0,"fee_funding_mojos":0}')
+    with pytest.raises(ValueError, match="FEE_FUNDING_INSUFFICIENT"):
+        _approve(ledger, preview, maximum_fee_mojos=0, cancellation_reserve_mojos=0,
+                 current_fee_funding_mojos=0, current_principal_funded=False)
+    assert ledger.get_connection().execute("SELECT COUNT(*) FROM fee_approvals").fetchone()[0] == 0
+
+
+def test_existing_consent_readback_does_not_require_selectable_principal_again(ledger):
+    preview = _store(ledger)
+    first = _approve(ledger, preview)
+    second = _approve(ledger, preview, current_fee_funding_mojos=0, current_principal_funded=False)
+    assert second["approval_id"] == first["approval_id"]
+    assert second["idempotent"] is True
+
+
+@pytest.mark.parametrize("funding", [True, 1.5, -1, "100"])
+def test_confirmation_cannot_coerce_fresh_funding(ledger, funding):
+    preview = _store(ledger)
+    with pytest.raises(ValueError):
+        _approve(ledger, preview, current_fee_funding_mojos=funding)
+    assert ledger.get_connection().execute("SELECT COUNT(*) FROM fee_approvals").fetchone()[0] == 0
+
+
 def test_concurrent_duplicate_confirmations_create_one_approval_version(ledger):
     preview = _store(ledger)
     with ThreadPoolExecutor(max_workers=2) as pool:

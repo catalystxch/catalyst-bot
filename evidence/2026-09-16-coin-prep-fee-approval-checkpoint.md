@@ -243,9 +243,48 @@ Primary schema evidence:
   and genuine operator-budget live acceptance remain open. Available internal
   evidence never grants dispatch permission. Current live package is preserved.
 
+## Server-owned runtime confirmation and HTTP/native consent (continuation)
+
+- The persistent goal and existing hourly heartbeat remain ACTIVE with the full
+  approved scope. No duplicate goal or automation was created.
+- Confirmation accepts a persisted server preview ID plus the operator's exact
+  maximum and protected cancellation allowance. It rereads current verified
+  wallet identity, actual asset, economic outputs, campaign and retained funding;
+  caller-supplied scope, plan, cost or funding cannot substitute for that evidence.
+  New consent checks principal and fresh fee funding together with prior scope
+  commitments inside the serialized database transaction.
+- Focused failing tests exposed two confirmation defects before their fixes:
+  pending inputs must not prevent idempotent readback of an existing consent,
+  and a quote can expire while waiting for the database write lock. Existing
+  consent now returns held/spent accounting without granting redispatch, while
+  runtime freshness is sampled after BEGIN IMMEDIATE has acquired the lock.
+- Added authenticated, mutation-protected HTTP and native approval surfaces.
+  They require a closed payload, reject malformed/coerced amounts and client
+  economic authority, and create no fee hold, effect claim, worker or wallet
+  transaction. Both return decimal-string monetary accounting. Two failing
+  tests at 9,007,199,254,740,993 mojos reproduced the previous JavaScript JSON
+  precision hazard before the shared response boundary was corrected.
+- Combined-test failures were traced to imported test fixtures retaining a
+  different file's project-module instances under conftest isolation. Shared
+  helpers now live in a non-test utility module and bind current dependencies
+  at setup. An earlier diagnostic setup performed read-only real Sage metadata
+  reads because its transport mock targeted the wrong module instance; no
+  signing, submission or production database mutation occurred. Reverse-order
+  isolation smoke: 8 passed. This test-harness issue is not a live app defect.
+- Fresh final confirmation/API/storage/consent/ledger/recovery/wallet snapshot/
+  preview/funding/pricing regressions: 253 passed in 78.47s. Separate local API
+  guard/economics/unsigned preview/estimation/transaction fee regressions:
+  139 passed in 10.31s. HTTP/native confirmation alone: 35 passed in 14.83s.
+  Ruff and git diff --check passed. Independent bounded review found no
+  remaining Critical/Important/Minor finding in this scoped groundwork.
+- Full staged projection and public preview, frozen dispatch adoption and all-
+  path exact holds, authoritative settlement integration, GUI/E2E, fresh Windows
+  package and genuine operator-budget live acceptance remain incomplete. No
+  live package reload, wallet mutation, main merge or release was performed.
+
 ## Outstanding acceptance gates
 
-Runtime canonical plan preview, HTTP/native bridge consent,
+Full staged runtime canonical plan preview and HTTP/native preview integration,
 all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,
 full regression testing, fresh Windows build and live operator-approved fee acceptance
 remain incomplete. These tests do not prove the entire feature ready.

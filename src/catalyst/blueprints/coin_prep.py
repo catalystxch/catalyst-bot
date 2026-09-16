@@ -62,6 +62,50 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+@bp.route("/api/coin-prep/fee-approval", methods=["POST"])
+def api_coin_prep_fee_approval():
+    """Record explicit fee consent, never launch or dispatch Coin Prep."""
+    import re
+    from coin_prep_fee_approval import MAX_ATOMIC_AMOUNT, approve_coin_prep_fees
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    keys = {"preview_id", "maximum_fee_mojos", "cancellation_reserve_mojos"}
+    invalid = {"success": False, "reason": "FEE_APPROVAL_REQUEST_INVALID",
+               "dispatch_authorized": False}
+    if (type(body) is not dict or set(body) != keys
+            or type(body["preview_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None):
+        return jsonify(invalid), 400
+    amounts = {}
+    for key in ("maximum_fee_mojos", "cancellation_reserve_mojos"):
+        value = body[key]
+        # Canonical atomic strings are lossless across JavaScript's JSON
+        # boundary. No float/bool/scientific/whitespace/leading-zero coercion.
+        if type(value) is str and re.fullmatch(r"0|[1-9][0-9]{0,18}", value):
+            value = int(value)
+        if type(value) is not int or not 0 <= value <= MAX_ATOMIC_AMOUNT:
+            return jsonify(invalid), 400
+        amounts[key] = value
+    try:
+        result = approve_coin_prep_fees(preview_id=body["preview_id"], **amounts)
+        # Keep atomic accounting lossless through HTTP and PyWebView JSON;
+        # JavaScript numbers cannot represent the full supported mojo range.
+        result = {key: str(value) if key.endswith("_mojos") else value
+                  for key, value in result.items()}
+        return jsonify({**result, "success": True})
+    except ValueError as exc:
+        reason = str(exc)
+        if re.fullmatch(r"FEE_[A-Z_]+", reason):
+            return jsonify({"success": False, "reason": reason,
+                            "dispatch_authorized": False}), 409
+        slog("COIN_PREP", "Fee confirmation rejected invalid server context", level="warning")
+    except Exception:
+        slog("COIN_PREP", "Fee confirmation could not read current server context", level="error")
+    return jsonify({"success": False, "reason": "FEE_APPROVAL_UNAVAILABLE",
+                    "dispatch_authorized": False}), 503
+
+
 def _coin_prep_wallet_snapshot(
     get_wallet_balance,
     get_spendable_coins,
