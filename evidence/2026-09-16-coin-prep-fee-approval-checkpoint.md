@@ -381,9 +381,61 @@ Primary schema evidence:
   No live wallet mutation, package reload, Windows build, main merge or release
   occurred during this continuation. The full goal and hourly loop remain active.
 
+## Bounded staged runtime preview and HTTP/native surfaces (continuation)
+
+- Connected the verified current economic/wallet snapshot to the exact first
+  unsigned batch and its original cost/fee-consistent network quote. Future
+  native preparation and individual cancellation protection are explicitly
+  projected standard-P2/CAT2 profiles, not prebuilt future transactions.
+- Native repeated denominations may need intermediate in-bundle spends. The
+  projected native envelope now includes disclosed ephemeral spend coverage.
+  Four new profile tests were observed failing before implementation; all 36
+  projection tests subsequently passed.
+- Cancellation cover uses frozen replacement output counts (including spares),
+  with the explicit assumption `one_individual_cancel_per_prepared_replacement`.
+  Fee-coin face value remains retained principal, separate from fee spending.
+- Added guarded POST `/api/coin-prep/fee-preview` and the native bridge surface.
+  Choices only are accepted; scope, costs, stages and funding cannot be supplied
+  by clients. Readback recursively serializes mojo integers as decimal strings,
+  including nested stage quotes. Preview creates no consent, fee reservation,
+  operation journal, signing, submission or worker launch.
+- Initial staged tests observed seven missing-service failures. Initial API/
+  native tests observed 14 missing-surface failures and four passing safety
+  guards. Missing explicit native access classification was then caught during
+  collection and corrected without weakening the inventory check.
+- A real unsigned bare-hex Sage response reproduced a projection-template parse
+  failure (`bytes object is expected to start with 0x`). Normalize only the
+  already-executable-validated spend copy for chia_rs JSON parsing. Original
+  wallet effect data and evidence remain unchanged. The focused regression then
+  passed. Slow final quotes cannot renew observation age or persist a usable
+  stale preview. Buy-only and sell-only cases exclude irrelevant protection.
+- Bounded independent review identified an understated future-native count:
+  total funds could suffice while the largest 50 roots could not fund the
+  pending native principal. An actual CLVM/Sage-summary fixture reproduced the
+  omission with 61 roots of 2b mojos and 112b frozen native principal.
+- Future amount analysis now excludes protected/reused roots, removes the
+  consumed CAT fee root and incorporates its validated fee change. If needed,
+  the preview prices 50-root-to-one-output bounded consolidation prerequisites,
+  with upper count ceil((N-50)/49), before the final projected native stage.
+  All upper-count fees are covered. Positive merge and final funding checks
+  refuse unrepresentable progression; no future selectable IDs are invented.
+  Optional projected work can show lower count zero without dropping the upper
+  budget. Exact unsigned stages still require a positive exact count.
+- Verification covers one prerequisite, three prerequisites and a >50-root
+  inventory where no consolidation is needed. Independent re-review found no
+  remaining finding in the bounded deltas and reproduced 97 focused passes.
+  Full dispatch/compatibility support is NOT established by this projection.
+- Final broad regression command covered preview API, confirmation API, staged
+  runtime, projection, wallet snapshot, pricing, funding, aggregation, canonical
+  contracts, confirmation, unsigned preview, batch planner, Sage executable
+  effects and Bootstrap mutation protection: 368 passed in 87.51s, exit 0.
+  Ruff checks over all changed Python files and git diff --check passed.
+  No live wallet mutation, package reload, Windows build, main merge or release
+  occurred. The full goal and hourly loop remain active.
+
 ## Outstanding acceptance gates
 
-Session completion lifecycle, full staged runtime canonical plan preview and HTTP/native preview integration,
+Session completion lifecycle, remaining compatibility/prerequisite-family canonical plan preview,
 all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,
 full regression testing, fresh Windows build and live operator-approved fee acceptance
 remain incomplete. These tests do not prove the entire feature ready.

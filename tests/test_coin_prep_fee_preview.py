@@ -61,6 +61,16 @@ def _preview(context, funding=100):
     )
 
 
+def test_optional_projected_stage_exposes_zero_lower_count_but_retains_full_upper_budget(context):
+    context[2][0]["transaction_count_min"] = 0
+    result = _preview(context)
+    assert result["available"] is True
+    assert result["preparation_transaction_count_min"] == 1
+    assert result["preparation_transaction_count_max"] == 3
+    assert result["estimated_minimum_fee_mojos"] == 15
+    assert result["estimated_total_fee_mojos"] == 80
+
+
 def test_projected_upper_count_prices_total_without_charging_fee_principal(context):
     result = _preview(context)
     assert result["available"] is True

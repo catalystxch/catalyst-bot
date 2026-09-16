@@ -62,6 +62,43 @@ bp = Blueprint("coin_prep", __name__)
 _coin_prep_trigger_lock = threading.Lock()
 
 
+def _fee_json_amounts(value):
+    """Preserve atomic amounts even inside staged quotes at JS boundaries."""
+    if type(value) is dict:
+        return {key: str(item) if key.endswith("_mojos") and type(item) is int
+                else _fee_json_amounts(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_fee_json_amounts(item) for item in value]
+    return value
+
+
+@bp.route("/api/coin-prep/fee-preview", methods=["POST"])
+def api_coin_prep_fee_preview():
+    """Estimate a server-owned staged plan without consent or wallet effects."""
+    import re
+    from coin_prep_fee_approval import preview_coin_prep_fees
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if type(body) is not dict:
+        return jsonify({"success": False, "reason": "FEE_PREP_OPTIONS_INVALID",
+                        "dispatch_authorized": False}), 400
+    try:
+        result = preview_coin_prep_fees(body)
+        return jsonify(_fee_json_amounts({**result, "success": result["available"] is True}))
+    except ValueError as exc:
+        reason = str(exc)
+        if re.fullmatch(r"FEE_[A-Z_]+", reason):
+            status = 400 if reason == "FEE_PREP_OPTIONS_INVALID" else 409
+            return jsonify({"success": False, "reason": reason,
+                            "dispatch_authorized": False}), status
+        slog("COIN_PREP", "Fee preview rejected invalid server context", level="warning")
+    except Exception:
+        slog("COIN_PREP", "Fee preview could not read current server context", level="error")
+    return jsonify({"success": False, "available": False, "reason": "FEE_PREVIEW_UNAVAILABLE",
+                    "dispatch_authorized": False}), 503
+
+
 @bp.route("/api/coin-prep/fee-approval", methods=["POST"])
 def api_coin_prep_fee_approval():
     """Record explicit fee consent, never launch or dispatch Coin Prep."""
@@ -91,9 +128,7 @@ def api_coin_prep_fee_approval():
         result = approve_coin_prep_fees(preview_id=body["preview_id"], **amounts)
         # Keep atomic accounting lossless through HTTP and PyWebView JSON;
         # JavaScript numbers cannot represent the full supported mojo range.
-        result = {key: str(value) if key.endswith("_mojos") else value
-                  for key, value in result.items()}
-        return jsonify({**result, "success": True})
+        return jsonify(_fee_json_amounts({**result, "success": True}))
     except ValueError as exc:
         reason = str(exc)
         if re.fullmatch(r"FEE_[A-Z_]+", reason):

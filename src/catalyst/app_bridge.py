@@ -921,6 +921,19 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:preview_coin_prep_fees")
+    def preview_coin_prep_fees(self, body=None):
+        """Read-only staged estimate via the same guarded HTTP handler."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/coin-prep/fee-preview", method="POST",
+            content_type="application/json", data=json.dumps(body),
+        ):
+            resp = api_server.api_coin_prep_fee_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -1908,6 +1921,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "download_splash_setup",
     "fresh_start",
     "live_config",
+    "preview_coin_prep_fees",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

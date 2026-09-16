@@ -78,17 +78,18 @@ def _unavailable(reason):
 
 
 def project_standard_cost(*, native_puzzle, cat_puzzle=None, xch_inputs,
-                          cat_inputs, xch_outputs):
+                          cat_inputs, xch_outputs, native_ephemeral_outputs=0):
     """Execute a conservative, disclosed profile, never a flat fee guess.
 
     This envelope covers the standard delegated-condition shape represented
     here, not arbitrary delegated programs, extra memos or wallet extensions.
     Such changes require a new profile or an exact unsigned cost.
     """
-    counts = (xch_inputs, cat_inputs, xch_outputs)
+    counts = (xch_inputs, cat_inputs, xch_outputs, native_ephemeral_outputs)
     if (any(type(value) is not int for value in counts)
             or not 1 <= xch_inputs <= 50 or not 0 <= cat_inputs <= 50
-            or not 1 <= xch_outputs <= 128 or xch_outputs + cat_inputs > 128):
+            or not 1 <= xch_outputs <= 128 or xch_outputs + cat_inputs > 128
+            or not 0 <= native_ephemeral_outputs <= xch_outputs):
         raise ValueError("FEE_PROJECTION_PROFILE_INVALID")
     try:
         _standard(native_puzzle)
@@ -111,13 +112,21 @@ def project_standard_cost(*, native_puzzle, cat_puzzle=None, xch_inputs,
     outputs = [[51, _tag(f"projected-native-output:{i}"),
                 native_total // (xch_outputs + 1) - i, [_tag("projected-hint")]]
                for i in range(xch_outputs)]
+    ephemerals = [Coin(native_coins[0].name(), native_puzzle.get_tree_hash(), outputs[i][2])
+                  for i in range(native_ephemeral_outputs)]
+    roots += ephemerals
     reserve_fee = native_total - sum(output[2] for output in outputs)
     spends = []
     for index, coin in enumerate(native_coins):
         conditions = mesh(coin)
         if index == 0:
-            conditions += outputs + [[52, reserve_fee]]
+            conditions += [[51, native_puzzle.get_tree_hash(), output[2], output[3]]
+                           if i < native_ephemeral_outputs else output
+                           for i, output in enumerate(outputs)] + [[52, reserve_fee]]
         solution = Program.to([[], (1, conditions), []])
+        spends.append(CoinSpend(coin, native_puzzle, solution).to_json_dict())
+    for index, coin in enumerate(ephemerals):
+        solution = Program.to([[], (1, mesh(coin) + [outputs[index]]), []])
         spends.append(CoinSpend(coin, native_puzzle, solution).to_json_dict())
     subtotal = 0
     for index, (parent, coin) in enumerate(zip(cat_parents, cat_coins)):
@@ -145,6 +154,8 @@ def project_standard_cost(*, native_puzzle, cat_puzzle=None, xch_inputs,
     if type(cost) is not int or not 0 < cost <= 11_000_000_000:
         return _unavailable("FEE_PROJECTION_COST_UNAVAILABLE")
     return {"available": True, "cost": cost, "cost_kind": "projected",
-            "dispatch_authorized": False, "input_count_max": len(roots),
+            "dispatch_authorized": False, "input_count_max": xch_inputs + cat_inputs,
+            "ephemeral_spend_count_max": native_ephemeral_outputs,
             "output_count_max": xch_outputs + cat_inputs,
-            "assumptions": list(_ASSUMPTIONS)}
+            "assumptions": list(_ASSUMPTIONS) + (
+                ["native_output_ephemeral_spends"] if native_ephemeral_outputs else [])}

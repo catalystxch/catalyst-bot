@@ -289,3 +289,182 @@ def read_next_prep_fee_snapshot(request_options: dict) -> dict:
                     "reason": "FEE_ESTIMATE_UNAVAILABLE", "dispatch_authorized": False}
     return {**context, "funding": funding, "pricing": pricing,
             "available": pricing["available"], "reason": pricing["reason"], "dispatch_authorized": False}
+
+
+def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> dict:
+    """Collect exact current batch, future XCH stage and cancellation cover.
+
+    Projections price observed standard wallet templates, never synthetic effect
+    evidence. Cancellation protection covers one individually priced cancel per
+    prepared replacement root; cheaper bulk cancellation does not enlarge this
+    allowance. This is an estimate of cover, not a promise all cancels are needed.
+    Bounded prerequisite/compatibility planning remains fail-closed when the
+    shared exact batch planner cannot represent the current workflow.
+    """
+    from chia_rs import CoinSpend
+    from coin_prep_batch_plan import BatchPlan, PlannedOutput
+    from coin_prep_fee_projection import project_standard_cost
+    from coin_prep_fee_pricing import is_current_fee_quote
+    from coin_prep_unsigned import inspect_batch_unsigned
+
+    context = read_next_prep_fee_snapshot(request_options)
+    if context["available"] is not True:
+        return context
+    plan = context["pricing"]["plan"]
+    stages, quotes, profiles, templates = [], {}, {}, {}
+    target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
+
+    def unavailable(reason):
+        return {**context, "available": False, "reason": reason, "dispatch_authorized": False}
+
+    def remember(inspection):
+        if inspection.get("available") is not True:
+            return False
+        validated = inspection["validated_unsigned"]
+        assets = {row["coin_id"].removeprefix("0x").lower():
+                  "cat" if row.get("asset") and row["asset"].get("asset_id") else "xch"
+                  for row in validated["summary"]["inputs"]}
+        for raw in validated["coin_spends"]:
+            # Sage permits bare hex; executable inspection already validated
+            # this exact bundle. chia_rs JSON parsing additionally requires 0x.
+            normalized = {**raw, "coin": dict(raw["coin"])}
+            for key in ("puzzle_reveal", "solution"):
+                normalized[key] = "0x" + normalized[key].removeprefix("0x")
+            for key in ("parent_coin_info", "puzzle_hash"):
+                normalized["coin"][key] = "0x" + normalized["coin"][key].removeprefix("0x")
+            spend = CoinSpend.from_json_dict(normalized)
+            templates.setdefault(assets[spend.coin.name().hex()], spend.puzzle_reveal)
+        return True
+
+    if plan.transaction_required:
+        inspection = context["pricing"]["inspection"]
+        remember(inspection)
+        name = f"prep_{plan.asset}"
+        stages.append({"stage_id": name, "cost": inspection["cost"], "cost_kind": "exact_unsigned",
+                       "transaction_count_min": 1, "transaction_count_max": 1, "cancellation": False})
+        quotes[name] = context["pricing"]["quote"]
+
+    cancellation_counts = {asset: sum(t.asset == asset and t.purpose == "replacement"
+                                     for t in context["recipe"]["targets"])
+                           for asset in ("xch", "cat")}
+    missing_native = [t for t in context["recipe"]["targets"] if t.asset == "xch"
+                      and (t.asset, t.ordinal) not in plan.reused_target_ids]
+    need_future_native = plan.transaction_required and plan.asset == "cat" and missing_native
+    needed_templates = ({"xch"} if need_future_native or any(cancellation_counts.values()) else set())
+    if cancellation_counts["cat"]:
+        needed_templates.add("cat")
+    for asset in sorted(needed_templates - templates.keys()):
+        coin = next((c for c in context["funding"]["snapshot"].coins
+                     if c.asset == asset and c.selectable and not c.protected), None)
+        if coin is None:
+            return unavailable("FEE_PROJECTION_PUZZLE_UNSUPPORTED")
+        # A read-only self-return probe learns the actual template, including
+        # when a reused cohort needs no preparation transaction of its own.
+        probe = BatchPlan(asset, (coin.coin_id,), None,
+                          (PlannedOutput(asset, "change", coin.amount_mojos, -1),), (), (), 0)
+        try:
+            inspected = inspect_batch_unsigned(probe, context["receive_address"],
+                                               context["identity"]["asset_id"])
+            if not remember(inspected):
+                return unavailable("FEE_PROJECTION_PUZZLE_UNSUPPORTED")
+        except (ValueError, TypeError, KeyError):
+            return unavailable("FEE_PROJECTION_PUZZLE_UNSUPPORTED")
+
+    def add_projection(name, *, xch_inputs, cat_inputs, xch_outputs,
+                       count=1, count_min=1, cancellation=False, ephemerals=0):
+        try:
+            projection = project_standard_cost(
+                native_puzzle=templates.get("xch"), cat_puzzle=templates.get("cat"),
+                xch_inputs=xch_inputs, cat_inputs=cat_inputs, xch_outputs=xch_outputs,
+                native_ephemeral_outputs=ephemerals,
+            )
+        except ValueError:
+            return "FEE_PROJECTION_PROFILE_INVALID"
+        if projection["available"] is not True:
+            return projection["reason"]
+        try:
+            quote = quote_provider(projection["cost"], target_seconds=target_seconds)
+        except Exception:
+            return "FEE_ESTIMATE_UNAVAILABLE"
+        if not is_current_fee_quote(quote, projection["cost"], target_seconds):
+            return "FEE_ESTIMATE_UNAVAILABLE"
+        stages.append({"stage_id": name, "cost": projection["cost"], "cost_kind": "projected",
+                       "transaction_count_min": count_min, "transaction_count_max": count,
+                       "cancellation": cancellation})
+        quotes[name] = quote
+        profiles[name] = {key: projection[key] for key in (
+            "input_count_max", "output_count_max", "ephemeral_spend_count_max", "assumptions")}
+        if cancellation:
+            profiles[name]["assumptions"].append("one_individual_cancel_per_prepared_replacement")
+        return None
+
+    if need_future_native:
+        # Confirmation changes the fee root to change, never a known selectable
+        # future coin. Bound possible roots and explicitly include intermediate
+        # spends for repeated denominations, plus possible change collision.
+        inputs = sum(c.asset == "xch" and c.selectable and not c.protected
+                     and c.coin_id not in plan.reused_coin_ids
+                     for c in context["funding"]["snapshot"].coins)
+        outputs = len(missing_native) + 1
+        reason = add_projection("prep_xch", xch_inputs=min(50, max(1, inputs)),
+                                cat_inputs=0, xch_outputs=outputs, ephemerals=outputs)
+        if reason:
+            return unavailable(reason)
+        # Inspect only future amounts, not invented selectable coin identities.
+        # The CAT fee root is consumed; its validated change replaces it only
+        # after confirmation. The later exact batch must refresh that evidence.
+        future_amounts = [c.amount_mojos for c in context["funding"]["snapshot"].coins
+                          if c.asset == "xch" and c.selectable and not c.protected
+                          and c.coin_id not in plan.reused_coin_ids
+                          and c.coin_id != plan.fee_source_id]
+        future_amounts += [o.amount_mojos for o in plan.outputs
+                           if o.asset == "xch" and o.purpose == "fee_change"]
+        principal = sum(t.amount_mojos for t in missing_native)
+        largest = sum(sorted(future_amounts, reverse=True)[:50])
+        if largest < principal + quotes["prep_xch"]["fee_mojos"]:
+            if len(future_amounts) <= 50:
+                return unavailable("FEE_FUTURE_NATIVE_FUNDING_UNAVAILABLE")
+            native_stage = stages.pop()
+            # Each bounded 50-root -> 1-root prerequisite reduces the number
+            # of roots by 49. This upper cover includes every such fee even
+            # when the target can be funded before all roots are consolidated.
+            maximum = (len(future_amounts) - 50 + 48) // 49
+            reason = add_projection("prep_xch_consolidation", xch_inputs=50,
+                                    cat_inputs=0, xch_outputs=1, count=maximum,
+                                    count_min=1 if largest < principal else 0)
+            if reason:
+                return unavailable(reason)
+            profiles["prep_xch_consolidation"]["assumptions"].append(
+                "bounded_native_50_to_1_prerequisites")
+            stages.append(native_stage)
+            fee = quotes["prep_xch_consolidation"]["fee_mojos"]
+            for _ in range(maximum):
+                future_amounts.sort(reverse=True)
+                merged = sum(future_amounts[:50]) - fee
+                if merged <= 0:
+                    return unavailable("FEE_FUTURE_NATIVE_FUNDING_UNAVAILABLE")
+                future_amounts = [merged, *future_amounts[50:]]
+            if sum(future_amounts) < principal + quotes["prep_xch"]["fee_mojos"]:
+                return unavailable("FEE_FUTURE_NATIVE_FUNDING_UNAVAILABLE")
+    for asset in ("xch", "cat"):
+        if cancellation_counts[asset]:
+            reason = add_projection(f"cancel_{asset}", xch_inputs=2 if asset == "xch" else 1,
+                                    cat_inputs=1 if asset == "cat" else 0,
+                                    xch_outputs=2 if asset == "xch" else 1,
+                                    count=cancellation_counts[asset], cancellation=True)
+            if reason:
+                return unavailable(reason)
+    # All network and unsigned construction has finished: do not persist a
+    # confirmable preview if provider latency concealed a wallet/plan change.
+    try:
+        after = read_fee_economic_snapshot(context["request_options"])
+    except ValueError:
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED") from None
+    if any(after[key] != context[key] for key in (
+            "identity", "configuration", "receive_address", "snapshot", "recipe", "campaign", "fee_pool")):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    if any(not is_current_fee_quote(quote, stage["cost"], target_seconds)
+           for stage in stages for quote in (quotes[stage["stage_id"]],)):
+        return unavailable("FEE_ESTIMATE_UNAVAILABLE")
+    return {**context, "stages": stages, "stage_quotes": quotes, "stage_profiles": profiles,
+            "available": True, "dispatch_authorized": False}

@@ -148,6 +148,23 @@ def test_cat_projection_covers_observed_linked_ring_cost(puzzles):
     assert _project(puzzles, cat_inputs=2)["cost"] >= 80_743_184
 
 
+def test_future_native_duplicate_outputs_include_disclosed_ephemeral_spends(puzzles):
+    baseline = _project(puzzles, xch_outputs=4)
+    result = _project(puzzles, xch_outputs=4, native_ephemeral_outputs=4)
+    assert result["available"] is True
+    assert result["cost"] > baseline["cost"]
+    assert result["input_count_max"] == 1
+    assert result["ephemeral_spend_count_max"] == 4
+    assert "native_output_ephemeral_spends" in result["assumptions"]
+    assert result["dispatch_authorized"] is False
+
+
+@pytest.mark.parametrize("count", [True, -1, 5])
+def test_invalid_ephemeral_profile_cannot_be_coerced_or_unbounded(puzzles, count):
+    with pytest.raises(ValueError, match="FEE_PROJECTION_PROFILE_INVALID"):
+        _project(puzzles, xch_outputs=4, native_ephemeral_outputs=count)
+
+
 @pytest.mark.parametrize("cat_count", [2, 3, 23])
 @pytest.mark.parametrize("distribution", ["first", "last", "distributed"])
 def test_projection_covers_real_linked_cat_return_distributions(

@@ -172,6 +172,7 @@ def estimate_coin_prep_fee_preview(
     *, scope: dict, economic_plan: dict, stages: list,
     fee_funding_mojos: int, request_options: dict,
     stage_quotes: dict | None = None,
+    stage_profiles: dict | None = None,
 ) -> dict:
     """Price trusted server-planned stages and persist an unapproved preview.
 
@@ -200,8 +201,8 @@ def estimate_coin_prep_fee_preview(
             raise ValueError("fee preview stage identity is invalid or duplicated")
         stage_ids.add(stage["stage_id"])
         _exact_int(stage["cost"], 1)
-        lower = _exact_int(stage["transaction_count_min"], 1)
-        upper = _exact_int(stage["transaction_count_max"], lower)
+        lower = _exact_int(stage["transaction_count_min"], 0 if stage["cost_kind"] == "projected" else 1)
+        upper = _exact_int(stage["transaction_count_max"], max(1, lower))
         if stage["cost_kind"] not in ("projected", "exact_unsigned"):
             raise ValueError("fee preview stage cost is unproven")
         if stage["cost_kind"] == "exact_unsigned" and lower != upper:
@@ -212,6 +213,19 @@ def estimate_coin_prep_fee_preview(
         stage_quotes = {}
     if type(stage_quotes) is not dict or not set(stage_quotes) <= stage_ids:
         raise ValueError("fee preview matched quotes have unsupported stage identities")
+    if stage_profiles is None:
+        stage_profiles = {}
+    if type(stage_profiles) is not dict or not set(stage_profiles) <= stage_ids:
+        raise ValueError("fee preview profiles have unsupported stage identities")
+    for profile in stage_profiles.values():
+        _closed_dict(profile, ("input_count_max", "output_count_max",
+                               "ephemeral_spend_count_max", "assumptions"))
+        for key in ("input_count_max", "output_count_max", "ephemeral_spend_count_max"):
+            _exact_int(profile[key], 0, 10000)
+        if (type(profile["assumptions"]) is not list or len(profile["assumptions"]) > 16
+                or any(type(a) is not str or re.fullmatch(r"[a-z0-9_]{1,64}", a) is None
+                       for a in profile["assumptions"])):
+            raise ValueError("fee preview profile assumptions are invalid")
     now = _exact_int(_now())
     prep = cancel = minimum = 0
     count_min = count_max = 0
@@ -238,7 +252,10 @@ def estimate_coin_prep_fee_preview(
             )}
             quote["reason"] = "network_fee_estimate"
             quote["fee_xch"] = format(Decimal(quote["fee_mojos"]) / Decimal(10**12), "f")
-        priced_stages.append({**stage, "quote": quote})
+        priced = {**stage, "quote": quote}
+        if stage["stage_id"] in stage_profiles:
+            priced["profile"] = stage_profiles[stage["stage_id"]]
+        priced_stages.append(priced)
         if quote["available"] is not True:
             available = False
         else:
@@ -297,6 +314,31 @@ def estimate_coin_prep_fee_preview(
         quote_json=_canonical_json(result), observed_at=observed, expires_at=expires,
     )
     return {**result, "preview_id": saved["preview_id"]}
+
+
+def preview_coin_prep_fees(request_options: dict) -> dict:
+    """Derive the complete read-only preview from trusted runtime state.
+
+    Client inputs are choices only. No worker, consent, journal, fee reservation
+    or wallet effect is created; persisted previews and session ownership do not
+    authorize spending. Every dispatch still needs a fresh exact transaction.
+    """
+    from coin_prep_fee_runtime import read_staged_prep_fee_snapshot
+
+    context = read_staged_prep_fee_snapshot(request_options, quote_provider=quote_fee)
+    if context["available"] is not True:
+        return {"available": False, "reason": context["reason"], "dispatch_authorized": False}
+    campaign = context["campaign"]
+    scope = resolve_server_fee_scope(identity=context["identity"],
+                                    campaign_id=campaign["campaign_id"] if campaign else None)
+    result = estimate_coin_prep_fee_preview(
+        scope=scope, economic_plan=context["recipe"]["economic_plan"],
+        stages=context["stages"], stage_quotes=context["stage_quotes"],
+        stage_profiles=context["stage_profiles"],
+        fee_funding_mojos=context["funding"]["fee_funding_mojos"],
+        request_options=context["request_options"],
+    )
+    return {**result, "dispatch_authorized": False}
 
 
 def approve_coin_prep_fees(
