@@ -433,6 +433,46 @@ Primary schema evidence:
   No live wallet mutation, package reload, Windows build, main merge or release
   occurred. The full goal and hourly loop remain active.
 
+## Atomic consent/journal-bound final prep hold (continuation)
+
+- Added internal `database.reserve_coin_prep_fee_for_dispatch`, with deliberate
+  preview-backed consent and latest version, exact PREPARED operation, bound
+  constructed outputs and active undispatched effect claim checked inside the
+  same IMMEDIATE transaction as the fee hold. A generic ledger approval is not
+  operator consent. Original quote freshness is sampled after acquiring the
+  write lock; manual, unavailable, malformed, future or expired quotes cannot
+  hold a fee. The quoted fee must equal the journal's exact final fee.
+- Holds preserve the cancellation allowance, match wallet backend/fingerprint/
+  network/CAT asset and normalize exact source and external fee cohorts.
+  Existing or previously dispatched operations cannot gain replay authority.
+  Two competing workers produce one hold. Existing ledger arithmetic is shared
+  without changing its conservative accounting and idempotent read semantics.
+- Initial fixture investigation found a test clock double omitted `time_ns`,
+  causing claim setup failure. Corrected only the clock fixture. The complete
+  initial 15-test red run then failed on the missing atomic boundary. Initial
+  implementation passed all 15; added contention/identity/version checks extend
+  verification of existing implemented branches rather than new functionality.
+- Independent review found that the existing prepared-operation API did not
+  bind its separate external-fee cohort to the claim. A normal-API isolated
+  fixture reproduced a target for fee coin 2 with a claim for fee coin 9;
+  the focused regression failed with DID NOT RAISE. The hold now rejects the
+  mismatch before insertion. Success tests caught bare-hex versus canonical
+  `0x` source comparisons during that fix; normalized both expected cohorts.
+  No production safety check or test assertion was weakened.
+- Fresh broad regression run: 190 passed in 80.39s, exit 0, covering the new
+  hold, ledger/recovery, preview/confirmation, consent validation/storage/session
+  ownership and existing direct batches. Fresh independent re-review reproduced
+  58 hold/ledger/recovery passes, exit 0, with no remaining findings in this
+  bounded delta. Fresh stability-schema suite: 133 passed in 47.45s, exit 0.
+  Ruff and git diff --check passed.
+- This is a fee-hold primitive, NOT completed dispatch enforcement: it never
+  signs/submits and always returns dispatch_authorized=false. The trusted fee
+  service must validate actual unsigned executable cost/effects and frozen
+  economics/configuration before calling it, then use the existing effect fence.
+  Worker integration, every compatibility family, cancellation dispatch and
+  automatic recovery/accounting remain unfinished. No live wallet mutation,
+  reload, package build, main merge or release occurred.
+
 ## Outstanding acceptance gates
 
 Session completion lifecycle, remaining compatibility/prerequisite-family canonical plan preview,

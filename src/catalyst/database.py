@@ -20768,52 +20768,153 @@ def reserve_approved_fee(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        approval = conn.execute(
-            "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
-        ).fetchone()
-        if approval is None:
-            raise ValueError("FEE_APPROVAL_REQUIRED")
-        latest = conn.execute(
-            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?", (scope,)
-        ).fetchone()[0]
-        if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
-            raise ValueError("FEE_APPROVAL_STALE")
-        existing = conn.execute(
-            "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
-        ).fetchone()
-        if existing is not None:
-            if (
-                existing["scope_sha256"] != scope
-                or existing["plan_sha256"] != plan
-                or existing["fee_mojos"] != fee
-                or existing["cancellation"] != int(cancellation)
-            ):
-                raise ValueError("FEE_OPERATION_CONFLICT")
-            conn.commit()
-            return {**dict(existing), "idempotent": True}
-        if approval["version"] != latest:
-            raise ValueError("FEE_APPROVAL_STALE")
-        totals = _fee_scope_totals(conn, scope)
-        committed = totals["committed_fee_mojos"]
-        noncancel = totals["noncancellation_committed_fee_mojos"]
-        if committed + fee > approval["total_fee_mojos"] or (
-            not cancellation
-            and noncancel + fee
-            > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
-        ):
-            raise ValueError("FEE_BUDGET_EXCEEDED")
-        conn.execute(
-            "INSERT INTO approved_fee_reservations VALUES (?, ?, ?, ?, ?, ?)",
-            (operation, approval_id, scope, plan, fee, int(cancellation)),
-        )
-        result = dict(
-            conn.execute(
-                "SELECT * FROM approved_fee_reservations WHERE operation_id=?",
-                (operation,),
-            ).fetchone()
-        )
+        result = _reserve_approved_fee_locked(
+            conn, approval_id, scope, plan, operation, fee, cancellation)
         conn.commit()
-        return {**result, "idempotent": False}
+        return result
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _reserve_approved_fee_locked(conn, approval_id, scope, plan, operation, fee, cancellation):
+    """Shared ledger arithmetic; caller owns the IMMEDIATE write transaction."""
+    approval = conn.execute(
+        "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
+    ).fetchone()
+    if approval is None:
+        raise ValueError("FEE_APPROVAL_REQUIRED")
+    latest = conn.execute(
+        "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?", (scope,)
+    ).fetchone()[0]
+    if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
+        raise ValueError("FEE_APPROVAL_STALE")
+    existing = conn.execute(
+        "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
+    ).fetchone()
+    if existing is not None:
+        if (existing["scope_sha256"] != scope or existing["plan_sha256"] != plan
+                or existing["fee_mojos"] != fee or existing["cancellation"] != int(cancellation)):
+            raise ValueError("FEE_OPERATION_CONFLICT")
+        return {**dict(existing), "idempotent": True}
+    if approval["version"] != latest:
+        raise ValueError("FEE_APPROVAL_STALE")
+    totals = _fee_scope_totals(conn, scope)
+    if totals["committed_fee_mojos"] + fee > approval["total_fee_mojos"] or (
+        not cancellation and totals["noncancellation_committed_fee_mojos"] + fee
+        > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
+    ):
+        raise ValueError("FEE_BUDGET_EXCEEDED")
+    conn.execute(
+        "INSERT INTO approved_fee_reservations VALUES (?, ?, ?, ?, ?, ?)",
+        (operation, approval_id, scope, plan, fee, int(cancellation)),
+    )
+    result = conn.execute(
+        "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
+    ).fetchone()
+    return {**dict(result), "idempotent": False}
+
+
+def reserve_coin_prep_fee_for_dispatch(
+    *, approval_id: str, scope_sha256: str, plan_sha256: str,
+    operation_id: str, final_quote: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Hold a final prep fee against consent and its undispatched exact journal.
+
+    Internal fee-service boundary, NOT a public authority or dispatch permit.
+    The service must first inspect the actual unsigned effect/cost, match frozen
+    economics and reverify live wallet/configuration. This transaction closes
+    the consent/version, quote-expiry, budget and journal races before signing.
+    Expected intermediate inputs may differ from the preview; the exact effect
+    claim and constructed additions must already be journaled. Recovery reads
+    existing holds separately: even a matching reservation cannot be replayed.
+    This prep-only boundary never borrows the protected cancellation allowance.
+    """
+    approval_id = _fee_digest(approval_id)
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    operation_id = _fee_operation_identity(operation_id)
+    if type(final_quote) is not dict or final_quote.get("available") is not True:
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+    try:
+        fee = _fee_amount(final_quote.get("fee_mojos"))
+        cost = _fee_amount(final_quote.get("cost"))
+        target_seconds = _fee_amount(final_quote.get("target_seconds"))
+        observed_at = _fee_amount(final_quote.get("observed_at"))
+        expires_at = _fee_amount(final_quote.get("expires_at"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
+    if (cost == 0 or final_quote.get("source") not in ("coinset", "full_node_rpc")
+            or expires_at != observed_at + 60):
+        raise ValueError("FEE_QUOTE_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Sample only after acquiring the writer lock, not before contention.
+        now = _fee_amount(int(time.time()))
+        if not observed_at <= now < expires_at:
+            raise ValueError("FEE_QUOTE_STALE")
+        consent = conn.execute(
+            "SELECT preview.*, approval.version, "
+            "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
+            "WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
+            "FROM coin_prep_fee_consents AS consent "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "JOIN fee_approvals AS approval USING(approval_id) WHERE consent.approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if consent is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        if (consent["scope_sha256"] != scope or consent["plan_sha256"] != plan
+                or consent["version"] != consent["latest_version"]
+                or json.loads(consent["plan_json"])["target_seconds"] != target_seconds):
+            raise ValueError("FEE_APPROVAL_STALE")
+        if conn.execute(
+            "SELECT 1 FROM approved_fee_reservations WHERE operation_id=?", (operation_id,)
+        ).fetchone() is not None:
+            raise ValueError("FEE_OPERATION_REPLAY")
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        if (operation is None or operation["outcome"] != "PREPARED"
+                or operation["constructed_outputs_json"] is None):
+            raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+        claim = conn.execute(
+            "SELECT claim.* FROM wallet_effect_claims AS claim "
+            "LEFT JOIN wallet_effect_claim_resolutions AS resolution ON resolution.claim_token=claim.claim_token "
+            "LEFT JOIN wallet_effect_dispatches AS dispatch ON dispatch.claim_token=claim.claim_token "
+            "WHERE claim.claim_token=? AND claim.generation=? AND claim.operation_id=? "
+            "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
+            (operation["effect_claim_token"], operation["effect_claim_generation"], operation_id),
+        ).fetchone()
+        if claim is None:
+            raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+        target = json.loads(operation["target_contract_json"])
+        exact_fee = target.get("fee_mojos", target.get("external_fee", {}).get("fee_mojos"))
+        expected_source_ids = sorted(norm_coin_id(coin_id) for coin_id in json.loads(operation["source_coin_ids_json"]))
+        expected_fee_ids = sorted(norm_coin_id(coin_id) for coin_id in target.get("external_fee", {}).get("coin_ids", []))
+        if (type(exact_fee) is not int or exact_fee != fee
+                or json.loads(claim["source_coin_ids_json"]) != expected_source_ids
+                or json.loads(claim["fee_coin_ids_json"]) != expected_fee_ids):
+            raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
+        import mutation_gate
+
+        identity = json.loads(operation["wallet_identity_json"])
+        approved_scope = json.loads(consent["scope_json"])
+        if (identity["backend"] != approved_scope["wallet_type"]
+                or identity["fingerprint"] != approved_scope["wallet_fingerprint"]
+                or identity["network_id"] != approved_scope["network"]
+                or claim["network"] != approved_scope["network"]
+                or claim["wallet_fingerprint_hash"] != mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+                or (target.get("cat_asset_id") is not None
+                    and target["cat_asset_id"] != approved_scope["asset_id"])):
+            raise ValueError("FEE_APPROVAL_STALE")
+        result = _reserve_approved_fee_locked(
+            conn, approval_id, scope, plan, operation_id, fee, False)
+        conn.commit()
+        return {**result, "dispatch_authorized": False}
     except BaseException:
         conn.rollback()
         raise
