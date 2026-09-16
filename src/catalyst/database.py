@@ -1559,7 +1559,155 @@ CREATE INDEX IF NOT EXISTS idx_market_cache_type ON market_analysis_cache(analys
 """
 
 
-STABILITY_SCHEMA_SQL = """
+FEE_SCHEMA_SQL = """
+-- Approvals and exact fee holds are immutable; settlement is separate evidence.
+CREATE TABLE IF NOT EXISTS fee_approvals (
+    approval_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(approval_id)=64 AND approval_id NOT GLOB '*[^0-9a-f]*'),
+    scope_sha256 TEXT NOT NULL
+        CHECK(length(scope_sha256)=64 AND scope_sha256 NOT GLOB '*[^0-9a-f]*'),
+    plan_sha256 TEXT NOT NULL
+        CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+    version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version>0),
+    total_fee_mojos INTEGER NOT NULL
+        CHECK(typeof(total_fee_mojos)='integer' AND total_fee_mojos>=0),
+    cancellation_reserve_mojos INTEGER NOT NULL
+        CHECK(typeof(cancellation_reserve_mojos)='integer'
+              AND cancellation_reserve_mojos>=0
+              AND cancellation_reserve_mojos<=total_fee_mojos),
+    UNIQUE(scope_sha256, version)
+);
+CREATE TABLE IF NOT EXISTS approved_fee_reservations (
+    operation_id TEXT PRIMARY KEY NOT NULL
+        CHECK((length(operation_id)=64 AND operation_id NOT GLOB '*[^0-9a-f]*')
+           OR (length(operation_id)=74 AND substr(operation_id,1,10)='coin-prep:'
+               AND substr(operation_id,11) NOT GLOB '*[^0-9a-f]*')),
+    approval_id TEXT NOT NULL REFERENCES fee_approvals(approval_id),
+    scope_sha256 TEXT NOT NULL
+        CHECK(length(scope_sha256)=64 AND scope_sha256 NOT GLOB '*[^0-9a-f]*'),
+    plan_sha256 TEXT NOT NULL
+        CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+    fee_mojos INTEGER NOT NULL CHECK(typeof(fee_mojos)='integer' AND fee_mojos>=0),
+    cancellation INTEGER NOT NULL
+        CHECK(typeof(cancellation)='integer' AND cancellation IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_approved_fee_reservations_scope
+    ON approved_fee_reservations(scope_sha256, cancellation);
+CREATE TABLE IF NOT EXISTS approved_fee_outcomes (
+    operation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES approved_fee_reservations(operation_id),
+    state TEXT NOT NULL CHECK(state IN ('CONFIRMED_SPENT', 'RELEASED_NO_EFFECT')),
+    evidence_id TEXT NOT NULL
+        CHECK(length(evidence_id)=64 AND evidence_id NOT GLOB '*[^0-9a-f]*'),
+    evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json))
+);
+CREATE TRIGGER IF NOT EXISTS approved_fee_outcomes_no_update
+BEFORE UPDATE ON approved_fee_outcomes BEGIN
+    SELECT RAISE(ABORT, 'fee outcomes are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_outcomes_no_delete
+BEFORE DELETE ON approved_fee_outcomes BEGIN
+    SELECT RAISE(ABORT, 'fee outcomes are append-only');
+END;
+-- BEFORE INSERT guards also fence REPLACE, whose implicit deletes do not
+-- invoke DELETE triggers when SQLite recursive_triggers is disabled.
+CREATE TRIGGER IF NOT EXISTS approved_fee_outcomes_no_replace
+BEFORE INSERT ON approved_fee_outcomes
+WHEN EXISTS (SELECT 1 FROM approved_fee_outcomes WHERE operation_id=NEW.operation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'fee outcomes are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fee_approvals_no_update
+BEFORE UPDATE ON fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'fee approvals are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fee_approvals_no_delete
+BEFORE DELETE ON fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'fee approvals are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fee_approvals_no_replace
+BEFORE INSERT ON fee_approvals
+WHEN EXISTS (
+    SELECT 1 FROM fee_approvals WHERE approval_id=NEW.approval_id
+        OR (scope_sha256=NEW.scope_sha256 AND version=NEW.version)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee approvals are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_reservations_no_update
+BEFORE UPDATE ON approved_fee_reservations BEGIN
+    SELECT RAISE(ABORT, 'fee reservations are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_reservations_no_delete
+BEFORE DELETE ON approved_fee_reservations BEGIN
+    SELECT RAISE(ABORT, 'fee reservations are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_reservations_no_replace
+BEFORE INSERT ON approved_fee_reservations
+WHEN EXISTS (
+    SELECT 1 FROM approved_fee_reservations WHERE operation_id=NEW.operation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee reservations are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_reservations_binding_guard
+BEFORE INSERT ON approved_fee_reservations
+WHEN NOT EXISTS (
+    SELECT 1 FROM fee_approvals WHERE approval_id=NEW.approval_id
+        AND scope_sha256=NEW.scope_sha256 AND plan_sha256=NEW.plan_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee reservation approval binding differs');
+END;
+CREATE TRIGGER IF NOT EXISTS approved_fee_outcomes_journal_guard
+BEFORE INSERT ON approved_fee_outcomes
+WHEN NOT EXISTS (
+    SELECT 1 FROM coin_prep_operations AS operation
+    JOIN approved_fee_reservations AS reservation
+        ON reservation.operation_id=operation.operation_id
+    JOIN wallet_effect_claims AS claim
+        ON claim.claim_token=operation.effect_claim_token
+        AND claim.generation=operation.effect_claim_generation
+        AND claim.operation_id=operation.operation_id
+    LEFT JOIN wallet_effect_claim_resolutions AS resolution
+        ON resolution.claim_token=claim.claim_token
+        AND resolution.generation=claim.generation
+    WHERE operation.operation_id=NEW.operation_id
+        AND operation.outcome_evidence_json=NEW.evidence_json
+        AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
+        AND json_extract(NEW.evidence_json, '$.effect_claim_token')=claim.claim_token
+        AND json_extract(NEW.evidence_json, '$.effect_claim_generation')=claim.generation
+        AND (
+            (
+                json_type(operation.target_contract_json, '$.fee_mojos')='integer'
+                AND json_extract(operation.target_contract_json, '$.fee_mojos')=reservation.fee_mojos
+            )
+            OR (
+                json_type(operation.target_contract_json, '$.fee_mojos') IS NULL
+                AND json_type(operation.target_contract_json, '$.external_fee.fee_mojos')='integer'
+                AND json_extract(operation.target_contract_json, '$.external_fee.fee_mojos')=reservation.fee_mojos
+            )
+        )
+        AND (
+            (NEW.state='CONFIRMED_SPENT' AND operation.outcome='CONFIRMED')
+            OR (
+                NEW.state='RELEASED_NO_EFFECT' AND operation.outcome='FAILED'
+                AND (
+                    json_extract(NEW.evidence_json, '$.reason_code')='AUTHORITATIVE_NO_EFFECT_CONFIRMED'
+                    OR resolution.outcome='RELEASED_NO_EFFECT'
+                )
+            )
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'fee outcome lacks bound journal evidence');
+END;
+"""
+
+
+STABILITY_SCHEMA_SQL = (
+    FEE_SCHEMA_SQL
+    + """
 
 -- Stability kernel: canonical durable offer intent registry. Atomic amounts
 -- are TEXT so they remain exact beyond SQLite's signed 64-bit INTEGER range.
@@ -3825,9 +3973,32 @@ BEGIN
     SELECT RAISE(ABORT, 'bootstrap_participation is append-only');
 END;
 """
+)
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "fee_approvals": {
+        "approval_id",
+        "scope_sha256",
+        "plan_sha256",
+        "version",
+        "total_fee_mojos",
+        "cancellation_reserve_mojos",
+    },
+    "approved_fee_reservations": {
+        "operation_id",
+        "approval_id",
+        "scope_sha256",
+        "plan_sha256",
+        "fee_mojos",
+        "cancellation",
+    },
+    "approved_fee_outcomes": {
+        "operation_id",
+        "state",
+        "evidence_id",
+        "evidence_json",
+    },
     "offer_intents": {
         "intent_id",
         "run_id",
@@ -4443,6 +4614,13 @@ _STABILITY_REQUIRED_COLUMNS = {
 }
 
 _STABILITY_INDEXES = {
+    "idx_approved_fee_reservations_scope": (
+        "approved_fee_reservations",
+        False,
+        False,
+        ("scope_sha256", "cancellation"),
+        None,
+    ),
     "idx_runtime_recovery_epochs_binding": (
         "runtime_recovery_epochs",
         False,
@@ -5171,6 +5349,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
             )
 
     _require_unique_key(conn, "offer_operation_journal", ("event_id",))
+    _require_unique_key(conn, "fee_approvals", ("scope_sha256", "version"))
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
     )
@@ -6302,6 +6481,78 @@ def _upgrade_expired_subsequent_spend_outcome_schema(
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade only the exact PR #218 groundwork, preserving every fee hold.
+
+    Unknown shapes or invalid existing amounts are not repaired or refunded.
+    DDL and copying run atomically; failed validation restores the old tables.
+    """
+    legacy = """
+    CREATE TABLE fee_approvals (
+        approval_id TEXT PRIMARY KEY, scope_sha256 TEXT NOT NULL,
+        plan_sha256 TEXT NOT NULL, version INTEGER NOT NULL,
+        total_fee_mojos INTEGER NOT NULL CHECK(total_fee_mojos >= 0),
+        cancellation_reserve_mojos INTEGER NOT NULL CHECK(cancellation_reserve_mojos >= 0),
+        UNIQUE(scope_sha256, version)
+    );
+    CREATE TABLE approved_fee_reservations (
+        operation_id TEXT PRIMARY KEY,
+        approval_id TEXT NOT NULL REFERENCES fee_approvals(approval_id),
+        scope_sha256 TEXT NOT NULL, plan_sha256 TEXT NOT NULL,
+        fee_mojos INTEGER NOT NULL CHECK(fee_mojos >= 0),
+        cancellation INTEGER NOT NULL CHECK(cancellation IN (0, 1))
+    );
+    """
+    tables = dict(
+        conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' "
+            "AND name IN ('fee_approvals', 'approved_fee_reservations')"
+        ).fetchall()
+    )
+    expected = _sqlite_connect(":memory:")
+    try:
+        expected.executescript(legacy)
+        legacy_tables = dict(
+            expected.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        )
+    finally:
+        expected.close()
+    if not any(
+        _normalized_schema_sql(tables.get(name)) == _normalized_schema_sql(sql)
+        for name, sql in legacy_tables.items()
+    ):
+        return
+    if any(
+        _normalized_schema_sql(tables.get(name)) != _normalized_schema_sql(sql)
+        for name, sql in legacy_tables.items()
+    ):
+        raise RuntimeError("legacy fee ledger shape differs from PR #218")
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name IN ('fee_approvals', 'approved_fee_reservations')"
+    ).fetchone():
+        raise RuntimeError("legacy fee ledger has unexpected triggers")
+    try:
+        conn.executescript(
+            "BEGIN EXCLUSIVE; "
+            "ALTER TABLE approved_fee_reservations RENAME TO legacy_fee_reservations_218; "
+            "ALTER TABLE fee_approvals RENAME TO legacy_fee_approvals_218; "
+            + FEE_SCHEMA_SQL
+        )
+        conn.execute("INSERT INTO fee_approvals SELECT * FROM legacy_fee_approvals_218")
+        conn.execute(
+            "INSERT INTO approved_fee_reservations SELECT * FROM legacy_fee_reservations_218"
+        )
+        conn.execute("DROP TABLE legacy_fee_reservations_218")
+        conn.execute("DROP TABLE legacy_fee_approvals_218")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -6310,6 +6561,7 @@ def _migrate_stability_schema() -> None:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
+        _upgrade_legacy_fee_ledger_schema(conn)
         _upgrade_expired_subsequent_spend_outcome_schema(conn)
         _upgrade_offer_cancel_cohort_member_limit(conn)
         existing_tables = {
@@ -19990,6 +20242,305 @@ def open_critical_write_connection(
     except BaseException:
         conn.close()
         raise
+
+
+def _fee_digest(value: Any) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ValueError("fee identity must be a lowercase SHA256 digest")
+    return value
+
+
+def _fee_amount(value: Any) -> int:
+    amount = _exact_integer(value, "fee_mojos")
+    if amount > 2**63 - 1:
+        raise ValueError("fee_mojos exceeds SQLite integer range")
+    return amount
+
+
+def _fee_operation_identity(value: Any) -> str:
+    if type(value) is str and value.startswith("coin-prep:"):
+        _fee_digest(value[10:])
+        return value
+    return _fee_digest(value)
+
+
+def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
+    """Exact held/spent sums across every approval version in this scope."""
+    held = spent = noncancel = 0
+    for row in conn.execute(
+        "SELECT reservation.fee_mojos, reservation.cancellation, outcome.state "
+        "FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE reservation.scope_sha256=?",
+        (scope,),
+    ):
+        fee = _fee_amount(row[0])
+        if row[2] == "RELEASED_NO_EFFECT":
+            continue
+        if row[2] == "CONFIRMED_SPENT":
+            spent += fee
+        else:
+            held += fee
+        if not row[1]:
+            noncancel += fee
+    return {
+        "held_fee_mojos": held,
+        "spent_fee_mojos": spent,
+        "committed_fee_mojos": held + spent,
+        "noncancellation_committed_fee_mojos": noncancel,
+    }
+
+
+def create_fee_approval(
+    *,
+    scope_sha256: str,
+    plan_sha256: str,
+    total_fee_mojos: int,
+    cancellation_reserve_mojos: int,
+) -> Dict[str, Any]:
+    """Persist a new approval version; never discard earlier commitments."""
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    total = _fee_amount(total_fee_mojos)
+    reserve = _fee_amount(cancellation_reserve_mojos)
+    if reserve > total:
+        raise ValueError("cancellation reserve exceeds total fee ceiling")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        totals = _fee_scope_totals(conn, scope)
+        protected = conn.execute(
+            "SELECT cancellation_reserve_mojos FROM fee_approvals "
+            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if protected is not None and reserve < protected[0]:
+            raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
+        if totals["committed_fee_mojos"] > total or (
+            totals["noncancellation_committed_fee_mojos"] > total - reserve
+        ):
+            raise ValueError("FEE_BUDGET_EXCEEDED")
+        version = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM fee_approvals WHERE scope_sha256=?",
+            (scope,),
+        ).fetchone()[0]
+        approval_id = hashlib.sha256(f"{scope}:{plan}:{version}".encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
+            (approval_id, scope, plan, version, total, reserve),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return get_fee_approval(approval_id)
+
+
+def get_fee_approval(approval_id: str) -> Dict[str, Any]:
+    """Read approved ceiling and all held fees in its economic scope."""
+    approval_id = _fee_digest(approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        result = dict(row)
+        result.update(_fee_scope_totals(conn, row["scope_sha256"]))
+        result["remaining_fee_mojos"] = (
+            row["total_fee_mojos"] - result["committed_fee_mojos"]
+        )
+        result["remaining_preparation_fee_mojos"] = min(
+            result["remaining_fee_mojos"],
+            row["total_fee_mojos"]
+            - row["cancellation_reserve_mojos"]
+            - result["noncancellation_committed_fee_mojos"],
+        )
+        return result
+    finally:
+        conn.close()
+
+
+def reserve_approved_fee(
+    *,
+    approval_id: str,
+    scope_sha256: str,
+    plan_sha256: str,
+    operation_id: str,
+    fee_mojos: int,
+    cancellation: bool,
+) -> Dict[str, Any]:
+    """Atomically hold exact fees before dispatch; unknown effects stay held."""
+    approval_id = _fee_digest(approval_id)
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    operation = _fee_operation_identity(operation_id)
+    fee = _fee_amount(fee_mojos)
+    if type(cancellation) is not bool:
+        raise ValueError("cancellation must be a boolean")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        approval = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
+        ).fetchone()
+        if approval is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?", (scope,)
+        ).fetchone()[0]
+        if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
+            raise ValueError("FEE_APPROVAL_STALE")
+        existing = conn.execute(
+            "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["scope_sha256"] != scope
+                or existing["plan_sha256"] != plan
+                or existing["fee_mojos"] != fee
+                or existing["cancellation"] != int(cancellation)
+            ):
+                raise ValueError("FEE_OPERATION_CONFLICT")
+            conn.commit()
+            return {**dict(existing), "idempotent": True}
+        if approval["version"] != latest:
+            raise ValueError("FEE_APPROVAL_STALE")
+        totals = _fee_scope_totals(conn, scope)
+        committed = totals["committed_fee_mojos"]
+        noncancel = totals["noncancellation_committed_fee_mojos"]
+        if committed + fee > approval["total_fee_mojos"] or (
+            not cancellation
+            and noncancel + fee
+            > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
+        ):
+            raise ValueError("FEE_BUDGET_EXCEEDED")
+        conn.execute(
+            "INSERT INTO approved_fee_reservations VALUES (?, ?, ?, ?, ?, ?)",
+            (operation, approval_id, scope, plan, fee, int(cancellation)),
+        )
+        result = dict(
+            conn.execute(
+                "SELECT * FROM approved_fee_reservations WHERE operation_id=?",
+                (operation,),
+            ).fetchone()
+        )
+        conn.commit()
+        return {**result, "idempotent": False}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_fee_reservation_outcome(
+    operation_id: str, evidence_id: str
+) -> Dict[str, Any]:
+    """Settle an exact hold only from its durable authoritative prep outcome.
+
+    Caller flags, timeouts and adapter success alone cannot refund or confirm fees.
+    The existing operation journal supplies identity, effect, and observation proof.
+    """
+    operation_id = _fee_operation_identity(operation_id)
+    evidence_id = _fee_digest(evidence_id)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT * FROM approved_fee_reservations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if reservation is None:
+            raise ValueError("FEE_RESERVATION_REQUIRED")
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if operation is None or operation["outcome"] not in {"CONFIRMED", "FAILED"}:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        encoded, evidence = _coin_prep_outcome_evidence(
+            operation["outcome"],
+            json.loads(operation["outcome_evidence_json"]),
+        )
+        if encoded != operation["outcome_evidence_json"] or (
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest() != evidence_id
+        ):
+            raise ValueError("FEE_EVIDENCE_MISMATCH")
+        if (
+            evidence["effect_claim_token"] != operation["effect_claim_token"]
+            or evidence["effect_claim_generation"]
+            != operation["effect_claim_generation"]
+        ):
+            raise ValueError("FEE_EVIDENCE_MISMATCH")
+        target = json.loads(operation["target_contract_json"])
+        exact_fee = target.get(
+            "fee_mojos", target.get("external_fee", {}).get("fee_mojos")
+        )
+        if type(exact_fee) is not int or exact_fee != reservation["fee_mojos"]:
+            raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
+        claim = conn.execute(
+            "SELECT claim.*, resolution.outcome AS resolution_outcome "
+            "FROM wallet_effect_claims AS claim "
+            "LEFT JOIN wallet_effect_claim_resolutions AS resolution "
+            "ON resolution.claim_token=claim.claim_token AND resolution.generation=claim.generation "
+            "WHERE claim.claim_token=? AND claim.generation=? AND claim.operation_id=?",
+            (
+                operation["effect_claim_token"],
+                operation["effect_claim_generation"],
+                operation_id,
+            ),
+        ).fetchone()
+        if claim is None:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        if operation["outcome"] == "CONFIRMED":
+            state = "CONFIRMED_SPENT"
+        elif evidence["reason_code"] == "AUTHORITATIVE_NO_EFFECT_CONFIRMED" or (
+            claim["resolution_outcome"] == "RELEASED_NO_EFFECT"
+        ):
+            state = "RELEASED_NO_EFFECT"
+        else:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        existing = conn.execute(
+            "SELECT * FROM approved_fee_outcomes WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["state"],
+                existing["evidence_id"],
+                existing["evidence_json"],
+            ) != (
+                state,
+                evidence_id,
+                encoded,
+            ):
+                raise ValueError("FEE_EVIDENCE_MISMATCH")
+            conn.commit()
+            return {**dict(existing), "idempotent": True}
+        conn.execute(
+            "INSERT INTO approved_fee_outcomes VALUES (?, ?, ?, ?)",
+            (operation_id, state, evidence_id, encoded),
+        )
+        conn.commit()
+        return {
+            "operation_id": operation_id,
+            "state": state,
+            "evidence_id": evidence_id,
+            "idempotent": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _stability_connection() -> sqlite3.Connection:

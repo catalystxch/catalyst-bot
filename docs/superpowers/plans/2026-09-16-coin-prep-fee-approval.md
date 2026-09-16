@@ -27,18 +27,18 @@ Files: create src/catalyst/fee_estimation.py and tests/test_fee_estimation.py; m
 
 Interface: `quote_fee(cost: int, target_seconds: int = 300) -> dict`; `normalize_fee_response(response: dict, *, cost: int, target_seconds: int, source: str, observed_at: int, now: int) -> dict`. Quote result contains available/reason/source/cost/target_seconds/fee_mojos/fee_xch/observed_at/expires_at. Unavailable result never contains a usable fee.
 
-- [ ] Write failing tests with literal expected fee amounts. Start with missing/empty estimate producing unavailable, numeric zero producing an available zero, and Decimal fractional mojos rounded upward.
+- [x] Write failing tests with literal expected fee amounts. Start with missing/empty estimate producing unavailable, numeric zero producing an available zero, and Decimal fractional mojos rounded upward.
 
 ```python
 assert normalize_fee_response({'success': True, 'estimates': []}, cost=20_000_000, target_seconds=300, source='coinset', observed_at=100, now=100)['available'] is False
 assert normalize_fee_response({'success': True, 'estimates': [0]}, cost=20_000_000, target_seconds=300, source='coinset', observed_at=100, now=100)['fee_mojos'] == 0
 ```
 
-- [ ] Run `python -m pytest tests/test_fee_estimation.py -q`; observe missing-behavior assertion failures before implementation.
-- [ ] Implement strict response normalization: exact success flag, single result, supplied target/cost match, finite nonnegative decimal value, SQLite integer fee limit, original observation time and 60-second expiry. Invalid requests fail closed without network calls.
-- [ ] Add and observe failing tests for negative/NaN/Infinity/bool/container/missing values, target/cost mismatch, stale/future observations and integer type boundaries. Implement only the missing checks.
-- [ ] Expose original observation metadata on provider snapshots/cache hits; reuse configured node/Coinset retrieval while rejecting unavailable/raw malformed data. Mock only transport/clock in quote integration tests.
-- [ ] Run fee tests, batch/direct prep regression tests and Ruff checks, record red/green evidence, commit focused changes.
+- [x] Run `python -m pytest tests/test_fee_estimation.py -q`; observe missing-behavior assertion failures before implementation.
+- [x] Implement strict response normalization: exact success flag, single result, supplied target/cost match, finite nonnegative decimal value, SQLite integer fee limit, original observation time and 60-second expiry. Invalid requests fail closed without network calls.
+- [x] Add and observe failing tests for negative/NaN/Infinity/bool/container/missing values, target/cost mismatch, stale/future observations and integer type boundaries. Implement only the missing checks.
+- [x] Expose original observation metadata on provider snapshots/cache hits; reuse configured node/Coinset retrieval while rejecting unavailable/raw malformed data. Provider tests mock transport/clock; quote-boundary tests additionally exercise malformed cached snapshots.
+- [x] Run fee tests, batch/direct prep regression tests and Ruff checks, record red/green evidence, commit focused changes (`61fdab4`).
 
 ## Task 2: Durable canonical approvals, exact holds and effect evidence
 
@@ -46,8 +46,8 @@ Files: modify src/catalyst/database.py; review/reuse PR #218; extend tests/test_
 
 Interfaces: retain create_fee_approval/get_fee_approval/reserve_approved_fee keyword signatures from PR #218; add `record_fee_reservation_outcome(operation_id: str, evidence_id: str) -> dict`, which reads authoritative journal evidence instead of accepting a caller-provided settled boolean. Approval preview identifiers are server-generated.
 
-- [ ] Bring reviewed ledger code/tests into the feature branch with exact provenance; do not merge the PR or claim dispatch enforcement.
-- [ ] Write failing real isolated-SQLite tests: two competing reservations cannot spend the same remainder; older-version fees remain counted; protected cancellation allowance is unavailable to prep; schema corruption blocks use.
+- [x] Bring reviewed ledger code/tests into the feature branch with exact provenance; do not merge the PR or claim dispatch enforcement.
+- [x] Write failing real isolated-SQLite tests: two competing reservations cannot spend the same remainder; older-version fees remain counted; protected cancellation allowance is unavailable to prep; schema corruption blocks use.
 
 ```python
 approval = database.create_fee_approval(scope_sha256='a'*64, plan_sha256='b'*64, total_fee_mojos=10_000_000_000, cancellation_reserve_mojos=2_000_000_000)
@@ -55,9 +55,9 @@ with pytest.raises(ValueError, match='FEE_BUDGET_EXCEEDED'):
     database.reserve_approved_fee(approval_id=approval['approval_id'], scope_sha256='a'*64, plan_sha256='b'*64, operation_id='1'*64, fee_mojos=8_016_000_000, cancellation=False)
 ```
 
-- [ ] Run ledger/schema tests to observe failures, then add canonical validated/migrated schema, indexes and append-only approval semantics. Monetary constraints must reject fractional and boolean fees.
-- [ ] Test journal-linked reserved/submitted/unknown/confirmed/no-effect transitions against literal held/spent totals. Timeout/process exit cannot release; confirmed fees remain spent; duplicate evidence cannot change totals; replay retrieval cannot authorize redispatch.
-- [ ] Run ledger, schema, authoritative recovery and reset-preservation tests; commit with checkpoint.
+- [x] Run ledger/schema tests to observe failures, then add canonical validated/migrated schema, indexes and append-only approval semantics. Monetary constraints must reject fractional and boolean fees.
+- [x] Test journal-linked reserved/submitted/unknown/confirmed/no-effect transitions against literal held/spent totals. Timeout/process exit cannot release; confirmed fees remain spent; duplicate evidence cannot change totals; replay retrieval cannot authorize redispatch.
+- [x] Run ledger, schema, authoritative recovery and reset-preservation tests; commit with checkpoint (296 combined regressions, 36 focused ledger/recovery, Ruff and independent review passed).
 
 ## Task 3: Read-only canonical multistage preview and approval APIs
 
@@ -130,4 +130,5 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] User approved written specification; new goal created and existing hourly loop refreshed.
 - [x] Existing isolated branch codex/coin-prep-fee-approval verified; untracked user/build artifacts preserved.
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.
-- [ ] Task 1 in progress; tasks 2–6 not yet implemented.
+- [x] Task 1 strict estimation foundation verified and committed.
+- [ ] Task 2 integration remains open: database foundation and recovery/reset preservation verified; server-owned canonical scope/plan helpers will be added with the Task 3 preview service. Tasks 3–6 not yet implemented.
