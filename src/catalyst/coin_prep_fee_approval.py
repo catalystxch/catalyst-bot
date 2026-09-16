@@ -173,6 +173,7 @@ def estimate_coin_prep_fee_preview(
     fee_funding_mojos: int, request_options: dict,
     stage_quotes: dict | None = None,
     stage_profiles: dict | None = None,
+    execution_context: dict | None = None,
 ) -> dict:
     """Price trusted server-planned stages and persist an unapproved preview.
 
@@ -185,6 +186,10 @@ def estimate_coin_prep_fee_preview(
     Preserved guidance is revalidated, not refreshed or used as dispatch consent.
     """
     contract = canonical_fee_contract(scope, economic_plan)
+    if execution_context is not None:
+        from coin_prep_fee_execution import validate_execution_context
+
+        validate_execution_context(execution_context, contract["scope"], contract["plan"])
     funding = _exact_int(fee_funding_mojos)
     if type(request_options) is not dict or type(stages) is not list:
         raise ValueError("fee preview options/stages are invalid")
@@ -311,7 +316,9 @@ def estimate_coin_prep_fee_preview(
         scope_sha256=contract["scope_sha256"], plan_sha256=contract["plan_sha256"],
         scope_json=contract["scope_json"], plan_json=contract["plan_json"],
         request_options_json=_canonical_json(request_options),
-        quote_json=_canonical_json(result), observed_at=observed, expires_at=expires,
+        quote_json=_canonical_json({**result, **(
+            {"execution_context": execution_context} if execution_context is not None else {})}),
+        observed_at=observed, expires_at=expires,
     )
     return {**result, "preview_id": saved["preview_id"]}
 
@@ -324,6 +331,7 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
     authorize spending. Every dispatch still needs a fresh exact transaction.
     """
     from coin_prep_fee_runtime import read_staged_prep_fee_snapshot
+    from coin_prep_fee_execution import freeze_execution_context
 
     context = read_staged_prep_fee_snapshot(request_options, quote_provider=quote_fee)
     if context["available"] is not True:
@@ -337,6 +345,7 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
         stage_profiles=context["stage_profiles"],
         fee_funding_mojos=context["funding"]["fee_funding_mojos"],
         request_options=context["request_options"],
+        execution_context=freeze_execution_context(context),
     )
     return {**result, "dispatch_authorized": False}
 
@@ -380,6 +389,14 @@ def approve_coin_prep_fees(
     if any(current[key] != preview[key] for key in (
             "scope_sha256", "plan_sha256", "scope_json", "plan_json")):
         raise ValueError("FEE_APPROVAL_STALE")
+    stored_quote = json.loads(preview["quote_json"])
+    if "execution_context" in stored_quote:
+        from coin_prep_fee_execution import freeze_execution_context, validate_execution_context
+
+        binding = stored_quote["execution_context"]
+        validate_execution_context(binding, persisted["scope"], persisted["plan"])
+        if freeze_execution_context(context) != binding:
+            raise ValueError("FEE_APPROVAL_STALE")
     funding = prepare_fee_inventory(
         context["snapshot"], context["recipe"]["targets"],
         current["plan"]["reserve_floors_mojos"],

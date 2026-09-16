@@ -8,6 +8,7 @@ and HTTP/native integration follow this boundary.
 
 import os
 import re
+import json
 
 from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
 from config import cfg
@@ -246,6 +247,61 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     return {**context, "recipe": recipe, "campaign": campaign,
             "request_options": options, "fee_pool": fee_pool, "dispatch_authorized": False}
+
+
+def read_approved_prep_fee_snapshot(approval_id: str) -> dict:
+    """Read fresh selectable inventory under immutable approved economics.
+
+    A later price or an expected change in source inventory cannot resize the
+    approved targets. This does NOT prove intermediate transaction completion,
+    price a bundle, claim inputs or authorize signing. Dispatch must inspect its
+    exact executable effect, use authoritative operation evidence and reserve
+    its fresh final fee. Changed configuration/identity/address/campaign requires
+    new consent rather than silently substituting a new recipe.
+    """
+    from coin_prep_fee_approval import canonical_fee_contract, validate_fee_consent
+    from coin_prep_fee_execution import encode_execution_configuration, validate_execution_context
+
+    consent = database.get_coin_prep_fee_approval_context(approval_id)
+    approved = canonical_fee_contract(json.loads(consent["scope_json"]), json.loads(consent["plan_json"]))
+    if any(approved[key] != consent[key] for key in (
+            "scope_sha256", "plan_sha256", "scope_json", "plan_json")):
+        raise ValueError("FEE_APPROVAL_STALE")
+    if consent["version"] != consent["latest_version"]:
+        raise ValueError("FEE_APPROVAL_STALE")
+    binding = json.loads(consent["quote_json"]).get("execution_context")
+    if binding is None:
+        raise ValueError("FEE_EXECUTION_CONTEXT_REQUIRED")
+    recipe = validate_execution_context(binding, approved["scope"], approved["plan"])
+    if encode_execution_configuration(_configuration()) != binding["configuration"]:
+        raise ValueError("FEE_APPROVAL_STALE")
+    context = read_fee_wallet_snapshot()
+    scope = approved["scope"]
+    if (any(context["identity"][key] != scope[key] for key in context["identity"])
+            or encode_execution_configuration(context["configuration"]) != binding["configuration"]
+            or context["receive_address"] != binding["receive_address"]):
+        raise ValueError("FEE_APPROVAL_STALE")
+    campaign = None
+    if scope["session_id"] is not None:
+        session = database.get_coin_prep_fee_session(scope["session_id"])
+        identity_json = json.dumps(context["identity"], sort_keys=True, separators=(",", ":"))
+        if (session["current_session_id"] != scope["session_id"] or session["identity_json"] != identity_json
+                or database.list_active_bootstrap_campaigns_for_asset(scope["asset_id"])):
+            raise ValueError("FEE_APPROVAL_STALE")
+    else:
+        campaign = database.get_bootstrap_campaign(scope["campaign_id"])
+        if (type(campaign) is not dict or campaign.get("status") != "active"
+                or campaign.get("revision") != approved["plan"]["campaign_revision"]
+                or any(campaign.get(key) != scope[key] for key in (
+                    "network", "wallet_type", "wallet_fingerprint", "wallet_id", "asset_id"))):
+            raise ValueError("FEE_APPROVAL_STALE")
+    # A version change during wallet reads must not leave stale consent usable.
+    approval = validate_fee_consent(approval_id=approval_id, scope=scope, economic_plan=approved["plan"])
+    if encode_execution_configuration(_configuration()) != binding["configuration"]:
+        raise ValueError("FEE_APPROVAL_STALE")
+    return {**context, "recipe": recipe, "campaign": campaign, "scope": scope,
+            "request_options": json.loads(consent["request_options_json"]),
+            "approval": approval, "dispatch_authorized": False}
 
 
 def read_next_prep_fee_snapshot(request_options: dict) -> dict:

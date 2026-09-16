@@ -473,6 +473,42 @@ Primary schema evidence:
   automatic recovery/accounting remain unfinished. No live wallet mutation,
   reload, package build, main merge or release occurred.
 
+## Frozen approved execution readback (continuation)
+
+- Runtime previews now persist a private server binding of lossless typed
+  configuration, receive address and exact prepared sizing arguments. Pure
+  validation reconstructs these targets and matches approved canonical outputs,
+  reserves and liquidity mode. Original headroom/multiplier metadata is retained
+  without applying it to the already-adjusted prepared sizes a second time.
+- Approval confirmation rejects changed execution settings/address even when
+  canonical output amounts happen to remain unchanged. Older core-only preview
+  fixtures can still record consent but cannot provide frozen execution readback.
+  Runtime previews always include the validated private binding; no client gets
+  configuration/CLI authority from the public response.
+- The new approved snapshot reader refreshes actual identity/asset/selectable
+  inventory, verifies configuration/address/session or campaign/latest consent,
+  and consumes frozen targets without market-price reads. Inventory changes
+  neither resize the plan nor constitute proof of intermediate transaction
+  completion. Actual funding, executable effect proof, Bootstrap financial caps,
+  final pricing/holds and effect dispatch fences must still be enforced by the
+  not-yet-integrated worker. dispatch_authorized is always false here.
+- Initial nine focused tests failed on missing binding/readback behavior before
+  implementation. Three more confirmation regressions failed with DID NOT RAISE
+  on fee-mode/manual-fee/expected-name changes; a zero-exponent canonicalization
+  regression also failed before its fix. Decimal fixed-point size is now bounded
+  before formatting; compact enormous exponents cannot allocate huge strings.
+- Expanded focused suite: 23 passed in 17.37s, exit 0. Independent read-only
+  review reproduced 74 frozen/confirmation/staged/HTTP-native preview passes,
+  exit 0, with no findings in this bounded groundwork. Ruff and diff whitespace
+  checks passed. Wider suite covering frozen execution, staged preview,
+  HTTP/native preview/confirmation, canonical contracts, pure target economics,
+  wallet snapshots and atomic dispatch holds: 324 passed in 103.25s, exit 0.
+  That run included the original 13 frozen tests; the final 23-test focused run
+  additionally covers invalid/huge Decimal values, changed identity/inventory/
+  receive address and resized CLI rejection.
+- No live wallet mutation, reload, package build, main merge or release occurred.
+  The full implementation goal and hourly continuation loop remain active.
+
 ## Outstanding acceptance gates
 
 Session completion lifecycle, remaining compatibility/prerequisite-family canonical plan preview,
