@@ -1640,6 +1640,13 @@ def estimate_unsigned_transaction_cost(result: dict):
     return callback(result)
 
 
+def inspect_unsigned_transaction_effect(result: dict, contract: dict):
+    callback = getattr(_wallet_adapter, "inspect_unsigned_transaction_effect", None)
+    if WALLET_TYPE != "sage" or not callable(callback):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return callback(result, contract)
+
+
 def submit_built_transaction_rpc(validated_result: dict):
     return _run_sage_mutation("submit_built_transaction_rpc", validated_result)
 

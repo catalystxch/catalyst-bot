@@ -3125,8 +3125,8 @@ def validate_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
     return sealed
 
 
-def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
-    """Return the exact mainnet mempool cost of a Sage unsigned transaction."""
+def _unsigned_bundle_conditions(result: Dict):
+    """Parse and execute an unsigned bundle without signing or RPC effects."""
 
     if type(result) is not dict or type(result.get("coin_spends")) is not list:
         return None
@@ -3168,10 +3168,33 @@ def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
             constants,
             uint32(0xFFFFFFFF),
         )
-        cost = int(conditions.cost)
-        return cost if cost > 0 else None
+        return (spends, conditions) if int(conditions.cost) > 0 else None
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
+    """Return executable cost only; this alone does not prove effect identity."""
+    execution = _unsigned_bundle_conditions(result)
+    return int(execution[1].cost) if execution is not None else None
+
+
+def inspect_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
+    """Validate summary and executable effects before trusting exact cost."""
+    validated = validate_unsigned_transaction_effect(result, contract)
+    if validated.get("_catalyst_validated_unsigned") is not True:
+        return validated
+    execution = _unsigned_bundle_conditions(validated)
+    if execution is None:
+        return _unsigned_effect_refusal("FEE_UNSIGNED_COST_UNAVAILABLE")
+    from unsigned_effect_binding import executable_matches_summary
+
+    spends, conditions = execution
+    if not executable_matches_summary(spends, conditions, validated["summary"], _exact_summary_mojos):
+        return _unsigned_effect_refusal("UNSIGNED_EXECUTABLE_EFFECT_MISMATCH")
+    validated["_catalyst_executable_effect_bound"] = True
+    validated["_catalyst_exact_unsigned_cost"] = int(conditions.cost)
+    return validated
 
 
 def submit_built_transaction_rpc(

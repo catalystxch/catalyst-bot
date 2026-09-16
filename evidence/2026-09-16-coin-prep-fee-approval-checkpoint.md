@@ -110,7 +110,36 @@ unsigned construction, HTTP/native endpoints and all dispatch/GUI integration
 remain incomplete. Mocked trusted stage costs are not proof of unsigned construction.
 No wallet actions, package reload, main merge or release occurred in this continuation.
 
-## Outstanding acceptance gates
+## Shared atomic targets and executable unsigned inspection (continuation)
+
+- Missing-helper tests failed before implementation. Shared target conversion now
+  enforces exact counts, integer bounds, CAT rounding and XCH-only fee funding;
+  the worker uses these same targets, target contracts and unsigned actions.
+- Actual CLVM inspection exposed an inherited summary/executable binding gap.
+  Independent review appended an extra valid spend while retaining the matching
+  summary; the first implementation incorrectly labelled its cost exact.
+  A focused regression reproduced this failure before the fix. Further failing
+  regressions covered false input amounts, false output IDs and XCH disguised
+  as CAT. No real wallet transactions were involved.
+- The new strict inspection path now joins every executable input and per-parent
+  addition to the validated summary, proves actual fee and destination-derived
+  coin IDs, and recognizes CAT2 module/TAIL identity and outer puzzle hashes.
+  Unknown/uninspectable effects are unavailable, never an exact heuristic.
+- Real XCH cost is 2,892,020; a pinned synthetic CAT2 ring costs 27,359,224.
+  Complete ephemeral chains pass; hidden spends, redirected outputs and false
+  fee/asset/identity evidence fail. Tests require no Chia Python runtime dependency,
+  signing, submission, journals, claims or fee holds.
+- Fresh expanded planner, Sage unsigned, Offer-wire, fee core, ledger/recovery,
+  replacement capacity and canonical schema regressions: 456 passed in 99.33s.
+  Subsequently expanded unsigned/decoder tests: 42 passed in 8.19s. Ruff and
+  `git diff --check` passed. Independent re-review found no Critical/Important
+  issue in this scoped inspection core.
+- Runtime economic configuration collection, server HTTP/native preview/approval,
+  final dispatch adoption, GUI confirmation, fresh package and live genuine-budget
+  acceptance remain open. The legacy cost-only helper is not effect proof, and
+  the running package has not been changed. No main merge or release occurred.
+
+## Outstanding acceptance gates (unchanged)
 
 Runtime canonical plan preview, HTTP/native bridge consent,
 all-path dispatch enforcement, authoritative settlement/recovery integration, GUI confirmation/E2E,

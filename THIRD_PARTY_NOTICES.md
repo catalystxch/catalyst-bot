@@ -52,6 +52,8 @@ copyright and permission notice is retained in
 
 CATalyst changes require exact lowercase `offer` HRP text, reject surrounding
 whitespace and noncanonical padding, and apply explicit encoded-size bounds.
+The same decoder also validates lowercase `xch`/`txch` wallet addresses with
+32-byte payloads for unsigned transaction destination verification.
 
 ### Chia Network chia-blockchain 2.5.7
 
@@ -72,3 +74,13 @@ apply bounded canonical zlib stream checks, and pass the decompressed bytes to
 the separately declared `chia_rs` runtime dependency for exact SpendBundle
 parsing and byte-for-byte round-trip validation. No Chia Python runtime code is
 copied into or required by this parser.
+
+`tests/fixtures/coin_prep_unsigned_cat2.json` contains a synthetic unsigned
+CAT2 ring generated with the official `cat_utils` implementation. Its puzzle
+reveal contains Chia Network's CAT2 program (module tree hash
+`37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a`).
+The fixture has no wallet secrets and is not a mainnet transaction.
+`src/catalyst/unsigned_effect_binding.py` implements the canonical CAT2 identity
+and curry-hash equations for matching these executable outputs to Sage's
+summary; no full Chia Python runtime dependency is introduced. The Chia license
+notice above applies to the embedded CAT2 program.

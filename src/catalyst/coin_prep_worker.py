@@ -2187,37 +2187,16 @@ class CoinPrepWorker:
     def _direct_batch_targets(self):
         """Return the exact final-output plan for the current tier settings."""
 
-        from coin_prep_batch_plan import TargetOutput
+        from coin_prep_targets import build_prep_targets
 
-        targets = []
-        for asset in ("xch", "cat"):
-            counts = self.xch_tier_counts if asset == "xch" else self.cat_tier_counts
-            sizes = self.tier_xch_sizes if asset == "xch" else self.tier_cat_sizes
-            ordinal = 0
-            for tier_rank, tier_name in enumerate(self.tier_order):
-                count = int(counts.get(tier_name, 0) or 0)
-                if asset == "xch":
-                    amount = int(
-                        Decimal(str(sizes.get(tier_name, 0))) * Decimal("1000000000000")
-                    )
-                else:
-                    amount = cat_display_amount_to_mojos_ceil(
-                        Decimal(str(sizes.get(tier_name, 0))), self.cat_decimals
-                    )
-                if count < 0 or (count and amount <= 0):
-                    raise ValueError("direct batch tier target is invalid")
-                for _index in range(count):
-                    targets.append(
-                        TargetOutput(
-                            asset=asset,
-                            purpose=self._purpose_for_tier(tier_name),
-                            tier_rank=tier_rank,
-                            amount_mojos=amount,
-                            ordinal=ordinal,
-                        )
-                    )
-                    ordinal += 1
-        return tuple(targets)
+        return build_prep_targets(
+            tier_order=self.tier_order,
+            xch_counts=self.xch_tier_counts,
+            cat_counts=self.cat_tier_counts,
+            xch_sizes=self.tier_xch_sizes,
+            cat_sizes=self.tier_cat_sizes,
+            cat_decimals=self.cat_decimals,
+        )
 
     def _direct_batch_snapshot(self, targets):
         """Read strict selectable coins and assign only exact reusable targets."""
@@ -2305,63 +2284,16 @@ class CoinPrepWorker:
     def _direct_batch_target_contract(self, plan, address: str) -> dict:
         """Build a version-2 durable target from one deterministic plan."""
 
-        outputs = []
-        for index, output in enumerate(plan.outputs):
-            purpose = {
-                "change": "top_up",
-                "fee_change": "fee_reserve",
-            }.get(output.purpose, output.purpose)
-            outputs.append(
-                {
-                    "output_index": index,
-                    "asset": output.asset,
-                    "address": address,
-                    "amount_mojos": output.amount_mojos,
-                    "purpose": purpose,
-                    "ordinal": output.ordinal,
-                }
-            )
-        target = {
-            "contract_version": 2,
-            "wallet_type": plan.asset,
-            "cat_asset_id": (
-                str(os.getenv("CAT_ASSET_ID", "")).strip()
-                if plan.asset == "cat"
-                else None
-            ),
-            "fee_mojos": plan.fee_mojos,
-            "outputs": outputs,
-        }
-        if plan.fee_source_id:
-            target["external_fee"] = {
-                "fee_mojos": plan.fee_mojos,
-                "coin_ids": [plan.fee_source_id],
-            }
-        return target
+        from coin_prep_unsigned import batch_target_contract
+
+        return batch_target_contract(
+            plan, address, str(os.getenv("CAT_ASSET_ID", "")).strip()
+        )
 
     def _direct_batch_actions(self, target: dict) -> list[dict]:
-        actions = []
-        for output in target["outputs"]:
-            action_id = (
-                {"type": "xch"}
-                if output["asset"] == "xch"
-                else {
-                    "type": "existing",
-                    "asset_id": target["cat_asset_id"],
-                }
-            )
-            actions.append(
-                {
-                    "type": "send",
-                    "id": action_id,
-                    "address": output["address"],
-                    "amount": str(output["amount_mojos"]),
-                    "memos": [],
-                }
-            )
-        if target["fee_mojos"]:
-            actions.append({"type": "fee", "amount": str(target["fee_mojos"])})
-        return actions
+        from coin_prep_unsigned import batch_actions
+
+        return batch_actions(target)
 
     def _direct_batch_relay_safe_fee_mojos(self, plan) -> int:
         """Scale an enabled Sage batch fee to its conservative CLVM cost.
