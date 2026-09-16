@@ -20817,6 +20817,32 @@ def _reserve_approved_fee_locked(conn, approval_id, scope, plan, operation, fee,
     return {**dict(result), "idempotent": False}
 
 
+def get_coin_prep_fee_dispatch_claim(operation_id: str) -> Dict[str, Any]:
+    """Read the exact active own claim without recovery-latch side effects.
+
+    This read is not a dispatch permit. The final hold/dispatch fences must
+    atomically recheck the undispatched journal and claim again.
+    """
+    operation_id = _fee_operation_identity(operation_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT claim.* FROM coin_prep_operations AS prep "
+            "JOIN wallet_effect_claims AS claim ON claim.claim_token=prep.effect_claim_token "
+            "AND claim.generation=prep.effect_claim_generation AND claim.operation_id=prep.operation_id "
+            "LEFT JOIN wallet_effect_claim_resolutions AS resolution ON resolution.claim_token=claim.claim_token "
+            "LEFT JOIN wallet_effect_dispatches AS dispatch ON dispatch.claim_token=claim.claim_token "
+            "WHERE prep.operation_id=? AND prep.outcome='PREPARED' "
+            "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+        return dict(row)
+    finally:
+        conn.close()
+
+
 def reserve_coin_prep_fee_for_dispatch(
     *, approval_id: str, scope_sha256: str, plan_sha256: str,
     operation_id: str, final_quote: Dict[str, Any],
@@ -20890,6 +20916,16 @@ def reserve_coin_prep_fee_for_dispatch(
             (operation["effect_claim_token"], operation["effect_claim_generation"], operation_id),
         ).fetchone()
         if claim is None:
+            raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+        # Reserve designations may change after service inventory checks. Do
+        # not use availability-filtered get_reserve_coins here: own claimed
+        # roots are intentionally unavailable to unrelated planners.
+        if conn.execute(
+            "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
+            "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
+            "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
+            (claim["claim_token"],),
+        ).fetchone() is not None:
             raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
         target = json.loads(operation["target_contract_json"])
         exact_fee = target.get("fee_mojos", target.get("external_fee", {}).get("fee_mojos"))

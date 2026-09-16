@@ -509,6 +509,48 @@ Primary schema evidence:
 - No live wallet mutation, reload, package build, main merge or release occurred.
   The full implementation goal and hourly continuation loop remain active.
 
+## Exact frozen pricing-to-hold service (continuation)
+
+- Added internal price_approved_prep_batch: trusted frozen consent and current
+  selectable inventory feed real executable unsigned inspection and bounded
+  network fee/cost convergence. Fresh context and durable accounting are reread
+  after slow work. Unknown holds remain counted; price increases inside the
+  remaining preparation allowance may proceed to claiming, while provider loss,
+  unfunded principal/fees and over-budget fees expose no usable bundle.
+  Manual mode cannot bypass unavailable network guidance.
+- Added reserve_approved_prep_dispatch: reconstructs the saved exact pre-claim
+  plan under current frozen economics, recomputes actual executable cost/effects,
+  compares the current original-age quote and exact fee, derives the operation
+  ID, binds actual additions, then joins the existing atomic journal/claim-bound
+  hold. It returns no signing/dispatch authority; retrieval cannot authorize
+  operation replay. No worker path invokes these helpers yet.
+- Six focused regressions failed before the pricing service existed; four more
+  failed before the executable/journal-to-hold boundary existed. Independent
+  review then reproduced a disappeared CAT root still obtaining a cached-bundle
+  hold. Missing-root and changed-amount regressions failed DID NOT RAISE before
+  the fix. Full inventory is now compared before and after executable inspection;
+  only exact process-current own-claim protection labels may be normalized.
+  Inventory amount/asset/selectability, other protections and funding changes
+  cannot be ignored. Recovery-list APIs are not used because they latch state.
+- An explicit non-creating getter regression failed before its fix; new
+  get_coin_prep_fee_dispatch_claim now uses read-only SQLite. Review also found
+  a reserve designation race after service checks: a normal set_coin_designation
+  regression failed DID NOT RAISE. The final hold now checks the exact selected
+  cohort's reserve designations inside BEGIN IMMEDIATE, without the availability
+  filter that hides own claimed roots from unrelated planners.
+- A combined run initially produced 23 fixture errors because the shared
+  approval fixture held a prior test file's database/clock module after conftest
+  restoration. Rebinding current project modules fixed the fixture without
+  changing production freshness rules. A subsequent 135-test regression passed;
+  final corrected regression (pricing-to-hold, frozen execution, exact pricing,
+  atomic holds, funding, ledger and authoritative recovery): 137 passed in
+  63.10s, exit 0, including all 19 newest boundary tests. Ruff and
+  git diff --check passed.
+- Independent final read-only review found no remaining findings in this
+  bounded groundwork; reproduced 62 pricing/frozen/hold passes and two latest
+  missing-database/atomic-reserve passes. Full implementation gates remain open.
+  No wallet mutation, live reload, build, main merge or release occurred.
+
 ## Outstanding acceptance gates
 
 Session completion lifecycle, remaining compatibility/prerequisite-family canonical plan preview,

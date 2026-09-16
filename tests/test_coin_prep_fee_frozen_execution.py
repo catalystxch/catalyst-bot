@@ -16,6 +16,11 @@ from fee_staged_preview_utils import prepare_unsigned_wallet
 
 @pytest.fixture
 def approved(tmp_path, monkeypatch):
+    # conftest restores project modules between files; this fixture is reused
+    # by other files, so never retain a previous file's database/clock binding.
+    global database, api_server
+    database = import_module("database")
+    api_server = import_module("api_server")
     wallet_reads = utils.live_reads(tmp_path, monkeypatch)
     state = next(wallet_reads)
     utils.economic_reads(state, monkeypatch)
