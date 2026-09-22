@@ -2618,9 +2618,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
         lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
     )
 
-    result = app_bridge.AppBridge().trigger_coin_prep(
-        {"fee_approval_id": "a" * 64}
-    )
+    result = app_bridge.AppBridge().trigger_coin_prep({"fee_approval_id": "a" * 64})
 
     assert result["error"] == "coin_prep_wallet_offer_check_unavailable"
     assert result["reason"] == "WALLET_OFFER_BOOK_UNAVAILABLE"
@@ -7978,7 +7976,10 @@ def _bounded_loopback_candidates(
 
 
 def _wait_for_diagnostics_status(process, port: int) -> dict:
-    deadline = time.monotonic() + 10
+    # A first read-only SQLite snapshot can be delayed by Windows Defender's
+    # initial scan on a fresh test database.  Keep the assertion bounded while
+    # allowing the same cold-start margin used by the browser/server helpers.
+    deadline = time.monotonic() + 30
     url = f"http://127.0.0.1:{port}/api/safety/status"
     while time.monotonic() < deadline:
         if process.poll() is not None:

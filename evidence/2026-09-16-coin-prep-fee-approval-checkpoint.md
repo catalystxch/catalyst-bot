@@ -598,3 +598,27 @@ and no release or main merge was made during this checkpoint.
   full regression, Windows package verification, isolated packaged GUI exercise,
   genuine TEST 7 operator-approved live acceptance, final audit/commit and any
   integration decision remain Task 6 gates. Main and release remain untouched.
+
+## Full-suite compatibility cleanup (22 September 2026)
+
+- The first serial full-suite run after protected cancellation completed with
+  6,868 passed, 99 skipped and 422 subtests passed. Ten failures were isolated:
+  six older Coin Prep/crash fixtures omitted the now-required fee approval,
+  two market-history assertions used fixed 20 August fills that had crossed the
+  production 30-day boundary, and two cold diagnostics children exceeded their
+  ten-second test-only readiness allowance while Windows scanned fresh SQLite
+  snapshots. None represented duplicate wallet work or escaped fee authority.
+- Legacy Coin Prep unit fixtures now exercise an approval-shaped launch or the
+  deliberate `FEE_DISPATCH_UNSUPPORTED` pause. Already-prepared completion is
+  explicitly approval-bound. The crash route still tests state reset, but first
+  passes the same server-side approved-dispatch gate as production.
+- Market-history tests now mint recent authoritative receipt timestamps instead
+  of depending on the calendar date; the production 30-day query remains
+  unchanged. The diagnostics helper remains bounded but uses a 30-second cold-
+  start allowance consistent with the other standalone server helpers; no
+  production timeout or diagnostic safety behavior changed.
+- All eight corrected failure cases passed together. The four affected test
+  modules then passed 154 tests, the two diagnostics parameter cases passed,
+  and the five changed files pass Ruff formatting/lint plus `git diff --check`.
+  A new full serial run, E2E/build and genuine operator-approved live acceptance
+  are still required before readiness can be claimed.

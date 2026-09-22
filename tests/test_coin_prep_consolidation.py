@@ -1340,6 +1340,11 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker.verify_coins = lambda: (4, 3)
         worker._merge_xch_fee_change_into_reserve = lambda: False
         worker._designate_final_sweep = lambda: None
+        worker.fee_approval_id = "a" * 64
+        worker._complete_approved_fee_session = lambda: {
+            "approval_id": worker.fee_approval_id,
+            "state": "completed",
+        }
 
         def coins_for(wallet_id, name, selectable_only=False):
             if wallet_id == 1:

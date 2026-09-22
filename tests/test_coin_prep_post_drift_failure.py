@@ -106,7 +106,7 @@ def test_post_prep_tier_drift_is_a_hard_failure(monkeypatch):
     assert events[0][1] == "tier_size_post_prep_drift"
 
 
-def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
+def test_run_full_preparation_stops_before_complete_banner_on_unsupported_compatibility(
     monkeypatch,
 ):
     fake_coin_manager = types.ModuleType("coin_manager")
@@ -171,13 +171,14 @@ def test_run_full_preparation_stops_before_complete_banner_on_post_drift(
     worker._format_cat_amount = str
     worker._recover_coin_prep_operations_read_only = MagicMock(return_value=True)
     worker._observe_recoverable_coin_prep_operation = MagicMock()
+    worker.fee_approval_id = "a" * 64
 
     assert worker.run_full_preparation() is False
     worker.update_status.assert_any_call(
         coin_prep_worker.PrepPhase.ERROR,
-        0.99,
-        "Post-prep tier drift detected - manual re-prep required",
-        error="POST_PREP_TIER_DRIFT: cat/outer=0.917x (n=3)",
+        0.0,
+        "Error: FEE_DISPATCH_UNSUPPORTED",
+        error="FEE_DISPATCH_UNSUPPORTED",
     )
     logged = "\n".join(str(call) for call in worker.log.mock_calls)
     assert "COIN PREPARATION COMPLETE" not in logged

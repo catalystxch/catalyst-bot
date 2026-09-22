@@ -105,6 +105,18 @@ def _canonical_digest(value: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _recent_authority_times() -> tuple[str, str]:
+    """Keep 30-day market-history assertions independent of wall-clock date."""
+
+    now = datetime.now(timezone.utc)
+    filled = now - timedelta(seconds=2)
+    reconciled = now - timedelta(seconds=1)
+    return (
+        filled.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        reconciled.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+
 def _task12_split_prep_contract(source_coin_id: str) -> dict:
     return {
         "operation_kind": "split",
@@ -826,8 +838,13 @@ def test_migration_never_mints_authority_from_correlated_mutable_economics(
 
 
 def test_market_history_consumes_exact_authoritative_projection(isolated_database):
+    filled_at, reconciled_at = _recent_authority_times()
     for suffix in ("market-history-a", "market-history-b", "market-history-c"):
-        _seed_authoritative_fill(suffix=suffix)
+        _seed_authoritative_fill(
+            suffix=suffix,
+            filled_at=filled_at,
+            reconciled_at=reconciled_at,
+        )
 
     history = market_data_collector._fetch_internal_db_history(ASSET)
 
@@ -2143,8 +2160,12 @@ def test_round_trip_authority_is_atomic_under_exact_replay_race(
 def test_market_position_uses_authoritative_receipts_not_legacy_inventory(
     isolated_database,
 ):
+    filled_at, reconciled_at = _recent_authority_times()
     _seed_authoritative_fill(
-        suffix="market-position-authority", size_cat=Decimal("100")
+        suffix="market-position-authority",
+        size_cat=Decimal("100"),
+        filled_at=filled_at,
+        reconciled_at=reconciled_at,
     )
     assert database.record_inventory_snapshot(ASSET, Decimal("877"))
 
