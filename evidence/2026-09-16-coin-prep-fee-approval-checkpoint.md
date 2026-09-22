@@ -745,3 +745,7 @@ and no release or main merge was made during this checkpoint.
   refresh required`, and a disabled preparation confirmation button. No fee
   approval or wallet transaction was submitted. The bot stayed stopped with
   zero offers and unchanged 138.472874970211 spendable XCH / 780212.284 MZ.
+- The 570-test fee-specific backend suite was repeated with unintended
+  external Coinset access disabled only in that test process. It passed in
+  185.71 seconds, without the earlier Windows network exceptions. The live
+  app configuration and fee source were not changed by this test setting.
