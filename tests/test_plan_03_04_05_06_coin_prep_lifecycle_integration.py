@@ -288,6 +288,10 @@ class _TempDB(unittest.TestCase):
             patch("blueprints.coin_prep.threading.Thread") as mock_thread_cls,
             patch("blueprints.coin_prep.log_event"),
             patch(
+                "coin_prep_fee_dispatch.price_approved_prep_batch",
+                return_value={"available": True},
+            ),
+            patch(
                 "blueprints.coin_prep._wallet_open_offer_snapshot_before_prep",
                 create=True,
                 **snapshot_patch,
@@ -306,6 +310,7 @@ class _TempDB(unittest.TestCase):
                 json={
                     "full_reset": full_reset,
                     "reset_offer_history": reset_offer_history,
+                    "fee_approval_id": "a" * 64,
                 },
                 headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,

@@ -94,10 +94,10 @@ assert fake_wallet.signatures == []
 assert fake_wallet.submissions == []
 ```
 
-- [ ] Observe failures; factor the existing prep economic plan so preview and execution consume identical validated tier/reserve/bootstrap choices. Use exact unsigned cost where current inputs exist, explicitly projected cost/count for future outputs.
-- [ ] Add tests for fee-coin principal versus actual spend, insufficient funding, stale quotes, changed identity/plan, projected stages and provider outage. Build canonical digests with integer atomic amounts and immutable economic scope.
+- [x] Observe failures; factor the existing prep economic plan so preview and execution consume identical validated tier/reserve/bootstrap choices. Use exact unsigned cost where current inputs exist, explicitly projected cost/count for future outputs.
+- [x] Add tests for fee-coin principal versus actual spend, insufficient funding, stale quotes, changed identity/plan, projected stages and provider outage. Build canonical digests with integer atomic amounts and immutable economic scope.
 - [x] Persist preview/approval state so reloads return pending operations and remaining budget rather than duplicate starts. Ensure HTTP mutation protection and desktop guard are shared.
-- [ ] Run API/bridge/planner/schema regressions; commit verified service/routes.
+- [x] Run API/bridge/planner/schema regressions; commit verified service/routes. The consolidated approval/preview/dispatch/lifecycle surface passed 481 tests on 22 September 2026.
 
 ## Task 4: Enforce approval and fresh exact fees on every prep dispatch
 
@@ -157,4 +157,5 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.
 - [x] Task 1 strict estimation foundation verified and committed.
 - [x] Task 2 database foundation and canonical scope/plan helper core verified; live integration is still outstanding.
-- [ ] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented. The supported Sage tier path now consumes frozen execution; unsupported compatibility modes pause safely. Protected cancellation consumption, final Bootstrap integration and Task 6 remain open; Task 5 is complete.
+- [x] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented and jointly regression-tested. Task 5 is complete.
+- [ ] Task 4 supported Sage tier execution and restart-safe authoritative accounting are implemented. Unsupported compatibility modes pause safely. Protected cancellation consumption and final Bootstrap integration remain open; Task 6 remains open.
