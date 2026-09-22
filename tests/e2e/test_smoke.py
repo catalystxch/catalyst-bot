@@ -1131,7 +1131,17 @@ def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: false, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 if (!String(path).includes('/coin-prep/trigger')) {
                     throw new Error(`Unexpected test request: ${path}`);
                 }
@@ -1185,7 +1195,18 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
                 action: 'proceed',
                 resets: { pnl: true, offers: false, counters: false },
             });
-            apiFetch = async () => new Response(JSON.stringify({
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify({
                 success: false,
                 error: 'coin_prep_requires_offer_cancellation',
                 reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
@@ -1198,7 +1219,8 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
             }), {
                 status: 409,
                 headers: { 'Content-Type': 'application/json' },
-            });
+                });
+            };
             await startCoinPrepFromModal();
         }"""
     )
@@ -1223,8 +1245,18 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: true, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             window.__submittedPrepPayload = null;
             apiFetch = async (_path, options) => {
+                if (String(_path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 window.__submittedPrepPayload = JSON.parse(options.body);
                 return new Response(JSON.stringify({
                     success: false,
@@ -1291,9 +1323,21 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
             askPrepHistoryChoice = async () => ({
                 action: 'proceed', resets: { pnl: false, offers: true, counters: true },
             });
-            apiFetch = async () => new Response(JSON.stringify(failure), {
-                status: 423, headers: { 'Content-Type': 'application/json' },
-            });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify(failure), {
+                    status: 423, headers: { 'Content-Type': 'application/json' },
+                });
+            };
             await startCoinPrepFromModal();
         }""",
         failure,
