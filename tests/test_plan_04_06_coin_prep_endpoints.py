@@ -71,6 +71,9 @@ class _FlaskBase(unittest.TestCase):
 
     def _post(self, path, body=None, auth=True):
         headers = dict(self.auth) if auth else {}
+        if path == "/api/coin-prep/trigger":
+            body = dict(body or {})
+            body.setdefault("fee_approval_id", "a" * 64)
         return self.client.post(
             path,
             json=body or {},
@@ -966,10 +969,46 @@ class TestCoinPrepTrigger(_FlaskBase):
         )
         self._legacy_recovery.start()
         self.addCleanup(self._legacy_recovery.stop)
+        self._fee_dispatch = patch(
+            "coin_prep_fee_dispatch.price_approved_prep_batch",
+            return_value={"available": True},
+        )
+        self._fee_dispatch.start()
+        self.addCleanup(self._fee_dispatch.stop)
 
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
         self.assertEqual(resp.status_code, 401)
+
+    def test_missing_fee_approval_is_rejected_before_background_start(self):
+        with patch("threading.Thread") as mock_thread:
+            resp = self.client.post(
+                "/api/coin-prep/trigger",
+                json={},
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
+            )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FEE_APPROVAL_REQUIRED")
+        mock_thread.assert_not_called()
+
+    def test_stale_fee_approval_is_rejected_before_background_start(self):
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch(
+                "coin_prep_fee_dispatch.price_approved_prep_batch",
+                return_value={
+                    "available": False,
+                    "reason": "FEE_APPROVAL_STALE",
+                },
+            ),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FEE_APPROVAL_STALE")
+        mock_thread.assert_not_called()
 
     def test_bootstrap_trigger_does_not_expose_internal_exception_detail(self):
         with patch.object(
@@ -1134,6 +1173,9 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertIn("--cat-wallet", captured["cmd"])
         index = captured["cmd"].index("--cat-wallet")
         self.assertEqual(captured["cmd"][index + 1], "2")
+        self.assertIn("--fee-approval-id", captured["cmd"])
+        approval_index = captured["cmd"].index("--fee-approval-id")
+        self.assertEqual(captured["cmd"][approval_index + 1], "a" * 64)
 
     def test_trigger_delegation_outlives_legitimate_chain_confirmation_waits(self):
         """The worker must not lose mutation authority during normal mainnet waits."""

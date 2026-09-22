@@ -155,3 +155,23 @@ def reserve_approved_prep_dispatch(*, approval_id: str, operation_id: str, price
         plan_sha256=final["approval"]["plan_sha256"], operation_id=operation_id,
         final_quote=quote)
     return {**hold, "validated_unsigned": validated, "dispatch_authorized": False}
+
+
+def recheck_approved_prep_dispatch(*, approval_id: str, operation_id: str,
+                                 priced_batch: dict, dispatch_capability=None) -> None:
+    """Final read-only check after the hold, before the existing effect fence.
+
+    The hold remains counted if identity/settings/inventory/guidance changed;
+    failure here is not authoritative proof that an effect can be refunded.
+    """
+    context = read_approved_prep_fee_snapshot(approval_id)
+    if any(priced_batch[key] != context[key] for key in (
+            "identity", "configuration", "receive_address", "recipe", "campaign", "scope")):
+        raise ValueError("FEE_APPROVAL_STALE")
+    pricing = priced_batch["pricing"]
+    if not is_current_fee_quote(pricing["quote"], pricing["inspection"]["cost"],
+                                context["recipe"]["economic_plan"]["target_seconds"]):
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+    claim = database.get_coin_prep_fee_dispatch_claim(
+        operation_id, dispatch_capability=dispatch_capability)
+    _verify_current_inventory(context, priced_batch["snapshot"], pricing["plan"], operation_id, claim)

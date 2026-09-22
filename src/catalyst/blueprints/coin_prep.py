@@ -18,6 +18,7 @@ import glob
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -1221,7 +1222,23 @@ def api_coin_prep():
             }
         ), 409
 
-    started = bot.coin_manager.start_coin_prep()
+    body = request.get_json(silent=True)
+    fee_approval_id = body.get("fee_approval_id") if type(body) is dict else None
+    if (
+        type(fee_approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+    ):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "reason": "FEE_APPROVAL_REQUIRED",
+                    "dispatch_authorized": False,
+                }
+            ),
+            409,
+        )
+    started = bot.coin_manager.start_coin_prep(fee_approval_id=fee_approval_id)
     return jsonify({"status": "started" if started else "already_running"})
 
 
@@ -2387,6 +2404,64 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
+        _fee_approval_id = _prep_req_data.get("fee_approval_id")
+        if (
+            type(_fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", _fee_approval_id) is None
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_REQUIRED",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        try:
+            from coin_prep_fee_dispatch import price_approved_prep_batch
+
+            _approved_dispatch = price_approved_prep_batch(_fee_approval_id)
+        except ValueError as exc:
+            reason = str(exc)
+            if re.fullmatch(r"FEE_[A-Z_]+", reason) is None:
+                reason = "FEE_APPROVAL_UNAVAILABLE"
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": reason,
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        except Exception:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_UNAVAILABLE",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                503,
+            )
+        if _approved_dispatch.get("available") is not True:
+            reason = _approved_dispatch.get("reason")
+            if type(reason) is not str or re.fullmatch(r"FEE_[A-Z_]+", reason) is None:
+                reason = "FEE_APPROVAL_UNAVAILABLE"
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": reason,
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
         try:
             _bootstrap_worker_args = _active_bootstrap_coin_prep_worker_args(
                 _prep_req_data
@@ -3140,6 +3215,7 @@ def _api_coin_prep_trigger_locked():
                     )
 
                 cmd += ["--cat-wallet", str(cat_wallet_id)]
+                cmd += ["--fee-approval-id", _fee_approval_id]
 
                 operation_id = f"coin-prep:{run_id}"
                 worker_id = f"coin-prep-worker:{run_id}"

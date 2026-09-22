@@ -26,6 +26,7 @@ import threading
 import subprocess
 import json
 import os
+import re
 import hashlib
 import sys
 import uuid
@@ -12058,8 +12059,36 @@ class CoinManager:
     # Full coin prep (subprocess)
     # -------------------------------------------------------------------
 
-    def start_coin_prep(self) -> bool:
+    def start_coin_prep(self, *, fee_approval_id: str | None = None) -> bool:
         """Launch the full coin_prep_worker as a subprocess."""
+        if (
+            type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_required",
+                "Coin Prep remains blocked until its fee budget is approved",
+            )
+            return False
+        try:
+            from coin_prep_fee_dispatch import price_approved_prep_batch
+
+            approved_dispatch = price_approved_prep_batch(fee_approval_id)
+        except Exception:
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_unavailable",
+                "Coin Prep fee approval could not be validated; no worker was changed",
+            )
+            return False
+        if approved_dispatch.get("available") is not True:
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_stale",
+                "Coin Prep fee approval is no longer current; no worker was changed",
+            )
+            return False
         # Kill any existing worker before starting a new one.
         # Two workers on the same wallet causes coin conflicts.
         if self._prep_process and self._prep_process.poll() is None:
@@ -12275,6 +12304,7 @@ class CoinManager:
 
             cmd.extend(["--cat-wallet", str(cat_wallet_id)])
             cmd.extend(["--run-id", prep_run_id])
+            cmd.extend(["--fee-approval-id", fee_approval_id])
 
             # Pass the bot's current weighted mid to the worker so CAT sizing
             # reflects what the bot is actually quoting, not Dexie's last_price

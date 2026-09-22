@@ -2593,6 +2593,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     """Desktop prep must reach wallet preflight, not lose its permit in Flask g."""
     import api_server
     import app_bridge
+    import coin_prep_fee_dispatch
     from blueprints import coin_prep
 
     _, clock = isolated_gate_database
@@ -2605,6 +2606,11 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     monkeypatch.setattr(api_server, "_coin_prep_proc", None)
     monkeypatch.setattr(api_server, "_coin_prep_thread", None)
     monkeypatch.setattr(api_server, "_coin_prep_state", {"running": False})
+    monkeypatch.setattr(
+        coin_prep_fee_dispatch,
+        "price_approved_prep_batch",
+        lambda _approval_id: {"available": True},
+    )
     # Stop at the external wallet boundary: no wallet calls, resets or worker.
     monkeypatch.setattr(
         coin_prep,
@@ -2612,7 +2618,9 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
         lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
     )
 
-    result = app_bridge.AppBridge().trigger_coin_prep()
+    result = app_bridge.AppBridge().trigger_coin_prep(
+        {"fee_approval_id": "a" * 64}
+    )
 
     assert result["error"] == "coin_prep_wallet_offer_check_unavailable"
     assert result["reason"] == "WALLET_OFFER_BOOK_UNAVAILABLE"

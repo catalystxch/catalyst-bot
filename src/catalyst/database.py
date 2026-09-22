@@ -10667,6 +10667,7 @@ def begin_wallet_effect_dispatch(
     source_coin_ids: Any,
     fee_coin_ids: Any = None,
     dispatched_at: Any = None,
+    prep_fee_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[_WalletEffectDispatchCapability]:
     """Durably cross the adapter boundary under the retained opaque permit."""
 
@@ -10694,6 +10695,8 @@ def begin_wallet_effect_dispatch(
         if not _wallet_effect_runtime_authority_is_current(conn, state):
             conn.rollback()
             return None
+        _recheck_held_prep_fee_locked(
+            conn, operation_id, safe_token, safe_generation, prep_fee_context)
         conn.execute(
             "INSERT INTO wallet_effect_dispatches "
             "(dispatch_token, claim_token, generation, authority_sha256, "
@@ -10714,6 +10717,8 @@ def begin_wallet_effect_dispatch(
         )
     except Exception:
         conn.rollback()
+        if prep_fee_context is not None:
+            raise
         return None
     finally:
         conn.close()
@@ -20817,13 +20822,18 @@ def _reserve_approved_fee_locked(conn, approval_id, scope, plan, operation, fee,
     return {**dict(result), "idempotent": False}
 
 
-def get_coin_prep_fee_dispatch_claim(operation_id: str) -> Dict[str, Any]:
+def get_coin_prep_fee_dispatch_claim(
+    operation_id: str, *, dispatch_capability: Any = None,
+) -> Dict[str, Any]:
     """Read the exact active own claim without recovery-latch side effects.
 
     This read is not a dispatch permit. The final hold/dispatch fences must
     atomically recheck the undispatched journal and claim again.
     """
     operation_id = _fee_operation_identity(operation_id)
+    if (dispatch_capability is not None
+            and type(dispatch_capability) is not _WalletEffectDispatchCapability):
+        raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
     conn = _stability_read_only_connection()
     try:
         row = conn.execute(
@@ -20833,14 +20843,94 @@ def get_coin_prep_fee_dispatch_claim(operation_id: str) -> Dict[str, Any]:
             "LEFT JOIN wallet_effect_claim_resolutions AS resolution ON resolution.claim_token=claim.claim_token "
             "LEFT JOIN wallet_effect_dispatches AS dispatch ON dispatch.claim_token=claim.claim_token "
             "WHERE prep.operation_id=? AND prep.outcome='PREPARED' "
-            "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
-            (operation_id,),
+            "AND resolution.claim_token IS NULL AND "
+            "((? IS NULL AND dispatch.claim_token IS NULL) OR "
+            "(dispatch.dispatch_token=? AND claim.claim_token=? AND claim.generation=?))",
+            (operation_id,
+             getattr(dispatch_capability, "dispatch_token", None),
+             getattr(dispatch_capability, "dispatch_token", None),
+             getattr(dispatch_capability, "claim_token", None),
+             getattr(dispatch_capability, "generation", None)),
         ).fetchone()
         if row is None:
             raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
         return dict(row)
     finally:
         conn.close()
+
+
+def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, context):
+    """Recheck held prep consent/quote/cohort after acquiring the dispatch lock.
+
+    A fee reservation never grants dispatch authority. In particular a legacy
+    caller cannot omit these checks for an operation with an approved fee hold.
+    The caller must already own the IMMEDIATE writer transaction.
+    """
+    hold = conn.execute(
+        "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation_id,)
+    ).fetchone()
+    if hold is None and context is None:
+        return
+    if hold is None or type(context) is not dict or hold["cancellation"]:
+        raise ValueError("FEE_RESERVATION_REQUIRED")
+    if context.get("approval_id") != hold["approval_id"]:
+        raise ValueError("FEE_APPROVAL_STALE")
+    quote = context.get("quote")
+    if type(quote) is not dict or quote.get("available") is not True:
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+    try:
+        fee, cost, target, observed, expiry = (
+            _fee_amount(quote.get(key)) for key in
+            ("fee_mojos", "cost", "target_seconds", "observed_at", "expires_at"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
+    if (cost == 0 or quote.get("source") not in ("coinset", "full_node_rpc")
+            or expiry != observed + 60 or fee != hold["fee_mojos"]):
+        raise ValueError("FEE_QUOTE_INVALID")
+    if not observed <= int(time.time()) < expiry:
+        raise ValueError("FEE_QUOTE_STALE")
+    consent = conn.execute(
+        "SELECT preview.*, approval.version, "
+        "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
+        "WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
+        "FROM coin_prep_fee_consents AS consent "
+        "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+        "JOIN fee_approvals AS approval USING(approval_id) WHERE consent.approval_id=?",
+        (hold["approval_id"],),
+    ).fetchone()
+    if (consent is None or consent["version"] != consent["latest_version"]
+            or consent["scope_sha256"] != hold["scope_sha256"]
+            or consent["plan_sha256"] != hold["plan_sha256"]
+            or json.loads(consent["plan_json"])["target_seconds"] != target):
+        raise ValueError("FEE_APPROVAL_STALE")
+    operation = conn.execute(
+        "SELECT * FROM coin_prep_operations WHERE operation_id=?", (operation_id,)
+    ).fetchone()
+    if (operation is None or operation["outcome"] != "PREPARED"
+            or operation["constructed_outputs_json"] is None
+            or operation["effect_claim_token"] != claim_token
+            or operation["effect_claim_generation"] != generation
+            or conn.execute("SELECT 1 FROM approved_fee_outcomes WHERE operation_id=?",
+                            (operation_id,)).fetchone() is not None):
+        raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+    claim = conn.execute(
+        "SELECT claim.* FROM wallet_effect_claims AS claim "
+        "LEFT JOIN wallet_effect_claim_resolutions AS resolution ON resolution.claim_token=claim.claim_token "
+        "LEFT JOIN wallet_effect_dispatches AS dispatch ON dispatch.claim_token=claim.claim_token "
+        "WHERE claim.claim_token=? AND claim.generation=? AND claim.operation_id=? "
+        "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
+        (claim_token, generation, operation_id),
+    ).fetchone()
+    if claim is None or conn.execute(
+        "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
+        "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
+        "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
+        (claim_token,),
+    ).fetchone() is not None:
+        raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
+    contract = json.loads(operation["target_contract_json"])
+    if contract.get("fee_mojos", contract.get("external_fee", {}).get("fee_mojos")) != fee:
+        raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
 
 
 def reserve_coin_prep_fee_for_dispatch(
@@ -24212,6 +24302,36 @@ def record_coin_prep_operation_outcome(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def get_coin_prep_operation_for_observation(operation_id: str) -> Dict[str, Any]:
+    """Read one fresh journal/effect cohort without setting a recovery latch.
+
+    An in-flight worker must observe the constructed additions and submitted
+    state actually persisted, not its earlier PREPARED return value. Separate
+    CAT fee roots are part of the observation contract, not just CAT sources.
+    """
+    operation_id = _fee_operation_identity(operation_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT prep.*, claim.fee_coin_ids_json AS effect_fee_coin_ids_json, "
+            "dispatch.dispatch_token AS effect_dispatch_token, "
+            "dispatch.authority_sha256 AS effect_authority_sha256, "
+            "dispatch.adapter_operation AS effect_adapter_operation "
+            "FROM coin_prep_operations AS prep JOIN wallet_effect_claims AS claim "
+            "ON claim.claim_token=prep.effect_claim_token "
+            "AND claim.generation=prep.effect_claim_generation "
+            "AND claim.operation_id=prep.operation_id "
+            "LEFT JOIN wallet_effect_dispatches AS dispatch "
+            "ON dispatch.claim_token=claim.claim_token AND dispatch.generation=claim.generation "
+            "WHERE prep.operation_id=?", (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        return dict(row)
     finally:
         conn.close()
 
