@@ -738,3 +738,10 @@ and no release or main merge was made during this checkpoint.
   but timed out at doctor during transient local network/Sage contention; a
   previous package passed as a control and the new package then passed the
   complete eight-endpoint smoke unchanged. No release package was published.
+- The source app's real TEST 7 GUI was reloaded, MZ wallet 2 reselected, and
+  the same bounded zero-headroom settings re-saved. The refreshed GUI displayed
+  the corrected `MZ/XCH` pair label and a 12-second-old Coinset quote. Without
+  any synthetic clock change, the quote later displayed `72s old`, `expired —
+  refresh required`, and a disabled preparation confirmation button. No fee
+  approval or wallet transaction was submitted. The bot stayed stopped with
+  zero offers and unchanged 138.472874970211 spendable XCH / 780212.284 MZ.
