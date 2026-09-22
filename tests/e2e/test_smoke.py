@@ -1134,6 +1134,7 @@ def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
             _coinPrepFeePreview = {
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
@@ -1198,6 +1199,7 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
             _coinPrepFeePreview = {
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
@@ -1248,6 +1250,7 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
             _coinPrepFeePreview = {
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             window.__submittedPrepPayload = null;
@@ -1326,6 +1329,7 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
             _coinPrepFeePreview = {
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
@@ -1643,6 +1647,7 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,
@@ -1851,6 +1856,7 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,

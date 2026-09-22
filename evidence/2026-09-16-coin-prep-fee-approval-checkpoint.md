@@ -622,3 +622,27 @@ and no release or main merge was made during this checkpoint.
   and the five changed files pass Ruff formatting/lint plus `git diff --check`.
   A new full serial run, E2E/build and genuine operator-approved live acceptance
   are still required before readiness can be claimed.
+- The subsequent hermetic serial run disabled unintended external Coinset access
+  at the environment boundary and completed with 6,878 passed, 99 skipped and
+  422 subtests passed in 1,061.51 seconds. There were no failures, cold-start
+  diagnostics timeouts or Windows socket exceptions. Intentional Coinset tests
+  continued to use their explicit mocked configuration and responses. Browser,
+  fresh package and live operator-approved acceptance gates remain open.
+
+## Complete Chromium gate after restart (22 September 2026)
+
+- The first full opt-in Chromium run completed with 92 passes and six failures.
+  All six were older browser fixtures that predated the fail-closed fee contract:
+  five supplied no `estimated_total_fee_mojos`, so client-side cap validation
+  correctly refused to record consent or trigger Coin Prep; one attempted a
+  protected Coin Prep cancellation without its 64-hex approval ID, so no cancel
+  request was sent.
+- The fixtures now carry the same displayed total and approval identity required
+  by production. The six previously failing cases passed together, including
+  both parameter variants. The corrected async cancellation/recovery case then
+  passed independently.
+- The complete real-Chromium E2E suite passed 98 tests in 73.17 seconds with
+  external Coinset lookup disabled. Production code and fail-closed validation
+  were not weakened. Fresh Windows package and genuine operator-approved live
+  acceptance gates remain open; CATalyst is still stopped and no wallet action
+  occurred.
