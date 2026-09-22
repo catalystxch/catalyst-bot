@@ -646,3 +646,23 @@ and no release or main merge was made during this checkpoint.
   were not weakened. Fresh Windows package and genuine operator-approved live
   acceptance gates remain open; CATalyst is still stopped and no wallet action
   occurred.
+
+## Fresh Windows package gate (22 September 2026)
+
+- A clean `python build.py` from commit `723ab6f` completed successfully with
+  PyInstaller 6.21.0 and Python 3.12.6. The build verified bundled HTML assets
+  and the certifi CA bundle. The isolated executable is version 1.4.0, size
+  11,232,145 bytes, SHA-256
+  `45DC07C1FEDCF1AF50476C7765DC66816660C0D26424667176CDDA4613D8FE13`.
+- The packaged API smoke passed health, mock-Sage startup, config validation,
+  diagnostics, self-test and doctor endpoints. The packaged worker authenticated
+  to an isolated mock Sage server with mutual TLS and passed its read-only RPC
+  probe. Neither test used the live wallet.
+- The packaged Windows desktop smoke passed clean first launch, duplicate-window
+  handoff, persisted relaunch and the branded fail-closed native safety fallback.
+  Temporary test data and ports were isolated; the installed/live package and
+  user data were not replaced.
+- The remaining acceptance gate is a real TEST 7 preview and genuine operator
+  confirmation of the displayed maximum fee, followed by bounded live Coin Prep
+  and restart/recovery verification. No such consent or wallet mutation has yet
+  occurred. Main and release remain untouched.
