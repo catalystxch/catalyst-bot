@@ -161,14 +161,18 @@ def _remove_fee_watermark(conn):
     guard = conn.execute("SELECT sql FROM sqlite_master WHERE "
                          "name='stability_migration_watermarks_no_delete'").fetchone()[0]
     conn.execute("DROP TRIGGER stability_migration_watermarks_no_delete")
-    conn.execute("DELETE FROM stability_migration_watermarks WHERE migration_key='coin-prep-fee-approval-schema'")
+    conn.execute(
+        "DELETE FROM stability_migration_watermarks WHERE migration_key IN "
+        "('coin-prep-fee-approval-schema','coin-prep-fee-session-completion-schema')"
+    )
     conn.execute(guard)
 
 
 def _remove_fee_tables(ledger):
     conn = ledger.get_connection()
     _remove_fee_watermark(conn)
-    for table in ("coin_prep_fee_consents", "coin_prep_fee_previews", "approved_fee_outcomes",
+    for table in ("coin_prep_fee_session_completions", "coin_prep_fee_consents",
+                  "coin_prep_fee_previews", "approved_fee_outcomes",
                   "approved_fee_reservations", "fee_approvals", "coin_prep_fee_sessions"):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     conn.commit()
@@ -179,14 +183,16 @@ def test_upgrade_from_pre_fee_schema_keeps_existing_stability_watermarks(ledger)
     # A real prior installation already completed stability migrations but had
     # no fee schema. It must upgrade, not be mistaken for erased legacy evidence.
     prior = [tuple(row) for row in ledger.get_connection().execute(
-        "SELECT * FROM stability_migration_watermarks WHERE migration_key<>'coin-prep-fee-approval-schema'")]
+        "SELECT * FROM stability_migration_watermarks WHERE migration_key NOT IN "
+        "('coin-prep-fee-approval-schema','coin-prep-fee-session-completion-schema')")]
     _remove_fee_tables(ledger)
     try:
         _restart(ledger)
     except RuntimeError as exc:
         pytest.fail(f"legitimate pre-fee installation cannot upgrade: {exc}")
     recovered = [tuple(row) for row in ledger.get_connection().execute(
-        "SELECT * FROM stability_migration_watermarks WHERE migration_key<>'coin-prep-fee-approval-schema'")]
+        "SELECT * FROM stability_migration_watermarks WHERE migration_key NOT IN "
+        "('coin-prep-fee-approval-schema','coin-prep-fee-session-completion-schema')")]
     assert recovered == prior
     assert _scope()["session_id"]
 
@@ -212,4 +218,46 @@ def test_missing_session_table_after_completed_migration_is_not_recreated_silent
     conn.execute("DROP TABLE coin_prep_fee_sessions")
     conn.commit()
     with pytest.raises(RuntimeError, match="fee.*watermark.*schema"):
+        _restart(ledger)
+
+
+def test_v1_session_schema_upgrades_without_losing_existing_session(ledger):
+    scope = _scope()
+    conn = ledger.get_connection()
+    guard = conn.execute("SELECT sql FROM sqlite_master WHERE "
+                         "name='stability_migration_watermarks_no_delete'").fetchone()[0]
+    conn.execute("DROP TRIGGER stability_migration_watermarks_no_delete")
+    conn.execute("DELETE FROM stability_migration_watermarks "
+                 "WHERE migration_key='coin-prep-fee-session-completion-schema'")
+    conn.execute(guard)
+    conn.execute("DROP TRIGGER coin_prep_fee_sessions_generation_guard")
+    conn.execute("DROP TABLE coin_prep_fee_session_completions")
+    conn.execute("""
+        CREATE TRIGGER coin_prep_fee_sessions_generation_guard
+        BEFORE INSERT ON coin_prep_fee_sessions
+        WHEN NEW.generation<>1 OR EXISTS (
+            SELECT 1 FROM coin_prep_fee_sessions WHERE identity_sha256=NEW.identity_sha256
+        )
+        BEGIN SELECT RAISE(ABORT, 'fee session completion evidence required'); END
+    """)
+    conn.commit()
+
+    _restart(ledger)
+
+    assert _scope() == scope
+    assert ledger.get_connection().execute(
+        "SELECT schema_version FROM stability_migration_watermarks "
+        "WHERE migration_key='coin-prep-fee-session-completion-schema'"
+    ).fetchone()[0] == 1
+    assert ledger.get_connection().execute(
+        "SELECT COUNT(*) FROM coin_prep_fee_session_completions"
+    ).fetchone()[0] == 0
+
+
+def test_missing_completion_table_after_its_watermark_is_not_recreated_silently(ledger):
+    _scope()
+    conn = ledger.get_connection()
+    conn.execute("DROP TABLE coin_prep_fee_session_completions")
+    conn.commit()
+    with pytest.raises(RuntimeError, match="fee session completion watermark"):
         _restart(ledger)

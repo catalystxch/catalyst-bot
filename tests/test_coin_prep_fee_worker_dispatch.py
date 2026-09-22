@@ -298,3 +298,48 @@ def test_constructed_output_write_failure_retains_claim_without_hold_or_signing(
     assert active_worker["adapter_attempts"] == []
     assert utils._counts()["approved_fee_reservations"] == 0
     assert utils._counts()["wallet_effect_claims"] == 1
+
+
+def test_worker_success_boundary_records_authoritative_session_completion(active_worker):
+    runtime = import_module("coin_prep_fee_runtime")
+    context = runtime.read_approved_prep_fee_snapshot(
+        active_worker["approval"]["approval_id"]
+    )
+    active_worker["xch"] = [
+        utils._coin(40000 + index, str(target.amount_mojos))
+        for index, target in enumerate(context["recipe"]["targets"])
+        if target.asset == "xch"
+    ]
+    active_worker["cat"] = [
+        utils._coin(50000 + index, str(target.amount_mojos))
+        for index, target in enumerate(context["recipe"]["targets"])
+        if target.asset == "cat"
+    ]
+
+    result = active_worker["worker"]._complete_approved_fee_session()
+
+    assert result["approval_id"] == active_worker["approval"]["approval_id"]
+    assert result["target_count"] == len(context["recipe"]["targets"])
+    assert result["dispatch_authorized"] is False
+
+
+def test_existing_target_shortcut_cannot_report_complete_before_fee_session_closes(
+    active_worker, monkeypatch,
+):
+    worker = active_worker["worker"]
+    statuses = []
+    worker.update_status = lambda phase, progress, message, **kwargs: statuses.append(
+        (phase, progress, message, kwargs)
+    )
+    worker.verify_coins = lambda: (4, 2)
+    worker._designate_final_sweep = lambda: None
+    worker._record_prep_reserve_advisory_baseline = lambda: None
+    worker._save_successful_prep_settings = lambda *_args: None
+    monkeypatch.setattr(
+        worker, "_complete_approved_fee_session",
+        lambda: (_ for _ in ()).throw(ValueError("FEE_SESSION_INCOMPLETE")),
+    )
+
+    with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):
+        worker._complete_existing_tier_preparation()
+    assert all(phase != active_worker["module"].PrepPhase.COMPLETE for phase, *_ in statuses)

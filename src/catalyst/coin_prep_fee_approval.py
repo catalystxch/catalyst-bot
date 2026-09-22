@@ -90,13 +90,65 @@ def resolve_server_fee_scope(*, identity: dict, campaign_id: str | None = None) 
 
     Refresh and restart reuse a standalone session; campaigns retain their
     existing durable identity. This does not create approval or wallet effects.
-    Session completion/new-generation transitions remain a separate open gate.
+    A completed standalone session advances exactly once on the next resolve.
     """
     identity = _canonical_fee_identity(identity)
     if campaign_id is not None:
         return {**identity, "campaign_id": _digest(campaign_id), "session_id": None}
     session = database.get_or_create_coin_prep_fee_session(identity_json=_canonical_json(identity))
     return {**identity, "campaign_id": None, "session_id": session["session_id"]}
+
+
+def complete_coin_prep_fee_session(approval_id: str) -> dict:
+    """Prove frozen targets exist and close one standalone approval scope.
+
+    Completion is deliberately read-only at the wallet boundary. A fresh
+    verified snapshot must satisfy every approved target without another
+    transaction, and a second read must reproduce the same ownership before
+    the database joins it to terminal operation/fee evidence. Campaign scopes
+    have their own lifecycle and cannot be closed through this function.
+    """
+
+    from coin_prep_batch_plan import BatchConstraints, BatchPlan, plan_batch
+    from coin_prep_fee_funding import prepare_fee_inventory
+    from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
+
+    approval_id = _digest(approval_id)
+    context = read_approved_prep_fee_snapshot(approval_id)
+    session_id = context["scope"].get("session_id")
+    if session_id is None:
+        raise ValueError("FEE_SESSION_COMPLETION_UNSUPPORTED")
+
+    def prove(snapshot_context):
+        recipe = snapshot_context["recipe"]
+        floors = recipe["economic_plan"]["reserve_floors_mojos"]
+        funding = prepare_fee_inventory(snapshot_context["snapshot"], recipe["targets"], floors)
+        if funding["principal_funded"] is not True:
+            raise ValueError("FEE_SESSION_INCOMPLETE")
+        plan = plan_batch(
+            funding["snapshot"], recipe["targets"],
+            BatchConstraints(reserve_floors=floors, fee_mojos=0),
+        )
+        if (type(plan) is not BatchPlan or plan.transaction_required is not False
+                or len(plan.reused_target_ids) != len(recipe["targets"])
+                or len(plan.reused_coin_ids) != len(recipe["targets"])):
+            raise ValueError("FEE_SESSION_INCOMPLETE")
+        return plan
+
+    first = prove(context)
+    after = read_approved_prep_fee_snapshot(approval_id)
+    if any(after[key] != context[key] for key in (
+        "identity", "configuration", "receive_address", "snapshot", "recipe",
+        "campaign", "scope", "approval",
+    )):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    second = prove(after)
+    if second != first:
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+    return database.record_coin_prep_fee_session_completion(
+        approval_id=approval_id, session_id=session_id,
+        target_coin_ids=list(second.reused_coin_ids),
+    )
 
 
 def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:

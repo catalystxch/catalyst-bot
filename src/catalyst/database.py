@@ -1589,11 +1589,100 @@ WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
 BEGIN SELECT RAISE(ABORT, 'fee session identity mismatch'); END;
 -- Later generations require a future journal-proven completion transition.
 -- Until that lifecycle is implemented, refresh/restart cannot renew a scope.
+CREATE TABLE IF NOT EXISTS coin_prep_fee_session_completions (
+    session_id TEXT PRIMARY KEY NOT NULL REFERENCES coin_prep_fee_sessions(session_id),
+    approval_id TEXT UNIQUE NOT NULL REFERENCES fee_approvals(approval_id),
+    scope_sha256 TEXT NOT NULL
+        CHECK(length(scope_sha256)=64 AND scope_sha256 NOT GLOB '*[^0-9a-f]*'),
+    plan_sha256 TEXT NOT NULL
+        CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+    evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json) AND json_type(evidence_json)='object'),
+    evidence_sha256 TEXT NOT NULL
+        CHECK(length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*'),
+    completed_at INTEGER NOT NULL CHECK(typeof(completed_at)='integer' AND completed_at>=0)
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_session_completions_no_update
+BEFORE UPDATE ON coin_prep_fee_session_completions BEGIN
+    SELECT RAISE(ABORT, 'fee session completions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_session_completions_no_delete
+BEFORE DELETE ON coin_prep_fee_session_completions BEGIN
+    SELECT RAISE(ABORT, 'fee session completions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_session_completions_no_replace
+BEFORE INSERT ON coin_prep_fee_session_completions
+WHEN EXISTS (SELECT 1 FROM coin_prep_fee_session_completions
+             WHERE session_id=NEW.session_id OR approval_id=NEW.approval_id)
+BEGIN SELECT RAISE(ABORT, 'fee session completions cannot be replaced'); END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_session_completions_evidence_guard
+BEFORE INSERT ON coin_prep_fee_session_completions
+WHEN catalyst_sha256(NEW.evidence_json) IS NOT NEW.evidence_sha256
+  OR json_extract(NEW.evidence_json, '$.version') IS NOT 1
+  OR json_extract(NEW.evidence_json, '$.session_id') IS NOT NEW.session_id
+  OR json_extract(NEW.evidence_json, '$.approval_id') IS NOT NEW.approval_id
+  OR json_extract(NEW.evidence_json, '$.scope_sha256') IS NOT NEW.scope_sha256
+  OR json_extract(NEW.evidence_json, '$.plan_sha256') IS NOT NEW.plan_sha256
+  OR json_type(NEW.evidence_json, '$.target_coin_ids') IS NOT 'array'
+  OR json_array_length(NEW.evidence_json, '$.target_coin_ids')<1
+  OR json_type(NEW.evidence_json, '$.operation_outcomes') IS NOT 'array'
+BEGIN SELECT RAISE(ABORT, 'fee session completion evidence mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_fee_session_completions_authority_guard
+BEFORE INSERT ON coin_prep_fee_session_completions
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM coin_prep_fee_sessions AS session
+      JOIN coin_prep_fee_consents AS consent ON consent.approval_id=NEW.approval_id
+      JOIN coin_prep_fee_previews AS preview ON preview.preview_id=consent.preview_id
+      JOIN fee_approvals AS approval ON approval.approval_id=NEW.approval_id
+     WHERE session.session_id=NEW.session_id
+       AND preview.scope_sha256=NEW.scope_sha256
+       AND preview.plan_sha256=NEW.plan_sha256
+       AND approval.scope_sha256=NEW.scope_sha256
+       AND approval.plan_sha256=NEW.plan_sha256
+       AND json_extract(preview.scope_json, '$.session_id')=NEW.session_id
+       AND approval.version=(SELECT MAX(current.version) FROM fee_approvals AS current
+                             WHERE current.scope_sha256=NEW.scope_sha256)
+)
+OR EXISTS (
+    SELECT 1 FROM approved_fee_reservations AS reservation
+    LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id)
+    WHERE reservation.scope_sha256=NEW.scope_sha256 AND outcome.operation_id IS NULL
+)
+OR json_array_length(NEW.evidence_json, '$.operation_outcomes')<>(
+    SELECT COUNT(*) FROM approved_fee_reservations
+    WHERE scope_sha256=NEW.scope_sha256
+)
+OR EXISTS (
+    SELECT 1 FROM approved_fee_reservations AS reservation
+    JOIN approved_fee_outcomes AS outcome USING(operation_id)
+    WHERE reservation.scope_sha256=NEW.scope_sha256 AND NOT EXISTS (
+        SELECT 1 FROM json_each(NEW.evidence_json, '$.operation_outcomes') AS item
+        WHERE json_extract(item.value, '$.operation_id')=reservation.operation_id
+          AND json_extract(item.value, '$.state')=outcome.state
+          AND json_extract(item.value, '$.evidence_id')=outcome.evidence_id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'fee session completion authority unresolved'); END;
 CREATE TRIGGER IF NOT EXISTS coin_prep_fee_sessions_generation_guard
 BEFORE INSERT ON coin_prep_fee_sessions
-WHEN NEW.generation<>1 OR EXISTS (
-    SELECT 1 FROM coin_prep_fee_sessions WHERE identity_sha256=NEW.identity_sha256
-)
+WHEN NEW.generation<>(
+        SELECT COALESCE(MAX(existing.generation), 0)+1
+        FROM coin_prep_fee_sessions AS existing
+        WHERE existing.identity_sha256=NEW.identity_sha256
+    )
+ OR (
+    EXISTS (SELECT 1 FROM coin_prep_fee_sessions AS existing
+            WHERE existing.identity_sha256=NEW.identity_sha256)
+    AND NOT EXISTS (
+        SELECT 1 FROM coin_prep_fee_sessions AS latest
+        JOIN coin_prep_fee_session_completions AS completion
+          ON completion.session_id=latest.session_id
+        WHERE latest.identity_sha256=NEW.identity_sha256
+          AND latest.generation=(SELECT MAX(candidate.generation)
+                                 FROM coin_prep_fee_sessions AS candidate
+                                 WHERE candidate.identity_sha256=NEW.identity_sha256)
+    )
+ )
 BEGIN SELECT RAISE(ABORT, 'fee session completion evidence required'); END;
 -- Approvals and exact fee holds are immutable; settlement is separate evidence.
 CREATE TABLE IF NOT EXISTS fee_approvals (
@@ -4090,6 +4179,10 @@ _STABILITY_REQUIRED_COLUMNS = {
     "coin_prep_fee_sessions": {
         "session_id", "identity_sha256", "identity_json", "generation", "created_at",
     },
+    "coin_prep_fee_session_completions": {
+        "session_id", "approval_id", "scope_sha256", "plan_sha256",
+        "evidence_json", "evidence_sha256", "completed_at",
+    },
     "coin_prep_fee_previews": {
         "preview_id", "scope_sha256", "plan_sha256", "scope_json", "plan_json",
         "request_options_json", "quote_json", "observed_at", "expires_at",
@@ -5472,6 +5565,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_operation_journal", ("event_id",))
     _require_unique_key(conn, "fee_approvals", ("scope_sha256", "version"))
     _require_unique_key(conn, "coin_prep_fee_sessions", ("identity_sha256", "generation"))
+    _require_unique_key(conn, "coin_prep_fee_session_completions", ("approval_id",))
     _require_unique_key(conn, "coin_prep_fee_consents", ("approval_id",))
     _require_unique_key(
         conn, "offer_operation_journal", ("operation_id", "attempt", "phase")
@@ -6040,6 +6134,12 @@ _FEE_APPROVAL_SCHEMA_TABLES = frozenset({
     "coin_prep_fee_sessions", "coin_prep_fee_previews", "coin_prep_fee_consents",
     "fee_approvals", "approved_fee_reservations", "approved_fee_outcomes",
 })
+_FEE_SESSION_COMPLETION_MIGRATION_KEY = "coin-prep-fee-session-completion-schema"
+_FEE_SESSION_COMPLETION_SCHEMA_VERSION = 1
+_FEE_SESSION_COMPLETION_POLICY_SHA256 = hashlib.sha256(
+    b"coin-prep-fee-session-completion:v1:journal-and-current-target-proof"
+).hexdigest()
+_FEE_SESSION_COMPLETION_TABLES = frozenset({"coin_prep_fee_session_completions"})
 
 
 def _fee_approval_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -6053,6 +6153,20 @@ def _fee_approval_schema_completed(conn: sqlite3.Connection) -> bool:
             or row["schema_version"] != _FEE_APPROVAL_SCHEMA_VERSION
             or row["policy_sha256"] != _FEE_APPROVAL_SCHEMA_POLICY_SHA256):
         raise RuntimeError("fee approval schema watermark contradicts schema policy")
+    return True
+
+
+def _fee_session_completion_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?", (_FEE_SESSION_COMPLETION_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (type(row["schema_version"]) is not int
+            or row["schema_version"] != _FEE_SESSION_COMPLETION_SCHEMA_VERSION
+            or row["policy_sha256"] != _FEE_SESSION_COMPLETION_POLICY_SHA256):
+        raise RuntimeError("fee session completion watermark contradicts schema policy")
     return True
 
 
@@ -6701,6 +6815,41 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _upgrade_fee_session_generation_guard(conn: sqlite3.Connection) -> None:
+    """Replace only the known generation-one guard after completion schema exists."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='coin_prep_fee_sessions_generation_guard'"
+    ).fetchone()
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(FEE_SCHEMA_SQL)
+        expected_row = expected_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='coin_prep_fee_sessions_generation_guard'"
+        ).fetchone()
+    finally:
+        expected_db.close()
+    if row is None or expected_row is None:
+        return
+    actual_sql, expected_sql = str(row[0]), str(expected_row[0])
+    if _normalized_schema_sql(actual_sql) == _normalized_schema_sql(expected_sql):
+        return
+    legacy_sql = """
+    CREATE TRIGGER coin_prep_fee_sessions_generation_guard
+    BEFORE INSERT ON coin_prep_fee_sessions
+    WHEN NEW.generation<>1 OR EXISTS (
+        SELECT 1 FROM coin_prep_fee_sessions WHERE identity_sha256=NEW.identity_sha256
+    )
+    BEGIN SELECT RAISE(ABORT, 'fee session completion evidence required'); END
+    """
+    if _normalized_schema_sql(actual_sql) != _normalized_schema_sql(legacy_sql):
+        raise RuntimeError("fee session generation guard has unknown schema")
+    conn.execute("DROP TRIGGER coin_prep_fee_sessions_generation_guard")
+    conn.execute(expected_sql)
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -6738,6 +6887,7 @@ def _migrate_stability_schema() -> None:
             "offer_reconciliation_coin_outcomes" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        _upgrade_fee_session_generation_guard(conn)
         epoch_columns = {
             str(row["name"])
             for row in conn.execute(
@@ -6927,8 +7077,12 @@ def _migrate_stability_schema() -> None:
         backfills_completed = _stability_backfills_completed(conn)
         post_tibet_schema_completed = _post_tibet_schema_completed(conn)
         fee_schema_completed = _fee_approval_schema_completed(conn)
+        fee_session_completion_completed = _fee_session_completion_schema_completed(conn)
         if fee_schema_completed and missing_stability_tables & _FEE_APPROVAL_SCHEMA_TABLES:
             raise RuntimeError("fee approval schema watermark contradicts schema")
+        if (fee_session_completion_completed
+                and missing_stability_tables & _FEE_SESSION_COMPLETION_TABLES):
+            raise RuntimeError("fee session completion watermark contradicts schema")
         missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
         if post_tibet_schema_completed and missing_post_tibet_tables:
             raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
@@ -6960,6 +7114,7 @@ def _migrate_stability_schema() -> None:
             | _POST_TIBET_SCHEMA_TABLES
             | _BOOTSTRAP_SCHEMA_TABLES
             | _FEE_APPROVAL_SCHEMA_TABLES
+            | _FEE_SESSION_COMPLETION_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -7012,6 +7167,15 @@ def _migrate_stability_schema() -> None:
                 "VALUES (?, ?, ?, ?)",
                 (_FEE_APPROVAL_SCHEMA_MIGRATION_KEY, _FEE_APPROVAL_SCHEMA_VERSION,
                  _FEE_APPROVAL_SCHEMA_POLICY_SHA256, _stability_wall_clock()),
+            )
+        if not fee_session_completion_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (_FEE_SESSION_COMPLETION_MIGRATION_KEY,
+                 _FEE_SESSION_COMPLETION_SCHEMA_VERSION,
+                 _FEE_SESSION_COMPLETION_POLICY_SHA256, _stability_wall_clock()),
             )
         conn.commit()
     except Exception:
@@ -20519,7 +20683,8 @@ def get_or_create_coin_prep_fee_session(*, identity_json: str) -> Dict[str, Any]
     """Resolve one durable server session without consent or wallet effects.
 
     The trusted collector supplies a closed canonical wallet identity. A later
-    generation cannot be minted until journal-proven completion is implemented.
+    generation is minted only after the latest session has an immutable,
+    journal-bound completion record.
     """
     identity = json.loads(identity_json)
     if (type(identity) is not dict or identity_json != json.dumps(
@@ -20542,7 +20707,19 @@ def get_or_create_coin_prep_fee_session(*, identity_json: str) -> Dict[str, Any]
         else:
             if row["identity_json"] != identity_json:
                 raise ValueError("FEE_SESSION_IDENTITY_MISMATCH")
-            session_id = row["session_id"]
+            completed = conn.execute(
+                "SELECT 1 FROM coin_prep_fee_session_completions WHERE session_id=?",
+                (row["session_id"],),
+            ).fetchone()
+            if completed is None:
+                session_id = row["session_id"]
+            else:
+                session_id = os.urandom(32).hex()
+                conn.execute(
+                    "INSERT INTO coin_prep_fee_sessions VALUES (?, ?, ?, ?, ?)",
+                    (session_id, digest, identity_json, int(row["generation"]) + 1,
+                     _fee_amount(int(time.time()))),
+                )
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -20559,14 +20736,150 @@ def get_coin_prep_fee_session(session_id: str) -> Dict[str, Any]:
     try:
         _validate_stability_schema(conn)
         row = conn.execute(
-            "SELECT session.*, (SELECT current.session_id FROM coin_prep_fee_sessions AS current "
+            "SELECT session.*, completion.approval_id AS completion_approval_id, "
+            "completion.completed_at, "
+            "(SELECT current.session_id FROM coin_prep_fee_sessions AS current "
             "WHERE current.identity_sha256=session.identity_sha256 "
             "ORDER BY current.generation DESC LIMIT 1) AS current_session_id "
-            "FROM coin_prep_fee_sessions AS session WHERE session.session_id=?", (session_id,),
+            "FROM coin_prep_fee_sessions AS session "
+            "LEFT JOIN coin_prep_fee_session_completions AS completion "
+            "ON completion.session_id=session.session_id "
+            "WHERE session.session_id=?", (session_id,),
         ).fetchone()
         if row is None:
             raise ValueError("FEE_SESSION_REQUIRED")
         return dict(row)
+    finally:
+        conn.close()
+
+
+def get_coin_prep_fee_session_completion(session_id: str) -> Dict[str, Any]:
+    """Read immutable completion evidence; it grants no spending authority."""
+
+    session_id = _fee_digest(session_id)
+    conn = _stability_read_only_connection()
+    try:
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT * FROM coin_prep_fee_session_completions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FEE_SESSION_COMPLETION_REQUIRED")
+        result = dict(row)
+        evidence = json.loads(result["evidence_json"])
+        return {**result, "target_count": len(evidence["target_coin_ids"]),
+                "operation_count": len(evidence["operation_outcomes"]),
+                "idempotent": True, "dispatch_authorized": False}
+    finally:
+        conn.close()
+
+
+def record_coin_prep_fee_session_completion(
+    *, approval_id: str, session_id: str, target_coin_ids: list[str],
+) -> Dict[str, Any]:
+    """Close a completed standalone scope against terminal fee journal evidence.
+
+    The caller supplies only freshly observed target identities. Approval,
+    scope, plan and every operation outcome are derived again under one write
+    lock. This transition neither reserves a fee nor authorizes a wallet effect.
+    """
+
+    approval_id = _fee_digest(approval_id)
+    session_id = _fee_digest(session_id)
+    if (type(target_coin_ids) is not list or not target_coin_ids
+            or any(type(value) is not str for value in target_coin_ids)):
+        raise ValueError("FEE_SESSION_COMPLETION_EVIDENCE_INVALID")
+    canonical_targets = sorted(_fee_digest(value) for value in target_coin_ids)
+    if len(canonical_targets) != len(set(canonical_targets)):
+        raise ValueError("FEE_SESSION_COMPLETION_EVIDENCE_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute(
+            "SELECT * FROM coin_prep_fee_session_completions "
+            "WHERE session_id=? OR approval_id=?", (session_id, approval_id),
+        ).fetchone()
+        context = conn.execute(
+            "SELECT approval.*, preview.scope_json, consent.preview_id, "
+            "(SELECT MAX(current.version) FROM fee_approvals AS current "
+            " WHERE current.scope_sha256=approval.scope_sha256) AS latest_version "
+            "FROM fee_approvals AS approval "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE approval.approval_id=?", (approval_id,),
+        ).fetchone()
+        if context is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        scope = json.loads(context["scope_json"])
+        session = conn.execute(
+            "SELECT * FROM coin_prep_fee_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        current = conn.execute(
+            "SELECT session_id FROM coin_prep_fee_sessions WHERE identity_sha256=("
+            "SELECT identity_sha256 FROM coin_prep_fee_sessions WHERE session_id=?) "
+            "ORDER BY generation DESC LIMIT 1", (session_id,),
+        ).fetchone()
+        if (session is None or current is None or current["session_id"] != session_id
+                or scope.get("session_id") != session_id or scope.get("campaign_id") is not None
+                or context["version"] != context["latest_version"]):
+            raise ValueError("FEE_APPROVAL_STALE")
+        unresolved = conn.execute(
+            "SELECT reservation.operation_id FROM approved_fee_reservations AS reservation "
+            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+            "ORDER BY reservation.operation_id LIMIT 1", (context["scope_sha256"],),
+        ).fetchone()
+        if unresolved is not None:
+            raise ValueError("FEE_SESSION_EFFECT_UNRESOLVED")
+        outcome_rows = conn.execute(
+            "SELECT reservation.operation_id, outcome.state, outcome.evidence_id "
+            "FROM approved_fee_reservations AS reservation "
+            "JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "WHERE reservation.scope_sha256=? ORDER BY reservation.operation_id",
+            (context["scope_sha256"],),
+        ).fetchall()
+        operation_outcomes = [dict(row) for row in outcome_rows]
+        evidence = {
+            "version": 1,
+            "session_id": session_id,
+            "approval_id": approval_id,
+            "scope_sha256": context["scope_sha256"],
+            "plan_sha256": context["plan_sha256"],
+            "target_coin_ids": canonical_targets,
+            "operation_outcomes": operation_outcomes,
+        }
+        encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        evidence_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        expected = (session_id, approval_id, context["scope_sha256"], context["plan_sha256"],
+                    encoded, evidence_sha256)
+        if prior is not None:
+            if tuple(prior[key] for key in (
+                "session_id", "approval_id", "scope_sha256", "plan_sha256",
+                "evidence_json", "evidence_sha256",
+            )) != expected:
+                raise ValueError("FEE_SESSION_COMPLETION_MISMATCH")
+            conn.commit()
+            return {**dict(prior), "target_count": len(canonical_targets),
+                    "operation_count": len(operation_outcomes), "idempotent": True,
+                    "dispatch_authorized": False}
+        completed_at = _fee_amount(int(time.time()))
+        conn.execute(
+            "INSERT INTO coin_prep_fee_session_completions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (*expected, completed_at),
+        )
+        row = dict(conn.execute(
+            "SELECT * FROM coin_prep_fee_session_completions WHERE session_id=?",
+            (session_id,),
+        ).fetchone())
+        conn.commit()
+        return {**row, "target_count": len(canonical_targets),
+                "operation_count": len(operation_outcomes), "idempotent": False,
+                "dispatch_authorized": False}
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

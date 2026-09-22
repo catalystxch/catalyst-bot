@@ -2165,6 +2165,22 @@ class CoinPrepWorker:
         except Exception as _e:
             self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
 
+    def _complete_approved_fee_session(self) -> dict:
+        """Close the approved standalone scope before reporting prep success."""
+
+        approval_id = getattr(self, "fee_approval_id", None)
+        if type(approval_id) is not str or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        from coin_prep_fee_approval import complete_coin_prep_fee_session
+
+        result = complete_coin_prep_fee_session(approval_id)
+        self.log(
+            "✅ Coin Prep fee session closed from authoritative target and "
+            f"journal evidence ({result['target_count']} targets, "
+            f"{result['operation_count']} operations)"
+        )
+        return result
+
     def _complete_existing_tier_preparation(self) -> bool:
         """Finish a prep run when current selectable tier coins are already valid."""
         self.update_status(
@@ -2175,6 +2191,7 @@ class CoinPrepWorker:
         xch_final, cat_final = self.verify_coins()
         self._designate_final_sweep()
         self._record_prep_reserve_advisory_baseline()
+        self._complete_approved_fee_session()
         self.update_status(
             PrepPhase.COMPLETE,
             1.0,
@@ -10935,6 +10952,12 @@ class CoinPrepWorker:
                 except Exception as status_err:
                     self.log(f"Post-prep drift status update failed: {status_err}")
                 return False
+
+            # A green worker exit is also the durable accounting boundary. The
+            # completion service re-reads the verified wallet and refuses to
+            # rotate this fee scope until every frozen target exists and every
+            # fee hold has an authoritative terminal outcome.
+            self._complete_approved_fee_session()
 
             self.log(f"\n{'=' * 60}")
             self.log("🎉 COIN PREPARATION COMPLETE!")
