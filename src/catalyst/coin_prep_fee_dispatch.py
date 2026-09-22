@@ -53,6 +53,15 @@ def price_approved_prep_batch(approval_id: str) -> dict:
     resize targets; any change during this individual pricing pass invalidates
     that pass. Unknown holds and protected cancellation cover remain counted.
     """
+    accounting = database.get_coin_prep_fee_approval_status(approval_id)
+    if accounting["unresolved_operation_count"]:
+        return {
+            "available": False,
+            "reason": "FEE_EFFECT_RECOVERY_REQUIRED",
+            "approval": accounting,
+            "recovery_state": accounting["state"],
+            "dispatch_authorized": False,
+        }
     context = read_approved_prep_fee_snapshot(approval_id)
     recipe = context["recipe"]
     plan = recipe["economic_plan"]

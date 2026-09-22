@@ -299,3 +299,75 @@ def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
         "must cover the displayed 0.000016 XCH estimated plan"
     )
     expect(page.locator("#cpConfirmBtn")).to_be_disabled()
+
+
+def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_launch(page):
+    _open_gui(page)
+    status = {
+        "success": True,
+        "running": False,
+        "complete": False,
+        "phase": "idle",
+        "progress": 0.5,
+        "message": "Previous worker stopped",
+        "overlapping_coin_prep_blocked": True,
+        "fee_resume_required": True,
+        "fee_approval_id": "d" * 64,
+        "fee_approval": {
+            "approval_id": "d" * 64,
+            "state": "submitted_awaiting_confirmation",
+            "total_fee_mojos": "20000001",
+            "cancellation_reserve_mojos": "4000000",
+            "held_fee_mojos": "12000000",
+            "spent_fee_mojos": "4000000",
+            "remaining_fee_mojos": "4000001",
+            "remaining_preparation_fee_mojos": "1",
+            "unresolved_operation_count": 1,
+            "pending_operation": {
+                "fee_mojos": "12000000",
+                "cancellation": False,
+                "effect_state": "submitted_awaiting_confirmation",
+            },
+            "dispatch_authorized": False,
+        },
+    }
+    result = page.evaluate(
+        """async status => {
+            window.__feeCalls = [];
+            window.apiFetch = async path => {
+                window.__feeCalls.push(String(path));
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`No preview, approval or launch expected: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'none';
+            const restored = await restoreCoinPrepReadiness();
+            return {
+                restored,
+                calls: window.__feeCalls,
+                coinPrepStatus,
+                modalOpen: document.getElementById('coinPrepConfirmOverlay').classList.contains('active'),
+                progressDisplay: document.getElementById('coinPrepProgressView').style.display,
+            };
+        }""",
+        status,
+    )
+
+    assert result == {
+        "restored": True,
+        "calls": ["/api/coin-prep/status"],
+        "coinPrepStatus": "checking",
+        "modalOpen": True,
+        "progressDisplay": "block",
+    }
+    expect(page.locator("#cpProgressTitle")).to_have_text("Coin Prep Paused Safely")
+    expect(page.locator("#cpProgressFeeState")).to_contain_text(
+        "submitted transaction is awaiting confirmation"
+    )
+    expect(page.locator("#cpProgressFeeHeld")).to_have_text("0.000012 XCH")
+    expect(page.locator("#cpProgressFeeSpent")).to_have_text("0.000004 XCH")
+    expect(page.locator("#cpProgressFeeRemaining")).to_have_text("0.000004000001 XCH")
+    expect(page.locator("#cpProgressFeeProtected")).to_have_text("0.000004 XCH")
+    expect(page.locator("#coinPrepCancelBtn")).to_be_hidden()

@@ -62,15 +62,23 @@ def test_higher_fee_cannot_consume_protected_cancellation_allowance(approved, mo
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
-def test_existing_unknown_hold_stays_counted_during_network_repricing(approved, monkeypatch):
+def test_existing_unknown_hold_blocks_overlapping_network_repricing(approved, monkeypatch):
     account = approved["approval"]
     database.reserve_approved_fee(
         approval_id=account["approval_id"], scope_sha256=account["scope_sha256"],
         plan_sha256=account["plan_sha256"], operation_id="1" * 64, fee_mojos=15, cancellation=False)
-    _network_quote(approved, monkeypatch, 30)
+    service = import_module("coin_prep_fee_dispatch")
+    monkeypatch.setattr(
+        service,
+        "read_approved_prep_fee_snapshot",
+        lambda _approval_id: pytest.fail(
+            "recovery gate must run before fresh wallet inventory reads"
+        ),
+    )
     result = _price(approved)
     assert result["available"] is False
-    assert result["reason"] == "FEE_BUDGET_EXCEEDED"
+    assert result["reason"] == "FEE_EFFECT_RECOVERY_REQUIRED"
+    assert result["recovery_state"] == "held_before_submission"
     assert result["approval"]["held_fee_mojos"] == 15
     assert result["approval"]["remaining_preparation_fee_mojos"] == 25
     assert utils._counts()["approved_fee_reservations"] == 1

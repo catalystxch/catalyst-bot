@@ -11846,7 +11846,7 @@
             
             <!-- PROGRESS VIEW (while coin prep is running) -->
             <div id="coinPrepProgressView" style="display: none;">
-                <div class="coin-prep-title">Preparing Coins</div>
+                <div class="coin-prep-title" id="cpProgressTitle">Preparing Coins</div>
                 <div class="coin-prep-phase" id="cpProgressPhase">Starting...</div>
                 
                 <!-- Progress bar with percentage overlay -->
@@ -11857,6 +11857,17 @@
                 
                 <div class="coin-prep-message" id="cpProgressMessage">
                     Initialising coin preparation...
+                </div>
+
+                <div id="cpProgressFeeAccounting" aria-live="polite" style="display:none; margin-top:14px; padding:14px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.28); border-radius:10px;">
+                    <div id="cpProgressFeeState" style="font-size:0.9em; line-height:1.5; color:var(--text-primary); margin-bottom:10px;"></div>
+                    <div style="display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 14px; font-size:0.82em;">
+                        <span style="color:var(--text-tertiary);">Maximum approved</span><span id="cpProgressFeeMaximum" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Currently held</span><span id="cpProgressFeeHeld" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Confirmed spent</span><span id="cpProgressFeeSpent" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Remaining total</span><span id="cpProgressFeeRemaining" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Protected for cancellation</span><span id="cpProgressFeeProtected" style="font-variant-numeric:tabular-nums;">--</span>
+                    </div>
                 </div>
                 
                 <div class="coin-prep-details">
@@ -18902,13 +18913,50 @@
             // A browser/window reload resets this client-only flag to "none".
             // Rehydrate it from the wallet-verified backend result so a
             // successful Coin Prep does not strand Start Bot after restart.
-            if (coinPrepStatus !== 'none' || !settingsReviewed) return false;
+            if (coinPrepStatus !== 'none') return false;
             try {
                 const response = await apiFetch(`${API_URL}/coin-prep/status`, {
                     cache: 'no-store'
                 });
                 if (!response.ok) return false;
                 const status = await response.json();
+                const feeState = String(status.fee_approval?.state || '');
+                const feeStillBlocks = status.overlapping_coin_prep_blocked === true
+                    && !['complete', 'stale'].includes(feeState);
+                if (feeStillBlocks) {
+                    _coinPrepFeeRecoveryBlocking = true;
+                    setCoinPrepStatus('checking');
+                    renderCoinPrepFeeAccounting(status);
+                    showCoinPrepView('progress');
+                    const modal = document.getElementById('coinPrepConfirmOverlay');
+                    if (modal) modal.classList.add('active');
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = status.fee_resume_required
+                        ? 'Coin Prep Paused Safely'
+                        : 'Preparing Coins';
+                    const phase = document.getElementById('cpProgressPhase');
+                    if (phase) phase.textContent = coinPrepFeeStateMessage(feeState);
+                    const message = document.getElementById('cpProgressMessage');
+                    if (message) {
+                        message.style.display = '';
+                        message.textContent = status.fee_resume_required
+                            ? 'CATalyst recovered the approved fee budget after restart and has blocked any overlapping Coin Prep.'
+                            : (status.message || 'Coin Prep is using the approved fee budget.');
+                    }
+                    const cancel = document.getElementById('coinPrepCancelBtn');
+                    if (cancel) cancel.style.display = status.fee_resume_required ? 'none' : '';
+                    const progressRaw = Number(status.progress || 0);
+                    const progress = progressRaw <= 1 ? progressRaw * 100 : progressRaw;
+                    const bar = document.getElementById('cpProgressBar');
+                    if (bar) bar.style.width = Math.min(Math.max(progress, 0), 100) + '%';
+                    const pct = document.getElementById('cpProgressPct');
+                    if (pct) pct.textContent = Math.round(progress) + '%';
+                    if (status.running && !coinPrepPollInterval) {
+                        coinPrepPollInterval = setInterval(pollCoinPrepProgress, 1500);
+                    }
+                    return true;
+                }
+                if (!settingsReviewed) return false;
                 if (status.complete !== true
                     || status.needs_coin_prep === true
                     || status.needs_prep === true
@@ -35165,6 +35213,7 @@ function closeCtgErrorModal() {
         // COIN PREP CONFIRMATION MODAL
         // ============================================================
         let coinPrepPollInterval = null;
+        let _coinPrepFeeRecoveryBlocking = false;
 
         // ─── F56 (2026-04-09): missing coin-prep modal helpers ──────────
         // These were referenced from saveConfig() and elsewhere but never
@@ -35640,6 +35689,47 @@ function closeCtgErrorModal() {
             return BigInt(text);
         }
 
+        function coinPrepFeeStateMessage(state) {
+            const messages = {
+                approved: 'Approved fee budget is ready to resume.',
+                held_before_submission: 'An exact fee is held before submission; recovery must prove whether it can safely continue.',
+                submitted_awaiting_confirmation: 'A submitted transaction is awaiting confirmation; its fee remains held until authoritative evidence arrives.',
+                paused_budget: 'Coin Prep is paused because the approved preparation allowance is exhausted.',
+                unavailable: 'Durable fee accounting is temporarily unavailable; Coin Prep remains blocked.',
+                complete: 'The approved Coin Prep fee session is complete.',
+                stale: 'This approval has been superseded by a newer fee budget.',
+            };
+            return messages[state] || 'Coin Prep fee accounting is being recovered.';
+        }
+
+        function renderCoinPrepFeeAccounting(status) {
+            const panel = document.getElementById('cpProgressFeeAccounting');
+            const accounting = status && status.fee_approval;
+            if (!panel || !accounting || typeof accounting !== 'object') {
+                if (panel) panel.style.display = 'none';
+                return false;
+            }
+            panel.style.display = 'block';
+            setCoinPrepFeeText('cpProgressFeeState', coinPrepFeeStateMessage(String(accounting.state || '')));
+            const values = [
+                ['cpProgressFeeMaximum', accounting.total_fee_mojos],
+                ['cpProgressFeeHeld', accounting.held_fee_mojos],
+                ['cpProgressFeeSpent', accounting.spent_fee_mojos],
+                ['cpProgressFeeRemaining', accounting.remaining_fee_mojos],
+                ['cpProgressFeeProtected', accounting.cancellation_reserve_mojos],
+            ];
+            for (const [id, raw] of values) {
+                let text = '--';
+                try {
+                    text = `${coinPrepMojosToXch(raw ?? '0')} XCH`;
+                } catch (_) {
+                    text = 'Unavailable';
+                }
+                setCoinPrepFeeText(id, text);
+            }
+            return true;
+        }
+
         function coinPrepMojosToXch(value) {
             const mojos = canonicalCoinPrepMojos(value);
             const whole = mojos / 1000000000000n;
@@ -35829,6 +35919,7 @@ function closeCtgErrorModal() {
         }
 
         function showCoinPrepConfirm(config, reason, reasonMessage, verification = null) {
+            _coinPrepFeeRecoveryBlocking = false;
             config = normalizeConfigForLiquidityMode(config || {});
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (!modal) return;
@@ -35969,7 +36060,7 @@ function closeCtgErrorModal() {
             
             // If user closes modal without completing prep, mark as skipped
             // (but don't overwrite 'done' if prep already completed)
-            if (coinPrepStatus === 'checking') {
+            if (coinPrepStatus === 'checking' && !_coinPrepFeeRecoveryBlocking) {
                 setCoinPrepStatus('skipped-unsafe');
             }
             
@@ -36325,6 +36416,14 @@ function closeCtgErrorModal() {
             try {
                 const response = await apiFetch(`${API_URL}/coin-prep/status`);
                 const status = await response.json();
+                renderCoinPrepFeeAccounting(status);
+                if (status.fee_resume_required === true) {
+                    _coinPrepFeeRecoveryBlocking = true;
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = 'Coin Prep Paused Safely';
+                    const cancel = document.getElementById('coinPrepCancelBtn');
+                    if (cancel) cancel.style.display = 'none';
+                }
                 
                 // Update progress bar - worker reports 0.0-1.0, convert to 0-100
                 const progressRaw = status.progress || 0;
@@ -36486,6 +36585,7 @@ function closeCtgErrorModal() {
                     
                     // Show complete view
                     setCoinPrepStatus('done');
+                    _coinPrepFeeRecoveryBlocking = false;
                     showCoinPrepView('complete');
                 }
                 

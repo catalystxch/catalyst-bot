@@ -1,6 +1,7 @@
 """Standalone fee sessions rotate only after authoritative plan completion."""
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import json
 
 import pytest
@@ -103,3 +104,81 @@ def test_generation_two_cannot_be_injected_without_completion_evidence(approved)
         )
     conn.rollback()
     assert database.get_coin_prep_fee_session(session_id)["current_session_id"] == session_id
+
+
+def test_fee_approval_status_survives_restart_without_granting_dispatch(approved):
+    approval = approved["approval"]
+
+    initial = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+
+    assert initial["state"] == "approved"
+    assert initial["approval_id"] == approval["approval_id"]
+    assert initial["held_fee_mojos"] == 0
+    assert initial["spent_fee_mojos"] == 0
+    assert initial["remaining_fee_mojos"] == approval["total_fee_mojos"]
+    assert initial["unresolved_operation_count"] == 0
+    assert initial["session_completed"] is False
+    assert initial["dispatch_authorized"] is False
+
+    database.reserve_approved_fee(
+        approval_id=approval["approval_id"],
+        scope_sha256=approval["scope_sha256"],
+        plan_sha256=approval["plan_sha256"],
+        operation_id="2" * 64,
+        fee_mojos=10,
+        cancellation=False,
+    )
+
+    recovered = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+
+    assert recovered["state"] == "held_before_submission"
+    assert recovered["held_fee_mojos"] == 10
+    assert recovered["remaining_fee_mojos"] == approval["total_fee_mojos"] - 10
+    assert recovered["unresolved_operation_count"] == 1
+    assert recovered["pending_operation"] == {
+        "fee_mojos": 10,
+        "cancellation": False,
+        "effect_state": "held_before_submission",
+    }
+    assert recovered["dispatch_authorized"] is False
+
+
+def test_campaign_scope_proves_exact_targets_without_standalone_rotation(
+    approved, monkeypatch,
+):
+    approval = approved["approval"]
+    targets = _install_completed_targets(approved, approval["approval_id"])
+    campaign_id = "c" * 64
+    context = deepcopy(runtime.read_approved_prep_fee_snapshot(approval["approval_id"]))
+    context["scope"] = {
+        **context["scope"],
+        "session_id": None,
+        "campaign_id": campaign_id,
+    }
+    context["campaign"] = {"campaign_id": campaign_id, "revision": 7}
+    monkeypatch.setattr(runtime, "read_approved_prep_fee_snapshot", lambda _approval: context)
+    monkeypatch.setattr(
+        database,
+        "get_coin_prep_fee_approval_status",
+        lambda _approval: {
+            "state": "approved",
+            "stale": False,
+            "unresolved_operation_count": 0,
+            "reservation_count": 2,
+        },
+    )
+
+    completed = service.complete_coin_prep_fee_scope(approval["approval_id"])
+
+    assert completed == {
+        "approval_id": approval["approval_id"],
+        "campaign_id": campaign_id,
+        "target_count": len(targets),
+        "operation_count": 2,
+        "campaign_managed": True,
+        "idempotent": True,
+        "dispatch_authorized": False,
+    }
+    assert database.get_connection().execute(
+        "SELECT COUNT(*) FROM coin_prep_fee_session_completions"
+    ).fetchone()[0] == 0

@@ -677,6 +677,7 @@ class CoinPrepStatus:
     error: Optional[str] = None
     timestamp: float = 0.0
     run_id: Optional[str] = None
+    fee_approval_id: Optional[str] = None
     execution_mode: Optional[str] = None
     reused: int = 0
     missing: int = 0
@@ -2171,11 +2172,11 @@ class CoinPrepWorker:
         approval_id = getattr(self, "fee_approval_id", None)
         if type(approval_id) is not str or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None:
             raise ValueError("FEE_APPROVAL_REQUIRED")
-        from coin_prep_fee_approval import complete_coin_prep_fee_session
+        from coin_prep_fee_approval import complete_coin_prep_fee_scope
 
-        result = complete_coin_prep_fee_session(approval_id)
+        result = complete_coin_prep_fee_scope(approval_id)
         self.log(
-            "✅ Coin Prep fee session closed from authoritative target and "
+            "✅ Coin Prep fee scope closed from authoritative target and "
             f"journal evidence ({result['target_count']} targets, "
             f"{result['operation_count']} operations)"
         )
@@ -11646,6 +11647,7 @@ def main():
     # Initialize worker — __init__ derives settings from GUI config
     worker = CoinPrepWorker()
     worker.fee_approval_id = args.fee_approval_id
+    worker.status.fee_approval_id = args.fee_approval_id
 
     # Pass run_id to worker so status file includes it (prevents stale reads)
     if args.run_id:

@@ -99,56 +99,88 @@ def resolve_server_fee_scope(*, identity: dict, campaign_id: str | None = None) 
     return {**identity, "campaign_id": None, "session_id": session["session_id"]}
 
 
-def complete_coin_prep_fee_session(approval_id: str) -> dict:
-    """Prove frozen targets exist and close one standalone approval scope.
+def _prove_approved_coin_prep_targets(context):
+    """Return an exact zero-effect plan only when every frozen target exists."""
+
+    from coin_prep_batch_plan import BatchConstraints, BatchPlan, plan_batch
+    from coin_prep_fee_funding import prepare_fee_inventory
+
+    recipe = context["recipe"]
+    floors = recipe["economic_plan"]["reserve_floors_mojos"]
+    funding = prepare_fee_inventory(context["snapshot"], recipe["targets"], floors)
+    if funding["principal_funded"] is not True:
+        raise ValueError("FEE_SESSION_INCOMPLETE")
+    plan = plan_batch(
+        funding["snapshot"], recipe["targets"],
+        BatchConstraints(reserve_floors=floors, fee_mojos=0),
+    )
+    if (type(plan) is not BatchPlan or plan.transaction_required is not False
+            or len(plan.reused_target_ids) != len(recipe["targets"])
+            or len(plan.reused_coin_ids) != len(recipe["targets"])):
+        raise ValueError("FEE_SESSION_INCOMPLETE")
+    return plan
+
+
+def complete_coin_prep_fee_scope(approval_id: str) -> dict:
+    """Prove frozen targets and close standalone or campaign-managed prep.
 
     Completion is deliberately read-only at the wallet boundary. A fresh
     verified snapshot must satisfy every approved target without another
     transaction, and a second read must reproduce the same ownership before
-    the database joins it to terminal operation/fee evidence. Campaign scopes
-    have their own lifecycle and cannot be closed through this function.
+    terminal fee evidence is accepted. Standalone ownership receives an
+    append-only completion record; Bootstrap remains under its own persisted
+    campaign lifecycle and is never rotated as a standalone session.
     """
 
-    from coin_prep_batch_plan import BatchConstraints, BatchPlan, plan_batch
-    from coin_prep_fee_funding import prepare_fee_inventory
     from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
 
     approval_id = _digest(approval_id)
     context = read_approved_prep_fee_snapshot(approval_id)
-    session_id = context["scope"].get("session_id")
-    if session_id is None:
-        raise ValueError("FEE_SESSION_COMPLETION_UNSUPPORTED")
-
-    def prove(snapshot_context):
-        recipe = snapshot_context["recipe"]
-        floors = recipe["economic_plan"]["reserve_floors_mojos"]
-        funding = prepare_fee_inventory(snapshot_context["snapshot"], recipe["targets"], floors)
-        if funding["principal_funded"] is not True:
-            raise ValueError("FEE_SESSION_INCOMPLETE")
-        plan = plan_batch(
-            funding["snapshot"], recipe["targets"],
-            BatchConstraints(reserve_floors=floors, fee_mojos=0),
-        )
-        if (type(plan) is not BatchPlan or plan.transaction_required is not False
-                or len(plan.reused_target_ids) != len(recipe["targets"])
-                or len(plan.reused_coin_ids) != len(recipe["targets"])):
-            raise ValueError("FEE_SESSION_INCOMPLETE")
-        return plan
-
-    first = prove(context)
+    first = _prove_approved_coin_prep_targets(context)
     after = read_approved_prep_fee_snapshot(approval_id)
     if any(after[key] != context[key] for key in (
         "identity", "configuration", "receive_address", "snapshot", "recipe",
         "campaign", "scope", "approval",
     )):
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
-    second = prove(after)
+    second = _prove_approved_coin_prep_targets(after)
     if second != first:
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
+
+    session_id = context["scope"].get("session_id")
+    campaign_id = context["scope"].get("campaign_id")
+    if session_id is None:
+        if campaign_id is None:
+            raise ValueError("FEE_SESSION_COMPLETION_UNSUPPORTED")
+        accounting = database.get_coin_prep_fee_approval_status(approval_id)
+        if accounting["stale"] is True:
+            raise ValueError("FEE_APPROVAL_STALE")
+        if accounting["unresolved_operation_count"] != 0:
+            raise ValueError("FEE_SESSION_EFFECT_UNRESOLVED")
+        return {
+            "approval_id": approval_id,
+            "campaign_id": campaign_id,
+            "target_count": len(second.reused_coin_ids),
+            "operation_count": accounting["reservation_count"],
+            "campaign_managed": True,
+            "idempotent": True,
+            "dispatch_authorized": False,
+        }
     return database.record_coin_prep_fee_session_completion(
         approval_id=approval_id, session_id=session_id,
         target_coin_ids=list(second.reused_coin_ids),
     )
+
+
+def complete_coin_prep_fee_session(approval_id: str) -> dict:
+    """Close a standalone scope; campaign callers must use the scope boundary."""
+
+    from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
+
+    approval_id = _digest(approval_id)
+    if read_approved_prep_fee_snapshot(approval_id)["scope"].get("session_id") is None:
+        raise ValueError("FEE_SESSION_COMPLETION_UNSUPPORTED")
+    return complete_coin_prep_fee_scope(approval_id)
 
 
 def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:

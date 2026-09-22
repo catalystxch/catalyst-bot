@@ -1358,6 +1358,7 @@ def api_coin_prep_status():
     bot = api_server.bot
     try:
         result = {"success": True, **api_server._coin_prep_state}
+        worker_fee_approval_id = None
         bootstrap_campaign = None
         asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
         if len(asset_id) == 64:
@@ -1445,6 +1446,12 @@ def api_coin_prep_status():
             try:
                 with open(status_file, "r") as f:
                     worker_status = json.load(f)
+                candidate_approval_id = worker_status.get("fee_approval_id")
+                if (
+                    type(candidate_approval_id) is str
+                    and re.fullmatch(r"[0-9a-f]{64}", candidate_approval_id)
+                ):
+                    worker_fee_approval_id = candidate_approval_id
 
                 # Check if this status file belongs to the CURRENT run.
                 # If it has a different run_id (or none), it's stale from
@@ -1485,6 +1492,7 @@ def api_coin_prep_status():
                         "paid_fee_mojos",
                         "confirmation_elapsed_seconds",
                         "compatibility_reason",
+                        "fee_approval_id",
                     ):
                         if detail_key in worker_status:
                             result[detail_key] = worker_status[detail_key]
@@ -1755,6 +1763,37 @@ def api_coin_prep_status():
                     api_server._coin_prep_state["error"] = result["error"]
 
         _refresh_finished_prep_coin_counts(result)
+
+        # A worker may disappear from memory during a browser/app/PC restart,
+        # but its consent and accounting do not. Recover only the approval ID
+        # written by the worker itself and expose a read-only, lossless view.
+        if worker_fee_approval_id is not None:
+            result["fee_approval_id"] = worker_fee_approval_id
+            try:
+                from database import get_coin_prep_fee_approval_status
+
+                durable_fee = get_coin_prep_fee_approval_status(
+                    worker_fee_approval_id
+                )
+                result["fee_approval"] = _fee_json_amounts(durable_fee)
+                active_fee_states = {
+                    "approved",
+                    "held_before_submission",
+                    "submitted_awaiting_confirmation",
+                    "paused_budget",
+                }
+                if durable_fee.get("state") in active_fee_states:
+                    result["overlapping_coin_prep_blocked"] = True
+                    if not result.get("running"):
+                        result["fee_resume_required"] = True
+            except Exception:
+                result["fee_approval"] = {
+                    "approval_id": worker_fee_approval_id,
+                    "state": "unavailable",
+                    "reason": "FEE_APPROVAL_STATUS_UNAVAILABLE",
+                    "dispatch_authorized": False,
+                }
+                result["overlapping_coin_prep_blocked"] = True
 
         # Optionally refresh live coin counts (when not actively prepping)
         refresh = request.args.get("refresh", "false").lower() == "true"

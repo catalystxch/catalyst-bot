@@ -96,7 +96,7 @@ assert fake_wallet.submissions == []
 
 - [ ] Observe failures; factor the existing prep economic plan so preview and execution consume identical validated tier/reserve/bootstrap choices. Use exact unsigned cost where current inputs exist, explicitly projected cost/count for future outputs.
 - [ ] Add tests for fee-coin principal versus actual spend, insufficient funding, stale quotes, changed identity/plan, projected stages and provider outage. Build canonical digests with integer atomic amounts and immutable economic scope.
-- [ ] Persist preview/approval state so reloads return pending operations and remaining budget rather than duplicate starts. Ensure HTTP mutation protection and desktop guard are shared.
+- [x] Persist preview/approval state so reloads return pending operations and remaining budget rather than duplicate starts. Ensure HTTP mutation protection and desktop guard are shared.
 - [ ] Run API/bridge/planner/schema regressions; commit verified service/routes.
 
 ## Task 4: Enforce approval and fresh exact fees on every prep dispatch
@@ -128,7 +128,7 @@ assert fake_wallet.submissions == []
 
 Files: modify bot_gui.html; create tests/e2e/test_coin_prep_fee_approval.py; extend frontend/bridge response tests.
 
-- [ ] Write failing browser tests through real GUI buttons with mocked transport/wallet effects. Coin Prep opens read-only estimate, not immediate signing; Cancel has no mutations; explicit confirm sends displayed budget only once.
+- [x] Write failing browser tests through real GUI buttons with mocked transport/wallet effects. Coin Prep opens read-only estimate, not immediate signing; Cancel has no mutations; explicit confirm sends displayed budget only once.
 
 ```python
 page.get_by_role('button', name='Coin Prep', exact=True).click()
@@ -137,9 +137,9 @@ page.get_by_role('button', name='Cancel', exact=True).click()
 assert fake_wallet.submissions == []
 ```
 
-- [ ] Observe failure and implement escaped/textContent rendering, source/age/projected labels, editable cap, protected cancellation amount, funding errors and five-minute estimate disclaimer.
-- [ ] Add red/green tests for stale refresh, changing costs, outage, budget increase prompt, duplicate clicks, desktop bridge equivalence, status updates and reload/resume of pending approvals. Approval refresh cannot launch prep or clear durable evidence.
-- [ ] Run E2E plus relevant frontend/API tests; commit verified UI.
+- [x] Observe failure and implement escaped/textContent rendering, source/age/projected labels, editable cap, protected cancellation amount, funding errors and five-minute estimate disclaimer.
+- [x] Add red/green tests for stale refresh, changing costs, outage, budget increase prompt, duplicate clicks, desktop bridge equivalence, status updates and reload/resume of pending approvals. Approval refresh cannot launch prep or clear durable evidence.
+- [x] Run E2E plus relevant frontend/API tests; commit verified UI.
 
 ## Task 6: Regression, fresh package and live acceptance
 
@@ -157,4 +157,4 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.
 - [x] Task 1 strict estimation foundation verified and committed.
 - [x] Task 2 database foundation and canonical scope/plan helper core verified; live integration is still outstanding.
-- [ ] Task 3 core, bounded staged runtime preview and HTTP/native preview/approval are implemented; full session lifecycle, every compatibility-family planning and frozen execution adoption remain open. Tasks 4–6 remain open.
+- [ ] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented; every compatibility-family planning and frozen execution adoption remain open. Task 5 is complete; Tasks 4 and 6 remain open.

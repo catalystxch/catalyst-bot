@@ -343,3 +343,35 @@ def test_existing_target_shortcut_cannot_report_complete_before_fee_session_clos
     with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):
         worker._complete_existing_tier_preparation()
     assert all(phase != active_worker["module"].PrepPhase.COMPLETE for phase, *_ in statuses)
+
+
+def test_worker_status_persists_fee_approval_identity_for_restart_recovery(active_worker):
+    worker = active_worker["worker"]
+    approval_id = active_worker["approval"]["approval_id"]
+    worker.fee_approval_id = approval_id
+    worker.status.fee_approval_id = approval_id
+
+    payload = worker.status.to_dict()
+
+    assert payload["fee_approval_id"] == approval_id
+
+
+def test_worker_success_accepts_campaign_managed_completion(active_worker, monkeypatch):
+    approval_id = active_worker["approval"]["approval_id"]
+    campaign_result = {
+        "approval_id": approval_id,
+        "campaign_id": "c" * 64,
+        "target_count": 8,
+        "operation_count": 2,
+        "campaign_managed": True,
+        "idempotent": True,
+        "dispatch_authorized": False,
+    }
+    service = import_module("coin_prep_fee_approval")
+    monkeypatch.setattr(
+        service, "complete_coin_prep_fee_scope", lambda _approval: campaign_result
+    )
+
+    result = active_worker["worker"]._complete_approved_fee_session()
+
+    assert result == campaign_result

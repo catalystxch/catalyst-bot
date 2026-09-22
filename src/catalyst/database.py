@@ -21066,6 +21066,146 @@ def get_fee_approval(approval_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
+    """Return durable, read-only operator accounting after reload/restart.
+
+    This deliberately exposes no claim, dispatch token, source coin or effect
+    authority.  Exact atomic amounts and the latest pending effect state are
+    enough for the UI to explain why a second Coin Prep must not overlap.
+    """
+
+    approval_id = _fee_digest(approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        _validate_stability_schema(conn)
+        context = conn.execute(
+            "SELECT approval.*, preview.scope_json, preview.plan_json, "
+            "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
+            " WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
+            "FROM coin_prep_fee_consents AS consent "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE approval.approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if context is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+
+        scope = json.loads(context["scope_json"])
+        if type(scope) is not dict:
+            raise ValueError("FEE_APPROVAL_STALE")
+        session_id = scope.get("session_id")
+        campaign_id = scope.get("campaign_id")
+        session_completed = False
+        session_current = True
+        session_generation = None
+        if session_id is not None:
+            session_id = _fee_digest(session_id)
+            session = conn.execute(
+                "SELECT session.generation, completion.session_id AS completed_session_id, "
+                "(SELECT current.session_id FROM coin_prep_fee_sessions AS current "
+                " WHERE current.identity_sha256=session.identity_sha256 "
+                " ORDER BY current.generation DESC LIMIT 1) AS current_session_id "
+                "FROM coin_prep_fee_sessions AS session "
+                "LEFT JOIN coin_prep_fee_session_completions AS completion "
+                "ON completion.session_id=session.session_id "
+                "WHERE session.session_id=?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError("FEE_SESSION_REQUIRED")
+            session_generation = int(session["generation"])
+            session_completed = session["completed_session_id"] is not None
+            session_current = session["current_session_id"] == session_id
+
+        rows = conn.execute(
+            "SELECT reservation.fee_mojos, reservation.cancellation, "
+            "outcome.state AS accounting_outcome, prep.outcome AS effect_outcome, "
+            "CASE WHEN dispatch.dispatch_token IS NULL THEN 0 ELSE 1 END AS dispatched "
+            "FROM approved_fee_reservations AS reservation "
+            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "LEFT JOIN coin_prep_operations AS prep USING(operation_id) "
+            "LEFT JOIN wallet_effect_dispatches AS dispatch "
+            "ON dispatch.adapter_operation=reservation.operation_id "
+            "WHERE reservation.scope_sha256=? "
+            "ORDER BY reservation.rowid",
+            (context["scope_sha256"],),
+        ).fetchall()
+        unresolved = [row for row in rows if row["accounting_outcome"] is None]
+        confirmed_count = sum(
+            1 for row in rows if row["accounting_outcome"] == "CONFIRMED_SPENT"
+        )
+        released_count = sum(
+            1 for row in rows if row["accounting_outcome"] == "RELEASED_NO_EFFECT"
+        )
+        totals = _fee_scope_totals(conn, context["scope_sha256"])
+        remaining = int(context["total_fee_mojos"]) - totals["committed_fee_mojos"]
+        remaining_preparation = min(
+            remaining,
+            int(context["total_fee_mojos"])
+            - int(context["cancellation_reserve_mojos"])
+            - totals["noncancellation_committed_fee_mojos"],
+        )
+        stale = (
+            int(context["version"]) != int(context["latest_version"])
+            or not session_current
+        )
+
+        pending_operation = None
+        if unresolved:
+            pending = unresolved[-1]
+            submitted = bool(pending["dispatched"]) or pending["effect_outcome"] in {
+                "SUBMITTED_UNKNOWN",
+                "CONFIRMED",
+            }
+            effect_state = (
+                "submitted_awaiting_confirmation"
+                if submitted
+                else "held_before_submission"
+            )
+            pending_operation = {
+                "fee_mojos": int(pending["fee_mojos"]),
+                "cancellation": bool(pending["cancellation"]),
+                "effect_state": effect_state,
+            }
+        elif session_completed:
+            effect_state = "complete"
+        elif stale:
+            effect_state = "stale"
+        elif remaining_preparation <= 0:
+            effect_state = "paused_budget"
+        else:
+            effect_state = "approved"
+
+        return {
+            "approval_id": approval_id,
+            "scope_sha256": context["scope_sha256"],
+            "plan_sha256": context["plan_sha256"],
+            "version": int(context["version"]),
+            "session_id": session_id,
+            "session_generation": session_generation,
+            "campaign_id": campaign_id,
+            "state": effect_state,
+            "session_completed": session_completed,
+            "stale": stale,
+            "total_fee_mojos": int(context["total_fee_mojos"]),
+            "cancellation_reserve_mojos": int(
+                context["cancellation_reserve_mojos"]
+            ),
+            **totals,
+            "remaining_fee_mojos": remaining,
+            "remaining_preparation_fee_mojos": remaining_preparation,
+            "reservation_count": len(rows),
+            "unresolved_operation_count": len(unresolved),
+            "confirmed_operation_count": confirmed_count,
+            "released_operation_count": released_count,
+            "pending_operation": pending_operation,
+            "dispatch_authorized": False,
+        }
+    finally:
+        conn.close()
+
+
 def reserve_approved_fee(
     *,
     approval_id: str,
