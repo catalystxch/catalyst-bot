@@ -1135,6 +1135,8 @@ def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
                 estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
@@ -1200,6 +1202,8 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
                 estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
@@ -1251,6 +1255,8 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
                 estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             window.__submittedPrepPayload = null;
@@ -1330,6 +1336,8 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
                 preview_id: 'a'.repeat(64), funded: true,
                 estimated_cancellation_fee_mojos: '20',
                 estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
             };
             document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {

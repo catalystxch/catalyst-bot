@@ -707,3 +707,34 @@ and no release or main merge was made during this checkpoint.
   or Coin Prep transaction has occurred. The operator has been asked to review
   and personally confirm a fresh displayed maximum through CATalyst before
   live spend testing; that acceptance gate remains open.
+
+## Expiring preview browser regression (22 September 2026)
+
+- The live GUI displayed a fixed age after rendering a fee quote. An expired
+  estimate could therefore appear recent and leave the confirmation button
+  enabled, although the backend would reject it. The browser now advances the
+  displayed source/age every second, marks an expired quote explicitly, and
+  disables confirmation until refresh. Refresh hides stale fee and cap details
+  while a replacement quote is requested.
+- A second regression showed expiry during the history-choice dialog could
+  still reach the approval endpoint. The launch handler now revalidates both
+  freshness and the unchanged operator maximum immediately before recording
+  consent. Closing the modal stops the age timer. The new browser tests were
+  observed failing before production changes and now pass.
+- Four older smoke fixtures were updated to include valid live expiry fields;
+  production fail-closed behavior was not weakened. All 14 focused fee browser
+  tests and the full 103-case Chromium suite pass. The relevant fee backend
+  suite passed 570 tests in 210.22 seconds; during it, Windows emitted noisy
+  network exceptions while some test paths attempted external Coinset access,
+  so the previously recorded hermetic full-suite run remains the authoritative
+  broad backend gate. The live source app remains idle with zero offers and
+  unchanged spendable TEST 7 XCH/MZ balances. No wallet mutation occurred.
+- A fresh isolated PyInstaller Windows build was made without cleaning or
+  replacing the existing `dist/Catalyst` package. Its executable SHA-256 is
+  `1F9533C8A1B897DE6FB95774379E14A235A1B19FD53FDB1DB91A4CF94135C0DE`;
+  bundled GUI and certifi CA files are present. The packaged Sage mTLS worker,
+  clean/duplicate/persisted/native-safety desktop launches, and packaged API
+  smoke all passed. The API smoke's first two attempts reached seven endpoints
+  but timed out at doctor during transient local network/Sage contention; a
+  previous package passed as a control and the new package then passed the
+  complete eight-endpoint smoke unchanged. No release package was published.

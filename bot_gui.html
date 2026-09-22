@@ -35691,6 +35691,7 @@ function closeCtgErrorModal() {
         let _coinPrepFeePlanBlocked = false;
         let _coinPrepFeeRequestSequence = 0;
         let _coinPrepConfirmReadyText = 'Yes, Prepare Coins';
+        let _coinPrepFeeAgeTimer = null;
 
         function canonicalCoinPrepMojos(value) {
             const text = String(value ?? '');
@@ -35793,11 +35794,42 @@ function closeCtgErrorModal() {
             if (allowed) btn.textContent = _coinPrepConfirmReadyText;
         }
 
+        function updateCoinPrepFeeFreshness() {
+            const preview = _coinPrepFeePreview;
+            if (!preview) return false;
+            const now = Date.now() / 1000;
+            const observedAt = Number(preview.observed_at);
+            const expiresAt = Number(preview.expires_at);
+            const age = Number.isFinite(observedAt) && observedAt > 0
+                ? Math.max(0, Math.trunc(now - observedAt)) : null;
+            const expired = !Number.isFinite(expiresAt) || expiresAt <= 0 || now >= expiresAt;
+            const sources = [];
+            for (const stage of preview.stages || []) {
+                const raw = String(stage?.quote?.source || '').toLowerCase();
+                const label = raw === 'coinset' ? 'Coinset'
+                    : raw === 'full_node' ? 'Full node'
+                    : raw.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+                if (label && !sources.includes(label)) sources.push(label);
+            }
+            setCoinPrepFeeText('cpFeeSource',
+                `${sources.join(' + ') || 'Unavailable'} · ${age === null ? 'age unavailable' : `${age}s old`} · ${preview.target_seconds}s target${expired ? ' · expired — refresh required' : ''}`);
+            if (expired) {
+                setCoinPrepFeeText('cpFeeStatus', 'The fee estimate has expired. Refresh it and review the new maximum before approving Coin Prep.');
+                setCoinPrepFeeLaunchEnabled(false);
+            }
+            return !expired;
+        }
+
         function validateCoinPrepFeeMaximum() {
             const input = document.getElementById('cpFeeMaximumInput');
             const error = document.getElementById('cpFeeInputError');
             if (!_coinPrepFeePreview || !input) {
                 if (error) error.textContent = '';
+                setCoinPrepFeeLaunchEnabled(false);
+                return null;
+            }
+            if (!updateCoinPrepFeeFreshness()) {
+                if (error) error.textContent = 'The fee estimate has expired. Refresh it before approving Coin Prep.';
                 setCoinPrepFeeLaunchEnabled(false);
                 return null;
             }
@@ -35826,6 +35858,8 @@ function closeCtgErrorModal() {
         }
 
         function renderCoinPrepFeePreview(preview) {
+            _coinPrepFeePreview = preview;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
             const panel = document.getElementById('cpFeePanel');
             const details = document.getElementById('cpFeeDetails');
             const capRow = document.getElementById('cpFeeCapRow');
@@ -35849,7 +35883,6 @@ function closeCtgErrorModal() {
             setCoinPrepFeeText('cpFeePrincipal', `${coinPrepMojosToXch(preview.fee_coin_principal_mojos)} XCH prepared as coin principal, not spent as fees`);
             setCoinPrepFeeText('cpFeeFunding', `${coinPrepMojosToXch(preview.fee_funding_mojos)} XCH${preview.funded ? '' : ' — insufficient'}`);
 
-            const sources = [];
             let exact = 0;
             let projected = 0;
             const stageLines = [];
@@ -35858,7 +35891,6 @@ function closeCtgErrorModal() {
                 const label = raw === 'coinset' ? 'Coinset'
                     : raw === 'full_node' ? 'Full node'
                     : raw.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
-                if (label && !sources.includes(label)) sources.push(label);
                 if (stage?.cost_kind === 'exact_unsigned') exact += 1;
                 if (stage?.cost_kind === 'projected') projected += 1;
                 const stageMin = Number(stage?.transaction_count_min || 0);
@@ -35869,8 +35901,6 @@ function closeCtgErrorModal() {
                 const stageFee = coinPrepMojosToXch(stage?.quote?.fee_mojos ?? '0');
                 stageLines.push(`${stageName}: ${stageKind}, ${stageCount} transaction${stageMax === 1 ? '' : 's'}, ${stageFee} XCH each (${label || 'source unavailable'})`);
             }
-            const age = Math.max(0, Math.trunc(Date.now() / 1000 - Number(preview.observed_at || 0)));
-            setCoinPrepFeeText('cpFeeSource', `${sources.join(' + ') || 'Unavailable'} · ${age}s old · ${preview.target_seconds}s target`);
             setCoinPrepFeeText('cpFeeEvidence', `${exact} exact · ${projected} projected`);
             setCoinPrepFeeText('cpFeeStages', stageLines.join(' · '));
             setCoinPrepFeeText('cpFeeStatus', preview.funded
@@ -35880,10 +35910,13 @@ function closeCtgErrorModal() {
             const input = document.getElementById('cpFeeMaximumInput');
             if (input) input.value = coinPrepMojosToXch(preview.suggested_maximum_fee_mojos);
             validateCoinPrepFeeMaximum();
+            _coinPrepFeeAgeTimer = setInterval(updateCoinPrepFeeFreshness, 1000);
         }
 
         function showCoinPrepFeeUnavailable(reason) {
             _coinPrepFeePreview = null;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
             const panel = document.getElementById('cpFeePanel');
             const details = document.getElementById('cpFeeDetails');
             const capRow = document.getElementById('cpFeeCapRow');
@@ -35899,10 +35932,16 @@ function closeCtgErrorModal() {
             const requestOptions = options || _coinPrepFeePreviewOptions || buildCoinPrepFeePreviewOptions();
             _coinPrepFeePreviewOptions = { ...requestOptions };
             _coinPrepFeePreview = null;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
             const requestSequence = ++_coinPrepFeeRequestSequence;
             const panel = document.getElementById('cpFeePanel');
             const refresh = document.getElementById('cpFeeRefreshBtn');
             if (panel) panel.style.display = 'block';
+            const details = document.getElementById('cpFeeDetails');
+            const capRow = document.getElementById('cpFeeCapRow');
+            if (details) details.style.display = 'none';
+            if (capRow) capRow.style.display = 'none';
             if (refresh) refresh.disabled = true;
             setCoinPrepFeeText('cpFeeStatus', 'Requesting a current network estimate…');
             setCoinPrepFeeLaunchEnabled(false);
@@ -36070,6 +36109,8 @@ function closeCtgErrorModal() {
         function closeCoinPrepConfirm() {
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (modal) modal.classList.remove('active');
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
             
             // If user closes modal without completing prep, mark as skipped
             // (but don't overwrite 'done' if prep already completed)
@@ -36301,7 +36342,7 @@ function closeCtgErrorModal() {
             const historyChoice = await askPrepHistoryChoice();
             if (!historyChoice || historyChoice.action === 'cancel') {
                 _coinPrepFeeConfirmBusy = false;
-                setCoinPrepFeeLaunchEnabled(true);
+                validateCoinPrepFeeMaximum();
                 return;
             }
             const resets = historyChoice.resets || {};
@@ -36310,6 +36351,9 @@ function closeCtgErrorModal() {
             try {
                 if (confirmedPreview !== _coinPrepFeePreview) {
                     throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
+                }
+                if (validateCoinPrepFeeMaximum() !== maximumFeeMojos) {
+                    throw new Error('The fee estimate expired or the maximum changed while reviewing history. Refresh and review the estimate before approving Coin Prep.');
                 }
                 if (btn) btn.textContent = 'Recording fee approval…';
                 const approvalResponse = await apiFetch(`${API_URL}/coin-prep/fee-approval`, {

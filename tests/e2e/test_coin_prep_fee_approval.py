@@ -138,6 +138,39 @@ def test_fee_preview_formats_pair_ticker_without_repeating_xch(page):
     )
 
 
+def test_fee_preview_age_advances_and_expired_quote_cannot_be_approved(page):
+    _open_gui(page)
+    preview = _preview()
+    result = page.evaluate(
+        """preview => {
+            const initialNow = Math.floor(Date.now() / 1000);
+            preview.observed_at = initialNow;
+            preview.expires_at = initialNow + 2;
+            renderCoinPrepFeePreview(preview);
+            const before = document.getElementById('cpFeeSource').textContent;
+            const originalNow = Date.now;
+            Date.now = () => (initialNow + 3) * 1000;
+            try {
+                updateCoinPrepFeeFreshness();
+                return {
+                    before,
+                    after: document.getElementById('cpFeeSource').textContent,
+                    disabled: document.getElementById('cpConfirmBtn').disabled,
+                    maximum: validateCoinPrepFeeMaximum(),
+                };
+            } finally {
+                Date.now = originalNow;
+            }
+        }""",
+        preview,
+    )
+    assert "0s old" in result["before"]
+    assert "3s old" in result["after"]
+    assert "expired" in result["after"]
+    assert result["disabled"] is True
+    assert result["maximum"] is None
+
+
 def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
     _open_gui(page)
     preview = _preview()
@@ -321,6 +354,42 @@ def test_history_cancel_records_no_fee_approval_or_trigger(page):
     )
 
     assert result == ["/api/coin-prep/fee-preview"]
+
+
+def test_quote_expiring_during_history_choice_does_not_record_approval(page):
+    _open_gui(page)
+    preview = _preview()
+    result = page.evaluate(
+        """async preview => {
+            const originalDateNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            window.__feeCalls = [];
+            window.apiFetch = async path => {
+                window.__feeCalls.push(String(path));
+                if (String(path).includes('/coin-prep/fee-preview')) {
+                    return new Response(JSON.stringify(preview), {status: 200});
+                }
+                throw new Error(`Expired quote must not be approved: ${path}`);
+            };
+            window.askPrepHistoryChoice = async () => {
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {pnl: false, offers: false, counters: false}};
+            };
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                await startCoinPrepFromModal();
+                return {calls: window.__feeCalls,
+                        disabled: document.getElementById('cpConfirmBtn').disabled};
+            } finally {
+                Date.now = originalDateNow;
+            }
+        }""",
+        preview,
+    )
+    assert result["calls"] == ["/api/coin-prep/fee-preview"]
+    assert result["disabled"] is True
 
 
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
