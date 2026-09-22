@@ -108,9 +108,9 @@ Interfaces: focused fee service produces validated final unsigned effect plus ex
 - [x] Internal atomic prep-hold groundwork joins deliberate preview consent/latest version, exact PREPARED journal and bound constructed additions, active undispatched effect claim, quoted final fee and lock-acquired original quote freshness. It enforces the protected preparation allowance, wallet/network/CAT consistency, normalized source and external-fee cohorts, and rejects reservation replay. This primitive returns no dispatch authority and is NOT yet called by worker paths.
 - [x] Read-only frozen execution groundwork persists typed server configuration, receive address and exact sizing arguments privately with runtime previews. Confirmation compares this binding against current settings even when output amounts are unchanged. Approved readback reconstructs canonical prepared targets without later price reads or double headroom, refreshes selectable inventory, and checks configuration/identity/address/current session or campaign/latest consent. It grants no dispatch permission and does not prove intermediate completion; actual worker adoption and Bootstrap financial authority remain open.
 - [x] Internal consent-bound exact pricing-to-hold service consumes frozen targets, derives fresh executable cost/network guidance and checks current remaining preparation allowance without borrowing cancellation cover. Its final boundary re-inspects the bundle, matches deterministic operation/journal/constructed additions, validates all current inventory while allowing only proven own-claim protection, and calls the exact atomic hold. A newly reserved selected root is denied inside the write transaction. These helpers never sign/submit and are not yet invoked by worker dispatch paths.
-- [ ] Adopt frozen approved economics/configuration in execution, connect actual unsigned cost/fixed-point pricing and this atomic hold to every supported dispatch, and bind recovery/accounting. Current preview economics must not be independently regenerated from a later price or CLI override.
+- [x] Adopt frozen approved economics/configuration in the supported Sage tier dispatch, connect actual unsigned cost/fixed-point pricing and the atomic hold to its direct and bounded-prerequisite transactions, and bind restart recovery/accounting. Unsupported compatibility modes pause without entering legacy manual-fee mutations.
 
-- [ ] Write failing direct and compatibility-path tests: missing approval and exceeded budget produce no signing/submission; configured manual fee cannot bypass; XCH combines use actual cost-specific network pricing.
+- [x] Write failing direct and compatibility-path tests: missing approval and exceeded budget produce no signing/submission; configured manual fee cannot bypass; supported bounded XCH prerequisites use actual cost-specific network pricing while unsupported legacy combines fail closed.
 
 ```python
 worker.run()
@@ -119,9 +119,9 @@ assert fake_wallet.signatures == []
 assert fake_wallet.submissions == []
 ```
 
-- [ ] Run each dispatch-family test red before implementing its guard. Build/validate unsigned effects and re-evaluate fee/cost with bounded fixed-point retries, then atomically reserve exact final fee before signing.
-- [ ] Test price increase within allowance proceeds, beyond allowance pauses, provider failure pauses, fee-induced output/cost changes converge or stop, approval scope changes stop, and ordinary expected intermediate outputs preserve economic approval.
-- [ ] Test crashes before signing and after submission, authoritative settlement/no-effect, duplicate recovery, automatic bootstrap prep and cancellation usage. Never treat reservation replay as a fresh spending permit.
+- [x] Run each supported dispatch-family test red before implementing its guard. Build/validate unsigned effects and re-evaluate fee/cost with bounded fixed-point retries, then atomically reserve exact final fee before signing.
+- [x] Test price increase within allowance proceeds, beyond allowance pauses, provider failure pauses, fee-induced output/cost changes converge or stop, approval scope changes stop, and ordinary expected intermediate outputs preserve economic approval.
+- [ ] Test crashes before signing and after submission, authoritative settlement/no-effect, duplicate recovery, automatic bootstrap prep and cancellation usage. Restart/replay and authoritative prep accounting are covered; approved cancellation consumption and final Bootstrap integration remain open.
 - [ ] Run all affected authority/prep/recovery/fee tests and checkpoint exact supported-path coverage; commit only verified controls.
 
 ## Task 5: Normal GUI confirmation, pause/reload recovery and E2E
@@ -157,4 +157,4 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.
 - [x] Task 1 strict estimation foundation verified and committed.
 - [x] Task 2 database foundation and canonical scope/plan helper core verified; live integration is still outstanding.
-- [ ] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented; every compatibility-family planning and frozen execution adoption remain open. Task 5 is complete; Tasks 4 and 6 remain open.
+- [ ] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented. The supported Sage tier path now consumes frozen execution; unsupported compatibility modes pause safely. Protected cancellation consumption, final Bootstrap integration and Task 6 remain open; Task 5 is complete.

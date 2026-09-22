@@ -1,21 +1,18 @@
-import json
+"""Direct Coin Prep runner coverage under explicit approved fee pricing.
+
+Low-level journal/hold/dispatch behavior lives in the dedicated fee-worker
+tests. This module retains wallet-shape and confirmation regressions while
+ensuring the runner never re-enters the retired manual-fee compatibility path.
+"""
+
 import threading
-from contextlib import nullcontext
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
-import coin_prep_batch_plan
 import coin_prep_worker
-import wallet
-from coin_prep_batch_plan import (
-    BatchPlan,
-    CoinSnapshot,
-    PlannedOutput,
-    SelectableCoin,
-    TargetOutput,
-)
+from coin_prep_batch_plan import BatchPlan, PlannedOutput, SelectableCoin
 
 
 def _worker():
@@ -44,10 +41,14 @@ def _worker():
         cat_coins_target=76,
     )
     worker._tx_fee_mojos = lambda: 10
-    worker.update_status = lambda phase=None, progress=None, message=None, error=None: (
-        None
-    )
+    worker.update_status = lambda phase=None, progress=None, message=None, error=None: None
     worker.log = lambda _message: None
+    return worker
+
+
+def _approved_worker():
+    worker = _worker()
+    worker.fee_approval_id = "a" * 64
     return worker
 
 
@@ -55,8 +56,31 @@ def _coin(asset, coin_id, amount, purpose=""):
     return SelectableCoin(asset, coin_id, amount, purpose)
 
 
+def _priced(plan, *, target_count=1):
+    return {
+        "available": True,
+        "reason": "ready" if plan.transaction_required else "already_prepared",
+        "receive_address": "xch1owner",
+        "recipe": {"targets": tuple(object() for _ in range(target_count))},
+        "pricing": {"plan": plan},
+        "dispatch_authorized": False,
+    }
+
+
+def _complete_plan(target_count):
+    return BatchPlan(
+        asset="",
+        source_coin_ids=(),
+        fee_source_id=None,
+        outputs=(),
+        reused_coin_ids=tuple(f"{index:064x}" for index in range(target_count)),
+        reused_target_ids=tuple(("xch", index) for index in range(target_count)),
+        fee_mojos=0,
+        transaction_required=False,
+    )
+
+
 def test_direct_snapshot_labels_database_reserve_for_floor_accounting(monkeypatch):
-    """Dropping the reserve designation makes safe protected balance invisible."""
     worker = _worker()
     reserve_id = "a" * 64
     source_id = "b" * 64
@@ -66,9 +90,7 @@ def test_direct_snapshot_labels_database_reserve_for_floor_accounting(monkeypatc
         lambda wallet_type: [{"coin_id": reserve_id}] if wallet_type == "xch" else [],
     )
     monkeypatch.setattr(
-        coin_prep_worker,
-        "get_coin_reconciliation_protected_ids",
-        lambda _coin_ids: [],
+        coin_prep_worker, "get_coin_reconciliation_protected_ids", lambda _coin_ids: []
     )
     worker._get_coins_via_rpc = lambda wallet_id, *_args, **_kwargs: (
         [
@@ -90,14 +112,6 @@ def test_direct_snapshot_labels_database_reserve_for_floor_accounting(monkeypatc
 
 
 def test_direct_snapshot_excludes_durably_protected_wallet_effect_coin(monkeypatch):
-    """A Sage coin from an earlier unresolved effect must never be replanned.
-
-    TEST 7 exposed a previously submitted CAT combine whose source later
-    reappeared in Sage's selectable view.  The durable mutation authority
-    correctly rejected that source, but the direct-batch planner kept choosing
-    it and failed Coin Prep before trying the remaining safe balance.
-    """
-
     worker = _worker()
     protected_id = "a" * 64
     safe_id = "b" * 64
@@ -128,95 +142,111 @@ def test_direct_snapshot_excludes_durably_protected_wallet_effect_coin(monkeypat
     assert [coin.coin_id for coin in snapshot.coins] == [safe_id]
 
 
-def test_observed_wallet_shape_uses_one_cat_and_one_xch_final_batch(monkeypatch):
-    worker = _worker()
-    worker._tx_fee_mojos = lambda: 0
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
+def test_approved_wallet_shape_uses_one_cat_and_one_xch_final_batch(monkeypatch):
+    worker = _approved_worker()
+    cat_plan = BatchPlan(
+        "cat",
+        ("c" * 64,),
+        "f" * 64,
+        tuple(PlannedOutput("cat", "replacement", 10, index) for index in range(76))
+        + (PlannedOutput("xch", "fee_change", 20, -1),),
+        (),
+        (),
+        7,
     )
-    monkeypatch.setenv("XCH_RESERVE", "0")
-
-    initial = CoinSnapshot(
+    xch_plan = BatchPlan(
+        "xch",
+        ("a" * 64,),
+        None,
+        tuple(PlannedOutput("xch", "replacement", 10, index) for index in range(126))
+        + (PlannedOutput("xch", "change", 740, -1),),
+        (),
+        (),
+        11,
+    )
+    priced = iter(
         (
-            _coin("cat", "c" * 64, 1_000),
-            _coin("xch", "f" * 64, 30),
-            _coin("xch", "a" * 64, 2_000),
+            _priced(cat_plan, target_count=202),
+            _priced(xch_plan, target_count=202),
+            _priced(_complete_plan(202), target_count=202),
         )
     )
-    after_cat = CoinSnapshot(
-        tuple(_coin("cat", f"{index:064x}", 10, "replacement") for index in range(76))
-        + (_coin("xch", "a" * 64, 2_000), _coin("xch", "e" * 64, 20))
+    monkeypatch.setattr(
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: next(priced),
     )
-    after_xch = CoinSnapshot(
-        tuple(_coin("cat", f"{index:064x}", 10, "replacement") for index in range(76))
-        + tuple(
-            _coin("xch", f"{index + 1000:064x}", 10, "replacement")
-            for index in range(126)
-        )
-        + (_coin("xch", "d" * 64, 740),)
-    )
-    snapshots = iter((initial, after_cat, after_xch))
-    worker._direct_batch_snapshot = lambda _targets: next(snapshots)
     submitted = []
-    worker._submit_direct_batch_plan = lambda plan, _address: (
+    worker._submit_direct_batch_plan = lambda plan, _address, *, priced_batch: (
         submitted.append(plan) or True
     )
 
     assert worker._run_direct_batch_prep() is True
     assert [plan.asset for plan in submitted] == ["cat", "xch"]
-    assert len(submitted[0].outputs) == 77
-    assert len(submitted[1].outputs) == 127
+    assert [len(plan.outputs) for plan in submitted] == [77, 127]
     assert worker.status.batch_confirmed == 2
-    assert worker.status.paid_fee_mojos == 0
+    assert worker.status.paid_fee_mojos == 18
 
 
-def test_direct_batch_refusal_falls_back_only_before_any_effect(monkeypatch):
-    worker = _worker()
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
-    )
-    monkeypatch.setenv("XCH_RESERVE", "0")
-    worker._direct_batch_snapshot = lambda _targets: CoinSnapshot(
-        tuple(_coin("cat", f"{index:064x}", 15) for index in range(60))
-        + (_coin("xch", "f" * 64, 30),)
-    )
+def test_unpriced_compatibility_refusal_pauses_without_legacy_fallback(monkeypatch):
+    worker = _approved_worker()
     submitted = []
-    worker._submit_direct_batch_plan = lambda plan, address: submitted.append(
-        (plan, address)
+    worker._submit_direct_batch_plan = lambda *args, **kwargs: submitted.append(
+        (args, kwargs)
+    )
+    monkeypatch.setattr(
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: {
+            "available": False,
+            "reason": "FEE_PREP_COMPATIBILITY_UNSUPPORTED",
+            "dispatch_authorized": False,
+        },
     )
 
-    assert worker._run_direct_batch_prep() is None
+    with pytest.raises(ValueError, match="FEE_PREP_COMPATIBILITY_UNSUPPORTED"):
+        worker._run_direct_batch_prep()
     assert submitted == []
-    assert worker.status.compatibility_reason == "INPUT_CAP_REQUIRES_PREREQUISITE"
+    assert worker.status.batch_confirmed == 0
 
 
 def test_direct_batch_never_falls_back_after_a_confirmed_effect(monkeypatch):
-    worker = _worker()
-    worker._tx_fee_mojos = lambda: 0
-    monkeypatch.setenv("XCH_RESERVE", "0")
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
+    worker = _approved_worker()
+    plan = BatchPlan(
+        "cat",
+        ("c" * 64,),
+        "f" * 64,
+        (PlannedOutput("cat", "replacement", 10, 0),),
+        (),
+        (),
+        7,
     )
-    initial = CoinSnapshot(
+    priced = iter(
         (
-            _coin("cat", "c" * 64, 1_000),
-            _coin("xch", "f" * 64, 30),
-            _coin("xch", "a" * 64, 2_000),
+            _priced(plan),
+            {
+                "available": False,
+                "reason": "FEE_EFFECT_RECOVERY_REQUIRED",
+                "dispatch_authorized": False,
+            },
         )
     )
-    snapshots = iter((initial, None))
-    worker._direct_batch_snapshot = lambda _targets: next(snapshots)
-    worker._submit_direct_batch_plan = lambda _plan, _address: True
+    monkeypatch.setattr(
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: next(priced),
+    )
+    submitted = []
+    worker._submit_direct_batch_plan = lambda plan, _address, *, priced_batch: (
+        submitted.append(plan) or True
+    )
 
-    with pytest.raises(coin_prep_worker.CoinPrepAuthorityUnresolved):
+    with pytest.raises(ValueError, match="FEE_EFFECT_RECOVERY_REQUIRED"):
         worker._run_direct_batch_prep()
+    assert submitted == [plan]
 
 
 def test_submitted_batch_wait_persists_live_confirmation_elapsed(monkeypatch):
     worker = _worker()
     clock = {"now": 0.0}
     persisted = []
-
     monkeypatch.setattr(coin_prep_worker.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(
         coin_prep_worker.time,
@@ -231,9 +261,7 @@ def test_submitted_batch_wait_persists_live_confirmation_elapsed(monkeypatch):
     )
 
     result = worker._wait_for_coin_prep_post_effect(
-        {"operation_id": "coin-prep:" + "1" * 64},
-        timeout_s=30,
-        poll_interval_s=5,
+        {"operation_id": "coin-prep:" + "1" * 64}, timeout_s=30, poll_interval_s=5
     )
 
     assert result == {"confirmed": True}
@@ -241,27 +269,14 @@ def test_submitted_batch_wait_persists_live_confirmation_elapsed(monkeypatch):
     assert worker.status.confirmation_elapsed_seconds == 15
 
 
-def test_submitted_batch_does_not_confirm_while_exact_sage_tx_is_pending(
-    monkeypatch,
-):
-    """Sage's optimistic coin view must not confirm an exact pending split.
-
-    TEST 7 showed the requested outputs before the transaction left Sage's
-    pending list.  Accepting that view poisoned durable coin authority when the
-    transaction later rolled back.
-    """
-
+def test_submitted_batch_does_not_confirm_while_exact_sage_tx_is_pending(monkeypatch):
     worker = _worker()
     clock = {"now": 0.0}
     txid = "3" * 64
     pending_views = iter(
-        (
-            [{"transaction_id": "0x" + txid}],
-            [{"transaction_id": "4" * 64}],
-        )
+        ([{"transaction_id": "0x" + txid}], [{"transaction_id": "4" * 64}])
     )
     observations = []
-
     monkeypatch.setattr(coin_prep_worker.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(
         coin_prep_worker.time,
@@ -269,24 +284,16 @@ def test_submitted_batch_does_not_confirm_while_exact_sage_tx_is_pending(
         lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
     )
     monkeypatch.setattr(
-        coin_prep_worker,
-        "get_pending_transactions",
-        lambda: next(pending_views),
+        coin_prep_worker, "get_pending_transactions", lambda: next(pending_views)
     )
     monkeypatch.setattr(
         coin_prep_worker,
         "get_transaction_relay_outcome",
-        lambda transaction_id: {
-            "status": "accepted",
-            "transaction_id": transaction_id,
-        },
+        lambda transaction_id: {"status": "accepted", "transaction_id": transaction_id},
     )
-
-    def optimistic_observation(_operation):
-        observations.append(clock["now"])
-        return {"confirmed": True}
-
-    worker._observe_coin_prep_post_effect = optimistic_observation
+    worker._observe_coin_prep_post_effect = lambda _operation: (
+        observations.append(clock["now"]) or {"confirmed": True}
+    )
     worker.update_status = lambda **_kwargs: None
 
     result = worker._wait_for_coin_prep_post_effect(
@@ -301,13 +308,10 @@ def test_submitted_batch_does_not_confirm_while_exact_sage_tx_is_pending(
     assert worker.status.confirmation_elapsed_seconds == 10
 
 
-def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(
-    monkeypatch,
-):
+def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(monkeypatch):
     worker = _worker()
     clock = {"now": 0.0}
     observations = []
-
     monkeypatch.setattr(coin_prep_worker.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(
         coin_prep_worker.time,
@@ -318,10 +322,7 @@ def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(
     monkeypatch.setattr(
         coin_prep_worker,
         "get_transaction_relay_outcome",
-        lambda transaction_id: {
-            "status": "accepted",
-            "transaction_id": transaction_id,
-        },
+        lambda transaction_id: {"status": "accepted", "transaction_id": transaction_id},
     )
     worker._observe_coin_prep_post_effect = lambda _operation: observations.append(True)
     worker.update_status = lambda **_kwargs: None
@@ -337,87 +338,31 @@ def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(
     assert observations == []
 
 
-def test_direct_batch_replans_with_relay_safe_fee_for_many_actions(monkeypatch):
-    """Sage peers rejected the former flat fee on a 43-action TEST 7 split."""
-
-    worker = _worker()
-    worker._tx_fee_mojos = lambda: 13_079_100
-    worker._direct_batch_targets = lambda: (
-        TargetOutput("xch", "replacement", 0, 10, 0),
+def test_network_priced_high_fee_is_reflected_without_legacy_fee_floor(monkeypatch):
+    worker = _approved_worker()
+    plan = BatchPlan(
+        "xch",
+        ("a" * 64,),
+        None,
+        (PlannedOutput("xch", "replacement", 10, 0),),
+        (),
+        (),
+        3_881_141_382,
     )
-    monkeypatch.setenv("XCH_RESERVE", "0")
+    priced = iter((_priced(plan), _priced(_complete_plan(1))))
     monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
-    )
-    snapshots = iter(
-        (
-            CoinSnapshot((_coin("xch", "a" * 64, 10_000_000_000),)),
-            CoinSnapshot(
-                (
-                    _coin("xch", "b" * 64, 10, "replacement"),
-                    _coin("xch", "c" * 64, 9_000_000_000),
-                )
-            ),
-        )
-    )
-    worker._direct_batch_snapshot = lambda _targets: next(snapshots)
-    worker._direct_batch_exact_relay_safe_fee_mojos = lambda _plan, _address: (
-        3_881_141_382
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: next(priced),
     )
     submitted = []
-    worker._submit_direct_batch_plan = lambda plan, _address: (
+    worker._submit_direct_batch_plan = lambda plan, _address, *, priced_batch: (
         submitted.append(plan) or True
     )
 
     assert worker._run_direct_batch_prep() is True
-    assert len(submitted) == 1
-    assert submitted[0].fee_mojos == 3_881_141_382
+    assert submitted == [plan]
     assert worker.status.planned_fee_mojos == 3_881_141_382
     assert worker.status.paid_fee_mojos == 3_881_141_382
-
-
-def test_direct_batch_never_submits_when_exact_fee_does_not_converge(monkeypatch):
-    worker = _worker()
-    worker._direct_batch_targets = lambda: (
-        TargetOutput("xch", "replacement", 0, 10, 0),
-    )
-    monkeypatch.setenv("XCH_RESERVE", "0")
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
-    )
-    worker._direct_batch_snapshot = lambda _targets: CoinSnapshot(
-        (_coin("xch", "a" * 64, 10_000),)
-    )
-    planned_fees = []
-
-    def changing_plan(_snapshot, _targets, constraints):
-        planned_fees.append(constraints.fee_mojos)
-        return BatchPlan(
-            asset="xch",
-            source_coin_ids=("a" * 64,),
-            fee_source_id=None,
-            outputs=(PlannedOutput("xch", "replacement", 10, 0),),
-            reused_coin_ids=(),
-            reused_target_ids=(),
-            fee_mojos=constraints.fee_mojos,
-        )
-
-    monkeypatch.setattr(coin_prep_batch_plan, "plan_batch", changing_plan)
-    worker._direct_batch_relay_safe_fee_mojos = lambda plan: plan.fee_mojos
-    worker._direct_batch_exact_relay_safe_fee_mojos = lambda plan, _address: (
-        plan.fee_mojos + 1
-    )
-    submitted = []
-    worker._submit_direct_batch_plan = lambda plan, _address: submitted.append(plan)
-
-    with pytest.raises(
-        coin_prep_worker.CoinPrepAuthorityUnresolved,
-        match="fee did not converge",
-    ):
-        worker._run_direct_batch_prep()
-
-    assert submitted == []
-    assert planned_fees == [10, 11, 12, 13, 14]
 
 
 def test_direct_batch_relay_safe_fee_preserves_explicit_zero():
@@ -440,8 +385,6 @@ def test_direct_batch_relay_safe_fee_preserves_explicit_zero():
 
 
 def test_submitted_batch_surfaces_sage_relay_rejection_and_bounds_wait(monkeypatch):
-    """A native peer rejection must not look like endless confirmation latency."""
-
     worker = _worker()
     clock = {"now": 0.0}
     messages = []
@@ -480,423 +423,69 @@ def test_submitted_batch_surfaces_sage_relay_rejection_and_bounds_wait(monkeypat
     assert "INVALID_FEE_TOO_CLOSE_TO_ZERO" in worker.status.message
 
 
-def test_direct_batch_uses_bounded_xch_prerequisite_after_cat_is_prepared(
+def test_approved_runner_uses_bounded_xch_prerequisite_after_cat_is_prepared(
     monkeypatch,
 ):
-    """A DBX-shaped fragmented XCH wallet must finish without replaying CAT.
-
-    The live DBX run had 54 XCH inputs needed for the final batch while the
-    conservative input cap is 50.  CAT outputs had already confirmed, so
-    falling back was no longer safe.  A bounded prerequisite must consolidate
-    only 50 eligible XCH inputs, then the refreshed final batch can complete.
-    """
-    worker = _worker()
-    worker._tx_fee_mojos = lambda: 0
-    monkeypatch.setenv("XCH_RESERVE", "0")
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
+    worker = _approved_worker()
+    prerequisite = BatchPlan(
+        "xch",
+        tuple(f"{index + 20_000:064x}" for index in range(50)),
+        None,
+        (PlannedOutput("xch", "change", 990, -1),),
+        (),
+        (),
+        13,
     )
-    prepared_cat = tuple(
-        _coin("cat", f"{index + 10_000:064x}", 10, "replacement") for index in range(76)
+    final = BatchPlan(
+        "xch",
+        tuple(f"{index + 30_000:064x}" for index in range(15)),
+        None,
+        tuple(PlannedOutput("xch", "replacement", 10, index) for index in range(126))
+        + (PlannedOutput("xch", "change", 320, -1),),
+        (),
+        (),
+        17,
     )
-    fragmented_xch = tuple(
-        _coin("xch", f"{index + 20_000:064x}", 20) for index in range(80)
-    )
-    after_prerequisite = (
-        prepared_cat
-        + (_coin("xch", f"{30_000:064x}", 990),)
-        + tuple(_coin("xch", f"{index + 20_050:064x}", 20) for index in range(30))
-    )
-    after_final = (
-        prepared_cat
-        + tuple(
-            _coin("xch", f"{index + 40_000:064x}", 10, "replacement")
-            for index in range(126)
-        )
-        + (_coin("xch", f"{50_000:064x}", 320),)
-    )
-    snapshots = iter(
+    priced = iter(
         (
-            CoinSnapshot(prepared_cat + fragmented_xch),
-            CoinSnapshot(after_prerequisite),
-            CoinSnapshot(after_final),
+            _priced(prerequisite, target_count=202),
+            _priced(final, target_count=202),
+            _priced(_complete_plan(202), target_count=202),
         )
     )
-    worker._direct_batch_snapshot = lambda _targets: next(snapshots)
+    monkeypatch.setattr(
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: next(priced),
+    )
     submitted = []
-    worker._submit_direct_batch_plan = lambda plan, _address: (
+    worker._submit_direct_batch_plan = lambda plan, _address, *, priced_batch: (
         submitted.append(plan) or True
     )
 
     assert worker._run_direct_batch_prep() is True
     assert [plan.asset for plan in submitted] == ["xch", "xch"]
     assert [len(plan.source_coin_ids) for plan in submitted] == [50, 15]
-    assert len(submitted[0].outputs) == 1
     assert submitted[0].outputs[0].purpose == "change"
     assert worker.status.batch_confirmed == 2
-    assert worker.status.paid_fee_mojos == 0
+    assert worker.status.paid_fee_mojos == 30
 
 
-def test_unsigned_output_binding_is_persisted_before_direct_batch_submit(monkeypatch):
-    worker = _worker()
-    monkeypatch.setenv("CAT_ASSET_ID", "a" * 64)
-    source = "1" * 64
-    fee_source = "2" * 64
-    plan = BatchPlan(
-        asset="cat",
-        source_coin_ids=(source,),
-        fee_source_id=fee_source,
-        outputs=(
-            PlannedOutput("cat", "replacement", 90, 0),
-            PlannedOutput("xch", "fee_change", 20, -1),
-        ),
-        reused_coin_ids=(),
-        reused_target_ids=(),
-        fee_mojos=10,
-    )
-    events = []
-    identity = {
-        "backend": "sage",
-        "name": "test",
-        "fingerprint": 1,
-        "network_id": "mainnet",
-        "kind": "bls",
-        "has_secrets": True,
-        "bound_at_utc": "2026-09-04T00:00:00.000000Z",
-        "maximum_age_seconds": 15,
-    }
-    worker._current_coin_prep_wallet_identity = lambda: identity
-    worker._submitted_split_verify_timeout_seconds = lambda: 30
-    worker._wait_for_coin_prep_post_effect = lambda *_args, **_kwargs: {
-        "expected_outputs": [],
-        "authoritative_view": {},
-    }
-    worker._verify_authoritative_post_operation_view = lambda **_kwargs: True
-    token = "a" * 64
-    operation = {
-        "operation_id": "coin-prep:" + "b" * 64,
-        "effect_claim_token": token,
-        "effect_claim_generation": 1,
-        "wallet_identity_json": json.dumps(identity),
-    }
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "claim_wallet_effect",
-        lambda **_kwargs: {"claim_token": token, "generation": 1},
+def test_uninspectable_unsigned_batch_pauses_before_any_effect(monkeypatch):
+    worker = _approved_worker()
+    submitted = []
+    worker._submit_direct_batch_plan = lambda *args, **kwargs: submitted.append(
+        (args, kwargs)
     )
     monkeypatch.setattr(
-        coin_prep_worker,
-        "prepare_coin_prep_operation",
-        lambda **_kwargs: {"operation": operation},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "build_transaction_rpc",
-        lambda *_args: events.append("build") or {"summary": {}, "coin_spends": [{}]},
-    )
-    sealed = {
-        "_catalyst_validated_unsigned": True,
-        "constructed_outputs": [
-            {
-                "asset": "cat",
-                "address": "xch1owner",
-                "amount_mojos": 90,
-                "purpose": "replacement",
-                "ordinal": 0,
-                "coin_id": "3" * 64,
-            },
-            {
-                "asset": "xch",
-                "address": "xch1owner",
-                "amount_mojos": 20,
-                "purpose": "fee_reserve",
-                "ordinal": -1,
-                "coin_id": "4" * 64,
-            },
-        ],
-    }
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "validate_unsigned_transaction_effect",
-        lambda *_args: events.append("validate") or sealed,
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "bind_coin_prep_constructed_outputs",
-        lambda *_args, **_kwargs: events.append("bind") or {"operation": operation},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "wallet_effect_claim_is_current",
-        lambda *_args, **_kwargs: True,
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "begin_wallet_effect_dispatch",
-        lambda *_args, **_kwargs: events.append("dispatch") or object(),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "wallet_effect_adapter_dispatch_authority",
-        lambda _dispatch: nullcontext(),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "submit_built_transaction_rpc",
-        lambda _sealed: events.append("submit") or {"success": True},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "complete_wallet_effect_dispatch",
-        lambda *_args, **_kwargs: "SUBMITTED",
-    )
-    worker._record_coin_prep_dispatch_outcome = lambda *_args, **_kwargs: events.append(
-        "record"
-    )
-
-    assert worker._submit_direct_batch_plan(plan, "xch1owner") is True
-    assert events[:5] == ["build", "validate", "bind", "dispatch", "submit"]
-
-
-def test_direct_batch_prepare_persistence_failure_retains_claim_without_dispatch(
-    monkeypatch,
-):
-    worker = _worker()
-    source = "1" * 64
-    plan = BatchPlan(
-        asset="xch",
-        source_coin_ids=(source,),
-        fee_source_id=None,
-        outputs=(PlannedOutput("xch", "replacement", 90, 0),),
-        reused_coin_ids=(),
-        reused_target_ids=(),
-        fee_mojos=10,
-    )
-    token = "a" * 64
-    retained = []
-    built = []
-    worker._current_coin_prep_wallet_identity = lambda: {"backend": "sage"}
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "claim_wallet_effect",
-        lambda **_kwargs: {"claim_token": token, "generation": 4},
-    )
-
-    def fail_prepare(**_kwargs):
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(coin_prep_worker, "prepare_coin_prep_operation", fail_prepare)
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "retain_wallet_effect_claim_for_reconciliation",
-        lambda claim_token, generation, *, reason_code: retained.append(
-            (claim_token, generation, reason_code)
-        ),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "build_transaction_rpc",
-        lambda *_args: built.append(True),
-    )
-
-    assert worker._submit_direct_batch_plan(plan, "xch1owner") is False
-    assert retained == [(token, 4, "DIRECT_BATCH_PREPARED_PERSIST_FAILED")]
-    assert built == []
-
-
-def test_direct_batch_output_binding_failure_retains_claim_without_dispatch(
-    monkeypatch,
-):
-    worker = _worker()
-    source = "1" * 64
-    plan = BatchPlan(
-        asset="xch",
-        source_coin_ids=(source,),
-        fee_source_id=None,
-        outputs=(PlannedOutput("xch", "replacement", 90, 0),),
-        reused_coin_ids=(),
-        reused_target_ids=(),
-        fee_mojos=10,
-    )
-    token = "a" * 64
-    operation = {
-        "operation_id": "coin-prep:" + "b" * 64,
-        "effect_claim_token": token,
-        "effect_claim_generation": 5,
-        "wallet_identity_json": json.dumps({"backend": "sage"}),
-    }
-    retained = []
-    dispatched = []
-    worker._current_coin_prep_wallet_identity = lambda: {"backend": "sage"}
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "claim_wallet_effect",
-        lambda **_kwargs: {"claim_token": token, "generation": 5},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "prepare_coin_prep_operation",
-        lambda **_kwargs: {"operation": operation},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "build_transaction_rpc",
-        lambda *_args: {"summary": {}, "coin_spends": [{}]},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "validate_unsigned_transaction_effect",
-        lambda *_args: {
-            "_catalyst_validated_unsigned": True,
-            "constructed_outputs": [
-                {
-                    "asset": "xch",
-                    "address": "xch1owner",
-                    "amount_mojos": 90,
-                    "purpose": "replacement",
-                    "ordinal": 0,
-                    "coin_id": "3" * 64,
-                }
-            ],
+        "coin_prep_fee_dispatch.price_approved_prep_batch",
+        lambda _approval_id: {
+            "available": False,
+            "reason": "FEE_UNSIGNED_COST_UNAVAILABLE",
+            "dispatch_authorized": False,
         },
     )
 
-    def fail_binding(*_args, **_kwargs):
-        raise RuntimeError("binding unavailable")
-
-    monkeypatch.setattr(
-        coin_prep_worker, "bind_coin_prep_constructed_outputs", fail_binding
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "retain_wallet_effect_claim_for_reconciliation",
-        lambda claim_token, generation, *, reason_code: retained.append(
-            (claim_token, generation, reason_code)
-        ),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "begin_wallet_effect_dispatch",
-        lambda *_args, **_kwargs: dispatched.append(True),
-    )
-
-    with pytest.raises(
-        coin_prep_worker.CoinPrepAuthorityUnresolved,
-        match="output binding",
-    ):
-        worker._submit_direct_batch_plan(plan, "xch1owner")
-
-    assert retained == [(token, 5, "DIRECT_BATCH_OUTPUT_BINDING_FAILED")]
-    assert dispatched == []
-
-
-def test_uninspectable_unsigned_batch_records_proven_no_effect_for_fallback(
-    monkeypatch,
-):
-    worker = _worker()
-    source = "1" * 64
-    plan = BatchPlan(
-        asset="xch",
-        source_coin_ids=(source,),
-        fee_source_id=None,
-        outputs=(PlannedOutput("xch", "replacement", 90, 0),),
-        reused_coin_ids=(),
-        reused_target_ids=(),
-        fee_mojos=10,
-    )
-    token = "a" * 64
-    operation = {
-        "operation_id": "coin-prep:" + "b" * 64,
-        "effect_claim_token": token,
-        "effect_claim_generation": 6,
-        "wallet_identity_json": json.dumps({"backend": "sage"}),
-    }
-    recorded = []
-    worker._current_coin_prep_wallet_identity = lambda: {"backend": "sage"}
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "claim_wallet_effect",
-        lambda **_kwargs: {"claim_token": token, "generation": 6},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "prepare_coin_prep_operation",
-        lambda **_kwargs: {"operation": operation},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker, "build_transaction_rpc", lambda *_args: {"success": True}
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "validate_unsigned_transaction_effect",
-        lambda *_args: {
-            "success": False,
-            "reason": "UNSIGNED_EFFECT_NOT_INSPECTABLE",
-        },
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "wallet_effect_claim_is_current",
-        lambda *_args, **_kwargs: True,
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "begin_wallet_effect_dispatch",
-        lambda *_args, **_kwargs: object(),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "wallet_effect_adapter_dispatch_authority",
-        lambda _dispatch: nullcontext(),
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "submit_built_transaction_rpc",
-        lambda _invalid: {"success": False, "_catalyst_effect_attempted": False},
-    )
-    monkeypatch.setattr(
-        coin_prep_worker,
-        "complete_wallet_effect_dispatch",
-        lambda *_args, **_kwargs: "RELEASED_NO_EFFECT",
-    )
-    worker._record_coin_prep_dispatch_outcome = lambda *_args, **kwargs: (
-        recorded.append(kwargs)
-    )
-
-    assert worker._submit_direct_batch_plan(plan, "xch1owner") is False
-    assert worker.status.compatibility_reason == "UNSIGNED_EFFECT_NOT_INSPECTABLE"
-    assert recorded == [
-        {
-            "dispatch_outcome": "RELEASED_NO_EFFECT",
-            "reason_code": "DIRECT_BATCH_RELEASED_NO_EFFECT_UNRECONCILED",
-        }
-    ]
-
-
-def test_uninspectable_unsigned_batch_enters_compatibility_before_any_effect(
-    monkeypatch,
-):
-    worker = _worker()
-    worker._tx_fee_mojos = lambda: 0
-    worker.xch_tier_counts = {"tier": 1}
-    worker.cat_tier_counts = {"tier": 1}
-    monkeypatch.setattr(
-        wallet, "get_next_address", lambda *_args, **_kwargs: {"address": "xch1owner"}
-    )
-    monkeypatch.setenv("XCH_RESERVE", "0")
-    worker._direct_batch_snapshot = lambda _targets: CoinSnapshot(
-        (
-            _coin("cat", "c" * 64, 100),
-            _coin("xch", "f" * 64, 20),
-            _coin("xch", "a" * 64, 100),
-        )
-    )
-
-    def unsupported(_plan, _address):
-        worker.status.compatibility_reason = "UNSIGNED_EFFECT_NOT_INSPECTABLE"
-        return False
-
-    worker._submit_direct_batch_plan = unsupported
-
-    assert worker._run_direct_batch_prep() is None
+    with pytest.raises(ValueError, match="FEE_UNSIGNED_COST_UNAVAILABLE"):
+        worker._run_direct_batch_prep()
+    assert submitted == []
     assert worker.status.batch_confirmed == 0
