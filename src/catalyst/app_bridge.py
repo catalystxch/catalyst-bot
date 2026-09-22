@@ -927,8 +927,10 @@ class AppBridge:
         import api_server
 
         with api_server.app.test_request_context(
-            "/api/coin-prep/fee-preview", method="POST",
-            content_type="application/json", data=json.dumps(body),
+            "/api/coin-prep/fee-preview",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
         ):
             resp = api_server.api_coin_prep_fee_preview()
         return _unwrap_flask_response(resp)
@@ -940,8 +942,10 @@ class AppBridge:
         import api_server
 
         with api_server.app.test_request_context(
-            "/api/coin-prep/fee-approval", method="POST",
-            content_type="application/json", data=json.dumps(body),
+            "/api/coin-prep/fee-approval",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
         ):
             resp = api_server.api_coin_prep_fee_approval()
         return _unwrap_flask_response(resp)

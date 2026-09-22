@@ -6384,7 +6384,9 @@ class OfferManager:
             "secure": True,
             "timeout": 60,
             "fee_mojos": priced["fee_mojos"],
-            "batch": {key: value for key, value in contract.items() if key != "fee_mojos"},
+            "batch": {
+                key: value for key, value in contract.items() if key != "fee_mojos"
+            },
         }
         if not self._is_exact_cancel_wallet_effect(wallet_effect):
             raise ValueError("FEE_CANCELLATION_PLAN_INVALID")

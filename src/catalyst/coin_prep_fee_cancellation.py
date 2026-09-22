@@ -136,9 +136,7 @@ def reserve_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(approval_id)
-    if any(
-        priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS
-    ):
+    if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
     unsigned = priced_cancellation.get("validated_unsigned")
     cost = priced_cancellation.get("cost")

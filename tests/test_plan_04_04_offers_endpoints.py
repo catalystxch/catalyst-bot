@@ -88,7 +88,9 @@ def test_native_cancel_all_forwards_coin_prep_fee_approval_body(monkeypatch):
 
     monkeypatch.setattr(api_server, "api_cancel_all", fake_cancel_all)
     monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
-    monkeypatch.setattr(api_server.mutation_gate, "enter_mutation", lambda _operation: object())
+    monkeypatch.setattr(
+        api_server.mutation_gate, "enter_mutation", lambda _operation: object()
+    )
     monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: None)
 
     result = app_bridge.AppBridge().cancel_all_offers(
@@ -582,9 +584,7 @@ class TestCancelAllPost(_FlaskBase):
         stopped = _make_bot()
         stopped.is_running.return_value = False
         with patch.object(api_server, "bot", stopped):
-            missing = self._post(
-                "/api/offers/cancel_all", {"source": "coin_prep"}
-            )
+            missing = self._post("/api/offers/cancel_all", {"source": "coin_prep"})
             malformed = self._post(
                 "/api/offers/cancel_all",
                 {"source": "coin_prep", "fee_approval_id": "not-a-digest"},

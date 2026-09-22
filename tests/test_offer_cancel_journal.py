@@ -1809,9 +1809,7 @@ def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
         identity_count=8,
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(
-        reserve_largest=lambda: (fee_coin_id, 1_000)
-    )
+    manager._fee_pool = SimpleNamespace(reserve_largest=lambda: (fee_coin_id, 1_000))
 
     results = manager.cancel_offers(
         trade_ids,
@@ -2443,9 +2441,7 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
     )
     assert OfferManager().retry_failed_cancels() == 0
     assert len(fee_settlements) == 2
-    assert {row["cohort_id"] for row in fee_settlements} == {
-        manifest["cohort_id"]
-    }
+    assert {row["cohort_id"] for row in fee_settlements} == {manifest["cohort_id"]}
     assert database.get_runtime_safety_latch()["state"] == "resolved"
     assert database.get_unresolved_offer_operation_blockers() == []
     for trade_id, coin_id in zip(trade_ids, source_coin_ids):
@@ -2570,7 +2566,9 @@ def test_retry_failed_cancels_resolves_exact_sage_all_peer_rejection(
     monkeypatch.setattr(
         database,
         "record_coin_prep_cancellation_fee_outcome",
-        lambda manifest: fee_settlements.append(manifest) or {"state": "RELEASED_NO_EFFECT"},
+        lambda manifest: (
+            fee_settlements.append(manifest) or {"state": "RELEASED_NO_EFFECT"}
+        ),
     )
 
     assert manager.reconcile_submitted_cancels_only() == 0

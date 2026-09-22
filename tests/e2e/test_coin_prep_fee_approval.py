@@ -110,10 +110,14 @@ def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
 
     assert result["value"] is True
     assert [call["path"] for call in result["calls"]] == ["/api/coin-prep/fee-preview"]
-    expect(page.locator("#cpFeeWalletPair")).to_have_text("Sage 736588221 · wallet 2 · MZ/XCH · mainnet")
+    expect(page.locator("#cpFeeWalletPair")).to_have_text(
+        "Sage 736588221 · wallet 2 · MZ/XCH · mainnet"
+    )
     expect(page.locator("#cpFeeTxCount")).to_have_text("2–4 preparation transactions")
     expect(page.locator("#cpFeeEstimate")).to_contain_text("0.000016 XCH")
-    expect(page.locator("#cpFeePrincipal")).to_contain_text("0.002 XCH prepared as coin principal, not spent as fees")
+    expect(page.locator("#cpFeePrincipal")).to_contain_text(
+        "0.002 XCH prepared as coin principal, not spent as fees"
+    )
     expect(page.locator("#cpFeeSource")).to_contain_text("Coinset + Full node")
     expect(page.locator("#cpFeeEvidence")).to_contain_text("1 exact · 1 projected")
     expect(page.locator("#cpFeeStages")).to_contain_text(
@@ -126,7 +130,9 @@ def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
     expect(page.locator("#cpConfirmBtn")).to_be_enabled()
 
 
-def test_confirmation_records_budget_before_one_launch_and_preserves_exact_strings(page):
+def test_confirmation_records_budget_before_one_launch_and_preserves_exact_strings(
+    page,
+):
     _open_gui(page)
     preview = _preview()
     result = page.evaluate(
@@ -267,8 +273,14 @@ def test_history_cancel_records_no_fee_approval_or_trigger(page):
 
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
     _open_gui(page)
-    assert page.evaluate("_apiBridgeMethod('/api/coin-prep/fee-preview', 'POST')") == "preview_coin_prep_fees"
-    assert page.evaluate("_apiBridgeMethod('/api/coin-prep/fee-approval', 'POST')") == "approve_coin_prep_fees"
+    assert (
+        page.evaluate("_apiBridgeMethod('/api/coin-prep/fee-preview', 'POST')")
+        == "preview_coin_prep_fees"
+    )
+    assert (
+        page.evaluate("_apiBridgeMethod('/api/coin-prep/fee-approval', 'POST')")
+        == "approve_coin_prep_fees"
+    )
 
 
 def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
@@ -340,7 +352,9 @@ def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
     expect(page.locator("#cpConfirmBtn")).to_be_disabled()
 
 
-def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_launch(page):
+def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_launch(
+    page,
+):
     _open_gui(page)
     status = {
         "success": True,

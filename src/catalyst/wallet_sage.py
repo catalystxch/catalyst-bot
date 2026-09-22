@@ -3190,7 +3190,9 @@ def inspect_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
     from unsigned_effect_binding import executable_matches_summary
 
     spends, conditions = execution
-    if not executable_matches_summary(spends, conditions, validated["summary"], _exact_summary_mojos):
+    if not executable_matches_summary(
+        spends, conditions, validated["summary"], _exact_summary_mojos
+    ):
         return _unsigned_effect_refusal("UNSIGNED_EXECUTABLE_EFFECT_MISMATCH")
     validated["_catalyst_executable_effect_bound"] = True
     validated["_catalyst_exact_unsigned_cost"] = int(conditions.cost)
@@ -5475,7 +5477,9 @@ def build_cancel_offers_batch_unsigned(
         or fee_mojos < 0
         or len(normalized_source_ids) != len(unique_trade_ids)
         or len(set(normalized_source_ids)) != len(normalized_source_ids)
-        or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in normalized_source_ids)
+        or any(
+            not re.fullmatch(r"[0-9a-f]{64}", value) for value in normalized_source_ids
+        )
         or not re.fullmatch(r"[0-9a-f]{64}", normalized_fee_coin_id)
         or normalized_fee_coin_id in set(normalized_source_ids)
     ):
@@ -5536,7 +5540,9 @@ def build_cancel_offers_batch_unsigned(
         "create_transaction",
         {
             "selected_coin_ids": [normalized_fee_coin_id],
-            "actions": ([{"type": "fee", "amount": str(fee_mojos)}] if fee_mojos else []),
+            "actions": (
+                [{"type": "fee", "amount": str(fee_mojos)}] if fee_mojos else []
+            ),
             "auto_submit": False,
         },
         timeout=60,

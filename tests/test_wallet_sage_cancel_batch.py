@@ -172,7 +172,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
             )
         )
 
-    def test_cancel_batch_rejects_tampered_sealed_unsigned_bundle_without_submission(self):
+    def test_cancel_batch_rejects_tampered_sealed_unsigned_bundle_without_submission(
+        self,
+    ):
         trade_ids = ["a" * 64, "b" * 64]
         tampered = self._sealed_cancel_bundle()
         tampered["summary"]["fee"] = 26
@@ -200,7 +202,9 @@ class WalletSageCancelBatchTests(unittest.TestCase):
             )
 
         submit.assert_not_called()
-        self.assertTrue(all(results[trade_id]["outcome"] == CANCEL_FAILED for trade_id in trade_ids))
+        self.assertTrue(
+            all(results[trade_id]["outcome"] == CANCEL_FAILED for trade_id in trade_ids)
+        )
 
     def test_cancel_batch_never_confirms_by_unlock_or_absence(self):
         with (

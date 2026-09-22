@@ -76,9 +76,12 @@ def test_cancellation_price_converges_on_actual_unsigned_cost_without_dispatch(
     assert result["validated_unsigned"]["_catalyst_validated_cancel_unsigned"] is True
     assert result["dispatch_authorized"] is False
     assert calls == [0, 20]
-    assert database.get_coin_prep_fee_approval_status(
-        approved["approval"]["approval_id"]
-    )["reservation_count"] == 0
+    assert (
+        database.get_coin_prep_fee_approval_status(approved["approval"]["approval_id"])[
+            "reservation_count"
+        ]
+        == 0
+    )
 
 
 def test_cancellation_price_preserves_available_zero_fee_without_extra_build(
@@ -262,9 +265,12 @@ def test_unrelated_cancel_cannot_charge_coin_prep_approval(approved):
     with pytest.raises(ValueError, match="FEE_CANCELLATION_SCOPE_INVALID"):
         _reserve_cancel(approved, manifest, contract, quote)
 
-    assert database.get_coin_prep_fee_approval_status(
-        approved["approval"]["approval_id"]
-    )["reservation_count"] == 0
+    assert (
+        database.get_coin_prep_fee_approval_status(approved["approval"]["approval_id"])[
+            "reservation_count"
+        ]
+        == 0
+    )
 
 
 def test_cancel_reservation_rechecks_quote_after_database_lock(approved):
@@ -283,9 +289,7 @@ def test_cancel_reservation_replay_cannot_authorize_second_dispatch(approved):
         _reserve_cancel(approved, manifest, contract, quote)
 
 
-def test_reserved_cancel_recheck_fails_closed_on_context_change(
-    approved, monkeypatch
-):
+def test_reserved_cancel_recheck_fails_closed_on_context_change(approved, monkeypatch):
     _builder(monkeypatch, approved)
     _quote(monkeypatch, approved, 20)
     priced = _price(approved)
@@ -428,9 +432,12 @@ def test_authoritative_peer_rejection_releases_protected_hold(approved):
 
     settled = database.record_coin_prep_cancellation_fee_outcome(manifest)
     assert settled["state"] == "RELEASED_NO_EFFECT"
-    assert database.get_coin_prep_fee_approval_status(
-        approved["approval"]["approval_id"]
-    )["held_fee_mojos"] == 0
+    assert (
+        database.get_coin_prep_fee_approval_status(approved["approval"]["approval_id"])[
+            "held_fee_mojos"
+        ]
+        == 0
+    )
 
 
 @pytest.mark.parametrize("member_count", [1, 2])
