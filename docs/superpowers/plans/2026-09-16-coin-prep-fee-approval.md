@@ -121,7 +121,7 @@ assert fake_wallet.submissions == []
 
 - [x] Run each supported dispatch-family test red before implementing its guard. Build/validate unsigned effects and re-evaluate fee/cost with bounded fixed-point retries, then atomically reserve exact final fee before signing.
 - [x] Test price increase within allowance proceeds, beyond allowance pauses, provider failure pauses, fee-induced output/cost changes converge or stop, approval scope changes stop, and ordinary expected intermediate outputs preserve economic approval.
-- [ ] Test crashes before signing and after submission, authoritative settlement/no-effect, duplicate recovery, automatic bootstrap prep and cancellation usage. Restart/replay and authoritative prep accounting are covered; approved cancellation consumption and final Bootstrap integration remain open.
+- [ ] Test crashes before signing and after submission, authoritative settlement/no-effect, duplicate recovery, automatic bootstrap prep and cancellation usage. Restart/replay, authoritative prep accounting and final Bootstrap preview/consent/reload/exact-pricing authority are covered; approved cancellation consumption remains open.
 - [ ] Run all affected authority/prep/recovery/fee tests and checkpoint exact supported-path coverage; commit only verified controls.
 
 ## Task 5: Normal GUI confirmation, pause/reload recovery and E2E
@@ -158,4 +158,4 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 - [x] Task 1 strict estimation foundation verified and committed.
 - [x] Task 2 database foundation and canonical scope/plan helper core verified; live integration is still outstanding.
 - [x] Task 3 core, bounded staged runtime preview, HTTP/native preview/approval, durable reload accounting and full standalone session lifecycle are implemented and jointly regression-tested. Task 5 is complete.
-- [ ] Task 4 supported Sage tier execution and restart-safe authoritative accounting are implemented. Unsupported compatibility modes pause safely. Protected cancellation consumption and final Bootstrap integration remain open; Task 6 remains open.
+- [ ] Task 4 supported Sage tier execution, restart-safe authoritative accounting and final Bootstrap campaign authority are implemented. Unsupported compatibility modes pause safely. Protected cancellation consumption remains open; Task 6 remains open.

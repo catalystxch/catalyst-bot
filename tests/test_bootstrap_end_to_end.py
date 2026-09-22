@@ -90,6 +90,8 @@ def _request(**overrides):
 @pytest.fixture
 def bootstrap_app(tmp_path, monkeypatch):
     from blueprints import bootstrap
+    from blueprints import coin_prep
+    import bot_loop
 
     database.close_connection()
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "bootstrap-e2e.db"))
@@ -105,8 +107,17 @@ def bootstrap_app(tmp_path, monkeypatch):
         "has_secrets": True,
     }
     clock = {"now": NOW}
+
+    class FixtureDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = clock["now"]
+            return current if tz is not None else current.replace(tzinfo=None)
+
     monkeypatch.setattr(bootstrap, "_read_bootstrap_identity", lambda: dict(identity))
     monkeypatch.setattr(bootstrap, "_utcnow", lambda: clock["now"])
+    monkeypatch.setattr(coin_prep, "datetime", FixtureDatetime)
+    monkeypatch.setattr(bot_loop, "datetime", FixtureDatetime)
     app = Flask(__name__)
     app.register_blueprint(bootstrap.bp)
     app.config.update(TESTING=True)
