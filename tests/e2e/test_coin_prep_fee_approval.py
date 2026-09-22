@@ -86,6 +86,58 @@ def _preview(*, available: bool = True) -> dict:
     }
 
 
+def test_zero_headroom_is_preserved_in_saved_coin_prep_plan(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('configCoinPrepHeadroomPct').value = '0';
+            let validated = null;
+            window.showStyledConfirm = async () => true;
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path).endsWith('/settings/validate')) {
+                    validated = JSON.parse(options.body);
+                    return new Response(JSON.stringify({valid: false, errors: [{message: 'test stop'}], warnings: []}), {status: 200});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+            await saveConfig();
+            return {headroom: validated?.coin_prep_headroom_pct,
+                    displayed: getCoinPrepHeadroomPct(document.getElementById('configCoinPrepHeadroomPct').value)};
+        }"""
+    )
+    assert result == {"headroom": 0, "displayed": 0}
+
+
+def test_zero_headroom_wallet_verification_uses_unpadded_coin_size(page):
+    _open_gui(page)
+    query = page.evaluate(
+        """async () => {
+            let seen = null;
+            window.apiFetch = async path => {
+                seen = String(path);
+                return new Response(JSON.stringify({all_sufficient: true, balance_sufficient: true}), {status: 200});
+            };
+            await checkIfCoinPrepNeeded({
+                tier_enabled: false, liquidity_mode: 'two_sided',
+                default_trade_xch: 0.1, max_active_buy: 3, max_active_sell: 3,
+                coin_prep_headroom_pct: 0,
+            });
+            return new URLSearchParams(seen.split('?')[1]).get('prepared_xch_size');
+        }"""
+    )
+    assert query == "0.1"
+
+
+def test_fee_preview_formats_pair_ticker_without_repeating_xch(page):
+    _open_gui(page)
+    preview = _preview()
+    preview["wallet"]["ticker"] = "MZ_XCH"
+    page.evaluate("preview => renderCoinPrepFeePreview(preview)", preview)
+    expect(page.locator("#cpFeeWalletPair")).to_have_text(
+        "Sage 736588221 · wallet 2 · MZ/XCH · mainnet"
+    )
+
+
 def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
     _open_gui(page)
     preview = _preview()

@@ -34991,7 +34991,7 @@
                 // coin_manager.py still reads COIN_PREP_MULTIPLIER for its
                 // own prep math, so we keep the field in the config payload.
                 coin_prep_multiplier: 1.0,
-                coin_prep_headroom_pct: parseFloat(document.getElementById('configCoinPrepHeadroomPct').value) || 10.0,
+                coin_prep_headroom_pct: getCoinPrepHeadroomPct(document.getElementById('configCoinPrepHeadroomPct').value),
 
                 // V2: Bot Operations
                 sniper_enabled: document.getElementById('configSniperEnabled').checked,
@@ -35568,8 +35568,7 @@ function closeCtgErrorModal() {
                     const tradeSize = Number(config.default_trade_xch || 0);
                     const maxBuy = parseInt(config.max_active_buy || 0);
                     const maxSell = parseInt(config.max_active_sell || 0);
-                    const headroom = Math.max(1.0,
-                        1 + (parseFloat(config.coin_prep_headroom_pct || 10) / 100));
+                    const headroom = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     if (tradeSize > 0) params.set('trade_size', String(tradeSize));
                     if (tradeSize > 0) params.set('prepared_xch_size', String(tradeSize * headroom));
                     const midPrice = Number(bot_state?.pricing?.mid || 0);
@@ -35836,9 +35835,11 @@ function closeCtgErrorModal() {
 
             const wallet = preview.wallet || {};
             const ticker = wallet.ticker || currentCAT?.symbol || currentCAT?.name || 'CAT';
+            const pair = /\/XCH$/i.test(ticker)
+                ? ticker : `${String(ticker).replace(/_XCH$/i, '')}/XCH`;
             setCoinPrepFeeText(
                 'cpFeeWalletPair',
-                `Sage ${wallet.wallet_fingerprint} · wallet ${wallet.wallet_id} · ${ticker}/XCH · ${wallet.network}`
+                `Sage ${wallet.wallet_fingerprint} · wallet ${wallet.wallet_id} · ${pair} · ${wallet.network}`
             );
             const lower = Number(preview.preparation_transaction_count_min || 0);
             const upper = Number(preview.preparation_transaction_count_max || 0);

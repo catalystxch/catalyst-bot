@@ -666,3 +666,44 @@ and no release or main merge was made during this checkpoint.
   confirmation of the displayed maximum fee, followed by bounded live Coin Prep
   and restart/recovery verification. No such consent or wallet mutation has yet
   occurred. Main and release remain untouched.
+
+## Live read-only acceptance and GUI corrections (22 September 2026)
+
+- The packaged candidate was connected to Sage TEST 7 fingerprint 736588221,
+  mainnet wallet 2 and MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+  The bot was stopped and no offers were open. A prior Bootstrap campaign was
+  stopped using its GUI; one cancellation entered the ambiguous-submission
+  safety gate, then the app's reconciliation-only Cancel All path resolved it.
+  The runtime safety gate returned ALLOWED with zero unresolved operations.
+- A local preset `pre-fee-live-acceptance` retained the original 97-field
+  configuration. For a bounded test, the saved Follow-mode setup was reduced
+  to three offers per side, 0.1 XCH base size and untiered prep. This is a
+  temporary live test configuration, not a restored trading strategy.
+- A fresh GUI estimate from the packaged build exposed a client bug: entering
+  zero prep headroom displayed zero in Settings but `saveConfig()` used `|| 10`
+  and silently persisted 10 percent. Wallet verification also treated zero
+  as ten percent. Two Chromium regressions reproduced the mismatch; both
+  client paths now use the shared zero-preserving headroom helpers. A third
+  red/green regression fixes the live fee-screen ticker `MZ_XCH/XCH` to
+  `MZ/XCH`. All 12 focused browser cases passed. The first post-edit full
+  browser run had 100 passes and one isolated localhost navigation error
+  (`ERR_NO_BUFFER_SPACE`) during concurrent live Sage/Splash activity; the
+  affected startup test passed alone, then the complete 101-case Chromium
+  suite passed on rerun. `git diff --check` is clean.
+- The old package was shut down cleanly with no offers left behind. The updated
+  source server was started on port 5000; Sage v0.13.0 reconnected to TEST 7,
+  and the MZ pair/asset were reselected. Splash started. The operator chose
+  Spacescan free-tier mode for this session, avoiding retransmission of the
+  stored API key. The bot remains stopped and runtime safety ALLOWED.
+- The updated live GUI now agrees end-to-end on zero headroom: six XCH outputs
+  at 0.1 XCH and six MZ outputs at 1,333 MZ. The fresh Coinset quote showed
+  two preparation transactions, one exact unsigned and three projected stage
+  profiles, 300-second target, 0.000718705906 XCH estimated total including
+  0.0000764193 XCH protected cancellation allowance, and 0.05 XCH fee-coin
+  principal rather than a fee. The quote is time-sensitive and not an approval.
+  A read-only status check after refresh confirmed zero open offers, zero
+  blockers and unchanged spendable XCH/MZ balances. No new fee-budget consent
+  or Coin Prep transaction has occurred. The operator has been asked to review
+  and personally confirm a fresh displayed maximum through CATalyst before
+  live spend testing; that acceptance gate remains open.
