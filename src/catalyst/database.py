@@ -1823,6 +1823,95 @@ WHEN NOT EXISTS (
             )
         )
 )
+AND NOT EXISTS (
+    SELECT 1
+    FROM approved_fee_reservations AS reservation
+    JOIN offer_cancel_cohort_manifests AS manifest
+      ON reservation.operation_id=catalyst_sha256(
+          'coin-prep-cancel:' || manifest.cohort_id
+      )
+    WHERE reservation.operation_id=NEW.operation_id
+      AND reservation.cancellation=1
+      AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
+      AND json_extract(NEW.evidence_json, '$.schema_version')=1
+      AND json_extract(NEW.evidence_json, '$.kind')=
+          'coin_prep_cancellation_fee_outcome'
+      AND json_extract(NEW.evidence_json, '$.state')=NEW.state
+      AND json_extract(NEW.evidence_json, '$.operation_id')=NEW.operation_id
+      AND json_extract(NEW.evidence_json, '$.cohort_id')=manifest.cohort_id
+      AND json_extract(NEW.evidence_json, '$.manifest_sha256')=
+          manifest.manifest_sha256
+      AND json_extract(NEW.evidence_json, '$.fee_mojos')=
+          reservation.fee_mojos
+      AND json_array_length(NEW.evidence_json, '$.members')=
+          manifest.member_count
+      AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(manifest.manifest_json, '$.members') AS manifest_member
+          LEFT JOIN json_each(NEW.evidence_json, '$.members') AS evidence_member
+            ON evidence_member.key=manifest_member.key
+          LEFT JOIN offer_operation_journal AS terminal
+            ON terminal.event_id=json_extract(
+                evidence_member.value, '$.event_id'
+            )
+          WHERE evidence_member.value IS NULL
+             OR terminal.event_id IS NULL
+             OR terminal.operation_id<>
+                json_extract(manifest_member.value, '$.operation_id')
+             OR terminal.attempt<>
+                json_extract(manifest_member.value, '$.attempt')
+             OR json_extract(evidence_member.value, '$.operation_id')<>
+                terminal.operation_id
+             OR json_extract(evidence_member.value, '$.attempt')<>
+                terminal.attempt
+             OR json_extract(evidence_member.value, '$.event_id')<>
+                terminal.event_id
+             OR json_extract(evidence_member.value, '$.evidence_sha256')<>
+                terminal.evidence_sha256
+             OR json_extract(evidence_member.value, '$.phase')<>terminal.phase
+             OR json_extract(evidence_member.value, '$.outcome')<>terminal.outcome
+             OR json_extract(evidence_member.value, '$.reason_code')<>
+                terminal.reason_code
+             OR EXISTS (
+                 SELECT 1 FROM offer_operation_journal AS later
+                 WHERE later.operation_id=terminal.operation_id
+                   AND later.sequence>terminal.sequence
+             )
+             OR (
+                 NEW.state='RELEASED_NO_EFFECT'
+                 AND NOT (
+                     (
+                         terminal.phase='FINALIZED'
+                         AND terminal.outcome='CANCEL_FAILED'
+                         AND terminal.blocks_mutation=0
+                         AND json_extract(
+                             terminal.evidence_json, '$.effect_attempted'
+                         )=0
+                         AND NOT EXISTS (
+                             SELECT 1 FROM offer_cancel_effect_claims AS claim
+                             WHERE claim.operation_id=terminal.operation_id
+                               AND claim.attempt=terminal.attempt
+                         )
+                     )
+                     OR (
+                         terminal.phase='RECONCILED'
+                         AND terminal.outcome='CANCEL_FAILED'
+                         AND terminal.reason_code='SAGE_RELAY_REJECTED'
+                         AND terminal.blocks_mutation=0
+                     )
+                 )
+             )
+             OR (
+                 NEW.state='CONFIRMED_SPENT'
+                 AND NOT (
+                     terminal.phase='RECONCILED'
+                     AND terminal.outcome='CANCEL_CONFIRMED'
+                     AND terminal.reason_code='AUTHORITATIVE_TERMINAL_PROOF'
+                     AND terminal.blocks_mutation=0
+                 )
+             )
+      )
+)
 BEGIN
     SELECT RAISE(ABORT, 'fee outcome lacks bound journal evidence');
 END;
@@ -3577,7 +3666,7 @@ BEGIN
     SELECT RAISE(ABORT, 'offer_fill_hook_receipts is append-only');
 END;
 
--- One canonical durable description of every multi-member cancellation
+-- One canonical durable description of every manifested cancellation
 -- cohort.  The row and all referenced PREPARED journal events are inserted in
 -- the same transaction, so a stored manifest is always complete and
 -- discoverable without the original caller's list.
@@ -3586,7 +3675,7 @@ CREATE TABLE IF NOT EXISTS offer_cancel_cohort_manifests (
     cohort_id                   TEXT NOT NULL UNIQUE,
     manifest_sha256             TEXT NOT NULL UNIQUE,
     member_count                INTEGER NOT NULL
-        CHECK(member_count BETWEEN 2 AND 500),
+        CHECK(member_count BETWEEN 1 AND 500),
     manifest_json               TEXT NOT NULL,
     created_at                  TEXT NOT NULL
 );
@@ -5327,7 +5416,7 @@ CREATE TABLE offer_cancel_cohort_manifests (
     cohort_id                   TEXT NOT NULL UNIQUE,
     manifest_sha256             TEXT NOT NULL UNIQUE,
     member_count                INTEGER NOT NULL
-        CHECK(member_count BETWEEN 2 AND 500),
+        CHECK(member_count BETWEEN 1 AND 500),
     manifest_json               TEXT NOT NULL,
     created_at                  TEXT NOT NULL
 )
@@ -5363,11 +5452,15 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
     if actual == _normalized_schema_sql(_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL):
         return
     legacy_128_sql = _OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL.replace(
-        "BETWEEN 2 AND 500", "BETWEEN 2 AND 128"
+        "BETWEEN 1 AND 500", "BETWEEN 2 AND 128"
+    )
+    previous_500_sql = _OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL.replace(
+        "BETWEEN 1 AND 500", "BETWEEN 2 AND 500"
     )
     if actual not in {
         _normalized_schema_sql(_LEGACY_OFFER_CANCEL_COHORT_MANIFESTS_TABLE_SQL),
         _normalized_schema_sql(legacy_128_sql),
+        _normalized_schema_sql(previous_500_sql),
     }:
         return
 
@@ -5393,8 +5486,55 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
     ):
         return
 
+    # SQLite rewrites references inside unrelated triggers when a table is
+    # renamed.  A database interrupted after the legacy envelope migration can
+    # therefore retain the exact current fee-outcome guard, but with its
+    # manifest reference rebound to the already-dropped ``*_current`` table.
+    # Accept only that deterministic rewrite and restore the canonical guard
+    # in the same transaction; any other trigger body remains fail-closed.
+    fee_guard = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='approved_fee_outcomes_journal_guard'"
+    ).fetchone()
+    canonical_fee_guard = None
+    rewritten_fee_guard = None
+    if fee_guard is not None:
+        expected_db = _sqlite_connect(":memory:")
+        try:
+            expected_db.executescript(STABILITY_SCHEMA_SQL)
+            expected_row = expected_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='approved_fee_outcomes_journal_guard'"
+            ).fetchone()
+        finally:
+            expected_db.close()
+        if expected_row is None:
+            raise RuntimeError("fee outcome journal guard definition is unavailable")
+        canonical_fee_guard = str(expected_row[0])
+        rewritten_variants = {
+            canonical_fee_guard.replace(
+                "offer_cancel_cohort_manifests AS manifest",
+                "offer_cancel_cohort_manifests_current AS manifest",
+            ),
+            canonical_fee_guard.replace(
+                "offer_cancel_cohort_manifests AS manifest",
+                '"offer_cancel_cohort_manifests_current" AS manifest',
+            ),
+        }
+        actual_fee_guard = _normalized_schema_sql(str(fee_guard[0]))
+        if actual_fee_guard == _normalized_schema_sql(canonical_fee_guard):
+            rewritten_fee_guard = False
+        elif actual_fee_guard in {
+            _normalized_schema_sql(value) for value in rewritten_variants
+        }:
+            rewritten_fee_guard = True
+        else:
+            raise RuntimeError("fee outcome journal guard has unknown manifest binding")
+
     conn.execute("BEGIN EXCLUSIVE")
     try:
+        if rewritten_fee_guard is True:
+            conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
         for trigger_name in expected_triggers:
             conn.execute(f'DROP TRIGGER "{trigger_name}"')
         conn.execute(
@@ -5414,6 +5554,8 @@ def _upgrade_offer_cancel_cohort_member_limit(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE offer_cancel_cohort_manifests_legacy_envelope")
         for trigger_sql in expected_triggers.values():
             conn.execute(trigger_sql)
+        if rewritten_fee_guard is True:
+            conn.execute(canonical_fee_guard)
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("cancel cohort schema upgrade broke foreign keys")
         conn.commit()
@@ -6796,19 +6938,68 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
         "AND tbl_name IN ('fee_approvals', 'approved_fee_reservations')"
     ).fetchone():
         raise RuntimeError("legacy fee ledger has unexpected triggers")
+    # The PR #218 fixture can coexist with the later session-completion table.
+    # Its authority trigger references the fee tables being replaced, so
+    # SQLite attempts to reparse it during ALTER TABLE and rejects the known
+    # partially-upgraded shape.  Drop only the exact canonical trigger inside
+    # the migration transaction; FEE_SCHEMA_SQL recreates it deterministically.
+    dependent_trigger_name = "coin_prep_fee_session_completions_authority_guard"
+    dependent = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (dependent_trigger_name,),
+    ).fetchone()
+    drop_dependent_sql = ""
+    canonical_db = _sqlite_connect(":memory:")
+    try:
+        canonical_db.executescript(FEE_SCHEMA_SQL)
+        canonical_tables = dict(
+            canonical_db.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='table' "
+                "AND name IN ('fee_approvals','approved_fee_reservations')"
+            ).fetchall()
+        )
+        expected_dependent = canonical_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (dependent_trigger_name,),
+        ).fetchone()
+    finally:
+        canonical_db.close()
+    if dependent is not None:
+        if (
+            expected_dependent is None
+            or _normalized_schema_sql(str(dependent[0]))
+            != _normalized_schema_sql(str(expected_dependent[0]))
+        ):
+            raise RuntimeError("legacy fee ledger has unknown dependent trigger")
+        drop_dependent_sql = f"DROP TRIGGER {dependent_trigger_name}; "
+    approval_v2 = "fee_approvals_pr218_v2"
+    reservation_v2 = "approved_fee_reservations_pr218_v2"
+    approval_sql = str(canonical_tables["fee_approvals"]).replace(
+        "fee_approvals", approval_v2
+    )
+    reservation_sql = (
+        str(canonical_tables["approved_fee_reservations"])
+        .replace("approved_fee_reservations", reservation_v2)
+        .replace("fee_approvals", approval_v2)
+    )
     try:
         conn.executescript(
             "BEGIN EXCLUSIVE; "
-            "ALTER TABLE approved_fee_reservations RENAME TO legacy_fee_reservations_218; "
-            "ALTER TABLE fee_approvals RENAME TO legacy_fee_approvals_218; "
+            + drop_dependent_sql
+            + approval_sql
+            + "; "
+            + reservation_sql
+            + "; "
+            + f"INSERT INTO {approval_v2} SELECT * FROM fee_approvals; "
+            + f"INSERT INTO {reservation_v2} SELECT * FROM approved_fee_reservations; "
+            + "DROP TABLE approved_fee_reservations; "
+            + "DROP TABLE fee_approvals; "
+            + f"ALTER TABLE {approval_v2} RENAME TO fee_approvals; "
+            + f"ALTER TABLE {reservation_v2} RENAME TO approved_fee_reservations; "
             + FEE_SCHEMA_SQL
         )
-        conn.execute("INSERT INTO fee_approvals SELECT * FROM legacy_fee_approvals_218")
-        conn.execute(
-            "INSERT INTO approved_fee_reservations SELECT * FROM legacy_fee_reservations_218"
-        )
-        conn.execute("DROP TABLE legacy_fee_reservations_218")
-        conn.execute("DROP TABLE legacy_fee_approvals_218")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("legacy fee ledger upgrade broke foreign keys")
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -6850,6 +7041,78 @@ def _upgrade_fee_session_generation_guard(conn: sqlite3.Connection) -> None:
     conn.execute(expected_sql)
 
 
+def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
+    """Extend the exact v1 guard to immutable cancellation-journal proof."""
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='approved_fee_outcomes_journal_guard'"
+    ).fetchone()
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(STABILITY_SCHEMA_SQL)
+        expected_row = expected_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='approved_fee_outcomes_journal_guard'"
+        ).fetchone()
+    finally:
+        expected_db.close()
+    if row is None or expected_row is None:
+        return
+    actual_sql, expected_sql = str(row[0]), str(expected_row[0])
+    if _normalized_schema_sql(actual_sql) == _normalized_schema_sql(expected_sql):
+        return
+    legacy_sql = """
+    CREATE TRIGGER approved_fee_outcomes_journal_guard
+    BEFORE INSERT ON approved_fee_outcomes
+    WHEN NOT EXISTS (
+        SELECT 1 FROM coin_prep_operations AS operation
+        JOIN approved_fee_reservations AS reservation
+            ON reservation.operation_id=operation.operation_id
+        JOIN wallet_effect_claims AS claim
+            ON claim.claim_token=operation.effect_claim_token
+            AND claim.generation=operation.effect_claim_generation
+            AND claim.operation_id=operation.operation_id
+        LEFT JOIN wallet_effect_claim_resolutions AS resolution
+            ON resolution.claim_token=claim.claim_token
+            AND resolution.generation=claim.generation
+        WHERE operation.operation_id=NEW.operation_id
+            AND operation.outcome_evidence_json=NEW.evidence_json
+            AND catalyst_sha256(NEW.evidence_json)=NEW.evidence_id
+            AND json_extract(NEW.evidence_json, '$.effect_claim_token')=claim.claim_token
+            AND json_extract(NEW.evidence_json, '$.effect_claim_generation')=claim.generation
+            AND (
+                (
+                    json_type(operation.target_contract_json, '$.fee_mojos')='integer'
+                    AND json_extract(operation.target_contract_json, '$.fee_mojos')=reservation.fee_mojos
+                )
+                OR (
+                    json_type(operation.target_contract_json, '$.fee_mojos') IS NULL
+                    AND json_type(operation.target_contract_json, '$.external_fee.fee_mojos')='integer'
+                    AND json_extract(operation.target_contract_json, '$.external_fee.fee_mojos')=reservation.fee_mojos
+                )
+            )
+            AND (
+                (NEW.state='CONFIRMED_SPENT' AND operation.outcome='CONFIRMED')
+                OR (
+                    NEW.state='RELEASED_NO_EFFECT' AND operation.outcome='FAILED'
+                    AND (
+                        json_extract(NEW.evidence_json, '$.reason_code')='AUTHORITATIVE_NO_EFFECT_CONFIRMED'
+                        OR resolution.outcome='RELEASED_NO_EFFECT'
+                    )
+                )
+            )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'fee outcome lacks bound journal evidence');
+    END
+    """
+    if _normalized_schema_sql(actual_sql) != _normalized_schema_sql(legacy_sql):
+        raise RuntimeError("fee outcome journal guard has unknown schema")
+    conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
+    conn.execute(expected_sql)
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -6888,6 +7151,7 @@ def _migrate_stability_schema() -> None:
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
         _upgrade_fee_session_generation_guard(conn)
+        _upgrade_fee_outcome_journal_guard(conn)
         epoch_columns = {
             str(row["name"])
             for row in conn.execute(
@@ -21501,6 +21765,401 @@ def reserve_coin_prep_fee_for_dispatch(
         conn.close()
 
 
+def reserve_coin_prep_cancellation_fee(
+    *,
+    approval_id: str,
+    scope_sha256: str,
+    plan_sha256: str,
+    manifest_json: Dict[str, Any],
+    batch_contract: Dict[str, Any],
+    final_quote: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Hold an exact Coin-Prep-attributable cancellation fee before claiming.
+
+    The caller supplies no operation identity: it is derived from the durable
+    canonical cohort.  Ordinary Cancel All journals have a different reason and
+    therefore cannot charge a Coin Prep approval.  The returned hold grants no
+    signing or replay authority.
+    """
+
+    approval_id = _fee_digest(approval_id)
+    scope = _fee_digest(scope_sha256)
+    plan = _fee_digest(plan_sha256)
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _fee_operation_identity(
+        hashlib.sha256(
+            f"coin-prep-cancel:{manifest['cohort_id']}".encode("utf-8")
+        ).hexdigest()
+    )
+    if type(batch_contract) is not dict or set(batch_contract) != {
+        "protocol",
+        "trade_ids",
+        "source_coin_ids",
+        "fee_coin_id",
+        "fee_mojos",
+    }:
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+    try:
+        fee = _fee_amount(batch_contract["fee_mojos"])
+        trade_ids = [
+            _fee_digest(str(value).lower().removeprefix("0x"))
+            for value in batch_contract["trade_ids"]
+        ]
+        source_ids = [
+            norm_coin_id(value) for value in batch_contract["source_coin_ids"]
+        ]
+        fee_coin_id = norm_coin_id(batch_contract["fee_coin_id"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID") from exc
+    if (
+        batch_contract["protocol"]
+        != "sage_native_cancel_offers_zero_plus_fee_v1"
+        or type(batch_contract["trade_ids"]) is not list
+        or type(batch_contract["source_coin_ids"]) is not list
+        or len(trade_ids) != manifest["member_count"]
+        or len(source_ids) != manifest["member_count"]
+        or len(set(trade_ids)) != len(trade_ids)
+        or len(set(source_ids)) != len(source_ids)
+        or fee_coin_id in set(source_ids)
+        or trade_ids != [member["trade_id"] for member in manifest["members"]]
+    ):
+        raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+    if type(final_quote) is not dict or final_quote.get("available") is not True:
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+    try:
+        quote_fee = _fee_amount(final_quote.get("fee_mojos"))
+        cost = _fee_amount(final_quote.get("cost"))
+        target_seconds = _fee_amount(final_quote.get("target_seconds"))
+        observed_at = _fee_amount(final_quote.get("observed_at"))
+        expires_at = _fee_amount(final_quote.get("expires_at"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
+    if (
+        quote_fee != fee
+        or cost == 0
+        or final_quote.get("source") not in ("coinset", "full_node_rpc")
+        or expires_at != observed_at + 60
+    ):
+        raise ValueError("FEE_QUOTE_INVALID")
+
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _fee_amount(int(time.time()))
+        if not observed_at <= now < expires_at:
+            raise ValueError("FEE_QUOTE_STALE")
+        consent = conn.execute(
+            "SELECT preview.*, approval.version, "
+            "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
+            "WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
+            "FROM coin_prep_fee_consents AS consent "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE consent.approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if consent is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        approved_scope = json.loads(consent["scope_json"])
+        if (
+            consent["scope_sha256"] != scope
+            or consent["plan_sha256"] != plan
+            or consent["version"] != consent["latest_version"]
+            or json.loads(consent["plan_json"])["target_seconds"]
+            != target_seconds
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        if conn.execute(
+            "SELECT 1 FROM approved_fee_reservations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone() is not None:
+            raise ValueError("FEE_OPERATION_REPLAY")
+        durable_manifest = conn.execute(
+            "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+            "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+            "WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if durable_manifest is None or (
+            _validated_offer_cancel_cohort_manifest_row(dict(durable_manifest))
+            != manifest
+        ):
+            raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+        expected_wallet_effect = {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": fee,
+            "batch": {
+                key: value
+                for key, value in batch_contract.items()
+                if key != "fee_mojos"
+            },
+        }
+        for member in manifest["members"]:
+            row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            if row is None:
+                raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+            event = validate_offer_cancel_cohort_prepared_event(dict(row), manifest)
+            evidence = json.loads(event["evidence_json"])
+            journal = json.loads(event["wallet_identity_json"])
+            binding = journal.get("snapshot", {}).get("binding", {})
+            if (
+                evidence.get("reason") != "coin_prep_cancel_all"
+                or evidence.get("wallet_effect") != expected_wallet_effect
+                or not binding
+                or (
+                    binding.get("backend") != approved_scope["wallet_type"]
+                    or binding.get("fingerprint")
+                    != approved_scope["wallet_fingerprint"]
+                    or binding.get("network_id") != approved_scope["network"]
+                )
+                or conn.execute(
+                    "SELECT 1 FROM offer_cancel_effect_claims "
+                    "WHERE operation_id=? AND attempt=?",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        fee_coin = conn.execute(
+            "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
+        ).fetchone()
+        if fee_coin is not None and fee_coin["designation"] == "reserve":
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        result = _reserve_approved_fee_locked(
+            conn, approval_id, scope, plan, operation_id, fee, True
+        )
+        conn.commit()
+        return {**result, "dispatch_authorized": False}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _coin_prep_cancellation_fee_operation_id(manifest: Dict[str, Any]) -> str:
+    return _fee_operation_identity(
+        hashlib.sha256(
+            f"coin-prep-cancel:{manifest['cohort_id']}".encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def get_coin_prep_cancellation_fee_hold(
+    manifest_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Read one exact unsettled protected-cancellation hold without authority."""
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _coin_prep_cancellation_fee_operation_id(manifest)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT reservation.*, outcome.state AS accounting_outcome "
+            "FROM approved_fee_reservations AS reservation "
+            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "WHERE reservation.operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if (
+            row is None
+            or int(row["cancellation"]) != 1
+            or row["accounting_outcome"] is not None
+        ):
+            raise ValueError("FEE_RESERVATION_REQUIRED")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def get_unsettled_coin_prep_cancellation_manifests() -> List[Dict[str, Any]]:
+    """Return bounded canonical cancellation manifests with an unsettled hold.
+
+    This is a recovery read only.  It deliberately derives ownership from the
+    reservation operation digest and never grants signing, dispatch or retry
+    authority.  Startup callers may use the returned immutable manifests to
+    attempt the same idempotent authoritative accounting transition.
+    """
+
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT manifest.manifest_sequence, manifest.cohort_id, "
+            "manifest.manifest_sha256, manifest.member_count, "
+            "manifest.manifest_json, manifest.created_at "
+            "FROM approved_fee_reservations AS reservation "
+            "JOIN offer_cancel_cohort_manifests AS manifest "
+            "ON reservation.operation_id=catalyst_sha256("
+            "'coin-prep-cancel:' || manifest.cohort_id) "
+            "LEFT JOIN approved_fee_outcomes AS outcome "
+            "ON outcome.operation_id=reservation.operation_id "
+            "WHERE reservation.cancellation=1 AND outcome.operation_id IS NULL "
+            "ORDER BY manifest.manifest_sequence LIMIT ?",
+            (_CANCEL_COHORT_MEMBER_LIMIT + 1,),
+        ).fetchall()
+        if len(rows) > _CANCEL_COHORT_MEMBER_LIMIT:
+            raise RuntimeError("unsettled cancellation fee recovery limit exceeded")
+        return [
+            _validated_offer_cancel_cohort_manifest_row(dict(row)) for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def record_coin_prep_cancellation_fee_outcome(
+    manifest_json: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Settle a protected cancellation hold from immutable journal proof only.
+
+    An unclaimed cohort can release its hold only when every member has an
+    exact ``effect_attempted=false`` terminal failure.  A claimed cohort can
+    release only after Sage's all-peer rejection reconciliation.  Confirmed
+    spend is charged only after Task 9 appended authoritative terminal proof
+    for every member.  Ambiguous, partial, or mixed cohorts stay held.
+    """
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _coin_prep_cancellation_fee_operation_id(manifest)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        reservation = conn.execute(
+            "SELECT * FROM approved_fee_reservations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if reservation is None or int(reservation["cancellation"]) != 1:
+            raise ValueError("FEE_RESERVATION_REQUIRED")
+        durable = conn.execute(
+            "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+            "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+            "WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if durable is None or (
+            _validated_offer_cancel_cohort_manifest_row(dict(durable)) != manifest
+        ):
+            raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+
+        states: set[str] = set()
+        terminal_members = []
+        for member in manifest["members"]:
+            rows = conn.execute(
+                "SELECT * FROM offer_operation_journal "
+                "WHERE operation_id=? AND attempt=? ORDER BY sequence",
+                (member["operation_id"], member["attempt"]),
+            ).fetchall()
+            if not rows:
+                raise ValueError("FEE_EFFECT_UNRESOLVED")
+            terminal = validate_offer_operation_event(dict(rows[-1]))
+            evidence = json.loads(terminal["evidence_json"])
+            claim = conn.execute(
+                "SELECT 1 FROM offer_cancel_effect_claims "
+                "WHERE operation_id=? AND attempt=?",
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            unattempted = (
+                terminal["phase"] == "FINALIZED"
+                and terminal["outcome"] == "CANCEL_FAILED"
+                and terminal["blocks_mutation"] == 0
+                and evidence.get("effect_attempted") is False
+                and claim is None
+            )
+            rejected = (
+                terminal["phase"] == "RECONCILED"
+                and terminal["outcome"] == "CANCEL_FAILED"
+                and terminal["reason_code"] == "SAGE_RELAY_REJECTED"
+                and terminal["blocks_mutation"] == 0
+            )
+            confirmed = (
+                terminal["phase"] == "RECONCILED"
+                and terminal["outcome"] == "CANCEL_CONFIRMED"
+                and terminal["reason_code"] == "AUTHORITATIVE_TERMINAL_PROOF"
+                and terminal["blocks_mutation"] == 0
+            )
+            if unattempted or rejected:
+                state = "RELEASED_NO_EFFECT"
+            elif confirmed:
+                state = "CONFIRMED_SPENT"
+            else:
+                raise ValueError("FEE_EFFECT_UNRESOLVED")
+            evidence_sha256 = terminal.get("evidence_sha256")
+            if (
+                type(evidence_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", evidence_sha256) is None
+            ):
+                raise ValueError("FEE_EVIDENCE_MISMATCH")
+            states.add(state)
+            terminal_members.append(
+                {
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "event_id": terminal["event_id"],
+                    "phase": terminal["phase"],
+                    "outcome": terminal["outcome"],
+                    "reason_code": terminal["reason_code"],
+                    "evidence_sha256": evidence_sha256,
+                }
+            )
+        if len(states) != 1:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        state = states.pop()
+        outcome_evidence = {
+            "schema_version": 1,
+            "kind": "coin_prep_cancellation_fee_outcome",
+            "state": state,
+            "operation_id": operation_id,
+            "cohort_id": manifest["cohort_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "fee_mojos": int(reservation["fee_mojos"]),
+            "members": terminal_members,
+        }
+        encoded = json.dumps(
+            outcome_evidence,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        evidence_id = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM approved_fee_outcomes WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["state"],
+                existing["evidence_id"],
+                existing["evidence_json"],
+            ) != (state, evidence_id, encoded):
+                raise ValueError("FEE_EVIDENCE_MISMATCH")
+            conn.commit()
+            return {
+                "operation_id": operation_id,
+                "state": state,
+                "evidence_id": evidence_id,
+                "idempotent": True,
+            }
+        conn.execute(
+            "INSERT INTO approved_fee_outcomes VALUES (?, ?, ?, ?)",
+            (operation_id, state, evidence_id, encoded),
+        )
+        conn.commit()
+        return {
+            "operation_id": operation_id,
+            "state": state,
+            "evidence_id": evidence_id,
+            "idempotent": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def record_fee_reservation_outcome(
     operation_id: str, evidence_id: str
 ) -> Dict[str, Any]:
@@ -22199,9 +22858,9 @@ def canonical_offer_cancel_cohort_manifest(members: Any) -> Dict[str, Any]:
 
     if (
         type(members) is not list
-        or not 2 <= len(members) <= _CANCEL_COHORT_MEMBER_LIMIT
+        or not 1 <= len(members) <= _CANCEL_COHORT_MEMBER_LIMIT
     ):
-        raise ValueError("cancellation cohort must contain 2 to 500 exact members")
+        raise ValueError("cancellation cohort must contain 1 to 500 exact members")
     expected_keys = {
         "trade_id",
         "operation_id",
@@ -26002,7 +26661,7 @@ def _validate_reconciliation_cancel_context(
                     or wallet_effect.get("timeout") != 60
                     or type(wallet_effect.get("fee_mojos")) is not int
                     or isinstance(wallet_effect.get("fee_mojos"), bool)
-                    or wallet_effect["fee_mojos"] <= 0
+                    or wallet_effect["fee_mojos"] < 0
                     or wallet_effect["fee_mojos"] != fee_mojos
                     or type(batch) is not dict
                     or set(batch)
@@ -26013,7 +26672,7 @@ def _validate_reconciliation_cancel_context(
                     or type(batch.get("source_coin_ids")) is not list
                     or len(batch["trade_ids"]) != len(context["members"])
                     or len(batch["source_coin_ids"]) != len(context["members"])
-                    or len(batch["trade_ids"]) < 2
+                    or len(batch["trade_ids"]) < 1
                 ):
                     raise ValueError("Task 8 native bulk cancel claim is invalid")
                 batch_trade_ids = [
@@ -26051,7 +26710,9 @@ def _validate_reconciliation_cancel_context(
                     "fee_mojos": wallet_effect["fee_mojos"],
                 }
                 native_batch_claims.append(native_batch_for_member)
-                durable_auxiliary = [batch_fee_id]
+                durable_auxiliary = (
+                    [batch_fee_id] if wallet_effect["fee_mojos"] > 0 else []
+                )
         missing_prepared_auxiliary = bool(auxiliary_bare and durable_auxiliary is None)
         if durable_auxiliary is not None and durable_auxiliary != auxiliary_bare:
             raise ValueError("Task 8 auxiliary coin claim is not exact")

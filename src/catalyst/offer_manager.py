@@ -19,6 +19,7 @@ the lock, and any coin reservation crosses through shared state guarded here.
 import hashlib
 import json
 import os
+import re
 import time
 import threading
 from dataclasses import dataclass
@@ -6168,7 +6169,7 @@ class OfferManager:
             "continuation_journal_sha256": journal["snapshot_sha256"],
             "wallet_effect": wallet_effect,
         }
-        if cohort_size > 1:
+        if cohort_size > 1 or batch_contract is not None:
             evidence["cohort_size"] = cohort_size
             evidence["effect_claim_protocol"] = "durable_cohort_claim_v1"
         return evidence
@@ -6196,7 +6197,7 @@ class OfferManager:
             or value["timeout"] != 60
             or type(fee_mojos) is not int
             or isinstance(fee_mojos, bool)
-            or fee_mojos <= 0
+            or fee_mojos < 0
             or type(batch) is not dict
             or set(batch)
             != {
@@ -6214,7 +6215,7 @@ class OfferManager:
         if (
             type(trade_ids) is not list
             or type(source_coin_ids) is not list
-            or len(trade_ids) < 2
+            or len(trade_ids) < 1
             or len(trade_ids) != len(source_coin_ids)
             or len(set(trade_ids)) != len(trade_ids)
             or len(set(source_coin_ids)) != len(source_coin_ids)
@@ -6333,6 +6334,61 @@ class OfferManager:
             },
         }
         return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
+
+    def _plan_coin_prep_cancel(
+        self, members: list[tuple], fee_approval_id: str
+    ) -> tuple[dict, dict]:
+        """Price a complete Sage cohort against explicit Coin Prep consent."""
+
+        if len(members) < 1 or get_wallet_type() != "sage" or self._fee_pool is None:
+            raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
+        largest = self._fee_pool.reserve_largest()
+        if largest is None:
+            raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+        fee_coin_id, fee_coin_amount = largest
+        fee_coin_id = str(fee_coin_id).strip().lower().removeprefix("0x")
+        trade_ids = []
+        source_coin_ids = []
+        for intent, _attempt, _member_id in members:
+            offer = database.get_offer(intent.trade_id)
+            raw_coin_id = offer.get("coin_id") if type(offer) is dict else None
+            coin_id = str(raw_coin_id or "").strip().lower().removeprefix("0x")
+            try:
+                valid = len(coin_id) == 64 and bool(bytes.fromhex(coin_id))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            trade_ids.append(intent.trade_id)
+            source_coin_ids.append(coin_id)
+        from coin_prep_fee_cancellation import price_approved_cancellation
+
+        priced = price_approved_cancellation(
+            approval_id=fee_approval_id,
+            trade_ids=trade_ids,
+            source_coin_ids=source_coin_ids,
+            fee_coin_id=fee_coin_id,
+        )
+        if priced.get("available") is not True:
+            raise ValueError(str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE"))
+        if priced["fee_mojos"] > fee_coin_amount:
+            raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+        contract = {
+            "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+            "trade_ids": list(priced["trade_ids"]),
+            "source_coin_ids": list(priced["source_coin_ids"]),
+            "fee_coin_id": priced["fee_coin_id"],
+            "fee_mojos": priced["fee_mojos"],
+        }
+        wallet_effect = {
+            "secure": True,
+            "timeout": 60,
+            "fee_mojos": priced["fee_mojos"],
+            "batch": {key: value for key, value in contract.items() if key != "fee_mojos"},
+        }
+        if not self._is_exact_cancel_wallet_effect(wallet_effect):
+            raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+        return contract, priced
 
     @staticmethod
     def _prepare_cancel_member(
@@ -6600,6 +6656,24 @@ class OfferManager:
                         reason_code="COHORT_RECOVERY_UNATTEMPTED",
                     )
                 recovered[intent.trade_id] = result
+            try:
+                database.record_coin_prep_cancellation_fee_outcome(manifest)
+            except ValueError as exc:
+                if str(exc) not in {
+                    "FEE_RESERVATION_REQUIRED",
+                    "FEE_EFFECT_UNRESOLVED",
+                }:
+                    raise
+        # A crash can occur after the last Task 9/relay event is committed but
+        # before its fee outcome is appended.  Such a manifest is no longer an
+        # unresolved cancellation blocker, so recover its still-held protected
+        # fee explicitly and idempotently on the next manager startup.
+        for manifest in database.get_unsettled_coin_prep_cancellation_manifests():
+            try:
+                database.record_coin_prep_cancellation_fee_outcome(manifest)
+            except ValueError as exc:
+                if str(exc) != "FEE_EFFECT_UNRESOLVED":
+                    raise
         return recovered
 
     def _abort_cancel_after_ambiguous_peer(
@@ -6928,7 +7002,7 @@ class OfferManager:
                             and (
                                 type(prepared_evidence["cohort_size"]) is not int
                                 or isinstance(prepared_evidence["cohort_size"], bool)
-                                or prepared_evidence["cohort_size"] < 2
+                                or prepared_evidence["cohort_size"] < 1
                             )
                         )
                     )
@@ -7323,6 +7397,8 @@ class OfferManager:
         manifest: dict,
         authorities: dict,
         batch_contract: dict,
+        fee_approval_id: Optional[str] = None,
+        priced_cancellation: Optional[dict] = None,
     ) -> Dict[str, dict]:
         """Run one manifest-bound Sage bulk cancellation wallet effect."""
 
@@ -7338,6 +7414,66 @@ class OfferManager:
             raise ValueError("cancellation cohort wallet identities do not match")
         wallet_hash, network = next(iter(bindings))
         self._offer_cancel_crash_boundary("after_prepare", representative)
+        validated_unsigned = None
+        if fee_approval_id is not None:
+            from coin_prep_fee_cancellation import (
+                recheck_reserved_approved_cancellation,
+                reserve_approved_cancellation,
+            )
+
+            try:
+                hold = reserve_approved_cancellation(
+                    approval_id=fee_approval_id,
+                    manifest=manifest,
+                    priced_cancellation=priced_cancellation,
+                )
+                validated_unsigned = hold["validated_unsigned"]
+            except Exception:
+                results = {}
+                for intent, attempt, member_id in members:
+                    authority = member_authorities[intent.trade_id]
+                    context = {
+                        "journal": authority[1],
+                        "wallet_hash": authority[2],
+                        "network": authority[3],
+                    }
+                    results[intent.trade_id] = self._finalize_unattempted_cohort_cancel(
+                        intent,
+                        attempt=attempt,
+                        cohort_id=manifest["cohort_id"],
+                        cohort_size=manifest["member_count"],
+                        member_id=member_id,
+                        context=context,
+                        reason_code="FEE_CANCELLATION_RESERVATION_BLOCKED",
+                    )
+                return results
+            self._offer_cancel_crash_boundary("after_fee_reservation", representative)
+            try:
+                recheck_reserved_approved_cancellation(
+                    approval_id=fee_approval_id,
+                    manifest=manifest,
+                    priced_cancellation=priced_cancellation,
+                )
+            except Exception:
+                results = {}
+                for intent, attempt, member_id in members:
+                    authority = member_authorities[intent.trade_id]
+                    context = {
+                        "journal": authority[1],
+                        "wallet_hash": authority[2],
+                        "network": authority[3],
+                    }
+                    results[intent.trade_id] = self._finalize_unattempted_cohort_cancel(
+                        intent,
+                        attempt=attempt,
+                        cohort_id=manifest["cohort_id"],
+                        cohort_size=manifest["member_count"],
+                        member_id=member_id,
+                        context=context,
+                        reason_code="FEE_CANCELLATION_RECHECK_BLOCKED",
+                    )
+                database.record_coin_prep_cancellation_fee_outcome(manifest)
+                return results
         claim = database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
         if claim != {
             "cohort_id": manifest["cohort_id"],
@@ -7386,6 +7522,7 @@ class OfferManager:
                 skip_confirmation=False,
                 source_coin_ids=list(batch_contract["source_coin_ids"]),
                 fee_coin_id=batch_contract["fee_coin_id"],
+                _validated_unsigned=validated_unsigned,
                 _cancel_continuation=continuation,
                 _cancel_operation_id=first_intent.operation_id,
                 _cancel_intent_id=first_intent.intent_id,
@@ -7483,6 +7620,12 @@ class OfferManager:
                 )
                 for intent, attempt, _member_id in members
             }
+        if fee_approval_id is not None:
+            try:
+                database.record_coin_prep_cancellation_fee_outcome(manifest)
+            except ValueError as exc:
+                if str(exc) != "FEE_EFFECT_UNRESOLVED":
+                    raise
         if shared_result["outcome"] in {
             CANCEL_SUBMITTED_UNCONFIRMED,
             CANCEL_UNKNOWN,
@@ -7515,6 +7658,7 @@ class OfferManager:
         force_storm: bool = False,
         skip_confirmation: bool = False,
         _retry_failed_attempts: Optional[Dict[str, int]] = None,
+        fee_approval_id: Optional[str] = None,
     ) -> Dict:
         """Cancel a list of offers.
 
@@ -7534,6 +7678,13 @@ class OfferManager:
         del skip_confirmation
         if not trade_ids:
             return {}
+        if fee_approval_id is not None:
+            if (
+                reason != "coin_prep_cancel_all"
+                or type(fee_approval_id) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+            ):
+                raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
 
         # F20: cancel-storm protection
         if not force_storm:
@@ -7617,7 +7768,7 @@ class OfferManager:
             )
             members.append((intent, attempt, member_id))
 
-        is_cohort = len(members) > 1
+        is_cohort = len(members) > 1 or fee_approval_id is not None
         recoverable_contexts = {}
         existing_results = {}
         for intent, attempt, member_id in members:
@@ -7673,7 +7824,9 @@ class OfferManager:
                 or retry_eligible[intent.trade_id]
             ]
             manifest = None
-            if len(participating) > 1:
+            if len(participating) > 1 or (
+                fee_approval_id is not None and len(participating) == 1
+            ):
                 manifest = database.canonical_offer_cancel_cohort_manifest(
                     [
                         {
@@ -7728,11 +7881,14 @@ class OfferManager:
                         ).hexdigest()
                     )
                     members.append((intent, attempt, member_id))
-            is_cohort = len(members) > 1
+            is_cohort = len(members) > 1 or (
+                fee_approval_id is not None and bool(members)
+            )
         else:
             manifest = None
 
         batch_contract = None
+        priced_cancellation = None
         if (
             is_cohort
             and manifest is not None
@@ -7740,7 +7896,14 @@ class OfferManager:
             and {intent.trade_id for intent, _attempt, _member_id in members}
             == {intent.trade_id for intent, _attempt, _member_id in ordered_members}
         ):
-            batch_contract = self._plan_sage_bulk_cancel(members)
+            if fee_approval_id is None:
+                batch_contract = self._plan_sage_bulk_cancel(members)
+            else:
+                batch_contract, priced_cancellation = self._plan_coin_prep_cancel(
+                    members, fee_approval_id
+                )
+        elif fee_approval_id is not None:
+            raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
 
         authorities = {}
         try:
@@ -7858,6 +8021,8 @@ class OfferManager:
                     manifest=manifest,
                     authorities=authorities,
                     batch_contract=batch_contract,
+                    fee_approval_id=fee_approval_id,
+                    priced_cancellation=priced_cancellation,
                 )
                 for intent, attempt, _member_id in members:
                     result = batch_results[intent.trade_id]
@@ -8044,6 +8209,7 @@ class OfferManager:
         cat_asset_id: str = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         side_filter: str = "",
+        fee_approval_id: Optional[str] = None,
     ) -> Dict:
         """Cancel all open offers (or only one side's offers) in controlled batches.
 
@@ -8141,8 +8307,9 @@ class OfferManager:
         try:
             results = self.cancel_offers(
                 trade_ids,
-                reason="cancel_all",
+                reason=("coin_prep_cancel_all" if fee_approval_id else "cancel_all"),
                 force_storm=True,
+                fee_approval_id=fee_approval_id,
             )
         except Exception as exc:
             # No wallet effect is issued outside ``cancel_offers``.  If the
@@ -8634,7 +8801,7 @@ class OfferManager:
             return None
         manifest_ids = {member["operation_id"] for member in manifest["members"]}
         if (
-            manifest["member_count"] < 2
+            manifest["member_count"] < 1
             or not set(blocker_ids).issubset(manifest_ids)
             or type(prepared) is not list
             or len(prepared) != manifest["member_count"]
@@ -8762,6 +8929,14 @@ class OfferManager:
                 wallet_fingerprint_hash=wallet_hash,
                 network=network,
             )
+            try:
+                database.record_coin_prep_cancellation_fee_outcome(exact_manifest)
+            except ValueError as exc:
+                if str(exc) not in {
+                    "FEE_RESERVATION_REQUIRED",
+                    "FEE_EFFECT_UNRESOLVED",
+                }:
+                    raise
             runtime = mutation_gate.current_runtime()
             if runtime is None:
                 return False

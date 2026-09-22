@@ -675,7 +675,7 @@ class AppBridge:
 
     @_safe
     @_mutation_guard("app_bridge:cancel_all_offers")
-    def cancel_all_offers(self, _body=None):
+    def cancel_all_offers(self, body=None):
         """Cancel all offers. Maps to POST /api/offers/cancel_all."""
         import api_server
 
@@ -683,7 +683,7 @@ class AppBridge:
             "/api/offers/cancel_all",
             method="POST",
             content_type="application/json",
-            data="{}",
+            data=json.dumps(body or {}),
         ):
             resp = api_server.api_cancel_all()
         return _unwrap_flask_response(resp)

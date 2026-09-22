@@ -692,7 +692,7 @@ def _is_exact_cancel_wallet_effect(
         or value["timeout"] != 60
         or type(fee_mojos) is not int
         or isinstance(fee_mojos, bool)
-        or fee_mojos <= 0
+        or fee_mojos < 0
         or type(batch) is not dict
         or set(batch)
         != {
@@ -710,7 +710,7 @@ def _is_exact_cancel_wallet_effect(
     if (
         type(trade_ids) is not list
         or type(source_coin_ids) is not list
-        or len(trade_ids) < 2
+        or len(trade_ids) < 1
         or len(trade_ids) != len(source_coin_ids)
         or len(set(trade_ids)) != len(trade_ids)
         or len(set(source_coin_ids)) != len(source_coin_ids)
@@ -956,7 +956,7 @@ def _is_exact_prepared_operation_blocker(
                 or attempt < 1
                 or type(cohort_size) is not int
                 or isinstance(cohort_size, bool)
-                or cohort_size < 2
+                or cohort_size < 1
                 or evidence["operation_id"] != event["operation_id"]
                 or evidence["intent_id"] != event["intent_id"]
                 or event["operation_id"] != f"cancel:{trade_id}"

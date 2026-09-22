@@ -1705,6 +1705,151 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     ) == [f"cancel:{trade_id}" for trade_id in trade_ids]
 
 
+@pytest.mark.parametrize("member_count", [1, 2])
+@pytest.mark.parametrize("approved_fee_mojos", [0, 42])
+def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
+    isolated_database,
+    monkeypatch,
+    member_count,
+    approved_fee_mojos,
+):
+    trade_ids = ["a" * 64, "b" * 64][:member_count]
+    source_coin_ids = ["c" * 64, "d" * 64][:member_count]
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"protected-sage-cancel-{index}",
+        )
+    fee_coin_id = "e" * 64
+    approval_id = "f" * 64
+    sealed = {
+        "_catalyst_validated_cancel_unsigned": True,
+        "_catalyst_cancel_unsigned_digest": "1" * 64,
+        "_catalyst_exact_unsigned_cost": 123_456,
+    }
+    calls = []
+    pricing = __import__("coin_prep_fee_cancellation")
+
+    def price(**kwargs):
+        calls.append(("price", kwargs))
+        return {
+            "available": True,
+            "trade_ids": list(kwargs["trade_ids"]),
+            "source_coin_ids": list(kwargs["source_coin_ids"]),
+            "fee_coin_id": kwargs["fee_coin_id"],
+            "fee_mojos": approved_fee_mojos,
+        }
+
+    def reserve(**kwargs):
+        calls.append(("reserve", kwargs))
+        return {
+            "validated_unsigned": sealed,
+            "dispatch_authorized": False,
+        }
+
+    def recheck(**kwargs):
+        calls.append(("recheck", kwargs))
+        return {"dispatch_authorized": False}
+
+    monkeypatch.setattr(pricing, "price_approved_cancellation", price)
+    monkeypatch.setattr(pricing, "reserve_approved_cancellation", reserve)
+    monkeypatch.setattr(pricing, "recheck_reserved_approved_cancellation", recheck)
+    settlement_attempts = []
+
+    def settle(manifest):
+        settlement_attempts.append(manifest)
+        raise ValueError("FEE_EFFECT_UNRESOLVED")
+
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        settle,
+    )
+
+    batch_effects = []
+
+    def batch_effect(
+        selected_trade_ids,
+        secure,
+        max_workers,
+        fee_mojos,
+        skip_confirmation,
+        *,
+        source_coin_ids,
+        fee_coin_id,
+        _validated_unsigned,
+        _identity_recheck=None,
+    ):
+        _identity_recheck("cancel_offers")
+        batch_effects.append(
+            {
+                "trade_ids": selected_trade_ids,
+                "fee_mojos": fee_mojos,
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+                "validated_unsigned": _validated_unsigned,
+            }
+        )
+        result = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": "2" * 64},
+            transaction_id="2" * 64,
+            spend_identity="3" * 64,
+        )
+        return {trade_id: dict(result) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=8,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(
+        reserve_largest=lambda: (fee_coin_id, 1_000)
+    )
+
+    results = manager.cancel_offers(
+        trade_ids,
+        reason="coin_prep_cancel_all",
+        force_storm=True,
+        fee_approval_id=approval_id,
+    )
+
+    assert [call[0] for call in calls] == ["price", "reserve", "recheck"]
+    assert calls[0][1] == {
+        "approval_id": approval_id,
+        "trade_ids": trade_ids,
+        "source_coin_ids": source_coin_ids,
+        "fee_coin_id": fee_coin_id,
+    }
+    assert calls[1][1]["approval_id"] == approval_id
+    assert calls[1][1]["priced_cancellation"]["fee_mojos"] == approved_fee_mojos
+    assert calls[2][1]["manifest"] == calls[1][1]["manifest"]
+    assert settlement_attempts == [calls[1][1]["manifest"]]
+    assert batch_effects == [
+        {
+            "trade_ids": trade_ids,
+            "fee_mojos": approved_fee_mojos,
+            "source_coin_ids": source_coin_ids,
+            "fee_coin_id": fee_coin_id,
+            "validated_unsigned": sealed,
+        }
+    ]
+    assert {result["outcome"] for result in results.values()} == {
+        CANCEL_SUBMITTED_UNCONFIRMED
+    }
+    for trade_id in trade_ids:
+        prepared = database.get_offer_operation_events(f"cancel:{trade_id}")[0]
+        assert json.loads(prepared["evidence_json"])["reason"] == (
+            "coin_prep_cancel_all"
+        )
+
+
 def test_sage_bulk_cancel_capacity_is_bounded_by_largest_fee_coin(monkeypatch):
     monkeypatch.setattr(
         offer_manager,
@@ -2283,7 +2428,24 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         )
         is None
     )
+    fee_settlements = []
+
+    def settle_protected_cancellation(manifest):
+        fee_settlements.append(manifest)
+        if len(fee_settlements) == 1:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        return {"state": "CONFIRMED_SPENT"}
+
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        settle_protected_cancellation,
+    )
     assert OfferManager().retry_failed_cancels() == 0
+    assert len(fee_settlements) == 2
+    assert {row["cohort_id"] for row in fee_settlements} == {
+        manifest["cohort_id"]
+    }
     assert database.get_runtime_safety_latch()["state"] == "resolved"
     assert database.get_unresolved_offer_operation_blockers() == []
     for trade_id, coin_id in zip(trade_ids, source_coin_ids):
@@ -2292,6 +2454,40 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         assert database.get_authoritative_terminal_record(trade_id)["outcome"] == (
             "CANCELLED_PROVEN"
         )
+
+
+def test_startup_recovers_settled_protected_cancellation_fee_outcome(
+    isolated_database,
+    monkeypatch,
+):
+    """Startup must finish a fee outcome committed after the cancel blockers."""
+
+    manifest = {
+        "cohort_id": "cohort:" + "f" * 64,
+        "member_count": 2,
+        "members": [],
+    }
+    settled = []
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_cancel_cohort_manifests",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unsettled_coin_prep_cancellation_manifests",
+        lambda: [manifest],
+    )
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        lambda supplied: settled.append(supplied) or {"state": "NO_EFFECT"},
+    )
+
+    recovered = object.__new__(OfferManager)._recover_persisted_cancel_cohorts()
+
+    assert recovered == {}
+    assert settled == [manifest]
 
 
 def test_retry_failed_cancels_resolves_exact_sage_all_peer_rejection(
@@ -2370,6 +2566,12 @@ def test_retry_failed_cancels_resolves_exact_sage_all_peer_rejection(
             status=lambda: {"allowed": True},
         ),
     )
+    fee_settlements = []
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        lambda manifest: fee_settlements.append(manifest) or {"state": "RELEASED_NO_EFFECT"},
+    )
 
     assert manager.reconcile_submitted_cancels_only() == 0
     assert database.get_unresolved_offer_operation_blockers() == []
@@ -2377,6 +2579,8 @@ def test_retry_failed_cancels_resolves_exact_sage_all_peer_rejection(
         database.get_offer_operation_events(f"cancel:{trade_id}")[-1]["phase"]
         for trade_id in trade_ids
     ] == ["RECONCILED", "RECONCILED"]
+    assert len(fee_settlements) == 1
+    assert fee_settlements[0]["member_count"] == 2
 
 
 def test_retry_failed_cancels_recovers_after_partial_bulk_settlement_crash(
@@ -3525,12 +3729,14 @@ def test_cancel_cohort_manifest_rejects_caps_digest_and_member_tamper(
             "prepared_event_id": f"cancel:{trade_id}:attempt:1:prepared",
         }
 
-    with pytest.raises(ValueError, match="2 to 500"):
-        database.canonical_offer_cancel_cohort_manifest([member(1)])
-    with pytest.raises(ValueError, match="2 to 500"):
+    with pytest.raises(ValueError, match="1 to 500"):
+        database.canonical_offer_cancel_cohort_manifest([])
+    with pytest.raises(ValueError, match="1 to 500"):
         database.canonical_offer_cancel_cohort_manifest(
             [member(index) for index in range(1, 502)]
         )
+    single = database.canonical_offer_cancel_cohort_manifest([member(1)])
+    assert single["member_count"] == 1
     maximum = database.canonical_offer_cancel_cohort_manifest(
         [member(index) for index in range(1, 501)]
     )

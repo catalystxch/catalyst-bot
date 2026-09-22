@@ -3695,7 +3695,7 @@ def _derive_sage_bulk_cancel_context(
         exact_manifest = database_module.validate_offer_cancel_cohort_manifest(manifest)
     except BaseException:
         return None
-    if exact_manifest["member_count"] < 2:
+    if exact_manifest["member_count"] < 1:
         return None
     manifest_operation_ids = {
         member["operation_id"] for member in exact_manifest["members"]
@@ -3755,7 +3755,7 @@ def _derive_sage_bulk_cancel_context(
             or wallet_effect.get("timeout") != 60
             or type(wallet_effect.get("fee_mojos")) is not int
             or isinstance(wallet_effect.get("fee_mojos"), bool)
-            or wallet_effect["fee_mojos"] <= 0
+            or wallet_effect["fee_mojos"] < 0
             or type(wallet_effect.get("batch")) is not dict
             or set(wallet_effect["batch"])
             != {"protocol", "trade_ids", "source_coin_ids", "fee_coin_id"}
@@ -3841,7 +3841,7 @@ def _derive_sage_bulk_cancel_context(
         return None
     expected_spent_ids = {
         *(_hex_id(value) for value in source_coin_ids),
-        fee_coin_id,
+        *([fee_coin_id] if shared_wallet_effect["fee_mojos"] > 0 else []),
     }
     contexts: list[dict[str, Any]] = []
     representative = durable_members[0]["intent"]
@@ -3911,7 +3911,9 @@ def _derive_sage_bulk_cancel_context(
             "cohort_id": exact_manifest["cohort_id"],
             "manifest_sha256": exact_manifest["manifest_sha256"],
             "members": members,
-            "auxiliary_coin_ids": [fee_coin_id],
+            "auxiliary_coin_ids": (
+                [fee_coin_id] if shared_wallet_effect["fee_mojos"] > 0 else []
+            ),
         }
         proof = _classify_terminal_evidence(
             representative,
@@ -4196,6 +4198,23 @@ def reconcile_offer(
                 observed_at,
             )
         raise
+    if result["classification"] == CANCELLED_PROVEN:
+        # Task 9 commits one cohort member at a time.  The exact protected fee
+        # remains held until the final member has authoritative terminal proof;
+        # then this same idempotent transition charges it once.  A crash after
+        # the final event is covered by OfferManager's unsettled-hold scan.
+        manifest = database.get_offer_cancel_cohort_manifest(
+            exact_cancel_context["cohort_id"]
+        )
+        if manifest is not None:
+            try:
+                database.record_coin_prep_cancellation_fee_outcome(manifest)
+            except ValueError as exc:
+                if str(exc) not in {
+                    "FEE_RESERVATION_REQUIRED",
+                    "FEE_EFFECT_UNRESOLVED",
+                }:
+                    raise
     response = {
         **result,
         "applied": result["classification"]

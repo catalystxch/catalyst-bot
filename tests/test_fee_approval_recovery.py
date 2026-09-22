@@ -1,12 +1,15 @@
 """Fee holds require authoritative effect evidence, never caller settlement flags."""
 
 import hashlib
+import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import database
+import coin_prep_fee_approval as fee_service
 import mutation_gate
 import replacement_capacity
 
@@ -137,30 +140,93 @@ def _prepared(monkeypatch):
         plan_hash=target["plan_hash"],
         constructed_outputs=constructed,
     )
-    approval = database.create_fee_approval(
-        scope_sha256="a" * 64,
-        plan_sha256="b" * 64,
-        total_fee_mojos=100,
+    scope = fee_service.resolve_server_fee_scope(
+        identity={
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": binding.fingerprint,
+            "wallet_id": 2,
+            "xch_wallet_id": 1,
+            "asset_id": "a" * 64,
+            "ticker": "MZ_XCH",
+        }
+    )
+    plan = {
+        "target_seconds": 300,
+        "coin_multiplier": "1",
+        "headroom_pct": "0",
+        "liquidity_mode": "two_sided",
+        "reserve_floors_mojos": {"xch": 0, "cat": 0},
+        "campaign_revision": None,
+        "cancellation_policy": "protected_no_prep",
+        "outputs": [
+            {
+                "asset": "cat",
+                "purpose": "replacement",
+                "tier_rank": 0,
+                "amount_mojos": 90,
+                "ordinal": 0,
+            }
+        ],
+    }
+    fee_contract = fee_service.canonical_fee_contract(scope, plan)
+    now = int(time.time())
+    quote = {
+        "available": True,
+        "cost": 20_000_000,
+        "target_seconds": 300,
+        "fee_mojos": 10,
+        "source": "coinset",
+        "observed_at": now,
+        "expires_at": now + 60,
+    }
+    preview = database.store_coin_prep_fee_preview(
+        **{
+            key: fee_contract[key]
+            for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")
+        },
+        request_options_json="{}",
+        quote_json=json.dumps(
+            {
+                "available": True,
+                "estimated_preparation_fee_mojos": 10,
+                "estimated_cancellation_fee_mojos": 10,
+                "fee_funding_mojos": 100,
+            }
+        ),
+        observed_at=now,
+        expires_at=now + 60,
+    )
+    approval = database.approve_coin_prep_fee_preview(
+        preview_id=preview["preview_id"],
+        scope_sha256=fee_contract["scope_sha256"],
+        plan_sha256=fee_contract["plan_sha256"],
+        maximum_fee_mojos=100,
         cancellation_reserve_mojos=20,
+        now=now,
     )
-    database.reserve_approved_fee(
+    database.reserve_coin_prep_fee_for_dispatch(
         approval_id=approval["approval_id"],
-        scope_sha256="a" * 64,
-        plan_sha256="b" * 64,
+        scope_sha256=fee_contract["scope_sha256"],
+        plan_sha256=fee_contract["plan_sha256"],
         operation_id=operation_id,
-        fee_mojos=10,
-        cancellation=False,
+        final_quote=quote,
     )
+    approval = {**approval, "dispatch_quote": quote}
     return operation_id, claim, identity, constructed, approval
 
 
-def _submit(operation_id, claim):
+def _submit(operation_id, claim, approval):
     dispatch = database.begin_wallet_effect_dispatch(
         claim["claim_token"],
         claim["generation"],
         operation_id=operation_id,
         source_coin_ids=["1" * 64],
         fee_coin_ids=["2" * 64],
+        prep_fee_context={
+            "approval_id": approval["approval_id"],
+            "quote": approval["dispatch_quote"],
+        },
     )
     database.complete_wallet_effect_dispatch(dispatch, result={"success": True})
     return database.record_coin_prep_operation_outcome(
@@ -227,7 +293,7 @@ def test_caller_no_effect_flags_do_not_release_unresolved_claim(
 
 def test_timeout_and_restart_leave_submitted_fee_held(isolated_database, monkeypatch):
     operation_id, claim, _, _, approval = _prepared(monkeypatch)
-    operation = _submit(operation_id, claim)
+    operation = _submit(operation_id, claim, approval)
     assert callable(getattr(database, "record_fee_reservation_outcome", None)), (
         "authoritative fee settlement is missing"
     )
@@ -247,7 +313,7 @@ def test_exact_journal_evidence_settles_once(
     isolated_database, monkeypatch, outcome, held, spent, remaining
 ):
     operation_id, claim, identity, outputs, approval = _prepared(monkeypatch)
-    _submit(operation_id, claim)
+    _submit(operation_id, claim, approval)
     common = {
         "effect_claim_token": claim["claim_token"],
         "effect_claim_generation": claim["generation"],
@@ -321,8 +387,8 @@ def test_exact_journal_evidence_settles_once(
     assert state["spent_fee_mojos"] == spent
     assert state["remaining_fee_mojos"] == remaining
     second = database.create_fee_approval(
-        scope_sha256="a" * 64,
-        plan_sha256="b" * 64,
+        scope_sha256=approval["scope_sha256"],
+        plan_sha256=approval["plan_sha256"],
         total_fee_mojos=200,
         cancellation_reserve_mojos=20,
     )
@@ -332,8 +398,8 @@ def test_exact_journal_evidence_settles_once(
     if outcome == "FAILED":
         database.reserve_approved_fee(
             approval_id=second["approval_id"],
-            scope_sha256="a" * 64,
-            plan_sha256="b" * 64,
+            scope_sha256=approval["scope_sha256"],
+            plan_sha256=approval["plan_sha256"],
             operation_id="9" * 64,
             fee_mojos=180,
             cancellation=False,

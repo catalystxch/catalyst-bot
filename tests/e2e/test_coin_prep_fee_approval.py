@@ -271,6 +271,45 @@ def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
     assert page.evaluate("_apiBridgeMethod('/api/coin-prep/fee-approval', 'POST')") == "approve_coin_prep_fees"
 
 
+def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
+    _open_gui(page)
+    approval_id = "d" * 64
+
+    result = page.evaluate(
+        """async approvalId => {
+            bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                window.__feeCalls.push({path: String(path), body: options.body || null});
+                return new Response(JSON.stringify({success: false, error: 'test stop'}), {
+                    status: 400,
+                    headers: {'Content-Type': 'application/json'},
+                });
+            };
+            await cancelAllOffers({
+                source: 'coin_prep',
+                openBuyCount: 1,
+                openSellCount: 1,
+                openOfferCount: 2,
+                prepPayload: {fee_approval_id: approvalId},
+            });
+            await confirmCancelAll();
+            return window.__feeCalls;
+        }""",
+        approval_id,
+    )
+
+    assert result == [
+        {
+            "path": "/api/offers/cancel_all",
+            "body": json.dumps(
+                {"source": "coin_prep", "fee_approval_id": approval_id},
+                separators=(",", ":"),
+            ),
+        }
+    ]
+
+
 def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
     _open_gui(page)
     preview = _preview()

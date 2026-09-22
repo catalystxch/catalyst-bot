@@ -342,7 +342,7 @@ def _cancel_cohort_manifest(blocker: Any, database_module: Any) -> dict | None:
             manifest = validator(manifest)
         if (
             type(manifest) is not dict
-            or manifest.get("member_count", 0) < 2
+            or manifest.get("member_count", 0) < 1
             or type(manifest.get("members")) is not list
             or blocker.get("operation_id")
             not in {member.get("operation_id") for member in manifest["members"]}

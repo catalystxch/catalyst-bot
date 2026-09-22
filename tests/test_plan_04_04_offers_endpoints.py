@@ -27,10 +27,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 try:
     import api_server
+    import app_bridge
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    app_bridge = None
     _SKIP = str(exc)
 
 
@@ -71,6 +73,33 @@ def _make_bot(offers=([], [], [])):
     bot.offer_manager.cancel_offers.return_value = {"success": True}
     bot.coin_manager.is_busy.return_value = False
     return bot
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_native_cancel_all_forwards_coin_prep_fee_approval_body(monkeypatch):
+    from flask import request
+
+    approval_id = "a" * 64
+    captured = {}
+
+    def fake_cancel_all():
+        captured["body"] = request.get_json(silent=True)
+        return {"success": True}
+
+    monkeypatch.setattr(api_server, "api_cancel_all", fake_cancel_all)
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server.mutation_gate, "enter_mutation", lambda _operation: object())
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: None)
+
+    result = app_bridge.AppBridge().cancel_all_offers(
+        {"source": "coin_prep", "fee_approval_id": approval_id}
+    )
+
+    assert result["success"] is True
+    assert captured["body"] == {
+        "source": "coin_prep",
+        "fee_approval_id": approval_id,
+    }
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
@@ -549,6 +578,22 @@ class TestCancelOffer(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllPost(_FlaskBase):
+    def test_coin_prep_cancel_requires_exact_approval_shape(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with patch.object(api_server, "bot", stopped):
+            missing = self._post(
+                "/api/offers/cancel_all", {"source": "coin_prep"}
+            )
+            malformed = self._post(
+                "/api/offers/cancel_all",
+                {"source": "coin_prep", "fee_approval_id": "not-a-digest"},
+            )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(malformed.status_code, 400)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
     def test_unresolved_cancel_all_runs_proof_only_reconciliation(self):
         """The recovery button must remain useful without authorizing a second spend."""
 

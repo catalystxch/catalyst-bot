@@ -560,3 +560,41 @@ remain incomplete. These tests do not prove the entire feature ready.
 
 The live package was not reloaded or changed, no wallet mutations were performed,
 and no release or main merge was made during this checkpoint.
+
+## Protected cancellation allowance and resumed verification (22 September 2026)
+
+- Coin Prep's Sage Cancel All path now constructs and validates one exact unsigned
+  cancellation transaction, prices its real CLVM cost with current guidance,
+  reserves the exact final fee only from the approval's protected cancellation
+  allowance, rechecks context/freshness, and submits those same sealed bytes.
+  It never falls back to the ordinary static-fee Cancel All path.
+- Durable one-to-500-member cancellation manifests bind roots, fee input,
+  reservation and wallet-effect evidence. Confirmed cohorts charge the fee once;
+  authoritative all-member no-effect releases it; ambiguity preserves the hold.
+  Startup recovery retries unsettled outcomes idempotently. Existing databases
+  with earlier two-member bounds migrate by canonical table copy without SQLite
+  trigger/foreign-key retargeting.
+- A single remaining live offer is valid. A genuinely available zero-fee quote
+  remains zero and has no fabricated fee input, while retaining the same manifest
+  and recovery guarantees. Ordinary/legacy cancellations without a protected
+  manifest are not charged to Coin Prep approvals.
+- The HTTP route requires the exact typed Coin Prep approval shape. A resumed
+  acceptance audit found that the PyWebView bridge discarded that payload; a
+  failing native regression reproduced `{}` reaching the route. The bridge now
+  forwards the exact JSON body. Chromium verifies the GUI sends only
+  `source=coin_prep` and the confirmed 64-hex approval ID.
+- Focused evidence: cancellation/recovery baseline 138 passed; reconciliation
+  and stability 449 passed; complete protected cancellation/API set 261 passed;
+  Chromium fee-approval E2E 9 passed; final cancellation/API/native/browser gate
+  216 passed. Ruff over all changed Python files passed and whitespace was
+  corrected after `git diff --check` identified one trailing space.
+- The broad affected run completed with 1,706 passes and two diagnostics child
+  startup timeouts. Both failures reproduced only while Windows Defender cold-
+  scanned each new SQLite snapshot (measured near 19 seconds); both tests passed
+  individually in 8-9 seconds once warm. No production timeout or safety rule was
+  changed to conceal this host condition.
+- Sage RPC is listening again after the PC restart. CATalyst remains stopped;
+  no wallet transaction or fabricated operator confirmation has occurred. Fresh
+  full regression, Windows package verification, isolated packaged GUI exercise,
+  genuine TEST 7 operator-approved live acceptance, final audit/commit and any
+  integration decision remain Task 6 gates. Main and release remain untouched.

@@ -32698,7 +32698,19 @@
             if (sellCount > 0) addLogEntry('info', `   ${sellCount} sell offer${sellCount !== 1 ? 's' : ''}...`);
 
             try {
-                const response = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
+                const coinPrepApprovalId = cancelContext?.source === 'coin_prep'
+                    ? cancelContext?.prepPayload?.fee_approval_id
+                    : null;
+                if (cancelContext?.source === 'coin_prep' && !/^[0-9a-f]{64}$/.test(String(coinPrepApprovalId || ''))) {
+                    throw new Error('The Coin Prep fee approval is missing or invalid. Refresh the fee estimate; no cancellation was sent.');
+                }
+                const response = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(coinPrepApprovalId
+                        ? { source: 'coin_prep', fee_approval_id: coinPrepApprovalId }
+                        : {}),
+                });
                 const result = await response.json();
 
                 if (!result.success) {

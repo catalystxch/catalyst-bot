@@ -838,7 +838,7 @@ def test_repeated_migration_does_not_rescan_append_only_effect_history(
     )
 
 
-@pytest.mark.parametrize("legacy_limit", [64, 128])
+@pytest.mark.parametrize("legacy_limit", [64, 128, 500])
 def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
     isolated_database,
     legacy_limit,
@@ -901,7 +901,13 @@ def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
             "VALUES (?,?,?,?,?)",
             ("cancel-cohort:" + "c" * 64, "d" * 64, 71, "{}", LATER),
         )
-    assert "BETWEEN 2 AND 500" in schema
+        conn.execute(
+            "INSERT INTO offer_cancel_cohort_manifests "
+            "(cohort_id,manifest_sha256,member_count,manifest_json,created_at) "
+            "VALUES (?,?,?,?,?)",
+            ("cancel-cohort:" + "e" * 64, "f" * 64, 1, "{}", LATER),
+        )
+    assert "BETWEEN 1 AND 500" in schema
     assert preserved == [("cancel-cohort:" + "a" * 64, "b" * 64, 2, "{}", AT)]
 
 

@@ -5385,6 +5385,193 @@ def classify_open_offers_for_pair(asset_id_mz: str):
     return open_buy, open_sell
 
 
+def _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids=None):
+    """Reject unsafe Sage cancellation summaries before any signing step."""
+
+    refusal = {
+        "success": False,
+        "error_code": "REJECTED",
+        "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+    }
+    if type(result) is not dict or not result.get("coin_spends"):
+        return result
+    summary = result.get("summary")
+    inputs = summary.get("inputs") if type(summary) is dict else None
+    try:
+        if type(inputs) is not list or not inputs:
+            raise ValueError("missing inputs")
+        if _exact_summary_mojos(summary.get("fee")) != expected_fee:
+            raise ValueError("fee mismatch")
+        input_ids = set()
+        output_ids = set()
+        input_total = 0
+        output_total = 0
+        for item in inputs:
+            if type(item) is not dict or type(item.get("outputs")) is not list:
+                raise ValueError("malformed input")
+            coin_id = _canonical_hex(item.get("coin_id"))
+            if not re.fullmatch(r"[0-9a-f]{64}", coin_id) or coin_id in input_ids:
+                raise ValueError("duplicate or malformed input")
+            input_ids.add(coin_id)
+            input_total += _exact_summary_mojos(item.get("amount"))
+            for output in item["outputs"]:
+                if type(output) is not dict:
+                    raise ValueError("malformed output")
+                output_id = _canonical_hex(output.get("coin_id"))
+                if (
+                    not re.fullmatch(r"[0-9a-f]{64}", output_id)
+                    or output_id in output_ids
+                ):
+                    raise ValueError("duplicate or malformed output")
+                if output.get("receiving") is not True or output.get("burning") is True:
+                    raise ValueError("non-receiving output")
+                output_ids.add(output_id)
+                output_total += _exact_summary_mojos(output.get("amount"))
+        if input_total - output_total != expected_fee:
+            raise ValueError("value mismatch")
+
+        root_ids = input_ids - output_ids
+        if expected_root_ids is not None and root_ids != set(expected_root_ids):
+            raise ValueError("root mismatch")
+
+        from chia_rs import Coin
+
+        spend_ids = []
+        for raw_spend in result["coin_spends"]:
+            if type(raw_spend) is not dict or type(raw_spend.get("coin")) is not dict:
+                raise ValueError("malformed coin spend")
+            raw_coin = dict(raw_spend["coin"])
+            for field in ("parent_coin_info", "puzzle_hash"):
+                value = raw_coin.get(field)
+                if isinstance(value, str) and not value.startswith("0x"):
+                    raw_coin[field] = f"0x{value}"
+            spend_ids.append(Coin.from_json_dict(raw_coin).name().hex())
+        if len(spend_ids) != len(set(spend_ids)) or set(spend_ids) != input_ids:
+            raise ValueError("coin spend mismatch")
+    except (TypeError, ValueError, AttributeError):
+        return refusal
+    return result
+
+
+def build_cancel_offers_batch_unsigned(
+    trade_ids: list,
+    *,
+    fee_mojos: int,
+    source_coin_ids: list,
+    fee_coin_id: str,
+    _identity_recheck=None,
+):
+    """Build and exactly cost one cancellation cohort without signing it."""
+
+    if not _require_signing_capability():
+        return {"success": False, "reason": "SIGNING_CAPABILITY_UNAVAILABLE"}
+    unique_trade_ids = list(dict.fromkeys(trade_ids or []))
+    normalized_source_ids = [_canonical_hex(value) for value in (source_coin_ids or [])]
+    normalized_fee_coin_id = _canonical_hex(fee_coin_id)
+    if (
+        not unique_trade_ids
+        or type(fee_mojos) is not int
+        or isinstance(fee_mojos, bool)
+        or fee_mojos < 0
+        or len(normalized_source_ids) != len(unique_trade_ids)
+        or len(set(normalized_source_ids)) != len(normalized_source_ids)
+        or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in normalized_source_ids)
+        or not re.fullmatch(r"[0-9a-f]{64}", normalized_fee_coin_id)
+        or normalized_fee_coin_id in set(normalized_source_ids)
+    ):
+        return {
+            "success": False,
+            "error_code": "REJECTED",
+            "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+        }
+
+    rpc_timeout = 120 if len(unique_trade_ids) > 10 else 60
+    if _identity_recheck is not None:
+        _identity_recheck("cancel_offers:build")
+    cancel_result = _sage_post(
+        "cancel_offers",
+        {"offer_ids": unique_trade_ids, "fee": "0", "auto_submit": False},
+        timeout=rpc_timeout,
+        retry_transport_error=False,
+    )
+    cancel_result = _validate_cancel_unsigned_component(
+        cancel_result, 0, normalized_source_ids
+    )
+    if not (
+        type(cancel_result) is dict
+        and cancel_result.get("success") is not False
+        and not cancel_result.get("error")
+        and cancel_result.get("coin_spends")
+    ):
+        return cancel_result
+
+    def _seal_unsigned(result):
+        cost = estimate_unsigned_transaction_cost(result)
+        if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
+            return {"success": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+        sealed_result = dict(result)
+        sealed_result["_catalyst_validated_cancel_unsigned"] = True
+        sealed_result["_catalyst_exact_unsigned_cost"] = cost
+        sealed_result["_catalyst_cancel_unsigned_digest"] = hashlib.sha256(
+            _json.dumps(
+                {
+                    "summary": result["summary"],
+                    "coin_spends": result["coin_spends"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return sealed_result
+
+    # The first fixed-point pricing pass deliberately uses a zero fee.  Do not
+    # manufacture an empty fee transaction or consume the protected fee coin
+    # merely to discover the cancellation bundle's exact CLVM cost.
+    if fee_mojos == 0:
+        return _seal_unsigned(cancel_result)
+
+    if _identity_recheck is not None:
+        _identity_recheck("cancel_offers:fee_build")
+    fee_result = _sage_post(
+        "create_transaction",
+        {
+            "selected_coin_ids": [normalized_fee_coin_id],
+            "actions": ([{"type": "fee", "amount": str(fee_mojos)}] if fee_mojos else []),
+            "auto_submit": False,
+        },
+        timeout=60,
+        retry_transport_error=False,
+    )
+    fee_result = _validate_cancel_unsigned_component(
+        fee_result, fee_mojos, [normalized_fee_coin_id]
+    )
+    if not (
+        type(fee_result) is dict
+        and fee_result.get("success") is not False
+        and not fee_result.get("error")
+        and fee_result.get("coin_spends")
+    ):
+        return fee_result
+
+    combined = {
+        "summary": {
+            "fee": fee_mojos,
+            "inputs": list(cancel_result["summary"]["inputs"])
+            + list(fee_result["summary"]["inputs"]),
+        },
+        "coin_spends": list(cancel_result["coin_spends"])
+        + list(fee_result["coin_spends"]),
+    }
+    combined = _validate_cancel_unsigned_component(
+        combined,
+        fee_mojos,
+        [*normalized_source_ids, normalized_fee_coin_id],
+    )
+    if type(combined) is not dict or combined.get("success") is False:
+        return combined
+    return _seal_unsigned(combined)
+
+
 def cancel_offers_batch(
     trade_ids: list,
     secure: bool = True,
@@ -5394,6 +5581,7 @@ def cancel_offers_batch(
     *,
     source_coin_ids: Optional[list] = None,
     fee_coin_id: Optional[str] = None,
+    _validated_unsigned: Optional[dict] = None,
     _identity_recheck=None,
 ):
     """Cancel multiple Sage offers in one native ``cancel_offers`` transaction.
@@ -5559,6 +5747,71 @@ def cancel_offers_batch(
     if _identity_recheck is not None:
         _identity_recheck("cancel_offers")
     try:
+        if _validated_unsigned is not None:
+            expected_root_ids = list(normalized_source_ids or [])
+            if resolved_fee:
+                if normalized_fee_coin_id is None:
+                    return _for_every_member(_unsigned_refusal())
+                expected_root_ids.append(normalized_fee_coin_id)
+            core = (
+                {
+                    "summary": _validated_unsigned.get("summary"),
+                    "coin_spends": _validated_unsigned.get("coin_spends"),
+                }
+                if type(_validated_unsigned) is dict
+                else None
+            )
+            expected_digest = (
+                hashlib.sha256(
+                    _json.dumps(
+                        core,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if core is not None
+                else None
+            )
+            exact_cost = (
+                _validated_unsigned.get("_catalyst_exact_unsigned_cost")
+                if type(_validated_unsigned) is dict
+                else None
+            )
+            if (
+                type(_validated_unsigned) is not dict
+                or _validated_unsigned.get("_catalyst_validated_cancel_unsigned")
+                is not True
+                or type(exact_cost) is not int
+                or isinstance(exact_cost, bool)
+                or exact_cost <= 0
+                or _validated_unsigned.get("_catalyst_cancel_unsigned_digest")
+                != expected_digest
+                or not expected_root_ids
+            ):
+                return _for_every_member(_unsigned_refusal())
+            checked = _validate_cancel_unsigned_component(
+                core,
+                resolved_fee,
+                expected_root_ids,
+            )
+            if (
+                type(checked) is not dict
+                or checked.get("success") is False
+                or checked.get("error")
+                or not checked.get("coin_spends")
+            ):
+                return _for_every_member(_unsigned_refusal())
+            if _identity_recheck is not None:
+                _identity_recheck("cancel_offers:sealed_submit")
+            result = _submit_coin_spends_if_needed(
+                _validated_unsigned,
+                "cancel_offers",
+                _identity_recheck=_identity_recheck,
+                _track_pending_identity=True,
+            )
+            return _for_every_member(
+                normalize_cancel_response(result, method="bulk_rpc")
+            )
         result = _sage_post(
             "cancel_offers",
             payload,

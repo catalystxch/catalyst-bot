@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -478,6 +479,22 @@ def api_open_offer_count():
 def api_cancel_all():
     """Cancel all open offers when the bot is not actively managing the book."""
     bot = api_server.bot
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if type(body) is not dict:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    fee_approval_id = body.get("fee_approval_id")
+    if fee_approval_id is None:
+        if body:
+            return jsonify({"success": False, "error": "invalid_request"}), 400
+    elif (
+        set(body) != {"source", "fee_approval_id"}
+        or body.get("source") != "coin_prep"
+        or type(fee_approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+    ):
+        return jsonify({"success": False, "error": "invalid_fee_approval"}), 400
     slog("GUI_ACTION", ">>> BUTTON: Cancel All Offers")
     cancelled = 0
     failed = 0
@@ -654,7 +671,10 @@ def api_cancel_all():
             def on_progress(payload):
                 _set_cancel_all_state(**payload)
 
-            result = bot.offer_manager.cancel_all(progress_callback=on_progress)
+            result = bot.offer_manager.cancel_all(
+                progress_callback=on_progress,
+                fee_approval_id=fee_approval_id,
+            )
             for tid, res in result.items():
                 if res and res.get("success"):
                     cancelled += 1
@@ -896,9 +916,15 @@ def api_cancel_all():
                             ),
                         )
                         _cancel_kwargs = {
-                            "reason": "manual_cancel_all",
+                            "reason": (
+                                "coin_prep_cancel_all"
+                                if fee_approval_id
+                                else "manual_cancel_all"
+                            ),
                             "force_storm": True,
                         }
+                        if fee_approval_id:
+                            _cancel_kwargs["fee_approval_id"] = fee_approval_id
                         _batch_retry_attempts = {
                             trade_id: _retry_failed_attempts[trade_id]
                             for trade_id in _batch_targets

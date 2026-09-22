@@ -757,6 +757,21 @@ class FeeCoinPool:
                     return cid
         return None
 
+    def reserve_largest(self) -> tuple[str, int] | None:
+        """Reserve the largest available fee coin and return its exact value."""
+
+        with self._lock:
+            candidates = [
+                (amount, coin_id)
+                for coin_id, amount in self._available
+                if coin_id not in self._reserved
+            ]
+            if not candidates:
+                return None
+            amount, coin_id = max(candidates)
+            self._reserved.add(coin_id)
+            return coin_id, amount
+
     # ---- introspection ----
 
     @property

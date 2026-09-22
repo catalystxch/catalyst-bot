@@ -1,6 +1,8 @@
 import sys
 import types
 import unittest
+import hashlib
+import json
 from unittest.mock import patch
 
 if "requests" not in sys.modules:
@@ -58,6 +60,148 @@ from cancel_outcomes import (
 
 
 class WalletSageCancelBatchTests(unittest.TestCase):
+    @staticmethod
+    def _sealed_cancel_bundle(*, fee=25):
+        result = {
+            "summary": {"fee": fee, "inputs": []},
+            "coin_spends": ["cancel", "fee"],
+        }
+        result["_catalyst_validated_cancel_unsigned"] = True
+        result["_catalyst_exact_unsigned_cost"] = 123_456
+        result["_catalyst_cancel_unsigned_digest"] = hashlib.sha256(
+            json.dumps(
+                {"summary": result["summary"], "coin_spends": result["coin_spends"]},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return result
+
+    def test_build_cancel_batch_is_exactly_costed_without_signing_or_submission(self):
+        trade_ids = ["a" * 64, "b" * 64]
+        source_coin_ids = ["c" * 64, "d" * 64]
+        fee_coin_id = "e" * 64
+        requests = []
+
+        def sage_post(endpoint, payload, **_kwargs):
+            requests.append((endpoint, payload))
+            if endpoint == "cancel_offers":
+                return {"summary": {"fee": 0, "inputs": []}, "coin_spends": ["cancel"]}
+            if endpoint == "create_transaction":
+                return {
+                    "summary": {"fee": 25, "inputs": []},
+                    "coin_spends": ["fee"],
+                }
+            self.fail(f"unexpected signing/submission endpoint: {endpoint}")
+
+        def validate(result, expected_fee, expected_root_ids=None):
+            return {
+                **result,
+                "_catalyst_validated_cancel_unsigned": True,
+                "_expected_fee": expected_fee,
+                "_expected_roots": expected_root_ids,
+            }
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(wallet_sage, "_sage_post", side_effect=sage_post),
+            patch.object(
+                wallet_sage,
+                "_validate_cancel_unsigned_component",
+                side_effect=validate,
+                create=True,
+            ),
+            patch.object(
+                wallet_sage,
+                "estimate_unsigned_transaction_cost",
+                return_value=123_456,
+            ),
+        ):
+            result = wallet_sage.build_cancel_offers_batch_unsigned(
+                trade_ids,
+                fee_mojos=25,
+                source_coin_ids=source_coin_ids,
+                fee_coin_id=fee_coin_id,
+            )
+
+        self.assertEqual(
+            [endpoint for endpoint, _payload in requests],
+            ["cancel_offers", "create_transaction"],
+        )
+        self.assertEqual(result["_catalyst_exact_unsigned_cost"], 123_456)
+        self.assertTrue(result["_catalyst_validated_cancel_unsigned"])
+        self.assertEqual(result["summary"]["fee"], 25)
+        self.assertEqual(result["coin_spends"], ["cancel", "fee"])
+
+    def test_cancel_batch_submits_sealed_unsigned_bundle_without_rebuilding(self):
+        trade_ids = ["a" * 64, "b" * 64]
+        submitted = self._sealed_cancel_bundle()
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=AssertionError("sealed submission must not rebuild"),
+            ),
+            patch.object(
+                wallet_sage,
+                "_submit_coin_spends_if_needed",
+                return_value={"success": True, "transaction_id": "f" * 64},
+            ) as submit,
+            patch.object(
+                wallet_sage,
+                "_validate_cancel_unsigned_component",
+                side_effect=lambda result, *_args: result,
+            ),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                trade_ids,
+                fee_mojos=25,
+                source_coin_ids=["c" * 64, "d" * 64],
+                fee_coin_id="e" * 64,
+                _validated_unsigned=submitted,
+            )
+
+        submit.assert_called_once()
+        self.assertEqual(submit.call_args.args[0], submitted)
+        self.assertTrue(
+            all(
+                results[trade_id]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+                for trade_id in trade_ids
+            )
+        )
+
+    def test_cancel_batch_rejects_tampered_sealed_unsigned_bundle_without_submission(self):
+        trade_ids = ["a" * 64, "b" * 64]
+        tampered = self._sealed_cancel_bundle()
+        tampered["summary"]["fee"] = 26
+
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage,
+                "_sage_post",
+                side_effect=AssertionError("tampered bundle must not rebuild"),
+            ),
+            patch.object(wallet_sage, "_submit_coin_spends_if_needed") as submit,
+            patch.object(
+                wallet_sage,
+                "_validate_cancel_unsigned_component",
+                side_effect=lambda result, *_args: result,
+            ),
+        ):
+            results = wallet_sage.cancel_offers_batch(
+                trade_ids,
+                fee_mojos=25,
+                source_coin_ids=["c" * 64, "d" * 64],
+                fee_coin_id="e" * 64,
+                _validated_unsigned=tampered,
+            )
+
+        submit.assert_not_called()
+        self.assertTrue(all(results[trade_id]["outcome"] == CANCEL_FAILED for trade_id in trade_ids))
+
     def test_cancel_batch_never_confirms_by_unlock_or_absence(self):
         with (
             patch.object(wallet_sage, "_require_signing_capability", return_value=True),
