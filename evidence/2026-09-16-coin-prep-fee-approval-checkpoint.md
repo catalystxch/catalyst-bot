@@ -993,3 +993,29 @@ HTTP 409 with `requires_stop:true` and the race explanation. The bot stayed
 running, the previous zero-offer Cancel All record did not restart, and fee
 accounting stayed 22,837,112 mojos spent, zero held/unresolved. This is not
 an active-offer cancellation test.
+
+## Live browser cross-check (23 September 2026, ~13:06 BST)
+
+- The open localhost CATalyst tab showed the source build
+  `v1.3.21+199.g23b1c85`, running on Sage fingerprint 736588221 with the
+  correct MZ/XCH pair. Dashboard market confidence was RED, withdrawal ALL,
+  with no tradable range; it showed 0 active offers and 0.55 XCH ask depth
+  against 4.012 XCH required per side. Cancel All was disabled while running.
+- The Dashboard still labelled the displayed `0.00007500` as “Trusted Mid
+  Price” despite RED confidence and no trusted midpoint. Offers still said
+  “Start the bot” in the empty state despite the running indicator. These
+  independently reproduce the frontend defects in the gate matrix; neither
+  was fixed by the inspection.
+- P&L showed the historical 3 confirmed buy fills and zero round trips;
+  Settings retained the `pre-fee-live-acceptance` 97-field preset and displayed
+  runtime safety ALLOWED. The Settings page had no unsaved edit from this
+  read-only inspection.
+- Market Intel showed Dexie READY, Splash DEGRADED, Spacescan ENABLED, and
+  Sage READY. Its “Thin Side BUY” indicator conflicts with the Dashboard's
+  eligible ask-depth shortage; inspect whether it intentionally uses raw
+  orderbook depth before classifying this as a further defect. It also said
+  “Listening enabled; start the bot to receive peer offers” while the bot was
+  running; verify the listener's separate status before changing this copy.
+- The terminal Playwright CLI browser launch produced no page state and was
+  stopped. The existing in-app localhost tab was used for the above observed
+  state. No campaign, trade, cancellation or wallet mutation was made.
