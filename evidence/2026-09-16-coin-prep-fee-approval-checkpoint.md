@@ -771,3 +771,28 @@ and no release or main merge was made during this checkpoint.
   evidence of an intermittent full-suite startup timing failure, not a clean
   broad-suite pass; root cause remains unproven. Do not count the broad gate
   as fully green or merge on this evidence.
+
+## Uniform-mode live failure and candidate fix (23 September 2026)
+
+- The operator confirmed a fresh exact TEST 7 MZ/XCH Coin Prep fee cap in the
+  GUI: approval `e2d754a39acbef7efe10bee647128479dbced3b35fcbc46011b8f3508ab7c6dc`,
+  1,269,651,253 mojos total including 135,000,780 mojos protected for
+  cancellation. The worker failed with `FEE_DISPATCH_UNSUPPORTED` before
+  dispatch. The durable journal still reports zero held or spent fee, zero
+  reservations and unresolved operations, and the approval remains current.
+- Root cause: the UI/pricer permitted the normal untiered output recipe but
+  `_run_direct_batch_prep` rejected every untiered worker. The candidate now
+  allows the Sage/DB direct path for untiered approved plans and classifies
+  final outputs from the frozen approved targets, without returning to a
+  manual fee or legacy signing route. Focused regressions were observed red
+  before the production change and green afterward; 24 dispatch tests pass,
+  along with the 423-test fee-specific backend selection and 14 browser
+  approval tests. Ruff and `git diff --check` pass.
+- A fresh isolated Windows bundle was built without touching the existing
+  live package; executable SHA-256 is
+  `9A9B75FBD04BD7EA79B0AACB4C4381F43704F55432DAE5A6AA867B6CF47DD2AB`.
+  Packaged API and Sage RPC worker smoke checks pass. The source server on
+  port 5000 still runs the old worker. The attempted exact-process restart
+  was denied by process-control policy, so the new code has **not** received
+  a live-wallet retry. The operator must close that app before the new source
+  server can be started; no approval bypass or live spend was attempted.

@@ -188,15 +188,75 @@ def test_direct_runner_uses_frozen_pricing_without_worker_price_or_fee_floor(act
     assert active_worker["adapter_attempts"] == [{"held": 20, "executable": True, "reservations": 1}]
 
 
-def test_unsupported_worker_mode_pauses_instead_of_entering_legacy_mutations(
+def test_uniform_worker_mode_uses_approved_direct_dispatch_instead_of_legacy_mutations(
     active_worker,
 ):
     worker = active_worker["worker"]
     worker.tier_enabled = False
+    worker._tx_fee_mojos = lambda: pytest.fail("uniform run used legacy manual fee")
 
-    with pytest.raises(ValueError, match="FEE_DISPATCH_UNSUPPORTED"):
+    with pytest.raises(RuntimeError, match="external adapter observation unavailable"):
         worker._run_direct_batch_prep()
 
+    assert active_worker["adapter_attempts"] == [
+        {"held": 20, "executable": True, "reservations": 1}
+    ]
+
+
+def test_uniform_worker_classifies_frozen_approved_outputs(active_worker):
+    worker = active_worker["worker"]
+    worker.tier_enabled = False
+    worker._approved_targets = active_worker["priced"]["recipe"]["targets"]
+    worker._tx_fee_mojos = lambda: 0
+
+    xch_plan = worker._build_tier_amount_plan("xch")
+    cat_plan = worker._build_tier_amount_plan("cat")
+    assert xch_plan == {
+        110_000_000_000: [("inner", 1)],
+        1_000_000_000: [("fees", 2)],
+    }
+    assert cat_plan == {11_000: [("inner", 1)]}
+
+    assigned, unmatched = worker._partition_coins_for_designation(
+        [{"amount": 110_000_000_000}, {"amount": 1_000_000_000},
+         {"amount": 1_000_000_000}, {"amount": 500_000_000_000}], "xch"
+    )
+    assert {tier: len(coins) for tier, coins in assigned.items()} == {
+        "inner": 1, "fees": 2,
+    }
+    assert [coin["amount"] for coin in unmatched] == [500_000_000_000]
+
+
+def test_real_uniform_preview_approval_reaches_frozen_worker_dispatch(active_worker):
+    state = active_worker
+    state["config"].TIER_ENABLED = False
+    service = import_module("coin_prep_fee_approval")
+    preview = service.preview_coin_prep_fees({"coin_multiplier": "0.5"})
+    assert preview.get("available") is True, preview
+    consent = service.approve_coin_prep_fees(
+        preview_id=preview["preview_id"], maximum_fee_mojos=80,
+        cancellation_reserve_mojos=40,
+    )
+    worker = state["worker"]
+    worker.tier_enabled = False
+    worker.fee_approval_id = consent["approval_id"]
+    worker._tx_fee_mojos = lambda: pytest.fail("uniform prep used manual fee")
+
+    with pytest.raises(RuntimeError, match="external adapter observation unavailable"):
+        worker._run_direct_batch_prep()
+
+    assert state["adapter_attempts"] == [
+        {"held": 20, "executable": True, "reservations": 1}
+    ]
+    assert len(worker._approved_targets) == 4
+    assert {target.tier_rank for target in worker._approved_targets} == {0, 4}
+
+
+def test_non_sage_worker_mode_still_cannot_dispatch(active_worker):
+    worker = active_worker["worker"]
+    worker.is_sage = False
+    with pytest.raises(ValueError, match="FEE_DISPATCH_UNSUPPORTED"):
+        worker._run_direct_batch_prep()
     assert active_worker["adapter_attempts"] == []
 
 

@@ -1896,6 +1896,19 @@ class CoinPrepWorker:
         """Build exact per-amount tier expectations for the current prep mode."""
         plan = {}
         if not self.tier_enabled:
+            from coin_prep_economics import PREP_TIERS
+
+            for target in getattr(self, "_approved_targets", ()):
+                if target.asset != wallet_type:
+                    continue
+                tier_name = PREP_TIERS[target.tier_rank]
+                specs = plan.setdefault(target.amount_mojos, [])
+                for index, (name, count) in enumerate(specs):
+                    if name == tier_name:
+                        specs[index] = (name, count + 1)
+                        break
+                else:
+                    specs.append((tier_name, 1))
             return plan
 
         for tier_name in self.tier_order:
@@ -2591,7 +2604,7 @@ class CoinPrepWorker:
         approval_id = getattr(self, "fee_approval_id", None)
         if type(approval_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", approval_id):
             raise ValueError("FEE_APPROVAL_REQUIRED")
-        if not self.is_sage or not self.tier_enabled or not DB_AVAILABLE:
+        if not self.is_sage or not DB_AVAILABLE:
             raise ValueError("FEE_DISPATCH_UNSUPPORTED")
         from coin_prep_fee_dispatch import price_approved_prep_batch
         with self.status_lock:
@@ -2609,6 +2622,7 @@ class CoinPrepWorker:
                 raise ValueError(priced["reason"])
             plan = priced["pricing"]["plan"]
             targets = priced["recipe"]["targets"]
+            self._approved_targets = targets
             with self.status_lock:
                 self.status.reused = len(plan.reused_coin_ids)
                 self.status.missing = len(targets) - len(plan.reused_coin_ids)
