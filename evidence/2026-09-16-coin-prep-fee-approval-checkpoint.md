@@ -1656,3 +1656,23 @@ an active-offer cancellation test.
   All test/build jobs are finished. Remaining native/operator and live-wallet
   gates are unchanged. No financial action, strategy resize, installed-app
   replacement, push, main merge or release occurred.
+
+### Remaining acceptance requires operator evidence
+
+- Revalidated local HEAD `248b2a4`, a clean tracked worktree and the native
+  handoff against the actual build. The executable retains SHA-256
+  `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
+  Snapshot and worktree native-smoke scripts both hash to
+  `5139E55C9EBCBAA4B11E42D25B83A87772E9C46F489D5F96ECBFBABDBFA87DB4`.
+  The native helper does not import the two later-corrected mock-Sage helpers,
+  so the documented command does not inherit their old fixture defects.
+- The native/operator gate remains unresolved across the verification
+  closeout, skip-audit continuation and this continuation. No operator result
+  or current-candidate live receipt has arrived. There is no active test/build
+  handle to wait on; unchanged-suite repeats would not resolve these gates.
+- The goal tool returned **blocked**, not complete or paused. The full
+  objective is unchanged. The next input needed is the result of
+  `2026-09-23-review-fix-native-check.md`; live financial actions still require
+  operator participation. Existing authorization is not being requested again.
+  No automation pause, installed-app change, financial action, main merge or
+  release occurred.
