@@ -868,3 +868,18 @@ and no release or main merge was made during this checkpoint.
   1,079 seconds. Ruff on `src/catalyst` and `tests` and `git diff --check`
   also passed. This is a backend regression gate, not evidence that the
   live bot/offer lifecycle or all native GUI actions have been exercised.
+
+## Fresh isolated Windows candidate package (23 September 2026)
+
+- From clean tracked source at `37b72b4`, the repository `build.py` entry
+  point built into new, isolated `build-fee-acceptance-20260923` and
+  `dist-fee-acceptance-20260923` directories; existing live and earlier
+  packages were not replaced. The executable is v1.4.0 and has SHA-256
+  `2800E255B9C1A42AA75CDECEABC8DE675E6921698C5003DE7DD515B1312BAAF0`.
+  The build verified bundled HTML and certifi CA data. PyInstaller emitted
+  one `importlib_resources.trees` hidden-import warning without a build
+  failure.
+- The packaged API smoke passed all eight endpoints, the packaged Sage RPC
+  worker smoke passed with synthetic fingerprint, and clean/duplicate/
+  persisted/native-safety desktop first-launch smokes passed. These run in
+  isolated test data and do not establish live offer behavior.
