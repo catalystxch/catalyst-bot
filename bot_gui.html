@@ -9261,7 +9261,7 @@
                     <!-- ===== HERO STRIP: Key numbers at a glance ===== -->
                     <div class="v4-hero-strip" id="heroStrip">
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label" id="heroMidPriceLabel">Trusted Mid Price <span class="cc-help">?<span class="cc-tooltip" id="heroMidPriceTooltip">Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.</span></span></div>
+                            <div class="v4-hero-label" id="heroMidPriceLabel">Indicative Mid Price <span class="cc-help">?<span class="cc-tooltip" id="heroMidPriceTooltip">Observed or remembered midpoint for display only. No trusted market price is currently available.</span></span></div>
                             <div class="v4-hero-value data-pending" id="heroMidPrice">—</div>
                             <div class="v4-hero-sub data-pending" id="heroSpread">spread —</div>
                             <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 6px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
@@ -9910,7 +9910,7 @@
                 <div id="offersEmptyState" style="display:none; text-align:center; padding: 48px 24px; color: var(--text-tertiary);">
                     <div style="font-size: 2em; margin-bottom: 12px; opacity: 0.3;">📋</div>
                     <div style="font-size: 1em; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary);">No open offers</div>
-                    <div style="font-size: 0.85em;">Start the bot to begin market making, or wait for the next loop cycle.</div>
+                    <div id="offersEmptyStateMessage" style="font-size: 0.85em;">Start the bot to begin market making.</div>
                 </div>
                 <!-- Buy Offers -->
                 <div class="offers-section" id="buyOffersSection">
@@ -14906,6 +14906,8 @@
                     if (midPrice) v4RecordPrice(midPrice);
                 }
             }
+
+            updateHeroPriceProvenance();
 
             // Spread — from command centre spread data if available
             const heroSpread = document.getElementById('heroSpread');
@@ -24144,21 +24146,53 @@
                 .replace(/\.0+$/, '');
         }
 
-        function updateHeroPriceProvenance(confidence = {}) {
+        function updateHeroPriceProvenance(confidence = (_lastMarketConfidence || {}).confidence || {}) {
             const label = document.getElementById('heroMidPriceLabel');
             const tooltip = document.getElementById('heroMidPriceTooltip');
             if (!label || !tooltip) return;
-            const trustedMid = Number(confidence.trusted_mid || 0);
-            const trustedBid = Number(confidence.trusted_bid || 0);
-            const trustedAsk = Number(confidence.trusted_ask || 0);
-            const hasTrustedMarketPrice = trustedMid > 0 || (trustedBid > 0 && trustedAsk > 0);
-            const usesBootstrapAnchor = !!_bootstrapActiveCampaign && !hasTrustedMarketPrice;
+            const trustedMid = Number(confidence.trusted_midpoint || 0);
+            const state = String(confidence.state || 'RED').toUpperCase();
+            const hasTrustedMarketPrice = ['GREEN', 'AMBER'].includes(state)
+                && confidence.data_valid !== false
+                && Number.isFinite(trustedMid) && trustedMid > 0;
+            const anchor = Number(_bootstrapActiveCampaign?.anchor_price || 0);
+            const usesBootstrapAnchor = !!_bootstrapActiveCampaign && !hasTrustedMarketPrice
+                && Number.isFinite(anchor) && anchor > 0;
             label.firstChild.nodeValue = usesBootstrapAnchor
                 ? 'Bootstrap Anchor Price '
-                : 'Trusted Mid Price ';
+                : hasTrustedMarketPrice ? 'Trusted Mid Price ' : 'Indicative Mid Price ';
             tooltip.textContent = usesBootstrapAnchor
                 ? 'The approved campaign anchor used for bounded Bootstrap offers while no trusted external market price is available.'
-                : 'Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.';
+                : hasTrustedMarketPrice
+                    ? 'Current midpoint derived from fresh, attributable offer-book evidence.'
+                    : 'Observed or remembered midpoint for display only. No trusted market price is currently available.';
+            const price = document.getElementById('heroMidPrice');
+            if (price && currentCAT?.asset_id && (hasTrustedMarketPrice || usesBootstrapAnchor)) {
+                price.textContent = (hasTrustedMarketPrice ? trustedMid : anchor).toFixed(8);
+            }
+        }
+
+        function updateOffersEmptyState(data = bot_state) {
+            const empty = document.getElementById('offersEmptyState');
+            const message = document.getElementById('offersEmptyStateMessage');
+            if (!empty || !message) return;
+            const offers = data.offers || {};
+            const hasOffers = (offers.buy || []).length + (offers.sell || []).length > 0;
+            empty.style.display = hasOffers ? 'none' : 'block';
+            const confidence = (_lastMarketConfidence || {}).confidence || {};
+            const red = String(confidence.state || '').toUpperCase() === 'RED';
+            if (!data.running) {
+                message.textContent = 'Start the bot to begin market making.';
+            } else if (data.runtime_safety?.allowed === false) {
+                message.textContent = 'Bot is running, but runtime safety is blocking new offers. Check Safety & Limits for the recovery action.';
+            } else if (red && !_bootstrapActiveCampaign) {
+                const reasons = (Array.isArray(confidence.reason_codes) ? confidence.reason_codes : [])
+                    .map(code => String(code).replaceAll('_', ' ')).join(' · ');
+                message.textContent = 'Bot is running, but Follow offers are paused by RED market confidence'
+                    + (reasons ? ': ' + reasons : '') + '. Waiting for sufficient trusted market evidence.';
+            } else {
+                message.textContent = 'Bot is running. Waiting for the next eligible offer cycle; check Dashboard for readiness and safety status.';
+            }
         }
 
         function renderMarketConfidence(data = {}) {
@@ -24167,6 +24201,7 @@
             const metrics = data.metrics || {};
             const state = String(confidence.state || 'RED').toUpperCase();
             updateHeroPriceProvenance(confidence);
+            updateOffersEmptyState();
             const stateColor = state === 'GREEN'
                 ? 'var(--status-success)'
                 : state === 'AMBER'
@@ -24391,6 +24426,7 @@
                         heroMid.style.fontSize = '';
                         heroMid.style.color = '';
                     }
+                    updateHeroPriceProvenance();
                 }
             } catch (err) {
                 debugWarn('[MARKET SUMMARY] Fetch failed:', err.message);
@@ -25050,11 +25086,7 @@
             updatePnlFlowDiagnostics(data);
 
             // Show/hide empty state for offers view
-            const offersEmptyState = document.getElementById('offersEmptyState');
-            if (offersEmptyState) {
-                const hasOffers = (data.offers.buy.length + data.offers.sell.length) > 0;
-                offersEmptyState.style.display = hasOffers ? 'none' : 'block';
-            }
+            updateOffersEmptyState(data);
 
             // Logs — system log is now purely SSE-driven (addLogEntry via allowlist).
             // Status poll no longer overwrites the log panel.
@@ -28572,6 +28604,7 @@
                         heroMid.textContent = midStr;
                         heroMid.classList.remove('data-pending');
                     }
+                    updateHeroPriceProvenance();
                     const heroSpread = document.getElementById('heroSpread');
                     if (heroSpread) {
                         const ccSpread = document.getElementById('ccYourSpread');
@@ -39497,6 +39530,7 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
     updateHeroPriceProvenance((_lastMarketConfidence || {}).confidence || {});
+    updateOffersEmptyState();
     const bootstrapTicker = String(
         payload?.identity?.ticker || currentCAT?.ticker_id || currentCAT?.ticker || 'CAT'
     ).replace(/_XCH$/i, '').replace(/\/XCH$/i, '').trim() || 'CAT';

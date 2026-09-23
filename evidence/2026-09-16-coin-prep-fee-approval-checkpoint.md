@@ -979,7 +979,7 @@ the exact evidence named; an adjacent gate is not inferred from it.
 | Live MZ/XCH Follow offer lifecycle | RED confidence, 0.55 XCH eligible ask depth vs 4.012 required, one usable provider, no trusted midpoint and zero offers | Blocked by legitimate market safety; creation, publication, fill, requote, active Cancel All and remake **not tested** |
 | Bounded Bootstrap alternative | Real GUI preview showed exact asset/corridor/3-per-side bounded plan; no campaign started or wallet effect | Awaiting exact campaign confirmation before live exposure; subsequent Coin Prep would need its own displayed fee approval |
 | Original saved strategy and reserves | `pre-fee-live-acceptance` preset preserved; saved 45/45 tiered plan needs more MZ than current spendable balance | Not restored; a different strategy must not be silently substituted |
-| Frontend price/empty-offer copy | Live browser showed a numeric midpoint labelled trusted despite RED/null trusted midpoint, and a running empty Offers page instructed Start Bot | Identified defects, not fixed; bounded correction design pending approval |
+| Frontend price/empty-offer copy | Three new browser regressions reproduced the defects before the fix; all 106 Chromium E2E tests passed afterwards; live read-only reload verified indicative price and running-RED Offers explanation | Fixed in source frontend; refreshed Windows artifact still required |
 
 No row supports merging main, issuing a release, or telling the secondary PC
 that live trading acceptance is complete. The active source bot may continue
@@ -1034,3 +1034,41 @@ an active-offer cancellation test.
   mojos spent, zero held, zero unresolved, and dispatch authorization false.
   This is a read-only post-restart consistency check, not a new fee quote or
   Coin Prep run.
+
+## Acceptance goal resumed and frontend corrections (23 September 2026, ~14:00 BST)
+
+- The current task had no active goal, so a new acceptance-readiness goal was
+  created. The existing hourly automation was retargeted to this task rather
+  than duplicated. The user's existing authorization covers routine bug fixes
+  and tests; a further design-approval question was not needed for these
+  already-reproduced frontend defects.
+- Corrected price provenance to use the API's canonical `trusted_midpoint`.
+  A positive finite midpoint is labelled trusted only with GREEN/AMBER
+  confidence and no explicit invalid-data state. Otherwise an active valid
+  Bootstrap anchor is labelled as such, or the price is labelled indicative
+  and display-only. Status, summary and SSE price writes reapply provenance
+  so an indicative poll cannot overwrite a trusted/anchor number while
+  retaining the wrong label.
+- Corrected the Offers empty state to distinguish stopped, running under
+  runtime-safety refusal, running RED Follow, and waiting for an eligible
+  offer cycle. It renders actual confidence reasons as text and clears the
+  obsolete blocker on recovery. No wallet, fee, strategy or trading safety
+  logic was changed.
+- Test-first evidence: the three added browser regressions failed before
+  the production changes. The focused set then passed 4 tests, including
+  the existing Bootstrap label regression. Full Chromium E2E subsequently
+  passed **106 tests in 88.88 seconds**. A final punctuation-only correction
+  is covered by the same focused regression group.
+- A read-only reload of the running localhost app verified the fully loaded
+  Dashboard showing `0.00007500` as **Indicative Mid Price**, RED confidence,
+  zero active offers and zero bot errors. Offers showed the running-RED
+  explanation with the observed insufficient-ask-depth/provider reasons,
+  rather than asking to start an already-running bot. Browser console
+  returned no warning/error entries. Python server version remained
+  `1.3.21+199.g23b1c85`; this was a frontend reload, not a backend restart.
+- No wallet mutation, new fee approval, Bootstrap campaign or live trade
+  was performed in this correction pass. The earlier backend/full-package
+  evidence remains scoped to its recorded revision. A fresh package with
+  this frontend, the outstanding live ladder/cancel/remake/recovery gates,
+  and investigation of the separately noted advisory/listener copy remain
+  open. Do not claim overall acceptance readiness or merge main/release.

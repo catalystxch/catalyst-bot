@@ -741,6 +741,86 @@ def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     )
 
 
+def test_follow_price_provenance_tracks_confidence_and_status_updates(page):
+    """An indicative poll must never overwrite a trusted price or gain its label."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null,
+            reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+    expect(page.locator("#heroMidPriceTooltip")).to_contain_text("display only")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00007500")
+
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'RED', data_valid: false, trusted_midpoint: '0.00008'
+    }})""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+
+
+def test_bootstrap_price_provenance_uses_canonical_trusted_midpoint(page):
+    """The actual trusted_midpoint API field takes precedence over an anchor."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        _bootstrapActiveCampaign = {anchor_price: '0.0001'};
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Bootstrap Anchor Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00010000")
+
+
+def test_empty_offers_explains_running_follow_block_and_clears_on_recovery(page):
+    """Running RED Follow explains the blocker; recovery removes that message."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = true;
+        updateUI(bot_state);
+        renderMarketConfidence({confidence: {
+            state: 'RED', reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    empty = page.locator("#offersEmptyState")
+    expect(empty).to_contain_text("insufficient ask depth")
+    expect(empty).not_to_contain_text("Start the bot")
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+    }})""")
+    expect(empty).not_to_contain_text("insufficient ask depth")
+    expect(empty).to_contain_text("Bot is running")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        updateUI(bot_state);
+    }""")
+    expect(empty).to_contain_text("Start the bot")
+
+
 def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     """Reload must not paint Follow mode while a durable campaign is active."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
