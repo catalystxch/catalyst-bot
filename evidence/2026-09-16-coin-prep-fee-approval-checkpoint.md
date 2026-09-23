@@ -749,3 +749,25 @@ and no release or main merge was made during this checkpoint.
   external Coinset access disabled only in that test process. It passed in
   185.71 seconds, without the earlier Windows network exceptions. The live
   app configuration and fee source were not changed by this test setting.
+
+## Candidate handoff and broad rerun (23 September 2026)
+
+- The 103-case Chromium E2E suite passed again. The candidate branch
+  `codex/coin-prep-fee-approval` was published to GitHub at `7f39471` for
+  secondary-PC review; it has not been merged or released. The remote `main`
+  contains a separate squash commit of earlier v1.4 work, so branch history
+  is divergent and must be reconciled before a clean PR to `main`.
+- The live TEST 7 MZ/XCH GUI showed a new Coinset quote of
+  0.000994804981 XCH total maximum, including 0.000105776646 XCH protected
+  cancellation allowance. It expired without operator confirmation. The bot
+  remains stopped; no Coin Prep transaction was submitted. The operator was
+  asked to refresh and confirm a current maximum in CATalyst itself.
+- A hermetic broad Python rerun recorded 6,877 passed, one skipped, 422
+  subtests passed, and one failure in the unrelated desktop startup-arbiter
+  diagnostic server timing test after 18m59s. That test's spawned diagnostics
+  server did not become ready within its 30-second bounded wait, with empty
+  captured stdout/stderr. The same test passed once immediately afterward
+  and in three further isolated reruns (about nine seconds each). This is
+  evidence of an intermittent full-suite startup timing failure, not a clean
+  broad-suite pass; root cause remains unproven. Do not count the broad gate
+  as fully green or merge on this evidence.
