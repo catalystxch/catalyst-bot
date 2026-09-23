@@ -950,3 +950,17 @@ and no release or main merge was made during this checkpoint.
   `confidence.trusted_mid`, while the API field is `trusted_midpoint`. The
   frontend needs a distinct non-tradable/indicative label when confidence
   has no trusted midpoint; this is an identified correction, not yet a fix.
+
+## Empty-wallet Cancel All and fee-ledger restart check (23 September 2026)
+
+- With the exact TEST 7 Sage fingerprint, wallet ID 2 and MZ asset rechecked,
+  and zero buy/sell offers confirmed, the bot was stopped. The real
+  `/api/offers/cancel_all` empty-wallet path completed with `cancelled:0`,
+  `phase:complete`, `error:null` and “No offers found to cancel.” This proves
+  the harmless zero-offer path only; it does **not** prove bulk cancellation
+  of live offers or cancellation-fee reservations.
+- The bot was restarted and reported `running:true`, zero offers, runtime
+  safety ALLOWED and no new error logs. `/api/coin-prep/status` still reported
+  22,837,112 mojos spent, zero held and zero unresolved fee operations. No
+  additional spend or campaign authority was created. The RED market and
+  active-offer cancellation/requote/remake gates remain outstanding.
