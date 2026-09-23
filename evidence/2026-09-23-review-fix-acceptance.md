@@ -36,6 +36,30 @@ Counts overlap and must not be added into a claimed total. See
 and all intermediate failures. Run 68774 was deliberately interrupted at
 36% to fix the reproduced local-DNS dependency; it has no passing summary.
 
+### Default-suite skip and exclusion audit
+
+A separate default-mode audit on 23 September exited 0 with **157 skipped in
+1.19 seconds**: `python -m pytest tests/e2e tests/test_linux_desktop_smoke.py
+-q -rs`. Its log is `default-skip-audit-20260923.log` in the plan workspace.
+The reasons account for the full default run's skipped total:
+
+- 156 browser cases are opt-in (`--e2e`), not failed or unavailable. Their
+  separate enabled Chromium run already passed all 156 in 108.13 seconds.
+- One Linux desktop smoke-helper test requires POSIX-executable temporary
+  files and skips on Windows. Linux execution remains unverified here;
+  this is not evidence for the pending Windows native-window check.
+
+In addition, `tests/conftest.py` excludes eight standalone integration scripts
+from collection: `test_parallel_offers.py`, `test_spacescan.py`,
+`test_api_data_sources.py`, `test_all_apis.py`, `test_coin_prep.py`,
+`test_coin_prep_v2.py`, `test_hidden_coins.py`, and `test_offer_create.py`.
+These are outside the reported totals, not eight additional passing tests.
+They contain standalone diagnostics/live API or wallet operations; for example,
+the old offer script directly splits coins and creates offers. They were not
+executed as a substitute for the current approval-bound live acceptance workflow.
+No application code, skip rule, wallet, installed package or strategy changed
+during this audit.
+
 Source and bundled UI must match:
 `D70A871D6E58D24751092B80A9CE2AB40B58A63B44A6841A9CE77FF093BE2432`.
 Executable SHA-256 after successful build:

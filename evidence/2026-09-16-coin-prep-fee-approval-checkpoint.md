@@ -1639,3 +1639,20 @@ an active-offer cancellation test.
   active; this is substantial verified progress, not full acceptance completion.
 - Next work is the native/live acceptance handoff, not another unchanged full
   suite or replacement goal. Current audit: `2026-09-23-review-fix-acceptance.md`.
+
+### Post-commit acceptance audit — 23 September 2026
+
+- Verified local HEAD `d18c574`, code commit `bc7203d`, the expected feature
+  branch, clean tracked files and active goal before this documentation update.
+  No native-check result or new live acceptance receipt has arrived.
+- Audited the default suite's skipped total without repeating the full suite:
+  `python -m pytest tests/e2e tests/test_linux_desktop_smoke.py -q -rs` exited
+  0 with **157 skipped in 1.19 seconds**. The 156 opt-in browser cases match
+  the separately enabled 156-pass Chromium receipt; the remaining case is a
+  POSIX-only Linux desktop helper. The eight standalone live/diagnostic scripts
+  excluded by conftest are outside those totals and were not run.
+- The updated acceptance audit now explicitly records these limits. This
+  clarifies existing coverage; it does not complete native or live acceptance.
+  All test/build jobs are finished. Remaining native/operator and live-wallet
+  gates are unchanged. No financial action, strategy resize, installed-app
+  replacement, push, main merge or release occurred.
