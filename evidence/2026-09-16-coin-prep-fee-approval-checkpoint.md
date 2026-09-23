@@ -852,3 +852,19 @@ and no release or main merge was made during this checkpoint.
 - Restoring the exact prior strategy would require more MZ or a deliberate
   resize. Neither was silently imposed. Full app acceptance and the broad
   backend rerun remain open; no main merge or release is justified yet.
+
+## Full-suite confirmed-view fixture repair (23 September 2026)
+
+- The first hermetic full-suite rerun reached 6,878 passed, 104 skipped and
+  three failures in `test_coin_prep_confirmed_views.py`. Its synthetic
+  `database` module did not implement the newly required terminal fee
+  settlement method. The three failures reproduced in isolation (34 passed,
+  three failed). A no-fee, no-op settlement response was added to that
+  fixture, matching its other synthetic journal operations; the file then
+  passed all 37 tests. No production behavior was changed for this repair.
+- The subsequent full hermetic run (`COINSET_ENABLED=false`,
+  `python -m pytest tests -q -o log_cli=false --tb=short`) completed with
+  **6,881 passed, 104 skipped, 422 subtests passed, exit code 0** in
+  1,079 seconds. Ruff on `src/catalyst` and `tests` and `git diff --check`
+  also passed. This is a backend regression gate, not evidence that the
+  live bot/offer lifecycle or all native GUI actions have been exercised.

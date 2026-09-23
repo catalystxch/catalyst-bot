@@ -96,6 +96,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         fake_database.get_reserve_coins = lambda *args, **kwargs: []
         fake_database.mark_coins_gone = lambda *args, **kwargs: True
         fake_database.mark_unreserved_free_coins_gone_for_preparation = lambda: 0
+        fake_database.settle_terminal_coin_prep_fee_reservations = lambda: 0
         sys.modules["database"] = fake_database
 
         fake_wallet_sage = types.ModuleType("wallet_sage")
