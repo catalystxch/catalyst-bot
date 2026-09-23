@@ -975,7 +975,7 @@ the exact evidence named; an adjacent gate is not inferred from it.
 | Fee estimator, approval, dispatch and recovery regressions | Hermetic full backend run: 6,881 passed, 104 skipped, 422 subtests passed; browser E2E: 103 passed after terminal settlement | Passed automated regression scope, not live offer scope |
 | Fresh Windows artifact | Isolated v1.4.0 build from tracked source `37b72b4`, SHA-256 `2800E255B9C1A42AA75CDECEABC8DE675E6921698C5003DE7DD515B1312BAAF0`; packaged API, mock Sage RPC and desktop first-launch smokes | Passed isolated package scope; not installed as the live app |
 | Live TEST 7 identity and fee-approved Coin Prep | Sage mainnet fingerprint 736588221, wallet ID 2, exact MZ asset; two confirmed prep operations, 22,837,112 mojos spent, zero held/unresolved after restart | Passed for the bounded untiered test plan |
-| Bot start/stop and empty-book recovery | Start, stop, restart and zero-offer Cancel All returned healthy, with runtime safety ALLOWED and no duplicate fee accounting | Passed only the empty-book path |
+| Bot start/stop and empty-book recovery | Start, stop, restart and zero-offer Cancel All returned healthy; direct Cancel All while running returned HTTP 409 / `requires_stop:true`; runtime safety remained ALLOWED and fee accounting unchanged | Passed empty-book and running-bot refusal paths only |
 | Live MZ/XCH Follow offer lifecycle | RED confidence, 0.55 XCH eligible ask depth vs 4.012 required, one usable provider, no trusted midpoint and zero offers | Blocked by legitimate market safety; creation, publication, fill, requote, active Cancel All and remake **not tested** |
 | Bounded Bootstrap alternative | Real GUI preview showed exact asset/corridor/3-per-side bounded plan; no campaign started or wallet effect | Awaiting exact campaign confirmation before live exposure; subsequent Coin Prep would need its own displayed fee approval |
 | Original saved strategy and reserves | `pre-fee-live-acceptance` preset preserved; saved 45/45 tiered plan needs more MZ than current spendable balance | Not restored; a different strategy must not be silently substituted |
@@ -985,3 +985,11 @@ No row supports merging main, issuing a release, or telling the secondary PC
 that live trading acceptance is complete. The active source bot may continue
 monitoring without offers until the market becomes eligible or a deliberately
 authorized Bootstrap campaign is used.
+
+The live running-bot cancellation refusal was exercised separately after the
+matrix was first written: exact TEST 7 fingerprint 736588221, wallet ID 2,
+MZ asset and zero offers were rechecked; POST `/api/offers/cancel_all` returned
+HTTP 409 with `requires_stop:true` and the race explanation. The bot stayed
+running, the previous zero-offer Cancel All record did not restart, and fee
+accounting stayed 22,837,112 mojos spent, zero held/unresolved. This is not
+an active-offer cancellation test.
