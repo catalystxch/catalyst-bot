@@ -835,3 +835,20 @@ and no release or main merge was made during this checkpoint.
   package) passed packaged API and Sage RPC worker smoke. Executable SHA-256:
   `F9F73CB5BFB9BDA751407104AF6199288554C8FD44EF09B176CA31E6D7C1BA3D`.
   No main merge or release has occurred.
+
+## Post-prep GUI and strategy-restoration check (23 September 2026)
+
+- The full 103-case Chromium E2E suite passed again after the terminal-fee
+  settlement change. The live source GUI remained idle after Coin Prep, with
+  zero unresolved operations and no bot start.
+- Loaded the saved `pre-fee-live-acceptance` 97-field preset in the live GUI
+  and reselected the verified TEST 7 MZ/XCH pair. The saved strategy contains
+  45 offers per side, tiered sizing and a 12% preparation headroom. Current
+  available MZ is about 780,212, whereas the GUI estimates about 783,289 MZ
+  for 45 sell offers and about 1,443,319 MZ for all prepared sell coins. The
+  GUI correctly refused Save & Continue with insufficient-token warnings.
+  The preset remains saved but was **not** applied; the temporary bounded live
+  test settings remain active. No further wallet or offer effect occurred.
+- Restoring the exact prior strategy would require more MZ or a deliberate
+  resize. Neither was silently imposed. Full app acceptance and the broad
+  backend rerun remain open; no main merge or release is justified yet.
