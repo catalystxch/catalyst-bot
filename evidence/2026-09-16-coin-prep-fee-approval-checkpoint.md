@@ -1019,3 +1019,18 @@ an active-offer cancellation test.
 - The terminal Playwright CLI browser launch produced no page state and was
   stopped. The existing in-app localhost tab was used for the above observed
   state. No campaign, trade, cancellation or wallet mutation was made.
+
+## Live log and durable-fee follow-up (23 September 2026, ~13:09 BST)
+
+- The visible Logs tab showed the 12:53 bot start, successful Sage sync,
+  0/0 wallet offers, clean recovery, prepared coin readiness, and no new
+  ERROR entries. The startup `startup_baseline_zero` warning matched the
+  current RED/no-trusted-price market; `cancel_all_blocked_live` was the
+  deliberately exercised HTTP 409 guard, not an unexpected failure.
+- A fresh `/api/status` read reported `running:true`, 23 loops, zero bot
+  errors, zero buy/sell offers, wallet ID 2, the exact MZ asset, and runtime
+  safety ALLOWED. `/api/coin-prep/status` reported the already-approved
+  session complete and stale=false, two confirmed operations, 22,837,112
+  mojos spent, zero held, zero unresolved, and dispatch authorization false.
+  This is a read-only post-restart consistency check, not a new fee quote or
+  Coin Prep run.
