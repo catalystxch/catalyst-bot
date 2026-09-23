@@ -912,3 +912,28 @@ and no release or main merge was made during this checkpoint.
   remake gates therefore remain **unverified**, not passed. No campaign was
   created merely to force exposure, and neither the saved 97-field preset nor
   the installed/live package was overwritten. Main and release remain untouched.
+
+## Live Bootstrap review and frontend inspection (23 September 2026)
+
+- Rechecked the running source app: exact TEST 7 fingerprint 736588221,
+  mainnet Sage wallet ID 2 and the MZ asset above; runtime safety ALLOWED,
+  market confidence RED and zero active offers. In the real browser, the
+  Settings Bootstrap wizard accepted a **review-only** preview with a
+  0.000075 XCH/MZ anchor, 0.0000375–0.00015 fixed corridor, one-day expiry,
+  1 XCH market budget, 10,000 MZ market budget and 0.001 XCH fee budget. It
+  displayed the full 64-character asset ID, a 10% first stage and three offers
+  per side. Start Campaign remained disabled without exact-asset confirmation.
+  The unsaved mode selection was returned to Follow; `/api/bootstrap/status`
+  remained inactive. No new fee consent, campaign or wallet effect occurred.
+- The Dashboard's active-settings placeholders initially appeared after a
+  browser load, then hydrated from `/api/dashboard` to the correct 3/3,
+  45-second, two-sided settings; that is not a reproduced persistent bug.
+  However, while `/api/market/confidence` had **no trusted midpoint or
+  tradable range**, the Dashboard displayed a numeric 0.00007500 under
+  “Trusted Mid Price”. The number comes from an indicative/remembered market
+  price, so the current label can overstate its authority. The Offers tab's
+  zero-offer empty state also said “Start the bot” while the bot was running
+  and market confidence was RED. Both are frontend copy/provenance findings
+  requiring a bounded, tested correction; neither is evidence that offer
+  creation worked. The P&L tab displayed three Sage-confirmed historical buy
+  fills and zero round trips; their session wording needs separate review.
