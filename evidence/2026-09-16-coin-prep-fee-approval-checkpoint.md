@@ -883,3 +883,32 @@ and no release or main merge was made during this checkpoint.
   worker smoke passed with synthetic fingerprint, and clean/duplicate/
   persisted/native-safety desktop first-launch smokes passed. These run in
   isolated test data and do not establish live offer behavior.
+
+## Live source bot restart and RED market gate (23 September 2026)
+
+- The previous source server was gracefully stopped with `cancel_offers:false`
+  after confirming zero active offers. The current `23b1c85` source server was
+  started on port 5000. Sage v0.13.0 was reconnected to TEST 7 mainnet
+  fingerprint `736588221`, wallet ID 2, and exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+  Read-only balances were 138.472852133099 XCH and 780212.284 MZ. Coin Prep
+  remained complete with two confirmed operations, 22,837,112 mojos spent,
+  zero held and zero unresolved.
+- With the temporary bounded 3-buy/3-sell, 0.1-XCH untiered configuration,
+  `/api/bot/start` accepted the request, the trading loop cycled, startup
+  Sage synchronization found zero open offers, and runtime safety stayed
+  allowed. No buy or sell offer was created. A verified stop returned the bot
+  to `running:false`, and a second start returned it to `running:true` with
+  no stale offers or new fee holds.
+- This is an intentional market-safety block, not a passed offer-lifecycle
+  gate. Fresh `/api/market/confidence` evidence was RED/INVALID with
+  `out_of_range_depth_excluded`, `insufficient_ask_depth` and
+  `single_provider_dependency`. Eligible independent ask depth was only
+  0.55 XCH versus 4.012 XCH required. Dexie was valid but Splash's offer set
+  was empty/degraded, so there was no trusted bid, ask or midpoint. The bot
+  logged `startup_baseline_zero` and `market_confidence_no_trusted_price` and
+  correctly held new exposure/requotes at zero. Bootstrap was inactive.
+- The live offer creation, visibility, requote, Cancel All under load and
+  remake gates therefore remain **unverified**, not passed. No campaign was
+  created merely to force exposure, and neither the saved 97-field preset nor
+  the installed/live package was overwritten. Main and release remain untouched.
