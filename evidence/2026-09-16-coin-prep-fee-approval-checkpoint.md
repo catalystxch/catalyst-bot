@@ -973,7 +973,7 @@ the exact evidence named; an adjacent gate is not inferred from it.
 | Gate | Current evidence | Disposition |
 | --- | --- | --- |
 | Fee estimator, approval, dispatch and recovery regressions | Hermetic full backend run: 6,881 passed, 104 skipped, 422 subtests passed; browser E2E: 103 passed after terminal settlement | Passed automated regression scope, not live offer scope |
-| Fresh Windows artifact | Isolated v1.4.0 build from tracked source `37b72b4`, SHA-256 `2800E255B9C1A42AA75CDECEABC8DE675E6921698C5003DE7DD515B1312BAAF0`; packaged API, mock Sage RPC and desktop first-launch smokes | Passed isolated package scope; not installed as the live app |
+| Fresh Windows artifact | Exact tracked export `d6cec6d` built as v1.4.0; SHA-256 `00BAEE263AB7BE39F37E0B529E08BD0104B5E0AA7AAB89C905BBABD38D051CED`; packaged API, mock Sage RPC and interrupted-publication recovery passed | Latest package native-window launch blocked by tool policy, not passed; earlier native evidence belongs to `37b72b4`. Not installed as the live app |
 | Live TEST 7 identity and fee-approved Coin Prep | Sage mainnet fingerprint 736588221, wallet ID 2, exact MZ asset; two confirmed prep operations, 22,837,112 mojos spent, zero held/unresolved after restart | Passed for the bounded untiered test plan |
 | Bot start/stop and empty-book recovery | Start, stop, restart and zero-offer Cancel All returned healthy; direct Cancel All while running returned HTTP 409 / `requires_stop:true`; runtime safety remained ALLOWED and fee accounting unchanged | Passed empty-book and running-bot refusal paths only |
 | Live MZ/XCH Follow offer lifecycle | RED confidence, 0.55 XCH eligible ask depth vs 4.012 required, one usable provider, no trusted midpoint and zero offers | Blocked by legitimate market safety; creation, publication, fill, requote, active Cancel All and remake **not tested** |
@@ -1072,3 +1072,43 @@ an active-offer cancellation test.
   this frontend, the outstanding live ladder/cancel/remake/recovery gates,
   and investigation of the separately noted advisory/listener copy remain
   open. Do not claim overall acceptance readiness or merge main/release.
+
+## Fresh exact-export package verification (23 September 2026, ~14:06 BST)
+
+- Previous goal turn was progress: frontend corrections and tests were
+  committed and pushed as `d6cec6d1a96ee7484fe0cd6bf756227dfc45ed36`.
+  This continuation exported that exact revision with `git archive` into
+  `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/candidate-d6cec6d`
+  and used the repository's `python build.py --no-clean` entry point in
+  that initially empty export. No existing build, installed package or
+  runtime profile was replaced.
+- Build exit 0, executable v1.4.0, SHA-256
+  `00BAEE263AB7BE39F37E0B529E08BD0104B5E0AA7AAB89C905BBABD38D051CED`.
+  The executable is at `candidate-d6cec6d/dist/Catalyst/Catalyst.exe`
+  below the above plan workspace. Source and bundled `bot_gui.html` both
+  have SHA-256
+  `86D9D5EB55248A77B5E7B3C6E84FED824F7ECB6DA034E9739EE01958D1BD8D09`.
+  HTML and certifi checks passed. The known PyInstaller warning about
+  `importlib_resources.trees` was emitted; it did not fail the build.
+  The optional upstream Splash executable is absent from the tracked
+  export/package, so these results do not prove bundled Splash operation.
+- `python scripts/packaged_api_smoke.py --exe dist/Catalyst/Catalyst.exe
+  --timeout 90` passed all eight endpoint contracts with a mock Sage and
+  isolated runtime data; the packaged health response reported v1.4.0.
+- `python scripts/packaged_sage_rpc_smoke.py --exe
+  dist/Catalyst/Catalyst.exe --timeout 90` passed, using synthetic
+  fingerprint 123456789 and loopback mock TLS RPC, not the live wallet.
+- `python scripts/packaged_upgrade_publication_recovery_smoke.py --exe
+  dist/Catalyst/Catalyst.exe --timeout 90` passed. It verified stale-owner
+  lease replacement, retryable undispatched claims, and suppression of an
+  ambiguous prior publication without retaining stale claim authority.
+  This is synthetic interrupted-publication recovery, not live fee or
+  live active-offer cancellation evidence.
+- The Windows computer-use surface could enumerate windows, but the
+  attempted shell launch of this package with a new isolated profile on
+  port 5097 was rejected by tool policy before execution. No alternate
+  launch route was attempted. Native clean/duplicate/persisted/safety
+  window verification for this exact artifact remains **unverified**.
+  Existing `scripts/packaged_desktop_first_launch_smoke.py` is available
+  for a user-run isolated native check. No new fee budget, campaign,
+  wallet transaction, main merge or release was created.
