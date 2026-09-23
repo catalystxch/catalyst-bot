@@ -1418,3 +1418,224 @@ an active-offer cancellation test.
   The earlier native handoff is explicitly marked baseline-only/superseded.
 - Broad Chromium 30297 completed, exit 0: **148 passed in 99.56 seconds**.
   Only changed-source default run 23219 remains active at this checkpoint.
+
+### Exact `028e096` package and renewal reproduction
+
+- The tracked `028e096a36af2624d3d01141e1e11e6ca296ca77` archive built
+  successfully (14963, exit 0). Executable SHA-256:
+  `77897754BDAF8DC3A464A4B5657202DE98959B2DF7F44740F291F877F9CFAD67`.
+  Source/bundled HTML agree at
+  `6FE5D2C65AF584C1D0AB5EB83820072500DD9E427A0A3C683F7D1B17D7B1A015`.
+- Packaged API/Sage RPC (88796), interrupted-publication recovery (88656)
+  and compiled fee rejection probes (23920) all exited 0. The rejection probe
+  accepts an explicit candidate directory; this run used `candidate-028e096`.
+  Its synthetic wallet observed no effectful RPC. The native-window gate is
+  not covered by these probes, and no installed/live runtime was replaced.
+- Default suite 23219 remains running against unchanged production source.
+  New isolated renewal regressions reproduced missing cumulative commitments
+  and retained protection: seven backend failures, two browser failures.
+  Logs: `renewal-budget-red.log`, `renewal-budget-browser-red.log`.
+  These expected red regressions are not yet fixed at this checkpoint.
+
+### Renewal, restart and fragmented-wallet corrections — 23 September afternoon
+
+- The preceding unchanged-source statement is superseded: renewal/recovery
+  fixes were applied while default suite 23219 was still running. That run is
+  intermediate evidence only. It ended **3 failed, 6,929 passed, 149 skipped,
+  422 subtests in 1,329.40 seconds**. All three failures and their dispositions
+  are named in `2026-09-23-fee-whole-feature-review.md`: stable-source reruns
+  passed the diagnostics ownership and source-inspection cases; the outdated
+  cancellation fixture was changed to real executable CAT2/native effects.
+  Cancellation regression group: **19 passed in 1.48 seconds**. No safety
+  assertion or production executable validation was removed to obtain green.
+- Renewal now preserves prior cancellation protection and held/spent amounts
+  in the displayed cumulative budget. The original ledger still enforces the
+  cap atomically. **129 backend/ledger/API tests passed** after seven red
+  regressions, with two browser renewals reproduced before their correction.
+- Stationary recovery now polls unresolved effects and exposes explicit
+  review only after authoritative resolution. Fresh status and unchanged
+  canonical scope/plan are required; review does not approve/launch. Saved
+  multiplier/target choices are used both for preview and launch. Status and
+  choices group: **75 passed**; broad Chromium: **155 passed in 122.80 seconds**.
+  No synthetic operator action in browser tests is a live fee consent.
+- Fragmented-wallet simulations reproduced the post-CAT prerequisite refusal
+  before the production fix. Exact pricing/hold reconstruction now support
+  the disclosed bounded XCH consolidation, including native-first previews.
+  Four 61/153-root scenarios run real unsigned CLVM inspection, worker claims,
+  exact fee holds, journal confirmation, settlement and completion; only the
+  external wallet is synthetic. Related group: **90 passed in 78.39 seconds**.
+  Additional over-eight-batch plans were reproduced as falsely confirmable;
+  preview and worker now share that limit and refuse them before any effect.
+- Provider failure diagnostics now survive full-node/Coinset -> exact/projected
+  estimates -> HTTP/native -> GUI. Twenty endpoint cases plus sanitization
+  failed before correction, then **21 passed**. Raw transport secrets and
+  arbitrary text are not exposed. Focused browser fee workflow: **24 passed
+  in 17.43 seconds**. Duration copy no longer promises total completion in
+  five minutes; 300 seconds is an inclusion target per transaction.
+- New final-source full regression, refreshed package, exact-candidate native
+  and live-cycle acceptance are not yet complete. `028e096` package evidence
+  predates these changes. No live wallet action, fee consent, campaign,
+  strategy resize, installed update, main merge or release occurred.
+
+### Frozen review-fix verification in progress
+
+- Combined fee/backend/API regression group ended normally: **318 passed in
+  150.43 seconds** (89942, exit 0). Additional worker-bound/staged regression:
+  **44 passed in 67.52 seconds** (10609, exit 0). Ruff and diff checks passed.
+- Source is frozen for the default full run **68774**, logging to
+  `review-fixes-full-final.log`, and broad Chromium **60812**, logging to
+  `review-fixes-e2e-final.log`. Do not edit production/tests during this run
+  or substitute the earlier intermediate suite. No duplicate full run.
+- An isolated candidate directory, `candidate-review-fixes-20260923`, contains
+  tracked HEAD `028e096` plus the working corrections and the new fragmented
+  execution test. It is **not a committed/released version**. Tracked
+  non-doc/evidence files plus that test (529 total after deduplication) were
+  byte-checked against the working tree. Manifest SHA-256, sorted path plus
+  file SHA-256 joined by LF:
+  `22C9D194FBF6E4514189B4D0368249E65DE6F099CE5541EAD7EEC5A0FE5BB8F3`.
+  Initial `git archive` LF versus checkout CRLF mismatch was corrected by
+  copying the tracked checkout bytes; no application source changed.
+- Build handle **84068**, `candidate-review-fixes-20260923-build.log`, is
+  provisional: final byte-copy verification overlapped its initial startup.
+  Re-run the build after that handle terminates before claiming exact-artifact
+  proof. All package smoke tests, native-window and live gates remain pending
+  for this new candidate. Existing packages and user files are preserved.
+
+### Refreshed package receipts and full-suite interruption investigation
+
+- Broad Chromium **60812** exited 0: **156 passed in 108.13 seconds**.
+- After provisional build 84068 and byte-copy verification both ended, a
+  second `build.py --no-clean` run **30149** exited 0 from the isolated
+  `candidate-review-fixes-20260923` snapshot. This second build is the current
+  artifact receipt; no executable hash from the provisional build is used.
+  Executable SHA-256:
+  `DEE0E105D81BCAB04615E1E572B9462652EE073D719A1C5E0C8B318294005EA4`.
+  Source and bundled HTML SHA-256:
+  `D70A871D6E58D24751092B80A9CE2AB40B58A63B44A6841A9CE77FF093BE2432`.
+- Packaged API (8 endpoints) and synthetic Sage mTLS worker **96294**, plus
+  interrupted-publication recovery **71255**, exited 0. The compiled fee
+  preview/approval/bypass rejection probe also exited 0 and observed no
+  effectful mock-wallet RPC. These are isolated package checks, not live
+  wallet or native-window acceptance. Logs use the
+  `candidate-review-fixes-20260923-` prefix in the plan workspace.
+- Tracked-secret scan passed. The documented `importlib_resources.trees`
+  build warning remains; build success does not prove an error-free runtime.
+- Full default run **68774** is not passed: after 31% it emitted Windows
+  exception `0x80320012` at `socket.getfqdn()` in `mutation_gate.pid_liveness`
+  during `test_os_pid_liveness_is_fail_closed_for_remote_host_and_current_process`.
+  The process is still present; no terminal pytest result exists. Investigate
+  the hostname-resolution stall before claiming the final backend gate.
+- Native window and full live TEST 7 cycle remain open. No live fee consent,
+  campaign action, strategy resize, installed replacement, merge or release.
+
+### Windows ownership-check DNS dependency reproduced
+
+- The interrupted-progress statement above is clarified: run 68774 resumed
+  after Windows' resolver delay, reaching 36%. A separate read-only
+  `socket.getfqdn()` process exceeded its explicit 15-second deadline. The
+  observed exception alone did not terminate pytest and is not a pytest failure
+  count. We deliberately interrupted **68774** (exit 1, no suite summary) before
+  changing source to fix this reproduced dependency. It is incomplete evidence,
+  not a passed full run. No concurrent replacement full run was started.
+- `pid_liveness` eagerly resolved an FQDN even for an exact local hostname.
+  Eight new tests first failed, including unavailable hostname evidence and
+  Windows configured-name/remote-name cases. Local-host proof now short-circuits
+  and Windows uses `GetComputerNameExW(ComputerNamePhysicalDnsFullyQualified)`;
+  unfamiliar hosts and API errors still return uncertain rather than dead.
+  This avoids network-dependent ownership checks without permitting takeover
+  on missing evidence or treating a cluster virtual name as physical PID proof.
+  [Microsoft API documentation](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getcomputernameexw)
+  describes these as locally configured names established from the registry.
+- Focused ownership regression **98465** is running. Logs:
+  `hostname-liveness-red.log` (8 failed as expected),
+  `hostname-liveness-green.log` (pending). Ruff/diff checks passed. The exact
+  refreshed package above predates this ownership correction and will need a
+  new snapshot/build before final acceptance. No native/live action occurred.
+
+### Runtime and preflight ownership correction verified; final run restarted
+
+- The runtime-only fix passed 255 tests but left two startup diagnostics
+  timeouts. Inspection found the same eager DNS lookup in read-only preflight.
+  Parameterizing the regression over both entry points produced eight more
+  failures. A shared standard-library-only `local_host_identity.py` now gives
+  both paths the same physical-host proof without writable application imports.
+- **52980 exited 0: 265 passed in 119.16 seconds**. Both earlier startup
+  timeouts passed without increasing their deadlines or changing takeover
+  rules. All 16 runtime/preflight hostname cases passed; unknown/foreign hosts
+  and name-read failures remain uncertain, not evidence that an owner died.
+- New default full suite **4916** started at approximately 15:27 UTC, logging
+  to `review-fixes-dns-full-final.log`. Production and tests are frozen.
+  No other full-suite process remains running. Ruff, diff and tracked-secret
+  checks passed for current working files.
+- Fresh candidate `candidate-review-fixes-dns-20260923` contains HEAD `028e096`
+  plus all working corrections. Copy verification **57980** exited 0 after
+  matching all 531 non-doc/evidence source/test/resource files. Manifest
+  SHA-256 (sorted `path SHA256` lines joined by LF):
+  `ED0A9DDB1DCC702AD60B866C5FEC550E434042617497224E95BB123F31486904`.
+  This includes the new fragmented execution tests, hostname tests and shared
+  identity module. It is not yet a commit or release. Build starts only after
+  copy verification finishes; older hashes are not this artifact's identity.
+- A read-only observation of the existing, earlier localhost runtime at
+  approximately 15:25 UTC reported running=true, 280 loops, zero loop errors,
+  no active buy/sell offers, correct MZ asset and wallet ID 2. Its three fills
+  are historical September 15 receipts, not this candidate's live evidence.
+  No wallet mutation, current campaign consent or installed-app replacement.
+
+### Exact new build and corrected isolated package probes
+
+- Build **58429** exited 0. Executable SHA-256:
+  `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
+  Bundled UI still matches source:
+  `D70A871D6E58D24751092B80A9CE2AB40B58A63B44A6841A9CE77FF093BE2432`.
+  Direct Python archive inspection confirms `local_host_identity` is included.
+- Initial API/fee-rejection probes **63465/44792** exited 1 (doctor timeout).
+  Logs exposed invalid mock client certificate names and fallback toward the
+  host's Sage discovery roots. No effectful wallet RPC was requested. New
+  fixture/real-selector and strict-authentication cases failed first (6 red).
+  Correcting those exposed the mock's unsupported Sage 0.12.0; probes
+  **64224/98484** still exited 1. Two more tests reproduced unsupported version
+  and inherited public exchange probes. These are test-harness defects, not
+  permission failures or reasons to weaken app certificate/version validation.
+- Corrected worktree helpers generate the real Sage-shaped synthetic pair in
+  `sage-data/ssl/wallet.crt` and `wallet.key`, isolate Windows discovery roots,
+  advertise mock Sage 0.13.0, require actual authentication before/after startup,
+  and make exchange diagnostics localhost-only. **14 helper tests passed in
+  3.64 seconds**, with Ruff/diff checks passing. No app runtime code changed.
+- Re-runs against the same immutable EXE exited 0: 8-endpoint API + synthetic
+  Sage worker, compiled fee preview/approval/trigger rejection with no effectful
+  mock RPC, and interrupted-publication recovery. Final logs are
+  `candidate-review-fixes-dns-20260923-{api-smoke,sage-smoke,fee-gates,upgrade-smoke}-final.log`.
+  The original build snapshot keeps its old helper scripts; final probes used
+  the corrected worktree harness. Full run **4916** continues against frozen
+  app source, but predates the eight new harness cases. Report their separate
+  14-test result, not a fabricated full-suite total covering them.
+- Current native command is in `2026-09-23-review-fix-native-check.md`; opening
+  it in Codex returned queued, not confirmed visible. An asynchronous operator
+  request was sent. No result yet. Full backend, native and live-cycle gates
+  remain open. No commit/push/main/release or installed replacement.
+
+### Final software results and durable code commit — approximately 15:45 UTC
+
+- Full default **4916 exited 0**: **6,981 passed, 157 skipped, 422 subtests
+  passed in 1,037.25 seconds**. It ran against unchanged app/runtime source.
+  The new test-helper cases were not in its initial collection; the separately
+  verified 14-helper-test result covers those and is not added to its total.
+- Broad Chromium: **156 passed**; final current-executable API/Sage/upgrade
+  recovery and fee rejection probes passed. Executable and UI hashes remain
+  `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223` and
+  `D70A871D6E58D24751092B80A9CE2AB40B58A63B44A6841A9CE77FF093BE2432`.
+- Post-build comparison found only the two corrected test helper scripts
+  differed from the immutable snapshot, plus their newly added regression file.
+  Application/resources stayed byte-identical. The exact current runtime
+  corrections, tests and helper fixes are committed locally as
+  **`bc7203d8f1c8ce29e6bb9fab8980422c6688d0ba`**. Before commit, staged-source
+  Ruff, diff and tracked-secret checks passed. Unrelated build/user artifacts
+  were not staged or removed. Nothing was pushed or merged into main.
+- The native operator check was requested with the exact current executable.
+  No result has arrived. Live TEST 7 campaign/fee confirmation, current-candidate
+  Coin Prep and full trading/cancel/remake/restart receipts remain open. Prior
+  live/source evidence cannot substitute for these. Saved strategy/reserves
+  and the existing app were preserved. Goal and hourly continuation remain
+  active; this is substantial verified progress, not full acceptance completion.
+- Next work is the native/live acceptance handoff, not another unchanged full
+  suite or replacement goal. Current audit: `2026-09-23-review-fix-acceptance.md`.
