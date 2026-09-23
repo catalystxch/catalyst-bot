@@ -16936,6 +16936,15 @@
             const sc = dashboard.spacescan_context || dashboard.spacescan || {};
             const trading = s.trading || {};
             const safety = s.safety || {};
+            // Legacy market_health may remain green while Follow has withdrawn
+            // every offer. Only the attributable confidence snapshot can support
+            // price-based advice; a zero effective target is not a live ladder.
+            const confidence = (_lastMarketConfidence || {}).confidence || {};
+            const confidenceState = String(confidence.state || '').toUpperCase();
+            const trustedMid = Number(confidence.trusted_midpoint || 0);
+            const hasTrustedMarketContext = ['GREEN', 'AMBER'].includes(confidenceState)
+                && confidence.data_valid !== false
+                && Number.isFinite(trustedMid) && trustedMid > 0;
 
             // F62 (2026-04-10): suppress all advice until the bot has settled
             // after a restart. During the first few cycles, data is stale or
@@ -17097,6 +17106,7 @@
                 Math.round(competitorBps / 50) * 50
             ].join(':');
             const closeGapCandidate = isRunning
+                && hasTrustedMarketContext
                 && !ladderStillBuilding
                 && liveOpenBuys > 0
                 && liveOpenSells > 0
@@ -17109,6 +17119,7 @@
                 && closeGapWideEnough
                 && uptimeSecs >= 900;
             const closeGapHoldAllowed = isRunning
+                && hasTrustedMarketContext
                 && !ladderStillBuilding
                 && !_gapCloserActive
                 && !_spreadCooldownActive
@@ -17159,6 +17170,7 @@
             const buyDynamicBps = parseFloat(mhMetrics.buy_spread_bps ?? 0) || 0;
             const sellDynamicBps = parseFloat(mhMetrics.sell_spread_bps ?? 0) || 0;
             const maxSpreadClampActive = isRunning
+                && hasTrustedMarketContext
                 && dynamicSpreadsEnabled
                 && maxBps > 0
                 && (buyDynamicBps >= maxBps - 0.5 || sellDynamicBps >= maxBps - 0.5);
@@ -17176,7 +17188,7 @@
 
             const hardMax = parseFloat(safety.hard_max_price) || 0;
             const hardMin = parseFloat(safety.hard_min_price) || 0;
-            const currentMid = parseFloat(bot_state?.pricing?.mid) || 0;
+            const currentMid = hasTrustedMarketContext ? trustedMid : 0;
             if (currentMid > 0 && hardMax > 0 && currentMid > hardMax) {
                 const pctOver = (((currentMid - hardMax) / hardMax) * 100).toFixed(1);
                 pushSuggestion({
@@ -17294,7 +17306,7 @@
             // is long enough that sparse fills are surprising.
             const _fillsVerySparse = totalFills === 0
                 || (fillsHr > 0 && fillsHr < 0.2 && totalFills < Math.max(3, uptimeSecs / 14400));
-            if (isRunning && uptimeSecs > 7200 && _fillsVerySparse && liveOpenBuys > 0 && liveOpenSells > 0) {
+            if (isRunning && hasTrustedMarketContext && uptimeSecs > 7200 && _fillsVerySparse && liveOpenBuys > 0 && liveOpenSells > 0) {
                 const _hoursUp = Math.round(uptimeSecs / 3600);
                 const _fillsCopy = totalFills === 0
                     ? 'zero fills'
@@ -17307,7 +17319,20 @@
                 });
             }
 
-            if (ladderStillBuilding && !isRecoveryGuidanceActive()) {
+            if (!hasTrustedMarketContext) {
+                const reasons = (Array.isArray(confidence.reason_codes) ? confidence.reason_codes : [])
+                    .map(code => String(code).replaceAll('_', ' ')).join(' · ');
+                pushSuggestion({
+                    type: 'info',
+                    icon: '...',
+                    msg: _bootstrapActiveCampaign
+                        ? 'No trusted external market price is available. Bootstrap uses its approved anchor and campaign limits; ordinary spread recommendations are paused.'
+                        : confidenceState === 'RED'
+                            ? 'Follow offers are paused by RED market confidence' + (reasons ? ': ' + reasons : '') + '. Tightening spreads cannot resolve missing trusted market evidence.'
+                            : 'Waiting for trusted market evidence before recommending spread changes.',
+                    action: null
+                });
+            } else if (ladderStillBuilding && !isRecoveryGuidanceActive()) {
                 pushSuggestion({
                     type: 'info',
                     icon: '...',
@@ -24202,6 +24227,7 @@
             const state = String(confidence.state || 'RED').toUpperCase();
             updateHeroPriceProvenance(confidence);
             updateOffersEmptyState();
+            if (window._lastDashboard) saUpdateAdvisor(window._lastDashboard);
             const stateColor = state === 'GREEN'
                 ? 'var(--status-success)'
                 : state === 'AMBER'

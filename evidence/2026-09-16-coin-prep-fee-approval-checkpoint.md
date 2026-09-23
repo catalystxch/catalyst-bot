@@ -1112,3 +1112,38 @@ an active-offer cancellation test.
   Existing `scripts/packaged_desktop_first_launch_smoke.py` is available
   for a user-run isolated native check. No new fee budget, campaign,
   wallet transaction, main merge or release was created.
+
+## Advisor confidence regression (23 September 2026, ~14:12 BST)
+
+- Read-only live `/api/dashboard` showed legacy health `green`, effective
+  buy/sell targets 0, open offers 0, and fill rate 0 while the authoritative
+  confidence endpoint/UI was RED. The advisor treated zero effective targets
+  as a completed ladder and diagnosed missing fills as a spread problem.
+  It also retained a previously rendered tighten button after a confidence
+  update and could describe an indicative price as executable.
+- Five new Chromium cases reproduced misleading tighten/widen advice and
+  stale actions before implementation. A sixth reproduced a spread-cap
+  adjustment recommendation under RED. An independent wallet-connectivity
+  warning characterization passed before and after the fix.
+- Price-based advisor branches now require a positive finite trusted
+  midpoint, GREEN/AMBER confidence and no invalid-data flag. RED Follow
+  explains the actual confidence reasons; an active Bootstrap campaign
+  explains that it uses an approved anchor rather than trusted external
+  pricing. Wallet, coin and other independent safety warnings are preserved.
+  Confidence updates immediately recompute existing recommendations, and
+  recovery is covered by a real rendered-action transition test. This only
+  changes guidance; no strategy or trading gate is weakened.
+- Verification: **7 focused tests passed**, then **113 full Chromium E2E
+  tests passed in 94.81 seconds**; **92 frontend/build/post-Tibet contract
+  tests passed**. Ruff on the new test file and `git diff --check` passed.
+- Live browser reload verified RED Follow explanation instead of the
+  former quiet-market/tighten advice, no spread-change recommendation,
+  and Indicative Mid Price. Browser console returned no errors/warnings.
+  No wallet action was performed. The `d6cec6d` package remains valid only
+  for its recorded source; this subsequent frontend fix needs a refreshed
+  package before final handoff.
+- The separately noted Thin Side discrepancy is not yet a confirmed
+  calculation defect: Market Intel uses its near-market `depth_buys` and
+  `depth_sells`, while confidence uses eligible independent-depth evidence.
+  Different filtering can produce different answers; no computation was
+  changed on that basis.
