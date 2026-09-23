@@ -935,5 +935,18 @@ and no release or main merge was made during this checkpoint.
   zero-offer empty state also said “Start the bot” while the bot was running
   and market confidence was RED. Both are frontend copy/provenance findings
   requiring a bounded, tested correction; neither is evidence that offer
-  creation worked. The P&L tab displayed three Sage-confirmed historical buy
-  fills and zero round trips; their session wording needs separate review.
+  creation worked. The P&L tab displayed three Sage-confirmed buy fills and
+  zero round trips. `/api/dashboard` gets these through `get_stats(...,
+  since=_get_run_history_cutoff())`, where the cutoff is the last explicit
+  fresh-run event, not the bot process start; the three fills are therefore
+  compatible with the app's persisted run scope rather than a new fill from
+  this zero-offer restart.
+- Root-cause tracing for the price label found that `/api/market/summary`
+  supplies an indicative 0.000075 midpoint from the visible book while
+  `/api/market/confidence` has `trusted_midpoint:null` and RED confidence.
+  `v4UpdateHeroStrip` and the summary/SSE updaters can render that numeric
+  midpoint, but `updateHeroPriceProvenance` leaves the label “Trusted Mid
+  Price” whenever there is no active Bootstrap campaign. It also reads
+  `confidence.trusted_mid`, while the API field is `trusted_midpoint`. The
+  frontend needs a distinct non-tradable/indicative label when confidence
+  has no trusted midpoint; this is an identified correction, not yet a fix.
