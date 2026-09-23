@@ -1354,3 +1354,67 @@ an active-offer cancellation test.
   not used to regenerate economic targets on approved direct dispatch. Its
   unsupported mutation fallback remains closed. Broader final-source backend,
   refreshed Windows package/native and live-offer gates remain incomplete.
+
+### Exact `0ad637e` Windows candidate and regression rerun
+
+- Committed the bounded sizing/disclosure corrections as
+  `0ad637e84a47db7d94aeb936a895b734f5df7ec8` on the existing feature branch.
+  This is not a main merge, release, installed upgrade or readiness claim.
+- The previous default run (77347) exited 0: **6,881 passed, 138 skipped,
+  422 subtests passed in 1,224.54 seconds**. It started before the backend
+  spare-count correction, so a new default run was started only after it
+  ended. Final-source run **40526** logs to `candidate-0ad637e-full.log`;
+  completion remains pending. Do not substitute the earlier result for it.
+- Exported exactly the tracked commit with `git archive` into the new isolated
+  `candidate-0ad637e` directory under this plan's ignored workspace. Existing
+  builds, installed package and user data were preserved. `python build.py
+  --no-clean` exited 0 (session 57808), package version v1.4.0.
+- Packaged executable SHA-256:
+  `3C5FC6155D3B1BA0E0CD46FDE09D0CBFD8DB79267F3A3D3F665C4E7AFE2EFD1F`.
+  Source and bundled `bot_gui.html` both hash to
+  `DB933827F5BF55BC51EB798DB601F71A9BB4A8AA6EBE69C76A6A55509AB7B23D`.
+- Exact-artifact packaged API (8 endpoints), synthetic Sage mTLS worker and
+  upgrade-interrupted publication recovery scripts all exited 0. Additional
+  isolated rejection probes exercised the compiled fee-preview, fee-approval
+  and trigger endpoints: forbidden caller fee/cost options and malformed
+  approval returned HTTP 400; missing approval returned HTTP 409. Each asserted
+  the specific reason, `success:false`, and `dispatch_authorized:false`.
+  The synthetic wallet received only initialization/read RPCs, no effect RPC.
+  Probe source and receipts are in this plan's workspace as
+  `candidate_fee_gate_probe.py` and `candidate-0ad637e-*-smoke.log` /
+  `candidate-0ad637e-fee-gates.log`.
+- The build retains the known `importlib_resources.trees` hidden-import
+  warning. This package was not native-window tested or installed: the prior
+  native launch policy restriction was not bypassed with another launch path.
+  The current live instance remains the earlier source runtime and the user's
+  original browser draft was not refreshed. Live Bootstrap activation,
+  active-offer lifecycle and exact-candidate native checks remain unverified.
+
+### Whole-feature review and fee-safety corrections — 23 September
+
+- Baseline 40526 ended normally, exit 0: **6,884 passed, 147 skipped,
+  422 subtests in 1,122 seconds**. No test failure was inferred from expected
+  injected-error logs. This result is for `0ad637e`, before this correction.
+- Independent review found executable cancellation-summary disagreement,
+  staged fragmented-XCH execution failure, renewal protection/ceiling gaps,
+  stationary recovery UI and unsynced-provider guidance. Full disposition:
+  `evidence/2026-09-23-fee-whole-feature-review.md`.
+- Reproduced cancellation mismatches test-first with real CLVM, including
+  zero fee, fee component, destination changes and sealed/unsealed routes.
+  Common validation now binds executable effects; duplicate ordinary-path
+  validation delegates to it. **169 cancellation/journal tests passed**.
+- Network health evidence is now strict: explicitly unsynced or malformed
+  metadata cannot supply usable guidance. Missing data stays unknown, observed
+  zero stays zero, and preview/browser diagnostics preserve large exact fee
+  totals. **199 related backend/API tests and 16 focused browser tests passed**.
+  First browser invocation omitted opt-in and skipped two new cases; corrected
+  `--e2e` invocation proved both red before their UI change. These are automated
+  synthetic tests, not actual wallet operations or native-window proof.
+- Changed-source default suite **23219** (`fee-safety-review-full.log`) and
+  broad Chromium **30297** (`fee-safety-review-e2e.log`) are running. No duplicate
+  full run; preserve handles until terminal status. Ruff and diff checks pass.
+- Remaining integration fixes are not blocked by live consent. No main merge,
+  release, installed update, new wallet effect or campaign activation occurred.
+  The earlier native handoff is explicitly marked baseline-only/superseded.
+- Broad Chromium 30297 completed, exit 0: **148 passed in 99.56 seconds**.
+  Only changed-source default run 23219 remains active at this checkpoint.

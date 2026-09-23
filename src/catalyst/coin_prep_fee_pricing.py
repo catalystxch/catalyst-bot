@@ -10,7 +10,7 @@ import time
 from coin_prep_batch_plan import BatchConstraints, BatchRefusal, plan_batch
 from coin_prep_targets import MAX_ATOMIC_AMOUNT
 from coin_prep_unsigned import inspect_batch_unsigned
-from fee_estimation import QUOTE_MAX_AGE_SECONDS, quote_fee
+from fee_estimation import QUOTE_MAX_AGE_SECONDS, fee_quote_network_evidence, quote_fee
 
 
 def _now():
@@ -24,6 +24,10 @@ def _integer(value, minimum=0, maximum=MAX_ATOMIC_AMOUNT):
 def is_current_fee_quote(quote, cost, target_seconds, *, now=None):
     """Recheck original provenance/age without renewing a cached quote."""
     if type(quote) is not dict or quote.get("available") is not True:
+        return False
+    try:
+        fee_quote_network_evidence(quote)
+    except ValueError:
         return False
     now = _now() if now is None else now
     observed = quote.get("observed_at")

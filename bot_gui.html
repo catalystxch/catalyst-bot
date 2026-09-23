@@ -11810,6 +11810,7 @@
                         <span class="label">Evidence</span><span class="value" id="cpFeeEvidence">--</span>
                     </div>
                     <div class="coin-prep-fee-note" id="cpFeeStages"></div>
+                    <div class="coin-prep-fee-note" id="cpFeeNetwork"></div>
                     <div class="coin-prep-fee-cap" id="cpFeeCapRow" style="display:none;">
                         <label for="cpFeeMaximumInput">Maximum total fee (XCH)</label>
                         <input id="cpFeeMaximumInput" inputmode="decimal" autocomplete="off"
@@ -36036,6 +36037,26 @@ function closeCtgErrorModal() {
             }
             setCoinPrepFeeText('cpFeeEvidence', `${exact} exact · ${projected} projected`);
             setCoinPrepFeeText('cpFeeStages', stageLines.join(' · '));
+            const networkLines = [];
+            for (const stage of preview.stages || []) {
+                const evidence = stage?.quote?.network_evidence || {};
+                const sync = evidence.full_node_synced === true
+                    ? 'provider synced' : 'provider sync unknown';
+                const metrics = [];
+                for (const [key, label, suffix] of [
+                    ['mempool_size', 'mempool transactions', ''],
+                    ['mempool_fees', 'mempool fees', ' mojos'],
+                    ['last_block_cost', 'last block cost', ''],
+                ]) {
+                    const value = evidence[key];
+                    metrics.push(value === null || value === undefined
+                        ? `${label} unavailable` : `${label} ${String(value)}${suffix}`);
+                }
+                const absent = ['mempool_size', 'mempool_fees', 'last_block_cost']
+                    .every(key => evidence[key] === null || evidence[key] === undefined);
+                networkLines.push(`${String(stage?.stage_id || 'stage').replace(/_/g, ' ')}: ${sync}; ${absent ? 'congestion data unavailable' : metrics.join(', ')}`);
+            }
+            setCoinPrepFeeText('cpFeeNetwork', networkLines.join(' · '));
             setCoinPrepFeeText('cpFeeStatus', preview.funded
                 ? 'Review the current estimate and choose the maximum total network fee you approve.'
                 : 'The wallet does not have enough selectable XCH fee funding for this estimate.');

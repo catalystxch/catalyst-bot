@@ -104,6 +104,26 @@ def test_preview_freshness_preserves_oldest_provider_observation(context):
     assert result["stages"][0]["quote"]["observed_at"] == 99
 
 
+@pytest.mark.parametrize("evidence", [
+    {"full_node_synced": None, "mempool_size": None, "mempool_fees": None, "last_block_cost": None},
+    {"full_node_synced": True, "mempool_size": 0, "mempool_fees": 9007199254740993,
+     "last_block_cost": 20000000},
+])
+def test_preview_retains_exact_network_diagnostics_without_inventing_health(context, monkeypatch, evidence):
+    original = tx_fees.get_suggested_transaction_fee
+    def provider(**kwargs):
+        response = original(**kwargs)
+        response["raw"].update({key: value for key, value in evidence.items() if value is not None})
+        return response
+    monkeypatch.setattr(tx_fees, "get_suggested_transaction_fee", provider)
+    result = _preview(context)
+    want = {key: str(value) if type(value) is int else value for key, value in evidence.items()}
+    assert result["available"] is True
+    assert all(stage["quote"]["network_evidence"] == want for stage in result["stages"])
+    saved = json.loads(database.get_coin_prep_fee_preview(result["preview_id"])["quote_json"])
+    assert saved["stages"][0]["quote"]["network_evidence"] == want
+
+
 @pytest.mark.parametrize("provider_response", [
     {"available": False, "source": "coinset", "observed_at": 99},
     {"available": True, "source": "coinset", "observed_at": 39,

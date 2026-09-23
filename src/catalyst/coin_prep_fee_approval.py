@@ -13,7 +13,7 @@ import time
 
 from replacement_capacity import COIN_PURPOSES
 import database
-from fee_estimation import quote_fee
+from fee_estimation import fee_quote_network_evidence, quote_fee
 
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
@@ -335,12 +335,18 @@ def estimate_coin_prep_fee_preview(
             quote = {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE",
                      "fee_mojos": None}
         else:
+            diagnostics = fee_quote_network_evidence(quote)
             quote = {key: quote[key] for key in (
                 "available", "source", "cost", "target_seconds", "fee_mojos",
                 "observed_at", "expires_at",
             )}
             quote["reason"] = "network_fee_estimate"
             quote["fee_xch"] = format(Decimal(quote["fee_mojos"]) / Decimal(10**12), "f")
+            # Keep large mempool fee totals exact through HTTP/native JSON.
+            quote["network_evidence"] = {
+                key: str(value) if type(value) is int else value
+                for key, value in diagnostics.items()
+            }
         priced = {**stage, "quote": quote}
         if stage["stage_id"] in stage_profiles:
             priced["profile"] = stage_profiles[stage["stage_id"]]

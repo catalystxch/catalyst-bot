@@ -11,6 +11,21 @@ def _integer(value, minimum=0):
     return type(value) is int and minimum <= value <= MAX_ATOMIC_AMOUNT
 
 
+def fee_quote_network_evidence(quote):
+    """Return validated internal diagnostics; legacy absent evidence is unknown."""
+    unknown = {"full_node_synced": None, "mempool_size": None,
+               "mempool_fees": None, "last_block_cost": None}
+    evidence = quote.get("network_evidence", unknown)
+    if type(evidence) is not dict or set(evidence) != set(unknown):
+        raise ValueError("invalid_network_evidence")
+    if evidence["full_node_synced"] is not None and evidence["full_node_synced"] is not True:
+        raise ValueError("invalid_network_evidence")
+    if any(value is not None and not _integer(value) for key, value in evidence.items()
+           if key != "full_node_synced"):
+        raise ValueError("invalid_network_evidence")
+    return dict(evidence)
+
+
 def normalize_fee_response(response, *, cost, target_seconds, source, observed_at, now):
     """Validate a provider response without manufacturing missing fee guidance.
 
@@ -27,6 +42,10 @@ def normalize_fee_response(response, *, cost, target_seconds, source, observed_a
         "fee_xch": None,
         "observed_at": observed_at,
         "expires_at": None,
+        "network_evidence": {
+            "full_node_synced": None, "mempool_size": None,
+            "mempool_fees": None, "last_block_cost": None,
+        },
     }
     if not (
         _integer(cost, 1)
@@ -43,6 +62,23 @@ def normalize_fee_response(response, *, cost, target_seconds, source, observed_a
     result["reason"] = "invalid_fee_response"
     if not isinstance(response, dict) or response.get("success") is not True:
         return result
+    # Absence is unknown; an explicitly unhealthy or malformed observation
+    # cannot support a usable quote, including an apparently free transaction.
+    evidence = result["network_evidence"]
+    if "full_node_synced" in response:
+        if type(response["full_node_synced"]) is not bool:
+            result["reason"] = "invalid_network_evidence"
+            return result
+        evidence["full_node_synced"] = response["full_node_synced"]
+        if response["full_node_synced"] is False:
+            result["reason"] = "fee_provider_unsynced"
+            return result
+    for field in ("mempool_size", "mempool_fees", "last_block_cost"):
+        if field in response:
+            if not _integer(response[field]):
+                result["reason"] = "invalid_network_evidence"
+                return result
+            evidence[field] = response[field]
     if "cost" in response and (
         not _integer(response["cost"], 1) or response["cost"] != cost
     ):

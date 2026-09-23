@@ -80,6 +80,26 @@ class TxFeesTests(unittest.TestCase):
         with patch("requests.post", return_value=response):
             self.assertIsNone(self.tx_fees._coinset_fee_estimate(300, 20_000_000))
 
+    def test_node_snapshot_does_not_invent_missing_sync_status(self):
+        with (
+            patch.object(self.tx_fees, "get_wallet_fee_environment",
+                         return_value={"supports_auto_estimate": True}),
+            patch.object(self.tx_fees, "_full_node_rpc",
+                         return_value={"success": True, "estimates": [0]}),
+        ):
+            quote = self.tx_fees.get_suggested_transaction_fee(cost=20_000_000)
+        self.assertTrue(quote["available"])
+        self.assertIsNone(quote["full_node_synced"])
+
+    def test_coinset_snapshot_does_not_invent_zero_congestion(self):
+        response = types.SimpleNamespace(status_code=200,
+            json=lambda: {"success": True, "estimates": [0]})
+        with patch("requests.post", return_value=response):
+            quote = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+        self.assertTrue(quote["available"])
+        for field in ("full_node_synced", "mempool_size", "mempool_fees", "last_block_cost"):
+            self.assertIsNone(quote[field])
+
     def test_explicit_zero_target_is_sent_unchanged(self):
         with (
             patch.object(

@@ -138,6 +138,24 @@ def test_fee_preview_formats_pair_ticker_without_repeating_xch(page):
     )
 
 
+@pytest.mark.parametrize("reported", [False, True])
+def test_fee_preview_discloses_unknown_network_evidence_and_exact_observed_values(page, reported):
+    _open_gui(page)
+    preview = _preview()
+    if reported:
+        preview["stages"][0]["quote"]["network_evidence"] = {
+            "full_node_synced": True, "mempool_size": "0",
+            "mempool_fees": "9007199254740993", "last_block_cost": "20000000",
+        }
+    page.evaluate("preview => renderCoinPrepFeePreview(preview)", preview)
+    expect(page.locator("#cpFeeNetwork")).to_contain_text("provider sync unknown")
+    expect(page.locator("#cpFeeNetwork")).to_contain_text("congestion data unavailable")
+    if reported:
+        expect(page.locator("#cpFeeNetwork")).to_contain_text("provider synced")
+        expect(page.locator("#cpFeeNetwork")).to_contain_text("mempool transactions 0")
+        expect(page.locator("#cpFeeNetwork")).to_contain_text("9007199254740993 mojos")
+
+
 def test_fee_preview_age_advances_and_expired_quote_cannot_be_approved(page):
     _open_gui(page)
     preview = _preview()

@@ -240,10 +240,7 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
             "message": "Fee estimated via Coinset cloud API (mirrors full-node get_fee_estimate).",
             "target_seconds": target_seconds,
             "cost": cost,
-            "full_node_synced": bool(data.get("full_node_synced", False)),
-            "mempool_size": int(data.get("mempool_size", 0) or 0),
-            "mempool_fees": int(data.get("mempool_fees", 0) or 0),
-            "last_block_cost": int(data.get("last_block_cost", 0) or 0),
+            **quote["network_evidence"],
             "raw": data,
         }
         _COINSET_FEE_CACHE[cache_key] = (now, snapshot)
@@ -295,7 +292,7 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
             "message": env.get("message"),
             "target_seconds": target,
             "cost": cost_val,
-            "full_node_synced": bool(result.get("full_node_synced", False)),
+            **quote["network_evidence"],
             "raw": result,
         }
         _SUGGESTED_FEE_CACHE[cache_key] = (now, snapshot)
@@ -318,7 +315,7 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
         "cost": cost_val,
         "fee_mojos": 0,
         "fee_xch": "0",
-        "full_node_synced": False,
+        **quote["network_evidence"],
         "raw": result or {},
     }
     _SUGGESTED_FEE_CACHE[cache_key] = (now, snapshot)

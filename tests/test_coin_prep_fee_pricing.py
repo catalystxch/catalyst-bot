@@ -193,6 +193,18 @@ def test_invalid_unavailable_or_stale_guidance_cannot_supply_a_fee(monkeypatch, 
     assert transport["fees"] == [0]
 
 
+@pytest.mark.parametrize("sync,mempool", [(False, 0), ("true", 0), (True, -1), (True, False)])
+def test_matched_quotes_reject_unhealthy_or_malformed_network_evidence(monkeypatch, transport, sync, mempool):
+    transport["quote_override"] = {"network_evidence": {
+        "full_node_synced": sync, "mempool_size": mempool,
+        "mempool_fees": None, "last_block_cost": None,
+    }}
+    result = _price(monkeypatch, transport)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert "inspection" not in result
+
+
 def test_quote_expiring_during_transport_is_unavailable(monkeypatch, transport):
     transport["slow_quote"] = True
     assert _price(monkeypatch, transport)["reason"] == "FEE_ESTIMATE_UNAVAILABLE"

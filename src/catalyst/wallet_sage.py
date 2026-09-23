@@ -5388,7 +5388,7 @@ def classify_open_offers_for_pair(asset_id_mz: str):
 
 
 def _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids=None):
-    """Reject unsafe Sage cancellation summaries before any signing step."""
+    """Bind cancellation summaries to executable effects before any signing."""
 
     refusal = {
         "success": False,
@@ -5450,6 +5450,18 @@ def _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids=
             spend_ids.append(Coin.from_json_dict(raw_coin).name().hex())
         if len(spend_ids) != len(set(spend_ids)) or set(spend_ids) != input_ids:
             raise ValueError("coin spend mismatch")
+        # A matching summary/root list does not prove the actual fee or return
+        # destinations. Execute the same bundle whose cost will be quoted and
+        # bind every addition/removal/asset/fee, including zero-fee components.
+        execution = _unsigned_bundle_conditions(result)
+        if execution is None:
+            raise ValueError("uninspectable cancellation effects")
+        from unsigned_effect_binding import executable_matches_summary
+
+        if not executable_matches_summary(
+            execution[0], execution[1], summary, _exact_summary_mojos
+        ):
+            raise ValueError("cancellation executable effect mismatch")
     except (TypeError, ValueError, AttributeError):
         return refusal
     return result
@@ -5622,79 +5634,8 @@ def cancel_offers_batch(
         }
 
     def _validate_unsigned_component(result, expected_fee, expected_root_ids=None):
-        """Reject unsafe Sage unsigned summaries before signing.
-
-        Sage 0.13 applies the request fee separately while constructing each
-        member cancel, then concatenates the spends.  For CAT offers this can
-        select the same XCH fee coin more than once.  Never pass that unsigned
-        bundle to signing.  Each component must prove its exact fee, roots,
-        value conservation, receiving-only outputs, and one-to-one agreement
-        between the public summary and the unsigned coin spends.
-        """
-        if type(result) is not dict or not result.get("coin_spends"):
-            return result
-        summary = result.get("summary")
-        inputs = summary.get("inputs") if type(summary) is dict else None
-        try:
-            if type(inputs) is not list or not inputs:
-                raise ValueError("missing inputs")
-            if _exact_summary_mojos(summary.get("fee")) != expected_fee:
-                raise ValueError("fee mismatch")
-            input_ids = set()
-            output_ids = set()
-            input_total = 0
-            output_total = 0
-            for item in inputs:
-                if type(item) is not dict or type(item.get("outputs")) is not list:
-                    raise ValueError("malformed input")
-                coin_id = _canonical_hex(item.get("coin_id"))
-                if not re.fullmatch(r"[0-9a-f]{64}", coin_id) or coin_id in input_ids:
-                    raise ValueError("duplicate or malformed input")
-                input_ids.add(coin_id)
-                input_total += _exact_summary_mojos(item.get("amount"))
-                for output in item["outputs"]:
-                    if type(output) is not dict:
-                        raise ValueError("malformed output")
-                    output_id = _canonical_hex(output.get("coin_id"))
-                    if (
-                        not re.fullmatch(r"[0-9a-f]{64}", output_id)
-                        or output_id in output_ids
-                    ):
-                        raise ValueError("duplicate or malformed output")
-                    if (
-                        output.get("receiving") is not True
-                        or output.get("burning") is True
-                    ):
-                        raise ValueError("non-receiving output")
-                    output_ids.add(output_id)
-                    output_total += _exact_summary_mojos(output.get("amount"))
-            if input_total - output_total != expected_fee:
-                raise ValueError("value mismatch")
-
-            root_ids = input_ids - output_ids
-            if expected_root_ids is not None and root_ids != set(expected_root_ids):
-                raise ValueError("root mismatch")
-
-            from chia_rs import Coin
-
-            spend_ids = []
-            for raw_spend in result["coin_spends"]:
-                if (
-                    type(raw_spend) is not dict
-                    or type(raw_spend.get("coin")) is not dict
-                ):
-                    raise ValueError("malformed coin spend")
-                raw_coin = dict(raw_spend["coin"])
-                for field in ("parent_coin_info", "puzzle_hash"):
-                    value = raw_coin.get(field)
-                    if isinstance(value, str) and not value.startswith("0x"):
-                        raw_coin[field] = f"0x{value}"
-                spend_ids.append(Coin.from_json_dict(raw_coin).name().hex())
-            if len(spend_ids) != len(set(spend_ids)) or set(spend_ids) != input_ids:
-                raise ValueError("coin spend mismatch")
-        except (TypeError, ValueError, AttributeError):
-            return _unsigned_refusal()
-        return result
+        """Use the same executable boundary for priced and ordinary cohorts."""
+        return _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids)
 
     if not _require_signing_capability():
         return _for_every_member(

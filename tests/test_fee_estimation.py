@@ -168,3 +168,49 @@ def test_invalid_cost_never_calls_provider(monkeypatch):
 
     monkeypatch.setattr(tx_fees, "get_suggested_transaction_fee", forbidden)
     assert module.quote_fee(True)["available"] is False
+
+
+@pytest.mark.parametrize("state", [False, None, 0, 1, "true", "false", [], {}])
+def test_supplied_unhealthy_or_malformed_sync_evidence_cannot_authorize_zero_fee(state):
+    quote = normalize({"success": True, "estimates": [0], "full_node_synced": state})
+    assert quote["available"] is False
+    assert quote["fee_mojos"] is None
+
+
+def test_missing_sync_and_congestion_evidence_is_unknown_not_fabricated():
+    quote = normalize({"success": True, "estimates": [0]})
+    assert quote["available"] is True
+    assert quote["network_evidence"] == {
+        "full_node_synced": None, "mempool_size": None,
+        "mempool_fees": None, "last_block_cost": None,
+    }
+
+
+def test_network_diagnostics_retain_real_observed_zero_and_nonzero_values():
+    evidence = {"full_node_synced": True, "mempool_size": 0,
+                "mempool_fees": 123456789, "last_block_cost": 20000000}
+    quote = normalize({"success": True, "estimates": [0], **evidence})
+    assert quote["available"] is True
+    assert quote["network_evidence"] == evidence
+
+
+@pytest.mark.parametrize("field", ["mempool_size", "mempool_fees", "last_block_cost"])
+@pytest.mark.parametrize("value", [True, -1, "0", None, 0.5, 2**63])
+def test_malformed_supplied_congestion_evidence_is_rejected(field, value):
+    quote = normalize({"success": True, "estimates": [0], field: value})
+    assert quote["available"] is False
+    assert quote["fee_mojos"] is None
+
+
+def test_public_quote_revalidates_unsynced_raw_evidence(monkeypatch):
+    module = importlib.import_module("fee_estimation")
+    tx_fees = importlib.import_module("tx_fees")
+    monkeypatch.setattr(module.time, "time", lambda: 100)
+    monkeypatch.setattr(tx_fees, "get_suggested_transaction_fee", lambda **_kwargs: {
+        "available": True, "source": "coinset", "observed_at": 100,
+        "raw": {"success": True, "estimates": [0], "full_node_synced": False},
+    })
+    quote = module.quote_fee(20_000_000)
+    assert quote["available"] is False
+    assert quote["fee_mojos"] is None
+    assert quote["network_evidence"]["full_node_synced"] is False
