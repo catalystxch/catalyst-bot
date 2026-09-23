@@ -360,6 +360,10 @@ def test_exact_journal_evidence_settles_once(
     operation = database.record_coin_prep_operation_outcome(
         operation_id, outcome=outcome, evidence_json=evidence
     )["operation"]
+    # A process may stop after persisting the authoritative effect but before
+    # settling its fee. Restart reconciliation must close that exact gap.
+    assert database.settle_terminal_coin_prep_fee_reservations() == 1
+    assert database.settle_terminal_coin_prep_fee_reservations() == 0
     assert callable(getattr(database, "record_fee_reservation_outcome", None)), (
         "authoritative fee settlement is missing"
     )

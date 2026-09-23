@@ -53,6 +53,10 @@ def price_approved_prep_batch(approval_id: str) -> dict:
     resize targets; any change during this individual pricing pass invalidates
     that pass. Unknown holds and protected cancellation cover remain counted.
     """
+    # A previous worker may have stopped after the authoritative prep outcome
+    # was journalled but before its exact fee hold was settled. Only terminal
+    # journal evidence can close that gap; unknown effects remain held.
+    database.settle_terminal_coin_prep_fee_reservations()
     accounting = database.get_coin_prep_fee_approval_status(approval_id)
     if accounting["unresolved_operation_count"]:
         return {

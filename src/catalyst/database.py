@@ -22479,6 +22479,43 @@ def record_fee_reservation_outcome(
         conn.close()
 
 
+def settle_terminal_coin_prep_fee_reservations(*, limit: int = 128) -> int:
+    """Close a crash gap using only terminal, durable prep outcome evidence.
+
+    Never infer confirmation from a submit response, timeout or wallet balance.
+    The existing settlement validator checks the exact contract, claim and
+    journal hash again under its own write transaction.
+    """
+
+    safe_limit = _exact_integer(limit, "fee settlement limit", minimum=1)
+    if safe_limit > 128:
+        raise ValueError("fee settlement limit exceeds hard limit")
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT prep.operation_id, prep.outcome_evidence_json "
+            "FROM coin_prep_operations AS prep "
+            "JOIN approved_fee_reservations AS reservation "
+            "ON reservation.operation_id=prep.operation_id "
+            "LEFT JOIN approved_fee_outcomes AS result "
+            "ON result.operation_id=prep.operation_id "
+            "WHERE prep.outcome IN ('CONFIRMED','FAILED') "
+            "AND result.operation_id IS NULL "
+            "ORDER BY prep.finalized_at, prep.operation_id LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        evidence = row["outcome_evidence_json"]
+        if type(evidence) is not str:
+            raise ValueError("FEE_EFFECT_UNRESOLVED")
+        record_fee_reservation_outcome(
+            row["operation_id"], hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+        )
+    return len(rows)
+
+
 def _stability_connection() -> sqlite3.Connection:
     """Return a short-lived autocommit connection for stability CAS writes."""
 

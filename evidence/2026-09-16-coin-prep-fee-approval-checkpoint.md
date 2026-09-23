@@ -796,3 +796,42 @@ and no release or main merge was made during this checkpoint.
   was denied by process-control policy, so the new code has **not** received
   a live-wallet retry. The operator must close that app before the new source
   server can be started; no approval bypass or live spend was attempted.
+
+## TEST 7 uniform live Coin Prep and terminal-fee recovery (23 September 2026)
+
+- After the operator closed the old server, the fixed source server started at
+  commit `61b6e38`. Sage v0.13.0 was healthy on mainnet TEST 7 fingerprint
+  `736588221`; MZ remained wallet ID 2 with the expected asset ID. The
+  previously confirmed approval was current and untouched (zero fee spent or
+  held). No offers were open. The approved untiered plan was retried without
+  requesting a second budget.
+- The first CAT batch reached Sage and confirmed, producing six additional
+  CAT coins. Its exact reserved fee was 13,306,061 mojos. A second defect was
+  exposed: the prep operation became authoritatively terminal, but the fee
+  reservation remained unresolved, causing the next batch to stop with
+  `FEE_EFFECT_RECOVERY_REQUIRED`. The durable terminal journal was reconciled
+  through `record_fee_reservation_outcome` validation, not by trusting the
+  submit response or timing out. This settled 13,306,061 mojos as spent and
+  released the hold; no effect was replayed.
+- A restart-safe, idempotent terminal-fee settlement pass was added before
+  approved-batch pricing and immediately after authoritative completion or
+  no-effect. Regressions were red before the new repository function and green
+  afterward. The focused 29 tests passed; the broader fee selection passed
+  428 tests with 14 opt-in skips. Ruff and diff whitespace checks passed.
+- The same approved plan resumed. The second XCH batch was submitted with a
+  9,531,051-mojo hold. Sage reported it pending for about five minutes, then
+  the exact output view confirmed it. The fee settled once. Coin Prep reached
+  `complete`, closed the scope from 62 approved targets and two confirmed
+  operations, and reported six XCH and six CAT prepared trading outputs.
+  Durable replay reconciliation returned zero additional settlements. Final
+  accounting: 22,837,112 mojos spent, zero held, zero unresolved.
+- The final designation sweep logged two `upsert_coin` refusals, consistent
+  with its protected-coin guard, and left older non-target coins unassigned;
+  tier designations for the six current XCH and six CAT outputs succeeded.
+  This should be reviewed separately before treating the entire app acceptance
+  as exhausted. The bot was not started, and original strategy/reserve settings
+  remain saved in the `pre-fee-live-acceptance` preset rather than restored.
+- A fresh isolated Windows bundle (no replacement of the existing live
+  package) passed packaged API and Sage RPC worker smoke. Executable SHA-256:
+  `F9F73CB5BFB9BDA751407104AF6199288554C8FD44EF09B176CA31E6D7C1BA3D`.
+  No main merge or release has occurred.

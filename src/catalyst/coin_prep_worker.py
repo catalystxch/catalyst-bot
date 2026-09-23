@@ -2570,6 +2570,9 @@ class CoinPrepWorker:
                     ),
                 },
             )
+            from database import settle_terminal_coin_prep_fee_reservations
+
+            settle_terminal_coin_prep_fee_reservations()
             self.log(
                 "Sage relay rejection was reconciled with an authoritative "
                 f"no-effect wallet view ({reason})"
@@ -9408,6 +9411,10 @@ class CoinPrepWorker:
                 outcome=outcome,
                 evidence_json=evidence,
             )
+            if decision.confirmed:
+                from database import settle_terminal_coin_prep_fee_reservations
+
+                settle_terminal_coin_prep_fee_reservations()
         except Exception as exc:
             self.log(f"Coin prep authoritative outcome could not be persisted: {exc}")
             return False
