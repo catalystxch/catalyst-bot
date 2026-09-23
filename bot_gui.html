@@ -11528,13 +11528,13 @@
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="display: flex; align-items: center; gap: 10px;">
                                 <input type="checkbox" id="configTransactionFeeEnabled" style="width: auto; margin: 0;" onchange="updateFeeSettingsUi(); updateCoinPrepPreview();">
-                                <span>Transaction Fees <span class="cc-help">?<span class="cc-tooltip">Adds a fee to on-chain wallet transactions only: coin prep, top-ups, combines, splits, and secure cancels. Offer creation itself still stays fee-free.</span></span></span>
+                                <span>Manual Transaction Fee <span class="cc-help">?<span class="cc-tooltip">Manual fee for wallet transactions outside the approved Coin Prep workflow. Coin Prep and its protected cancellations use fresh cost-based estimates within a separately approved budget; this switch cannot disable that approval or make prep free. Offer creation itself stays fee-free.</span></span></span>
                             </label>
                         </div>
                         <div id="transactionFeeManualWrap" style="display: none;">
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Fee Amount (XCH per transaction) <span class="cc-help">?<span class="cc-tooltip">Fee you want to use for each transaction.</span></span></label>
+                                    <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
                                     <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
@@ -21099,14 +21099,74 @@
         function formatCoinPrepXch(value) {
             const num = Number(value || 0);
             if (!Number.isFinite(num)) return '--';
-            const decimals = num >= 1 ? 4 : 6;
-            return num.toFixed(decimals).replace(/\.?0+$/, '');
+            return num.toFixed(12).replace(/\.?0+$/, '');
+        }
+
+        function coinPrepCatDecimals() {
+            const decimals = Number(currentCAT?.decimals ?? 3);
+            return Number.isInteger(decimals) && decimals >= 0 && decimals <= 18 ? decimals : 3;
+        }
+
+        function coinPrepDecimalFraction(value) {
+            const text = String(value);
+            if (text.length > 128) return null;
+            const match = /^(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(text);
+            if (!match) return null;
+            const places = (match[2] || '').length - Number(match[3] || 0);
+            if (!Number.isInteger(places) || Math.abs(places) > 128) return null;
+            const digits = BigInt(match[1] + (match[2] || ''));
+            return places >= 0 ? [digits, 10n ** BigInt(places)]
+                : [digits * 10n ** BigInt(-places), 1n];
+        }
+
+        function coinPrepCatCapacityFromFractions(size, price, headroom) {
+            // UI estimate only; the server still supplies the authoritative
+            // frozen outputs. Exact ratios avoid binary dust at mojo edges.
+            if (!size || !price || !headroom || price[0] <= 0n) return 0;
+            const scale = 10n ** BigInt(coinPrepCatDecimals());
+            const numerator = size[0] * headroom[0] * price[1] * scale;
+            const denominator = size[1] * headroom[1] * price[0];
+            const atomic = (numerator + denominator - 1n) / denominator;
+            return Number(atomic) / Number(scale);
+        }
+
+        function coinPrepHeadroomFraction(headroomPct) {
+            // Build 1 + percent/100 as a decimal ratio, not a binary sum:
+            // 14% must not become 1.1400000000000001 before mojo rounding.
+            const pct = coinPrepDecimalFraction(getCoinPrepHeadroomPct(headroomPct));
+            return pct ? [100n * pct[1] + pct[0], 100n * pct[1]] : null;
+        }
+
+        function uniformCoinPrepCatCapacity(tradeSize, midPrice, headroomPct) {
+            return coinPrepCatCapacityFromFractions(coinPrepDecimalFraction(tradeSize),
+                coinPrepDecimalFraction(midPrice), coinPrepHeadroomFraction(headroomPct));
+        }
+
+        function coinPrepSellPriceFraction(slot, midPrice, spreadBps, maxOffers, minEdgeBps) {
+            const mid = coinPrepDecimalFraction(midPrice);
+            const spread = coinPrepDecimalFraction(spreadBps);
+            const edge = coinPrepDecimalFraction(minEdgeBps);
+            if (!mid || !spread || !edge || !Number.isInteger(maxOffers) || maxOffers <= 0) return null;
+            let distanceNumerator, distanceDenominator;
+            if (edge[0] * spread[1] >= spread[0] * edge[1]) {
+                distanceNumerator = spread[0];
+                distanceDenominator = spread[1] * 10000n;
+            } else if (maxOffers === 1) {
+                distanceNumerator = edge[0];
+                distanceDenominator = edge[1] * 10000n;
+            } else {
+                const intervals = BigInt(maxOffers - 1);
+                distanceNumerator = edge[0] * spread[1] * intervals
+                    + (spread[0] * edge[1] - edge[0] * spread[1]) * BigInt(slot);
+                distanceDenominator = edge[1] * spread[1] * intervals * 10000n;
+            }
+            return [mid[0] * (distanceDenominator + distanceNumerator), mid[1] * distanceDenominator];
         }
 
         function formatCoinPrepCat(value) {
             const num = Number(value || 0);
             if (!Number.isFinite(num)) return '--';
-            return Math.round(num).toLocaleString();
+            return num.toLocaleString(undefined, {maximumFractionDigits: coinPrepCatDecimals()});
         }
 
         // Coin prep summary labels refer to COIN DENOMINATION (size of each coin
@@ -21241,6 +21301,13 @@
                     'Primary',
                     `${formatCoinPrepXch(plan.preparedXchSize)} prep`
                 ));
+                const feeCount = Number(plan.tierCounts?.fees || 0);
+                if (feeCount > 0) {
+                    rows.push(buildCoinPrepBreakdownRow(
+                        getCoinPrepTierLabel('fees'),
+                        `${feeCount} x ${formatCoinPrepXch(plan.preparedTierSizesXch.fees)} prep`
+                    ));
+                }
             } else if (asset === 'cat' && Number(plan.preparedCatPerCoin || 0) > 0) {
                 rows.push(buildCoinPrepBreakdownRow(
                     'Primary',
@@ -21301,29 +21368,18 @@
             if (!hint) return;
 
             const opts = getFeeOptionsFromInputs();
-            const env = feeStatusCache && feeStatusCache.environment ? feeStatusCache.environment : null;
-            const tierEnabled = document.getElementById('configTierEnabled')?.checked || false;
-            const manualOnly = env && env.supports_auto_estimate === false;
-
-            if (!opts.transactionFeeEnabled || opts.effectiveFeeXch <= 0) {
-                hint.innerHTML = 'Fees are <strong>OFF</strong>. Coin prep, top-ups, combines and secure cancels will be sent with zero fee, and no fee-tier coins will be prepared.';
-                return;
-            }
-
-            let poolText = 'No dedicated fee coin pool is configured yet.';
-            if (!tierEnabled && opts.feeCount > 0) {
-                poolText = 'Dedicated fee coins are only prepared during tiered coin prep. Flat prep still uses general XCH coins.';
-            } else if (opts.feeCount > 0 && opts.feeCoinSize > 0) {
-                poolText = `Fee pool planned: ${opts.feeCount} x ${opts.feeCoinSize.toFixed(8)} XCH.`;
-            }
-
-            const sourceText = manualOnly
-                ? 'Sage setup: this is a manual fee amount.'
-                : 'This fee amount is applied manually to wallet transactions.';
+            const manualText = opts.transactionFeeEnabled && opts.effectiveFeeXch > 0
+                ? `Manual transaction fee: <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong>, only for transactions using manual fee settings.`
+                : 'Manual transaction fees are <strong>OFF</strong>; this does not make Coin Prep free.';
+            const poolText = opts.feePoolEnabled
+                ? `Configured fee-coin pool: ${opts.feeCount} x ${formatTransactionFeeXch(opts.feeCoinSize)} XCH, retained in the wallet, not fees already spent. The Coin Prep review shows the actual required outputs.`
+                : 'No dedicated fee-coin pool is enabled by these settings.';
 
             hint.innerHTML = `
-                On-chain transactions will use <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong> each.<br>
-                ${sourceText} Offer creation stays fee-free. ${poolText}
+                ${manualText}<br>
+                <strong>Coin Prep</strong> requires fresh cost-based network estimates and a separately approved maximum fee budget, including a protected cancellation allowance, regardless of this setting.
+                Unavailable estimates or unsupported preparation paths pause without spending; this manual amount cannot bypass approval.<br>
+                ${poolText} Creating an offer itself stays fee-free.
             `;
         }
 
@@ -21492,12 +21548,14 @@
             minEdgeBps,
             maxSell,
             tierCounts,
-            sellTierSizes
+            sellTierSizes,
+            headroomPct = 0
         }) {
             const tiers = ['inner', 'mid', 'outer', 'extreme'];
             const dist = getCoinPrepTierDistribution(maxSell, tierCounts);
             const tierLiveCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
             const tierMaxCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            const tierPreparedCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
             let liveCatTotal = 0;
             let slot = 0;
 
@@ -21512,13 +21570,18 @@
                         const cat = sizeXch / price;
                         tierLiveCat[tier] += cat;
                         tierMaxCat[tier] = Math.max(tierMaxCat[tier], cat);
+                        const prepared = coinPrepCatCapacityFromFractions(
+                            coinPrepDecimalFraction(sellTierSizes[tier]),
+                            coinPrepSellPriceFraction(slot, midPrice, spreadBps, maxSell, minEdgeBps),
+                            coinPrepHeadroomFraction(headroomPct));
+                        tierPreparedCat[tier] = Math.max(tierPreparedCat[tier], prepared);
                         liveCatTotal += cat;
                     }
                     slot += 1;
                 }
             }
 
-            return {tierLiveCat, tierMaxCat, liveCatTotal, tierCounts: dist};
+            return {tierLiveCat, tierMaxCat, tierPreparedCat, liveCatTotal, tierCounts: dist};
         }
 
         function clampCoinPrepMultiplier(value) {
@@ -22146,6 +22209,12 @@
             const modeState = getLiquidityModeState(liquidityMode);
             const buySideActive = modeState.buyActive;
             const sellSideActive = modeState.sellActive;
+            // Match frozen uniform economics: size the reusable cohort from
+            // both configured limits, then omit the inactive asset's outputs.
+            const countMultiplier = coinPrepDecimalFraction(coinPrepMultiplier ?? 1);
+            const uniformSlots = coinPrepDecimalFraction(maxBuy + maxSell);
+            const uniformCoinCount = countMultiplier && uniformSlots
+                ? Number(uniformSlots[0] * countMultiplier[0] / (uniformSlots[1] * countMultiplier[1])) : 0;
             if (!buySideActive) maxBuy = 0;
             if (!sellSideActive) maxSell = 0;
             const prepMult = getCoinPrepHeadroomMultiplier(headroomPct);
@@ -22160,12 +22229,29 @@
                 minXchForOffers: 0,
                 minCatForOffers: 0,
                 preparedXchSize: tradeSize * prepMult,
-                preparedCatPerCoin: midPrice > 0 ? Math.round((tradeSize / midPrice) * prepMult) : 0,
+                preparedCatPerCoin: uniformCoinPrepCatCapacity(tradeSize, midPrice, headroomPct),
                 offerTierSizesXch: {},
                 preparedTierSizesXch: {},
                 preparedTierSizesCat: {},
                 tierCounts: {},
                 tierSequence: []
+            };
+
+            // Frozen backend economics include fee-reserve outputs for both
+            // uniform and tiered prep. Add their principal before any tiered
+            // residual/topup calculation, without applying trading headroom.
+            const addFeePool = () => {
+                const parsedFeeSize = parseFloat(feeCoinSize) || 0;
+                const parsedFeeCount = parseInt(feeCount) || 0;
+                if (feePoolEnabled && parsedFeeSize > 0 && parsedFeeCount > 0) {
+                    plan.tierSequence.push('fees');
+                    plan.offerTierSizesXch.fees = parsedFeeSize;
+                    plan.preparedTierSizesXch.fees = parsedFeeSize;
+                    plan.preparedTierSizesCat.fees = 0;
+                    plan.tierCounts.fees = parsedFeeCount;
+                    plan.xchCoinsNeeded += parsedFeeCount;
+                    plan.totalXchForCoinPrep += parsedFeeCount * parsedFeeSize;
+                }
             };
 
             if (tierEnabled) {
@@ -22227,6 +22313,7 @@
                     maxSell,
                     tierCounts: configuredTierCountsSell,
                     sellTierSizes: plan.sellTierSizesXch,
+                    headroomPct,
                 }) : {
                     tierLiveCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
                     tierMaxCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
@@ -22293,11 +22380,8 @@
                 for (const tier of plan.tierSequence) {
                     plan.tierCounts[tier] = buySizeCounts[tier] || 0;
                     const _buySizeXch = _sizeOrientedBuy[tier] || 0;
-                    const _sellTierCat = sellLadderCatPlan.tierMaxCat[tier] || 0;
                     plan.preparedTierSizesXch[tier] = _buySizeXch * prepMult;
-                    plan.preparedTierSizesCat[tier] = midPrice > 0
-                        ? Math.round(_sellTierCat * prepMult)
-                        : 0;
+                    plan.preparedTierSizesCat[tier] = sellLadderCatPlan.tierPreparedCat?.[tier] || 0;
                     plan.xchCoinsNeeded += plan.tierCounts[tier];
                     plan.catCoinsNeeded += sellWeightedCounts[tier] || 0;
                     plan.totalXchForCoinPrep += plan.tierCounts[tier] * plan.preparedTierSizesXch[tier];
@@ -22333,17 +22417,7 @@
                     }
                 }
 
-                const parsedFeeSize = parseFloat(feeCoinSize) || 0;
-                const parsedFeeCount = parseInt(feeCount) || 0;
-                if (feePoolEnabled && parsedFeeSize > 0 && parsedFeeCount > 0) {
-                    plan.tierSequence.push('fees');
-                    plan.offerTierSizesXch.fees = parsedFeeSize;
-                    plan.preparedTierSizesXch.fees = parsedFeeSize;
-                    plan.preparedTierSizesCat.fees = 0;
-                    plan.tierCounts.fees = parsedFeeCount;
-                    plan.xchCoinsNeeded += parsedFeeCount;
-                    plan.totalXchForCoinPrep += parsedFeeCount * parsedFeeSize;
-                }
+                addFeePool();
 
                 // Topup coin: the working budget Smart Settings carves off
                 // for the topup worker to split when a tier runs short.
@@ -22468,12 +22542,13 @@
                     }
                 }
             } else {
-                plan.xchCoinsNeeded = buySideActive ? (maxBuy + (sellSideActive ? maxSell : 0)) : 0;
-                plan.catCoinsNeeded = sellSideActive ? (maxSell + (buySideActive ? maxBuy : 0)) : 0;
+                plan.xchCoinsNeeded = buySideActive ? uniformCoinCount : 0;
+                plan.catCoinsNeeded = sellSideActive ? uniformCoinCount : 0;
                 plan.totalXchForCoinPrep = plan.preparedXchSize * plan.xchCoinsNeeded;
                 plan.totalCatForCoinPrep = plan.preparedCatPerCoin * plan.catCoinsNeeded;
                 plan.minXchForOffers = plan.preparedXchSize * maxBuy;
                 plan.minCatForOffers = plan.preparedCatPerCoin * maxSell;
+                addFeePool();
             }
 
             return plan;
@@ -35497,17 +35572,18 @@ function closeCtgErrorModal() {
                     }
                     const configuredMaxSell = parseInt(config.max_active_sell || config.MAX_ACTIVE_SELL_OFFERS || 0)
                         || tiers.reduce((sum, t) => sum + (parseInt(sellTierCountsForVerify[t]) || 0), 0);
+                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     const sellLadderCatPlan = buildSellLadderCatPlan({
                         midPrice,
-                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
-                            || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
-                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
-                            || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS
+                            ?? ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100)),
+                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS
+                            ?? ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100)),
                         maxSell: configuredMaxSell,
                         tierCounts: sellTierCountsForVerify,
                         sellTierSizes: sellTierSizesForVerify,
+                        headroomPct: getCoinPrepHeadroomPct(config.coin_prep_headroom_pct),
                     });
-                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     const coinPrepMultiplier = clampCoinPrepMultiplier(config.coin_prep_multiplier);
                     const configuredBuyCounts = getConfiguredTierCountsFromConfigXch(config);
                     const configuredSellCounts = getConfiguredTierCountsFromConfig(config);
@@ -35537,9 +35613,7 @@ function closeCtgErrorModal() {
                         const preparedBuyXch = buyXch * prepFactor;
                         const buyCnt = preparedBuyCounts[t] || 0;
                         const sellCnt = preparedSellCounts[t] || 0;
-                        const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
-                        const preparedSellCat = sellCatSize > 0
-                            ? Math.round(sellCatSize * prepFactor) : 0;
+                        const preparedSellCat = sellLadderCatPlan.tierPreparedCat[t] || 0;
                         if (liquidityMode === 'buy_only') {
                             if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
                             if (buyCnt > 0) params.set(`${t}_xch_count`, String(buyCnt));
@@ -35632,7 +35706,7 @@ function closeCtgErrorModal() {
                     if (tradeSize > 0) params.set('prepared_xch_size', String(tradeSize * headroom));
                     const midPrice = Number(bot_state?.pricing?.mid || 0);
                     if (tradeSize > 0 && midPrice > 0) {
-                        params.set('prepared_cat_size', String(Math.round((tradeSize / midPrice) * headroom)));
+                        params.set('prepared_cat_size', String(uniformCoinPrepCatCapacity(tradeSize, midPrice, config.coin_prep_headroom_pct)));
                     }
                     if (maxBuy > 0) params.set('max_buy', String(maxBuy));
                     if (maxSell > 0) params.set('max_sell', String(maxSell));
@@ -36056,10 +36130,10 @@ function closeCtgErrorModal() {
                 coinPrepMultiplier: Math.max(0.5, Math.min(3.0, parseFloat(config.coin_prep_multiplier) || 1)),
                 tierEnabled,
                 midPrice,
-                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
-                    || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
-                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
-                    || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS
+                    ?? ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100)),
+                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS
+                    ?? ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100)),
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(config.inner_size_xch) || tradeSize * 2,
                 midSize: parseFloat(config.mid_size_xch) || tradeSize,

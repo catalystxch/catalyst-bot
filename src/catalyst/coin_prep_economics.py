@@ -197,10 +197,19 @@ def build_standard_prep_economics(*, configuration, fee_pool, live_price,
         except ValueError:
             raise ValueError("FEE_PREP_PRICE_UNAVAILABLE") from None
         if tiered:
+            # Spares increase output quantities, not executable ladder slots.
+            # Pricing a synthetic live+spare ladder can under-size coins when
+            # spares are distributed differently from the actual live offers.
+            live_sell_counts = {
+                tier: _integer(configuration.get(f"SELL_{tier.upper()}_TIER_COUNT", 0),
+                               0, MAX_PLAN_OUTPUTS)
+                for tier in TIER_ORDER
+            }
             cat_sizes = prepared_cat_sizes(
                 live_sizes={tier: sell_sizes[tier] for tier in cat_counts}, price=price,
                 headroom_multiplier=headroom_multiplier, cat_decimals=decimals,
-                sell_counts=cat_counts, max_offers=sum(cat_counts.values()),
+                sell_counts=live_sell_counts,
+                max_offers=_integer(configuration["MAX_ACTIVE_SELL_OFFERS"], 0, MAX_PLAN_OUTPUTS),
                 spread_bps=configuration["SPREAD_BPS"], min_edge_bps=configuration["MIN_EDGE_BPS"],
             )
         else:

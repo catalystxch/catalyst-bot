@@ -73,6 +73,26 @@ def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(se
     assert [o.amount_mojos for o in _build(settings)["targets"] if o.asset == "cat"] == [110_000, 27_500]
 
 
+@pytest.mark.parametrize("inner_spares,mid_spares", [(0, 0), (9, 0), (1, 2)])
+def test_cat_spares_do_not_move_executable_live_ladder_prices(settings, inner_spares, mid_spares):
+    """Spare output quantities must not create imaginary live pricing slots."""
+    settings.update(
+        COIN_PREP_HEADROOM_PCT=Decimal("0"), SPREAD_BPS=Decimal("1000"),
+        MAX_ACTIVE_SELL_OFFERS=3, SELL_INNER_SIZE_XCH=Decimal("0.1"),
+        SELL_MID_SIZE_XCH=Decimal("0.2"), SELL_INNER_TIER_COUNT=1,
+        SELL_MID_TIER_COUNT=2, SELL_OUTER_TIER_COUNT=0,
+        SELL_INNER_TIER_SPARE_COUNT=inner_spares, SELL_MID_TIER_SPARE_COUNT=mid_spares,
+    )
+    result = _service().build_standard_prep_economics(
+        configuration=settings, fee_pool=FEE_POOL, live_price="0.000075")
+    # Live slots are .000075, .00007875, .0000825 regardless of spares.
+    # The first mid slot is the largest required mid coin: ceil(.2/.00007875).
+    cat_outputs = [o.amount_mojos for o in result["targets"] if o.asset == "cat"]
+    assert cat_outputs == [1_333_334] * (1 + inner_spares) + [2_539_683] * (2 + mid_spares)
+    assert result["worker_args"]["cat_target"] == 3 + inner_spares + mid_spares
+    assert result["worker_args"]["cat_tier_sizes"] == "inner=1333.334,mid=2539.683"
+
+
 def test_reversed_modern_buy_positions_keep_counts_paired_with_their_sizes(settings):
     settings.update(BUY_LADDER_REVERSED=True, BUY_INNER_SIZE_XCH=Decimal("0.1"),
                     BUY_EXTREME_SIZE_XCH=Decimal("1"), BUY_EXTREME_TIER_COUNT=2)

@@ -1147,3 +1147,210 @@ an active-offer cancellation test.
   `depth_sells`, while confidence uses eligible independent-depth evidence.
   Different filtering can produce different answers; no computation was
   changed on that basis.
+
+## Fee Settings disclosure and uniform-summary verification (23 September 2026)
+
+- The previous continuation produced a real review-only Bootstrap preview:
+  exact MZ asset, anchor 0.000075 XCH/CAT, corridor 0.0000375–0.00015,
+  one day, 1 XCH / 10,000 MZ campaign allocations, 0.001 XCH fee budget,
+  initial 10% stage and 3 offers per funded side. No campaign was activated
+  and no fee approval or wallet effect was created. The review remains in
+  the user's original tab for the final financial handoff.
+- Source investigation confirmed that the Settings fee hint was still based
+  on legacy manual-fee semantics: OFF falsely promised zero-fee preparation,
+  ON promised the same configured fee for every transaction, and uniform
+  prep was incorrectly described as having no dedicated fee outputs.
+  Six new browser cases failed before correcting those branches. The hint
+  now distinguishes manual settings from fresh cost-based Coin Prep estimates,
+  its separately approved cap/protected cancellation allowance, and retained
+  fee-coin principal. It no longer treats Sage's legacy manual-estimate flag
+  as the capability of the separate Coin Prep estimator.
+- A separate failing numerical/browser regression exposed that the flat
+  Settings plan omitted the configured fee-reserve outputs from its XCH
+  count, required principal and size breakdown: 3+3 replacement coins plus
+  50 fee coins of 0.001 XCH were shown as 6 coins / 0.6 XCH rather than
+  56 / 0.65. Uniform and tiered display plans now share the fee-output
+  addition; tiered fees are still added before residual/topup calculation.
+  CAT outputs and executable economic/approval logic were not changed.
+- Focused verification: 9 browser tests passed after both corrections;
+  Ruff and diff whitespace checks passed. A full browser run after the
+  disclosure-only fix passed 119 tests in 98.45 seconds. Final browser and
+  frontend/build contract reruns covering the numerical fix are in progress;
+  their logs are `fee-summary-e2e.log` and `fee-summary-contracts.log` under
+  this plan's ignored workspace. The full hermetic backend/default suite
+  remains running with log `fee-disclosure-full.log`; no full-green claim yet.
+- A separate temporary localhost tab verified the corrected fee disclosure
+  with the actual manual setting 0.0000130791 XCH and 50 x 0.001 XCH pool;
+  browser warnings/errors were empty. That tab was closed without saving
+  settings, and the campaign review tab was not reloaded. A read-only status
+  check reported the source bot running, 116 loops, zero bot errors and
+  runtime safety allowed. These are not live offer-lifecycle test results.
+- Further source discrepancies require test-first investigation: the legacy
+  flat Settings calculator appears to ignore the prep multiplier and rounds
+  CAT denominations to whole tokens, unlike frozen backend economics. They
+  remain open; do not infer that every Settings amount is verified from the
+  fee-output correction alone. Updated packaging and all previously open
+  native/live acceptance gates remain outstanding.
+
+### Follow-up: uniform multiplier and denomination precision
+
+- Final verification of the initial fee-output correction completed:
+  **121 Chromium tests passed in 90.70 seconds** and **103 frontend/build
+  contract tests passed in 15.14 seconds**.
+- Four further failing browser cases confirmed that uniform Settings counts
+  ignored the multiplier and filtered inactive side limits earlier than the
+  backend. The UI now matches frozen economics: floor the combined configured
+  buy/sell count times the multiplier, then omit inactive asset outputs.
+  The server's allocation, approval and execution behavior is unchanged.
+- Five further failures confirmed whole-CAT rounding in uniform capacity
+  estimates/formatting and loss of a one-mojo XCH denomination in the size
+  formatter. Uniform CAT estimates now use bounded integer decimal ratios
+  for ceiling-to-mojo conversion, preserving the configured CAT precision.
+  Exact-division characterization stayed green. CAT formatting preserves
+  meaningful fractional units and XCH formatting preserves all 12 places.
+  The resulting Settings estimate is still not signing/dispatch authority;
+  the approval dialog supplies the server's exact frozen outputs.
+- **19 focused browser tests passed in 13.01 seconds**; Ruff and diff checks
+  passed. Full Chromium and frontend/build/frozen-economics reruns for this
+  final source are running in `fee-summary-complete-e2e.log` and
+  `fee-summary-contracts-final.log`. The original full default/backend run
+  is still live and has not been restarted. No final broad-green claim,
+  commit, updated package, wallet effect, main merge or release yet.
+- Tiered Settings/preflight CAT denomination rounding is a separately located
+  legacy path and still requires reproduction against exact backend ladder
+  economics. Do not extrapolate the uniform fix to that path.
+
+### Completed browser/contract reruns
+
+- Final-source Chromium E2E: **131 passed in 94.81 seconds**, process exit 0.
+- Frontend/build/post-Tibet contracts plus backend frozen-prep/economic
+  contracts: **160 passed in 54.73 seconds**, process exit 0.
+- The full default/backend suite remains live under execution session
+  **15778**, with output in `fee-disclosure-full.log`. Its latest progress
+  was 38%; this is not a completed full-suite result. Preserve/re-poll that
+  handle rather than launching another full run. The newer browser tests
+  added during its execution are covered by the separate final E2E run.
+- Source edits remain uncommitted pending review of the full-suite result.
+  No package was replaced and no new live trading authority was created.
+
+### Tiered readiness and residual accounting follow-up
+
+- Three failing Chromium cases reproduced whole-CAT rounding in both tiered
+  Settings/readiness and uniform readiness requests. The tiered backend fixture
+  requires 1,466.667 and 2,793.651 CAT, not 1,467 and 2,794; uniform readiness
+  requires 1,333.334, not 1,333. Decimal-ratio arithmetic now covers these UI
+  calculations, including exact generated sell prices and headroom. Three
+  exact-price boundary characterizations protect against adding a mojo through
+  binary rounding. No server signing, approval or execution authority changed.
+- Focused browser checks initially passed 25 cases. The broad run then reported
+  136 passed / 1 failed: the existing residual-topup test encoded the old whole-CAT
+  denomination. The independently checked Python economics gives a 1.068 CAT
+  output at a 1.03 price with 10% headroom; two outputs leave 897.864 CAT after
+  a 100 CAT reserve from 1,000 CAT. The fixture now specifies the 300 bps price
+  inputs and asserts that exact denomination/residual. All 26 focused checks
+  passed in 17.49 seconds. The final full-browser rerun is still in progress in
+  `tier-capacity-final-e2e.log`; do not claim it completed yet.
+- The related frontend/build/post-Tibet/frozen-economic run completed:
+  **160 passed in 54.24 seconds**. Ruff on both changed browser test files,
+  whitespace checks and the tracked-secret scanner passed.
+- The full default/backend run (session 15778) completed with **6,880 passed,
+  120 skipped, 422 subtests passed and one failure in 1,249.15 seconds**:
+  `test_free_port_standalone_process_defers_to_existing_durable_owner` timed out
+  waiting for its isolated diagnostics child. The same test passed alone in
+  16.70 seconds without source changes. This is not a clean full-suite result,
+  and the timeout cause remains unproven. The whole mutation-gate file is being
+  rerun under session 98257 (`mutation-gate-final-recheck.log`). Do not suppress
+  the original failure or restart duplicate broad runs.
+- Read-only live frontend verification in a separate temporary tab showed
+  56 XCH outputs / 0.6500 XCH including 50 x 0.001 fee-principal outputs, plus
+  six 1,333.334 MZ outputs / 8,000.004 MZ. Browser warning/error logs were empty;
+  the temporary tab was closed. The user's original tab retains its review-only
+  Bootstrap draft and older loaded HTML to avoid discarding that draft.
+- The existing goal and hourly heartbeat were verified ACTIVE; no new goal or
+  duplicate automation was created. Coding/test authority is already granted.
+  The original review still has an unchecked exact-asset/budget confirmation,
+  a disabled Start Campaign button and no active campaign. Consequential live
+  financial confirmation remains a user handoff. No wallet action, preset
+  resize, live package replacement, main merge or release occurred.
+
+### Follow-up reruns completed
+
+- Final Chromium rerun: **137 passed in 96.08 seconds**, exit 0.
+- Entire mutation-safety test file: **249 passed in 159.95 seconds**, exit 0,
+  including the diagnostics ownership case that timed out in the full run.
+  No production startup behavior or timeout assertion was weakened. The first
+  timeout remains recorded; a passing retry alone does not establish its cause.
+- Started a new full default/backend run after both completed, logging to
+  `fee-precision-full-final.log`, execution session **77347**. It has not
+  completed; preserve/re-poll that handle. No broad-green claim or
+  commit yet. Prior full run and all browser/contract follow-ups are terminal.
+  Updated Windows packaging, exact-artifact native checks and active-offer live
+  cycle remain incomplete. No new permission is needed for independent tests.
+
+### Explicit zero-valued settings preflight regression
+
+- Further source review found the readiness calculation used a truthy fallback:
+  a saved zero spread or zero inner edge was replaced by the current form input,
+  even when that input was an unrelated unsaved edit. Two new browser cases
+  reproduced the mismatch (1,423.949 / 1,333.334 instead of 1,466.667 CAT).
+- The readiness path now falls back to the form only when the configuration
+  field is absent/null, preserving explicit zero and existing uppercase aliases.
+  No provider, budget, dispatch or trading-risk validation changed.
+- The affected fee-precision and start-safety browser files passed **51 tests
+  in 32.88 seconds** after the fix. Ruff and `git diff --check` passed.
+  The full Chromium rerun is in session **63594**, `zero-price-final-e2e.log`.
+  The original full default rerun remains in session **77347**; its handle was
+  revalidated live, so no duplicate backend run was started. Earlier 137-browser
+  verification predates this final two-line fallback correction and is not
+  substituted for the new rerun. The pending live campaign remains untouched.
+
+- Final-source reruns completed: **139 Chromium E2E tests passed in 97.75
+  seconds** (session 63594, exit 0) and **58 frontend contract tests passed in
+  4.11 seconds** (`zero-price-frontend-contracts.log`, exit 0). The full
+  default/backend session 77347 remains the only active test run. Source edits
+  remain uncommitted pending its result; exact-package refresh and the previously
+  listed live/native gates are not complete.
+
+### Review-driven sizing corrections, 23 September 2026
+
+- Bounded independent review found three UI discrepancies and an adjacent
+  authoritative economics defect. Spare counts were being used as live sell
+  ladder slots: an asymmetric spare distribution produced 2,444.445 CAT where
+  the actual live slot needed 2,539.683 CAT. Two new backend cases failed before
+  correction (the zero-spare characterization passed). Pricing now uses live
+  counts and the configured live offer limit; output quantities still include
+  spares. Economics/frozen-execution tests: **60 passed in 39.02 seconds**.
+- Four browser regressions reproduced 14% headroom becoming binary
+  1.1400000000000001 and inflating an exact 114 CAT output to 114.001.
+  Percentage-to-multiplier conversion now remains a decimal rational through
+  CAT mojo rounding in both uniform and tiered Settings/readiness paths.
+- Two visible-confirmation cases failed because saved zero spread/edge was
+  replaced by unrelated unsaved form values. Confirmation now uses the same
+  nullish fallback as readiness. Another case reproduced floor(50 * .58)
+  showing 28 instead of the server's 29 outputs; the count product now uses
+  decimal-ratio integer division. These are estimates, not wallet authority.
+- All **34 focused fee-precision browser tests passed in 21.15 seconds** after
+  these fixes. Ruff, whitespace and tracked-secret checks passed. Broad browser
+  verification is running under session **74310** (`review-sizing-e2e.log`).
+- The original default/backend run **77347** is still running. It began before
+  the new economics correction and must not serve as final-source backend proof.
+  Let it finish, inspect its result, then run the changed-source default suite.
+  Do not duplicate it merely because a polling call yields.
+- The goal and hourly heartbeat were freshly verified ACTIVE. No extra general
+  permission is needed for code fixes or independent tests. The review-only
+  Bootstrap draft remains a separate final financial-action handoff; no live
+  campaign, new fee spend, preset resize, main merge or release was performed.
+
+- Broad browser run completed with **146 passed in 104.34 seconds**, session
+  74310 exit 0 confirmed. The additional worker dispatch,
+  economics/frozen-execution and four existing frontend files run under handle
+  **28280**, `review-sizing-contracts-corrected.log`; the first invocation used
+  a nonexistent frontend filename and ran no tests (not a production failure).
+  Backend 77347 is still progressing; no duplicate full run was launched.
+
+- Worker dispatch/economics/frozen-execution/frontend follow-up completed:
+  **142 passed in 56.62 seconds**, session 28280 exit 0. The supported worker
+  consumes the approved recipe's exact targets; the legacy sizing helper is
+  not used to regenerate economic targets on approved direct dispatch. Its
+  unsupported mutation fallback remains closed. Broader final-source backend,
+  refreshed Windows package/native and live-offer gates remain incomplete.
