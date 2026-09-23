@@ -11804,6 +11804,7 @@
                         <span class="label">Preparation count</span><span class="value" id="cpFeeTxCount">--</span>
                         <span class="label">Current estimate</span><span class="value" id="cpFeeEstimate">--</span>
                         <span class="label">Protected cancellation</span><span class="value" id="cpFeeCancellation">--</span>
+                        <span class="label">Existing fee commitments</span><span class="value" id="cpFeePriorAccounting">--</span>
                         <span class="label">Fee-coin principal</span><span class="value" id="cpFeePrincipal">--</span>
                         <span class="label">Fee funding available</span><span class="value" id="cpFeeFunding">--</span>
                         <span class="label">Estimate source</span><span class="value" id="cpFeeSource">--</span>
@@ -11823,7 +11824,7 @@
                             onclick="refreshCoinPrepFeePreview()" style="margin-top:10px; padding:7px 12px;">Refresh fee estimate</button>
                 </div>
                 <div class="coin-prep-message">
-                    This will take around five minutes to complete. You can monitor progress below.
+                    The default fee estimate targets inclusion within 300 seconds per transaction, not total preparation time. Block inclusion and completion times are not guaranteed.
                 </div>
 
                 <div class="coin-prep-guidance">
@@ -11883,7 +11884,7 @@
                 </div>
                 
                 <div style="margin-top: 20px; padding: 10px 14px; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; font-size: 0.85em; color: rgba(255,255,255,0.6); line-height: 1.5; text-align: center;">
-                    ℹ️ This will take around five minutes to complete. Each split requires a blockchain transaction to confirm.
+                    ℹ️ Each split must confirm on-chain. The 300-second default target is per transaction; total preparation may take longer and is not guaranteed.
                 </div>
                 
                 <div style="margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
@@ -11894,6 +11895,7 @@
                         <button id="coinPrepCancelBtn" onclick="cancelCoinPrepInProgress()" style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); color: var(--sell-color); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85em; transition: all 0.2s;">
                             Cancel Coin Prep
                         </button>
+                        <button id="cpReviewFeeBudgetBtn" class="btn" style="display:none;" disabled>Review fee budget</button>
                     </div>
                     <div id="coinPrepLogBox" class="coin-prep-log-box">
                         Waiting for coin prep logs...
@@ -12353,7 +12355,7 @@
                 </ul>
             </div>
             <p style="opacity: 0.7; margin-bottom: 20px; font-size: 0.88em; color: var(--text-secondary);">
-                Coin prep only needs to run once and takes around five minutes.
+                Coin prep prepares coins for your current settings. The default fee estimate targets 300-second inclusion per transaction, not a guaranteed total preparation time.
             </p>
             <div class="v4-modal-actions v4-modal-actions--center">
                 <button class="btn btn-start btn-primary" onclick="closeSkipWarningAndGoBack()" style="flex: 1; max-width: 190px;">🪙 Run Coin Prep</button>
@@ -18955,6 +18957,7 @@
                     _coinPrepFeeRecoveryBlocking = true;
                     setCoinPrepStatus('checking');
                     renderCoinPrepFeeAccounting(status);
+                    updateCoinPrepRecoveryControls(status);
                     showCoinPrepView('progress');
                     const modal = document.getElementById('coinPrepConfirmOverlay');
                     if (modal) modal.classList.add('active');
@@ -18979,7 +18982,7 @@
                     if (bar) bar.style.width = Math.min(Math.max(progress, 0), 100) + '%';
                     const pct = document.getElementById('cpProgressPct');
                     if (pct) pct.textContent = Math.round(progress) + '%';
-                    if (status.running && !coinPrepPollInterval) {
+                    if (!coinPrepPollInterval) {
                         coinPrepPollInterval = setInterval(pollCoinPrepProgress, 1500);
                     }
                     return true;
@@ -35826,6 +35829,61 @@ function closeCtgErrorModal() {
         let _coinPrepFeeRequestSequence = 0;
         let _coinPrepConfirmReadyText = 'Yes, Prepare Coins';
         let _coinPrepFeeAgeTimer = null;
+        let _coinPrepRecoveryStatus = null;
+        let _coinPrepFeeReviewContract = null;
+        let _coinPrepRecoveryReviewBusy = false;
+
+        function updateCoinPrepRecoveryControls(status) {
+            _coinPrepRecoveryStatus = status;
+            const accounting = status?.fee_approval;
+            const recovering = status?.running !== true
+                && status?.overlapping_coin_prep_blocked === true
+                && !['complete', 'stale'].includes(accounting?.state);
+            _coinPrepFeeRecoveryBlocking = recovering;
+            const options = accounting?.request_options;
+            const canReview = recovering && status.fee_resume_required === true
+                && ['approved', 'paused_budget'].includes(accounting?.state)
+                && accounting?.unresolved_operation_count === 0 && accounting?.stale === false
+                && options && typeof options === 'object' && !Array.isArray(options);
+            const button = document.getElementById('cpReviewFeeBudgetBtn');
+            if (button) {
+                button.style.display = recovering ? '' : 'none';
+                button.disabled = !canReview || _coinPrepRecoveryReviewBusy;
+            }
+            return {recovering, canReview: !!canReview};
+        }
+
+        async function reviewRecoveredCoinPrepFees() {
+            if (_coinPrepRecoveryReviewBusy) return;
+            const expectedId = _coinPrepRecoveryStatus?.fee_approval?.approval_id;
+            _coinPrepRecoveryReviewBusy = true;
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/status`, {cache: 'no-store'});
+                if (!response.ok) throw new Error('Current fee recovery status is unavailable.');
+                const status = await response.json();
+                renderCoinPrepFeeAccounting(status);
+                const controls = updateCoinPrepRecoveryControls(status);
+                const accounting = status.fee_approval;
+                if (!controls.canReview || accounting.approval_id !== expectedId) return;
+                _coinPrepFeeReviewContract = {
+                    scope_sha256: accounting.scope_sha256, plan_sha256: accounting.plan_sha256,
+                };
+                if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+                coinPrepPollInterval = null;
+                showCoinPrepView('confirm');
+                // Do not show stale browser-derived denominations after restart.
+                document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary').style.display = 'none';
+                const banner = document.getElementById('cpReasonBanner');
+                banner.style.display = '';
+                banner.textContent = 'Reviewing fees for the existing approved coin plan. This does not resume preparation until you explicitly approve and continue. Changed plans must be reviewed through Settings.';
+                await refreshCoinPrepFeePreview(accounting.request_options);
+            } catch (error) {
+                setCoinPrepFeeText('cpProgressMessage', formatError(error));
+            } finally {
+                _coinPrepRecoveryReviewBusy = false;
+                if (_coinPrepRecoveryStatus) updateCoinPrepRecoveryControls(_coinPrepRecoveryStatus);
+            }
+        }
 
         function canonicalCoinPrepMojos(value) {
             const text = String(value ?? '');
@@ -35970,16 +36028,18 @@ function closeCtgErrorModal() {
             try {
                 const maximum = canonicalCoinPrepMojos(coinPrepXchToMojos(input.value));
                 const cancellation = canonicalCoinPrepMojos(
-                    _coinPrepFeePreview.estimated_cancellation_fee_mojos
+                    _coinPrepFeePreview.minimum_cancellation_reserve_mojos
+                        ?? _coinPrepFeePreview.estimated_cancellation_fee_mojos
                 );
                 const estimatedTotal = canonicalCoinPrepMojos(
-                    _coinPrepFeePreview.estimated_total_fee_mojos
+                    _coinPrepFeePreview.minimum_cumulative_fee_mojos
+                        ?? _coinPrepFeePreview.estimated_total_fee_mojos
                 );
                 if (maximum < cancellation) {
                     throw new Error(`The cap must retain at least ${coinPrepMojosToXch(cancellation)} XCH for protected cancellation.`);
                 }
                 if (maximum < estimatedTotal) {
-                    throw new Error(`The cap must cover the displayed ${coinPrepMojosToXch(estimatedTotal)} XCH estimated plan.`);
+                    throw new Error(`The cumulative cap must cover at least ${coinPrepMojosToXch(estimatedTotal)} XCH, including existing commitments and cancellation protection.`);
                 }
                 if (error) error.textContent = '';
                 setCoinPrepFeeLaunchEnabled(_coinPrepFeePreview.funded === true);
@@ -36012,8 +36072,11 @@ function closeCtgErrorModal() {
             const lower = Number(preview.preparation_transaction_count_min || 0);
             const upper = Number(preview.preparation_transaction_count_max || 0);
             setCoinPrepFeeText('cpFeeTxCount', `${lower === upper ? lower : `${lower}–${upper}`} preparation transactions`);
-            setCoinPrepFeeText('cpFeeEstimate', `${coinPrepMojosToXch(preview.estimated_total_fee_mojos)} XCH total`);
-            setCoinPrepFeeText('cpFeeCancellation', `${coinPrepMojosToXch(preview.estimated_cancellation_fee_mojos)} XCH reserved`);
+            setCoinPrepFeeText('cpFeeEstimate', `${coinPrepMojosToXch(preview.estimated_total_fee_mojos)} XCH remaining plan estimate`);
+            const cancellation = preview.minimum_cancellation_reserve_mojos ?? preview.estimated_cancellation_fee_mojos;
+            setCoinPrepFeeText('cpFeeCancellation', `${coinPrepMojosToXch(cancellation)} XCH protected; current estimate ${coinPrepMojosToXch(preview.estimated_cancellation_fee_mojos)} XCH`);
+            const accounting = preview.fee_accounting || {};
+            setCoinPrepFeeText('cpFeePriorAccounting', `${coinPrepMojosToXch(accounting.spent_fee_mojos ?? '0')} XCH spent · ${coinPrepMojosToXch(accounting.held_fee_mojos ?? '0')} XCH held (included in the cumulative cap)`);
             setCoinPrepFeeText('cpFeePrincipal', `${coinPrepMojosToXch(preview.fee_coin_principal_mojos)} XCH prepared as coin principal, not spent as fees`);
             setCoinPrepFeeText('cpFeeFunding', `${coinPrepMojosToXch(preview.fee_funding_mojos)} XCH${preview.funded ? '' : ' — insufficient'}`);
 
@@ -36058,7 +36121,7 @@ function closeCtgErrorModal() {
             }
             setCoinPrepFeeText('cpFeeNetwork', networkLines.join(' · '));
             setCoinPrepFeeText('cpFeeStatus', preview.funded
-                ? 'Review the current estimate and choose the maximum total network fee you approve.'
+                ? 'Review the current estimate and choose the cumulative maximum network fee you approve, including prior spent/held fees and protected cancellation.'
                 : 'The wallet does not have enough selectable XCH fee funding for this estimate.');
 
             const input = document.getElementById('cpFeeMaximumInput');
@@ -36067,7 +36130,7 @@ function closeCtgErrorModal() {
             _coinPrepFeeAgeTimer = setInterval(updateCoinPrepFeeFreshness, 1000);
         }
 
-        function showCoinPrepFeeUnavailable(reason) {
+        function showCoinPrepFeeUnavailable(reason, providerFailures = []) {
             _coinPrepFeePreview = null;
             if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
             _coinPrepFeeAgeTimer = null;
@@ -36078,7 +36141,20 @@ function closeCtgErrorModal() {
             if (details) details.style.display = 'none';
             if (capRow) capRow.style.display = 'none';
             const suffix = reason ? ` (${reason})` : '';
-            setCoinPrepFeeText('cpFeeStatus', `Fee estimate unavailable${suffix}. Coin Prep remains safely blocked; refresh when the wallet and fee provider are ready.`);
+            const labels = { full_node_rpc: 'Full node', coinset: 'Coinset' };
+            const reasons = {
+                fee_provider_unsynced: 'not synced', fee_provider_unavailable: 'unavailable',
+                fee_provider_disabled: 'disabled', fee_provider_not_configured: 'not configured',
+                fee_provider_rate_limited: 'rate limited', fee_provider_http_error: 'request rejected',
+                invalid_fee_response: 'invalid fee response', invalid_network_evidence: 'invalid network data',
+                stale_or_future_fee_quote: 'stale or invalid quote time',
+                invalid_fee_quote_request: 'invalid quote request',
+            };
+            const diagnostics = (Array.isArray(providerFailures) ? providerFailures.slice(0, 8) : [])
+                .filter(item => Object.prototype.hasOwnProperty.call(labels, item?.source))
+                .map(item => `${labels[item.source]}: ${Object.prototype.hasOwnProperty.call(reasons, item.reason) ? reasons[item.reason] : 'unavailable'}`);
+            const detail = diagnostics.length ? ` ${diagnostics.join('; ')}.` : '';
+            setCoinPrepFeeText('cpFeeStatus', `Fee estimate unavailable${suffix}.${detail} Coin Prep remains safely blocked; refresh when the wallet and fee provider are ready.`);
             setCoinPrepFeeLaunchEnabled(false);
         }
 
@@ -36108,10 +36184,16 @@ function closeCtgErrorModal() {
                 const data = await response.json();
                 if (requestSequence !== _coinPrepFeeRequestSequence) return false;
                 if (!response.ok || data.success !== true || data.available !== true || !data.preview_id) {
-                    showCoinPrepFeeUnavailable(data.reason || data.error || `HTTP ${response.status}`);
+                    showCoinPrepFeeUnavailable(data.reason || data.error || `HTTP ${response.status}`, data.provider_failures);
                     return false;
                 }
                 _coinPrepFeePreview = data;
+                if (_coinPrepFeeReviewContract && ['scope_sha256', 'plan_sha256'].some(
+                    key => !/^[0-9a-f]{64}$/.test(String(_coinPrepFeeReviewContract[key] || ''))
+                        || data[key] !== _coinPrepFeeReviewContract[key])) {
+                    showCoinPrepFeeUnavailable('FEE_APPROVAL_STALE — review changed coin settings first');
+                    return false;
+                }
                 renderCoinPrepFeePreview(data);
                 return true;
             } catch (error) {
@@ -36126,6 +36208,8 @@ function closeCtgErrorModal() {
 
         function showCoinPrepConfirm(config, reason, reasonMessage, verification = null) {
             _coinPrepFeeRecoveryBlocking = false;
+            _coinPrepFeeReviewContract = null;
+            document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary').style.display = '';
             config = normalizeConfigForLiquidityMode(config || {});
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (!modal) return;
@@ -36482,6 +36566,7 @@ function closeCtgErrorModal() {
             const maximumFeeMojos = validateCoinPrepFeeMaximum();
             if (maximumFeeMojos === null) return;
             const confirmedPreview = _coinPrepFeePreview;
+            const confirmedOptions = {..._coinPrepFeePreviewOptions};
             _coinPrepFeeConfirmBusy = true;
             const btn = document.getElementById('cpConfirmBtn');
             if (btn) {
@@ -36516,7 +36601,8 @@ function closeCtgErrorModal() {
                     body: JSON.stringify({
                         preview_id: confirmedPreview.preview_id,
                         maximum_fee_mojos: maximumFeeMojos,
-                        cancellation_reserve_mojos: String(confirmedPreview.estimated_cancellation_fee_mojos),
+                        cancellation_reserve_mojos: String(confirmedPreview.minimum_cancellation_reserve_mojos
+                            ?? confirmedPreview.estimated_cancellation_fee_mojos),
                     }),
                 });
                 const approval = await approvalResponse.json();
@@ -36529,7 +36615,7 @@ function closeCtgErrorModal() {
                     throw new Error(`Fee approval was not recorded (${reason}). No transaction was sent.`);
                 }
                 // Send the spare coin multiplier from the GUI to the API
-                const coinMultiplier = parseFloat(document.getElementById('configCoinPrepMultiplier')?.value) || 2;
+                const coinMultiplier = confirmedOptions.coin_multiplier;
                 const prepPayload = {
                     coin_multiplier: coinMultiplier,
                     fee_approval_id: approval.approval_id,
@@ -36628,6 +36714,19 @@ function closeCtgErrorModal() {
                 const response = await apiFetch(`${API_URL}/coin-prep/status`);
                 const status = await response.json();
                 renderCoinPrepFeeAccounting(status);
+                const recovery = updateCoinPrepRecoveryControls(status);
+                if (recovery.recovering) {
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = 'Coin Prep Paused Safely';
+                    setCoinPrepFeeText('cpProgressPhase', coinPrepFeeStateMessage(status.fee_approval?.state));
+                    setCoinPrepFeeText('cpProgressMessage', recovery.canReview
+                        ? 'Recovery is resolved. Review the current fee budget to continue; no work will restart automatically.'
+                        : 'Waiting for authoritative recovery evidence. Submitted transactions may still confirm; no overlapping preparation will start.');
+                    document.getElementById('coinPrepCancelBtn').style.display = 'none';
+                    document.getElementById('cpProgressDoneFallback').style.display = 'none';
+                    // Worker percentages/errors cannot declare journal-held effects complete.
+                    return;
+                }
                 if (status.fee_resume_required === true) {
                     _coinPrepFeeRecoveryBlocking = true;
                     const title = document.getElementById('cpProgressTitle');
@@ -36981,6 +37080,7 @@ function updateCtgCalculations() {
 
 // Event listeners for real-time updates
 document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('cpReviewFeeBudgetBtn')?.addEventListener('click', reviewRecoveredCoinPrepFees);
     // Live Controls moved from dashboard to Settings → Live sub-tab.
     // Relocate the existing DOM node so all the lc* handler ids stay valid.
     try { mountLiveControlsInSettings(); } catch (_) {}

@@ -94,7 +94,7 @@ def _mock_sage_payload(path: str) -> dict[str, Any]:
     if path == "/initialize":
         return {"success": True}
     if path == "/get_version":
-        return {"success": True, "version": "0.12.0"}
+        return {"success": True, "version": "0.13.0"}
     if path == "/get_key":
         return {
             "success": True,
@@ -139,7 +139,8 @@ def _start_mock_sage(
         temp_dir, "server", "mock-sage-server", ca_key, ca_cert, is_server=True
     )
     client_cert, client_key = _create_signed_cert(
-        temp_dir, "client", "mock-sage-client", ca_key, ca_cert, is_server=False
+        temp_dir / "sage-data" / "ssl", "wallet", "mock-sage-client",
+        ca_key, ca_cert, is_server=False
     )
 
     httpd = MockSageServer(("127.0.0.1", 0), MockSageHandler)
@@ -180,6 +181,11 @@ def _build_env(
             "SAGE_CERT_PATH": str(client_cert),
             "SAGE_KEY_PATH": str(client_key),
             "SAGE_DATA_DIR": str(temp_dir / "sage-data"),
+            "SAGE_HOME": str(temp_dir / "sage-data"),
+            "SAGE_ALLOWED_CERT_ROOTS": str(temp_dir / "sage-data"),
+            "APPDATA": str(temp_dir / "roaming"),
+            "LOCALAPPDATA": str(temp_dir / "local"),
+            "USERPROFILE": str(temp_dir / "profile"),
             "CMM_DATA_DIR": str(temp_dir / "catalyst-data"),
             "CATALYST_FLASK_PORT": str(flask_port),
             "BOT_LOCAL_WRITE_TOKEN": local_token,
@@ -193,6 +199,10 @@ def _build_env(
             "CAT_ASSET_ID": "0" * 64,
             "CAT_NAME": "Packaged Smoke Token",
             "CAT_TICKER": "SMOKE",
+            # This verifies packaged diagnostics, not live exchange reachability.
+            # A closed numeric-loopback endpoint cannot block on public DNS.
+            "DEXIE_API_BASE": "http://127.0.0.1:1",
+            "SPLASH_ENABLED": "false",
         }
     )
     return env
@@ -265,6 +275,8 @@ def _validate_payload(check: EndpointCheck, payload: Any) -> None:
         raise SmokeFailure(
             f"{check.path} missing required key(s): {', '.join(missing)}"
         )
+    if check.path == "/api/wallet/sage-running" and payload.get("rpc_authenticated") is not True:
+        raise SmokeFailure("mock Sage RPC is not authenticated")
 
 
 def _request_json(
@@ -421,6 +433,16 @@ def run_smoke(exe_path: Path, timeout_s: int) -> int:
                     )
                 _validate_payload(check, payload)
                 print(f"OK {check.method} {check.path}")
+
+            # Startup can reload credentials asynchronously. Authentication before
+            # begin-startup alone cannot establish that the mock remains in use.
+            auth_check = next(c for c in _endpoint_checks()
+                              if c.path == "/api/wallet/sage-running")
+            auth_status, auth_payload = _request_json(
+                base_url=base_url, check=auth_check, local_token=local_token)
+            if auth_status != 200:
+                raise SmokeFailure("mock Sage authentication readback failed")
+            _validate_payload(auth_check, auth_payload)
 
             if not server.saw_client_cert:
                 raise SmokeFailure(

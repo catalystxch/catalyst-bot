@@ -35,6 +35,27 @@ def test_missing_guidance_is_unavailable_not_zero(response):
     assert quote["fee_xch"] is None
 
 
+def test_failed_provider_metadata_cannot_expose_arbitrary_transport_details(monkeypatch):
+    module = importlib.import_module("fee_estimation")
+    fees = importlib.import_module("tx_fees")
+    monkeypatch.setattr(fees, "get_suggested_transaction_fee", lambda **_: {
+        "available": False, "source": "unavailable", "reason": "secret-test-key",
+        "provider_failures": [
+            {"source": "coinset", "reason": "fee_provider_unsynced", "observed_at": 100,
+             "raw": "secret-test-key"},
+            {"source": "coinset", "reason": "secret-test-key", "observed_at": True},
+            {"source": "https://secret-test-key", "reason": "fee_provider_unsynced"},
+        ],
+    })
+    quote = module.quote_fee(20_000_000)
+    assert quote["available"] is False and quote["fee_mojos"] is None
+    assert quote.get("provider_failures") == [
+        {"source": "coinset", "reason": "fee_provider_unsynced", "observed_at": 100},
+        {"source": "coinset", "reason": "fee_provider_unavailable", "observed_at": None},
+    ]
+    assert "secret-test-key" not in str(quote)
+
+
 @pytest.mark.parametrize(
     "value,expected", [(0, 0), (123, 123), ("123.01", 124), (Decimal("0.1"), 1)]
 )

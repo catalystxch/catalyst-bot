@@ -1,6 +1,8 @@
 """Sage native batch-cancel compatibility at the typed Task 8 boundary."""
 
 import unittest
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import wallet_sage
@@ -18,16 +20,29 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
         from chia_rs import Coin, CoinSpend, G2Element, Program, SpendBundle
         from chia_rs.sized_bytes import bytes32
 
-        asset_id = "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105"
+        from chia.util.bech32m import encode_puzzle_hash
+
         fee_mojos = 13_079_100
-        coins = [
-            Coin(bytes32(b"1" * 32), bytes32(b"a" * 32), 1_000),
-            Coin(bytes32(b"2" * 32), bytes32(b"b" * 32), 2_000),
-            Coin(bytes32(b"3" * 32), bytes32(b"c" * 32), 1_000_000_000),
-        ]
-        spends = [CoinSpend(coin, Program.to(1), Program.to([])) for coin in coins]
-        source_coin_ids = [coins[0].name().hex(), coins[1].name().hex()]
-        fee_coin_id = coins[2].name().hex()
+        # Use real executable CAT/native effects. A summary claiming outputs
+        # with empty puzzle solutions must be refused by the adapter.
+        cat = json.loads((Path(__file__).parent / "fixtures" / "coin_prep_unsigned_cat2.json").read_text())
+        puzzle = Program.to(1)
+        destination = bytes32(b"d" * 32)
+
+        def native(parent, amount, fee):
+            coin = Coin(parent, puzzle.get_tree_hash(), amount)
+            output = Coin(coin.name(), destination, amount - fee)
+            spend = CoinSpend(coin, puzzle, Program.to([[51, destination, amount - fee]]))
+            return spend, {"coin_id": coin.name().hex(), "amount": amount, "asset": None,
+                           "outputs": [{"coin_id": output.name().hex(), "amount": amount - fee,
+                                        "address": encode_puzzle_hash(destination, "xch"),
+                                        "receiving": True, "burning": False}]}
+
+        native_spend, native_summary = native(b"2" * 32, 2_000, 0)
+        fee_spend, fee_summary = native(b"3" * 32, 1_000_000_000, fee_mojos)
+        spends = [CoinSpend.from_json_dict(cat["coin_spends"][0]), native_spend, fee_spend]
+        source_coin_ids = [spend.coin.name().hex() for spend in spends[:2]]
+        fee_coin_id = fee_spend.coin.name().hex()
         trade_ids = ["a" * 64, "b" * 64]
         signed_bundle = SpendBundle(spends, G2Element())
         signed_json = signed_bundle.to_json_dict()
@@ -39,36 +54,7 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
                 return {
                     "summary": {
                         "fee": 0,
-                        "inputs": [
-                            {
-                                "coin_id": source_coin_ids[0],
-                                "amount": 1_000,
-                                "asset": {"asset_id": asset_id},
-                                "outputs": [
-                                    {
-                                        "coin_id": "4" * 64,
-                                        "address": "xch1cancelchange",
-                                        "amount": 1_000,
-                                        "receiving": True,
-                                        "burning": False,
-                                    }
-                                ],
-                            },
-                            {
-                                "coin_id": source_coin_ids[1],
-                                "amount": 2_000,
-                                "asset": {"asset_id": asset_id},
-                                "outputs": [
-                                    {
-                                        "coin_id": "5" * 64,
-                                        "address": "xch1cancelchange",
-                                        "amount": 2_000,
-                                        "receiving": True,
-                                        "burning": False,
-                                    }
-                                ],
-                            },
-                        ],
+                        "inputs": [cat["summary"]["inputs"][0], native_summary],
                     },
                     "coin_spends": signed_json["coin_spends"][:2],
                 }
@@ -76,22 +62,7 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
                 return {
                     "summary": {
                         "fee": fee_mojos,
-                        "inputs": [
-                            {
-                                "coin_id": fee_coin_id,
-                                "amount": 1_000_000_000,
-                                "asset": None,
-                                "outputs": [
-                                    {
-                                        "coin_id": "6" * 64,
-                                        "address": "xch1feechange",
-                                        "amount": 1_000_000_000 - fee_mojos,
-                                        "receiving": True,
-                                        "burning": False,
-                                    }
-                                ],
-                            }
-                        ],
+                        "inputs": [fee_summary],
                     },
                     "coin_spends": signed_json["coin_spends"][2:],
                 }

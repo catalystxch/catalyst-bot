@@ -24,7 +24,7 @@ from decimal import Decimal, ROUND_UP
 from typing import Dict, Optional
 
 from config import cfg
-from fee_estimation import normalize_fee_response
+from fee_estimation import fee_failure_diagnostics, normalize_fee_response
 
 
 XCH_MOJOS = Decimal("1000000000000")
@@ -162,7 +162,7 @@ def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[D
         return None
 
 
-def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
+def _coinset_fee_estimate(target_seconds: int, cost: int, *, diagnostics=None) -> Optional[Dict]:
     """Query Coinset cloud API for a fee estimate.
 
     Used as the primary auto-fee source for Sage users who have no local
@@ -172,8 +172,15 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
     Returns a normalised snapshot dict (same shape as full-node path) or
     None if Coinset is disabled, unreachable, or returns bad data.
     """
-    if not getattr(cfg, "COINSET_ENABLED", True):
+    def unavailable(reason, observed_at=None):
+        if diagnostics is not None:
+            diagnostics.extend(fee_failure_diagnostics({
+                "available": False, "source": "coinset", "reason": reason,
+                "observed_at": observed_at}))
         return None
+
+    if not getattr(cfg, "COINSET_ENABLED", True):
+        return unavailable("fee_provider_disabled")
 
     cache_key = (target_seconds, cost)
     now = time.time()
@@ -215,13 +222,17 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
                 break
             # 429/500/502/503/504 → retry; other 4xx → give up immediately
             if r.status_code not in (429, 500, 502, 503, 504):
-                return None
+                return unavailable("fee_provider_http_error")
             if _attempt < 2:
                 time.sleep(1 + _attempt * 2)  # 1s, 3s
         if r is None or r.status_code != 200:
-            return None
-        data = r.json()
+            return unavailable("fee_provider_rate_limited" if r is not None and r.status_code == 429
+                               else "fee_provider_unavailable")
         observed_at = int(time.time())
+        try:
+            data = r.json()
+        except ValueError:
+            return unavailable("invalid_fee_response", observed_at)
         quote = normalize_fee_response(
             data,
             cost=cost,
@@ -231,7 +242,7 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
             now=observed_at,
         )
         if not quote["available"]:
-            return None
+            return unavailable(quote["reason"], observed_at)
         snapshot = {
             **quote,
             "available": True,
@@ -246,7 +257,7 @@ def _coinset_fee_estimate(target_seconds: int, cost: int) -> Optional[Dict]:
         _COINSET_FEE_CACHE[cache_key] = (now, snapshot)
         return snapshot
     except Exception:
-        return None
+        return unavailable("fee_provider_unavailable")
 
 
 def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) -> Dict:
@@ -299,7 +310,11 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
         return dict(snapshot)
 
     # No local full node — try Coinset cloud API before giving up
-    coinset_result = _coinset_fee_estimate(target, cost_val)
+    failures = fee_failure_diagnostics(quote if result is not None else {
+        "available": False, "source": "full_node_rpc", "observed_at": None,
+        "reason": ("fee_provider_unavailable" if env.get("supports_auto_estimate")
+                   else "fee_provider_not_configured")})
+    coinset_result = _coinset_fee_estimate(target, cost_val, diagnostics=failures)
     if coinset_result:
         _SUGGESTED_FEE_CACHE[cache_key] = (now, coinset_result)
         return dict(coinset_result)
@@ -317,6 +332,7 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
         "fee_xch": "0",
         **quote["network_evidence"],
         "raw": result or {},
+        "provider_failures": failures,
     }
     _SUGGESTED_FEE_CACHE[cache_key] = (now, snapshot)
     return dict(snapshot)

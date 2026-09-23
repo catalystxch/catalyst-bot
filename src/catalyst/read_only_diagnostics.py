@@ -407,11 +407,9 @@ def _pid_liveness(pid: int, owner_host: str) -> bool | None:
         return None
     if safe_pid <= 0 or not safe_host:
         return None
-    local_names = {
-        socket.gethostname().casefold(),
-        socket.getfqdn().casefold(),
-    }
-    if safe_host not in local_names:
+    from local_host_identity import is_local_host
+
+    if not is_local_host(safe_host):
         return None
     if safe_pid == os.getpid():
         return True

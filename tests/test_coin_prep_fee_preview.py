@@ -87,6 +87,60 @@ def test_projected_upper_count_prices_total_without_charging_fee_principal(conte
     assert result["stages"][1]["cost_kind"] == "exact_unsigned"
 
 
+@pytest.mark.parametrize("prep_held,cancel_held,want_cap,want_funding", [
+    (0, 0, 110, 110), (30, 0, 140, 110),
+    (0, 50, 130, 80), (30, 50, 160, 80),
+])
+def test_renewal_preserves_protection_and_prices_a_cumulative_ceiling(
+    context, prep_held, cancel_held, want_cap, want_funding
+):
+    # Earlier cancellation guidance was 40; it has now fallen to 10. Existing
+    # cancellation commitments consume the total, not the non-cancellation cap.
+    context[2][2]["transaction_count_max"] = 8
+    first = _preview(context, funding=1000)
+    approval = database.approve_coin_prep_fee_preview(
+        preview_id=first["preview_id"], scope_sha256=first["scope_sha256"],
+        plan_sha256=first["plan_sha256"], maximum_fee_mojos=200,
+        cancellation_reserve_mojos=40, now=100,
+    )
+    for index, fee, cancellation in ((1, prep_held, False), (2, cancel_held, True)):
+        if fee:
+            database.reserve_approved_fee(
+                approval_id=approval["approval_id"], scope_sha256=first["scope_sha256"],
+                plan_sha256=first["plan_sha256"], operation_id=str(index) * 64,
+                fee_mojos=fee, cancellation=cancellation,
+            )
+    context[2][2]["transaction_count_max"] = 2
+    result = _preview(context, funding=want_funding)
+    assert result["estimated_total_fee_mojos"] == 80
+    assert result["estimated_cancellation_fee_mojos"] == 10
+    assert result["suggested_maximum_fee_mojos"] == want_cap
+    assert result["minimum_cumulative_fee_mojos"] == want_cap
+    assert result["minimum_cancellation_reserve_mojos"] == 40
+    assert result["fee_accounting"]["held_fee_mojos"] == prep_held + cancel_held
+    assert result["fee_accounting"]["spent_fee_mojos"] == 0
+    assert result["funded"] is True
+    assert _preview(context, funding=want_funding - 1)["funded"] is False
+    renewed = database.approve_coin_prep_fee_preview(
+        preview_id=result["preview_id"], scope_sha256=result["scope_sha256"],
+        plan_sha256=result["plan_sha256"],
+        maximum_fee_mojos=result["suggested_maximum_fee_mojos"],
+        cancellation_reserve_mojos=result["minimum_cancellation_reserve_mojos"], now=100,
+    )
+    assert renewed["version"] == 2
+    assert renewed["remaining_fee_mojos"] == want_funding
+
+
+def test_other_wallet_scope_does_not_inflate_renewal_disclosure(context):
+    database.create_fee_approval(
+        scope_sha256="f" * 64, plan_sha256="e" * 64,
+        total_fee_mojos=1000, cancellation_reserve_mojos=900,
+    )
+    result = _preview(context)
+    assert result["minimum_cancellation_reserve_mojos"] == 10
+    assert result["suggested_maximum_fee_mojos"] == 80
+
+
 def test_preview_does_not_create_effect_journal_consent_or_worker_state(context):
     result = _preview(context)
     conn = database.get_connection()

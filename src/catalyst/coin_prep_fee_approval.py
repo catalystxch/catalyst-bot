@@ -13,7 +13,7 @@ import time
 
 from replacement_capacity import COIN_PURPOSES
 import database
-from fee_estimation import fee_quote_network_evidence, quote_fee
+from fee_estimation import fee_failure_diagnostics, fee_quote_network_evidence, quote_fee
 
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
@@ -333,7 +333,7 @@ def estimate_coin_prep_fee_preview(
             # Invalid matched guidance must not fall back to a different quote.
             # Do not persist a malformed usable fee or untrusted extra fields.
             quote = {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE",
-                     "fee_mojos": None}
+                     "fee_mojos": None, "provider_failures": fee_failure_diagnostics(quote)}
         else:
             diagnostics = fee_quote_network_evidence(quote)
             quote = {key: quote[key] for key in (
@@ -380,6 +380,16 @@ def estimate_coin_prep_fee_preview(
         available = False
         total = None
         observed, expires = now, now + 60
+    accounting = database.get_fee_scope_budget(contract["scope_sha256"])
+    protected = minimum_cumulative = None
+    if available:
+        protected = max(cancel, accounting["protected_cancellation_fee_mojos"])
+        # Cancellation commitments already consumed part of the lifetime total;
+        # do not double-count them as preparation or discard prior protection.
+        minimum_cumulative = _exact_int(max(
+            accounting["noncancellation_committed_fee_mojos"] + prep + protected,
+            accounting["committed_fee_mojos"] + prep + cancel,
+        ))
     result = {
         "available": available,
         "reason": "network_fee_estimate" if available else "FEE_ESTIMATE_UNAVAILABLE",
@@ -394,13 +404,18 @@ def estimate_coin_prep_fee_preview(
         "estimated_cancellation_fee_mojos": cancel if available else None,
         "estimated_total_fee_mojos": total,
         "estimated_minimum_fee_mojos": minimum if available else None,
-        "suggested_maximum_fee_mojos": total,
+        "suggested_maximum_fee_mojos": minimum_cumulative,
+        "minimum_cumulative_fee_mojos": minimum_cumulative,
+        "minimum_cancellation_reserve_mojos": protected,
+        "fee_accounting": accounting,
         "fee_coin_principal_mojos": principal,
         "fee_funding_mojos": funding,
-        "funded": available and total <= funding,
+        "funded": available and minimum_cumulative - accounting["committed_fee_mojos"] <= funding,
         "observed_at": observed,
         "expires_at": expires,
         "inclusion_is_guaranteed": False,
+        "provider_failures": fee_failure_diagnostics({"provider_failures": [
+            failure for stage in priced_stages for failure in stage["quote"].get("provider_failures", [])]}),
     }
     saved = database.store_coin_prep_fee_preview(
         scope_sha256=contract["scope_sha256"], plan_sha256=contract["plan_sha256"],
@@ -425,7 +440,8 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
 
     context = read_staged_prep_fee_snapshot(request_options, quote_provider=quote_fee)
     if context["available"] is not True:
-        return {"available": False, "reason": context["reason"], "dispatch_authorized": False}
+        return {"available": False, "reason": context["reason"], "dispatch_authorized": False,
+                "provider_failures": fee_failure_diagnostics(context)}
     campaign = context["campaign"]
     scope = resolve_server_fee_scope(identity=context["identity"],
                                     campaign_id=campaign["campaign_id"] if campaign else None)

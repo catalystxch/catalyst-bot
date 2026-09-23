@@ -1,6 +1,8 @@
 """Preview surfaces expose staged evidence, never fee consent or dispatch."""
 
 from importlib import import_module
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -110,3 +112,48 @@ def test_auth_and_loopback_precede_preview(local_preview, headers, remote, statu
     )
     assert response.status_code == status
     assert local_preview["reads"] == [] and not local_preview.get("builds")
+
+
+@pytest.mark.parametrize("surface", ["http", "native"])
+@pytest.mark.parametrize("stage", ["exact", "projected"])
+@pytest.mark.parametrize("failure,reason,observed", [
+    ("unsynced", "fee_provider_unsynced", 1000),
+    ("malformed", "invalid_fee_response", 1000),
+    ("throttled", "fee_provider_rate_limited", None),
+    ("transport", "fee_provider_unavailable", None),
+    ("disabled", "fee_provider_disabled", None),
+])
+def test_provider_failure_reasons_survive_real_quotes_to_public_preview(
+    local_preview, monkeypatch, surface, stage, failure, reason, observed,
+):
+    fees = import_module("tx_fees")
+    estimation = import_module("fee_estimation")
+    fees._COINSET_FEE_CACHE.clear()
+    fees._SUGGESTED_FEE_CACHE.clear()
+    monkeypatch.setattr(fees, "time", SimpleNamespace(time=lambda: 1000, sleep=lambda _: None))
+    monkeypatch.setattr(estimation, "time", SimpleNamespace(time=lambda: 1000))
+    monkeypatch.setattr(fees.cfg, "COINSET_ENABLED", failure != "disabled", raising=False)
+    monkeypatch.setattr(fees, "get_wallet_fee_environment", lambda: {"supports_auto_estimate": True})
+    monkeypatch.setattr(fees, "_full_node_rpc", lambda *_a, **_k: {
+        "success": True, "estimates": [0], "full_node_synced": False})
+
+    def post(*_a, **_k):
+        if failure == "transport":
+            raise RuntimeError("https://example.invalid/?api_key=secret-test-key")
+        return SimpleNamespace(status_code=429 if failure == "throttled" else 200,
+            json=lambda: {"success": True, **({"estimates": [0], "full_node_synced": False}
+                                            if failure == "unsynced" else {})})
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr(import_module("coin_prep_fee_approval"), "quote_fee", estimation.quote_fee)
+    if stage == "exact":
+        monkeypatch.setattr(import_module("coin_prep_fee_pricing"), "quote_fee", estimation.quote_fee)
+    result = request_preview(local_preview, surface, {})
+    assert result["available"] is False and result["dispatch_authorized"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert result.get("provider_failures") == [
+        {"source": "full_node_rpc", "reason": "fee_provider_unsynced", "observed_at": 1000},
+        {"source": "coinset", "reason": reason, "observed_at": observed},
+    ]
+    assert "secret-test-key" not in json.dumps(result)
+    assert result.get("preview_id") is None
+    assert not any(utils._counts().values())

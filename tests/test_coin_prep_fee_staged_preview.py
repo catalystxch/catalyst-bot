@@ -184,3 +184,24 @@ def test_future_fragmentation_prices_every_bounded_prerequisite(staged, root_cou
     assert result["preparation_transaction_count_max"] == maximum + 2
     assert result["estimated_total_fee_mojos"] == total
     assert not any(utils._counts().values())
+
+
+@pytest.mark.parametrize("mode", ["two_sided", "buy_only"])
+def test_workflow_exceeding_worker_batch_limit_is_refused_before_initial_effect(staged, mode):
+    from chia_rs import Coin
+    from fee_projection_test_utils import standard_puzzles
+
+    native, _cat = standard_puzzles()
+    staged["config"].LIQUIDITY_MODE = mode
+    staged["xch"] = []
+    for index in range(453):
+        coin = Coin(index.to_bytes(32, "big"), native.get_tree_hash(), 300_000_000)
+        row = utils._coin(index, str(coin.amount))
+        row["coin_id"] = coin.name().hex()
+        staged["xch"].append(row)
+        staged["unsigned_roots"][coin.name().hex()] = (coin, native, None)
+    result = preview()
+    assert result["available"] is False, result
+    assert result["reason"] == "FEE_PREP_BATCH_LIMIT_EXCEEDED"
+    assert result.get("preview_id") is None
+    assert not any(utils._counts().values())

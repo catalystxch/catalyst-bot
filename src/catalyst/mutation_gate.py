@@ -1181,8 +1181,10 @@ def pid_liveness(pid: int, owner_host: str) -> Optional[bool]:
         safe_host = _exact_text(owner_host, "owner_host")
     except ValueError:
         return None
-    local_names = {socket.gethostname().casefold(), socket.getfqdn().casefold()}
-    if safe_host.casefold() not in local_names:
+    from local_host_identity import is_local_host
+
+    if not is_local_host(safe_host):
+        # Missing local identity is uncertainty, never evidence of a dead owner.
         return None
     if safe_pid == os.getpid():
         return True

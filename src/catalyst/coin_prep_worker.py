@@ -2610,6 +2610,7 @@ class CoinPrepWorker:
         if not self.is_sage or not DB_AVAILABLE:
             raise ValueError("FEE_DISPATCH_UNSUPPORTED")
         from coin_prep_fee_dispatch import price_approved_prep_batch
+        from coin_prep_fee_pricing import MAX_PREP_BATCHES
         with self.status_lock:
             self.status.execution_mode = "direct_final_batch_v2"
             self.status.compatibility_reason = None
@@ -2619,7 +2620,7 @@ class CoinPrepWorker:
             self.status.batch_confirmed = 0
         # Keep progress bounded. Every pass refreshes remaining durable budget
         # and live inventory but never resizes the approved outputs.
-        for batch_number in range(1, 9):
+        for batch_number in range(1, MAX_PREP_BATCHES + 1):
             priced = price_approved_prep_batch(approval_id)
             if priced["available"] is not True:
                 raise ValueError(priced["reason"])

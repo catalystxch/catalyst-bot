@@ -29,6 +29,8 @@ def _preview(*, available: bool = True) -> dict:
         "success": True,
         "available": True,
         "preview_id": "a" * 64,
+        "scope_sha256": "c" * 64,
+        "plan_sha256": "b" * 64,
         "dispatch_authorized": False,
         "wallet": {
             "network": "mainnet",
@@ -267,6 +269,7 @@ def test_confirmation_records_budget_before_one_launch_and_preserves_exact_strin
             window.pollCoinPrepProgress = () => {};
             await refreshCoinPrepFeePreview({coin_multiplier: '1'});
             document.getElementById('cpFeeMaximumInput').value = '0.000020000001';
+            document.getElementById('configCoinPrepMultiplier').value = '9';
             await Promise.all([startCoinPrepFromModal(), startCoinPrepFromModal()]);
             return window.__feeCalls;
         }""",
@@ -283,6 +286,7 @@ def test_confirmation_records_budget_before_one_launch_and_preserves_exact_strin
     }
     assert len(trigger_calls) == 1
     assert trigger_calls[0]["body"]["fee_approval_id"] == "d" * 64
+    assert str(trigger_calls[0]["body"]["coin_multiplier"]) == "1"
 
 
 def test_unavailable_fee_quote_blocks_approval_and_launch(page):
@@ -305,6 +309,72 @@ def test_unavailable_fee_quote_blocks_approval_and_launch(page):
     assert result["calls"] == ["/api/coin-prep/fee-preview"]
     expect(page.locator("#cpFeeStatus")).to_contain_text("Fee estimate unavailable")
     expect(page.locator("#cpConfirmBtn")).to_be_disabled()
+
+
+def test_provider_outage_discloses_sources_and_reasons_without_enabling_approval(page):
+    _open_gui(page)
+    unavailable = {**_preview(available=False), "provider_failures": [
+        {"source": "full_node_rpc", "reason": "fee_provider_unsynced", "observed_at": 1000},
+        {"source": "coinset", "reason": "fee_provider_rate_limited", "observed_at": None},
+    ]}
+    result = page.evaluate("""async data => {
+        window.apiFetch = async () => new Response(JSON.stringify(data), {status: 200});
+        return await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+    }""", unavailable)
+    assert result is False
+    expect(page.locator("#cpFeeStatus")).to_contain_text("Full node: not synced")
+    expect(page.locator("#cpFeeStatus")).to_contain_text("Coinset: rate limited")
+    expect(page.locator("#cpConfirmBtn")).to_be_disabled()
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+def test_renewal_uses_displayed_cumulative_cap_and_retains_cancellation_protection(page, confirm):
+    _open_gui(page)
+    preview = {**_preview(),
+               "minimum_cumulative_fee_mojos": "39000000",
+               "suggested_maximum_fee_mojos": "39000000",
+               "minimum_cancellation_reserve_mojos": "15000000",
+               "fee_accounting": {"held_fee_mojos": "8000000", "spent_fee_mojos": "12000000",
+                                  "committed_fee_mojos": "20000000",
+                                  "noncancellation_committed_fee_mojos": "12000000",
+                                  "protected_cancellation_fee_mojos": "15000000"}}
+    result = page.evaluate(
+        """async ({preview, confirm}) => {
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                const body = options.body ? JSON.parse(options.body) : null;
+                window.__feeCalls.push({path: String(path), body});
+                if (String(path).endsWith('/fee-preview')) {
+                    return new Response(JSON.stringify(preview), {status: 200});
+                }
+                if (String(path).endsWith('/fee-approval') && confirm) {
+                    return new Response(JSON.stringify({success: false, reason: 'test stop'}), {status: 400});
+                }
+                throw new Error(`Unexpected mutation: ${path}`);
+            };
+            window.askPrepHistoryChoice = async () => ({
+                action: 'proceed', resets: {pnl: false, offers: false, counters: false}});
+            await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+            const input = document.getElementById('cpFeeMaximumInput');
+            if (!confirm) input.value = '0.000038';
+            input.dispatchEvent(new Event('input'));
+            const disabled = document.getElementById('cpConfirmBtn').disabled;
+            const disclosure = document.getElementById('cpFeePanel').textContent;
+            await startCoinPrepFromModal();
+            return {calls: window.__feeCalls, disabled, disclosure};
+        }""", {"preview": preview, "confirm": confirm},
+    )
+    assert result["disabled"] is (not confirm)
+    approval_calls = [call for call in result["calls"] if call["path"].endswith('/fee-approval')]
+    assert len(approval_calls) == int(confirm)
+    if confirm:
+        assert approval_calls[0]["body"] == {
+            "preview_id": "a" * 64, "maximum_fee_mojos": "39000000",
+            "cancellation_reserve_mojos": "15000000",
+        }
+    assert "0.000012 XCH spent" in result["disclosure"]
+    assert "0.000008 XCH held" in result["disclosure"]
+    assert "0.000015 XCH" in result["disclosure"]
 
 
 def test_stale_confirmation_refreshes_preview_without_triggering_wallet_work(page):
@@ -486,7 +556,7 @@ def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
 
     assert result == ["/api/coin-prep/fee-preview"]
     expect(page.locator("#cpFeeInputError")).to_contain_text(
-        "must cover the displayed 0.000016 XCH estimated plan"
+        "0.000016 XCH"
     )
     expect(page.locator("#cpConfirmBtn")).to_be_disabled()
 
@@ -563,3 +633,96 @@ def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_la
     expect(page.locator("#cpProgressFeeRemaining")).to_have_text("0.000004000001 XCH")
     expect(page.locator("#cpProgressFeeProtected")).to_have_text("0.000004 XCH")
     expect(page.locator("#coinPrepCancelBtn")).to_be_hidden()
+
+
+def _paused_recovery_status():
+    return {
+        "success": True, "running": False, "complete": False, "phase": "error",
+        "progress": 1, "message": "Worker stopped after submission",
+        "overlapping_coin_prep_blocked": True, "fee_resume_required": True,
+        "fee_approval": {
+            "approval_id": "d" * 64, "state": "submitted_awaiting_confirmation",
+            "scope_sha256": "c" * 64, "plan_sha256": "b" * 64,
+            "total_fee_mojos": "20000000", "cancellation_reserve_mojos": "4000000",
+            "held_fee_mojos": "12000000", "spent_fee_mojos": "4000000",
+            "remaining_fee_mojos": "4000000", "remaining_preparation_fee_mojos": "0",
+            "unresolved_operation_count": 1, "stale": False, "dispatch_authorized": False,
+            "request_options": {"coin_multiplier": "2", "target_seconds": 300},
+        },
+    }
+
+
+def test_stopped_worker_keeps_observing_recovery_without_marking_progress_complete(page):
+    _open_gui(page)
+    page.evaluate("""async status => {
+        window.__recoveryCalls = [];
+        window.apiFetch = async path => {
+            window.__recoveryCalls.push(String(path));
+            if (!String(path).endsWith('/coin-prep/status')) throw new Error('Unexpected mutation');
+            return new Response(JSON.stringify(status), {status: 200});
+        };
+        coinPrepStatus = 'none';
+        await restoreCoinPrepReadiness();
+    }""", _paused_recovery_status())
+    page.wait_for_function("window.__recoveryCalls.length >= 2", timeout=4500)
+    expect(page.locator("#coinPrepProgressView")).to_be_visible()
+    expect(page.locator("#coinPrepCompleteView")).to_be_hidden()
+    expect(page.locator("#coinPrepErrorView")).to_be_hidden()
+    expect(page.locator("#cpProgressDoneFallback")).to_be_hidden()
+    expect(page.locator("#cpReviewFeeBudgetBtn")).to_be_disabled()
+    assert page.evaluate("coinPrepStatus") == "checking"
+
+
+@pytest.mark.parametrize("reappears", [False, True])
+@pytest.mark.parametrize("changed_plan", [False, True])
+def test_recovery_resolution_requires_deliberate_fresh_budget_review(page, reappears, changed_plan):
+    _open_gui(page)
+    # Isolate the already-connected recovery screen from the unrelated
+    # first-launch disclaimer. Keep real button hit-testing/handler dispatch.
+    page.evaluate("document.getElementById('startupOverlay').style.display = 'none'")
+    refreshed = _preview()
+    if changed_plan:
+        refreshed["plan_sha256"] = "e" * 64
+    page.evaluate("""async ({status, preview}) => {
+        window.__recoveryStatus = status;
+        window.__recoveryCalls = [];
+        window.apiFetch = async (path, options = {}) => {
+            const body = options.body ? JSON.parse(options.body) : null;
+            window.__recoveryCalls.push({path: String(path), body, method: options.method || 'GET'});
+            if (String(path).endsWith('/coin-prep/status')) {
+                return new Response(JSON.stringify(window.__recoveryStatus), {status: 200});
+            }
+            if (String(path).endsWith('/fee-preview')) {
+                return new Response(JSON.stringify(preview), {status: 200});
+            }
+            throw new Error(`No approval, reset or launch expected: ${path}`);
+        };
+        coinPrepStatus = 'none';
+        await restoreCoinPrepReadiness();
+        window.__recoveryStatus = {...status, fee_approval: {...status.fee_approval,
+            unresolved_operation_count: 0, held_fee_mojos: '0', spent_fee_mojos: '16000000',
+            state: 'paused_budget'}};
+        await pollCoinPrepProgress();
+    }""", {"status": _paused_recovery_status(), "preview": refreshed})
+    expect(page.locator("#cpReviewFeeBudgetBtn")).to_be_visible()
+    expect(page.locator("#cpReviewFeeBudgetBtn")).to_be_enabled()
+    assert all(call["method"] == 'GET'
+               for call in page.evaluate("window.__recoveryCalls"))
+    if reappears:
+        page.evaluate("status => { window.__recoveryStatus = status; }", _paused_recovery_status())
+    page.locator("#cpReviewFeeBudgetBtn").click()
+    if reappears:
+        expect(page.locator("#cpReviewFeeBudgetBtn")).to_be_disabled()
+        expect(page.locator("#coinPrepProgressView")).to_be_visible()
+    elif changed_plan:
+        expect(page.locator("#cpFeeStatus")).to_contain_text('FEE_APPROVAL_STALE')
+        expect(page.locator("#cpConfirmBtn")).to_be_disabled()
+    else:
+        expect(page.locator("#cpFeeWalletPair")).to_contain_text('736588221')
+        expect(page.locator("#coinPrepConfirmView")).to_be_visible()
+    calls = page.evaluate("window.__recoveryCalls")
+    previews = [call for call in calls if call["path"].endswith('/fee-preview')]
+    assert len(previews) == (0 if reappears else 1)
+    if previews:
+        assert previews[0]["body"] == {"coin_multiplier": "2", "target_seconds": 300}
+    assert all(call["method"] == 'GET' or call["path"].endswith('/fee-preview') for call in calls), calls

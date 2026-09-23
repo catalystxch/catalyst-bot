@@ -10,7 +10,9 @@ import time
 from coin_prep_batch_plan import BatchConstraints, BatchRefusal, plan_batch
 from coin_prep_targets import MAX_ATOMIC_AMOUNT
 from coin_prep_unsigned import inspect_batch_unsigned
-from fee_estimation import QUOTE_MAX_AGE_SECONDS, fee_quote_network_evidence, quote_fee
+from fee_estimation import QUOTE_MAX_AGE_SECONDS, fee_failure_diagnostics, fee_quote_network_evidence, quote_fee
+
+MAX_PREP_BATCHES = 8
 
 
 def _now():
@@ -43,8 +45,9 @@ def is_current_fee_quote(quote, cost, target_seconds, *, now=None):
     )
 
 
-def _unavailable(reason):
-    return {"available": False, "reason": reason, "dispatch_authorized": False}
+def _unavailable(reason, quote=None):
+    return {"available": False, "reason": reason, "dispatch_authorized": False,
+            "provider_failures": fee_failure_diagnostics(quote)}
 
 
 def price_next_prep_batch(*, snapshot, targets, reserve_floors, receive_address,
@@ -61,7 +64,8 @@ def price_next_prep_batch(*, snapshot, targets, reserve_floors, receive_address,
         raise ValueError("FEE_PRICING_CONSTRAINTS_INVALID")
     fee = 0
     for _round in range(4):
-        plan = plan_batch(snapshot, targets, BatchConstraints(reserve_floors, fee))
+        plan = plan_batch(snapshot, targets, BatchConstraints(
+            reserve_floors, fee, allow_bounded_prerequisite=True))
         if type(plan) is BatchRefusal:
             return _unavailable(plan.code)
         if plan.transaction_required is False:
@@ -87,7 +91,7 @@ def price_next_prep_batch(*, snapshot, targets, reserve_floors, receive_address,
         except Exception:
             return _unavailable("FEE_ESTIMATE_UNAVAILABLE")
         if not is_current_fee_quote(quote, inspection["cost"], target_seconds):
-            return _unavailable("FEE_ESTIMATE_UNAVAILABLE")
+            return _unavailable("FEE_ESTIMATE_UNAVAILABLE", quote)
         if quote["fee_mojos"] == fee:
             return {"available": True, "reason": "cost_fee_consistent", "plan": plan,
                     "inspection": inspection, "quote": quote,

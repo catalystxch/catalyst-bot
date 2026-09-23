@@ -344,6 +344,7 @@ def read_next_prep_fee_snapshot(request_options: dict) -> dict:
             return {**context, "funding": funding, "available": False,
                     "reason": "FEE_ESTIMATE_UNAVAILABLE", "dispatch_authorized": False}
     return {**context, "funding": funding, "pricing": pricing,
+            "provider_failures": pricing.get("provider_failures", []),
             "available": pricing["available"], "reason": pricing["reason"], "dispatch_authorized": False}
 
 
@@ -360,8 +361,9 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
     from chia_rs import CoinSpend
     from coin_prep_batch_plan import BatchPlan, PlannedOutput
     from coin_prep_fee_projection import project_standard_cost
-    from coin_prep_fee_pricing import is_current_fee_quote
+    from coin_prep_fee_pricing import MAX_PREP_BATCHES, is_current_fee_quote
     from coin_prep_unsigned import inspect_batch_unsigned
+    from fee_estimation import fee_failure_diagnostics
 
     context = read_next_prep_fee_snapshot(request_options)
     if context["available"] is not True:
@@ -392,10 +394,13 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             templates.setdefault(assets[spend.coin.name().hex()], spend.puzzle_reveal)
         return True
 
+    native_prerequisite = (plan.transaction_required and plan.asset == "xch"
+                           and bool(plan.outputs) and all(
+                               o.ordinal < 0 and o.purpose == "change" for o in plan.outputs))
     if plan.transaction_required:
         inspection = context["pricing"]["inspection"]
         remember(inspection)
-        name = f"prep_{plan.asset}"
+        name = "prep_xch_consolidation" if native_prerequisite else f"prep_{plan.asset}"
         stages.append({"stage_id": name, "cost": inspection["cost"], "cost_kind": "exact_unsigned",
                        "transaction_count_min": 1, "transaction_count_max": 1, "cancellation": False})
         quotes[name] = context["pricing"]["quote"]
@@ -405,7 +410,8 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
                            for asset in ("xch", "cat")}
     missing_native = [t for t in context["recipe"]["targets"] if t.asset == "xch"
                       and (t.asset, t.ordinal) not in plan.reused_target_ids]
-    need_future_native = plan.transaction_required and plan.asset == "cat" and missing_native
+    need_future_native = (plan.transaction_required and missing_native
+                          and (plan.asset == "cat" or native_prerequisite))
     needed_templates = ({"xch"} if need_future_native or any(cancellation_counts.values()) else set())
     if cancellation_counts["cat"]:
         needed_templates.add("cat")
@@ -443,6 +449,7 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         except Exception:
             return "FEE_ESTIMATE_UNAVAILABLE"
         if not is_current_fee_quote(quote, projection["cost"], target_seconds):
+            context["provider_failures"] = fee_failure_diagnostics(quote)
             return "FEE_ESTIMATE_UNAVAILABLE"
         stages.append({"stage_id": name, "cost": projection["cost"], "cost_kind": "projected",
                        "transaction_count_min": count_min, "transaction_count_max": count,
@@ -472,9 +479,10 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         future_amounts = [c.amount_mojos for c in context["funding"]["snapshot"].coins
                           if c.asset == "xch" and c.selectable and not c.protected
                           and c.coin_id not in plan.reused_coin_ids
+                          and c.coin_id not in plan.source_coin_ids
                           and c.coin_id != plan.fee_source_id]
         future_amounts += [o.amount_mojos for o in plan.outputs
-                           if o.asset == "xch" and o.purpose == "fee_change"]
+                           if o.asset == "xch" and o.purpose in {"change", "fee_change"}]
         principal = sum(t.amount_mojos for t in missing_native)
         largest = sum(sorted(future_amounts, reverse=True)[:50])
         if largest < principal + quotes["prep_xch"]["fee_mojos"]:
@@ -485,15 +493,17 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             # of roots by 49. This upper cover includes every such fee even
             # when the target can be funded before all roots are consolidated.
             maximum = (len(future_amounts) - 50 + 48) // 49
-            reason = add_projection("prep_xch_consolidation", xch_inputs=50,
+            consolidation_name = ("prep_xch_consolidation_remaining" if native_prerequisite
+                                  else "prep_xch_consolidation")
+            reason = add_projection(consolidation_name, xch_inputs=50,
                                     cat_inputs=0, xch_outputs=1, count=maximum,
                                     count_min=1 if largest < principal else 0)
             if reason:
                 return unavailable(reason)
-            profiles["prep_xch_consolidation"]["assumptions"].append(
+            profiles[consolidation_name]["assumptions"].append(
                 "bounded_native_50_to_1_prerequisites")
             stages.append(native_stage)
-            fee = quotes["prep_xch_consolidation"]["fee_mojos"]
+            fee = quotes[consolidation_name]["fee_mojos"]
             for _ in range(maximum):
                 future_amounts.sort(reverse=True)
                 merged = sum(future_amounts[:50]) - fee
@@ -512,6 +522,8 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
                 return unavailable(reason)
     # All network and unsigned construction has finished: do not persist a
     # confirmable preview if provider latency concealed a wallet/plan change.
+    if sum(s["transaction_count_max"] for s in stages if not s["cancellation"]) > MAX_PREP_BATCHES:
+        return unavailable("FEE_PREP_BATCH_LIMIT_EXCEEDED")
     try:
         after = read_fee_economic_snapshot(context["request_options"])
     except ValueError:

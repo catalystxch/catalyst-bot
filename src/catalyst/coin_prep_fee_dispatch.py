@@ -8,6 +8,7 @@ the existing wallet-effect fence. No manual fee/price/plan override is accepted.
 from coin_prep_fee_funding import prepare_fee_inventory
 from coin_prep_fee_pricing import is_current_fee_quote, price_next_prep_batch
 from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
+from fee_estimation import fee_failure_diagnostics
 import database
 import json
 from dataclasses import replace
@@ -85,7 +86,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
     # larger allowance, even though they do not change the economic plan.
     context = after
     if pricing["available"] is not True:
-        return _paused(context, pricing["reason"])
+        return _paused(context, pricing["reason"], provider_failures=fee_failure_diagnostics(pricing))
     if pricing["transaction_required"] is True:
         fee = pricing["plan"].fee_mojos
         if not is_current_fee_quote(pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]):
@@ -129,7 +130,8 @@ def reserve_approved_prep_dispatch(*, approval_id: str, operation_id: str, price
     funding = prepare_fee_inventory(priced_batch["snapshot"], context["recipe"]["targets"],
                                    economics["reserve_floors_mojos"])
     expected = plan_batch(funding["snapshot"], context["recipe"]["targets"],
-                          BatchConstraints(economics["reserve_floors_mojos"], plan.fee_mojos))
+                          BatchConstraints(economics["reserve_floors_mojos"], plan.fee_mojos,
+                                           allow_bounded_prerequisite=True))
     if funding["principal_funded"] is not True or plan != expected or plan.fee_mojos > funding["fee_funding_mojos"]:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
     target = batch_target_contract(plan, context["receive_address"], context["identity"]["asset_id"])

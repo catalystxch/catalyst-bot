@@ -5,10 +5,37 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
 QUOTE_MAX_AGE_SECONDS = 60
+_FAILURE_REASONS = frozenset({
+    "invalid_fee_quote_request", "stale_or_future_fee_quote", "invalid_fee_response",
+    "invalid_network_evidence", "fee_provider_unsynced", "fee_provider_unavailable",
+    "fee_provider_disabled", "fee_provider_not_configured", "fee_provider_rate_limited",
+    "fee_provider_http_error",
+})
 
 
 def _integer(value, minimum=0):
     return type(value) is int and minimum <= value <= MAX_ATOMIC_AMOUNT
+
+
+def fee_failure_diagnostics(value):
+    """Bounded non-authoritative reasons, never raw exceptions/URLs/provider text."""
+    if type(value) is not dict:
+        return []
+    rows = value.get("provider_failures")
+    if type(rows) is not list:
+        rows = [value] if value.get("available") is not True else []
+    result = []
+    for row in rows[:8]:
+        if type(row) is not dict or row.get("source") not in ("coinset", "full_node_rpc"):
+            continue
+        reason = row.get("reason")
+        reason = reason if type(reason) is str and reason in _FAILURE_REASONS else "fee_provider_unavailable"
+        observed = row.get("observed_at")
+        diagnostic = {"source": row["source"], "reason": reason,
+                      "observed_at": observed if _integer(observed) else None}
+        if diagnostic not in result:
+            result.append(diagnostic)
+    return result
 
 
 def fee_quote_network_evidence(quote):
@@ -135,7 +162,7 @@ def quote_fee(cost: int, target_seconds: int = 300) -> dict:
 
     snapshot = get_suggested_transaction_fee(cost=cost, target_seconds=target_seconds)
     now = int(time.time())
-    return normalize_fee_response(
+    quote = normalize_fee_response(
         snapshot.get("raw") if snapshot.get("available") is True else None,
         cost=cost,
         target_seconds=target_seconds,
@@ -143,3 +170,7 @@ def quote_fee(cost: int, target_seconds: int = 300) -> dict:
         observed_at=snapshot.get("observed_at"),
         now=now,
     )
+    if quote["available"] is not True:
+        quote["provider_failures"] = fee_failure_diagnostics(
+            snapshot if snapshot.get("available") is not True else quote)
+    return quote

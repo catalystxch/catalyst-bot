@@ -20963,6 +20963,28 @@ def _insert_fee_approval(
     return approval_id
 
 
+def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
+    """Read one consistent scope's prior protection and cumulative commitments.
+
+    This is disclosure only. Confirmation and dispatch independently recheck
+    current accounting inside their write transactions; a preview is no permit.
+    """
+    scope = _fee_digest(scope_sha256)
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        protected = conn.execute(
+            "SELECT cancellation_reserve_mojos FROM fee_approvals "
+            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1", (scope,),
+        ).fetchone()
+        return {
+            **_fee_scope_totals(conn, scope),
+            "protected_cancellation_fee_mojos": _fee_amount(protected[0]) if protected else 0,
+        }
+    finally:
+        conn.close()
+
+
 def create_fee_approval(
     *,
     scope_sha256: str,
@@ -21482,7 +21504,7 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
     try:
         _validate_stability_schema(conn)
         context = conn.execute(
-            "SELECT approval.*, preview.scope_json, preview.plan_json, "
+            "SELECT approval.*, preview.scope_json, preview.plan_json, preview.request_options_json, "
             "(SELECT MAX(newer.version) FROM fee_approvals AS newer "
             " WHERE newer.scope_sha256=approval.scope_sha256) AS latest_version "
             "FROM coin_prep_fee_consents AS consent "
@@ -21584,6 +21606,7 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             "approval_id": approval_id,
             "scope_sha256": context["scope_sha256"],
             "plan_sha256": context["plan_sha256"],
+            "request_options": json.loads(context["request_options_json"]),
             "version": int(context["version"]),
             "session_id": session_id,
             "session_generation": session_generation,

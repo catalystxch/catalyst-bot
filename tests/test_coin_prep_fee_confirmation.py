@@ -54,6 +54,15 @@ def test_confirmation_uses_persisted_scope_and_current_wallet_economics(confirma
                          "approved_fee_reservations": 0, "coin_prep_operations": 0, "wallet_effect_claims": 0}
 
 
+def test_restart_status_exposes_saved_choices_without_granting_dispatch(confirmation):
+    approval = _confirm(confirmation)
+    database.close_connection()
+    state = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+    assert state["request_options"] == {"coin_multiplier": "1", "target_seconds": 300}
+    assert state["dispatch_authorized"] is False
+    assert _counts()["approved_fee_reservations"] == 0
+
+
 @pytest.mark.parametrize("owner,reason", [("missing", "FEE_SESSION_REQUIRED"),
                                          ("foreign", "FEE_APPROVAL_STALE")])
 def test_unowned_session_preview_cannot_be_confirmed(confirmation, owner, reason):

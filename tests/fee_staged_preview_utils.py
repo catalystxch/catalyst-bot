@@ -1,7 +1,7 @@
 """Executable unsigned Sage responses for read-only staged preview tests."""
 
 from chia_rs import Coin, CoinSpend, Program
-from chia.util.bech32m import encode_puzzle_hash
+from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 import pytest
 
 from fee_approval_test_utils import ADDRESS, ASSET, _coin
@@ -29,9 +29,13 @@ def prepare_unsigned_wallet(state, monkeypatch):
         selected = [roots[cid] for cid in ids]
         fee = sum(int(a["amount"]) for a in actions if a["type"] == "fee")
         spends, summaries = [], []
+        assigned_assets = set()
         for coin, puzzle, asset in selected:
+            first_for_asset = asset not in assigned_assets
+            assigned_assets.add(asset)
             sends = [a for a in actions if a["type"] == "send"
-                     and (a["id"]["type"] == "xch") == (asset is None)]
+                     and (a["id"]["type"] == "xch") == (asset is None) and first_for_asset]
+            destination = decode_puzzle_hash(ADDRESS)
             conditions, output_rows, duplicate_amounts, ephemeral_spends = [], [], set(), []
             for action in sends:
                 assert action["address"] == ADDRESS and action["memos"] == []
@@ -46,18 +50,18 @@ def prepare_unsigned_wallet(state, monkeypatch):
                                         "receiving": True, "burning": False})
                 else:
                     duplicate_amounts.add(amount)
-                ph = b"\x32" * 32 if asset is None else _cat_puzzle_hash(bytes.fromhex(ASSET), b"\x32" * 32)
+                ph = destination if asset is None else _cat_puzzle_hash(bytes.fromhex(ASSET), destination)
                 row = {"coin_id": Coin(parent.name(), ph, amount).name().hex(), "amount": str(amount),
                        "address": ADDRESS, "receiving": True, "burning": False}
                 if parent == coin:
-                    conditions.append([51, b"\x32" * 32, amount])
+                    conditions.append([51, destination, amount])
                     output_rows.append(row)
                 else:
                     ephemeral_spends.append(CoinSpend(parent, native,
-                        Program.to([[], (1, [[51, b"\x32" * 32, amount]]), []])))
+                        Program.to([[], (1, [[51, destination, amount]]), []])))
                     summaries.append({"coin_id": parent.name().hex(), "amount": str(parent.amount),
                                       "address": ADDRESS, "asset": None, "outputs": [row]})
-            if asset is None and fee:
+            if asset is None and fee and first_for_asset:
                 conditions.append([52, fee])
             inner_solution = [[], (1, conditions), []]
             solution = inner_solution if asset is None else [inner_solution,
