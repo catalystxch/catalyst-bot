@@ -1695,3 +1695,38 @@ an active-offer cancellation test.
   live identity/status evidence. The candidate needs to be opened for the next
   operator-led live acceptance step; no automatic launch or trading action
   was taken.
+
+### Current-candidate live TEST 7 progress — 24 September 2026
+
+- The packaged candidate connected to Sage v0.13.0 and verified mainnet TEST 7
+  fingerprint `736588221`, MZ wallet ID `2`, and asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+  Splash and the configured Spacescan path also passed startup.
+- A confirmed live start produced one complete 2.9-second loop with zero
+  errors. RED attributable-market confidence kept both adaptive targets at
+  zero and created no offers. Stop completed with zero active offers, locked
+  coins, unresolved operations, reservations or publication claims.
+- Smart Settings failed closed on unsuitable Follow evidence. The unsaved
+  45/45 preset was visibly rejected as underfunded (about 1.443 million MZ
+  preparation need versus 780,212 available) and discarded; persisted 3/3
+  settings were reverified.
+- A temporary 4/4 plan exercised fresh fee estimation. An expired quote was
+  blocked until refresh. The refreshed 25-second-old Coinset quote shows a
+  cumulative maximum of `0.000401997224 XCH`, including protected cancellation
+  `0.0000902074 XCH`, one exact unsigned cost and three projected costs. Full
+  detail is in `2026-09-24-live-test7-acceptance.md`.
+- The exact 4/4 budget has not yet been approved or dispatched. That action,
+  confirmation accounting, restart recovery, and any live offer lifecycle
+  possible under genuine non-RED evidence remain open. No safety bypass,
+  fabricated consent, merge, release or installed-app replacement occurred.
+
+### 2026-09-24 focused live-acceptance rerun
+
+- Fresh focused fee, Coin Prep, cancellation, retry, and restart regression
+  selection: **948 passed in 346.62 seconds**.
+- Live TEST 7 quote refresh revalidated Sage `736588221`, wallet `2`, MZ/XCH
+  mainnet and retained a current `0.000401997224 XCH` cumulative maximum with
+  `0.0000902074 XCH` protected cancellation, zero spent, and zero held.
+- Real Coin Prep dispatch remains intentionally pending exact operator consent
+  for that current maximum; broad test permission is not recorded as a fee
+  budget approval.
