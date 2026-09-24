@@ -59,9 +59,9 @@
   - projected cancellation XCH: `0.000003288565 XCH` each for 1-8;
   - projected cancellation CAT: `0.00000798736 XCH` each for 1-8.
 - The UI enabled `Yes, Prepare Coins (+0% headroom)` only after the fresh
-  quote arrived. No approval has been recorded and no preparation transaction
-  has been dispatched. The next click is a real financial action and needs
-  operator confirmation of this exact displayed cumulative maximum.
+  quote arrived. At that pre-approval checkpoint no mutation had occurred; the
+  later explicit approval, dispatch, and authoritative outcome are recorded
+  below.
 
 ## Still open
 
@@ -122,3 +122,41 @@
   allowed with zero unresolved operations, reservations, or publications.
   The browser converged to the same STOPPED state on its subsequent status
   poll.
+
+## Specification acceptance matrix
+
+| Requirement group | Evidence | Result |
+|---|---|---|
+| Transaction-specific estimates | Strict normalization covers missing versus zero, malformed/NaN/negative/boolean values, integer bounds, matching cost/target, source provenance, original observation age, and upward Decimal rounding. Exact current unsigned costs and clearly labelled projections are exercised by focused and full regressions. | PASS |
+| Freshness and providers | Quotes expire after 60 seconds without cache-age renewal. The live stale quote blocked approval until Refresh; current Coinset guidance used the 300-second target. Outage, malformed evidence, source disagreement, and manual-fee bypass attempts fail closed in tests and package probes. | PASS |
+| Canonical preview and consent | HTTP/native/GUI previews are read-only and server-owned. The GUI showed wallet/pair, exact/projected counts and costs, source/age, target, retained principal, funding, editable maximum, and protected cancellation allowance. Approval is durable and scope/plan-bound. Cancel and duplicate confirmation have no unintended effects. | PASS |
+| Exact dispatch enforcement | Supported direct CAT/XCH and bounded prerequisite paths rebuild and inspect unsigned effects, converge fee/cost with bounded retries, reserve the exact final fee atomically, permit only within-cap repricing, and pause unsupported or over-cap paths. Bootstrap, retry, direct API, and native bridge bypass cases are covered. | PASS |
+| Protected cancellation | Preparation cannot borrow the protected allowance. Exact Sage cancellation uses its own inspected bundle and durable hold; cancellation/no-effect/recovery and insufficient-allowance behavior are covered across backend, API, native, and browser regressions. The live prep did not consume the reserve. | PASS |
+| Durable accounting and recovery | Concurrency, conflicting replay, crash-before-signing, submitted/unknown, confirmed, authoritative no-effect, later approval versions, reset preservation, and restart idempotency are covered. Live restart recovered 15,562,944 mojos spent, zero held/unresolved, with no duplicate dispatch. | PASS |
+| Accurate UI/API status | Projected versus exact evidence, source age, funding/principal, cumulative/remaining totals, waiting/paused/preparing/submitted/complete states, reload recovery, and actionable failures are exercised by 156 Chromium cases and focused regressions. Live `/api/coin-prep/status` agreed with the GUI and ledger. | PASS |
+| Build and package | Full suite: 6,981 passed, 157 skipped, 422 subtests. Focused fee/live-acceptance selection: 948 passed. Fresh Windows EXE SHA-256 `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`; API/Sage/recovery/fee-denial probes and operator native clean/duplicate/persisted/safety launches passed. | PASS |
+| Live TEST 7 Coin Prep | Sage mainnet fingerprint `736588221`, MZ wallet `2`, and the exact asset ID were verified. Genuine GUI approval covered `0.000401997224 XCH`; two batches confirmed for `0.000015562944 XCH`, produced 8/8 XCH and 8/8 MZ readiness, and survived restart without double accounting. | PASS |
+| Live bot start/stop and fail-closed market gate | Intended 3/3 strategy was restored. Preflight, reconciliation, start, loop, stop, zero-lock and zero-unresolved checks passed before and after restart. Current attributable market confidence remains RED, so zero offers were created as designed. | PASS |
+| Live create/requote/cancel/remake | Automated publication, requote, cancellation, retry and recovery coverage is green, but a live cycle cannot be honestly produced while the market gate has no attributable trusted executable price. CATalyst correctly refuses to fabricate price evidence or bypass the gate. | BLOCKED — external market evidence |
+
+Ruling: the approved fee feature meets its own completion contract because its
+live preview, consent, exact prep, accounting, restart, supported-path and
+no-bypass gates are proven. The broader other-PC handoff goal remains active
+because it explicitly also asks for a live create/requote/cancel/remake cycle.
+Waiting for genuine non-RED market evidence is safer than altering production
+confidence thresholds; if this ruling is wrong, acceptance is delayed rather
+than funds being exposed under fabricated pricing authority.
+
+## Latest read-only runtime audit
+
+- At 24 September 2026 10:53 BST, `/api/status` still reported the intended
+  Sage/MZ identity, `running=false`, 8 prepared XCH and 8 prepared CAT trading
+  coins, zero locked coins, zero open offers, zero pending cancellations, zero
+  unresolved operations/reservations/publications, and runtime safety allowed.
+- The latest loop evidence still said `No attributable trusted offer-book price
+  is available; new exposure and requotes remain blocked`. This is the only
+  outstanding live-cycle gate, not a missing permission or fee-consent gate.
+- The operator has now authorized acceptance of displayed fee prices during
+  continued testing as well as start/stop, Coin Prep, Smart Settings,
+  cancellation, requoting and offer remake actions. CATalyst's plan-bound
+  recorded caps and safety checks remain mandatory.
