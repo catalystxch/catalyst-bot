@@ -226,3 +226,20 @@ than funds being exposed under fabricated pricing authority.
   must not be repeated. Only live offer lifecycle acceptance remains open;
   no strategy/consent change, bot restart, transaction, push, merge or release
   was performed during this reconciliation.
+
+## Public-book refresh without trading — 24 September 2026 13:05 BST
+
+- Inspected `/api/market/intel` and its order-book refresh path, then used
+  that existing GET endpoint while the bot remained stopped. It returned a
+  0.7-second-old book, six refreshes and zero book errors. Public display
+  source was `dexie_v3_orderbook`, best bid `0.00004` and ask `0.00011` XCH/MZ.
+  Its aggregate depth is not independently attributable eligible depth and
+  must not be used as authority to trade or replace the confidence policy.
+- The subsequent confidence read still denied creation/requotes: its policy
+  assessment remained the expired `2026-09-24T09:59:42.218421Z` snapshot. The
+  public-book refresh does not run or approve a new trading cycle.
+- Status remained stopped, two loops/zero errors, zero locks, zero runtime
+  blockers, and no own offers. Fee status stayed complete with `15562944`
+  mojos spent, two confirmations and zero held/unresolved. No wallet action,
+  settings change, fee approval or bot start was performed. This establishes
+  a read-only monitoring path, not a passed live offer-cycle gate.
