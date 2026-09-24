@@ -658,7 +658,7 @@ def _current_profile_owner_pid() -> int | None:
 
 
 def _focus_catalyst_window_with_user32(
-    user32, callback_factory, *, owner_pid: int
+    user32, callback_factory, *, owner_pid: int, kernel32=None
 ) -> bool:
     """Restore the exact native CATalyst window exposed by another process."""
 
@@ -692,9 +692,48 @@ def _focus_catalyst_window_with_user32(
     handle = target[0]
     user32.ShowWindow(handle, 9)  # SW_RESTORE
     user32.BringWindowToTop(handle)
-    if not user32.SetForegroundWindow(handle):
+    activated = bool(user32.SetForegroundWindow(handle))
+    if activated and int(user32.GetForegroundWindow() or 0) == int(handle):
+        return True
+
+    # Windows may deny SetForegroundWindow when CATalyst is launched by a
+    # background process (for example an updater or automated smoke test).
+    # Temporarily join the foreground thread's input queue, perform the same
+    # activation, and always detach again.  This is limited to the HWND whose
+    # PID was proven by the current profile's lease/instance lock above.
+    attached_threads = []
+    current_thread = 0
+    try:
+        foreground_handle = int(user32.GetForegroundWindow() or 0)
+        if foreground_handle <= 0:
+            return False
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        current_thread = int(kernel32.GetCurrentThreadId() or 0)
+        foreground_thread = int(
+            user32.GetWindowThreadProcessId(foreground_handle, None) or 0
+        )
+        target_thread = int(user32.GetWindowThreadProcessId(handle, None) or 0)
+        if current_thread <= 0 or foreground_thread <= 0 or target_thread <= 0:
+            return False
+        for thread_id in dict.fromkeys((foreground_thread, target_thread)):
+            if thread_id == current_thread:
+                continue
+            if not user32.AttachThreadInput(current_thread, thread_id, True):
+                return False
+            attached_threads.append(thread_id)
+        user32.ShowWindow(handle, 9)  # SW_RESTORE
+        user32.BringWindowToTop(handle)
+        activated = bool(user32.SetForegroundWindow(handle))
+    except Exception:
         return False
-    return int(user32.GetForegroundWindow() or 0) == int(handle)
+    finally:
+        for thread_id in reversed(attached_threads):
+            try:
+                user32.AttachThreadInput(current_thread, thread_id, False)
+            except Exception:
+                pass
+    return activated and int(user32.GetForegroundWindow() or 0) == int(handle)
 
 
 def _focus_existing_catalyst_window(
