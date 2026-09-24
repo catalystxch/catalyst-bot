@@ -152,6 +152,16 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
+Latest combined-candidate verification is recorded in
+`evidence/2026-09-24-combined-candidate-verification.md`: frozen source `088d9d6`,
+fresh Windows build, 156 Chromium passes, 6,999 final worktree passes with
+157 skips and 422 subtests, corrected isolated package probes, and a recorded
+same-executable native acceptance receipt. The 20:25 UTC heartbeat rechecked
+all 198 bundled file hashes/sizes. These newer results supersede the earlier
+test/build counts above without relabelling older live TEST 7 receipts as
+new-build wallet tests. No test job remains active. The app is currently
+unavailable, and the broader live offer lifecycle remains incomplete.
+
 - [x] User approved written specification; new goal created and existing hourly loop refreshed.
 - [x] Existing isolated branch codex/coin-prep-fee-approval verified; untracked user/build artifacts preserved.
 - [x] Baseline fee/planner/direct batch tests: 37 passed on 16 September 2026.

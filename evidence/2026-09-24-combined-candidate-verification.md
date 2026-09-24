@@ -14,7 +14,7 @@ Started: 24 September 2026, 18:08 UTC.
 - Build and tests use the extracted tracked-source archive, not a changing
   checkout. Existing live and earlier candidate packages are untouched.
 
-## Verification results and remaining run
+## Verification results
 
 - Frozen-source full default suite: `C:\Python312\python.exe -m pytest tests -q`;
   session `68347` exited **0**: **6,993 passed, 157 skipped, 422 subtests passed
@@ -51,6 +51,31 @@ Started: 24 September 2026, 18:08 UTC.
   `02F090A74B6E7FA16954B3F5AEAEB3849DE63A67B84F0F3CE6B9B684B1F2A845`
   immediately before the smoke run.
 - Ruff on the six changed production/test files and `git diff --check` passed.
+
+## Result reconciliation at the 20:25 UTC heartbeat
+
+- Read the completed `combined-helper-final-full.log`: its terminal summary is
+  **6,999 passed, 157 skipped, 422 subtests passed in 1039.94s**. The former
+  session `97189` is retired, not still running. Commit `eaca304` records the
+  exit-zero result and the same-executable native acceptance receipt above.
+- Recomputed the executable and manifest SHA-256 values: both match the
+  recorded values above. Independently checked all **198 manifest entries**
+  against the current bundle's file sizes and SHA-256 values: zero mismatches
+  or missing files. No production source changed after the frozen snapshot;
+  subsequent code changes concern only the isolated probe helper and its tests.
+- Native acceptance is a recorded receipt from `eaca304`; this heartbeat did
+  not rerun native launches. The separate older operator receipt for executable
+  `703E707F...` is not used to certify this executable. No repeat native smoke
+  is required for this unchanged bundle.
+- A fresh read-only status request still received connection refusal at
+  `127.0.0.1:5000`, and process inventory found no Catalyst process. One Sage
+  process remains (`sage-tauri.exe`, PID `60824`). This does not establish
+  live wallet identity or current market authority, and is not a crash finding.
+- No verification job remains active. Live offer creation/publication,
+  requoting, active cancellation and remake remain unverified. Resume those
+  observations only after the candidate is reopened, with fresh identity and
+  market evidence and the existing action/budget safeguards. The goal remains
+  blocked, not complete; the automation is not paused or deleted.
 
 ## Package probe failure and test-first isolation correction
 

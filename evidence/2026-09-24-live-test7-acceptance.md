@@ -4,7 +4,8 @@ Latest artifact note: secondary-PC corrections were subsequently combined at
 `088d9d6`. This file's live receipts remain valid for the executable identified
 below; they do not certify a later build. See
 `2026-09-24-combined-candidate-verification.md` for current combined-build tests,
-the test-first Doctor-probe isolation correction, pending native verification,
+the test-first Doctor-probe isolation correction, the recorded same-build native
+acceptance and the completed 6,999-test regression run,
 and the correction that Sage was running as `sage-tauri.exe` while CATalyst's
 local service was unavailable. The secondary PC used a different fingerprint;
 its receipts must not be relabelled TEST 7.
