@@ -146,7 +146,7 @@ assert fake_wallet.submissions == []
 Files: build.py/package manifests only if required; evidence/2026-09-16-coin-prep-fee-approval-checkpoint.md for gates and receipts.
 
 - [x] Run full relevant pytest suites, full suite where practical, Ruff and tracked-secret checks; inspect failures rather than narrowing scope. Final frozen-app suite: 6,981 passed, 157 skipped, 422 subtests in 1,037.25s (23 September, session 4916); broad Chromium 156 passed. Eight later test-harness cases are verified separately in the 14-test helper run. Ruff, staged-secret and diff checks passed. Exact native/live gates remain below.
-- [ ] Build fresh Windows package with the repository build entry point and verify exact built commit/resources. Exercise HTTP and native GUI in isolated test data first.
+- [x] Build fresh Windows package with the repository build entry point and verify exact built commit/resources. Exercise HTTP and native GUI in isolated test data first. Candidate build/API/package receipts are in `evidence/2026-09-23-review-fix-acceptance.md`; the operator-reported clean/duplicate/relaunch/safety native launch pass is recorded in `evidence/2026-09-24-native-operator-result.md`. This does not establish live fee or trading acceptance.
 - [ ] Verify live identity and current configuration, show a fresh preview through the GUI and obtain genuine operator fee-budget confirmation before spending. Execute prep and read back signed fee/effect, peer acceptance and chain confirmation evidence; verify pause/restart recovery and no double accounting.
 - [ ] Audit every spec requirement against source/tests/UI/build/live receipts, recording blocked gates as incomplete. Leave goal active until all requirements are proven. No automatic release/main merge.
 

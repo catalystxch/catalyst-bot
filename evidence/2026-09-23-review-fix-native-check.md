@@ -1,5 +1,9 @@
 # Current candidate: isolated Windows window check
 
+Status: the operator returned the final success output on 24 September 2026.
+See `2026-09-24-native-operator-result.md`. This scoped handoff is satisfied;
+the instructions below are retained for reproducibility, not a repeat request.
+
 Run this in PowerShell and return its final result or error. It opens temporary
 CATalyst windows to check first launch, duplicate-window handoff, profile relaunch
 and the startup safety screen. **Do not click trading or wallet approval buttons.**
@@ -25,7 +29,8 @@ native launch only, not Coin Prep, live trading or full acceptance.
 
 - Local v1.4.0 test snapshot, runtime-equivalent to code commit `bc7203d`,
   not a release. The final backend run passed 6,981 tests, with 157 skipped.
-  Native launch and live trading are still separate open acceptance gates.
+  Native launch has an operator-reported pass; live trading is still an open
+  acceptance gate.
 - Executable SHA-256:
   `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
 - UI SHA-256:

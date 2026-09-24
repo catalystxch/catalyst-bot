@@ -1676,3 +1676,22 @@ an active-offer cancellation test.
   operator participation. Existing authorization is not being requested again.
   No automation pause, installed-app change, financial action, main merge or
   release occurred.
+
+### Operator native launch receipt — 24 September 2026
+
+- The operator returned `Packaged clean, duplicate, persisted, and native
+  safety launches passed` after running the documented current-candidate
+  command. Recorded as an operator-reported pass in
+  `2026-09-24-native-operator-result.md`; not an independently rerun test.
+- Native launch is no longer a pending operator handoff. The current-candidate
+  live TEST 7 identity, fee/prep, publication/fill/requote/cancel/remake and
+  restart-accounting gates remain open. Do not replace them with this receipt.
+- The initial workspace tool response was delayed, then returned exit 0 with
+  clean tracked files and HEAD `76efcd4`. The goal tool returned null, so there
+  is no registered goal in this thread. No new goal, financial action, installed
+  replacement, push, main merge or release occurred while recording the result.
+- Read-only executable hashing reconfirmed the recorded `703E707F...` hash.
+  The localhost:5000 status GET was connection-refused, so there is no fresh
+  live identity/status evidence. The candidate needs to be opened for the next
+  operator-led live acceptance step; no automatic launch or trading action
+  was taken.

@@ -28,7 +28,7 @@ their new tests differ from the pre-commit snapshot, as detailed below.
 | Ruff, whitespace, tracked-secret checks | Current changed/new Python files and tracked tree passed | Pass |
 | Fresh Windows build | Session 58429 exited 0; Python archive contains the new local-host helper | Build pass |
 | Compiled API, mock Sage, upgrade recovery and fee rejection | Current executable passed all four probes with corrected isolated harness; `*-smoke-final.log` / `*-fee-gates-final.log` | Scoped package passes, not native/live proof |
-| Native window: clean/duplicate/relaunch/safety fallback | No current-candidate result | Operator check required |
+| Native window: clean/duplicate/relaunch/safety fallback | Operator returned the named helper's final success output on 24 September; see `2026-09-24-native-operator-result.md` | Operator-reported launch pass; not live-wallet proof |
 | Live TEST 7 prep and full trading/recovery cycle | Earlier source receipts only; no current-candidate live result | Open, not passed |
 
 Counts overlap and must not be added into a claimed total. See
@@ -95,8 +95,9 @@ Ruff, whitespace and secret checks passed before committing `bc7203d`.
 
 Native-window tests use disposable data and localhost ports, not the real
 wallet or installed profile. The previous `0ad637e` native command is obsolete
-for current acceptance; use `2026-09-23-review-fix-native-check.md`. That handoff
-was requested asynchronously; no operator result has yet been received.
+for current acceptance; use `2026-09-23-review-fix-native-check.md`. The operator
+has now returned its success output; the scoped launch check is satisfied.
+See `2026-09-24-native-operator-result.md` for provenance and limitations.
 
 Before any live action, verify actual Sage mainnet TEST 7 fingerprint
 736588221, MZ wallet ID 2 and asset
