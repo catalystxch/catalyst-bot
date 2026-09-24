@@ -5563,6 +5563,82 @@ def test_windows_existing_window_handoff_fails_when_foreground_is_denied(monkeyp
     )
 
 
+def test_windows_existing_window_handoff_attaches_to_foreground_input_thread(
+    monkeypatch,
+):
+    """A duplicate launcher must recover from Windows' foreground denial."""
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.attached = False
+            self.attachments = []
+            self.foreground = 303
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            if owner_pid is not None:
+                owner_pid._obj.value = 4567
+            return {101: 222, 303: 333}.get(handle, 0)
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return True
+
+        def SetForegroundWindow(self, handle):
+            if not self.attached:
+                return False
+            self.foreground = handle
+            return True
+
+        def GetForegroundWindow(self):
+            return self.foreground
+
+        def AttachThreadInput(self, attach, attach_to, enabled):
+            self.attachments.append((attach, attach_to, bool(enabled)))
+            self.attached = bool(enabled)
+            return True
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 444
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert desktop_app._focus_catalyst_window_with_user32(
+        user32,
+        lambda callback: callback,
+        owner_pid=4567,
+        kernel32=Kernel32(),
+    )
+    assert user32.attachments == [
+        (444, 333, True),
+        (444, 222, True),
+        (444, 222, False),
+        (444, 333, False),
+    ]
+
+
 def test_windows_window_handoff_rejects_same_title_from_wrong_process(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
