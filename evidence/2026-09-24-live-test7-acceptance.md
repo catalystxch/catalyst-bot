@@ -243,3 +243,20 @@ than funds being exposed under fabricated pricing authority.
   mojos spent, two confirmations and zero held/unresolved. No wallet action,
   settings change, fee approval or bot start was performed. This establishes
   a read-only monitoring path, not a passed live offer-cycle gate.
+
+## Runtime unavailable — 24 September 2026, 13:03 UTC heartbeat
+
+- The status and public-market GETs to localhost:5000 were both connection
+  refused. A subsequent listener check found no port-5000 listener; the
+  expected `Catalyst` and `sage` processes were not found. This establishes
+  service unavailability, not whether shutdown was deliberate or a crash.
+- Failed GETs yielded no authoritative status. Null-derived placeholder
+  fields printed by the diagnostic wrapper, including offer counts, are
+  discarded; they do not describe the wallet or app. The last successful
+  status/fee observations remain the earlier recorded receipts.
+- Worktree HEAD is `29f893d`; the intervening temporary artifact-workflow
+  commits have no net tree difference from `5b54d94`. Tracked files were clean
+  before this note. No app or wallet was relaunched, no setting was changed,
+  and no wallet action occurred. Further local runtime observation needs the
+  tested candidate and Sage reopened; the native smoke test does not need
+  repeating. Live offer-cycle acceptance remains incomplete.
