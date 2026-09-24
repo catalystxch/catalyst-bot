@@ -73,6 +73,40 @@ def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(se
     assert [o.amount_mojos for o in _build(settings)["targets"] if o.asset == "cat"] == [110_000, 27_500]
 
 
+def test_worker_spare_output_counts_do_not_create_imaginary_live_sell_slots(monkeypatch):
+    """Worker output counts include spares, but ladder pricing must not."""
+    import coin_prep_worker
+
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.offer_tier_xch_sizes_sell = {
+        "inner": Decimal("4.3055"),
+        "mid": Decimal("3.588"),
+        "outer": Decimal("2.6909"),
+    }
+    # One live coin plus one spare per tier is passed to the worker as the
+    # total output quantity.  Those spare quantities are not live slots.
+    worker.cat_tier_counts = {"inner": 2, "mid": 2, "outer": 2}
+    worker.cat_live_tier_counts = {"inner": 1, "mid": 1, "outer": 1}
+    worker.cat_decimals = 3
+    worker.coin_prep_headroom_multiplier = Decimal("1.12")
+    worker.coin_prep_headroom_pct = Decimal("12")
+    worker._get_live_price = lambda: Decimal("0.000075")
+    worker.log = lambda *_args, **_kwargs: None
+    monkeypatch.setenv("SELL_INNER_TIER_COUNT", "1")
+    monkeypatch.setenv("SELL_MID_TIER_COUNT", "1")
+    monkeypatch.setenv("SELL_OUTER_TIER_COUNT", "1")
+    monkeypatch.setenv("SELL_EXTREME_TIER_COUNT", "0")
+    monkeypatch.setenv("MAX_ACTIVE_SELL_OFFERS", "3")
+    monkeypatch.setenv("SPREAD_BPS", "850")
+    monkeypatch.setenv("MIN_EDGE_BPS", "340")
+
+    assert worker._derive_tier_cat_sizes() == {
+        "inner": Decimal("62181.303"),
+        "mid": Decimal("50571.78"),
+        "outer": Decimal("37036.044"),
+    }
+
+
 @pytest.mark.parametrize("inner_spares,mid_spares", [(0, 0), (9, 0), (1, 2)])
 def test_cat_spares_do_not_move_executable_live_ladder_prices(settings, inner_spares, mid_spares):
     """Spare output quantities must not create imaginary live pricing slots."""
