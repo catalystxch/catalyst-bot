@@ -1245,6 +1245,104 @@ class TestCoinPrepTrigger(_FlaskBase):
         approval_index = captured["cmd"].index("--fee-approval-id")
         self.assertEqual(captured["cmd"][approval_index + 1], "a" * 64)
 
+    def test_tier_trigger_passes_live_cat_counts_separately_from_spares(self):
+        captured = {}
+
+        class ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class DoneProcess:
+            pid = 12345
+            returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return DoneProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "coin_prep_output.log")
+            config_values = {
+                "TIER_ENABLED": True,
+                "LIQUIDITY_MODE": "two_sided",
+                "BUY_LADDER_REVERSED": False,
+                "BUY_INNER_TIER_COUNT": 1,
+                "BUY_INNER_TIER_SPARE_COUNT": 0,
+                "SELL_INNER_TIER_COUNT": 1,
+                "SELL_INNER_TIER_SPARE_COUNT": 2,
+            }
+            zero_count_names = [
+                f"{side}_{tier.upper()}_TIER_{suffix}"
+                for side in ("BUY", "SELL")
+                for tier in ("mid", "outer", "extreme")
+                for suffix in ("COUNT", "SPARE_COUNT")
+            ]
+            config_values.update({name: 0 for name in zero_count_names})
+            config_patchers = [
+                patch.object(coin_prep_blueprint.cfg, name, value)
+                for name, value in config_values.items()
+            ]
+            for patcher in config_patchers:
+                patcher.start()
+                self.addCleanup(patcher.stop)
+
+            with (
+                patch.object(
+                    api_server,
+                    "_reset_fresh_run_session",
+                    return_value=self._FAKE_SUMMARY,
+                ),
+                patch.object(api_server, "bot", None),
+                patch.object(coin_prep_blueprint.threading, "Thread", ImmediateThread),
+                patch(
+                    "coin_manager._coin_prep_worker_command", return_value=["worker"]
+                ),
+                patch(
+                    "coin_manager._coin_prep_worker_environment", return_value={}
+                ),
+                patch(
+                    "coin_manager._issue_coin_prep_worker_delegation",
+                    return_value=MagicMock(to_environment=lambda: {}),
+                ),
+                patch(
+                    "coin_manager._revoke_coin_prep_worker_delegation",
+                    return_value={"revoked": True},
+                ),
+                patch("subprocess.Popen", side_effect=fake_popen),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_runtime_dir",
+                    return_value=temp_dir,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_output_log_file",
+                    return_value=log_path,
+                ),
+                patch.object(api_server, "_get_live_mid_price_str", return_value=None),
+                patch.object(
+                    api_server,
+                    "get_fee_settings_snapshot",
+                    return_value={"fee_pool_enabled": False},
+                ),
+            ):
+                response = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(response.status_code, 200)
+        total_index = captured["cmd"].index("--tier-counts-cat")
+        live_index = captured["cmd"].index("--live-tier-counts-cat")
+        self.assertEqual(captured["cmd"][total_index + 1], "inner=3")
+        self.assertEqual(
+            captured["cmd"][live_index + 1],
+            "inner=1,mid=0,outer=0,extreme=0",
+        )
+
     def test_trigger_delegation_outlives_legitimate_chain_confirmation_waits(self):
         """The worker must not lose mutation authority during normal mainnet waits."""
 
