@@ -1746,3 +1746,20 @@ an active-offer cancellation test.
 - Live create/requote/cancel/remake evidence remains externally blocked by
   genuine RED attributable market confidence. Automated coverage is green;
   CATalyst did not bypass the market gate or fabricate an executable price.
+
+### Read-only reconciliation of newer acceptance evidence — 24 September
+
+- Native operator result and live Coin Prep/restart receipts are now present;
+  the old native/operator blocker is superseded. Do not request the native
+  command or generic permission again.
+- Reverified PID 72524 listening on port 5000 is the exact hashed candidate.
+  Current API readback agrees with completed fee accounting: 15,562,944 mojos
+  spent, two confirmed reservations, zero held/unresolved, and session complete.
+  The bot is stopped with zero offers, locked coins or runtime safety blockers.
+- The 12:03 BST market-confidence GET denies creation/requote/exposure, but
+  reads an expired 09:59:42 UTC assessment. This is not new external-market
+  evidence. The outstanding gate is live offer lifecycle acceptance, not fee
+  consent, Coin Prep, package startup or native acceptance. Full details and
+  provenance are appended to `2026-09-24-live-test7-acceptance.md`.
+- Goal tool still reports blocked. No app code, strategy, wallet action,
+  installed package, main branch or release changed in this read-only audit.

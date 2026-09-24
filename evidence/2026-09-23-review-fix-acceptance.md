@@ -7,6 +7,11 @@ as `bc7203d8f1c8ce29e6bb9fab8980422c6688d0ba`, after base
 `028e096a36af2624d3d01141e1e11e6ca296ca77`. This code commit is not pushed.
 No main merge, release, installed replacement or new live campaign occurred.
 
+Update on 24 September: native acceptance and live fee/prep/restart evidence
+are now recorded in `2026-09-24-native-operator-result.md` and
+`2026-09-24-live-test7-acceptance.md`. Those receipts supersede the historical
+pending-live notes below. The broader live offer lifecycle remains incomplete.
+
 ## Frozen source and test receipts
 
 The isolated directory is
@@ -29,7 +34,8 @@ their new tests differ from the pre-commit snapshot, as detailed below.
 | Fresh Windows build | Session 58429 exited 0; Python archive contains the new local-host helper | Build pass |
 | Compiled API, mock Sage, upgrade recovery and fee rejection | Current executable passed all four probes with corrected isolated harness; `*-smoke-final.log` / `*-fee-gates-final.log` | Scoped package passes, not native/live proof |
 | Native window: clean/duplicate/relaunch/safety fallback | Operator returned the named helper's final success output on 24 September; see `2026-09-24-native-operator-result.md` | Operator-reported launch pass; not live-wallet proof |
-| Live TEST 7 prep and full trading/recovery cycle | Earlier source receipts only; no current-candidate live result | Open, not passed |
+| Live TEST 7 fee approval, prep and restart accounting | Current-candidate operator-approved cap, two confirmed batches, 15,562,944 mojos spent, zero held/unresolved; restart retained completion. See 24 September live acceptance receipt | Live fee/prep/restart pass; current read-only accounting rechecked |
+| Live bot start/stop and trading lifecycle | Current-candidate start/stop and RED fail-closed checks recorded; no live offers created | Start/stop pass; live publication/requote/cancel/remake remain open |
 
 Counts overlap and must not be added into a claimed total. See
 `2026-09-23-fee-whole-feature-review.md` for the findings, red/green evidence
@@ -47,7 +53,7 @@ The reasons account for the full default run's skipped total:
   separate enabled Chromium run already passed all 156 in 108.13 seconds.
 - One Linux desktop smoke-helper test requires POSIX-executable temporary
   files and skips on Windows. Linux execution remains unverified here;
-  this is not evidence for the pending Windows native-window check.
+  this is not evidence for the separate Windows native-window check.
 
 In addition, `tests/conftest.py` excludes eight standalone integration scripts
 from collection: `test_parallel_offers.py`, `test_spacescan.py`,

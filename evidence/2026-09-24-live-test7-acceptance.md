@@ -197,3 +197,32 @@ than funds being exposed under fabricated pricing authority.
   live create/requote/cancel/remake evidence without an external market-state
   change. The active goal is therefore blocked, not complete; all completed
   fee-prep and package evidence remains valid and no safety gate was weakened.
+
+## Read-only receipt reconciliation — 24 September 2026 12:03 BST
+
+- Re-read the new native/operator and live acceptance receipts rather than
+  treating the earlier pending-operator checkpoint as current. Native success
+  remains operator-reported; it was not independently rerun in this audit.
+- The process listening on localhost:5000 was PID 72524, running the exact
+  `candidate-review-fixes-dns-20260923/dist/Catalyst/Catalyst.exe`. A fresh hash
+  matched `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
+- Fresh GETs of `/api/status` and `/api/coin-prep/status` independently
+  corroborated the recorded completed fee session: approval `cae3170f...`,
+  `15562944` mojos spent, two confirmed reservations, zero held/unresolved,
+  `session_completed=true`, and `dispatch_authorized=false`. Protected
+  cancellation remains `90207400` mojos; unused total budget is `386434280`.
+- Current status reported stopped, two loops and zero errors, no active buy
+  or sell offers, no locked XCH/CAT coins, no pending cancellations, and zero
+  runtime safety blockers. Selected MZ asset and CAT wallet ID 2 match the
+  target. The public fingerprint is hashed, so this read alone is not a new
+  full Sage identity attestation. No wallet action was attempted.
+- `/api/market/confidence` at `2026-09-24T12:03:06.592046+01:00` returned RED,
+  `data_valid=false`, and all creation/requote/exposure permissions false.
+  Its underlying assessment is from `2026-09-24T09:59:42.218421Z`, with the
+  recorded depth/provider reasons plus expired snapshot/evidence flags.
+  This confirms the current app gate, not a fresh external market survey;
+  stopped-runtime observations cannot prove the market has not changed.
+- The registered goal remains blocked, not complete. Native-result requests
+  must not be repeated. Only live offer lifecycle acceptance remains open;
+  no strategy/consent change, bot restart, transaction, push, merge or release
+  was performed during this reconciliation.
