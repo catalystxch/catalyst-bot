@@ -869,6 +869,9 @@ class CoinPrepWorker:
         tier_counts_cat_str = os.getenv(
             "_CLI_TIER_COUNTS_CAT"
         )  # per-side CAT (sell ladder)
+        live_tier_counts_cat_str = os.getenv(
+            "_CLI_LIVE_TIER_COUNTS_CAT"
+        )  # live CAT offer slots only (excludes prep spares)
 
         def _parse_sizes(spec):
             out = {}
@@ -969,6 +972,11 @@ class CoinPrepWorker:
                 if tier_counts_cat_str
                 else dict(legacy_counts)
             )
+            self.cat_live_tier_counts = (
+                _parse_counts(live_tier_counts_cat_str)
+                if live_tier_counts_cat_str is not None
+                else None
+            )
 
             # Build a unified `tier_counts` for legacy code paths that still
             # consume a single dict. Use max() so per-amount partition logic
@@ -1034,6 +1042,7 @@ class CoinPrepWorker:
             self.tier_counts = {}
             self.xch_tier_counts = {}
             self.cat_tier_counts = {}
+            self.cat_live_tier_counts = None
             self.tier_cat_sizes = {}
             self.tier_order = []
 
@@ -3175,12 +3184,28 @@ class CoinPrepWorker:
                 )
                 for tier_name in TIER_ORDER
             }
-            if any(cli_sell_tier_counts.values()):
+            explicit_live_counts = getattr(self, "cat_live_tier_counts", None)
+            if explicit_live_counts is not None:
+                # GUI prep output counts include spares.  Its separate live
+                # count contract is the authoritative ladder shape used for
+                # pricing; standalone/legacy callers continue to use their
+                # CLI output counts below.
+                sell_tier_counts = {
+                    tier_name: max(
+                        0, int(explicit_live_counts.get(tier_name, 0) or 0)
+                    )
+                    for tier_name in TIER_ORDER
+                }
+                max_sell_offers = sum(sell_tier_counts.values())
+            elif any(cli_sell_tier_counts.values()):
                 sell_tier_counts = cli_sell_tier_counts
                 max_sell_offers = sum(cli_sell_tier_counts.values())
             else:
+                # Legacy in-process callers may not provide CLI counts.
                 sell_tier_counts = {
-                    tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
+                    tier_name: _env_int(
+                        f"SELL_{tier_name.upper()}_TIER_COUNT", 0
+                    )
                     for tier_name in TIER_ORDER
                 }
                 max_sell_offers = _env_int(
@@ -11205,6 +11230,12 @@ def parse_arguments():
         help="Per-side CAT tier counts (sell ladder): inner=4,mid=16,outer=16,extreme=14",
     )
     parser.add_argument(
+        "--live-tier-counts-cat",
+        type=str,
+        default=None,
+        help="Live CAT sell-offer slot counts, excluding prepared spare outputs",
+    )
+    parser.add_argument(
         "--prep-headroom-pct",
         type=float,
         default=None,
@@ -11653,6 +11684,9 @@ def main():
     if args.tier_counts_cat is not None:
         os.environ["_CLI_TIER_COUNTS_CAT"] = args.tier_counts_cat
         overrides.append(f"TIER_COUNTS_CAT={args.tier_counts_cat}")
+    if args.live_tier_counts_cat is not None:
+        os.environ["_CLI_LIVE_TIER_COUNTS_CAT"] = args.live_tier_counts_cat
+        overrides.append(f"LIVE_TIER_COUNTS_CAT={args.live_tier_counts_cat}")
     if args.prep_headroom_pct is not None:
         os.environ["_CLI_PREP_HEADROOM_PCT"] = str(args.prep_headroom_pct)
         overrides.append(f"PREP_HEADROOM={args.prep_headroom_pct}%")

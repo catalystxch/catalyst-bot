@@ -3097,6 +3097,18 @@ def _api_coin_prep_trigger_locked():
                         "outer": _tier_count("SELL", "outer"),
                         "extreme": _tier_count("SELL", "extreme"),
                     }
+                    sell_live_position_counts = {
+                        tier: max(
+                            0,
+                            int(
+                                getattr(
+                                    cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0
+                                )
+                                or 0
+                            ),
+                        )
+                        for tier in ("inner", "mid", "outer", "extreme")
+                    }
 
                     # ── Translate slot positions → coin SIZE counts ─────────
                     # The coin prep allocates coins by SIZE, not by position.
@@ -3112,11 +3124,15 @@ def _api_coin_prep_trigger_locked():
 
                     xch_tier_counts = _flip_tiers(buy_position_counts, side="buy")
                     cat_tier_counts = _flip_tiers(sell_position_counts, side="sell")
+                    cat_live_tier_counts = _flip_tiers(
+                        sell_live_position_counts, side="sell"
+                    )
                     _liquidity_mode = (
                         getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
                     ).lower()
                     if _liquidity_mode == "buy_only":
                         cat_tier_counts = {}
+                        cat_live_tier_counts = {}
                     elif _liquidity_mode == "sell_only":
                         xch_tier_counts = {}
 
@@ -3168,6 +3184,9 @@ def _api_coin_prep_trigger_locked():
                     cat_counts_str = ",".join(
                         f"{k}={v}" for k, v in cat_tier_counts.items()
                     )
+                    cat_live_counts_str = ",".join(
+                        f"{k}={v}" for k, v in cat_live_tier_counts.items()
+                    )
                     # F62 (2026-04-09): also build per-side size strings.
                     # Sniper/fees stay in the combined `tier_sizes` dict;
                     # only the four trading tiers differ between buy and sell.
@@ -3209,6 +3228,8 @@ def _api_coin_prep_trigger_locked():
                         xch_counts_str,
                         "--tier-counts-cat",
                         cat_counts_str,
+                        "--live-tier-counts-cat",
+                        cat_live_counts_str,
                         "--prep-headroom-pct",
                         str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10"))),
                         "--run-id",
