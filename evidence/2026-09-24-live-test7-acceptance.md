@@ -65,13 +65,9 @@
 
 ## Still open
 
-- Approve and execute the exact 4/4 Coin Prep budget above, verify exact final
-  repricing/reservations/confirmation accounting, then restore and reverify the
-  intended 3/3 strategy unless the operator chooses to retain 4/4.
 - Live offer publication/requote/cancel/remake cannot be observed while
   attributable market confidence remains RED. The live loop proved the
   fail-closed path; it did not fabricate market evidence or bypass safety.
-- Restart accounting after a real Coin Prep operation remains open.
 
 ## Focused automated regression rerun
 
@@ -84,3 +80,45 @@
   the estimate remained current at `0.000401997224 XCH` cumulative maximum,
   with `0.0000902074 XCH` protected cancellation allowance, zero spent, zero
   held, and the same 1 exact / 3 projected evidence split.
+
+## Approved live Coin Prep and exact accounting
+
+- The operator explicitly approved the refreshed `0.000401997224 XCH`
+  cumulative maximum. The app recorded approval
+  `cae3170fdf37da6c24627bc93d6b25d0a7d92df2eecde7443d8e4b2a0fe89a50`
+  for plan `7be772c324866231b479f6a97007a885f109fbc050015b0bc7c44048ac92f9cf`.
+- Existing P&L, three fills, and 2,554 historical offer rows were preserved;
+  no history-reset option was selected.
+- CAT batch 1 reserved and then authoritatively confirmed an exact
+  `0.000015034908 XCH` fee. XCH batch 2 reserved and then authoritatively
+  confirmed an exact `0.000000528036 XCH` fee. The UI remained fail-closed
+  with `COIN_PREP_EFFECT_UNKNOWN` while each submitted effect was unresolved.
+- Final authoritative fee state was `complete`: `0.000015562944 XCH` spent,
+  zero held, zero unresolved operations, two confirmed reservations, no
+  released reservations, and `0.000386434280 XCH` of the approved cap unused.
+  The protected `0.000090207400 XCH` cancellation allowance was never consumed.
+- Direct-final-batch-v2 preparation completed successfully with two confirmed
+  batches, 66 target outputs, and visible 8/8 XCH plus 8/8 MZ trading-coin
+  readiness. Wallet totals remained 138.472836570155 XCH and 780212.284 MZ;
+  fee-coin/output principal was not misreported as fee spend.
+
+## Restart, recovery, and restored strategy
+
+- The packaged candidate shut down cleanly and restarted from the same EXE.
+  Before any new wallet mutation, `/api/coin-prep/status` recovered the fee
+  session as complete with `15562944` mojos spent, zero held, zero unresolved,
+  and `session_completed=true`; no duplicate transaction was dispatched.
+- Restarted startup reverified Sage mainnet fingerprint `736588221`, wallet
+  `2`, MZ asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  Splash, and the configured Spacescan path.
+- The temporary 4/4 settings were replaced with the intended 3-buy / 3-sell
+  strategy. The app recognized the prepared 8/8 XCH and 8/8 MZ ladder as
+  sufficient for 3/3 without requesting another fee approval.
+- A post-restart live start passed all 10 checks, reconciled zero wallet
+  offers and zero orphan locks, ran one 2.83-second loop with zero errors, and
+  again created no offers because attributable market confidence was RED.
+  Stop completed cleanly; authoritative `/api/status` reported
+  `running=false`, zero open offers, zero locked coins, and runtime safety
+  allowed with zero unresolved operations, reservations, or publications.
+  The browser converged to the same STOPPED state on its subsequent status
+  poll.

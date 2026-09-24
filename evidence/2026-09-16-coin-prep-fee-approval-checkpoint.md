@@ -1727,6 +1727,22 @@ an active-offer cancellation test.
 - Live TEST 7 quote refresh revalidated Sage `736588221`, wallet `2`, MZ/XCH
   mainnet and retained a current `0.000401997224 XCH` cumulative maximum with
   `0.0000902074 XCH` protected cancellation, zero spent, and zero held.
-- Real Coin Prep dispatch remains intentionally pending exact operator consent
-  for that current maximum; broad test permission is not recorded as a fee
-  budget approval.
+- At that checkpoint, real Coin Prep dispatch was intentionally pending exact
+  operator consent; the approved execution and outcome are recorded below.
+
+### Approved live execution and restart result — 24 September 2026
+
+- The operator approved the exact `0.000401997224 XCH` cumulative maximum.
+  Two direct-final batches confirmed with exact total fee
+  `0.000015562944 XCH`; zero fee remained held or unresolved and the protected
+  cancellation reserve was not consumed.
+- The resulting 8/8 XCH and 8/8 MZ trade-coin targets were complete. A packaged
+  process restart recovered the session as complete and idempotent, with no
+  duplicate dispatch.
+- The intended 3/3 strategy was restored and recognized as prepared. A fresh
+  post-restart start passed all 10 checks and one 2.83-second loop, remained
+  fail-closed under genuine RED market confidence, created zero offers, and
+  stopped with zero locks, open offers, or unresolved durable work.
+- Live create/requote/cancel/remake evidence remains externally blocked by
+  genuine RED attributable market confidence. Automated coverage is green;
+  CATalyst did not bypass the market gate or fabricate an executable price.
