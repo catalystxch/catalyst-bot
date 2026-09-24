@@ -22,9 +22,9 @@ Started: 24 September 2026, 18:08 UTC.
   earlier classification: 156 opt-in browser tests (separately passed) and
   one POSIX-only helper. Standalone live scripts remain excluded, not passed.
 - The corrected probe harness and six new regression cases were added after
-  frozen-source collection. They are verified separately below, not included
-  in the 6,993 count. A fresh whole-worktree suite is now running as session
-  `97189`, log `combined-helper-final-full.log`; preserve it, do not duplicate.
+  frozen-source collection. The fresh whole-worktree suite completed with
+  **6,999 passed, 157 skipped, 422 subtests passed in 1039.94s**, exit code 0.
+  Log: `combined-helper-final-full.log`.
 - Fresh isolated Windows build: `C:\Python312\python.exe build.py --no-clean`;
   session `1148` exited **0**, log `candidate-088d9d6-combined-build.log`.
   Python 3.12.6, PyInstaller 6.21.0; the existing
@@ -45,6 +45,11 @@ Started: 24 September 2026, 18:08 UTC.
   log `candidate-088d9d6-combined-sage.log`.
 - Packaged interrupted-publication upgrade/recovery smoke: **passed**;
   log `candidate-088d9d6-combined-recovery.log`.
+- Exact combined executable native desktop smoke on the primary PC: **passed**
+  clean-profile launch, duplicate verified-owner handoff, persisted-profile
+  relaunch and native safety launch. The executable SHA-256 was rechecked as
+  `02F090A74B6E7FA16954B3F5AEAEB3849DE63A67B84F0F3CE6B9B684B1F2A845`
+  immediately before the smoke run.
 - Ruff on the six changed production/test files and `git diff --check` passed.
 
 ## Package probe failure and test-first isolation correction
@@ -106,9 +111,9 @@ Started: 24 September 2026, 18:08 UTC.
 - Secondary-PC live Coin Prep evidence uses fingerprint `3702373391`, not
   this task's required TEST 7 fingerprint `736588221`. Keep their approvals,
   balances, fee receipts and acceptance provenance separate.
-- Earlier native/full-suite/live receipts remain evidence for their exact
-  source and executable; they do not automatically certify this new combined
-  executable. Its native launch gate is still unverified.
+- Earlier live receipts remain evidence for their exact source and executable;
+  they do not automatically certify new wallet effects. The new combined
+  executable's native launch gate is now independently verified above.
 - CATalyst localhost:5000 was connection-refused at this heartbeat. A broader
   process inventory found two `sage-tauri.exe` processes (PIDs 60824 and
   72516), created at 10:15 BST. The earlier exact-name `sage` check missed
