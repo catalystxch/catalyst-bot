@@ -160,3 +160,26 @@ than funds being exposed under fabricated pricing authority.
   continued testing as well as start/stop, Coin Prep, Smart Settings,
   cancellation, requoting and offer remake actions. CATalyst's plan-bound
   recorded caps and safety checks remain mandatory.
+
+## Fresh market-gate retry — 24 September 2026 10:59 BST
+
+- Immediately before the authorized start, the GUI showed Sage fingerprint
+  `736588221`, MZ wallet ID `2`, the expected asset, 8/8 prepared trade coins,
+  and zero active offers or locked coins. Startup reconciled the wallet to zero
+  open/unknown offers and passed the effect-safety checks.
+- Coinset's optional early-fill lookup timed out during startup. CATalyst
+  classified this as one non-critical service failure and retained wallet-RPC
+  fill detection; it did not weaken price or transaction authority.
+- A fresh live cycle replaced the expired confidence snapshot. Dexie evidence
+  was current, but confidence remained RED because out-of-range depth was
+  excluded, ask-side independent depth remained insufficient, and only one
+  provider supplied usable price evidence. Splash had an empty offer set and
+  the other evidence sources supplied no current independent executable price.
+- Two loops completed with zero errors, zero buy/sell offers, zero XCH/CAT
+  locks, and no wallet mutation. The bot was then stopped through the GUI.
+  Authoritative `/api/status` confirmed `running=false`, zero pending
+  cancellations, zero unresolved operations/reservations/publications, and
+  `runtime_safety.allowed=true`.
+- Result: the live offer-cycle gate remains externally blocked by genuine
+  market evidence after an active retry. Permission, wallet readiness, fee
+  consent, application startup, and Coin Prep are not the blocker.
