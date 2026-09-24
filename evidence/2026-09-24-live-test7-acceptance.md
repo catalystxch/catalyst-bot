@@ -183,3 +183,17 @@ than funds being exposed under fabricated pricing authority.
 - Result: the live offer-cycle gate remains externally blocked by genuine
   market evidence after an active retry. Permission, wallet readiness, fee
   consent, application startup, and Coin Prep are not the blocker.
+
+## Blocked-state audit — 24 September 2026 11:00 BST
+
+- A third consecutive goal audit re-read authoritative `/api/status` after the
+  fresh cycle. The candidate remained stopped on Sage/MZ wallet `2` with the
+  expected asset, two completed loops, zero errors, zero offers, zero XCH/CAT
+  locks, zero pending cancellations, and zero unresolved operations,
+  reservations, or publication claims. Runtime safety remained allowed.
+- The latest authoritative market log still stated: `No attributable trusted
+  offer-book price is available; new exposure and requotes remain blocked`.
+  There is no remaining independent test or code change that can create honest
+  live create/requote/cancel/remake evidence without an external market-state
+  change. The active goal is therefore blocked, not complete; all completed
+  fee-prep and package evidence remains valid and no safety gate was weakened.
