@@ -50,6 +50,9 @@ owner thread fails.
 - `git diff --check`: passed.
 
 The secondary PC separately recorded a green full suite, fresh Windows builds,
-packaged smoke evidence, and a successful live TEST 7 Coin Prep for PR #221.
+packaged smoke evidence, and a successful live Coin Prep for PR #221 using its
+separately authorized Harvestr wallet, fingerprint `3702373391`. This is not
+the primary TEST 7 fingerprint `736588221` and does not replace that identity's
+acceptance receipts.
 The remaining live publication and fee-estimator outcomes are documented safety
 blocks, not bypassed gates.

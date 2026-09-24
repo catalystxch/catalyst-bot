@@ -205,6 +205,21 @@ def _build_env(
             "SPLASH_ENABLED": "false",
         }
     )
+    # Config reload reads .env with override=True. Environment-only isolation
+    # can therefore fall back to the shipped public Dexie URL after startup.
+    # Persist only known synthetic settings, never the caller's environment.
+    profile_keys = (
+        "WALLET_TYPE", "SAGE_RPC_URL", "SAGE_CERT_PATH", "SAGE_KEY_PATH",
+        "SAGE_DATA_DIR", "SAGE_FINGERPRINT", "WALLET_EXPECTED_NAME",
+        "WALLET_EXPECTED_KEY_KIND", "CATALYST_NETWORK_ID", "CAT_ASSET_ID",
+        "CAT_NAME", "CAT_TICKER", "DEXIE_API_BASE", "SPLASH_ENABLED",
+    )
+    profile_path = temp_dir / "catalyst-data" / ".env"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(
+        "".join(f"{key}={json.dumps(env[key])}\n" for key in profile_keys),
+        encoding="utf-8",
+    )
     return env
 
 
@@ -236,6 +251,11 @@ def _endpoint_checks() -> list[EndpointCheck]:
             "GET",
             "/api/config/validate",
             ("is_valid", "errors", "warnings", "error_count", "warning_count"),
+        ),
+        EndpointCheck(
+            "GET",
+            "/api/config",
+            ("DEXIE_API_BASE", "SPLASH_ENABLED"),
         ),
         EndpointCheck(
             "GET",
@@ -277,6 +297,11 @@ def _validate_payload(check: EndpointCheck, payload: Any) -> None:
         )
     if check.path == "/api/wallet/sage-running" and payload.get("rpc_authenticated") is not True:
         raise SmokeFailure("mock Sage RPC is not authenticated")
+    if check.path == "/api/config" and (
+        payload.get("DEXIE_API_BASE") != "http://127.0.0.1:1"
+        or payload.get("SPLASH_ENABLED") is not False
+    ):
+        raise SmokeFailure("packaged probe network isolation was not retained")
 
 
 def _request_json(

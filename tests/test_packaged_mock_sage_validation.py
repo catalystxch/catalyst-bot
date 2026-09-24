@@ -74,3 +74,69 @@ def test_package_api_probe_keeps_exchange_diagnostics_off_public_network(tmp_pat
     )
     assert urlsplit(env["DEXIE_API_BASE"]).hostname == "127.0.0.1"
     assert env["SPLASH_ENABLED"] == "false"
+
+
+def test_package_api_probe_persists_network_isolation_across_config_reload(tmp_path, monkeypatch):
+    """The app's on-disk config must not replace loopback with public Dexie."""
+    import config
+
+    script = _script("packaged_api_smoke")
+    env = script._build_env(
+        base_env={"DEXIE_API_BASE": "https://public-provider.invalid"},
+        temp_dir=tmp_path, sage_rpc_url="https://127.0.0.1:19257",
+        client_cert=tmp_path / "sage-data/ssl/wallet.crt",
+        client_key=tmp_path / "sage-data/ssl/wallet.key",
+        flask_port=15234, local_token="test-token",
+    )
+    profile = Path(env["CMM_DATA_DIR"]) / ".env"
+    assert profile.is_file(), "Probe must persist its synthetic profile before launch"
+    monkeypatch.setattr(config, "_ENV_PATH", str(profile))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    # Exercise actual config reload, even after process values have changed.
+    monkeypatch.setenv("DEXIE_API_BASE", "https://public-provider.invalid")
+    monkeypatch.setenv("SPLASH_ENABLED", "true")
+    loaded = config.Config()
+    loaded.reload()
+    assert loaded.DEXIE_API_BASE == "http://127.0.0.1:1"
+    assert loaded.SPLASH_ENABLED is False
+    assert loaded.SAGE_RPC_URL == "https://127.0.0.1:19257"
+    assert loaded.SAGE_FINGERPRINT == "123456789"
+
+
+def test_package_api_probe_profile_does_not_copy_host_secrets(tmp_path):
+    from dotenv import dotenv_values
+
+    script = _script("packaged_api_smoke")
+    env = script._build_env(
+        base_env={"SPACESCAN_API_KEY": "do-not-copy-host-secret"},
+        temp_dir=tmp_path, sage_rpc_url="https://127.0.0.1:19257",
+        client_cert=tmp_path / "sage-data/ssl/wallet.crt",
+        client_key=tmp_path / "sage-data/ssl/wallet.key",
+        flask_port=15234, local_token="test-token",
+    )
+    profile = Path(env["CMM_DATA_DIR"]) / ".env"
+    assert profile.is_file(), "Probe must persist its synthetic profile before launch"
+    settings = dotenv_values(profile)
+    assert "SPACESCAN_API_KEY" not in settings
+    assert settings["CAT_ASSET_ID"] == "0" * 64
+
+
+@pytest.mark.parametrize("dexie,splash", [
+    ("https://api.dexie.space", False),
+    ("http://127.0.0.1:1", True),
+    ("http://127.0.0.1:1", "false"),
+])
+def test_package_api_probe_rejects_runtime_network_isolation_drift(dexie, splash):
+    script = _script("packaged_api_smoke")
+    check = script.EndpointCheck("GET", "/api/config", ("DEXIE_API_BASE", "SPLASH_ENABLED"))
+    with pytest.raises(script.SmokeFailure, match="network isolation"):
+        script._validate_payload(check, {"DEXIE_API_BASE": dexie, "SPLASH_ENABLED": splash})
+
+
+def test_package_api_probe_reads_isolation_before_doctor():
+    script = _script("packaged_api_smoke")
+    paths = [check.path for check in script._endpoint_checks()]
+    assert "/api/config" in paths
+    assert paths.index("/api/wallet/begin-startup") < paths.index("/api/config")
+    assert paths.index("/api/config") < paths.index("/api/doctor?force=true")
