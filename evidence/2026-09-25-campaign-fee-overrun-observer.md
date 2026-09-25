@@ -1,6 +1,144 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 11:42–11:48 UTC
+## Latest observer checkpoint — 12:54–12:58 UTC
+
+**New automatic-stop recovery boundary is RED; acceptance remains blocked.**
+This is distinct from the explicit/manual stop cases that passed below.
+
+Read-only inspection found the owner's new EXE already running as PID 19624,
+started at 12:27:58 UTC, listening on localhost:5000. This observer did not
+launch, stop or alter that live instance. GET `/api/bootstrap/status` freshly
+reported Sage mainnet TEST 7 fingerprint **736588221**, MZ wallet **2**, and the
+expected `b8edcc6a...dbec105` asset. The new package reports campaign fees
+correctly: **0.001736563369 XCH**, with original **0.001 XCH** cap unchanged.
+GET `/api/status` reported bot stopped, one loop, zero errors, six open offers
+(three buys/three sells), zero pending cancellation and zero runtime blockers.
+These are app readbacks, not fresh independent chain proof for all six offers.
+
+The campaign now has **status=active, stage=stopped, revision=1**. Its unchanged
+version-2 approval still binds plan/request revision **0**, with spent
+**1736563369**, held **0**, remaining **-1716888510** mojos,
+`state=paused_budget`, and `dispatch_authorized=false`. No new consent exists.
+
+- New `tests/test_bootstrap_automatic_stop_fee_recovery.py` uses the real policy
+  evaluator, `plan_bootstrap_state_update` and transactional
+  `update_bootstrap_campaign_state`, then closes/reopens the isolated SQLite
+  connection. An authoritative fee overrun produces precisely this active /
+  stopped-stage / incremented-revision state. The ordinary prep readback still
+  refuses, as required.
+- The actual fee-preview API then returns **503 / FEE_PREVIEW_UNAVAILABLE**,
+  rather than a read-only recovery quote. Explicit
+  `allow_campaign_fee_recovery=True` readback separately raises
+  **FEE_APPROVAL_STALE**. Both tests fail at these expected boundaries:
+  **2 failed in 1.97s**, exit 1. No new consent/hold or wallet effect was created.
+- Root cause: the new recovery fallback and one-step revision exception only
+  recognize `status=stopped`. Automatic policy materialization advances the
+  revision and sets the stage to stopped **without changing active status**.
+  Do not repair this by ignoring arbitrary revision/economic changes or
+  enabling ordinary preparation/creation under the overrun.
+- Command: `C:\Python312\python.exe -m pytest
+  tests/test_bootstrap_automatic_stop_fee_recovery.py -q --tb=short`.
+  Log: `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-automatic-stop-recovery-red-20260925.log`,
+  SHA-256 `014E61362FCC62586C9BE48FB6E05694ECBF591B0CBCB00B6058B5FB34B1F2FD`.
+  Test SHA-256 `814B90C503976BD8CFEC55F23ADEC9B248EBF1BDE5BDA0C6290D2C3A989C3708`.
+  Ruff on the new test and `git diff --check` passed.
+- The test is deliberately left as shared WIP for the repair owner to include
+  alongside its required untracked `bootstrap_fee_fixture.py`; this observer
+  does not commit the owner's fixture or production changes. The owner was
+  sent the exact live readbacks, two failing cases and root-cause trace.
+
+The earlier full-suite/build receipts do not cover this new regression.
+No further fee-bearing live tests, release or readiness claim. Preserve the
+six outstanding obligations, historical overrun, original budget and genuine
+new-consent requirement. This observer made only read-only live GETs and
+isolated offline tests, with no live wallet transaction or configuration change.
+
+## Prior observer checkpoint — 12:43–12:53 UTC
+
+The accounting/cancellation owner, **Review Catalyst work (3)**, has repaired
+both recovery boundaries reproduced below. Fresh independent verification of
+the shared working tree now passes. This supersedes the earlier RED status,
+not the historical overrun or the unfinished live acceptance gates.
+
+- Original generic-cap bypass, real-policy overrun recovery, stopped-campaign
+  renewal (spent below and exactly at cap), and Bootstrap integration:
+  **10 passed in 7.55s**, exit 0. Command: `C:\Python312\python.exe -m pytest
+  tests/test_bootstrap_cancel_fee_budget.py
+  tests/test_bootstrap_fee_recovery_policy.py
+  tests/test_bootstrap_stopped_fee_renewal.py
+  tests/test_coin_prep_fee_bootstrap_integration.py -q --tb=short`.
+- Exact protected cancellation, ledger, authoritative recovery, atomic dispatch
+  holds and cancellation journal: **196 passed in 111.45s**, exit 0. Command:
+  `C:\Python312\python.exe -m pytest tests/test_coin_prep_fee_cancellation.py
+  tests/test_fee_approval_ledger.py tests/test_fee_approval_recovery.py
+  tests/test_coin_prep_fee_dispatch_hold.py tests/test_offer_cancel_journal.py
+  -q --tb=short`. This includes concurrency, no-effect, duplicate and restart
+  cases; it is not a rerun of the entire backend suite.
+- Actual Chromium fee-workflow regression suite: **27 passed in 15.15s**,
+  exit 0. Command: `C:\Python312\python.exe -m pytest
+  tests/e2e/test_coin_prep_fee_approval.py --e2e -q --tb=short`. The fixture uses
+  isolated test data and mocked financial responses, not the live wallet.
+- The new `dist/Catalyst/Catalyst.exe` independently passed all three existing
+  package probes with `--exe` pointing to that exact absolute path:
+  `scripts/packaged_api_smoke.py` (nine API checks),
+  `scripts/packaged_sage_rpc_smoke.py` (synthetic mTLS wallet), and
+  `scripts/packaged_upgrade_publication_recovery_smoke.py`. Each exited 0.
+  These use disposable profiles and loopback mock services; they do not prove
+  a live campaign cancellation or the native window workflow.
+
+### Exact observed provenance
+
+- Branch `codex/coin-prep-fee-approval`, base HEAD
+  `45f3df8505fb966b921df32791e8459a10d24cc1` **plus the owner's uncommitted
+  repair**. The base commit alone is not the tested source. In particular,
+  `tests/bootstrap_fee_fixture.py` remains an untracked required fixture.
+- EXE SHA-256:
+  `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
+- Source and bundled `bot_gui.html` both hash to
+  `F05417633E035762CB4094A8C54F011826217E2E72335C314F44535136275E28`.
+- Observed `coin_prep_fee_runtime.py` SHA-256:
+  `EB4CC423A89731D8C12707EE8DB31E1A942201989202EB60F731408C74D1C42C`;
+  `coin_prep_fee_cancellation.py`:
+  `B98A5EBE9E647196888DBC2A583C8336243B3D12F167153873BDE48AC201DCC3`;
+  `database.py`:
+  `EA2A77A0808B7D9D3BCD93C69D58B85A4B1DB0B5FBFD8F51AE8B2826956C50D0`.
+
+Logs remain under `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/`:
+
+| Log | SHA-256 |
+| --- | --- |
+| `observer-recovery-green-20260925.log` | `F83C34014C28E7285B528A63D93EBE225B73E6B8260252735A0BD22AE56FECF3` |
+| `observer-ledger-cancel-20260925.log` | `5CA0131769A0A0931767805A4F9D8921AE851773FC66606161221CCB20502782` |
+| `observer-browser-fee-20260925.log` | `8417274BC9DA740ACCF151469EF6518C3726BF0B3075611A20E384EFEA1DE1C2` |
+| `observer-package-api-20260925.log` | `037180AE72CB6968B24A4F9719E9A5644B6AA03656F45164F49C6405F82FCFD9` |
+| `observer-package-sage-20260925.log` | `3C6D138DBE55C8BEAB1953D15458AF883C9AB2F1837086521D7EDAEF511BFD69` |
+| `observer-package-upgrade-20260925.log` | `FA6D575A8134751BA4310D0E2A5C3BFC2F218A84D664387FE5132BB48A67AF7B` |
+
+### Still open — do not promote to complete
+
+The owner's `2026-09-24-live-test7-acceptance.md` now reports **7009 backend
+passes, 160 skips, 422 subtests**, **159 Chromium passes**, a successful new
+Windows build, and native clean/duplicate/persisted/safety smokes. Those are
+owner-reported receipts: this observer has requested the exact supporting log
+paths and final immutable source/package provenance, and has not independently
+rerun or relabelled those complete-suite/native results. No duplicate full build
+or full suite was started. All independent jobs above have finished.
+
+Live cancellation recovery under a genuinely confirmed displayed cumulative
+budget, authoritative settlement and post-fix restart accounting remain open,
+as do the remaining live requote/market/publication acceptance gates. Last
+durable evidence retains six second-wave offers; no current chain state or
+offer disappearance is inferred from an unavailable app. Before any live
+effect, reverify TEST 7 identity and coordinate with the live-session owner.
+The original **0.001736563369 XCH** spend against **0.001 XCH** remains visible;
+no historical cap or record was rewritten and no fee consent was manufactured.
+
+This observer changed no production code, live profile, strategy, reserve or
+installed package and performed no live wallet action. The other task's entire
+WIP is preserved. No merge/release or readiness/completion claim; the automation
+remains active for the unfinished gates.
+
+## Prior observer checkpoint — 11:42–11:48 UTC
 
 The other task's uncommitted repair now passes the prior real-policy overrun
 recovery regression, including read-only preview after a stop and rejection of

@@ -152,7 +152,41 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
-Latest combined-candidate verification is recorded in
+**25 September 2026, 12:58 UTC:** release/secondary-PC readiness is still open.
+The historical campaign cancellation overrun and current repair verification
+are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
+Independent post-repair checks now pass: 10 campaign/bypass/recovery tests,
+196 ledger/cancellation/hold/journal tests, 27 Chromium fee-flow tests, and
+isolated API/mock Sage/upgrade-recovery probes against EXE SHA-256
+`6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
+The owner reports 7009 full backend passes and 159 full Chromium passes plus a
+fresh build/native smokes; exact supporting logs and immutable final-source
+provenance still need to be tied to the handoff artifact. Current source is
+base `45f3df8` plus shared repair WIP, not that commit alone.
+
+- [ ] Fix the newly reproduced automatic-policy-stop recovery boundary:
+  `tests/test_bootstrap_automatic_stop_fee_recovery.py` has two RED cases.
+  Actual policy materialization leaves status active / stage stopped and
+  increments revision, unlike explicit stop. Read-only fee preview fails 503
+  and cancellation-recovery readback refuses stale approval. Preserve frozen
+  economics, identity and ordinary prep denial; do not allow arbitrary revision
+  drift. Live GETs on the new EXE confirm this exact state and correct historical
+  fee disclosure, but do not establish a successful recovery transaction.
+- [ ] Finalize exact source/package provenance without omitting the new shared
+  test fixture or conflating historical package/native receipts.
+- [ ] Complete post-fix live campaign cleanup through genuine displayed
+  recovery consent, exact cap-enforced dispatch, authoritative settlement and
+  restart accounting; preserve the original 0.001 XCH cap and evidenced overrun.
+- [ ] Finish remaining live requote/recovery/market/publication acceptance.
+
+No further fee-bearing live tests until the repaired accounting and dispatch
+controls are verified for the intended artifact and actual new displayed fee
+consent is recorded. Review Catalyst work (3) owns the production repair and
+live session. Keep the unaffordable saved strategy intact. Earlier checked
+items below/above describe historical fee-feature evidence, not clearance of
+these newly discovered acceptance gates. No merge, release or goal completion.
+
+Prior combined-candidate verification is recorded in
 `evidence/2026-09-24-combined-candidate-verification.md`: frozen source `088d9d6`,
 fresh Windows build, 156 Chromium passes, 6,999 final worktree passes with
 157 skips and 422 subtests, corrected isolated package probes, and a recorded
