@@ -1,5 +1,61 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
+## Latest observer checkpoint — 10:41–10:50 UTC
+
+The historical overrun below remains an actual overrun, not erased by the
+in-progress repair. **Review Catalyst work (3)** owns the production fix and
+live session in this same worktree. This observer changed only its own new
+regression and this receipt; no live wallet action or package replacement.
+
+- Independent focused rerun of `test_bootstrap_cancel_fee_budget.py`,
+  `test_coin_prep_fee_bootstrap_integration.py` and `test_bootstrap_api.py`:
+  **18 passed in 10.22s**, exit 0. The original unapproved generic-cancellation
+  bypass test is now green against the other task's uncommitted fix. That is
+  not certification of every atomic dispatch/recovery path.
+- Read-only inspection of the real database through the new WIP helpers now
+  derives **1736563369 mojos** and reports campaign `fee_spent_xch` as
+  **0.001736563369**, not zero. Original cap remains **0.001 XCH**, revision 0.
+  Current approval `66cb34a8...` remains version 2, total **19674859**, held 0,
+  remaining **-1716888510**. This is source-helper readback, not proof that a
+  rebuilt packaged runtime has launched or that historical records were edited.
+- New RED `tests/test_bootstrap_fee_recovery_policy.py` preserves the **real**
+  `_active_bootstrap_coin_prep_context`. Existing recovery tests replaced that
+  function with a fixed recipe and therefore missed its policy precondition.
+  The fixture verifies valid identity, dates and balances before injecting
+  authoritative spend of 10000000010 against a 10000000000-mojo campaign cap.
+  Real creation policy correctly refuses with
+  `bootstrap_coin_prep_not_authorized:fee_reserve`. The actual fee-preview API
+  then returns **503 / FEE_PREVIEW_UNAVAILABLE**, preventing the existing
+  renewal workflow from displaying its read-only recovery quote.
+- The test asserts no new consent, fee hold, operation or wallet effect claim
+  was created. Its required recovery preview must disclose the actual prior
+  spend and must not authorize dispatch or mutate the original campaign cap.
+  Keep creation blocked: do not fix the preview by zeroing spend, ignoring the
+  policy, or silently increasing a budget. A narrowly scoped cancellation-only
+  or frozen-plan recovery workflow still needs real end-to-end verification.
+- Reproduction: new test alone **1 failed in 1.98s**; combined with the original
+  bypass test **1 failed, 1 passed in 3.11s**, exit 1. Failure is the expected
+  HTTP 503-vs-200 assertion, not setup, expiry, identity or funding failure.
+  Ruff on the new file and `git diff --check` passed. No full suite or new
+  Windows build was run by this observer while the other task repairs source.
+- Reproduced source hashes: `blueprints/coin_prep.py`
+  `FFED3CB19188ACEBCF6461C8E85DB78F31C9DD4B65491F511D4C47AB32C33DC8`;
+  `coin_prep_fee_runtime.py`
+  `F2DBA262B7EBEBD2BC071C931C10238A5C1E2588E423E9F4704C187000AC0560`.
+  New test hash:
+  `D82BEBEF593563020F4926968DDFA4643DEF7A6F34F742705B03E09718FA1D10`.
+- The repair task received the failing regression and a related review request
+  to cover manual-stop cancellation refusal/submitted-unconfirmed followed by
+  retry/restart. The latter is a traced concern, **not** a separately reproduced
+  defect: current stop code terminalizes the campaign after any cancellation
+  result dict while approved snapshots require an active campaign.
+
+Fee-bearing live tests remain on hold. Exact post-fix full/backend/browser/
+native/Windows-artifact verification and remaining live recovery/requote gates
+are unfinished. No main merge, release, readiness or goal-completion claim.
+
+## Historical observation
+
 Read-only observation during the 09:40 UTC heartbeat, continuing through
 approximately 09:55 UTC. This receipt supersedes the earlier statement that
 no live create/cancel/remake cycle had run. It does **not** certify acceptance.
