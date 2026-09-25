@@ -152,6 +152,33 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
+**25 September 2026, 21:59 UTC:** primary commit61ad703 incorporates the shared
+repairs and later latest-campaign-approval status fix. Raw final backend log
+confirms **7042 passed,165 skipped,422 subtests**; current471-file manifest
+`C9DCF5F653FE314C0DE10C0653E41F9D036D253D130AA94AF73178AA80FF8A7A`.
+Final EXE `5B3D259964A8537D214E150F853B19B99ED6297D96A00B247F1E97BBFA07F6D4`
+matches all131 project modules+entrypoint/HTML. All198 files in the primary's
+local ZIP match the bundle. Primary records164 Chromium/build/package/native
+smokes; those console-only receipts were not independently rerun.
+
+Protected live cleanup used priorEXE55C749, not5B3D. Observer read-only durable
+proof confirms new3+3 terminal cohorts, fees90369+311977=402346mojos, original
+cap/overrun preserved. LatestV3 consent1746988850/spent1736965715/held0/remaining
+10023135/stalefalse/unresolved0 agrees with new5B3D real-profile restart API;
+botstopped,0openoffers/locks/blockers. Primary records displayed budget and
+separate cancellation confirmation. No new observer wallet action or consent.
+These close protected cleanup/settlement/restart gates with exact attribution.
+
+Live automatic requote/remaining market-publication acceptance is still open.
+Current confidence refuses creation/requote but was derived13:36:39UTC and is
+expired, so do not call this fresh evidence of unavoidable market insufficiency.
+Review Catalyst work (3) retains live ownership and was asked to obtain fresh
+attributable confidence before further classification/actions. See latest
+observer checkpoint for raw log hashes, cohort IDs and receipt boundaries.
+No duplicate full suite/build, strategy activation, main merge, release or goal
+completion. Earlier pending/provenance/native/live statuses below are historical
+where this update explicitly supplies newer evidence.
+
 **25 September 2026, 20:56 UTC:** collected the repaired-source full backend:
 **7041 passed, 165 skipped, 422 subtests passed in 1421.36s**, finished 18:30:07
 UTC. Log SHA-256 `BF0E21FA5534E7285820C3B51FC272B5A8E0F2E561581E47A31DE13418CC1645`.
@@ -245,11 +272,14 @@ Current source is base `f07af36` plus shared repair WIP, not that commit alone.
   cancellation fee-accounting gap, including once-only cohort/reservation
   accounting and authoritative terminal transitions; 59 focused and 7041 full
   backend passes on the matching 471-file source/test manifest.
-- [ ] Finalize exact source/package provenance without omitting the new shared
-  test fixture or conflating historical package/native receipts.
-- [ ] Complete post-fix live campaign cleanup through genuine displayed
+- [x] Finalize exact source/package provenance without omitting the new shared
+  test fixture or conflating historical package/native receipts:61ad703 source,
+  EXE5B3D,198matching ZIP files; primary-recorded exact native smokes, observer
+  verified restart/API/code attribution. Live mutation remains attributed55C.
+- [x] Complete post-fix live campaign cleanup through genuine displayed
   recovery consent, exact cap-enforced dispatch, authoritative settlement and
   restart accounting; preserve the original 0.001 XCH cap and evidenced overrun.
+  New402346mojos fit explicitV3 cumulative1746988850 cap; held/unresolved0.
 - [ ] Finish remaining live requote/recovery/market/publication acceptance.
 
 No further fee-bearing live tests until the repaired accounting and dispatch

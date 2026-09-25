@@ -1,6 +1,104 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 20:49–20:56 UTC
+## Latest observer checkpoint — 21:50–21:59 UTC
+
+### Protected cleanup and restart receipts independently corroborated
+
+Review Catalyst work (3) committed the shared repairs and its new acceptance
+receipt as **61ad703c1b127ec0797a76daef89827e2bfb0923**. Tracked worktree files
+were clean at this observer check. No source change, new consent, wallet effect,
+runtime restart, or package replacement was performed by this observer.
+
+The primary task explicitly attributes the live six-offer cleanup to the
+preceding EXE **55C749B5BC98B53F4EFBF1DE3A1C2DD15DEC804C6F1B4B0B4D238DFFD2591EEC**.
+The subsequent production change was the read-only Coin Prep status endpoint
+selecting the latest campaign approval rather than the old completed worker's
+approval. Live wallet mutation is **not** relabelled as a test of the later EXE.
+
+Fresh read-only database observations through `database.py`, with mode=ro and
+query-only connections, confirm two new canonical three-member cohorts:
+
+| Cohort suffix | Exact batch fee (mojos) | Terminal members |
+| --- | ---: | ---: |
+| `1a170238f7e0a063df370d485af002741a98678f0b52bf922a0d3153b4c56bd8` | 90369 | 3 |
+| `7a134e3d8ed39b528f43a7eb51fc4e750e6185aa1f69a8d14522589df7f169ba` | 311977 | 3 |
+
+All six RECONCILED journal events have `CANCEL_CONFIRMED`,
+`CANCELLED_PROVEN`, `EXACT_CANCEL_RETURN_PROOF`, and `blocks_mutation=0`.
+The **402346-mojo** additional fee is counted once per cohort, not per member.
+Both historical 864000000-mojo batches remain visible; the original
+**0.001 XCH campaign cap and 1736563369-mojo historical spend** are intact
+(the historical excess over that cap was **736563369 mojos**).
+The renewed displayed ceiling is a distinct append-only consent, not an edit
+to that original budget. The primary task records the deliberate GUI budget
+approval and separate Cancel Offers confirmation; this observer did not press
+either confirmation.
+
+Durable approval **fe95e93d02ebe2b73650b61f4f590c57606766b77ab23961e228dea47328d8df**
+is version **3**, approved at Unix **1790369536**, preview
+`900d3acebbffa87f27c0c6fe5bd6d38066bddfe5413d12087b80a65007460eb6`.
+Both database and current packaged HTTP readback agree: total **1746988850**,
+spent **1736965715**, held **0**, remaining **10023135**, protected allowance
+**11111490** mojos; stale=false, unresolved=0, dispatch_authorized=false.
+Fresh `/api/status`, `/api/bootstrap/status` and `/api/offers/open_count`
+show the bot stopped, zero open offers, zero XCH/MZ locks and zero mutation
+blockers. Identity is Sage/mainnet fingerprint **736588221**, wallet **2**,
+the authorized MZ asset. Idle balance zeros are not used as funding evidence.
+
+Raw observer receipt:
+`.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-live-recovery-readback-20260925-2158.log`,
+SHA-256 **21C6FB34B7C11746EF8043712D5A1EDA41D7087D94F04E18D2C7B032EF55D891**.
+The primary live runtime log
+`C:/Users/t_you/AppData/Roaming/Catalyst/bot_superlog_20260925_210531.log`
+corroborates the initial `FEE_CAMPAIGN_BUDGET_EXCEEDED` refusal, subsequent
+six durable requests and `cancel_all_confirmed` result. Its SHA-256 is
+**789EE036934EF8654836D4BC8F137DCEA94FF17A7BB5F8E99AC7BC4BD4CBD3B2**.
+
+### Final source and package provenance
+
+- Complete raw backend log `primary-full-backend-after-renewal-fix-20260925.log`
+  was read: **7042 passed, 165 skipped, 422 subtests passed in 1821.60s**,
+  final write 21:34:41 UTC. SHA-256
+  **48680C7603633647CB2845AA0954A0DEE2890D117107116804F0FE524256CD87**.
+- Current **471-file** source/test manifest is
+  **C9DCF5F653FE314C0DE10C0653E41F9D036D253D130AA94AF73178AA80FF8A7A**.
+  This supersedes 3097114C for the later status correction; earlier results
+  remain attributed to their own source.
+- Final shared EXE SHA-256:
+  **5B3D259964A8537D214E150F853B19B99ED6297D96A00B247F1E97BBFA07F6D4**.
+  Running PID **83392** has this exact path and started at **21:40:05 UTC**.
+  Independent read-only bytecode comparison matches all **131 project PYZ
+  modules plus entrypoint** to current source; bundled HTML remains51579E735A2E.
+- Primary local ZIP `CATalyst-61ad703-primary-acceptance.zip` hashes to
+  **8263C112014C09E6BE9F021A212A7EA99CD40C9990C7359AC7B8FAE860FCD53A**.
+  Independent stream comparison found all **198 files** matching the current
+  bundle, with zero missing/different/extra files; no extraction or launch.
+- The primary task records **182 focused**, **164 Chromium**, fresh build,
+  API/mock-Sage/upgrade-recovery and native clean/duplicate/persisted/safety
+  smokes passing. Those outputs were console-only; this observer has the
+  primary's written receipt, not separate raw logs or an independent rerun.
+  Current exact-package restart/API and durable accounting were independently
+  checked as above. No unchanged full suite/build was duplicated.
+
+### Remaining acceptance gate — do not call stale data a fresh market verdict
+
+At **21:56 UTC**, `/api/market/confidence` refuses creation and requoting:
+`can_create=false`, `can_requote=false`, state RED. However its `derived_at`
+is **13:36:39.502435 UTC** and reasons include `confidence_snapshot_expired`
+and `market_evidence_expired`. It also carries historical insufficient ask
+depth/provider-independence reasons. This proves a **stale confidence refusal**,
+not that freshly sampled current market conditions necessarily lack depth.
+`/api/market/intel` readback does not itself rederive this durable policy state.
+The live owner was notified to obtain fresh attributable evidence before
+classifying automatic requote/publication as externally impossible.
+
+Protected cleanup/settlement and post-fix restart readback now have evidence;
+the distinct automatic live requote and remaining market/publication gates
+remain open. Preserve the unaffordable saved pre-fee strategy. Do not repeat
+cleanup or spend again to reconfirm a passing gate. No main merge, release or
+overall readiness/goal-completion claim; automation remains active.
+
+## Prior observer checkpoint — 20:49–20:56 UTC
 
 ### Full repaired-source backend result collected
 
