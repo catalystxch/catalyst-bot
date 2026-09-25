@@ -152,24 +152,29 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
-**25 September 2026, 14:58 UTC:** release/secondary-PC readiness is still open.
+**25 September 2026, 15:58 UTC:** release/secondary-PC readiness is still open.
 The historical campaign cancellation overrun and current repair verification
 are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
 Fresh campaign/bypass/recovery verification passes 16 tests, including both
 composed-stop and canonical-context refusal cases. Focused browser verification
 passes 32 tests; complete Chromium E2E passes 164 tests. Current EXE
 `943B0D54FC9DF01D8005C35A0946D7D41EB060D3511ABD63FC2A7913F7167D6D`
-independently passes API/mock-Sage/upgrade-recovery probes. One full backend run
-is in progress (session 25624, log `observer-full-backend-20260925-1455.log` in
-the SDD directory), with an error marker but no final summary yet. Keep source
-frozen and collect it before starting another run. Earlier evidence includes
+independently passes API/mock-Sage/upgrade-recovery probes. The full backend run
+was collected: 7011 passes, 165 skips, 422 subtests, two failures and two setup
+errors, all in stopped-fee-renewal import initialization. A minimal cross-file
+reproduction preceded the test-only correction; same-order 7 tests and the
+16-test campaign/recovery group now pass. Replacement full run is active:
+session 88147, log `observer-full-backend-20260925-1554.log` in the SDD directory.
+Keep source frozen and collect it before starting another run. Earlier evidence includes
 196 ledger/cancellation/hold/journal tests, 27 Chromium fee-flow tests, and
 isolated API/mock Sage/upgrade-recovery probes against EXE SHA-256
 `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
 The owner's earlier 7011 full backend /159 Chromium/native receipt names
 `768CDE4B...`; do not conflate it with current 943B0D verification. Exact final
 source/build/native provenance still needs to be tied to the handoff artifact.
-Current source is base `21984c1` plus shared repair WIP, not that commit alone.
+Read-only comparison now matches all 131 embedded project PYZ modules plus the
+desktop entrypoint to current source; this is not native/live acceptance.
+Current source is base `f07af36` plus shared repair WIP, not that commit alone.
 
 - [x] Original automatic-policy-stop regressions now pass and are integrated
   into `tests/test_bootstrap_stopped_fee_renewal.py`. This closes that isolated
@@ -181,8 +186,10 @@ Current source is base `21984c1` plus shared repair WIP, not that commit alone.
   Additional real-button tests cover approval refusal, Keep Offers, and a second
   cancellation confirmation through mocked async completion, retaining the
   approved ID and never launching prep/history reset. No live wallet is used.
-- [ ] Collect the full current-source backend suite, diagnose its reported
-  error(s), and close full-regression verification without weakening guards.
+- [x] Collect and diagnose the failed full suite; reproduce and fix its
+  test-isolation import errors without changing financial assertions/guards.
+- [ ] Collect the replacement full current-source backend suite and close
+  full-regression verification without weakening guards.
 - [ ] Finalize exact source/package provenance without omitting the new shared
   test fixture or conflating historical package/native receipts.
 - [ ] Complete post-fix live campaign cleanup through genuine displayed

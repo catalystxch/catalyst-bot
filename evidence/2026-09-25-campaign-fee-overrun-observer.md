@@ -1,6 +1,91 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 14:46–14:58 UTC
+## Latest observer checkpoint — 15:47–15:58 UTC
+
+The recorded full backend job was collected **before** starting another run.
+Session 25624 finished exit 1: **7011 passed, 165 skipped, 422 subtests passed,
+2 failed and 2 setup errors in 1160.27s**. All four failures were in
+`tests/test_bootstrap_stopped_fee_renewal.py`:
+
+- `test_stopped_campaign_can_review_cancel_budget_without_prior_overrun[0]`
+- `test_stopped_campaign_can_review_cancel_budget_without_prior_overrun[10000000000]`
+- `test_automatic_policy_stop_preserves_read_only_recovery_preview` (setup)
+- `test_automatic_policy_stop_preserves_only_cancellation_recovery_context` (setup)
+
+They failed on the same circular import, before the financial assertions:
+`blueprints.coin_prep -> api_server -> blueprints.coin_prep.bp`. The 470-file
+manifest was rechecked before editing and still matched the recorded
+`A63E0EA44A5FA9AB6442610B16D07B7BB6F5607EE5C8EA704DD984DF0475C5DD`.
+This full run is RED, not relabelled as passing because the other tests passed.
+
+### Reproduced test-isolation correction
+
+Running `test_bootstrap_recovery_invariants.py` before the stopped-renewal file
+reproduced **2 failed, 3 passed, 2 errors in 5.35s**. A collection-time import
+alone was insufficient: the invariants file imports the stopped-renewal module
+for its fixture before pytest collects that file, so the per-file module-graph
+restoration removes its dependencies without re-executing its imports.
+
+The minimal correction explicitly initializes `api_server` at execution time
+before importing its blueprint in the stopped-renewal test and shared automatic-
+stop fixture. No assertions, production code, accounting rules or safety guards
+changed. The same order-sensitive command then passed **7 tests in 5.48s**;
+the six-file campaign/bypass/recovery group passed **16 tests in 13.52s**.
+Ruff on the affected recovery tests and `git diff --check` passed.
+
+The repair owner was notified. Its other edits and the shared fixture remain
+untouched; this narrow harness correction remains alongside its uncommitted
+test work rather than committing the owner's broader changes accidentally.
+
+### Replacement full-suite job — collect before any duplicate
+
+One replacement run is active: session **88147**, Python PID **1012**, command
+`C:\Python312\python.exe -m pytest tests -q --tb=short`, log
+`.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-full-backend-20260925-1554.log`.
+It has no final result at this checkpoint. Keep source/tests frozen until it
+finishes. The new 470-file manifest is
+`16B4885B947C71EE54A59ACF7ED48FFECD6D8D942807232AF1D300F2A0CEEB73`.
+Recheck it at completion. Source base is `f07af36` plus shared WIP; this is not
+an immutable handoff commit. No duplicate browser suite or rebuild was run.
+
+### Broader exact-package source check
+
+Read-only archive inspection compared **all 131 project modules found in the
+embedded PYZ plus the desktop entrypoint** against compiled current source:
+**zero mismatches**, normalizing filenames only. No application code was
+imported/executed by this audit. EXE remains
+`943B0D54FC9DF01D8005C35A0946D7D41EB060D3511ABD63FC2A7913F7167D6D`;
+source and bundled GUI both remain
+`51579E735A2E064673924A90B45D0B5B4D6E1B7E000861DF3D5E7177E3E42047`.
+This strengthens source provenance, **not** native/dependency/live acceptance.
+The latest owner's written native receipt still names `768CDE4B...`; it has
+not been transferred to this executable. Exact-current native evidence remains
+open, alongside full regression and post-fix live recovery/requote gates.
+
+Logs/scripts under the SDD directory:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `observer-full-backend-20260925-1455.log` (failed full run) | `87619359EC3D38D447AE710BD2EEA101B22DDAE2FF8755CD010CFBB91302B180` |
+| `observer-import-order-red-20260925.log` | `4CD62181BB815BB6653EFBCFF2B40A3A8E01D2A63A8A1A655D739B049CA3F35E` |
+| `observer-import-order-final-20260925.log` | `C5D05FA250611ED688F2B760346942182E1B8B2E526E58BB0347FA6E8976209D` |
+| `observer-recovery-group-20260925-1553.log` | `1B271A7D45C309B15867B4670D03F60C9BC108111F827181F6F0EF7D5621BE4C` |
+| `observer_audit_all_bundle_code.py` | `7F12A01BBA0118A5CF20146AB9635E24798C2CC4829013BA21C0027C2864C5D4` |
+| `observer-all-bundle-code-20260925.log` | `6AAC3D433F00BD46407C8AFD20157541A65B8EE6EA4C56F989271A0580DEB3FA` |
+
+The intermediate `observer-import-order-green-20260925.log` is misleadingly
+named: it records the failed collection-import attempt, **not** a green run.
+Final corrected stopped-renewal test SHA-256 is
+`4A2B201611E81E4A3B4AA1D85CA070CDBA113D96473C8A6125FF408E436439D7`.
+
+No wallet action, new consent, budget/strategy/profile change, package overwrite,
+merge or release occurred in this observer run. The original **0.001 XCH** cap
+and **1736563369 mojos** historical spending remain unchanged. Live spending
+remains prohibited until the intended artifact's controls and recovery workflow
+are verified and genuine new displayed fee consent is recorded. Goal and
+automation are not complete.
+
+## Prior observer checkpoint — 14:46–14:58 UTC
 
 **Both composed recovery regressions now pass in the shared working tree.**
 This is focused verification of the owner's repair, not live acceptance or a
