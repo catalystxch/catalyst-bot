@@ -1,6 +1,50 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 21:50–21:59 UTC
+## Latest observer checkpoint — 22:30–22:34 UTC
+
+### Fresh exact-package market gate — safely RED
+
+Review Catalyst work (3) exercised the normal GUI on exact final EXE
+**5B3D259964A8537D214E150F853B19B99ED6297D96A00B247F1E97BBFA07F6D4**.
+Its evidence-only commit is **f560816** atop unchanged source/package commit
+61ad703. The user explicitly confirmed Start. No fee approval or wallet spend
+was required or created.
+
+Independent reading of the live log and current HTTP state corroborates:
+
+- Sage selected mainnet TEST 7 fingerprint **736588221**, CAT wallet **2** and
+  the authorized MZ asset; Splash started. All **10 preflight checks passed**.
+- Startup reconciliation found zero wallet/DB offers, zero unknown offers and
+  zero orphan-looking locks. Runtime safety allowed the start.
+- The bot recorded **two loops, zero errors**. It derived fresh confidence at
+  **2026-09-25T22:31:37.43154Z**. Host UTC at independent inspection was
+  22:33:50, confirming that timestamp was current, not future-dated.
+- The fresh decision was RED for substantive reasons only:
+  `out_of_range_depth_excluded`, `insufficient_ask_depth`, and
+  `single_provider_dependency`. Dexie supplied a current 9-bid/29-ask book;
+  Splash's offer set was empty. Creation/requote remained disabled, so the bot
+  created and requoted zero offers without bypassing market safety.
+- Stop completed cleanly. Fresh current readback: running=false, loop_count=2,
+  errors=0, open offers=0, XCH locks=0, CAT locks=0, runtime safety allowed.
+  The short-lived decision later gained the expected expired-evidence reasons
+  after stopping; that does not invalidate the recorded running-cycle proof.
+
+Runtime log:
+`C:/Users/t_you/AppData/Roaming/Catalyst/bot_superlog_20260925_224016.log`,
+SHA-256 **03F7437E3954FD6A20193821C000AB25663879C5156F813E68A78573D7E5EA2C**,
+length 27756 bytes, final write 22:31:56.7087808 UTC. The 471-file manifest
+remains **C9DCF5F653FE314C0DE10C0653E41F9D036D253D130AA94AF73178AA80FF8A7A**.
+
+This closes the fresh-confidence/start/stop and fail-closed market decision
+checks on the exact final package. It does **not** fabricate a successful live
+create/requote: automatic requote/publication is currently unexercisable under
+genuine RED market authority. Historical creation/publication/remake evidence
+exists, but a final-package successful automatic requote remains an external
+market-state gate. Continue monitoring rather than weakening thresholds or
+manufacturing market depth. No main merge, release, overall readiness claim,
+goal completion or automation pause.
+
+## Prior observer checkpoint — 21:50–21:59 UTC
 
 ### Protected cleanup and restart receipts independently corroborated
 
@@ -80,17 +124,17 @@ six durable requests and `cancel_all_confirmed` result. Its SHA-256 is
   Current exact-package restart/API and durable accounting were independently
   checked as above. No unchanged full suite/build was duplicated.
 
-### Remaining acceptance gate — do not call stale data a fresh market verdict
+### Remaining acceptance gate at 21:56 UTC — historical stale readback
 
-At **21:56 UTC**, `/api/market/confidence` refuses creation and requoting:
+At **21:56 UTC**, before the later live cycle, `/api/market/confidence` refused creation and requoting:
 `can_create=false`, `can_requote=false`, state RED. However its `derived_at`
 is **13:36:39.502435 UTC** and reasons include `confidence_snapshot_expired`
 and `market_evidence_expired`. It also carries historical insufficient ask
 depth/provider-independence reasons. This proves a **stale confidence refusal**,
 not that freshly sampled current market conditions necessarily lack depth.
 `/api/market/intel` readback does not itself rederive this durable policy state.
-The live owner was notified to obtain fresh attributable evidence before
-classifying automatic requote/publication as externally impossible.
+The later 22:31 UTC cycle above supersedes this stale-only uncertainty with
+fresh attributable RED evidence.
 
 Protected cleanup/settlement and post-fix restart readback now have evidence;
 the distinct automatic live requote and remaining market/publication gates

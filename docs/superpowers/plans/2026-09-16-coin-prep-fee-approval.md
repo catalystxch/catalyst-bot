@@ -152,6 +152,20 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
+**25 September 2026, 22:34 UTC:** exact final EXE5B3D normal-GUI start passed
+10 preflights and reconciled zero wallet/DB/unknown offers or orphan locks under
+verified TEST7 identity. Fresh confidence derived22:31:37Z while running: RED
+for out-of-range depth exclusion, insufficient ask depth and single-provider
+dependency; Dexie had9bids/29asks, Splash empty. Creation/requote correctly
+remained disabled; two loops completed with0errors and0offers. Clean stop leaves
+runningfalse,0offers/locks, safetyallowed. Log SHA03F7437E3954FD6A20193821C000AB25663879C5156F813E68A78573D7E5EA2C.
+Host UTC inspection confirmed timestamp current; post-stop TTL expiry is
+expected. Evidence-only commitf560816; source/package manifestC9DCF5 unchanged.
+Fresh-confidence/start/stop/fail-closed exact-package checks are now proven.
+Successful automatic requote/publication remains unexercisable under genuine
+RED authority and stays an external market-state gate. Monitor; never weaken
+confidence thresholds or fabricate offers/depth. No main/release/goalcomplete.
+
 **25 September 2026, 21:59 UTC:** primary commit61ad703 incorporates the shared
 repairs and later latest-campaign-approval status fix. Raw final backend log
 confirms **7042 passed,165 skipped,422 subtests**; current471-file manifest
@@ -280,7 +294,9 @@ Current source is base `f07af36` plus shared repair WIP, not that commit alone.
   recovery consent, exact cap-enforced dispatch, authoritative settlement and
   restart accounting; preserve the original 0.001 XCH cap and evidenced overrun.
   New402346mojos fit explicitV3 cumulative1746988850 cap; held/unresolved0.
-- [ ] Finish remaining live requote/recovery/market/publication acceptance.
+- [ ] Finish remaining successful live automatic requote/publication acceptance.
+  Exact-package fresh market evaluation and fail-closed behavior pass, but
+  genuine RED authority currently prevents safe execution of the success path.
 
 No further fee-bearing live tests until the repaired accounting and dispatch
 controls are verified for the intended artifact and actual new displayed fee
