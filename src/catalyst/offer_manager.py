@@ -7682,8 +7682,7 @@ class OfferManager:
             return {}
         if fee_approval_id is not None:
             if (
-                reason != "coin_prep_cancel_all"
-                or type(fee_approval_id) is not str
+                type(fee_approval_id) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
             ):
                 raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
@@ -7726,6 +7725,47 @@ class OfferManager:
                     }
 
         canonical_intents = [self._canonical_cancel_intent(tid) for tid in trade_ids]
+        bootstrap_campaign_ids = set()
+        bootstrap_member_count = 0
+        for canonical_intent in canonical_intents:
+            creation_intent = database.get_offer_intent(canonical_intent.intent_id)
+            purpose = (
+                str(creation_intent.get("purpose") or "")
+                if type(creation_intent) is dict
+                else ""
+            )
+            if not purpose.startswith("bootstrap:"):
+                continue
+            parts = purpose.split(":")
+            if (
+                len(parts) != 4
+                or parts[0] != "bootstrap"
+                or parts[2] != "revision"
+                or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+            ):
+                raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+            bootstrap_campaign_ids.add(parts[1])
+            bootstrap_member_count += 1
+        if bootstrap_campaign_ids:
+            if (
+                len(bootstrap_campaign_ids) != 1
+                or bootstrap_member_count != len(canonical_intents)
+            ):
+                raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+            campaign_id = next(iter(bootstrap_campaign_ids))
+            approved_id = database.get_latest_coin_prep_fee_approval_for_campaign(
+                campaign_id
+            )
+            if approved_id is None:
+                raise ValueError("FEE_BUDGET_APPROVAL_REQUIRED")
+            if fee_approval_id is not None and fee_approval_id != approved_id:
+                raise ValueError("FEE_APPROVAL_STALE")
+            fee_approval_id = approved_id
+            # Bootstrap cancellation is attributable to the campaign's approved
+            # Coin Prep scope and must consume only its protected allowance.
+            reason = "coin_prep_cancel_all"
+        elif fee_approval_id is not None and reason != "coin_prep_cancel_all":
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
         self._recover_persisted_cancel_cohorts()
         unique_intents = []
         seen_trade_ids = set()

@@ -1767,6 +1767,23 @@ def api_coin_prep_status():
         # A worker may disappear from memory during a browser/app/PC restart,
         # but its consent and accounting do not. Recover only the approval ID
         # written by the worker itself and expose a read-only, lossless view.
+        # Bootstrap cancellation recovery may deliberately renew that consent
+        # after the worker completed.  Prefer the campaign's latest immutable
+        # approval so status never reports a superseded ceiling with cumulative
+        # scope spend (which can otherwise render a misleading negative balance).
+        if bootstrap_campaign is not None:
+            try:
+                from database import get_latest_coin_prep_fee_approval_for_campaign
+
+                latest_campaign_approval_id = (
+                    get_latest_coin_prep_fee_approval_for_campaign(
+                        bootstrap_campaign["campaign_id"]
+                    )
+                )
+                if latest_campaign_approval_id is not None:
+                    worker_fee_approval_id = latest_campaign_approval_id
+            except Exception:
+                pass
         if worker_fee_approval_id is not None:
             result["fee_approval_id"] = worker_fee_approval_id
             try:

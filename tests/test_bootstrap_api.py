@@ -356,6 +356,30 @@ def test_status_reports_temporarily_unavailable_identity_without_http_conflict(
     }
 
 
+def test_status_uses_authoritative_campaign_fee_evidence(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    _bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(
+        database,
+        "get_bootstrap_campaign_authoritative_fee_spent_mojos",
+        lambda exact_id: 8_563_369 if exact_id == campaign_id else 0,
+    )
+
+    status = client.get("/api/bootstrap/status").get_json()
+
+    assert status["campaign"]["fee_spent_xch"] == "0.000008563369"
+
+
 def test_status_export_and_scoped_stop_use_exact_active_campaign(
     isolated_db, bootstrap_api, monkeypatch
 ):
@@ -391,13 +415,17 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
         "_campaign_trade_ids",
         lambda exact_id: ["trade-a", "trade-b"] if exact_id == campaign_id else [],
     )
+    def cancel_while_authority_is_active(trade_ids):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+        cancelled.extend(trade_ids)
+        return {
+            trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids
+        }
+
     monkeypatch.setattr(
         bootstrap,
         "_cancel_campaign_offers",
-        lambda trade_ids: (
-            cancelled.extend(trade_ids)
-            or {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids}
-        ),
+        cancel_while_authority_is_active,
     )
     stopped = client.post(
         "/api/bootstrap/stop",

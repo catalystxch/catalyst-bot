@@ -531,6 +531,147 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
     ]
 
 
+def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
+    _open_gui(page)
+    preview = _preview()
+    approval_id = "d" * 64
+
+    result = page.evaluate(
+        """async ({preview, approvalId}) => {
+            bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
+            window.__feeCalls = [];
+            window.__statusReads = 0;
+            window.apiFetch = async (path, options = {}) => {
+                const url = String(path);
+                window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/cancel_all/status')) {
+                    window.__statusReads += 1;
+                    return new Response(JSON.stringify({
+                        success: true,
+                        running: false,
+                        complete: false,
+                        phase: 'error',
+                        reason_code: 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                        message: 'Cancel all failed: FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (url.includes('/coin-prep/fee-preview')) {
+                    return new Response(JSON.stringify(preview), {
+                        status: 200,
+                        headers: {'Content-Type': 'application/json'},
+                    });
+                }
+                if (url.includes('/offers/cancel_all')) {
+                    return new Response(JSON.stringify({
+                        success: true, async: true, total: 2, timeout_seconds: 180,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (url.includes('/status')) {
+                    return new Response(JSON.stringify({success: true}), {
+                        status: 200,
+                        headers: {'Content-Type': 'application/json'},
+                    });
+                }
+                throw new Error(`Unexpected test request: ${url}`);
+            };
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            await cancelAllOffers({
+                source: 'coin_prep',
+                openBuyCount: 1,
+                openSellCount: 1,
+                openOfferCount: 2,
+                prepPayload: {fee_approval_id: approvalId},
+            });
+            await confirmCancelAll();
+            await new Promise(resolve => setTimeout(resolve, 2200));
+            clearCancelAllCompletionTimers();
+            stopCancelAllProgressPolling();
+            return {
+                calls: window.__feeCalls,
+                overlay: document.getElementById('coinPrepConfirmOverlay').classList.contains('active'),
+                banner: document.getElementById('cpReasonBanner').textContent,
+            };
+        }""",
+        {"preview": preview, "approvalId": approval_id},
+    )
+
+    cancel_calls = [
+        call for call in result["calls"] if "/offers/cancel_all" in call["path"]
+        and "/status" not in call["path"]
+    ]
+    preview_calls = [
+        call for call in result["calls"] if "/coin-prep/fee-preview" in call["path"]
+    ]
+    assert len(cancel_calls) == 1
+    assert len(preview_calls) == 1
+    assert result["overlay"] is True
+    assert "new cumulative maximum" in result["banner"]
+
+
+def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
+    _open_gui(page)
+    preview = _preview()
+
+    result = page.evaluate(
+        """async preview => {
+            bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                const url = String(path);
+                window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/cancel_all/status')) {
+                    return new Response(JSON.stringify({
+                        success: true,
+                        running: false,
+                        complete: false,
+                        phase: 'error',
+                        reason_code: 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                        message: 'Cancel all failed: FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (url.includes('/coin-prep/fee-preview')) {
+                    return new Response(JSON.stringify(preview), {
+                        status: 200,
+                        headers: {'Content-Type': 'application/json'},
+                    });
+                }
+                if (url.includes('/offers/cancel_all')) {
+                    return new Response(JSON.stringify({
+                        success: true, async: true, total: 2, timeout_seconds: 180,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                throw new Error(`Unexpected test request: ${url}`);
+            };
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            await cancelAllOffers();
+            await confirmCancelAll();
+            await new Promise(resolve => setTimeout(resolve, 2200));
+            clearCancelAllCompletionTimers();
+            stopCancelAllProgressPolling();
+            return {
+                calls: window.__feeCalls,
+                overlay: document.getElementById('coinPrepConfirmOverlay').classList.contains('active'),
+                banner: document.getElementById('cpReasonBanner').textContent,
+            };
+        }""",
+        preview,
+    )
+
+    cancel_calls = [
+        call for call in result["calls"] if "/offers/cancel_all" in call["path"]
+        and "/status" not in call["path"]
+    ]
+    preview_calls = [
+        call for call in result["calls"] if "/coin-prep/fee-preview" in call["path"]
+    ]
+    assert len(cancel_calls) == 1
+    assert len(preview_calls) == 1
+    assert result["overlay"] is True
+    assert "new cumulative maximum" in result["banner"]
+
+
 def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
     _open_gui(page)
     preview = _preview()
@@ -671,6 +812,93 @@ def test_stopped_worker_keeps_observing_recovery_without_marking_progress_comple
     expect(page.locator("#cpProgressDoneFallback")).to_be_hidden()
     expect(page.locator("#cpReviewFeeBudgetBtn")).to_be_disabled()
     assert page.evaluate("coinPrepStatus") == "checking"
+
+
+def _completed_campaign_prep_with_protected_cancellation_status():
+    return {
+        "success": True,
+        "running": False,
+        "complete": True,
+        "phase": "complete",
+        "progress": 1,
+        "message": "Coin preparation successful!",
+        "xch_coins": 36,
+        "xch_target": 36,
+        "cat_coins": 30,
+        "cat_target": 30,
+        "overlapping_coin_prep_blocked": True,
+        "fee_resume_required": True,
+        "fee_approval": {
+            "approval_id": "d" * 64,
+            "state": "paused_budget",
+            "total_fee_mojos": "19674859",
+            "cancellation_reserve_mojos": "11111490",
+            "held_fee_mojos": "0",
+            "spent_fee_mojos": "8563369",
+            "remaining_fee_mojos": "11111490",
+            "remaining_preparation_fee_mojos": "0",
+            "unresolved_operation_count": 0,
+            "stale": False,
+            "dispatch_authorized": False,
+        },
+        "last_prep_settings": {"cat_asset_id": "a" * 64},
+    }
+
+
+def test_completed_campaign_prep_is_not_reopened_as_budget_recovery(page):
+    _open_gui(page)
+    status = _completed_campaign_prep_with_protected_cancellation_status()
+    result = page.evaluate(
+        """async status => {
+            window.apiFetch = async path => {
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            settingsReviewed = true;
+            currentCAT = {asset_id: 'a'.repeat(64)};
+            coinPrepStatus = 'none';
+            const restored = await restoreCoinPrepReadiness();
+            return {
+                restored,
+                coinPrepStatus,
+                modalOpen: document.getElementById('coinPrepConfirmOverlay')
+                    .classList.contains('active'),
+            };
+        }""",
+        status,
+    )
+
+    assert result == {
+        "restored": True,
+        "coinPrepStatus": "done",
+        "modalOpen": False,
+    }
+
+
+def test_live_completion_wins_over_campaign_cancellation_reserve_recovery(page):
+    _open_gui(page)
+    status = _completed_campaign_prep_with_protected_cancellation_status()
+    page.evaluate(
+        """async status => {
+            window.apiFetch = async path => {
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            coinPrepStatus = 'checking';
+            document.getElementById('coinPrepConfirmOverlay').classList.add('active');
+            showCoinPrepView('progress');
+            await pollCoinPrepProgress();
+        }""",
+        status,
+    )
+
+    expect(page.locator("#coinPrepCompleteView")).to_be_visible()
+    expect(page.locator("#coinPrepProgressView")).to_be_hidden()
+    assert page.evaluate("coinPrepStatus") == "done"
 
 
 @pytest.mark.parametrize("reappears", [False, True])

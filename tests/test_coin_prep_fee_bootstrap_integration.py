@@ -1,6 +1,7 @@
 """Bootstrap Coin Prep keeps exact campaign authority through fee dispatch."""
 
 from importlib import import_module
+from decimal import Decimal
 import time
 from types import SimpleNamespace
 
@@ -139,6 +140,173 @@ def test_bootstrap_preview_consent_and_exact_pricing_share_campaign_revision(
     assert priced["available"] is True
     assert priced["scope"]["campaign_id"] == state["campaign_id"]
     assert priced["pricing"]["plan"].fee_mojos == 20
+
+
+def test_bootstrap_campaign_resolves_its_latest_explicit_fee_approval(
+    approved_bootstrap,
+):
+    database = import_module("database")
+
+    approval_id = database.get_latest_coin_prep_fee_approval_for_campaign(
+        approved_bootstrap["campaign_id"]
+    )
+
+    assert approval_id == approved_bootstrap["approval"]["approval_id"]
+
+
+def test_campaign_renewal_discloses_journal_fees_missing_from_approval_ledger(
+    approved_bootstrap, monkeypatch
+):
+    database = import_module("database")
+    service = import_module("coin_prep_fee_approval")
+    state = approved_bootstrap
+    external_spend = 1_736_563_369
+    monkeypatch.setattr(
+        database,
+        "_bootstrap_campaign_authoritative_fee_spent_mojos",
+        lambda _conn, campaign_id, **_context: (
+            external_spend if campaign_id == state["campaign_id"] else 0
+        ),
+    )
+
+    accounting = database.get_fee_scope_budget(state["preview"]["scope_sha256"])
+    renewed = service.preview_coin_prep_fees(
+        {
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 0,
+        }
+    )
+
+    assert accounting["spent_fee_mojos"] == external_spend
+    assert accounting["committed_fee_mojos"] == external_spend
+    assert accounting["noncancellation_committed_fee_mojos"] == 0
+    assert renewed["fee_accounting"]["spent_fee_mojos"] == external_spend
+    assert renewed["suggested_maximum_fee_mojos"] > external_spend
+
+
+def test_bootstrap_cancellation_cannot_exceed_authoritative_campaign_fee_budget(
+    approved_bootstrap, monkeypatch
+):
+    database = import_module("database")
+    cancellation = import_module("coin_prep_fee_cancellation")
+    wallet = import_module("wallet")
+    state = approved_bootstrap
+    campaign_budget_mojos = int(
+        Decimal(state["campaign"]["fee_budget_xch"]) * Decimal(10**12)
+    )
+    monkeypatch.setattr(
+        database,
+        "_bootstrap_campaign_authoritative_fee_spent_mojos",
+        lambda _conn, campaign_id, **_context: (
+            campaign_budget_mojos if campaign_id == state["campaign_id"] else 0
+        ),
+    )
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda trade_ids, *, fee_mojos, source_coin_ids, fee_coin_id: {
+            "summary": {"fee": fee_mojos},
+            "coin_spends": ["sealed"],
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 123_456,
+            "_catalyst_cancel_unsigned_digest": "f" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cancellation,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": state["now"],
+            "expires_at": state["now"] + 60,
+        },
+    )
+
+    result = cancellation.price_approved_cancellation(
+        approval_id=state["approval"]["approval_id"],
+        trade_ids=["a" * 64],
+        source_coin_ids=["b" * 64],
+        fee_coin_id="c" * 64,
+    )
+
+    assert result["available"] is False
+    assert result["reason"] == "FEE_CAMPAIGN_BUDGET_EXCEEDED"
+    assert result["required_fee_mojos"] == 20
+    assert result["remaining_campaign_fee_mojos"] == 0
+
+
+def test_explicit_renewed_ceiling_allows_only_the_displayed_campaign_recovery(
+    approved_bootstrap, monkeypatch
+):
+    database = import_module("database")
+    cancellation = import_module("coin_prep_fee_cancellation")
+    service = import_module("coin_prep_fee_approval")
+    wallet = import_module("wallet")
+    state = approved_bootstrap
+    original_budget = int(
+        Decimal(state["campaign"]["fee_budget_xch"]) * Decimal(10**12)
+    )
+    external_spend = original_budget + 10
+    monkeypatch.setattr(
+        database,
+        "_bootstrap_campaign_authoritative_fee_spent_mojos",
+        lambda _conn, campaign_id, **_context: (
+            external_spend if campaign_id == state["campaign_id"] else 0
+        ),
+    )
+    renewed_preview = service.preview_coin_prep_fees(
+        {
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 0,
+        }
+    )
+    renewed = service.approve_coin_prep_fees(
+        preview_id=renewed_preview["preview_id"],
+        maximum_fee_mojos=renewed_preview["suggested_maximum_fee_mojos"],
+        cancellation_reserve_mojos=renewed_preview[
+            "minimum_cancellation_reserve_mojos"
+        ],
+    )
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda trade_ids, *, fee_mojos, source_coin_ids, fee_coin_id: {
+            "summary": {"fee": fee_mojos},
+            "coin_spends": ["sealed"],
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 123_456,
+            "_catalyst_cancel_unsigned_digest": "f" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cancellation,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": state["now"],
+            "expires_at": state["now"] + 60,
+        },
+    )
+
+    result = cancellation.price_approved_cancellation(
+        approval_id=renewed["approval_id"],
+        trade_ids=["a" * 64],
+        source_coin_ids=["b" * 64],
+        fee_coin_id="c" * 64,
+    )
+
+    assert renewed["version"] == 2
+    assert renewed["total_fee_mojos"] > original_budget
+    assert result["available"] is True
+    assert result["fee_mojos"] == 20
 
 
 def test_bootstrap_revision_change_invalidates_consent_before_dispatch(

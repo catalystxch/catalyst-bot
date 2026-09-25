@@ -1033,10 +1033,23 @@ def api_cancel_all():
                         "authoritatively terminal offer(s)",
                     )
                 except Exception as _e:
+                    _fee_reason_codes = {
+                        "FEE_BUDGET_EXCEEDED",
+                        "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                    }
+                    _reason_code = next(
+                        (
+                            code
+                            for code in _fee_reason_codes
+                            if code in str(_e).upper()
+                        ),
+                        None,
+                    )
                     _set_cancel_all_state(
                         running=False,
                         complete=False,
                         error=str(_e),
+                        reason_code=_reason_code,
                         phase="error",
                         finished_at=datetime.now(timezone.utc).isoformat(),
                         message=f"Cancel all failed: {_e}",
@@ -2482,6 +2495,7 @@ def _new_cancel_all_state():
         "running": False,
         "complete": False,
         "error": None,
+        "reason_code": None,
         "phase": "idle",
         "message": "",
         "started_at": None,

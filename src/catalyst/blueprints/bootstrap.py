@@ -481,9 +481,13 @@ def api_bootstrap_stop():
             raise BootstrapApiError("bootstrap_revision_stale", 409)
         trade_ids = _campaign_trade_ids(campaign_id)
         stopped_at = _utcnow()
+        # Keep the exact campaign authority active while protected cancellation
+        # is priced and reserved. Stopping first would invalidate the approved
+        # campaign scope and tempt callers to fall back to an unbudgeted generic
+        # cancellation path.
+        cancel_results = _cancel_campaign_offers(trade_ids)
         if not database.stop_bootstrap_campaign(campaign_id, "manual", stopped_at):
             raise BootstrapApiError("bootstrap_stop_failed", 409)
-        cancel_results = _cancel_campaign_offers(trade_ids)
         database.append_bootstrap_campaign_event(
             {
                 "campaign_id": campaign_id,

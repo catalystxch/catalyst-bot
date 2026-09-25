@@ -27,7 +27,14 @@ def approved(tmp_path, monkeypatch):
     runtime = import_module("coin_prep_fee_runtime")
     service = import_module("coin_prep_fee_approval")
     pricing = import_module("coin_prep_fee_pricing")
+    tx_fees = import_module("tx_fees")
     monkeypatch.setattr(runtime, "cfg", state["config"])
+    # The confirmation tests deliberately mutate fee-mode configuration to
+    # prove the frozen execution binding becomes stale.  Keep their economic
+    # inventory read deterministic: they are not fee-estimator integration
+    # tests and must never contact Coinset merely to reach the stale check.
+    fee_pool = tx_fees.get_fee_pool_plan()
+    monkeypatch.setattr(tx_fees, "get_fee_pool_plan", lambda: fee_pool)
     state["now"] = 1000
     monkeypatch.setattr(service, "_now", lambda: state["now"])
     monkeypatch.setattr(pricing, "_now", lambda: state["now"])

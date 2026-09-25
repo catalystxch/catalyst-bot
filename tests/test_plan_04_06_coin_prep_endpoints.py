@@ -275,6 +275,66 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertFalse(body["running"])
         read_status.assert_called_once_with(approval_id)
 
+    def test_bootstrap_status_uses_newer_campaign_fee_renewal(self):
+        """Cancellation-only renewal must replace the stale worker approval view."""
+
+        worker_approval_id = "b" * 64
+        renewed_approval_id = "c" * 64
+        campaign_id = "campaign-fee-renewal"
+        worker_status = {
+            "phase": "complete",
+            "run_id": "old-prep-run",
+            "fee_approval_id": worker_approval_id,
+        }
+        renewed = {
+            "approval_id": renewed_approval_id,
+            "state": "approved",
+            "total_fee_mojos": 1_746_988_850,
+            "spent_fee_mojos": 1_736_965_715,
+            "held_fee_mojos": 0,
+            "remaining_fee_mojos": 10_023_135,
+            "remaining_preparation_fee_mojos": 10_023_135,
+            "cancellation_reserve_mojos": 11_111_490,
+            "unresolved_operation_count": 0,
+            "dispatch_authorized": False,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": campaign_id, "revision": 1}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=renewed_approval_id,
+                ) as latest,
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=renewed,
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertEqual(body["fee_approval_id"], renewed_approval_id)
+        self.assertEqual(body["fee_approval"]["remaining_fee_mojos"], "10023135")
+        latest.assert_called_once_with(campaign_id)
+        read_status.assert_called_once_with(renewed_approval_id)
+
     def test_tier_size_drift_marks_status_as_needing_prep(self):
         summary = {
             "xch_free_count": 5,

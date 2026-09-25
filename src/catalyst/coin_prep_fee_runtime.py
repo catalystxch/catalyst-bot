@@ -9,6 +9,7 @@ and HTTP/native integration follow this boundary.
 import os
 import re
 import json
+from decimal import Decimal
 
 from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
 from config import cfg
@@ -191,6 +192,18 @@ def read_fee_wallet_snapshot() -> dict:
             "snapshot": CoinSnapshot(tuple(coins))}
 
 
+def _campaign_is_stopped_for_fee_recovery(campaign: object) -> bool:
+    """Recognize explicit and policy-materialized Bootstrap stop states."""
+
+    return type(campaign) is dict and (
+        campaign.get("status") == "stopped"
+        or (
+            campaign.get("status") == "active"
+            and campaign.get("stage") == "stopped"
+        )
+    )
+
+
 def read_fee_economic_snapshot(request_options: dict) -> dict:
     """Read a current trusted wallet/configuration/campaign economic recipe.
 
@@ -212,11 +225,101 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
 
     validate_fee_pool_configuration(config)
     fee_pool = get_fee_pool_plan()
-    bootstrap = _active_bootstrap_coin_prep_context(options)
+    recovery_recipe = None
+    try:
+        stopped = (
+            database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
+            if "bootstrap_campaign_id" in options
+            else None
+        )
+        stopped_has_cleanup = False
+        if _campaign_is_stopped_for_fee_recovery(stopped):
+            # A stopped campaign can still own live offers whose exact network
+            # cancellation cost exceeds its old protected allowance.  Permit a
+            # read-only renewal quote whenever cleanup is genuinely outstanding;
+            # preparation dispatch remains blocked by the stopped status.
+            from blueprints.bootstrap import _campaign_trade_ids
+
+            stopped_has_cleanup = bool(
+                _campaign_trade_ids(options["bootstrap_campaign_id"])
+            )
+        if (
+            type(stopped) is dict
+            and _campaign_is_stopped_for_fee_recovery(stopped)
+            and (
+                stopped_has_cleanup
+                or Decimal(str(stopped.get("fee_spent_xch", "0")))
+                > Decimal(str(stopped.get("fee_budget_xch", "0")))
+            )
+        ):
+            raise ValueError("bootstrap_coin_prep_not_authorized:fee_reserve")
+        bootstrap = _active_bootstrap_coin_prep_context(options)
+    except ValueError as exc:
+        if (
+            str(exc) != "bootstrap_coin_prep_not_authorized:fee_reserve"
+            or "bootstrap_campaign_id" not in options
+        ):
+            raise
+        # Creation authority remains stopped after a campaign fee overrun or
+        # while its offers still need cleanup, but the operator still needs a
+        # truthful cancellation-only recovery quote.
+        # Reuse only the last explicitly approved, frozen campaign recipe; do
+        # not derive fresh outputs or turn the stopped campaign back on.
+        approval_id = database.get_latest_coin_prep_fee_approval_for_campaign(
+            options["bootstrap_campaign_id"]
+        )
+        if approval_id is None:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+        consent = database.get_coin_prep_fee_approval_context(approval_id)
+        scope = json.loads(consent["scope_json"])
+        plan = json.loads(consent["plan_json"])
+        binding = json.loads(consent["quote_json"]).get("execution_context")
+        from coin_prep_fee_execution import (
+            encode_execution_configuration,
+            validate_execution_context,
+        )
+
+        approved_revision = plan.get("campaign_revision")
+        requested_revision = options["bootstrap_campaign_revision"]
+        recovery_revision_matches = approved_revision == requested_revision or (
+            _campaign_is_stopped_for_fee_recovery(stopped)
+            and stopped.get("revision") == requested_revision
+            and type(approved_revision) is int
+            and requested_revision > approved_revision
+        )
+
+        if (
+            scope.get("campaign_id") != options["bootstrap_campaign_id"]
+            or not recovery_revision_matches
+            or options["target_seconds"] != plan.get("target_seconds")
+            or any(identity.get(key) != scope.get(key) for key in identity)
+            or binding is None
+            or binding.get("configuration")
+            != encode_execution_configuration(config)
+            or binding.get("receive_address") != context["receive_address"]
+        ):
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+        recovery_recipe = validate_execution_context(binding, scope, plan)
+        campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
+        if (
+            type(campaign) is not dict
+            or campaign.get("status") not in {"active", "stopped"}
+        ):
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+        bootstrap = {
+            "campaign": campaign,
+            "worker_args": dict(recovery_recipe["worker_args"]),
+            "recovery_only": True,
+        }
     campaign = None
     if bootstrap is not None:
         campaign = bootstrap["campaign"]
-        if (type(campaign) is not dict or campaign.get("status") != "active"
+        if (type(campaign) is not dict
+                or campaign.get("status") not in (
+                    ("active", "stopped")
+                    if recovery_recipe is not None
+                    else ("active",)
+                )
                 or campaign.get("network") != identity["network"]
                 or campaign.get("wallet_type") != identity["wallet_type"]
                 or campaign.get("wallet_fingerprint") != identity["wallet_fingerprint"]
@@ -225,9 +328,12 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
         if options["coin_multiplier"] != "1":
             raise ValueError("FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED")
-        recipe = build_exact_prep_economics(configuration=config, worker_args=bootstrap["worker_args"],
-                                            campaign_revision=campaign["revision"],
-                                            target_seconds=options["target_seconds"])
+        recipe = recovery_recipe or build_exact_prep_economics(
+            configuration=config,
+            worker_args=bootstrap["worker_args"],
+            campaign_revision=campaign["revision"],
+            target_seconds=options["target_seconds"],
+        )
     else:
         if "bootstrap_campaign_id" in options:
             raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
@@ -249,7 +355,9 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             "request_options": options, "fee_pool": fee_pool, "dispatch_authorized": False}
 
 
-def read_approved_prep_fee_snapshot(approval_id: str) -> dict:
+def read_approved_prep_fee_snapshot(
+    approval_id: str, *, allow_campaign_fee_recovery: bool = False
+) -> dict:
     """Read fresh selectable inventory under immutable approved economics.
 
     A later price or an expected change in source inventory cannot resize the
@@ -290,11 +398,42 @@ def read_approved_prep_fee_snapshot(approval_id: str) -> dict:
             raise ValueError("FEE_APPROVAL_STALE")
     else:
         campaign = database.get_bootstrap_campaign(scope["campaign_id"])
-        if (type(campaign) is not dict or campaign.get("status") != "active"
-                or campaign.get("revision") != approved["plan"]["campaign_revision"]
+        approved_revision = approved["plan"]["campaign_revision"]
+        stopped_recovery_revision = (
+            allow_campaign_fee_recovery
+            and type(campaign) is dict
+            and _campaign_is_stopped_for_fee_recovery(campaign)
+            and type(approved_revision) is int
+            and type(campaign.get("revision")) is int
+            and campaign.get("revision") > approved_revision
+        )
+        if (type(campaign) is not dict
+                or campaign.get("status") not in (
+                    ("active", "stopped")
+                    if allow_campaign_fee_recovery
+                    else ("active",)
+                )
+                or (
+                    campaign.get("revision") != approved_revision
+                    and not stopped_recovery_revision
+                )
                 or any(campaign.get(key) != scope[key] for key in (
                     "network", "wallet_type", "wallet_fingerprint", "wallet_id", "asset_id"))):
             raise ValueError("FEE_APPROVAL_STALE")
+        campaign_budget_mojos = int(
+            Decimal(str(campaign["fee_budget_xch"])) * Decimal(10**12)
+        )
+        if (
+            database.get_bootstrap_campaign_authoritative_fee_spent_mojos(
+                campaign["campaign_id"]
+            )
+            > campaign_budget_mojos
+            and not allow_campaign_fee_recovery
+        ):
+            # A recovery approval may fund cancellation, but must never revive
+            # the frozen preparation plan after the immutable campaign budget
+            # has already been exceeded.
+            raise ValueError("FEE_CAMPAIGN_BUDGET_EXCEEDED")
     # A version change during wallet reads must not leave stale consent usable.
     approval = validate_fee_consent(approval_id=approval_id, scope=scope, economic_plan=approved["plan"])
     if encode_execution_configuration(_configuration()) != binding["configuration"]:

@@ -18951,7 +18951,9 @@
                 if (!response.ok) return false;
                 const status = await response.json();
                 const feeState = String(status.fee_approval?.state || '');
-                const feeStillBlocks = status.overlapping_coin_prep_blocked === true
+                const feeStillBlocks = status.complete !== true
+                    && status.phase !== 'complete'
+                    && status.overlapping_coin_prep_blocked === true
                     && !['complete', 'stale'].includes(feeState);
                 if (feeStillBlocks) {
                     _coinPrepFeeRecoveryBlocking = true;
@@ -32892,6 +32894,9 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
+                                    if (['FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                        await reviewCancelAllFeeBudgetFailure(st);
+                                    }
                                 }
                                 if (operationGeneration === _cancelAllOperationGeneration) {
                                     _cancelAllInProgress = false;
@@ -32955,6 +32960,32 @@
                     _cancelAllInProgress = false;
                 }
             }
+        }
+
+        async function reviewCancelAllFeeBudgetFailure(status) {
+            _coinPrepFeeReviewContract = null;
+            _coinPrepFeeRecoveryBlocking = true;
+            _coinPrepFeeRecoveryIntent = {
+                action: 'cancel_all',
+                total: Number(status?.total) || 0,
+                buy: Number(status?.buy_count) || 0,
+                sell: Number(status?.sell_count) || 0,
+            };
+            _coinPrepConfirmReadyText = 'Approve Fee & Continue Cancellation';
+            const modal = document.getElementById('coinPrepConfirmOverlay');
+            if (!modal) return false;
+            if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+            coinPrepPollInterval = null;
+            showCoinPrepView('confirm');
+            const summary = document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary');
+            if (summary) summary.style.display = 'none';
+            const banner = document.getElementById('cpReasonBanner');
+            if (banner) {
+                banner.style.display = '';
+                banner.textContent = 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
+            }
+            modal.classList.add('active');
+            return refreshCoinPrepFeePreview(buildCoinPrepFeePreviewOptions());
         }
 
         // Local helper: read cached cancel-all state from last poll
@@ -35832,11 +35863,14 @@ function closeCtgErrorModal() {
         let _coinPrepRecoveryStatus = null;
         let _coinPrepFeeReviewContract = null;
         let _coinPrepRecoveryReviewBusy = false;
+        let _coinPrepFeeRecoveryIntent = null;
 
         function updateCoinPrepRecoveryControls(status) {
             _coinPrepRecoveryStatus = status;
             const accounting = status?.fee_approval;
-            const recovering = status?.running !== true
+            const recovering = status?.complete !== true
+                && status?.phase !== 'complete'
+                && status?.running !== true
                 && status?.overlapping_coin_prep_blocked === true
                 && !['complete', 'stale'].includes(accounting?.state);
             _coinPrepFeeRecoveryBlocking = recovering;
@@ -36209,6 +36243,7 @@ function closeCtgErrorModal() {
         function showCoinPrepConfirm(config, reason, reasonMessage, verification = null) {
             _coinPrepFeeRecoveryBlocking = false;
             _coinPrepFeeReviewContract = null;
+            _coinPrepFeeRecoveryIntent = null;
             document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary').style.display = '';
             config = normalizeConfigForLiquidityMode(config || {});
             const modal = document.getElementById('coinPrepConfirmOverlay');
@@ -36347,6 +36382,7 @@ function closeCtgErrorModal() {
         function closeCoinPrepConfirm() {
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (modal) modal.classList.remove('active');
+            _coinPrepFeeRecoveryIntent = null;
             if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
             _coinPrepFeeAgeTimer = null;
             
@@ -36567,6 +36603,7 @@ function closeCtgErrorModal() {
             if (maximumFeeMojos === null) return;
             const confirmedPreview = _coinPrepFeePreview;
             const confirmedOptions = {..._coinPrepFeePreviewOptions};
+            const recoveryIntent = _coinPrepFeeRecoveryIntent;
             _coinPrepFeeConfirmBusy = true;
             const btn = document.getElementById('cpConfirmBtn');
             if (btn) {
@@ -36578,7 +36615,9 @@ function closeCtgErrorModal() {
             // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
             // When there's no data worth preserving it short-circuits to
             // 'proceed' with all resets false so first-run UX is frictionless.
-            const historyChoice = await askPrepHistoryChoice();
+            const historyChoice = recoveryIntent?.action === 'cancel_all'
+                ? {action: 'proceed', resets: {}}
+                : await askPrepHistoryChoice();
             if (!historyChoice || historyChoice.action === 'cancel') {
                 _coinPrepFeeConfirmBusy = false;
                 validateCoinPrepFeeMaximum();
@@ -36613,6 +36652,19 @@ function closeCtgErrorModal() {
                         throw new Error('The wallet or plan changed. A fresh fee estimate is ready for review; no transaction was sent.');
                     }
                     throw new Error(`Fee approval was not recorded (${reason}). No transaction was sent.`);
+                }
+                if (recoveryIntent?.action === 'cancel_all') {
+                    _coinPrepFeeRecoveryIntent = null;
+                    closeCoinPrepConfirm();
+                    await cancelAllOffers({
+                        source: 'coin_prep',
+                        prepPayload: {fee_approval_id: approval.approval_id},
+                        openOfferCount: recoveryIntent.total,
+                        openBuyCount: recoveryIntent.buy,
+                        openSellCount: recoveryIntent.sell,
+                        resumeAfterCancel: false,
+                    });
+                    return;
                 }
                 // Send the spare coin multiplier from the GUI to the API
                 const coinMultiplier = confirmedOptions.coin_multiplier;

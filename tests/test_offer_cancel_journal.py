@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pickle
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import offer_manager
+import offer_reconciliation
 from cancel_outcomes import (
     CANCEL_CONFIRMED,
     CANCEL_FAILED,
@@ -222,6 +224,14 @@ def _install_real_cancel_authority(monkeypatch, *, effect):
 @pytest.fixture(autouse=True)
 def _fail_closed_network_guard(monkeypatch):
     attempts: list[str] = []
+
+    # OfferManager imports reconciliation lazily at the proof boundary. Keep
+    # that import pinned to the module this test file collected and patches;
+    # whole-suite module restoration may otherwise leave a different historical
+    # instance in sys.modules and accidentally reach the live Sage adapter.
+    monkeypatch.setitem(sys.modules, "offer_reconciliation", offer_reconciliation)
+    monkeypatch.setitem(sys.modules, "database", database)
+    monkeypatch.setitem(sys.modules, "mutation_gate", mutation_gate)
 
     def blocked(*_args, **_kwargs):
         attempts.append("socket")
@@ -2091,6 +2101,12 @@ def test_proof_only_recovery_settles_external_zero_fee_cancel_of_aborted_cohort(
 ):
     """A Sage recovery cancel may settle one submitted member and aborted peers."""
 
+    # Whole-suite isolation must restore one coherent dependency graph.  A
+    # stale lazily imported reconciliation module can otherwise read or commit
+    # a different database while the direct proof helpers appear valid.
+    assert offer_manager.database is database
+    assert offer_manager.mutation_gate is mutation_gate
+
     trade_ids = ["a" * 64, "b" * 64, "c" * 64]
     source_coin_ids = ["d" * 64, "e" * 64, "f" * 64]
     transaction_id = "1" * 64
@@ -2140,8 +2156,6 @@ def test_proof_only_recovery_settles_external_zero_fee_cancel_of_aborted_cohort(
         transaction_id=transaction_id,
         spend_identity=spend_identity,
     )
-    import offer_reconciliation
-
     monkeypatch.setattr(
         offer_reconciliation,
         "load_authoritative_evidence",
@@ -2266,8 +2280,6 @@ def test_sage_bulk_cancel_accepts_exact_height_evidence_when_sage_omits_txid(
     manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)
     assert manifest is not None
 
-    import offer_reconciliation
-
     context = offer_reconciliation._derive_sage_bulk_cancel_context(
         manifest,
         [row["operation_id"] for row in blockers],
@@ -2369,8 +2381,6 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
         for result in submitted.values()
     )
-
-    import offer_reconciliation
 
     evidence = _confirmed_sage_bulk_cancel_evidence(
         trade_ids=trade_ids,
@@ -2639,8 +2649,6 @@ def test_retry_failed_cancels_recovers_after_partial_bulk_settlement_crash(
         result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
         for result in submitted.values()
     )
-
-    import offer_reconciliation
 
     evidence = _confirmed_sage_bulk_cancel_evidence(
         trade_ids=trade_ids,
@@ -5325,8 +5333,6 @@ def test_retry_failed_cancel_reconciles_elapsed_offer_before_wallet_effect(
     manager._cancel_retry_backoff_seconds = 0
     manager.cancel_offers([TRADE_ID], force_storm=True)
 
-    import offer_reconciliation
-
     monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
     reconcile_calls = []
 
@@ -5387,8 +5393,6 @@ def test_retry_failed_cancel_accepts_existing_terminal_authority_without_replay(
             "terminal_state": "expired",
         },
     )
-
-    import offer_reconciliation
 
     monkeypatch.setattr(
         offer_reconciliation,
@@ -5454,8 +5458,6 @@ def test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation(
     manager = OfferManager()
     manager._cancel_retry_backoff_seconds = 0
     manager.cancel_offers([TRADE_ID], force_storm=True)
-
-    import offer_reconciliation
 
     monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
     reconcile_calls = []
@@ -5543,8 +5545,6 @@ def test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven(
     manager = OfferManager()
     manager._cancel_retry_backoff_seconds = 0
     manager.cancel_offers([TRADE_ID], force_storm=True)
-
-    import offer_reconciliation
 
     reconcile_calls = []
     release_calls = []

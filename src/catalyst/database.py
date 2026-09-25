@@ -20908,6 +20908,102 @@ def _fee_operation_identity(value: Any) -> str:
     return _fee_digest(value)
 
 
+def _fee_scope_legacy_cancellation_holds(
+    conn: sqlite3.Connection, scope: str,
+) -> List[Dict[str, Any]]:
+    """Project unresolved pre-ledger effects without inventing reservations.
+
+    A durable claim may have reached the wallet even if no result was saved.
+    Keep its exact cohort fee committed until every member has authoritative
+    terminal evidence. Read all lineage in the caller's accounting transaction.
+    """
+    rows = conn.execute(
+        "SELECT journal.* FROM offer_operation_journal AS journal "
+        "JOIN offer_intents AS intent USING(intent_id) "
+        "WHERE journal.operation_type='CANCEL' AND journal.phase='PREPARED' "
+        "AND EXISTS (SELECT 1 FROM coin_prep_fee_previews AS preview "
+        "WHERE preview.scope_sha256=? AND intent.purpose LIKE "
+        "'bootstrap:' || json_extract(preview.scope_json, '$.campaign_id') || ':revision:%')",
+        (scope,),
+    ).fetchall()
+    cohorts = {}
+    for row in rows:
+        event = validate_offer_operation_event(dict(row))
+        evidence = json.loads(event["evidence_json"])
+        cohort_id = _required_stability_text(evidence.get("cohort_id"), "cohort_id")
+        cohorts.setdefault(cohort_id, set()).add(event["event_id"])
+
+    holds = []
+    for cohort_id, prepared_ids in cohorts.items():
+        durable = conn.execute(
+            "SELECT * FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (cohort_id,),
+        ).fetchone()
+        if durable is None:
+            raise ValueError("FEE_CANCELLATION_JOURNAL_REQUIRED")
+        manifest = _validated_offer_cancel_cohort_manifest_row(dict(durable))
+        if prepared_ids != {m["prepared_event_id"] for m in manifest["members"]}:
+            raise ValueError("FEE_CANCELLATION_CAMPAIGN_MISMATCH")
+        fees = set()
+        states = set()
+        attempted = False
+        for member in manifest["members"]:
+            journal = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+                "AND attempt=? ORDER BY sequence",
+                (member["operation_id"], member["attempt"]),
+            ).fetchall()
+            prepared = validate_offer_cancel_cohort_prepared_event(dict(journal[0]), manifest)
+            effect = json.loads(prepared["evidence_json"]).get("wallet_effect")
+            if type(effect) is not dict:
+                raise ValueError("FEE_CANCELLATION_EVIDENCE_INVALID")
+            fees.add(_fee_amount(effect.get("fee_mojos")))
+            terminal = validate_offer_operation_event(dict(journal[-1]))
+            evidence = json.loads(terminal["evidence_json"])
+            claimed = conn.execute(
+                "SELECT 1 FROM offer_cancel_effect_claims WHERE operation_id=? AND attempt=?",
+                (member["operation_id"], member["attempt"]),
+            ).fetchone() is not None
+            attempted |= claimed or evidence.get("effect_attempted") is True
+            unattempted = (
+                terminal["phase"] == "FINALIZED" and terminal["outcome"] == "CANCEL_FAILED"
+                and terminal["blocks_mutation"] == 0
+                and evidence.get("effect_attempted") is False and not claimed
+            )
+            rejected = (
+                terminal["phase"] == "RECONCILED" and terminal["outcome"] == "CANCEL_FAILED"
+                and terminal["reason_code"] == "SAGE_RELAY_REJECTED"
+                and terminal["blocks_mutation"] == 0
+            )
+            confirmed = (
+                terminal["phase"] == "RECONCILED" and terminal["outcome"] == "CANCEL_CONFIRMED"
+                and terminal["reason_code"] == "AUTHORITATIVE_TERMINAL_PROOF"
+                and terminal["blocks_mutation"] == 0
+            )
+            states.add("released" if unattempted or rejected else "spent" if confirmed else "held")
+        if len(fees) != 1:
+            raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
+        fee = fees.pop()
+        reservation = conn.execute(
+            "SELECT scope_sha256, cancellation, fee_mojos FROM approved_fee_reservations "
+            "WHERE operation_id=?", (_coin_prep_cancellation_fee_operation_id(manifest),),
+        ).fetchone()
+        if reservation is not None:
+            if (reservation["scope_sha256"], reservation["cancellation"], reservation["fee_mojos"]) != (scope, 1, fee):
+                raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
+            continue  # The append-only reservation/outcome already accounts for this batch.
+        if states == {"released"} or states == {"spent"} or not attempted:
+            continue
+        if "spent" in states:
+            # Partial/mixed terminal proof cannot be attributed twice or refunded.
+            raise ValueError("FEE_CANCELLATION_EFFECT_UNRESOLVED")
+        holds.append({
+            "fee_mojos": fee, "cancellation": 1,
+            "accounting_outcome": None, "effect_outcome": "SUBMITTED_UNKNOWN", "dispatched": 1,
+        })
+    return holds
+
+
 def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
     """Exact held/spent sums across every approval version in this scope."""
     held = spent = noncancel = 0
@@ -20927,6 +21023,25 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
             held += fee
         if not row[1]:
             noncancel += fee
+    campaign_rows = conn.execute(
+        "SELECT DISTINCT json_extract(scope_json, '$.campaign_id') AS campaign_id "
+        "FROM coin_prep_fee_previews WHERE scope_sha256=? "
+        "AND json_extract(scope_json, '$.campaign_id') IS NOT NULL",
+        (scope,),
+    ).fetchall()
+    campaign_ids = {row[0] for row in campaign_rows}
+    if len(campaign_ids) > 1:
+        raise ValueError("fee scope has conflicting Bootstrap campaigns")
+    if campaign_ids:
+        # Older generic Cancel All effects were journalled authoritatively but
+        # did not create fee reservations.  Carry only that missing difference
+        # into the append-only scope totals: reservations already represented
+        # in both ledgers must never be counted twice.
+        authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
+            conn, campaign_ids.pop(), held_scope=scope,
+        )
+        spent += max(0, authoritative - spent)
+        held += sum(row["fee_mojos"] for row in _fee_scope_legacy_cancellation_holds(conn, scope))
     return {
         "held_fee_mojos": held,
         "spent_fee_mojos": spent,
@@ -21465,11 +21580,34 @@ def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def get_latest_coin_prep_fee_approval_for_campaign(
+    campaign_id: str,
+) -> Optional[str]:
+    """Resolve the latest explicit Coin Prep consent for one exact campaign."""
+
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT consent.approval_id "
+            "FROM coin_prep_fee_consents AS consent "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE json_extract(preview.scope_json, '$.campaign_id')=? "
+            "ORDER BY approval.version DESC LIMIT 1",
+            (safe_id,),
+        ).fetchone()
+        return None if row is None else _fee_digest(row[0])
+    finally:
+        conn.close()
+
+
 def get_fee_approval(approval_id: str) -> Dict[str, Any]:
     """Read approved ceiling and all held fees in its economic scope."""
     approval_id = _fee_digest(approval_id)
     conn = _stability_read_only_connection()
     try:
+        conn.execute("BEGIN")
         row = conn.execute(
             "SELECT * FROM fee_approvals WHERE approval_id=?", (approval_id,)
         ).fetchone()
@@ -21502,6 +21640,7 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
     approval_id = _fee_digest(approval_id)
     conn = _stability_read_only_connection()
     try:
+        conn.execute("BEGIN")
         _validate_stability_schema(conn)
         context = conn.execute(
             "SELECT approval.*, preview.scope_json, preview.plan_json, preview.request_options_json, "
@@ -21557,6 +21696,7 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             (context["scope_sha256"],),
         ).fetchall()
         unresolved = [row for row in rows if row["accounting_outcome"] is None]
+        unresolved.extend(_fee_scope_legacy_cancellation_holds(conn, context["scope_sha256"]))
         confirmed_count = sum(
             1 for row in rows if row["accounting_outcome"] == "CONFIRMED_SPENT"
         )
@@ -35588,7 +35728,110 @@ def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
         .execute("SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_id,))
         .fetchone()
     )
-    return _decode_bootstrap_campaign(row) if row is not None else None
+    return (
+        _bootstrap_campaign_with_authoritative_fee_spend(
+            _decode_bootstrap_campaign(row)
+        )
+        if row is not None
+        else None
+    )
+
+
+def get_bootstrap_campaign_authoritative_fee_spent_mojos(campaign_id: str) -> int:
+    """Return exact confirmed fees attributable to one Bootstrap campaign.
+
+    Coin Prep's immutable fee ledger is authoritative for preparation effects.
+    Offer cancellation proof lives in the stability journal instead, where one
+    native batch is repeated for every cohort member.  Count each proven batch
+    once and exclude cancellation reservations from the prep sum so a protected
+    cancellation represented in both journals is never double counted.
+    """
+
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        return _bootstrap_campaign_authoritative_fee_spent_mojos(conn, safe_id)
+    finally:
+        conn.close()
+
+
+def _bootstrap_campaign_authoritative_fee_spent_mojos(
+    conn: sqlite3.Connection, campaign_id: str, *, held_scope: Optional[str] = None,
+) -> int:
+    """Aggregate terminal evidence in the caller's single accounting snapshot."""
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    prep_row = conn.execute(
+        "SELECT COALESCE(SUM(reservation.fee_mojos), 0) "
+        "FROM approved_fee_reservations AS reservation "
+        "JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE reservation.cancellation=0 "
+        "AND outcome.state='CONFIRMED_SPENT' "
+        "AND EXISTS ("
+        " SELECT 1 FROM coin_prep_fee_previews AS preview "
+        " WHERE preview.scope_sha256=reservation.scope_sha256 "
+        " AND json_extract(preview.scope_json, '$.campaign_id')=?"
+        ")", (safe_id,),
+    ).fetchone()
+    prep_fee = _fee_amount(prep_row[0] if prep_row is not None else 0)
+    cancellation_batches: Dict[str, int] = {}
+    prefix = f"bootstrap:{safe_id}:revision:"
+    rows = conn.execute(
+        "SELECT journal.evidence_json "
+        "FROM offer_operation_journal AS journal "
+        "JOIN offer_intents AS intent ON intent.intent_id=journal.intent_id "
+        "WHERE intent.purpose LIKE ? "
+        "AND journal.operation_type='CANCEL' "
+        "AND journal.phase='RECONCILED' "
+        "AND journal.outcome='CANCEL_CONFIRMED'", (prefix + "%",),
+    ).fetchall()
+    for row in rows:
+        evidence = json.loads(row[0])
+        exact_subset = evidence.get("exact_subset") if type(evidence) is dict else None
+        cancel_context = exact_subset.get("cancel_context") if type(exact_subset) is dict else None
+        classification = exact_subset.get("classification") if type(exact_subset) is dict else None
+        if (
+            type(cancel_context) is not dict
+            or type(classification) is not dict
+            or classification.get("classification") != "CANCELLED_PROVEN"
+        ):
+            raise ValueError("Bootstrap cancellation fee evidence is invalid")
+        cohort_id = _required_stability_text(cancel_context.get("cohort_id"), "cancellation cohort_id")
+        fee = _fee_amount(classification.get("fee_mojos"))
+        prior = cancellation_batches.setdefault(cohort_id, fee)
+        if prior != fee:
+            raise ValueError("Bootstrap cancellation fee evidence conflicts")
+    if held_scope is not None:
+        # Scope accounting already counts unsettled reservations as held. A
+        # crash between journal confirmation and ledger settlement must not
+        # import that same batch as additional spend. The public campaign view
+        # still reports the full proven spend; settlement later moves the hold.
+        for cohort_id, fee in list(cancellation_batches.items()):
+            operation_id = hashlib.sha256(f"coin-prep-cancel:{cohort_id}".encode()).hexdigest()
+            pending = conn.execute(
+                "SELECT reservation.fee_mojos FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.operation_id=? AND reservation.scope_sha256=? "
+                "AND reservation.cancellation=1 AND outcome.operation_id IS NULL",
+                (operation_id, held_scope),
+            ).fetchone()
+            if pending is not None:
+                if _fee_amount(pending[0]) != fee:
+                    raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
+                del cancellation_batches[cohort_id]
+    return prep_fee + sum(cancellation_batches.values())
+
+
+def _bootstrap_campaign_with_authoritative_fee_spend(
+    campaign: Dict[str, Any],
+) -> Dict[str, Any]:
+    authoritative = Decimal(
+        get_bootstrap_campaign_authoritative_fee_spent_mojos(campaign["campaign_id"])
+    ) / Decimal(10**12)
+    materialized = Decimal(str(campaign.get("fee_spent_xch", "0")))
+    result = dict(campaign)
+    result["fee_spent_xch"] = format(max(authoritative, materialized), "f")
+    return result
 
 
 def get_active_bootstrap_campaign(
@@ -35612,7 +35855,13 @@ def get_active_bootstrap_campaign(
         )
         .fetchone()
     )
-    return _decode_bootstrap_campaign(row) if row is not None else None
+    return (
+        _bootstrap_campaign_with_authoritative_fee_spend(
+            _decode_bootstrap_campaign(row)
+        )
+        if row is not None
+        else None
+    )
 
 
 def list_active_bootstrap_campaigns_for_asset(asset_id: str) -> List[Dict[str, Any]]:
@@ -35631,7 +35880,12 @@ def list_active_bootstrap_campaigns_for_asset(asset_id: str) -> List[Dict[str, A
         )
         .fetchall()
     )
-    return [_decode_bootstrap_campaign(row) for row in rows]
+    return [
+        _bootstrap_campaign_with_authoritative_fee_spend(
+            _decode_bootstrap_campaign(row)
+        )
+        for row in rows
+    ]
 
 
 def _bootstrap_state_material(

@@ -6,6 +6,7 @@ same approval, quote, selected roots and sealed unsigned bundle.
 """
 
 import re
+from decimal import Decimal
 
 import database
 from coin_prep_fee_pricing import is_current_fee_quote
@@ -70,7 +71,9 @@ def price_approved_cancellation(
     if accounting["unresolved_operation_count"]:
         context = {"approval": accounting}
         return _unavailable(context, "FEE_EFFECT_RECOVERY_REQUIRED")
-    context = read_approved_prep_fee_snapshot(approval_id)
+    context = read_approved_prep_fee_snapshot(
+        approval_id, allow_campaign_fee_recovery=True
+    )
     target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
     fee = 0
     for _round in range(4):
@@ -95,9 +98,39 @@ def price_approved_cancellation(
         if not is_current_fee_quote(quote, cost, target_seconds):
             return _unavailable(context, "FEE_ESTIMATE_UNAVAILABLE")
         if quote["fee_mojos"] == fee:
-            after = read_approved_prep_fee_snapshot(approval_id)
+            after = read_approved_prep_fee_snapshot(
+                approval_id, allow_campaign_fee_recovery=True
+            )
             if any(after[key] != context[key] for key in _CONTEXT_KEYS):
                 raise ValueError("FEE_APPROVAL_STALE")
+            campaign = after.get("campaign")
+            if type(campaign) is dict:
+                original_budget = Decimal(str(campaign.get("fee_budget_xch"))) * Decimal(
+                    10**12
+                )
+                if (
+                    original_budget != original_budget.to_integral_value()
+                    or original_budget < 0
+                ):
+                    raise ValueError("FEE_CAMPAIGN_BUDGET_INVALID")
+                # The campaign record remains immutable historical authority.
+                # A later, explicitly confirmed append-only approval version is
+                # the only way to raise the cumulative recovery ceiling.
+                effective_budget = max(
+                    int(original_budget),
+                    int(after["approval"]["total_fee_mojos"]),
+                )
+                spent = database.get_bootstrap_campaign_authoritative_fee_spent_mojos(
+                    campaign["campaign_id"]
+                )
+                remaining_campaign = max(0, effective_budget - spent)
+                if fee > remaining_campaign:
+                    return _unavailable(
+                        after,
+                        "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                        required_fee_mojos=fee,
+                        remaining_campaign_fee_mojos=remaining_campaign,
+                    )
             if fee > after["approval"]["remaining_fee_mojos"]:
                 return _unavailable(
                     after,
@@ -135,7 +168,9 @@ def reserve_approved_cancellation(
         or priced_cancellation.get("approval", {}).get("approval_id") != approval_id
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
-    context = read_approved_prep_fee_snapshot(approval_id)
+    context = read_approved_prep_fee_snapshot(
+        approval_id, allow_campaign_fee_recovery=True
+    )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
     unsigned = priced_cancellation.get("validated_unsigned")
@@ -194,7 +229,9 @@ def recheck_reserved_approved_cancellation(
         or priced_cancellation.get("approval", {}).get("approval_id") != approval_id
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
-    context = read_approved_prep_fee_snapshot(approval_id)
+    context = read_approved_prep_fee_snapshot(
+        approval_id, allow_campaign_fee_recovery=True
+    )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
     quote = priced_cancellation.get("quote")
