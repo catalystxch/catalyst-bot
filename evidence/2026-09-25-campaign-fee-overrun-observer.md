@@ -1,6 +1,95 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 12:54–12:58 UTC
+## Latest observer checkpoint — 13:45–13:54 UTC
+
+**The original automatic-stop cases now pass; two composed recovery paths are
+newly RED. Acceptance remains incomplete.** This observer made no live wallet
+or runtime changes. Review Catalyst work (3) still owns production/UI repair
+and the live session; both new reproductions were sent there before checkpointing.
+
+### Fresh independent results
+
+- The owner integrated the previous automatic-stop fixture/tests into
+  `tests/test_bootstrap_stopped_fee_renewal.py` (the temporary standalone file
+  is no longer needed). Campaign bypass, real-policy recovery, stopped renewal
+  and Bootstrap integration now pass **12 tests in 10.87s**, exit 0:
+  `C:\Python312\python.exe -m pytest tests/test_bootstrap_cancel_fee_budget.py
+  tests/test_bootstrap_fee_recovery_policy.py
+  tests/test_bootstrap_stopped_fee_renewal.py
+  tests/test_coin_prep_fee_bootstrap_integration.py -q --tb=short`.
+- New `tests/test_bootstrap_recovery_stop_sequence.py` composes a real automatic
+  policy stop at revision 1 with the real explicit-stop database transition and
+  a connection restart. The unchanged campaign economics now have revision 2.
+  The real fee-preview endpoint returns **409 / FEE_PREP_CAMPAIGN_UNAVAILABLE**
+  instead of a read-only new-consent quote: **1 failed in 1.81s**, exit 1.
+  Consent/hold/effect counts remain unchanged. The one-step `approved + 1`
+  exception is insufficient for this reachable sequence. This is a request to
+  review new cleanup consent, not permission to execute stale approval across
+  arbitrary economic/revision changes. Ordinary prep must remain refused.
+- New `tests/e2e/test_campaign_cancel_fee_recovery.py` opens the actual GUI
+  cancellation-budget recovery review and clicks its real confirmation button
+  in Chromium. After one mocked successful approval, the GUI requests
+  **`/api/coin-prep/trigger`**, even though the review describes cancellation
+  recovery. The no-new-prep-dispatch assertion is RED: **1 failed in 1.83s**,
+  exit 1. All financial responses are mocked; no wallet is contacted. Existing
+  cancellation-error browser tests stopped at opening the review, so did not
+  cover this next action. The review uses the ordinary `startCoinPrepFromModal`
+  handler without a cancellation-only operation context. The new test is a
+  bounded dispatch regression, not proof that the eventual cancellation retry
+  or settlement works. Test setup import/overlay issues were corrected before
+  obtaining this behavioral RED; those setup failures are not product evidence.
+
+Both new files are left as shared WIP for the repair owner to integrate with its
+untracked `bootstrap_fee_fixture.py`. The observer does not commit or overwrite
+the owner's production changes or fixture. No duplicate full suite/build was
+started while that task was active.
+
+### Artifact/version boundary
+
+At 13:54 UTC the current EXE hashes to
+`FCD403F9EA294D2495FCB3674F33508DEB83EA1A10285323A4C852B956986AC0`
+(file modified 13:40:28 UTC). Source and bundled HTML both hash to
+`91C546EB3936B851FEB8E4F6CBFE5C9605A383ECD2E06D3C9B48F675C2BED26F`;
+observed runtime source hashes to
+`916F604954F909AC9EA6F7614E9F542B4DDFBF18356A0D77CEC595C960D864B2`.
+Base HEAD is `c404f5082b9cd1d473b5202c16737d30891e2088` plus shared repair WIP,
+not an immutable committed candidate.
+
+The owner's latest written automatic-stop receipt reports 7011 backend passes,
+160 skips, 422 subtests, 159 Chromium passes, and package/native smokes for
+EXE `768CDE4B55B3335CB2652F10A455FB5FAAA0E4DB0ABF6FD43CBF561CFD26FD3B`.
+That is **not the current FCD403 artifact**. Exact source/log/package provenance
+was requested from the owner; do not relabel the older full/native receipt or
+the independent 6C3B package checks below as verification of FCD403.
+
+Logs under `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/`:
+
+| Log | SHA-256 |
+| --- | --- |
+| `observer-auto-stop-green-20260925-1345.log` | `94E66B2929E205864DD9070808655D06511C73A72A8C2DF516620141D6666DBE` |
+| `observer-stop-sequence-red-20260925-1345.log` | `424109FE08E4C3EE5A831C666D89CB262B1C65DA16B143382F313E57324C2977` |
+| `observer-cancel-review-red-20260925-1355.log` | `80687E3EAE6FAFCB9E9CD1D8BC8089321AD32FC9B3539B1A307CFC0E68F82F17` |
+
+The new backend and browser test SHA-256 values are respectively
+`695C27483D4444E2574D25840AD7C056607E3BC65A187F7C25BC3918ED2BB157` and
+`D7EE03130EBC990C6C33D93F61CD03D79FC6B82EAD94B0B0E837DF44A3330AC8`.
+Reproduction commands:
+
+```powershell
+C:\Python312\python.exe -m pytest tests/test_bootstrap_recovery_stop_sequence.py -q --tb=short
+C:\Python312\python.exe -m pytest tests/e2e/test_campaign_cancel_fee_recovery.py --e2e -q --tb=short
+```
+
+Ruff on both new test files and `git diff --check` passed after the reproductions.
+
+Historical **1736563369 mojos** spent against the original **0.001 XCH** cap
+remains unchanged evidence. No new consent, cap increase, fee-bearing live test,
+strategy change, installed-package replacement, main merge or release occurred
+in this observer run. Post-fix displayed recovery consent, exact capped cleanup,
+authoritative settlement/restart, remaining requote and market/publication gates
+are still open. The goal is not complete and the automation remains enabled.
+
+## Prior observer checkpoint — 12:54–12:58 UTC
 
 **New automatic-stop recovery boundary is RED; acceptance remains blocked.**
 This is distinct from the explicit/manual stop cases that passed below.

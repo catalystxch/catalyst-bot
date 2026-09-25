@@ -152,26 +152,33 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
-**25 September 2026, 12:58 UTC:** release/secondary-PC readiness is still open.
+**25 September 2026, 13:54 UTC:** release/secondary-PC readiness is still open.
 The historical campaign cancellation overrun and current repair verification
 are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
-Independent post-repair checks now pass: 10 campaign/bypass/recovery tests,
+Fresh campaign/bypass/recovery verification passes 12 tests, including the
+original automatic-policy-stop cases. Earlier independent evidence includes
 196 ledger/cancellation/hold/journal tests, 27 Chromium fee-flow tests, and
 isolated API/mock Sage/upgrade-recovery probes against EXE SHA-256
 `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
-The owner reports 7009 full backend passes and 159 full Chromium passes plus a
-fresh build/native smokes; exact supporting logs and immutable final-source
+The owner reports 7011 full backend passes and 159 full Chromium passes plus a
+fresh build/native smokes for EXE `768CDE4B...`. The current EXE instead hashes
+to `FCD403F9EA294D2495FCB3674F33508DEB83EA1A10285323A4C852B956986AC0`;
+do not conflate these receipts. Exact supporting logs and immutable source
 provenance still need to be tied to the handoff artifact. Current source is
-base `45f3df8` plus shared repair WIP, not that commit alone.
+base `c404f50` plus shared repair WIP, not that commit alone.
 
-- [ ] Fix the newly reproduced automatic-policy-stop recovery boundary:
-  `tests/test_bootstrap_automatic_stop_fee_recovery.py` has two RED cases.
-  Actual policy materialization leaves status active / stage stopped and
-  increments revision, unlike explicit stop. Read-only fee preview fails 503
-  and cancellation-recovery readback refuses stale approval. Preserve frozen
-  economics, identity and ordinary prep denial; do not allow arbitrary revision
-  drift. Live GETs on the new EXE confirm this exact state and correct historical
-  fee disclosure, but do not establish a successful recovery transaction.
+- [x] Original automatic-policy-stop regressions now pass and are integrated
+  into `tests/test_bootstrap_stopped_fee_renewal.py`. This closes that isolated
+  failure, not every composed stop/recovery or live acceptance gate.
+- [ ] Fix explicit stop following automatic policy stop: the new
+  `tests/test_bootstrap_recovery_stop_sequence.py` is RED (1 failed). Revision 2
+  with unchanged economics cannot review new cleanup consent (409
+  FEE_PREP_CAMPAIGN_UNAVAILABLE). Preserve canonical economics/identity and
+  ordinary prep denial; do not accept arbitrary stale execution authority.
+- [ ] Fix cancellation-only fee review confirmation: the new Chromium
+  `tests/e2e/test_campaign_cancel_fee_recovery.py` is RED (1 failed). The actual
+  confirmation button records mocked consent then wrongly requests Coin Prep
+  instead of retaining cancellation-only intent. No live wallet is used.
 - [ ] Finalize exact source/package provenance without omitting the new shared
   test fixture or conflating historical package/native receipts.
 - [ ] Complete post-fix live campaign cleanup through genuine displayed
