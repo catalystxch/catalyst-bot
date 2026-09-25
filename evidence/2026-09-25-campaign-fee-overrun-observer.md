@@ -1,6 +1,56 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 10:41–10:50 UTC
+## Latest observer checkpoint — 11:42–11:48 UTC
+
+The other task's uncommitted repair now passes the prior real-policy overrun
+recovery regression, including read-only preview after a stop and rejection of
+ordinary preparation after an overrun. Independent command:
+`python -m pytest tests/test_bootstrap_cancel_fee_budget.py
+tests/test_bootstrap_fee_recovery_policy.py
+tests/test_coin_prep_fee_bootstrap_integration.py -q --tb=short`:
+**8 passed in 8.03s**, exit 0. This is focused source verification, not a new
+Windows-package or live-wallet acceptance receipt.
+
+A further recovery boundary remains RED:
+
+- New `tests/test_bootstrap_stopped_fee_renewal.py` persists a genuine isolated
+  campaign-owned created intent and trade binding, checks the campaign's
+  outstanding trade list, and stops the campaign through the database API.
+  The campaign cap is 10000000000 mojos; the two cases have authoritative spend
+  **0** and **10000000000** respectively. A new 1000-mojo network quote exceeds
+  the existing small explicit approval, so cleanup needs renewed consent even
+  without a prior campaign overrun.
+- Real `_active_bootstrap_coin_prep_context` returns no active creation context,
+  and ordinary approved-prep readback correctly rejects the stopped campaign.
+  The actual POST `/api/coin-prep/fee-preview` then returns
+  **409 / FEE_PREP_CAMPAIGN_UNAVAILABLE** in both cases. The new fallback only
+  recognizes a stopped campaign when spent is strictly greater than its cap;
+  it does not handle ordinary budget-refusal/stop cleanup below or at the cap.
+- No new consent, fee hold, prep operation or wallet effect claim was created.
+  Required behavior is a truthful read-only recovery preview with creation
+  still stopped and the original cap unchanged—not authority to spend without
+  a fresh displayed approval.
+- Focused reproduction: **2 failed in 2.78s**, exit 1, at the expected HTTP
+  409-vs-200 assertion. Log:
+  `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-stopped-renewal-red.log`.
+  An earlier two-case run before adding the outstanding intent also failed;
+  the strengthened fixture is the authoritative reproduction. Ruff for the
+  new file and `git diff --check` passed.
+- Observed runtime SHA-256:
+  `A9FDC5955B7E053F3A39D940D7AC92EA698ED45982636E65F550E863FCCDBE0D`.
+  Regression SHA-256:
+  `C88F25768B95FA8B77C21AF8868ECEE0F1A67B6FCC9D5CAD7EF19F73D218DE2F`.
+  Production remains shared WIP owned by **Review Catalyst work (3)**. The
+  owner received the exact failing cases and root-cause trace. This observer
+  did not modify or commit that task's production/UI/fixture changes.
+
+No live wallet action, package replacement, cap increase, full-suite rerun,
+merge or release was performed by this observer. The historical overrun is
+unchanged evidence. Post-fix full/backend/browser/native/Windows verification
+and remaining live recovery/requote gates are still unfinished; readiness and
+the persistent goal remain incomplete.
+
+## Prior observer checkpoint — 10:41–10:50 UTC
 
 The historical overrun below remains an actual overrun, not erased by the
 in-progress repair. **Review Catalyst work (3)** owns the production fix and
