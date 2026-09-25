@@ -152,33 +152,37 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
-**25 September 2026, 13:54 UTC:** release/secondary-PC readiness is still open.
+**25 September 2026, 14:58 UTC:** release/secondary-PC readiness is still open.
 The historical campaign cancellation overrun and current repair verification
 are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
-Fresh campaign/bypass/recovery verification passes 12 tests, including the
-original automatic-policy-stop cases. Earlier independent evidence includes
+Fresh campaign/bypass/recovery verification passes 16 tests, including both
+composed-stop and canonical-context refusal cases. Focused browser verification
+passes 32 tests; complete Chromium E2E passes 164 tests. Current EXE
+`943B0D54FC9DF01D8005C35A0946D7D41EB060D3511ABD63FC2A7913F7167D6D`
+independently passes API/mock-Sage/upgrade-recovery probes. One full backend run
+is in progress (session 25624, log `observer-full-backend-20260925-1455.log` in
+the SDD directory), with an error marker but no final summary yet. Keep source
+frozen and collect it before starting another run. Earlier evidence includes
 196 ledger/cancellation/hold/journal tests, 27 Chromium fee-flow tests, and
 isolated API/mock Sage/upgrade-recovery probes against EXE SHA-256
 `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
-The owner reports 7011 full backend passes and 159 full Chromium passes plus a
-fresh build/native smokes for EXE `768CDE4B...`. The current EXE instead hashes
-to `FCD403F9EA294D2495FCB3674F33508DEB83EA1A10285323A4C852B956986AC0`;
-do not conflate these receipts. Exact supporting logs and immutable source
-provenance still need to be tied to the handoff artifact. Current source is
-base `c404f50` plus shared repair WIP, not that commit alone.
+The owner's earlier 7011 full backend /159 Chromium/native receipt names
+`768CDE4B...`; do not conflate it with current 943B0D verification. Exact final
+source/build/native provenance still needs to be tied to the handoff artifact.
+Current source is base `21984c1` plus shared repair WIP, not that commit alone.
 
 - [x] Original automatic-policy-stop regressions now pass and are integrated
   into `tests/test_bootstrap_stopped_fee_renewal.py`. This closes that isolated
   failure, not every composed stop/recovery or live acceptance gate.
-- [ ] Fix explicit stop following automatic policy stop: the new
-  `tests/test_bootstrap_recovery_stop_sequence.py` is RED (1 failed). Revision 2
-  with unchanged economics cannot review new cleanup consent (409
-  FEE_PREP_CAMPAIGN_UNAVAILABLE). Preserve canonical economics/identity and
-  ordinary prep denial; do not accept arbitrary stale execution authority.
-- [ ] Fix cancellation-only fee review confirmation: the new Chromium
-  `tests/e2e/test_campaign_cancel_fee_recovery.py` is RED (1 failed). The actual
-  confirmation button records mocked consent then wrongly requests Coin Prep
-  instead of retaining cancellation-only intent. No live wallet is used.
+- [x] Explicit stop following automatic policy stop now passes the prior RED
+  regression. Added repeated-stop changed reserve/identity/address refusals
+  also pass; new cleanup review does not grant ordinary prep authority.
+- [x] Cancellation-only fee review now passes the prior RED browser case.
+  Additional real-button tests cover approval refusal, Keep Offers, and a second
+  cancellation confirmation through mocked async completion, retaining the
+  approved ID and never launching prep/history reset. No live wallet is used.
+- [ ] Collect the full current-source backend suite, diagnose its reported
+  error(s), and close full-regression verification without weakening guards.
 - [ ] Finalize exact source/package provenance without omitting the new shared
   test fixture or conflating historical package/native receipts.
 - [ ] Complete post-fix live campaign cleanup through genuine displayed

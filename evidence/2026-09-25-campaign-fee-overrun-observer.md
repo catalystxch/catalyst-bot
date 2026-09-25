@@ -1,6 +1,98 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 13:45–13:54 UTC
+## Latest observer checkpoint — 14:46–14:58 UTC
+
+**Both composed recovery regressions now pass in the shared working tree.**
+This is focused verification of the owner's repair, not live acceptance or a
+release-readiness claim. Production/UI work remains owned by Review Catalyst
+work (3); no live wallet action or profile/settings change occurred here.
+
+- Six-file campaign/bypass/recovery group: **16 passed in 18.61s**, exit 0.
+  This includes explicit stop after automatic stop, plus three added checks
+  refusing changed reserves, fingerprint and a different valid receive address
+  at revision 2. Both fee preview and cancellation-recovery context remain
+  fail-closed, without new consent/holds/effects or changing the original cap.
+- Three-file Chromium fee/recovery group: **32 passed in 24.75s**, exit 0.
+  The previous confirmation regression now opens a separate cancellation
+  confirmation, rather than requesting prep. Three additional cases exercise
+  that actual button through async completion, Keep Offers, and rejected fee
+  approval. The exact newly approved ID reaches cancellation only after the
+  second confirmation; none invokes prep or history resets.
+- **Complete Chromium E2E: 164 passed in 101.53s**, exit 0. The new tests use
+  mocked financial transport; this is not proof of a real cancellation/fee.
+- Exact current Windows EXE independently passed isolated packaged API (nine
+  checks), synthetic mTLS Sage RPC, and upgrade/publication recovery probes,
+  each exit 0. These do not prove native-window or live financial behavior.
+- The first combined backend check had 12 passes and one test setup error:
+  cross-file fixture reuse imported the blueprint before `api_server` after
+  module-graph isolation. The observer's stop-sequence file now explicitly
+  imports `api_server` at collection; the 13-case rerun and 16-case expanded run
+  pass. New refusal-test assertions were aligned with the existing structured
+  409 response (`success=false`, explicit reason, no dispatch), not an assumed
+  `available` key. Those setup/assertion mistakes are not product regressions.
+  No production code was changed by this observer. Ruff and diff checks passed.
+
+### In-flight whole-suite gate — do not mark green
+
+One full backend run started after confirming no competing pytest/build job:
+`C:\Python312\python.exe -m pytest tests -q --tb=short`.
+Execution session **25624**, Python PID **72300**, log
+`.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-full-backend-20260925-1455.log`.
+It has emitted an error marker; final failure names/summary are not yet
+available. Keep source/tests frozen, collect this job before diagnosing or
+starting another full suite. The complete browser job (session 91233) is done.
+The repair owner was notified of the freeze and ownership of these runs.
+
+The 470-file manifest covers tracked and untracked source/tests plus GUI,
+desktop entry point, requirements and pytest config. SHA-256 of sorted LF-joined
+`path SHA256` rows is
+`A63E0EA44A5FA9AB6442610B16D07B7BB6F5607EE5C8EA704DD984DF0475C5DD`.
+Recheck it when the full suite finishes. Source is base `21984c1` plus shared
+uncommitted repairs/fixtures; it is not an immutable release commit.
+
+### Exact independently tested artifact
+
+- EXE: `943B0D54FC9DF01D8005C35A0946D7D41EB060D3511ABD63FC2A7913F7167D6D`.
+- Source/bundled HTML: `51579E735A2E064673924A90B45D0B5B4D6E1B7E000861DF3D5E7177E3E42047`.
+- Runtime source: `403C123700FA02B753288EF1B988A684AAC4B874F6615DB2A40CE91F0FFA4577`.
+
+These hashes were unchanged before/after the isolated package probes. The
+observer also compared code objects extracted read-only from the EXE's embedded
+PYZ against freshly compiled source, normalizing filenames only: all six repair
+modules match (`coin_prep_fee_runtime`, `coin_prep_fee_cancellation`, `database`,
+`offer_manager`, `blueprints.bootstrap`, `blueprints.offers`). No application
+module was imported/executed for this archive comparison. The SDD audit script
+`observer_compare_bundle.py` hashes to
+`018C744C4383E8D315A78FE7776F9E8F3A748FEFFF6CD9A88DE6D1696F7AFD71`;
+its `observer-bundle-code-20260925.log` hashes to
+`2C7AFDA79D061200A4B0ACB428DC19CF070E372D3946A653D5E04AAB9B29A440`.
+This connects the specific repair code to this artifact, not every native/live
+acceptance gate. The
+owner's latest written full/native receipt still names `768CDE4B...`, not this
+943B0D artifact. Do not relabel it. Exact final build/source/native provenance
+and live post-fix cleanup/settlement/restart/requote remain open.
+
+Logs in the SDD directory:
+
+| Log | SHA-256 |
+| --- | --- |
+| `observer-recovery-invariants-final-20260925.log` | `4E303C222CBAD3E3A2276D4147E2429C6749A7E683A823B1172C178F3288EDDB` |
+| `observer-recovery-browser-final-20260925.log` | `71519736CC180872EAF5B03FE9DD74B824C5D27F81BB7C3972169B0F073B020E` |
+| `observer-full-browser-20260925-1455.log` | `CF9E529048C0E8E3AD0DD489AC287ABACAD5C989310E94D264BA931C31ADBACD` |
+| `observer-package-api-20260925-1451.log` | `037180AE72CB6968B24A4F9719E9A5644B6AA03656F45164F49C6405F82FCFD9` |
+| `observer-package-sage-20260925-1451.log` | `F724CADC2BF92BC9044A8F45AA14D998807AE4152E87D0CCC326ED2F40392583` |
+| `observer-package-upgrade-20260925-1451.log` | `FA6D575A8134751BA4310D0E2A5C3BFC2F218A84D664387FE5132BB48A67AF7B` |
+
+New observer test files `tests/test_bootstrap_recovery_invariants.py` and
+`tests/e2e/test_campaign_cancel_recovery_confirmation.py`, plus the existing
+composed-stop/confirmation tests, remain shared WIP for the owner to integrate
+with the required fixture. Commands for the expanded runs add these files to
+the campaign and browser commands recorded below. Historical **1736563369
+mojos** spent versus original **0.001 XCH** cap remains disclosed unchanged.
+Automation instructions now require collecting recorded jobs first and retain
+all no-spend/consent/provenance constraints; the automation remains active.
+
+## Prior observer checkpoint — 13:45–13:54 UTC
 
 **The original automatic-stop cases now pass; two composed recovery paths are
 newly RED. Acceptance remains incomplete.** This observer made no live wallet
