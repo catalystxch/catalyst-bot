@@ -469,3 +469,26 @@ than funds being exposed under fabricated pricing authority.
   (insufficient attributable in-range ask depth and provider independence).
   The saved pre-fee strategy still exceeds available MZ and was neither
   silently resized nor activated. No merge or release occurred.
+
+### Fresh confidence and live start/stop gate — 25 September 2026
+
+- The exact final package was connected through the normal GUI workflow to
+  Sage mainnet fingerprint `736588221`, CAT wallet 2 and the authorized MZ
+  asset. Splash was started locally and the configured Spacescan credential
+  was accepted through the existing startup flow. Coin Prep remained complete;
+  no new fee approval or wallet spend was requested.
+- After explicit operator confirmation, live Start passed all ten preflight
+  checks. Startup reconciliation found zero wallet or database offers, runtime
+  safety was allowed, and the first two 45-second cycles completed with zero
+  errors.
+- The running bot replaced the stale snapshot with fresh attributable evidence
+  at `2026-09-25T22:31:37.43154Z`. The decision remained **RED** for the current
+  substantive reasons `out_of_range_depth_excluded`, `insufficient_ask_depth`
+  and `single_provider_dependency`; the running UI showed Dexie evidence valid,
+  Splash degraded because its offer set was empty, all exposure withdrawn, and
+  `can_create=false`, `can_requote=false`.
+- CATalyst therefore created no offers and attempted no requote. The bot was
+  stopped normally after the fresh decision. Final readback: running false,
+  two loops, zero errors, zero open offers, zero XCH/CAT locks and runtime
+  safety allowed. Once stopped, the short-lived evidence correctly aged back
+  to fail-closed expired status; this does not alter the fresh-cycle proof.
