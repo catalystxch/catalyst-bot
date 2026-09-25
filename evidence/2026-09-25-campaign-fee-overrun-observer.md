@@ -1,6 +1,60 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 17:48–18:12 UTC
+## Latest observer checkpoint — 20:49–20:56 UTC
+
+### Full repaired-source backend result collected
+
+The recorded 18:06 run finished at **18:30:07 UTC**. Its persisted pytest
+summary is **7041 passed, 165 skipped, 422 subtests passed in 1421.36s**.
+Log: `.superpowers/sdd/2026-09-16-coin-prep-fee-approval/observer-full-backend-20260925-1806.log`,
+SHA-256 **BF0E21FA5534E7285820C3B51FC272B5A8E0F2E561581E47A31DE13418CC1645**.
+The original session **56922** has expired (`Unknown process id` on collection)
+and PID **35184** is absent. Thus the passing persisted test result is verified,
+but this heartbeat does not claim a freshly recovered process exit code.
+No recorded observer full/build/package job remains active; no duplicate suite
+or build was launched just because the original session handle expired.
+
+Both the current worktree and isolated candidate still contain the same
+**471-file** source/test manifest:
+**3097114C6243E617BFD1D18654146423C7608A70CF4513D4D5188DA1F0D9314E**.
+The candidate EXE **736FAA2E01C27C175DAB7FC395AA394750689976356701F15CA6F21409AC0906**
+and repaired `database.py` **A8EDF4A786821610A9C938DF7866B3E6F3EC130CCCF78D2EE01A601DE51DB9C1**
+are unchanged. This closes the full-backend regression gate for the bounded
+legacy-accounting repair, including its 26 new cases and the previously
+verified stop/recovery/cancellation controls. It does not close native or live
+acceptance. Earlier 164-test Chromium evidence remains tied to the unchanged
+HTML **51579E735A2E064673924A90B45D0B5B4D6E1B7E000861DF3D5E7177E3E42047**,
+not a new end-to-end run of the current executable.
+
+### Shared package changed independently — receipt requested
+
+The shared `dist/Catalyst/Catalyst.exe` now hashes to
+**55C749B5BC98B53F4EFBF1DE3A1C2DD15DEC804C6F1B4B0B4D238DFFD2591EEC**
+(file last-write **20:04:28 UTC**). This observer did not replace it. Review
+Catalyst work (3) is active and retains UI/native/live ownership; the completed
+backend result and a request for the exact new build/native/live receipts were
+sent to that task. Its last written native receipt still names EXE768CDE4B;
+do not relabel that receipt as a test of EXE55C749 or EXE736FAA.
+
+Read-only inspection of EXE55C749 matched **131 project PYZ modules plus the
+desktop entrypoint**, with zero differences against the tested worktree.
+Its bundled HTML matches the source hash above. Audit session **9923 exited 0**;
+log `observer-shared-bundle-code-20260925-2055.log`, SHA-256
+**6AAC3D433F00BD46407C8AFD20157541A65B8EE6EA4C56F989271A0580DEB3FA**.
+This checks embedded project code only; dependency/resource/native behavior
+and live identity are not inferred from it. The older isolated API/mock-Sage/
+upgrade-recovery probes remain receipts for EXE736FAA, not EXE55C749.
+
+No wallet action, live configuration/consent/cap change, production edit,
+installed-package replacement or strategy activation was performed by this
+observer. The original **1736563369-mojo** spend against **0.001 XCH** remains
+preserved. Exact intended-package/native evidence, post-fix displayed recovery
+consent, cleanup dispatch/settlement/restart, and remaining requote/market gates
+remain unfinished. No main merge, release, secondary-PC readiness or goal
+completion is claimed. The source freeze for the completed run is released;
+coordinate any further edits and tests with the active repair/live owner.
+
+## Prior observer checkpoint — 17:48–18:12 UTC
 
 ### Bounded offline repair and verification
 

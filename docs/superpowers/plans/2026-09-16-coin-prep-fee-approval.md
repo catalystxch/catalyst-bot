@@ -152,6 +152,26 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
+**25 September 2026, 20:56 UTC:** collected the repaired-source full backend:
+**7041 passed, 165 skipped, 422 subtests passed in 1421.36s**, finished 18:30:07
+UTC. Log SHA-256 `BF0E21FA5534E7285820C3B51FC272B5A8E0F2E561581E47A31DE13418CC1645`.
+Session56922 is expired and PID35184 absent; the passing persisted summary is
+verified, not a newly recovered exit code. No observer verification job remains
+active. Current source and isolated candidate still match the 471-file manifest
+`3097114C6243E617BFD1D18654146423C7608A70CF4513D4D5188DA1F0D9314E`; isolated
+EXE736FAA remains unchanged. No duplicate full suite/build or production edit.
+
+Shared EXE now hashes to
+`55C749B5BC98B53F4EFBF1DE3A1C2DD15DEC804C6F1B4B0B4D238DFFD2591EEC`.
+Independent read-only inspection matches all131 embedded project modules,
+entrypoint and HTML to tested source. This does not transfer isolated736FAA
+package probes or older768CDE4B native receipts to55C749. Review Catalyst work
+(3) is active, retains UI/native/live ownership, and was asked for exact new
+build/native/live evidence. The bounded legacy-accounting regression gate is
+closed; intended-artifact/native and post-fix live recovery/requote gates remain
+open. Original overrun/cap and user data preserved. No readiness/main/release or
+goal-completion claim. The following 18:12/18:08 job statuses are historical.
+
 **18:12 UTC package follow-up:** isolated build63634 completed exit0. Candidate
 EXE SHA-256 `736FAA2E01C27C175DAB7FC395AA394750689976356701F15CA6F21409AC0906`
 passed API/mock-Sage/upgrade-publication probes and all131 embedded project
@@ -221,9 +241,10 @@ Current source is base `f07af36` plus shared repair WIP, not that commit alone.
   test-isolation import errors without changing financial assertions/guards.
 - [x] Collect the replacement frozen-source full suite: 7015 passes, no
   failures/errors, without weakening guards.
-- [ ] Fix and verify the newly reproduced legacy submitted/unknown campaign
+- [x] Fix and verify the newly reproduced legacy submitted/unknown campaign
   cancellation fee-accounting gap, including once-only cohort/reservation
-  accounting and authoritative terminal transitions; renew relevant/full tests.
+  accounting and authoritative terminal transitions; 59 focused and 7041 full
+  backend passes on the matching 471-file source/test manifest.
 - [ ] Finalize exact source/package provenance without omitting the new shared
   test fixture or conflating historical package/native receipts.
 - [ ] Complete post-fix live campaign cleanup through genuine displayed
