@@ -1,6 +1,118 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 16:47–16:56 UTC
+## Latest observer checkpoint — 17:48–18:12 UTC
+
+### Bounded offline repair and verification
+
+After confirming the repair owner was idle, unchanged source and no active
+verification job, this task notified Review Catalyst work (3) and took the
+bounded legacy accounting repair. That task retains UI/native/live ownership.
+No live wallet, profile, displayed consent, original campaign cap, or installed
+package was changed. The historical **1736563369-mojo** overrun is unchanged.
+
+Test-first evidence in `tests/test_bootstrap_legacy_fee_commitments.py`:
+
+- Original canonical two-member submitted/unknown regressions reproduced:
+  **2 failed / 2 protected controls passed**. Expanded real-SQLite cases were
+  **9 failed / 4 passed** before production changes; all failures were missing
+  holds or missing fail-closed fee validation, not setup errors.
+- A synchronized separate SQLite writer confirmed a batch during readback:
+  **80 committed instead of 40**, proving mixed old-held/new-spent snapshots.
+  An additional approval-reader variant exposed its missing read transaction.
+- A protected cohort confirmed in the journal before ledger settlement also
+  reproduced **80 instead of 40**; this is a crash-window double count, not a
+  demonstrated new over-budget dispatch.
+
+`database.py` now reconstructs unreserved cancellation holds from immutable
+canonical campaign/attempt/cohort lineage. It counts each batch once, excludes
+protected reservations already represented in the ledger, retains ambiguous
+and claimed-before-result effects, and releases only exact terminal/no-effect
+evidence. Conflicting/malformed fees and partial terminal attribution fail
+closed. It does not insert consent, reservations or effects on readback.
+Authoritative spend aggregation shares the caller's transaction; status and
+approval reads use one snapshot. Journal-confirmed but unsettled protected
+holds are not re-imported as additional scope spend, while the public campaign
+view continues to show the proven charge. Existing recovery test stubs moved
+to the connection-aware evidence aggregator; their assertions were preserved.
+
+Final focused command (all files under `tests/`):
+`python -m pytest test_bootstrap_legacy_fee_commitments.py
+test_coin_prep_fee_cancellation.py test_bootstrap_cancel_fee_budget.py
+test_bootstrap_fee_recovery_policy.py test_bootstrap_stopped_fee_renewal.py
+test_bootstrap_recovery_stop_sequence.py test_bootstrap_recovery_invariants.py
+test_coin_prep_fee_bootstrap_integration.py -q --tb=short`.
+Result: **59 passed in 48.01s**, exit 0. The new file contributes 26 cases:
+restart/claim boundary, protected/legacy deduplication, rejection, no-effect,
+retry, authoritative confirmation, malformed evidence, scope separation,
+atomic next-reservation cap, concurrent readback and real HTTP/native bridge
+readback/refusal. Ruff and `git diff --check` passed. Prior intermediate
+related run had six failures caused by evidence stubs targeting the old public
+read wrapper; corrected at the new boundary, with financial assertions intact.
+
+### Active jobs — collect before duplicating or editing source
+
+- Full backend: **session 56922 / PID 35184**, started **18:06 UTC**,
+  `python -m pytest tests -q --tb=short`, log
+  `observer-full-backend-20260925-1806.log` in the SDD directory. **Pending**.
+- Isolated Windows build: **session 63634 EXIT 0**, `python build.py --no-clean`,
+  log `observer-legacy-build-20260925.log`. **Complete**. Source snapshot:
+  `.superpowers/candidate-legacy-20260925-1806`, 593 copied tracked/build/test
+  inputs including the shared untracked test fixture and regressions. It
+  does not copy ignored user configuration or overwrite the shared `dist`.
+
+Frozen source/test manifest: **471 files**, SHA-256
+`3097114C6243E617BFD1D18654146423C7608A70CF4513D4D5188DA1F0D9314E`.
+Do not modify frozen source/tests or launch another full suite during this run.
+These are not completion or final-artifact acceptance claims.
+
+### Fresh isolated Windows candidate — scoped checks complete
+
+Executable: `.superpowers/candidate-legacy-20260925-1806/dist/Catalyst/Catalyst.exe`.
+SHA-256 **736FAA2E01C27C175DAB7FC395AA394750689976356701F15CA6F21409AC0906**.
+Bundled/source HTML SHA-256
+`51579E735A2E064673924A90B45D0B5B4D6E1B7E000861DF3D5E7177E3E42047`.
+The 471-file post-build candidate and worktree manifests both equal the frozen
+`3097114C...` value above. Read-only embedded-code comparison found **all 131
+project PYZ modules plus desktop entrypoint matching**, zero differences.
+
+On this exact executable, these isolated commands all exited 0:
+
+- `python scripts/packaged_api_smoke.py --exe <candidate>`: nine endpoints.
+- `python scripts/packaged_sage_rpc_smoke.py --exe <candidate>`: synthetic
+  fingerprint **123456789**, temporary mock HTTPS/mTLS, not live TEST 7.
+- `python scripts/packaged_upgrade_publication_recovery_smoke.py --exe <candidate>`:
+  interrupted-publication upgrade recovery; session86598 collected EXIT0.
+
+No package probe remains active. Existing shared EXE943B0D and user profile
+remain untouched. Build warning: optional hidden import `importlib_resources.trees`
+was not found; build verification and scoped probes passed. Optional Splash
+binary is absent from the tracked snapshot. No native-window or live-wallet
+acceptance is inferred from these headless isolated probes.
+
+| Evidence | SHA-256 |
+|---|---|
+| `src/catalyst/database.py` | `A8EDF4A786821610A9C938DF7866B3E6F3EC130CCCF78D2EE01A601DE51DB9C1` |
+| `tests/test_bootstrap_legacy_fee_commitments.py` | `4FC25FA7A1D2574C83A07B4A0F00D4A62420BA0A3C0130A86D6E99B3206FAF72` |
+| `observer-legacy-expanded-red-20260925.log` | `BA7B0CDA5FF9157C5B99E5317480475F5E405A53D5FA232F77F546D8C22424C9` |
+| `observer-legacy-race-red-20260925.log` | `26FCA86BF660245618BA6E50838D284CE8017207AAADD7F06D67253FDF13ED21` |
+| `observer-protected-settlement-red-20260925.log` | `059C00C55286C8494D15A5932DF7A9E04801C5A81B4C1513041154B995DB4112` |
+| `observer-legacy-all-focused-20260925.log` | `386154D771C4450CD90B34C7DE71C4B706626F67A052DEB52E4B09591724725E` |
+| `observer-legacy-build-20260925.log` | `2B37A0C8BC872590E92F6627EA5E84AC26810835880B35A7FA9EA5621D5BD065` |
+| `observer-legacy-package-api-20260925.log` | `037180AE72CB6968B24A4F9719E9A5644B6AA03656F45164F49C6405F82FCFD9` |
+| `observer-legacy-package-sage-20260925.log` | `4FCD80B8A90631E8A04BAC57E740C6DE44720D10F216336EAB3CD51E9C68BA1B` |
+| `observer-legacy-package-recovery-20260925.log` | `FA6D575A8134751BA4310D0E2A5C3BFC2F218A84D664387FE5132BB48A67AF7B` |
+| `observer-legacy-bundle-code-20260925.log` | `6AAC3D433F00BD46407C8AFD20157541A65B8EE6EA4C56F989271A0580DEB3FA` |
+
+### Remaining gates
+
+The preserved EXE `943B0D54...` **predates these database repairs**. Its earlier
+131-module bytecode match, isolated smokes, and the separate older native
+receipt do not certify the new source. Collect the active full-suite result,
+verify exact new package native provenance, then coordinate post-fix
+live cleanup/restart/requote/market gates with actual new displayed consent.
+Do not spend, merge, release or mark the goal complete based on focused tests.
+
+## Prior observer checkpoint — 16:47–16:56 UTC
 
 ### Frozen full-suite result collected
 

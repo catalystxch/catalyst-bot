@@ -152,6 +152,31 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
+**18:12 UTC package follow-up:** isolated build63634 completed exit0. Candidate
+EXE SHA-256 `736FAA2E01C27C175DAB7FC395AA394750689976356701F15CA6F21409AC0906`
+passed API/mock-Sage/upgrade-publication probes and all131 embedded project
+module comparisons plus entrypoint. Candidate/worktree471-file manifests both
+match the frozen value below. Only full backend56922/PID35184 remains active;
+native/live acceptance remains open. Existing shared package untouched.
+
+**25 September 2026, 18:08 UTC update:** the legacy unresolved-fee gap now has
+a bounded test-first repair and **59 focused passing tests** (26 new cases),
+including HTTP/native restart refusal, authoritative no-effect/retry/terminal
+transitions and protected/legacy deduplication. Further REDs for mixed SQLite
+snapshots and confirmation-before-ledger-settlement double counting were fixed.
+Full backend **56922/PID35184** is pending on frozen 471-file manifest
+`3097114C6243E617BFD1D18654146423C7608A70CF4513D4D5188DA1F0D9314E`;
+isolated Windows build **63634** is pending from
+`.superpowers/candidate-legacy-20260925-1806`. Collect both before duplicates or
+source changes. The former EXE943B0D is preserved but does not contain these
+repairs. This task temporarily owns the bounded offline accounting repair;
+Review Catalyst work (3) retains UI/native/live ownership. See the latest
+observer checkpoint for exact logs/hashes and intermediate failures. No wallet
+spend, cap change, native/live relabelling, merge, release or completion.
+
+The following 16:56 checkpoint is historical and superseded only where the
+18:08 update explicitly supplies newer evidence:
+
 **25 September 2026, 16:56 UTC:** release/secondary-PC readiness is still open.
 The historical campaign cancellation overrun and current repair verification
 are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
