@@ -1,6 +1,81 @@
 # TEST 7 campaign fee overrun — independent observer, 25 September 2026
 
-## Latest observer checkpoint — 15:47–15:58 UTC
+## Latest observer checkpoint — 16:47–16:56 UTC
+
+### Frozen full-suite result collected
+
+Session **88147** completed exit 0: **7015 passed, 165 skipped, 422 subtests
+passed in 1167.27s**. The 470-file source/test manifest still matches
+`16B4885B947C71EE54A59ACF7ED48FFECD6D8D942807232AF1D300F2A0CEEB73`.
+Full log `observer-full-backend-20260925-1554.log` SHA-256:
+`7333AB6DC49D053448BE4ACAC76BACEA9E11F7404DAEB13702E350F5A8B8100B`.
+No recorded observer verification job remains running; the freeze for this run
+was released and the repair owner notified. The existing executable remains
+`943B0D54FC9DF01D8005C35A0946D7D41EB060D3511ABD63FC2A7913F7167D6D`.
+This passes the previously failing test-initialization gate, not every remaining
+acceptance requirement. No duplicate full suite/browser/build was started.
+
+### New RED: unresolved pre-fix campaign cancellation commitments
+
+The approved recovery contract requires submitted/unknown effects to remain
+counted. New `tests/test_bootstrap_legacy_fee_commitments.py` reconstructs a
+pre-fix campaign cancellation in a **real disposable database**:
+
+1. Two campaign-bound created intents are persisted with unique offer hashes.
+2. The real canonical cohort prepare/claim/finalize APIs journal a single
+   native batch, with its exact **40-mojo** fee repeated in both member records.
+3. The result is either `CANCEL_SUBMITTED_UNCONFIRMED` or `CANCEL_UNKNOWN`.
+   The legacy variant has no fee reservation, matching the original bypass.
+4. After closing/reopening the connection, both real journal mutation blockers
+   remain. However approval status reports **held=0, committed=0**, rather than
+   counting the one 40-mojo unresolved effect.
+
+The otherwise identical protected-control variants reserve 40 mojos through
+the real protected-fee API before the effect claim. They correctly retain
+**held=40, spent=0, committed=40** across repeated reads/restarts, without double
+counting the two members. Readback does not create consent/holds/effects.
+
+Final focused result: **2 failed, 2 passed in 4.28s**, exit 1. Both failures are
+the expected `held_fee_mojos: 0 != 40` assertions in the legacy variants, not
+setup failures. Earlier fixture drafts had a duplicate offer hash and an extra
+PREPARED evidence key; those were corrected before the final canonical-cohort
+reproduction and are not product defects.
+
+Root trace: `_fee_scope_totals` imports only **confirmed** external campaign
+fees; `get_coin_prep_fee_approval_status` derives unresolved effects solely
+from `approved_fee_reservations`. Thus a legacy journalled effect without a
+reservation disappears from the fee-accounting readback while still unresolved
+in the separate operation journal. This demonstrates an accounting/recovery
+disclosure defect, **not another proven dispatch bypass**: the independent
+journal blockers remain, and no live wallet action was attempted.
+
+The new test is shared WIP for Review Catalyst work (3), which retains production
+database/UI repair and live-session ownership. The owner received the RED, the
+working protected controls, and the need to verify once-only legacy/reservation
+overlap, authoritative terminal/no-effect transitions, and malformed/conflicting
+fee evidence. This observer did not edit production code or weaken any guard.
+Do not describe the expanded acceptance suite as green until this new regression
+is fixed and relevant/full verification is renewed.
+
+Artifacts in the SDD directory unless otherwise stated:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `observer-legacy-protected-control-20260925.log` | `41C0D2AA50234545F634F1C88A7B1B8A0628C38F1183263E1D9EFD086C7C4C5B` |
+| `tests/test_bootstrap_legacy_fee_commitments.py` | `D597EEA75FEE07D726E67AC9C67F9CF692D7D111D47F9A609AFDB4D8728FD009` |
+| `src/catalyst/database.py` at reproduction | `EA2A77A0808B7D9D3BCD93C69D58B85A4B1DB0B5FBFD8F51AE8B2826956C50D0` |
+
+Command: `C:\Python312\python.exe -m pytest tests/test_bootstrap_legacy_fee_commitments.py -q --tb=short`.
+Ruff on the new file and `git diff --check` passed. The prior full green receipt
+covers its frozen 470 files; it does not include this later four-case regression.
+
+Original campaign cap **0.001 XCH** and historical spend **1736563369 mojos**
+remain intact. No new consent, fee-bearing action, strategy/profile change,
+package overwrite, main merge or release occurred. Exact-current native proof,
+post-fix live cleanup/settlement/restart and remaining requote/market/publication
+gates remain open. The goal and automation remain incomplete.
+
+## Prior observer checkpoint — 15:47–15:58 UTC
 
 The recorded full backend job was collected **before** starting another run.
 Session 25624 finished exit 1: **7011 passed, 165 skipped, 422 subtests passed,

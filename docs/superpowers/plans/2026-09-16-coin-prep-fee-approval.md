@@ -152,7 +152,7 @@ Files: build.py/package manifests only if required; evidence/2026-09-16-coin-pre
 
 ## Current checkpoint
 
-**25 September 2026, 15:58 UTC:** release/secondary-PC readiness is still open.
+**25 September 2026, 16:56 UTC:** release/secondary-PC readiness is still open.
 The historical campaign cancellation overrun and current repair verification
 are recorded in `evidence/2026-09-25-campaign-fee-overrun-observer.md`.
 Fresh campaign/bypass/recovery verification passes 16 tests, including both
@@ -163,9 +163,15 @@ independently passes API/mock-Sage/upgrade-recovery probes. The full backend run
 was collected: 7011 passes, 165 skips, 422 subtests, two failures and two setup
 errors, all in stopped-fee-renewal import initialization. A minimal cross-file
 reproduction preceded the test-only correction; same-order 7 tests and the
-16-test campaign/recovery group now pass. Replacement full run is active:
-session 88147, log `observer-full-backend-20260925-1554.log` in the SDD directory.
-Keep source frozen and collect it before starting another run. Earlier evidence includes
+16-test campaign/recovery group now pass. Replacement full run completed:
+session 88147, **7015 passed, 165 skipped, 422 subtests**, exit 0; log
+`observer-full-backend-20260925-1554.log` in the SDD directory. The frozen
+470-file manifest remained unchanged. No observer test job remains active.
+A subsequent real-database legacy-unresolved cancellation regression is RED:
+2 failures (submitted/unknown fees reported as zero held), with 2 otherwise
+identical protected-reservation controls passing. Separate journal safety
+blockers remain; this is not a proven new dispatch bypass. The new cases are
+not included in the prior green full-run count. Earlier evidence includes
 196 ledger/cancellation/hold/journal tests, 27 Chromium fee-flow tests, and
 isolated API/mock Sage/upgrade-recovery probes against EXE SHA-256
 `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
@@ -188,8 +194,11 @@ Current source is base `f07af36` plus shared repair WIP, not that commit alone.
   approved ID and never launching prep/history reset. No live wallet is used.
 - [x] Collect and diagnose the failed full suite; reproduce and fix its
   test-isolation import errors without changing financial assertions/guards.
-- [ ] Collect the replacement full current-source backend suite and close
-  full-regression verification without weakening guards.
+- [x] Collect the replacement frozen-source full suite: 7015 passes, no
+  failures/errors, without weakening guards.
+- [ ] Fix and verify the newly reproduced legacy submitted/unknown campaign
+  cancellation fee-accounting gap, including once-only cohort/reservation
+  accounting and authoritative terminal transitions; renew relevant/full tests.
 - [ ] Finalize exact source/package provenance without omitting the new shared
   test fixture or conflating historical package/native receipts.
 - [ ] Complete post-fix live campaign cleanup through genuine displayed
