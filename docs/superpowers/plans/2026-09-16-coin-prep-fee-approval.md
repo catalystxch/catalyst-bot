@@ -159,8 +159,11 @@ fresh Windows build, 156 Chromium passes, 6,999 final worktree passes with
 same-executable native acceptance receipt. The 20:25 UTC heartbeat rechecked
 all 198 bundled file hashes/sizes. These newer results supersede the earlier
 test/build counts above without relabelling older live TEST 7 receipts as
-new-build wallet tests. No test job remains active. The app is currently
-unavailable, and the broader live offer lifecycle remains incomplete.
+new-build wallet tests. No test job remains active. The combined app reopened
+on 25 September with intact fee accounting; see
+`evidence/2026-09-25-combined-runtime-reopened.md`. The broader live offer
+lifecycle remains incomplete, pending an operator-run live cycle and fresh
+market authority; no safety gate may be bypassed.
 
 - [x] User approved written specification; new goal created and existing hourly loop refreshed.
 - [x] Existing isolated branch codex/coin-prep-fee-approval verified; untracked user/build artifacts preserved.

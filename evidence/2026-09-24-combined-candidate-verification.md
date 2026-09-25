@@ -2,6 +2,10 @@
 
 Started: 24 September 2026, 18:08 UTC.
 
+Later runtime note: `2026-09-25-combined-runtime-reopened.md` records the exact
+combined executable reopened with intact TEST 7 fee accounting. It supersedes
+the runtime-unavailable observation below, not the remaining live-cycle gate.
+
 ## Scope and provenance
 
 - Feature branch: `codex/coin-prep-fee-approval`; frozen source `088d9d6`.
