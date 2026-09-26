@@ -192,17 +192,17 @@ def test_runtime_economics_are_derived_from_current_wallet_settings_without_effe
         assert database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
-def test_runtime_fee_snapshot_carries_enabled_sniper_pool_into_authoritative_plan(economic_reads):
+def test_runtime_fee_snapshot_ignores_retired_sniper_pool_settings(economic_reads):
     economic_reads["config"].SNIPER_ENABLED = True
     economic_reads["config"].SNIPER_PREP_COUNT = 20
     economic_reads["config"].SNIPER_SIZE_XCH = Decimal("0.33")
 
     result = _economic_collect(economic_reads)
 
-    assert result["recipe"]["worker_args"]["xch_target"] == 23
-    assert result["recipe"]["worker_args"]["cat_target"] == 21
-    assert "sniper=0.363" in result["recipe"]["worker_args"]["buy_tier_sizes"]
-    assert "sniper=36.3" in result["recipe"]["worker_args"]["cat_tier_sizes"]
+    assert result["recipe"]["worker_args"]["xch_target"] == 3
+    assert result["recipe"]["worker_args"]["cat_target"] == 1
+    assert "sniper=" not in result["recipe"]["worker_args"]["buy_tier_sizes"]
+    assert "sniper=" not in result["recipe"]["worker_args"]["cat_tier_sizes"]
 
 
 @pytest.mark.parametrize("options", [{"scope_sha256": "38" * 32}, {"cost": 1}, {"outputs": []},

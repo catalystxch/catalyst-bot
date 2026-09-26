@@ -57,8 +57,8 @@ def test_asymmetric_live_counts_and_spares_use_actual_sell_ladder_prices(setting
     assert result["worker_args"]["cat_target"] == 2
 
 
-def test_enabled_sniper_pool_is_part_of_fee_preview_and_worker_targets(settings):
-    """The approved fee plan must cover every denomination the GUI verifies."""
+def test_retired_sniper_settings_do_not_shape_fee_preview_or_worker_targets(settings):
+    """Stale sniper settings cannot re-enable a retired wallet-prep cohort."""
     settings.update(
         SNIPER_ENABLED=True,
         SNIPER_PREP_COUNT=20,
@@ -67,29 +67,14 @@ def test_enabled_sniper_pool_is_part_of_fee_preview_and_worker_targets(settings)
 
     result = _build(settings)
 
-    assert result["worker_args"]["xch_target"] == 25
-    assert result["worker_args"]["cat_target"] == 22
-    assert "sniper=0.363" in result["worker_args"]["buy_tier_sizes"]
-    assert "sniper=36.3" in result["worker_args"]["cat_tier_sizes"]
-    assert result["worker_args"]["tier_counts_xch"] == "inner=3,fees=2,sniper=20"
-    assert result["worker_args"]["tier_counts_cat"] == "inner=1,outer=1,sniper=20"
-    assert len([target for target in result["targets"] if target.asset == "xch"]) == 25
-    assert len([target for target in result["targets"] if target.asset == "cat"]) == 22
-
-
-@pytest.mark.parametrize("mode", ["buy_only", "sell_only"])
-def test_one_sided_fee_plan_matches_ui_by_excluding_two_sided_sniper_pool(settings, mode):
-    settings.update(
-        LIQUIDITY_MODE=mode,
-        SNIPER_ENABLED=True,
-        SNIPER_PREP_COUNT=20,
-        SNIPER_SIZE_XCH=Decimal("0.33"),
-    )
-
-    result = _build(settings)
-
+    assert result["worker_args"]["xch_target"] == 5
+    assert result["worker_args"]["cat_target"] == 2
     assert "sniper" not in result["worker_args"]["buy_tier_sizes"]
     assert "sniper" not in result["worker_args"]["cat_tier_sizes"]
+    assert "sniper" not in result["worker_args"]["tier_counts_xch"]
+    assert "sniper" not in result["worker_args"]["tier_counts_cat"]
+    assert len([target for target in result["targets"] if target.asset == "xch"]) == 5
+    assert len([target for target in result["targets"] if target.asset == "cat"]) == 2
 
 
 def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(settings, monkeypatch):
