@@ -98,6 +98,8 @@ def economic_reads(live_reads, monkeypatch):
                        "SPREAD_BPS": Decimal("10000"), "MIN_EDGE_BPS": Decimal("0"),
                        "MAX_ACTIVE_BUY_OFFERS": 1, "MAX_ACTIVE_SELL_OFFERS": 1,
                        "DEFAULT_TRADE_XCH": Decimal("0.1"), "FEE_PREP_COUNT": 2,
+                       "SNIPER_ENABLED": False, "SNIPER_PREP_COUNT": 0,
+                       "SNIPER_SIZE_XCH": Decimal("0"),
                        "FEE_COIN_SIZE_XCH": Decimal("0.001"), "TRANSACTION_FEE_MODE": "manual",
                        "TRANSACTION_FEE_XCH": Decimal("0.00001")}.items():
         setattr(configuration, key, value)
@@ -172,4 +174,3 @@ def _counts():
     return {table: database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("fee_approvals", "coin_prep_fee_consents", "approved_fee_reservations",
                           "coin_prep_operations", "wallet_effect_claims")}
-

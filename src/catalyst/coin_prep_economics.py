@@ -15,7 +15,9 @@ from coin_prep_targets import MAX_ATOMIC_AMOUNT, MAX_PLAN_OUTPUTS, build_prep_ta
 from ladder_sizing import TIER_ORDER, summarize_sell_ladder_cat
 
 
-PREP_TIERS = (*TIER_ORDER, "fees")
+# Keep the existing fee rank stable for persisted plan compatibility; sniper is
+# an additional standard-plan tier rather than an insertion before fee reserve.
+PREP_TIERS = (*TIER_ORDER, "fees", "sniper")
 _REVERSED = dict(zip(TIER_ORDER, reversed(TIER_ORDER)))
 
 
@@ -176,6 +178,16 @@ def build_standard_prep_economics(*, configuration, fee_pool, live_price,
                 sizes[tier] = size
                 if count:
                     counts[tier] = count
+        sniper_enabled = configuration.get("SNIPER_ENABLED", False)
+        if type(sniper_enabled) is not bool:
+            raise ValueError("Coin Prep sniper flag must be an exact boolean")
+        sniper_count = _integer(configuration.get("SNIPER_PREP_COUNT", 0), 0, MAX_PLAN_OUTPUTS)
+        sniper_size = _decimal(configuration.get("SNIPER_SIZE_XCH", 0))
+        if mode == "two_sided" and sniper_enabled and sniper_count and sniper_size > 0:
+            xch_counts["sniper"] = sniper_count
+            cat_counts["sniper"] = sniper_count
+            buy_sizes["sniper"] = sniper_size
+            sell_sizes["sniper"] = sniper_size
     else:
         count = int(sum(_integer(configuration[key], 0, MAX_PLAN_OUTPUTS) for key in
                         ("MAX_ACTIVE_BUY_OFFERS", "MAX_ACTIVE_SELL_OFFERS")) * multiplier)
@@ -205,13 +217,22 @@ def build_standard_prep_economics(*, configuration, fee_pool, live_price,
                                0, MAX_PLAN_OUTPUTS)
                 for tier in TIER_ORDER
             }
-            cat_sizes = prepared_cat_sizes(
-                live_sizes={tier: sell_sizes[tier] for tier in cat_counts}, price=price,
-                headroom_multiplier=headroom_multiplier, cat_decimals=decimals,
-                sell_counts=live_sell_counts,
-                max_offers=_integer(configuration["MAX_ACTIVE_SELL_OFFERS"], 0, MAX_PLAN_OUTPUTS),
-                spread_bps=configuration["SPREAD_BPS"], min_edge_bps=configuration["MIN_EDGE_BPS"],
-            )
+            ladder_sizes = {
+                tier: sell_sizes[tier] for tier in cat_counts if tier != "sniper"
+            }
+            if ladder_sizes:
+                cat_sizes = prepared_cat_sizes(
+                    live_sizes=ladder_sizes, price=price,
+                    headroom_multiplier=headroom_multiplier, cat_decimals=decimals,
+                    sell_counts=live_sell_counts,
+                    max_offers=_integer(configuration["MAX_ACTIVE_SELL_OFFERS"], 0, MAX_PLAN_OUTPUTS),
+                    spread_bps=configuration["SPREAD_BPS"], min_edge_bps=configuration["MIN_EDGE_BPS"],
+                )
+            if "sniper" in cat_counts:
+                cat_sizes["sniper"] = round_cat_display_amount_up_to_mojo(
+                    (sell_sizes["sniper"] / price) * headroom_multiplier,
+                    decimals,
+                )
         else:
             cat_sizes = {"inner": round_cat_display_amount_up_to_mojo(
                 (sell_sizes["inner"] / price) * headroom_multiplier, decimals)}

@@ -17,6 +17,8 @@ def _service():
 def settings():
     result = {"TIER_ENABLED": True, "BUY_LADDER_REVERSED": False,
               "LIQUIDITY_MODE": "two_sided", "CAT_DECIMALS": 3,
+              "SNIPER_ENABLED": False, "SNIPER_PREP_COUNT": 0,
+              "SNIPER_SIZE_XCH": Decimal("0"),
               "COIN_PREP_HEADROOM_PCT": Decimal("10"), "SPREAD_BPS": Decimal("10000"),
               "MIN_EDGE_BPS": Decimal("0"), "XCH_RESERVE": Decimal("0.25"),
               "CAT_RESERVE": Decimal("1.001"), "MAX_ACTIVE_BUY_OFFERS": 3,
@@ -53,6 +55,41 @@ def test_asymmetric_live_counts_and_spares_use_actual_sell_ladder_prices(setting
     assert result["worker_args"]["cat_tier_sizes"] == "inner=110,outer=27.5"
     assert result["worker_args"]["xch_target"] == 5
     assert result["worker_args"]["cat_target"] == 2
+
+
+def test_enabled_sniper_pool_is_part_of_fee_preview_and_worker_targets(settings):
+    """The approved fee plan must cover every denomination the GUI verifies."""
+    settings.update(
+        SNIPER_ENABLED=True,
+        SNIPER_PREP_COUNT=20,
+        SNIPER_SIZE_XCH=Decimal("0.33"),
+    )
+
+    result = _build(settings)
+
+    assert result["worker_args"]["xch_target"] == 25
+    assert result["worker_args"]["cat_target"] == 22
+    assert "sniper=0.363" in result["worker_args"]["buy_tier_sizes"]
+    assert "sniper=36.3" in result["worker_args"]["cat_tier_sizes"]
+    assert result["worker_args"]["tier_counts_xch"] == "inner=3,fees=2,sniper=20"
+    assert result["worker_args"]["tier_counts_cat"] == "inner=1,outer=1,sniper=20"
+    assert len([target for target in result["targets"] if target.asset == "xch"]) == 25
+    assert len([target for target in result["targets"] if target.asset == "cat"]) == 22
+
+
+@pytest.mark.parametrize("mode", ["buy_only", "sell_only"])
+def test_one_sided_fee_plan_matches_ui_by_excluding_two_sided_sniper_pool(settings, mode):
+    settings.update(
+        LIQUIDITY_MODE=mode,
+        SNIPER_ENABLED=True,
+        SNIPER_PREP_COUNT=20,
+        SNIPER_SIZE_XCH=Decimal("0.33"),
+    )
+
+    result = _build(settings)
+
+    assert "sniper" not in result["worker_args"]["buy_tier_sizes"]
+    assert "sniper" not in result["worker_args"]["cat_tier_sizes"]
 
 
 def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(settings, monkeypatch):
