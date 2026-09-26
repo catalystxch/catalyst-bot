@@ -1771,16 +1771,36 @@ def api_coin_prep_status():
         # after the worker completed.  Prefer the campaign's latest immutable
         # approval so status never reports a superseded ceiling with cumulative
         # scope spend (which can otherwise render a misleading negative balance).
-        if bootstrap_campaign is not None:
+        durable_fee = None
+        campaign_id = (
+            bootstrap_campaign.get("campaign_id")
+            if bootstrap_campaign is not None
+            else None
+        )
+        if campaign_id is None and worker_fee_approval_id is not None:
+            try:
+                from database import get_coin_prep_fee_approval_status
+
+                durable_fee = get_coin_prep_fee_approval_status(
+                    worker_fee_approval_id
+                )
+                campaign_id = durable_fee.get("campaign_id") or (
+                    durable_fee.get("request_options") or {}
+                ).get("bootstrap_campaign_id")
+            except Exception:
+                durable_fee = None
+        if campaign_id is not None:
             try:
                 from database import get_latest_coin_prep_fee_approval_for_campaign
 
                 latest_campaign_approval_id = (
                     get_latest_coin_prep_fee_approval_for_campaign(
-                        bootstrap_campaign["campaign_id"]
+                        campaign_id
                     )
                 )
                 if latest_campaign_approval_id is not None:
+                    if latest_campaign_approval_id != worker_fee_approval_id:
+                        durable_fee = None
                     worker_fee_approval_id = latest_campaign_approval_id
             except Exception:
                 pass
@@ -1789,9 +1809,10 @@ def api_coin_prep_status():
             try:
                 from database import get_coin_prep_fee_approval_status
 
-                durable_fee = get_coin_prep_fee_approval_status(
-                    worker_fee_approval_id
-                )
+                if durable_fee is None:
+                    durable_fee = get_coin_prep_fee_approval_status(
+                        worker_fee_approval_id
+                    )
                 result["fee_approval"] = _fee_json_amounts(durable_fee)
                 active_fee_states = {
                     "approved",

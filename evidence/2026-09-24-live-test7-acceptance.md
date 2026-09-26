@@ -492,3 +492,26 @@ than funds being exposed under fabricated pricing authority.
   two loops, zero errors, zero open offers, zero XCH/CAT locks and runtime
   safety allowed. Once stopped, the short-lived evidence correctly aged back
   to fail-closed expired status; this does not alter the fresh-cycle proof.
+
+### Terminal-campaign approval status correction — 26 September 2026
+
+- Read-only monitoring after the fresh start/stop cycle exposed one remaining
+  status-only defect: once the completed Bootstrap campaign left the active
+  campaign list, `/api/coin-prep/status` fell back to the worker's superseded
+  version-2 approval and displayed a misleading negative remaining amount.
+  Durable spend, holds and wallet safety were unaffected.
+- A red-first regression reproduces the terminal-campaign transition. Status
+  now follows the worker approval's durable campaign identity to the latest
+  immutable renewal even when no active campaign row remains.
+- Focused renewal/status checks: **4 passed**. Broader approval, recovery and
+  ledger group: **183 passed**. Superseding complete Python suite: **7043
+  passed, 165 skipped, 422 subtests passed** in 1556.10 seconds. Ruff and diff
+  checks passed.
+- Fresh Windows build and packaged API, mock Sage RPC, upgrade/publication
+  recovery and native clean/duplicate/persisted/safety smokes all passed.
+  Exact executable SHA-256:
+  `0F5E3A29C4B5AEA2285E22E23E157F191B07E27B7DCEFB01A0F2A7E322FDF224`.
+- Real-profile restart now reports renewal
+  `fe95e93d02ebe2b73650b61f4f590c57606766b77ab23961e228dea47328d8df`,
+  version 3, total `1746988850`, spent `1736965715`, held `0`, remaining
+  `10023135`, `stale=false`, zero unresolved operations and zero open offers.
