@@ -2183,6 +2183,8 @@ def api_coin_prep_verify():
                         for suffix in ("xch", "cat", "count", "xch_count", "cat_count")
                     )
                 ]
+            if bootstrap_context is None:
+                tiers = [tier for tier in tiers if tier != "sniper"]
             if not tiers:
                 tiers = ["inner", "mid", "outer", "extreme"]
             result_tiers = {}
