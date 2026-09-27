@@ -48,6 +48,8 @@ def test_confirmation_text_uses_no_custom_tag_stripping_sanitizer():
     source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
 
     assert ".replace(/<[^>]*>/g" not in source
+    assert ".confirm-modal-message" in source
+    assert "white-space: pre-line" in source
 
 
 def test_smart_settings_result_does_not_reinterpret_dynamic_markup():
