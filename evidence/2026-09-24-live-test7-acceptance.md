@@ -641,3 +641,33 @@ than funds being exposed under fabricated pricing authority.
   `insufficient_ask_depth` and `single_provider_dependency`. Both
   `can_create` and `can_requote` remained false, so no offer, cancellation,
   fee or other wallet effect was attempted.
+
+### Integrated lifecycle-audit receipt and another live gate cycle — 27 September 2026
+
+- Primary reviewed secondary evidence commit
+  `43804baf127946fe8bcda7893e669b5ba5d41c06`: it descended from the prior
+  secondary checkpoint, changed only the secondary acceptance evidence file,
+  and passed `git diff --check`. The checkpoint records **47 passed** focused
+  create/publication/requote/remake/cancellation/restart/atomic-ledger/bypass
+  tests in 20.87 seconds and found no production defect or genuine automated
+  safety-coverage gap. It was integrated and pushed as feature head
+  `464ef56213618b7e525dc4ab811ae1b1b425e8cb`.
+- Before another primary wallet-aware cycle, the package freshly listed TEST 7
+  fingerprint `736588221` and bound CAT wallet 2 to exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+  The normal cookie-authenticated Start endpoint succeeded; startup reconciled
+  zero open buys, zero open sells and zero unknown offers. Stop completed
+  cleanly after two loops.
+- The fresh confidence snapshot at `2026-09-27T12:27:46.251673Z` remained RED
+  with Dexie valid, Splash unavailable, provider redundancy 1, and reasons
+  `out_of_range_depth_excluded`, `insufficient_ask_depth` and
+  `single_provider_dependency`. `can_create=false` and `can_requote=false`, so
+  no offer, cancellation, fee or other wallet effect occurred.
+- Final status was running false, errors zero, zero open offers, zero locked
+  XCH/CAT, zero pending cancellation and runtime safety allowed with no
+  unresolved operations, reservations, publication claims or prepared
+  creations. The stopped-bot status response's top-level zero balance fields
+  were investigated: they are intentional read-only polling placeholders, not
+  wallet evidence. Verified balances remain protected by the balance snapshot
+  cache and frontend merge logic; exact regressions cover transient-zero
+  preservation.
