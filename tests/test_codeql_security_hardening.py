@@ -40,6 +40,13 @@ def test_gui_token_icons_are_validated_before_dom_assignment():
     assert "titleIcon.setAttribute('src', iconUrl)" not in source
     assert "img.setAttribute('src', url)" not in source
     assert "iconEl.src = url" not in source
+    assert "titleIcon.src =" not in source
+
+
+def test_confirmation_text_uses_no_custom_tag_stripping_sanitizer():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert ".replace(/<[^>]*>/g" not in source
 
 
 def test_smart_settings_result_does_not_reinterpret_dynamic_markup():

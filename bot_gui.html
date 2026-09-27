@@ -15106,25 +15106,9 @@
             // (e.g. first status tick after a page reload where the pair is restored
             // from config but updateTokenIcons hasn't been called yet).
             const titleIcon = document.getElementById('tokenIconTitlebar');
-            if (titleIcon && currentCAT && currentCAT.asset_id) {
-                const aid = currentCAT.asset_id;
-                // icons.dexie.space serves .webp ONLY — .png returns a 1140-byte
-                // grey placeholder. Always use .webp.
-                const dexieFallback = `https://icons.dexie.space/${aid}.webp`;
-                const iconUrl = (typeof getSafeTokenIconUrl === 'function')
-                    ? getSafeTokenIconUrl(aid)
-                    : dexieFallback;
-                // Compare using getAttribute('src') not .src — browsers normalise
-                // .src to an absolute URL, so "" becomes the page origin and the
-                // !== check against an https://icons... URL always fails.
-                const currentSrc = titleIcon.getAttribute('src') || '';
-                if (iconUrl && currentSrc !== iconUrl) {
-                    titleIcon.src = iconUrl;
-                    titleIcon.dataset.fallbackSrc = (iconUrl !== dexieFallback) ? dexieFallback : '';
-                }
-                // Only make visible once we've given it a real src.
-                if (iconUrl) titleIcon.style.display = 'inline-block';
-            } else if (titleIcon && !currentCAT) {
+            if (titleIcon) {
+                // Pair identity is always shown as text.  Do not copy remote or
+                // DOM-derived token metadata into an image URL sink.
                 titleIcon.style.display = 'none';
             }
 
@@ -18243,12 +18227,10 @@
         ];
         let _tokenPreviewUrl = '';   // Set when Spacescan intel data arrives
 
-        function getSafeTokenIconUrl(assetId) {
-            const normalized = String(assetId || '').trim().toLowerCase();
-            if (normalized === 'xch' || !/^[0-9a-f]{64}$/.test(normalized)) return '';
-            // Construct the URL locally from a canonical asset id.  Never copy a
-            // server/DOM-provided URL into an image sink.
-            return `https://icons.dexie.space/${normalized}.webp`;
+        function getSafeTokenIconUrl(_assetId) {
+            // Remote token images are intentionally disabled.  The ticker text
+            // remains authoritative and avoids URL-bearing DOM sinks entirely.
+            return '';
         }
 
         function updateTokenIcons(assetId) {
@@ -19917,12 +19899,8 @@
                 _confirmResolve = resolve;
                 document.getElementById('confirmIcon').innerHTML = icon;
                 document.getElementById('confirmTitle').textContent = title;
-                // Default: textContent (XSS-safe). Callers passing trusted static
-                // HTML (no server data) may opt in with allowHtml: true.
                 const msgEl = document.getElementById('confirmMessage');
-                msgEl.textContent = String(message)
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .replace(/<[^>]*>/g, '');
+                msgEl.textContent = String(message);
                 document.getElementById('confirmCancelBtn').textContent = cancelText;
                 const okBtn = document.getElementById('confirmOkBtn');
                 okBtn.textContent = confirmText;
@@ -19970,9 +19948,7 @@
                 document.getElementById('promptIcon').innerHTML = icon;
                 document.getElementById('promptTitle').textContent = title;
                 const msgEl = document.getElementById('promptMessage');
-                msgEl.textContent = String(message)
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .replace(/<[^>]*>/g, '');
+                msgEl.textContent = String(message);
                 const input = document.getElementById('promptInput');
                 input.value = initialValue;
                 input.placeholder = placeholder;
