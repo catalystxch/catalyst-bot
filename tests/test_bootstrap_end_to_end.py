@@ -1075,8 +1075,6 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
 
 
 def test_red_market_authorizes_only_current_bootstrap_publication_claim(monkeypatch):
-    import bot_loop
-
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
     loop._enter_runtime_effect_phase = lambda phase: False
     loop._runtime_recovery_cycle_boundary = lambda: True
@@ -1115,8 +1113,6 @@ def test_red_market_authorizes_only_current_bootstrap_publication_claim(monkeypa
 
 
 def test_red_market_still_drains_current_bootstrap_publication_queues(monkeypatch):
-    import bot_loop
-
     flushed = []
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
     loop._enter_runtime_effect_phase = lambda phase: False
