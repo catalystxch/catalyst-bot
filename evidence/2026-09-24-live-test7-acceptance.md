@@ -719,6 +719,12 @@ than funds being exposed under fabricated pricing authority.
   recovery invariant, mutation gate, Coin Prep integration, fee-approval
   ledger and fee-recovery suites. The fresh result was **88 passed in 37.27
   seconds** with exit code 0.
+- Primary then ran the complete real-Chromium Coin Prep fee-approval E2E file
+  with `--e2e`: **28 passed in 20.72 seconds**. This covers lossless displayed
+  quote evidence, quote age and expiry, recorded confirmation before launch,
+  unavailable-provider fail-closed behavior, renewal and cumulative caps,
+  cancellation forwarding, native bridge parity, restart accounting,
+  no-effect completion precedence, and deliberate recovery review.
 - Secondary was assigned a complementary non-wallet audit against exact
   feature head `0253134e64b4f389767d7aee718f0743590afbef`, covering Bootstrap
   start gating, approval persistence and bypass resistance, protected
