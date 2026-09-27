@@ -593,3 +593,38 @@ than funds being exposed under fabricated pricing authority.
   candidate because the authoritative market gate is freshly RED. That gate
   must not be bypassed and remains the only substantive external live-cycle
   limitation. No merge to `main` and no release occurred.
+
+### Final-SHA cross-PC lifecycle audit — 27 September 2026
+
+- Both machines fetched and verified exact integration head
+  `cf7ea04605a295f67a59b3e76ccbef489c9949d3`. Production source
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca` is its ancestor and every later
+  change is confined to the two acceptance-evidence files; the range passes
+  `git diff --check`.
+- The secondary PC reverified Sage 0.13.0 mainnet, its authorized Harvestr
+  test wallet fingerprint `3702373391`, CAT wallet 2 and the exact MZ asset,
+  then performed a read-only Smart Settings/Market Intel refresh. At
+  `2026-09-27T12:04:16.036623Z` confidence remained RED with
+  `can_create=false`, `can_requote=false`, provider redundancy 1 and reasons
+  `out_of_range_depth_excluded`, `insufficient_ask_depth` and
+  `single_provider_dependency`. Dexie evidence was fresh; Splash returned an
+  empty offer set and its local API was unavailable. The app shut down with
+  zero CATalyst processes. No wallet mutation, fee, offer or bot start
+  occurred.
+- The independent campaign-completion audit confirmed that
+  `fee_resume_required=true` with top-level Coin Prep `complete=true` is
+  intentional campaign-managed cancellation protection, not an unresolved
+  accounting effect. Secondary ran the five exact design/source/UI boundary
+  tests successfully. Primary independently reran the three non-browser
+  boundaries successfully; the two browser boundaries are already covered by
+  the green 164-case Chromium suite on each PC.
+- Primary reran a focused lifecycle slice spanning confirmation through
+  cancel/restart, publication gating, Bootstrap requote routing, campaign fee
+  caps, atomic competing holds, no-effect retry accounting, cancellation
+  crash recovery and protected-fee startup recovery: 18 parametrized cases
+  passed in 8.57 seconds.
+- A deeper secondary requirement-to-source-to-test audit of live-blocked
+  create/publication/requote/cancel/remake paths is in progress. Its result is
+  not represented as complete here. Live lifecycle acceptance therefore
+  remains open behind the same external RED market gate; no safety gate was
+  bypassed and no merge or release occurred.
