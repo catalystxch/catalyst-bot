@@ -554,3 +554,42 @@ than funds being exposed under fabricated pricing authority.
   insufficient attributable ask depth, and single-provider dependency. The
   saved pre-fee strategy remains preserved and inactive because it exceeds
   available MZ.
+
+### Cross-PC checkpoint integration and fresh primary live cycle — 27 September 2026
+
+- The secondary PC independently verified production candidate
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca` and pushed evidence head
+  `35d70f77b63dd3074c02bb11fdeb2e26e41a30f8`. Primary review confirmed the
+  exact base ancestry, evidence-only one-file diff and clean diff check before
+  cherry-picking both commits. The secondary then fetched final integration
+  head `0b1c7765f4859ebc8867e7a3b84bd49f5e42491a`, verified that all four
+  post-production commits were evidence-only, reproduced a clean range diff,
+  and matched the integrated secondary evidence content hash exactly.
+- The exact primary package built from `9bbf972` was restarted in Flask mode
+  after its executable hash was rechecked as
+  `8E109AD62089C5DD5E8C729AF7C363F3D6745BD07BC0D0980531F77620C5D568`.
+  Health returned v1.4.0 with the bot stopped. The normal protected startup
+  flow listed and selected TEST 7, then freshly verified Sage 0.13.0 healthy,
+  mainnet fingerprint `736588221`, CAT wallet 2 and the exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- One authorized Start/Stop cycle completed two live loops with zero errors.
+  Fresh confidence snapshots at `2026-09-27T11:52:29.978368Z`,
+  `2026-09-27T11:52:57.670337Z` and `2026-09-27T11:53:14.941879Z` remained
+  RED for the substantive reasons `out_of_range_depth_excluded`,
+  `insufficient_ask_depth` and `single_provider_dependency`. At every readback
+  `can_create=false` and `can_requote=false`; CATalyst correctly created no
+  buy or sell offer.
+- Normal Stop returned `stopped`. Final readback showed running false, two
+  loops, zero errors, zero open offers, zero XCH/CAT locks, runtime safety
+  allowed, Coin Prep complete, zero held fee mojos and zero unresolved fee
+  operations. No wallet transaction or fee spend occurred in this cycle.
+- Campaign-managed approval `fe95e93d...` remains conservatively resumable by
+  design: Bootstrap completion proves frozen targets but intentionally does
+  not create a standalone session-completion record, preserving protected
+  cancellation allowance. This explains `state=approved` and
+  `fee_resume_required=true`; it is not an unresolved-effect or accounting
+  defect.
+- Live create/publication/requote/remake remains unexecuted on this integrated
+  candidate because the authoritative market gate is freshly RED. That gate
+  must not be bypassed and remains the only substantive external live-cycle
+  limitation. No merge to `main` and no release occurred.
