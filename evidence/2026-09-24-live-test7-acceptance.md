@@ -867,3 +867,52 @@ than funds being exposed under fabricated pricing authority.
   The independent receipt is
   `evidence/2026-09-27-secondary-public-readiness-54a3aeb.md`. It performed no
   live-wallet mutation; the primary live lane above remains authoritative.
+
+### Public-readiness review cleanup and exact candidate — 27 September 2026
+
+- The exact runtime candidate is
+  `d048f44cacd056abc9dbcc6fae3c588dc4c80e27`. It resolves the final verified
+  duplicate-import review findings without changing fee, wallet, offer or
+  campaign behavior: redundant local `re` imports were removed, Windows
+  `ctypes` imports were consolidated, and test imports were consolidated. The
+  final follow-up is one Ruff-required blank line. All review threads are
+  resolved and every GitHub lint, unit, CodeQL, Semgrep, Gitleaks and security
+  check passes.
+- Primary's complete serial suite passed **7,062 tests, skipped 166, and passed
+  422 subtests in 1,168.16 seconds**. A subsequent exact-head Bootstrap
+  end-to-end rerun passed 33 tests in 8.07 seconds. Tracked Ruff check and
+  format verification pass all 478 Python files; `git diff --check` passes.
+  The full real-Chromium suite passed **165 tests in 88.65 seconds**.
+- Primary built the detached exact candidate at
+  `C:\catalyst\.superpowers\public-ready-d048f44`. The executable SHA-256 is
+  `C200D870F3849A8D8D5E3541F5FBED5C7E36B95C5AD42A967DBCF4CF824CC200`.
+  `CATalyst-d048f44-public-ready.zip` contains 243 entries, is 36,580,312
+  bytes, and has SHA-256
+  `7C0984CCEB17F2A892F5CA74BF8E6CDD3563CE8C85B8EBD624303FBAC14CD01C`.
+  The extracted executable hash matches; the archive scan found zero runtime
+  `.env`, database, SQLite, log or Coin Prep state artifacts. Packaged API,
+  synthetic Sage RPC, interrupted-publication recovery and native
+  clean/duplicate/persisted/safety smokes all pass. Microsoft Defender real-time
+  protection was enabled and reported zero detections for this candidate.
+- Primary replaced only the prior CATalyst process after verifying it was idle.
+  The exact `d048f44` executable recovered mainnet Sage TEST 7 fingerprint
+  `736588221`, MZ wallet 2, exact asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  three live buys plus three live sells, `0.09 XCH` and `1,200 MZ` locks,
+  runtime safety allowed and zero errors. No offer or wallet mutation occurred
+  during the handover. The real UI is staged at **Start Bot Now**; policy-bound
+  action-time confirmation remains required before it may resume transactions.
+- Secondary independently verified and built the same exact commit. Its focused
+  suite passed 168 tests; Ruff check/format, compileall, diff check, fresh build,
+  all packaged smokes, prior-package upgrade and archive round-trip passed. Its
+  executable SHA-256 is
+  `4FC2916E5079ED6B7194A2BFB0F6125DA97AD23AC15C8321F69EDF1DD6D96862`;
+  ZIP SHA-256 is
+  `99127BDC7FCCEF491E0A70DAA3B049D77B3081BDF28E07E2ED746D67FBEB2830`.
+  Its exact-candidate 24-hour clean window began at
+  `2026-09-27T21:30:14.8881775Z` and is monitored every 30 minutes.
+- **Unfinished gates:** both exact-candidate 24-hour clean windows have not yet
+  elapsed; exact-head live Start/Stop and any resulting requote/cancel/remake
+  transaction still require action-time confirmation through the real UI;
+  PR #220 therefore remains draft and neither `main` nor a release has been
+  changed.
