@@ -368,3 +368,63 @@ No discrepancy or CATalyst defect was reproduced. The live evidence is
 internally consistent with the independently tested durable state-machine and
 fee-ledger contracts, including restart blocking until all six cancellations
 are authoritative and a clean same-revision six-offer remake afterward.
+
+## Bootstrap reload readiness defect and secondary fix verification
+
+The feature branch was fetched and checked out at exact delegated candidate
+`d7b7624272a2493de002a0a6425c8f72cbacd983`. No CATalyst process was launched
+against Sage and no live wallet read, approval, signature, fee, offer or spend
+was performed; the primary PC retained sole control of the live campaign.
+
+A real fail-open readiness defect was reproduced. After an earlier Coin Prep
+completion, the browser trusted historical `/api/coin-prep/status` data and
+could display "Prepared coin sizes look ready" and enable Start even when the
+current active Bootstrap revision required re-preparation. This was not only a
+display defect: the active Bootstrap backend start path bypassed the legacy
+Smart Settings tier-drift check without replacing it with exact campaign-bound
+Coin Prep verification.
+
+Two regressions failed before the fix at the intended boundaries:
+
+- Chromium reload regression: **1 failed** because historical completion
+  restored readiness instead of calling the exact current-campaign verifier.
+- Backend mutation-boundary regression: **1 failed** because `/api/bot/start`
+  returned 200 instead of failing closed when exact Bootstrap prep was not
+  ready.
+
+The smallest fix reuses the existing read-only Coin Prep verifier with the
+exact durable campaign ID and revision in both places. The browser re-verifies
+before restoring its ready flag. The backend independently repeats the same
+verification immediately before Start and rejects unavailable, ambiguous,
+mismatched or insufficient results. The production fix is commit
+`1a5cccadc99135cc63502dbf01b1084dc86a7917` on branch
+`codex/secondary-bootstrap-reload-readiness`.
+
+Verification results:
+
+- Focused Chromium Coin Prep/start-safety group: **56 passed in 32.42s**.
+- Relevant backend, endpoint and Bootstrap integration group: **112 passed in
+  12.47s**.
+- Complete serial suite: **7,048 passed, 166 skipped, 422 subtests passed in
+  1,229.36s**, with one pre-existing pytest deprecation warning.
+- Repository-wide `python -m ruff check .`: **passed**.
+- `git diff --check`: **passed**.
+
+The first complete-suite attempt became invalid at 90% when pytest reported
+`OSError: [Errno 28] No space left on device`; its late failures/errors are not
+product results. The disposable `pytest-of-M920q` tree was removed. The
+supposedly lean isolated profile was also found to contain a 2.45 GB nested
+historical `backups` copy. That redundant nested copy was removed as required
+by the acceptance handoff, while the separate authoritative backup at
+`acceptance-data/0bd4605/authoritative-backups-20260926-1541` was verified
+present and preserved. The identical complete-suite rerun then produced the
+green result above and crossed the prior failure point with 3.53 GB free.
+
+A fresh clean `python build.py` build passed under Python 3.12.10 and
+PyInstaller 6.22.3, including bundled HTML and certifi CA checks. The exact
+executable is `dist/Catalyst/Catalyst.exe`, SHA-256
+`09F547D7DD5D81B5D0465F43DF93DEEF756D2797947CEDA4DF942A0BE4A177EA`.
+Against those bytes, packaged API smoke passed all nine endpoints, synthetic
+Sage mTLS worker smoke passed, interrupted-publication upgrade/recovery smoke
+passed, and the native desktop smoke passed clean launch, duplicate handoff,
+persisted-profile relaunch and native safety launch.
