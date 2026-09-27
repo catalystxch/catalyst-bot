@@ -69,6 +69,18 @@ def test_fee_reason_translation_never_returns_arbitrary_exception_text():
         )
         == "FEE_APPROVAL_UNAVAILABLE"
     )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE"), "FEE_PREVIEW_UNAVAILABLE"
+        )
+        == "FEE_PREP_CAMPAIGN_UNAVAILABLE"
+    )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_WALLET_IDENTITY_UNAVAILABLE"), "FEE_PREVIEW_UNAVAILABLE"
+        )
+        == "FEE_WALLET_IDENTITY_UNAVAILABLE"
+    )
 
 
 def test_coin_prep_cli_rejects_unsafe_args_without_spawning(monkeypatch):

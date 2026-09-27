@@ -74,6 +74,22 @@ def _public_fee_reason(exc: ValueError, fallback: str) -> str:
         return "FEE_ESTIMATE_UNAVAILABLE"
     if value == "FEE_WALLET_CONTEXT_CHANGED":
         return "FEE_WALLET_CONTEXT_CHANGED"
+    if value == "FEE_WALLET_IDENTITY_UNAVAILABLE":
+        return "FEE_WALLET_IDENTITY_UNAVAILABLE"
+    if value == "FEE_WALLET_INVENTORY_UNAVAILABLE":
+        return "FEE_WALLET_INVENTORY_UNAVAILABLE"
+    if value == "FEE_WALLET_ASSET_UNAVAILABLE":
+        return "FEE_WALLET_ASSET_UNAVAILABLE"
+    if value == "FEE_WALLET_ADDRESS_UNAVAILABLE":
+        return "FEE_WALLET_ADDRESS_UNAVAILABLE"
+    if value == "FEE_PREP_CAMPAIGN_UNAVAILABLE":
+        return "FEE_PREP_CAMPAIGN_UNAVAILABLE"
+    if value == "FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED":
+        return "FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED"
+    if value == "FEE_PREP_CONFIGURATION_INVALID":
+        return "FEE_PREP_CONFIGURATION_INVALID"
+    if value == "FEE_PREP_PRICE_UNAVAILABLE":
+        return "FEE_PREP_PRICE_UNAVAILABLE"
     if value == "FEE_BUDGET_EXCEEDED":
         return "FEE_BUDGET_EXCEEDED"
     if value == "FEE_DISPATCH_PLAN_MISMATCH":
