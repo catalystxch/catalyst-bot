@@ -515,3 +515,38 @@ than funds being exposed under fabricated pricing authority.
   `fe95e93d02ebe2b73650b61f4f590c57606766b77ab23961e228dea47328d8df`,
   version 3, total `1746988850`, spent `1736965715`, held `0`, remaining
   `10023135`, `stale=false`, zero unresolved operations and zero open offers.
+
+### Combined secondary-fix integration candidate — 27 September 2026
+
+- PR #223 (standard Coin Prep must ignore retired sniper-tier query hints) and
+  PR #225 (restart status must use durable campaign provenance instead of
+  inferring Bootstrap from offer-tier sizes) were independently reproduced
+  red-first on the primary PC, reviewed, and integrated into the feature
+  branch only. No merge to `main` and no release occurred.
+- The exact combined source identity is
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca`; local HEAD and
+  `github/codex/coin-prep-fee-approval` resolved to that same full SHA after
+  push. The tracked worktree was clean.
+- Primary affected regression group: **165 passed**. Superseding complete
+  Python suite: **7047 passed, 165 skipped, 422 subtests passed** in 1061.59
+  seconds. Complete real-Chromium E2E: **164 passed** in 99.17 seconds. Ruff
+  and `git diff --check` passed.
+- A fresh Windows build from that exact SHA passed after the exact stale
+  packaged PID holding the previous `dist` DLL was identified and stopped.
+  Packaged API (nine endpoint checks), synthetic mTLS Sage RPC,
+  interrupted-publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all exited successfully.
+- Exact executable: `dist/Catalyst/Catalyst.exe`; SHA-256
+  `8E109AD62089C5DD5E8C729AF7C363F3D6745BD07BC0D0980531F77620C5D568`.
+  Immutable handoff archive:
+  `CATalyst-9bbf972-primary-acceptance.zip`; SHA-256
+  `E1D773FC88698B7B41AE542685174A41A7EB733265DA8F4881210B782D92326A`.
+- The secondary PC was instructed to fetch and independently retest this
+  exact combined SHA, commit and push its evidence checkpoint, and remain the
+  sole live-wallet owner during the cross-PC run. Its complete combined-SHA
+  result is still pending and is not represented as passed here.
+- Existing live-market limitations remain legitimate acceptance facts rather
+  than bypass candidates: confidence is RED for excluded out-of-range depth,
+  insufficient attributable ask depth, and single-provider dependency. The
+  saved pre-fee strategy remains preserved and inactive because it exceeds
+  available MZ.
