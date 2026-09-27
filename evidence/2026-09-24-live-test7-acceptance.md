@@ -743,3 +743,23 @@ than funds being exposed under fabricated pricing authority.
   submitted or mutated by the suite.
 - A fresh repository-wide `python -m ruff check .` completed immediately after
   the full suite with `All checks passed!` and exit code 0.
+
+### Exact-head Windows package verification — 27 September 2026
+
+- Primary created an isolated detached worktree at exact feature head
+  `a6bf486c36ded5a1eb11d3d95b5eee380be9fb1c`, preserving the running live
+  package and its user data. `python build.py` completed successfully with
+  PyInstaller 6.21.0 on Python 3.12.6 and verified bundled HTML and certifi CA
+  assets.
+- The fresh executable is
+  `C:\catalyst\.superpowers\build-a6bf486\dist\Catalyst\Catalyst.exe`, with
+  SHA-256
+  `160D52D1593D03F2C99880A20166A22B08DDB78660D198962DAB29C27A175619`.
+- Against that exact executable, packaged API smoke passed all health,
+  Sage-running, startup, configuration, diagnostics, self-test and doctor
+  routes; packaged Sage-RPC worker smoke passed; upgrade/publication recovery
+  smoke passed; and the native desktop smoke passed clean-profile, duplicate
+  handoff, persisted-profile relaunch and startup-safety launches.
+- All package smokes exited 0. They used isolated profiles or mocked Sage RPC;
+  they did not act on TEST 7, approve a fee, create an offer or mutate the
+  preserved live Bootstrap review.
