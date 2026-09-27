@@ -323,3 +323,48 @@ Direct source audit confirmed the tested safety boundaries:
 No CATalyst defect was reproduced, so no fix branch or package rebuild was
 created. This checkpoint is evidence-only and does not expand the live result:
 the primary PC remains the sole owner of the concurrent live Bootstrap review.
+
+## Live Bootstrap recovery evidence review and invariant audit
+
+The primary live-checkpoint commit was fetched and verified at exact feature
+HEAD `9b780830ebc21b83b131c7f06bbdd2269e558bde`, with exact parent
+`15332ca371654f6487a5aa2c2a838a6981b2c3bc`. The sole parent delta is 43 added
+lines in `evidence/2026-09-24-live-test7-acceptance.md`; `git diff --check`
+passed. The checkpoint records campaign
+`aaf64855aef9e1919d7cdfd4b15c1f589e7acf9321d71787b0b8122df9e16405`
+at revision 0, the exact TEST 7 MZ identity, a bounded 3-buy/3-sell first stage,
+exact Coin Prep fee closure, 0/6 through 6/6 authoritative cancellation, and a
+clean 3-buy/3-sell remake on the same campaign revision.
+
+The secondary PC remained strictly non-wallet and tested those recorded
+invariants with isolated temporary databases and mocked wallet/provider
+boundaries. No CATalyst process was launched against the live profile and no
+wallet read, fee approval, signing or spend occurred.
+
+The focused backend/integration command ran the complete Bootstrap live
+lifecycle, campaign persistence, Bootstrap end-to-end, Coin Prep fee-session
+completion, Bootstrap fee integration, protected cancellation and legacy-fee
+commitment files. Result: **102 passed in 55.96 seconds**. This covers:
+
+- every offer carrying the campaign and budget revision, with the active
+  revision rechecked at the journal boundary;
+- completion requiring exact current targets and zero unresolved holds, with
+  durable accounting surviving restart and confirmed cancellation moving the
+  hold to spend exactly once;
+- partial terminal cohorts remaining committed, restart surfacing the real hold,
+  and unresolved cancellation preventing replacement creation;
+- the full mocked confirmation → Coin Prep → bounded offer creation → cancel →
+  restart/remake cycle, including creation of only missing levels and fencing
+  superseded revisions.
+
+The focused Chromium recovery command exercised 11 GUI paths and passed all 11
+in 8.46 seconds. It verified that Cancel All explicitly covers the authoritative
+Sage offer set, Coin Prep waits while terminal proof propagates, unverified
+success cannot resume work, the async operation remains latched, reload restores
+its progress, completion clears stale recovery UI, and stale operation
+generations cannot unlock a newer cancellation.
+
+No discrepancy or CATalyst defect was reproduced. The live evidence is
+internally consistent with the independently tested durable state-machine and
+fee-ledger contracts, including restart blocking until all six cancellations
+are authoritative and a clean same-revision six-offer remake afterward.
