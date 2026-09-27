@@ -17,6 +17,8 @@ def _service():
 def settings():
     result = {"TIER_ENABLED": True, "BUY_LADDER_REVERSED": False,
               "LIQUIDITY_MODE": "two_sided", "CAT_DECIMALS": 3,
+              "SNIPER_ENABLED": False, "SNIPER_PREP_COUNT": 0,
+              "SNIPER_SIZE_XCH": Decimal("0"),
               "COIN_PREP_HEADROOM_PCT": Decimal("10"), "SPREAD_BPS": Decimal("10000"),
               "MIN_EDGE_BPS": Decimal("0"), "XCH_RESERVE": Decimal("0.25"),
               "CAT_RESERVE": Decimal("1.001"), "MAX_ACTIVE_BUY_OFFERS": 3,
@@ -53,6 +55,26 @@ def test_asymmetric_live_counts_and_spares_use_actual_sell_ladder_prices(setting
     assert result["worker_args"]["cat_tier_sizes"] == "inner=110,outer=27.5"
     assert result["worker_args"]["xch_target"] == 5
     assert result["worker_args"]["cat_target"] == 2
+
+
+def test_retired_sniper_settings_do_not_shape_fee_preview_or_worker_targets(settings):
+    """Stale sniper settings cannot re-enable a retired wallet-prep cohort."""
+    settings.update(
+        SNIPER_ENABLED=True,
+        SNIPER_PREP_COUNT=20,
+        SNIPER_SIZE_XCH=Decimal("0.33"),
+    )
+
+    result = _build(settings)
+
+    assert result["worker_args"]["xch_target"] == 5
+    assert result["worker_args"]["cat_target"] == 2
+    assert "sniper" not in result["worker_args"]["buy_tier_sizes"]
+    assert "sniper" not in result["worker_args"]["cat_tier_sizes"]
+    assert "sniper" not in result["worker_args"]["tier_counts_xch"]
+    assert "sniper" not in result["worker_args"]["tier_counts_cat"]
+    assert len([target for target in result["targets"] if target.asset == "xch"]) == 5
+    assert len([target for target in result["targets"] if target.asset == "cat"]) == 2
 
 
 def test_execution_worker_and_preview_share_the_hand_checked_economic_amounts(settings, monkeypatch):

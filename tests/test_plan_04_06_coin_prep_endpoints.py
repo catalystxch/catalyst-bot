@@ -781,6 +781,25 @@ class TestCoinPrepVerify(_FlaskBase):
             )
         self.assertEqual(resp.status_code, 200)
 
+    def test_tier_verify_ignores_retired_sniper_query_even_when_stale_settings_enable_it(self):
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self.client.get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&sniper_xch=0.33&sniper_cat=4400"
+                "&sniper_xch_count=20&sniper_cat_count=20",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("sniper", body["tiers"])
+        self.assertTrue(body["all_sufficient"])
+        self.assertFalse(body["needs_coin_prep"])
+
     def test_flat_mode_response_has_required_keys(self):
         with (
             patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
