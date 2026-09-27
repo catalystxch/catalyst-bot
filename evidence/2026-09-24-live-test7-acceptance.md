@@ -699,3 +699,28 @@ than funds being exposed under fabricated pricing authority.
   sparse-gossip disclosure and stopped-listener presentation; all ten passed
   in 0.64 seconds. An initial command used the wrong unittest class qualifier
   and collected no cases; the corrected selectors produced this result.
+
+### Bounded Market Bootstrap review and fee-boundary regression — 27 September 2026
+
+- Through the normal browser workflow, primary selected the exact TEST 7 MZ
+  pair, Bootstrap authority, two-sided operation, 10% XCH and MZ reserves and
+  the Balanced profile. The review was bounded to anchor `0.000075 XCH/MZ`,
+  one-day expiry, `0.9 XCH`, `12,000 MZ`, a maximum `0.001 XCH` fee budget,
+  and three buy plus three sell offers.
+- The exact 64-character asset confirmation was supplied and Preview returned
+  `REVIEW ONLY — no wallet action` for asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  fixed corridor `0.0000375–0.00015`, and first stage 10%. Start Campaign was
+  enabled, but was deliberately not invoked without the required action-time
+  confirmation of that displayed plan and fee ceiling. No offer, fee, wallet
+  mutation or campaign row was created by this preview.
+- Primary independently reran the focused Bootstrap API/UI, campaign
+  persistence, stopped-campaign renewal, cancellation-budget, recovery stop,
+  recovery invariant, mutation gate, Coin Prep integration, fee-approval
+  ledger and fee-recovery suites. The fresh result was **88 passed in 37.27
+  seconds** with exit code 0.
+- Secondary was assigned a complementary non-wallet audit against exact
+  feature head `0253134e64b4f389767d7aee718f0743590afbef`, covering Bootstrap
+  start gating, approval persistence and bypass resistance, protected
+  cancellation allowance, and restart recovery. Its new checkpoint is still
+  in progress and is not represented as complete here.
