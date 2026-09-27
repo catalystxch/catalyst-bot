@@ -87,6 +87,7 @@ def _request(**overrides):
 def bootstrap_app(tmp_path, monkeypatch):
     from blueprints import bootstrap
     from blueprints import coin_prep
+
     database.close_connection()
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "bootstrap-e2e.db"))
     monkeypatch.setattr(database, "_db_initialized_path", "")
