@@ -730,3 +730,14 @@ than funds being exposed under fabricated pricing authority.
   start gating, approval persistence and bypass resistance, protected
   cancellation allowance, and restart recovery. Its new checkpoint is still
   in progress and is not represented as complete here.
+
+### Fresh full primary regression — 27 September 2026
+
+- After integrating the secondary final-head safety checkpoint, primary ran
+  `python -m pytest -q tests` from the exact integrated feature branch. The
+  complete result was **7,047 passed, 165 skipped, 422 subtests passed in
+  933.30 seconds (15:33)** with exit code 0.
+- The run used pytest's isolated temporary data directory. Expected warnings
+  exercised fail-closed lease, recovery and authoritative-reconciliation test
+  paths; no test failed and the preserved live TEST 7 Bootstrap review was not
+  submitted or mutated by the suite.
