@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,53 @@ from blueprints import bot as bot_routes
 from blueprints import coin_prep as coin_prep_routes
 from blueprints import config_bp
 import coin_prep_worker
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_gui_does_not_reinterpret_confirmation_text_as_html():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "msgEl.innerHTML = message" not in source
+    assert "msgEl.innerHTML = String(message)" not in source
+
+
+def test_gui_external_links_use_protocol_allowlist_not_scheme_denylist():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "startsWith('javascript:')" not in source
+    assert "!/^https?:$/i.test(parsed.protocol)" in source
+
+
+def test_gui_token_icons_are_validated_before_dom_assignment():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "function getSafeTokenIconUrl(" in source
+    assert "titleIcon.setAttribute('src', iconUrl)" not in source
+    assert "img.setAttribute('src', url)" not in source
+    assert "iconEl.src = url" not in source
+
+
+def test_smart_settings_result_does_not_reinterpret_dynamic_markup():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "resultBody.innerHTML =" not in source
+
+
+def test_fee_reason_translation_never_returns_arbitrary_exception_text():
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_APPROVAL_STALE"), "FEE_APPROVAL_UNAVAILABLE"
+        )
+        == "FEE_APPROVAL_STALE"
+    )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_SECRET_LOCAL_PATH"), "FEE_APPROVAL_UNAVAILABLE"
+        )
+        == "FEE_APPROVAL_UNAVAILABLE"
+    )
 
 
 def test_coin_prep_cli_rejects_unsafe_args_without_spawning(monkeypatch):

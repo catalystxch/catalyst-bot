@@ -15111,15 +15111,15 @@
                 // icons.dexie.space serves .webp ONLY — .png returns a 1140-byte
                 // grey placeholder. Always use .webp.
                 const dexieFallback = `https://icons.dexie.space/${aid}.webp`;
-                const iconUrl = (typeof getTokenIconUrl === 'function')
-                    ? getTokenIconUrl(aid)
+                const iconUrl = (typeof getSafeTokenIconUrl === 'function')
+                    ? getSafeTokenIconUrl(aid)
                     : dexieFallback;
                 // Compare using getAttribute('src') not .src — browsers normalise
                 // .src to an absolute URL, so "" becomes the page origin and the
                 // !== check against an https://icons... URL always fails.
                 const currentSrc = titleIcon.getAttribute('src') || '';
                 if (iconUrl && currentSrc !== iconUrl) {
-                    titleIcon.setAttribute('src', iconUrl);
+                    titleIcon.src = iconUrl;
                     titleIcon.dataset.fallbackSrc = (iconUrl !== dexieFallback) ? dexieFallback : '';
                 }
                 // Only make visible once we've given it a real src.
@@ -15919,7 +15919,7 @@
             if (!anchor || !IS_DESKTOP) return;
 
             const rawHref = anchor.getAttribute('href') || '';
-            if (!rawHref || rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
+            if (!rawHref || rawHref.startsWith('#')) {
                 return;
             }
 
@@ -18243,33 +18243,16 @@
         ];
         let _tokenPreviewUrl = '';   // Set when Spacescan intel data arrives
 
-        function getTokenIconUrl(assetId) {
-            if (!assetId || assetId.toLowerCase() === 'xch') return '';
-            // Prefer the icon_url stored in currentCAT (populated from data-icon-url
-            // in the option element, which the server derives from Dexie's full 64-char
-            // base_id).  Sage wallet returns truncated 32-char IDs which icons.dexie.space
-            // doesn't recognise — using the Dexie base_id ensures the correct icon loads.
-            if (currentCAT && currentCAT.asset_id === assetId && currentCAT.icon_url) {
-                return currentCAT.icon_url;
-            }
-            // Only use the Spacescan CDN URL if it comes from a known-whitelisted host.
-            if (_tokenPreviewUrl) {
-                try {
-                    const host = new URL(_tokenPreviewUrl).hostname;
-                    if (_SPACESCAN_ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h))) {
-                        return _tokenPreviewUrl;
-                    }
-                } catch (_) { /* malformed URL — fall through */ }
-            }
-            // Last resort: construct from assetId directly (works when assetId is
-            // already the full 64-char Dexie base_id).
-            // IMPORTANT: icons.dexie.space serves .webp ONLY — .png returns a
-            // 1140-byte grey placeholder.
-            return `https://icons.dexie.space/${assetId}.webp`;
+        function getSafeTokenIconUrl(assetId) {
+            const normalized = String(assetId || '').trim().toLowerCase();
+            if (normalized === 'xch' || !/^[0-9a-f]{64}$/.test(normalized)) return '';
+            // Construct the URL locally from a canonical asset id.  Never copy a
+            // server/DOM-provided URL into an image sink.
+            return `https://icons.dexie.space/${normalized}.webp`;
         }
 
         function updateTokenIcons(assetId) {
-            const url = getTokenIconUrl(assetId);
+            const url = getSafeTokenIconUrl(assetId);
             // dexie.space is always in the CSP — guaranteed fallback if primary fails.
             // Must use .webp; .png returns the grey 404 placeholder.
             const dexieFallback = (assetId && assetId.toLowerCase() !== 'xch')
@@ -18280,7 +18263,7 @@
             // .src to a full absolute URL, which breaks !== comparisons.
             document.querySelectorAll('.cc-token-icon').forEach(img => {
                 if (url) {
-                    img.setAttribute('src', url);
+                    img.src = url;
                     img.dataset.fallbackSrc = (url !== dexieFallback) ? dexieFallback : '';
                     img.style.display = 'inline-block';
                 } else {
@@ -18297,7 +18280,7 @@
                 const iconEl = pill.querySelector('.cc-token-icon');
                 if (nameEl) nameEl.textContent = tokenName;
                 if (iconEl && url) {
-                    iconEl.src = url;
+                    iconEl.setAttribute('src', getSafeTokenIconUrl(assetId));
                     iconEl.style.display = 'inline-block';
                 } else if (iconEl) {
                     iconEl.style.display = 'none';
@@ -19937,11 +19920,9 @@
                 // Default: textContent (XSS-safe). Callers passing trusted static
                 // HTML (no server data) may opt in with allowHtml: true.
                 const msgEl = document.getElementById('confirmMessage');
-                if (allowHtml) {
-                    msgEl.innerHTML = message;
-                } else {
-                    msgEl.textContent = String(message);
-                }
+                msgEl.textContent = String(message)
+                    .replace(/<br\s*\/?>/gi, '\n')
+                    .replace(/<[^>]*>/g, '');
                 document.getElementById('confirmCancelBtn').textContent = cancelText;
                 const okBtn = document.getElementById('confirmOkBtn');
                 okBtn.textContent = confirmText;
@@ -19989,8 +19970,9 @@
                 document.getElementById('promptIcon').innerHTML = icon;
                 document.getElementById('promptTitle').textContent = title;
                 const msgEl = document.getElementById('promptMessage');
-                if (allowHtml) msgEl.innerHTML = message;
-                else msgEl.textContent = String(message);
+                msgEl.textContent = String(message)
+                    .replace(/<br\s*\/?>/gi, '\n')
+                    .replace(/<[^>]*>/g, '');
                 const input = document.getElementById('promptInput');
                 input.value = initialValue;
                 input.placeholder = placeholder;
@@ -20811,11 +20793,17 @@
                     const profileLabel = escapeHtml(appliedProfile.charAt(0).toUpperCase() + appliedProfile.slice(1));
                     const profileBadge = `<span style="background:${profileColour}22;color:${profileColour};border:1px solid ${profileColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${profileLabel}</span>`;
 
-                    resultTitle.innerHTML = `\u2713 Smart Settings applied &nbsp;${qBadge}&nbsp;${profileBadge}`;
-                    resultBody.innerHTML = `<div style="margin-bottom:8px;line-height:1.8;">${srcBadges}</div>
-                        <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:8px;display:flex;flex-direction:column;gap:8px;">
-                            ${marketRow}${capitalRow}${ladderRow}${spreadRow}${incentiveRow}${diffRow}
-                        </div>`;
+                    resultTitle.textContent = `\u2713 Smart Settings applied · ${qualityScore}% ${qualityLabel} · ${appliedProfile}`;
+                    resultBody.textContent = [
+                        `Market: ${priceStr}; ${regime}; ${mktActivity}; ${riskLabel || 'unknown'} risk`,
+                        cp.available_xch > 0
+                            ? `Capital: ${(cp.total_xch || cp.available_xch).toFixed(3)} XCH total; ${cp.n_final || 0} offers/side`
+                            : 'Capital: insufficient after reserve',
+                        spreadBps > 0
+                            ? `Spread: ${spreadPct}; requote ${requotePct}`
+                            : 'Spread: unavailable',
+                        _diffParts.length ? `Changed: ${_diffParts.join(' · ')}` : '',
+                    ].filter(Boolean).join('\n');
                     resultBox.style.display = 'block';
 
                     // Show quick-rerun strip and highlight active profile button
@@ -21089,7 +21077,7 @@
             const progressEl = document.getElementById('smartDefaultsProgress');
             if (resultBox) { resultBox.style.display = 'none'; }
             if (resultTitle) resultTitle.innerHTML = '';
-            if (resultBody) resultBody.innerHTML = '';
+                if (resultBody) resultBody.textContent = '';
             if (statusEl) statusEl.textContent = '';
             if (progressEl) progressEl.style.display = 'none';
 

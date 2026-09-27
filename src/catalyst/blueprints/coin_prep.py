@@ -60,14 +60,49 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 bp = Blueprint("coin_prep", __name__)
 
+
+def _public_fee_reason(exc: ValueError, fallback: str) -> str:
+    """Translate internal exceptions to fixed public reason-code literals."""
+    value = str(exc)
+    if value == "FEE_PREP_OPTIONS_INVALID":
+        return "FEE_PREP_OPTIONS_INVALID"
+    if value == "FEE_APPROVAL_STALE":
+        return "FEE_APPROVAL_STALE"
+    if value == "FEE_BUDGET_INSUFFICIENT":
+        return "FEE_BUDGET_INSUFFICIENT"
+    if value == "FEE_ESTIMATE_UNAVAILABLE":
+        return "FEE_ESTIMATE_UNAVAILABLE"
+    if value == "FEE_WALLET_CONTEXT_CHANGED":
+        return "FEE_WALLET_CONTEXT_CHANGED"
+    if value == "FEE_BUDGET_EXCEEDED":
+        return "FEE_BUDGET_EXCEEDED"
+    if value == "FEE_DISPATCH_PLAN_MISMATCH":
+        return "FEE_DISPATCH_PLAN_MISMATCH"
+    if value == "FEE_EFFECT_NOT_DISPATCHABLE":
+        return "FEE_EFFECT_NOT_DISPATCHABLE"
+    if value == "FEE_EFFECT_RECOVERY_REQUIRED":
+        return "FEE_EFFECT_RECOVERY_REQUIRED"
+    if value == "FEE_PREP_FUNDING_INSUFFICIENT":
+        return "FEE_PREP_FUNDING_INSUFFICIENT"
+    if value == "FEE_PREP_PRINCIPAL_UNFUNDED":
+        return "FEE_PREP_PRINCIPAL_UNFUNDED"
+    if value == "FEE_UNSIGNED_COST_UNAVAILABLE":
+        return "FEE_UNSIGNED_COST_UNAVAILABLE"
+    return fallback
+
+
 _coin_prep_trigger_lock = threading.Lock()
 
 
 def _fee_json_amounts(value):
     """Preserve atomic amounts even inside staged quotes at JS boundaries."""
     if type(value) is dict:
-        return {key: str(item) if key.endswith("_mojos") and type(item) is int
-                else _fee_json_amounts(item) for key, item in value.items()}
+        return {
+            key: str(item)
+            if key.endswith("_mojos") and type(item) is int
+            else _fee_json_amounts(item)
+            for key, item in value.items()
+        }
     if type(value) is list:
         return [_fee_json_amounts(item) for item in value]
     return value
@@ -82,22 +117,42 @@ def api_coin_prep_fee_preview():
 
     body = request.get_json(silent=True)
     if type(body) is not dict:
-        return jsonify({"success": False, "reason": "FEE_PREP_OPTIONS_INVALID",
-                        "dispatch_authorized": False}), 400
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FEE_PREP_OPTIONS_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
     try:
         result = preview_coin_prep_fees(body)
-        return jsonify(_fee_json_amounts({**result, "success": result["available"] is True}))
+        return jsonify(
+            _fee_json_amounts({**result, "success": result["available"] is True})
+        )
     except ValueError as exc:
-        reason = str(exc)
-        if re.fullmatch(r"FEE_[A-Z_]+", reason):
+        reason = _public_fee_reason(exc, "FEE_PREVIEW_UNAVAILABLE")
+        if reason != "FEE_PREVIEW_UNAVAILABLE":
             status = 400 if reason == "FEE_PREP_OPTIONS_INVALID" else 409
-            return jsonify({"success": False, "reason": reason,
-                            "dispatch_authorized": False}), status
-        slog("COIN_PREP", "Fee preview rejected invalid server context", level="warning")
+            return jsonify(
+                {"success": False, "reason": reason, "dispatch_authorized": False}
+            ), status
+        slog(
+            "COIN_PREP", "Fee preview rejected invalid server context", level="warning"
+        )
     except Exception:
-        slog("COIN_PREP", "Fee preview could not read current server context", level="error")
-    return jsonify({"success": False, "available": False, "reason": "FEE_PREVIEW_UNAVAILABLE",
-                    "dispatch_authorized": False}), 503
+        slog(
+            "COIN_PREP",
+            "Fee preview could not read current server context",
+            level="error",
+        )
+    return jsonify(
+        {
+            "success": False,
+            "available": False,
+            "reason": "FEE_PREVIEW_UNAVAILABLE",
+            "dispatch_authorized": False,
+        }
+    ), 503
 
 
 @bp.route("/api/coin-prep/fee-approval", methods=["POST"])
@@ -109,11 +164,17 @@ def api_coin_prep_fee_approval():
 
     body = request.get_json(silent=True)
     keys = {"preview_id", "maximum_fee_mojos", "cancellation_reserve_mojos"}
-    invalid = {"success": False, "reason": "FEE_APPROVAL_REQUEST_INVALID",
-               "dispatch_authorized": False}
-    if (type(body) is not dict or set(body) != keys
-            or type(body["preview_id"]) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None):
+    invalid = {
+        "success": False,
+        "reason": "FEE_APPROVAL_REQUEST_INVALID",
+        "dispatch_authorized": False,
+    }
+    if (
+        type(body) is not dict
+        or set(body) != keys
+        or type(body["preview_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None
+    ):
         return jsonify(invalid), 400
     amounts = {}
     for key in ("maximum_fee_mojos", "cancellation_reserve_mojos"):
@@ -131,15 +192,29 @@ def api_coin_prep_fee_approval():
         # JavaScript numbers cannot represent the full supported mojo range.
         return jsonify(_fee_json_amounts({**result, "success": True}))
     except ValueError as exc:
-        reason = str(exc)
-        if re.fullmatch(r"FEE_[A-Z_]+", reason):
-            return jsonify({"success": False, "reason": reason,
-                            "dispatch_authorized": False}), 409
-        slog("COIN_PREP", "Fee confirmation rejected invalid server context", level="warning")
+        reason = _public_fee_reason(exc, "FEE_APPROVAL_UNAVAILABLE")
+        if reason != "FEE_APPROVAL_UNAVAILABLE":
+            return jsonify(
+                {"success": False, "reason": reason, "dispatch_authorized": False}
+            ), 409
+        slog(
+            "COIN_PREP",
+            "Fee confirmation rejected invalid server context",
+            level="warning",
+        )
     except Exception:
-        slog("COIN_PREP", "Fee confirmation could not read current server context", level="error")
-    return jsonify({"success": False, "reason": "FEE_APPROVAL_UNAVAILABLE",
-                    "dispatch_authorized": False}), 503
+        slog(
+            "COIN_PREP",
+            "Fee confirmation could not read current server context",
+            level="error",
+        )
+    return jsonify(
+        {
+            "success": False,
+            "reason": "FEE_APPROVAL_UNAVAILABLE",
+            "dispatch_authorized": False,
+        }
+    ), 503
 
 
 def _coin_prep_wallet_snapshot(
@@ -1448,9 +1523,8 @@ def api_coin_prep_status():
                 with open(status_file, "r") as f:
                     worker_status = json.load(f)
                 candidate_approval_id = worker_status.get("fee_approval_id")
-                if (
-                    type(candidate_approval_id) is str
-                    and re.fullmatch(r"[0-9a-f]{64}", candidate_approval_id)
+                if type(candidate_approval_id) is str and re.fullmatch(
+                    r"[0-9a-f]{64}", candidate_approval_id
                 ):
                     worker_fee_approval_id = candidate_approval_id
                     if bootstrap_campaign is None:
@@ -1828,9 +1902,7 @@ def api_coin_prep_status():
                 from database import get_latest_coin_prep_fee_approval_for_campaign
 
                 latest_campaign_approval_id = (
-                    get_latest_coin_prep_fee_approval_for_campaign(
-                        campaign_id
-                    )
+                    get_latest_coin_prep_fee_approval_for_campaign(campaign_id)
                 )
                 if latest_campaign_approval_id is not None:
                     if latest_campaign_approval_id != worker_fee_approval_id:
@@ -2101,9 +2173,7 @@ def api_coin_prep_verify(_args=None):
             topup_pool_xch_mojos = 0
             topup_pool_cat_mojos = 0
         else:
-            xch_reserve_mojos = _xch_display_to_mojos_ceil(
-                args.get("xch_reserve", "0")
-            )
+            xch_reserve_mojos = _xch_display_to_mojos_ceil(args.get("xch_reserve", "0"))
             cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
                 _safe_non_negative_decimal(args.get("cat_reserve", "0")),
                 cat_decimals,
@@ -2534,9 +2604,7 @@ def _api_coin_prep_trigger_locked():
 
             _approved_dispatch = price_approved_prep_batch(_fee_approval_id)
         except ValueError as exc:
-            reason = str(exc)
-            if re.fullmatch(r"FEE_[A-Z_]+", reason) is None:
-                reason = "FEE_APPROVAL_UNAVAILABLE"
+            reason = _public_fee_reason(exc, "FEE_APPROVAL_UNAVAILABLE")
             return (
                 jsonify(
                     {
@@ -3172,10 +3240,7 @@ def _api_coin_prep_trigger_locked():
                         tier: max(
                             0,
                             int(
-                                getattr(
-                                    cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0
-                                )
-                                or 0
+                                getattr(cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0) or 0
                             ),
                         )
                         for tier in ("inner", "mid", "outer", "extreme")
