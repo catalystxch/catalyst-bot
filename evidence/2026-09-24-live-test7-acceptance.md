@@ -763,3 +763,46 @@ than funds being exposed under fabricated pricing authority.
 - All package smokes exited 0. They used isolated profiles or mocked Sage RPC;
   they did not act on TEST 7, approve a fee, create an offer or mutate the
   preserved live Bootstrap review.
+
+### Confirmed live Bootstrap, Coin Prep and recovery cycle — 27 September 2026
+
+- The operator confirmed the displayed bounded Bootstrap campaign through the
+  normal browser workflow. CATalyst durably created campaign
+  `aaf64855aef9e1919d7cdfd4b15c1f589e7acf9321d71787b0b8122df9e16405`
+  at revision 0 for exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  Sage fingerprint `736588221`, CAT wallet 2 and mainnet. The plan remained
+  bounded to anchor `0.000075`, corridor `0.0000375–0.00015`, one-day expiry,
+  `0.9 XCH`, `12,000 MZ`, maximum campaign fees `0.001 XCH`, and a 10% first
+  stage with three buys plus three sells.
+- The fresh Coinset quote targeted 300-second inclusion per transaction and
+  displayed two preparation transactions, one exact plus three projected cost
+  records, `0.000250212184 XCH` cumulative maximum and
+  `0.00006940005 XCH` protected cancellation allowance. The UI separately
+  identified `0.006 XCH` fee-coin principal as prepared principal, not fees.
+  The operator confirmed that exact displayed cap and preserved all historical
+  fills, P&L, offers and runtime evidence.
+- Coin Prep ran through the normal UI. The first authoritative settlement moved
+  `0.000041494074 XCH` from held to confirmed spent; final confirmed spend was
+  `0.00005348811 XCH`, with no held fee remaining. The worker closed the fee
+  scope from authoritative target and journal evidence with 66 targets and two
+  operations. Final readiness was **36/36 XCH** and **30/30 MZ** campaign coins;
+  the wallet showed 218 XCH coins and 99 MZ coins including reserves.
+- Start Bot completed its wallet reconciliation and created exactly six live
+  campaign offers: three buy and three sell. Two full loops completed with zero
+  errors. The active stage locked exactly `0.09 XCH` and `1,200 MZ`; offer rows
+  showed Dexie publication success and exact Dexie rediscovery. Splash remained
+  degraded with `InsufficientPeers`, which was disclosed without weakening the
+  RED confidence gate or interrupting bounded Bootstrap execution.
+- Primary then exercised the authorized stop/cancel/recovery path. Stop completed
+  cleanly after the current cycle. Cancel All used the protected fee workflow,
+  kept restart blocked while operations were unresolved, progressed from 0/6 to
+  3/6 and finally **6/6 authoritatively terminal with zero failures**. Locked
+  inventory returned to zero and Start remained unavailable until the final
+  Sage proof arrived.
+- After terminal reconciliation, primary restarted the same campaign. Wallet
+  reconciliation found zero unknown/open offers, and two new loops recreated
+  exactly three buy plus three sell offers with the same `0.09 XCH` and
+  `1,200 MZ` stage locks. At the checkpoint the bot was RUNNING, errors were
+  zero, campaign revision remained 0, and the RED Follow-market confidence gate
+  remained intact while bounded Bootstrap offers stayed active.
