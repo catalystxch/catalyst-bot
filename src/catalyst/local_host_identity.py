@@ -10,16 +10,15 @@ def _configured_local_fqdn() -> str:
     """Read Windows' physical computer name without a network DNS lookup."""
     if os.name != "nt":
         return socket.getfqdn()
-    import ctypes
-    from ctypes import wintypes
+    from ctypes import WinDLL, byref, c_int, create_unicode_buffer, wintypes
 
-    get_name = ctypes.WinDLL("kernel32", use_last_error=True).GetComputerNameExW
-    get_name.argtypes = [ctypes.c_int, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    get_name = WinDLL("kernel32", use_last_error=True).GetComputerNameExW
+    get_name.argtypes = [c_int, wintypes.LPWSTR, wintypes.LPDWORD]
     get_name.restype = wintypes.BOOL
-    buffer = ctypes.create_unicode_buffer(256)
+    buffer = create_unicode_buffer(256)
     size = wintypes.DWORD(len(buffer))
     # Physical, not a cluster virtual name whose PID may belong to another node.
-    if not get_name(7, buffer, ctypes.byref(size)):
+    if not get_name(7, buffer, byref(size)):
         return ""
     return buffer.value
 

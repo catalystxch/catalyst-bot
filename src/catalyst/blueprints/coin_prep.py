@@ -173,7 +173,6 @@ def api_coin_prep_fee_preview():
 @bp.route("/api/coin-prep/fee-approval", methods=["POST"])
 def api_coin_prep_fee_approval():
     """Record explicit fee consent, never launch or dispatch Coin Prep."""
-    import re
     from coin_prep_fee_approval import MAX_ATOMIC_AMOUNT, approve_coin_prep_fees
     from super_log import slog
 
@@ -3898,7 +3897,6 @@ def api_logs_download():
         import glob
         import io
         import platform as _platform
-        import re
         import sys as _sys
         import zipfile
         from pathlib import Path

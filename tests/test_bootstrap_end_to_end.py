@@ -960,7 +960,6 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     ).get_json()["campaign_id"]
     record = database.get_bootstrap_campaign(campaign_id)
 
-    import bot_loop
     import tx_fees
     import wallet
 
@@ -1139,7 +1138,6 @@ def test_red_market_still_drains_current_bootstrap_publication_queues(monkeypatc
 
 
 def test_live_bot_finalizes_automatic_bootstrap_stop_after_offer_clearance(monkeypatch):
-    import bot_loop
     import tx_fees
     import wallet
 
@@ -1654,7 +1652,6 @@ def test_live_bot_materializes_authoritative_stage_before_creating(
         required_depth_mojos=50_000_000_000,
     )
 
-    import bot_loop
     import wallet
 
     monkeypatch.setattr(wallet, "get_wallet_puzzle_hashes", lambda: {"99" * 32})
