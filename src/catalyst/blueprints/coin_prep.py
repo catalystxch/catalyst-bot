@@ -1940,7 +1940,7 @@ def api_coin_prep_status():
 
 
 @bp.route("/api/coin-prep/verify")
-def api_coin_prep_verify():
+def api_coin_prep_verify(_args=None):
     """Verify if the wallet already has the right coins for the requested prep.
 
     Fetches spendable coins from the wallet and groups them by amount,
@@ -1956,6 +1956,7 @@ def api_coin_prep_verify():
       tier_enabled=false
       trade_size=0.7&prepared_xch_size=0.77&prepared_cat_size=7654&max_buy=25&max_sell=25
     """
+    args = request.args if _args is None else _args
     bot = api_server.bot
     try:
         from wallet import get_spendable_coins_rpc, get_wallet_balance, WALLET_ID_XCH
@@ -1966,20 +1967,20 @@ def api_coin_prep_verify():
             or getattr(cfg, "CAT_WALLET_ID", 2)
             or 2
         )
-        tier_enabled = request.args.get("tier_enabled", "false").lower() == "true"
+        tier_enabled = args.get("tier_enabled", "false").lower() == "true"
         liquidity_mode = _safe_liquidity_mode(
-            request.args.get("liquidity_mode")
+            args.get("liquidity_mode")
             or getattr(cfg, "LIQUIDITY_MODE", "two_sided")
             or "two_sided"
         )
         bootstrap_context = None
         bootstrap_campaign_id = str(
-            request.args.get("bootstrap_campaign_id") or ""
+            args.get("bootstrap_campaign_id") or ""
         ).strip()
         if bootstrap_campaign_id:
             try:
                 bootstrap_revision = int(
-                    request.args.get("bootstrap_campaign_revision", "")
+                    args.get("bootstrap_campaign_revision", "")
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError("bootstrap_coin_prep_confirmation_required") from exc
@@ -2105,17 +2106,17 @@ def api_coin_prep_verify():
             topup_pool_cat_mojos = 0
         else:
             xch_reserve_mojos = _xch_display_to_mojos_ceil(
-                request.args.get("xch_reserve", "0")
+                args.get("xch_reserve", "0")
             )
             cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
-                _safe_non_negative_decimal(request.args.get("cat_reserve", "0")),
+                _safe_non_negative_decimal(args.get("cat_reserve", "0")),
                 cat_decimals,
             )
             topup_pool_xch_mojos = _xch_display_to_mojos_ceil(
-                request.args.get("topup_pool_xch", "0")
+                args.get("topup_pool_xch", "0")
             )
             topup_pool_cat_mojos = cat_display_amount_to_mojos_ceil(
-                _safe_non_negative_decimal(request.args.get("topup_pool_cat", "0")),
+                _safe_non_negative_decimal(args.get("topup_pool_cat", "0")),
                 cat_decimals,
             )
         xch_available_mojos = max(0, xch_balance_mojos - xch_reserve_mojos)
@@ -2213,7 +2214,7 @@ def api_coin_prep_verify():
                         "fees",
                     ]
                     if any(
-                        request.args.get(f"{tier}_{suffix}") is not None
+                        args.get(f"{tier}_{suffix}") is not None
                         for suffix in ("xch", "cat", "count", "xch_count", "cat_count")
                     )
                 ]
@@ -2236,19 +2237,19 @@ def api_coin_prep_verify():
                     cat_needed = exact_spec["cat_needed"]
                 else:
                     xch_amount = _safe_non_negative_decimal(
-                        request.args.get(f"{tier}_xch", "0")
+                        args.get(f"{tier}_xch", "0")
                     )
                     cat_amount = _safe_non_negative_decimal(
-                        request.args.get(f"{tier}_cat", "0")
+                        args.get(f"{tier}_cat", "0")
                     )
                     common_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_count", "0")
+                        args.get(f"{tier}_count", "0")
                     )
                     xch_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_xch_count", common_needed)
+                        args.get(f"{tier}_xch_count", common_needed)
                     )
                     cat_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_cat_count", common_needed)
+                        args.get(f"{tier}_cat_count", common_needed)
                     )
                 needed = max(xch_needed, cat_needed)
                 is_xch_only_tier = tier == "fees" or cat_amount <= 0
@@ -2408,15 +2409,15 @@ def api_coin_prep_verify():
             return jsonify(api_server._client_safe_payload(response))
         else:
             # Flat mode
-            trade_size = _safe_non_negative_decimal(request.args.get("trade_size", "0"))
+            trade_size = _safe_non_negative_decimal(args.get("trade_size", "0"))
             prepared_xch_size = _safe_non_negative_decimal(
-                request.args.get("prepared_xch_size", str(trade_size or 0))
+                args.get("prepared_xch_size", str(trade_size or 0))
             )
             prepared_cat_size = _safe_non_negative_decimal(
-                request.args.get("prepared_cat_size", "0")
+                args.get("prepared_cat_size", "0")
             )
-            max_buy = _safe_non_negative_int(request.args.get("max_buy", "0"))
-            max_sell = _safe_non_negative_int(request.args.get("max_sell", "0"))
+            max_buy = _safe_non_negative_int(args.get("max_buy", "0"))
+            max_sell = _safe_non_negative_int(args.get("max_sell", "0"))
             if liquidity_mode == "buy_only":
                 max_sell = 0
             elif liquidity_mode == "sell_only":
