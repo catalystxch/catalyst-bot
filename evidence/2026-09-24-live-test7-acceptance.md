@@ -693,3 +693,9 @@ than funds being exposed under fabricated pricing authority.
   limitation is host/network reachability, while an empty Splash gossip stream
   remains legitimate degraded evidence rather than permission to fabricate
   provider redundancy.
+- Primary independently reran ten exact Splash adapter, health-alert and UI
+  boundary regressions covering normalized peer health, future-dated evidence
+  rejection, zero-peer degradation, metrics reachability, hook failure,
+  sparse-gossip disclosure and stopped-listener presentation; all ten passed
+  in 0.64 seconds. An initial command used the wrong unittest class qualifier
+  and collected no cases; the corrected selectors produced this result.
