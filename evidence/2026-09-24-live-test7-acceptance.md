@@ -806,3 +806,64 @@ than funds being exposed under fabricated pricing authority.
   `1,200 MZ` stage locks. At the checkpoint the bot was RUNNING, errors were
   zero, campaign revision remained 0, and the RED Follow-market confidence gate
   remained intact while bounded Bootstrap offers stayed active.
+
+### Exact integrated-head verification and live restart recovery — 27 September 2026
+
+- The authoritative feature head is
+  `60d49f2cf9822d9b8700b1391f75dcec54297c75` (`Remove optional Chia address
+  dependency`). The correction replaces accidental runtime and test reliance
+  on optional `chia.util.bech32m` with CATalyst's audited bundled Bech32m
+  primitives. Focused red/green coverage proved canonical XCH/txch vectors,
+  Dexie reward-address handling and Sage-owned puzzle-hash recovery with the
+  optional Chia package unavailable. The final focused result was 29 passed;
+  the exact former CI surface passed 254 tests with `chia` forced unavailable.
+- GitHub Code Quality, Deep Security Scan, CodeQL for Python/JavaScript/actions,
+  Semgrep and Gitleaks all passed at this exact head. Primary's clean full suite
+  passed **7,062 tests, skipped 166, and passed 422 subtests in 1,044.59
+  seconds**. The complete real-Chromium E2E suite passed **165 tests in 83.76
+  seconds**. Tracked Ruff check and format verification passed all 478 tracked
+  Python files, and no direct `chia.util.bech32m` import remains in application
+  or test code.
+- Primary built an isolated clean Windows package from that exact commit at
+  `C:\catalyst\.superpowers\public-ready-60d49f2`. The executable SHA-256 is
+  `522D5748AC0585AC5F93953606EBFF938BF05C1324D9B3B600DECF5E020A1E3C`.
+  `CATalyst-60d49f2-public-ready.zip` contains 192 files, is 37,309,261 bytes,
+  and has SHA-256
+  `46E978AA0F39D0D37976D633CE12298BBF4F1AEC6C3142982D6B5DC0E9265FD0`.
+  The extracted executable hash matched. The archive contains no runtime
+  `.env`, database/SQLite, log or Coin Prep state artifacts. Packaged API,
+  synthetic Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety smokes all passed. Current Microsoft
+  Defender reported zero active threats and zero recent detections for the
+  candidate; historical Defender records were not misrepresented as empty.
+- Primary shut down the prior package through its normal UI with `Cancel all
+  offers before shutdown` visibly unchecked, then launched the exact-head
+  executable. This caused no wallet mutation. The recovered process owns port
+  5000 and reports Sage RPC authenticated and listening, mainnet MZ wallet 2,
+  the exact campaign and asset, fee spent 59,937,994 mojos, zero held fee,
+  zero unresolved operations, and runtime safety allowed with every blocker
+  count zero.
+- Exact-head readback then proved recovery of all six live offers rather than
+  relying on the stopped bot's compact status projection. `/api/offers` and
+  `/api/offers/open_count` report three buys plus three sells. The diagnostic
+  endpoint reports that wallet and DB agree, every live offer has a unique
+  non-reserve coin, no wallet-only/stale/pending-cancel rows exist, and local
+  book consistency is true. `/api/coins` reconstructs three XCH locks totalling
+  `0.09 XCH` and three MZ locks totalling `1,200 MZ`. Coin Prep verification is
+  sufficient and read-only. This closes exact-build restart recovery without
+  cancelling, replacing or duplicating any offer.
+- The secondary PC independently repeated the exact `60d49f2` verification in
+  a fresh Python 3.12.10 environment installed only from
+  `requirements-dev.txt`; `chia_rs` was present and the full `chia` package was
+  absent. Its full serial result was **7,062 passed, 166 skipped in 1,370.32
+  seconds**, and its full Chromium result was **165 passed in 117.44 seconds**.
+  Tracked Ruff check/format, compileall, diff check, the clean Windows build,
+  API/Sage/recovery/native smokes, prior-package upgrade/relaunch, archive
+  artifact scan and round-trip executable hash all passed. Its independent EXE
+  SHA-256 was
+  `E1BF66D4A976E158E9F9458D63B0933F820F4605377E2765D6F7DAAD2B510D66`;
+  its ZIP SHA-256 was
+  `08C40097DD440A2E8D7CBC50EBD3D2D1AB0B22568A9864831EDA386E09E71D8A`.
+  The independent receipt is
+  `evidence/2026-09-27-secondary-public-readiness-54a3aeb.md`. It performed no
+  live-wallet mutation; the primary live lane above remains authoritative.
