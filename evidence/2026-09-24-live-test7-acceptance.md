@@ -628,3 +628,16 @@ than funds being exposed under fabricated pricing authority.
   not represented as complete here. Live lifecycle acceptance therefore
   remains open behind the same external RED market gate; no safety gate was
   bypassed and no merge or release occurred.
+- Immediately before another authorized primary cycle, the live package
+  listed TEST 7 fingerprint `736588221`, reported Sage synced, and bound CAT
+  wallet 2 to the exact MZ asset. The normal cookie-authenticated Start API
+  then completed one fresh loop and Stop returned `stopped`. Final status was
+  running false, errors zero, zero open offers, zero XCH/CAT locks, zero
+  pending cancellations and no runtime-safety blocker.
+- The cycle produced a fresh confidence snapshot at
+  `2026-09-27T12:19:38.618715Z`: Dexie evidence was valid and fresh, Splash
+  was degraded with `empty_offer_set`, provider redundancy was 1, and state
+  remained RED for `out_of_range_depth_excluded`,
+  `insufficient_ask_depth` and `single_provider_dependency`. Both
+  `can_create` and `can_requote` remained false, so no offer, cancellation,
+  fee or other wallet effect was attempted.
