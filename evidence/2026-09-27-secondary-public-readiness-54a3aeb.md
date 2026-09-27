@@ -4,11 +4,74 @@
 
 - Repository: `catalystxch/catalyst-bot`.
 - Remote branch: `codex/coin-prep-fee-approval`.
-- Final exact head: `4ebd9e7a369bd53f974ae421261d173396dc84fd`.
+- Final exact head: `60d49f2cf9822d9b8700b1391f75dcec54297c75`.
 - The candidate was tested in a detached isolated worktree. The remote ref and
   `git rev-parse HEAD` matched before final-head testing and packaging.
 - No CATalyst process was pointed at the live Sage profile. No wallet read,
   approval, signature, transaction, offer or fee spend was performed.
+
+## Superseding no-Chia CI revalidation at `60d49f2`
+
+GitHub CI exposed an undeclared dependency at predecessor `4ebd9e7`: the
+`unit-tests` job finished with **6,838 passed, 182 skipped, 1 failed and 15
+errors** because several production and test paths imported
+`chia.util.bech32m`, while the declared requirements intentionally contain
+`chia_rs` but not the full `chia-blockchain` distribution. Exact CI output is
+preserved at `outputs/4ebd9e7-ci-failure/unit-tests-job.log`.
+
+Primary fixed the defect at exact candidate
+`60d49f2cf9822d9b8700b1391f75dcec54297c75` by moving canonical XCH/TXCH
+Bech32m encoding and decoding into the dependency-light Sage wire module, then
+using it for Dexie address conversion and Sage wallet ownership decoding. The
+secondary PC fetched the remote branch, confirmed the remote ref and detached
+worktree both resolved to that full SHA, and reviewed the 12-file diff from
+`4ebd9e7`; `git diff --check` passed.
+
+A new Python 3.12.10 virtual environment was created strictly from
+`requirements-dev.txt`. `chia_rs` 0.30.0 was importable and
+`importlib.util.find_spec("chia")` returned `None`, proving the full Chia
+package was absent. In that environment:
+
+- affected Dexie/Sage wire and cancellation regressions passed **66/66**;
+- the complete serial suite passed **7,062 tests, 166 skipped, one warning in
+  1,370.32s**;
+- the complete opt-in Chromium E2E suite passed **165/165 in 117.44s**;
+- tracked Ruff check passed, tracked Ruff format check reported **478 files
+  already formatted**, `compileall src scripts tests` passed and
+  `git diff --check` passed;
+- reference-vector and blocked-full-Chia tests proved canonical XCH/TXCH
+  conversion, Dexie round trips and Sage ownership-cache decoding work without
+  `chia-blockchain`.
+
+The only suite warning is the pre-existing pytest deprecation warning for a
+`itertools.product` parametrization in `test_offer_registry.py`.
+GitHub's clean-requirements `unit-tests` job for exact `60d49f2` subsequently
+succeeded in 11m54s, independently confirming the missing-dependency failure
+is closed in CI.
+
+## Exact `60d49f2` Windows build and package
+
+- Clean `python build.py` succeeded with Python 3.12.10 and PyInstaller 6.22.3;
+  bundled HTML and certifi checks passed. Only the established optional
+  `pycparser.lextab` and `pycparser.yacctab` hidden-import warnings appeared.
+- Executable SHA-256:
+  `E1BF66D4A976E158E9F9458D63B0933F820F4605377E2765D6F7DAAD2B510D66`.
+- ZIP:
+  `acceptance-artifacts/60d49f2/CATalyst-60d49f2-secondary-public-readiness.zip`.
+- ZIP SHA-256:
+  `08C40097DD440A2E8D7CBC50EBD3D2D1AB0B22568A9864831EDA386E09E71D8A`.
+- A new-directory extraction reproduced the executable hash exactly. The
+  package contained zero profile/runtime artifacts and no bundled full `chia`
+  package directory.
+- Packaged API, synthetic Sage mTLS RPC, interrupted-publication recovery and
+  native desktop clean/duplicate/persisted/safety smokes all passed.
+
+The prior accepted package was launched against a new isolated profile, then
+the exact `60d49f2` package opened and reopened that same profile. Database size
+and migration marker were preserved, v1.4.0 health was returned, and every
+launch correctly stayed fail-closed with `WALLET_IDENTITY_BINDING_INVALID`.
+Evidence is at `outputs/60d49f2-upgrade-smoke/upgrade-result.json` and
+`outputs/60d49f2-upgrade-smoke/upgrade-smoke.log`.
 
 ## Suite and security results
 
