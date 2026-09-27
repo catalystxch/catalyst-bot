@@ -121,3 +121,58 @@ passes the independently repeatable backend, Chromium, static, Windows build,
 package, duplicate-launch, persisted-restart and live Sage read-only recovery
 gates. Remaining live publication work is legitimately blocked by RED market
 confidence. No new CATalyst defect was found in this combined verification.
+
+## Lifecycle coverage audit checkpoint
+
+The feature branch was fetched again and verified at exact remote HEAD
+`e2a9c8fe03677abcf1d0c3cbee49e4115839ffb3`, with exact parent
+`b15cf8d8b26d53e70f6433c66db5b46fc9a5daf6`. The parent-to-head diff changes
+only `evidence/2026-09-24-live-test7-acceptance.md`; `git diff --check` passed.
+The complete range after production source `9bbf972a9e8b0b6459e67f483080dc487993a7ca`
+contains evidence files only.
+
+The smallest focused lifecycle slice expanded to **47 tests**, all passing in
+**20.87 seconds** under the complete Python 3.12 acceptance environment. Exact
+requirement-to-test coverage was:
+
+- Create and publication acknowledgement:
+  `test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence`,
+  `test_offer_manager_crash_boundaries_never_resubmit_ambiguous_intent`,
+  `test_offer_manager_concurrent_creation_has_exactly_one_effect_winner`,
+  `test_success_requires_current_claim_version_and_digest_binds_acknowledgement`,
+  `test_actual_transport_binds_request_header_bytes_and_provider_acknowledgement`,
+  and `test_crash_after_remote_success_reclaims_stale_claim_with_same_identity`.
+- Within-cap requote and remake:
+  `test_lineage_recovery_is_safe_at_each_durable_crash_boundary`,
+  `test_requote_resumes_visible_lineage_before_tier_and_budget_filtering`,
+  `test_replacement_runs_two_visible_child_before_parent_cancel_waves`, and
+  `test_amber_never_authorizes_create_child_first_requotes`.
+- Protected cancellation:
+  `test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee`,
+  `test_cancel_reservation_replay_cannot_authorize_second_dispatch`,
+  `test_protected_cancel_hold_cannot_release_before_authoritative_outcome`, and
+  `test_authoritative_confirmation_charges_hold_and_restart_scan_is_idempotent`.
+- Cancel retry and restart:
+  `test_retry_failed_cancel_advances_durable_attempt_after_restart`,
+  `test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation`,
+  `test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven`,
+  `test_retry_failed_cancel_race_has_one_new_wallet_effect`,
+  `test_startup_recovers_settled_protected_cancellation_fee_outcome`, and
+  `test_restart_resumes_unresolved_cancellation_without_replacement_creation`.
+- Atomic fee ledger:
+  `test_cancellation_can_use_protected_allowance_but_not_exceed_total`,
+  `test_concurrent_reservations_cannot_each_spend_same_remainder`,
+  `test_reservation_survives_connection_restart`,
+  `test_reservation_replay_is_not_a_new_dispatch_permission`, and
+  `test_new_approval_cannot_reduce_protected_cancellation_allowance`.
+- Bypass resistance:
+  `test_offer_creation_continuation_rejects_forgery_without_effect`,
+  `test_production_cancellation_callers_route_or_deny_before_adapter`,
+  `test_startup_repost_is_blocked_when_market_publication_gate_is_closed`, and
+  `test_amber_never_authorizes_create_child_first_requotes`.
+
+No production defect or genuine automated safety-coverage gap was proven. The
+remaining boundary is live acceptance only: RED market confidence prevented a
+real Sage offer, Dexie acknowledgement/discovery, fee-consuming cancellation,
+requote and remake cycle. Mock evidence is not treated as live acceptance. No
+wallet mutation or fee was incurred during this audit.
