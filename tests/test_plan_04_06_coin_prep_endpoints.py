@@ -544,6 +544,91 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body["xch_coins"], 3)
         self.assertEqual(body["cat_coins"], 1)
 
+    def test_completed_standard_prep_rehydrates_using_prepared_coin_sizes(self):
+        """Standard prep recovery must validate the larger prepared coin shape."""
+
+        approval_id = "b" * 64
+        xch_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 1_130_000_000_000}}],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 10_000}}],
+        }
+        last_prep = {
+            "tier_enabled": True,
+            "tier_counts_xch": {"inner": 1},
+            "tier_counts_cat": {"inner": 1},
+            "tier_sizes_xch": {"inner": "1.13"},
+            "offer_tier_sizes_xch": {"inner": "1"},
+            "tier_sizes_cat": {"inner": "10"},
+        }
+        standard_approval = {
+            "approval_id": approval_id,
+            "campaign_id": None,
+            "request_options": {
+                "coin_multiplier": "1",
+                "target_seconds": 300,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            last_path = os.path.join(temp_dir, "coin_prep_last.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "phase": "complete",
+                        "run_id": "old-run",
+                        "fee_approval_id": approval_id,
+                    },
+                    handle,
+                )
+            with open(last_path, "w", encoding="utf-8") as handle:
+                json.dump(last_prep, handle)
+
+            def spendable(wallet_id):
+                return xch_records if int(wallet_id) == 1 else cat_records
+
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_last_file",
+                    return_value=last_path,
+                ),
+                patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(
+                    api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}
+                ),
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=standard_approval,
+                ),
+                patch("database.get_coin_summary", return_value={}),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_tier_size_drift_findings",
+                    return_value=[],
+                ),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertTrue(body["complete"])
+        self.assertTrue(body["previously_complete"])
+        self.assertEqual(body["phase"], "complete")
+        self.assertEqual(body["xch_target"], 1)
+        self.assertEqual(body["cat_target"], 1)
+
     def test_completed_tier_prep_does_not_rehydrate_undersized_offer_coin(self):
         """A restart must not call an offer coin ready when it cannot fund the spend."""
 
