@@ -17,8 +17,11 @@ def _targets(**overrides):
         "tier_order": ("inner", "mid", "fees"),
         "xch_counts": {"inner": 2, "mid": 1, "fees": 2},
         "cat_counts": {"inner": 1, "mid": 2},
-        "xch_sizes": {"inner": Decimal("1.1"), "mid": Decimal("0.5"),
-                      "fees": Decimal("0.001")},
+        "xch_sizes": {
+            "inner": Decimal("1.1"),
+            "mid": Decimal("0.5"),
+            "fees": Decimal("0.001"),
+        },
         "cat_sizes": {"inner": Decimal("100.0001"), "mid": Decimal("20.00001")},
         "cat_decimals": 3,
     }
@@ -28,7 +31,9 @@ def _targets(**overrides):
 
 def test_prepared_atomic_outputs_use_exact_xch_and_upward_cat_rounding():
     targets = _targets()
-    assert [(t.asset, t.purpose, t.tier_rank, t.amount_mojos, t.ordinal) for t in targets] == [
+    assert [
+        (t.asset, t.purpose, t.tier_rank, t.amount_mojos, t.ordinal) for t in targets
+    ] == [
         ("xch", "replacement", 0, 1_100_000_000_000, 0),
         ("xch", "replacement", 0, 1_100_000_000_000, 1),
         ("xch", "replacement", 1, 500_000_000_000, 2),
@@ -46,18 +51,32 @@ def test_empty_side_does_not_invent_coins_or_require_its_sizes():
     assert {target.asset for target in targets} == {"xch"}
 
 
-@pytest.mark.parametrize("counts", [{"inner": True}, {"inner": 1.0},
-                                    {"inner": -1}, {"hidden": 1}, {"inner": 10_001}])
+@pytest.mark.parametrize(
+    "counts",
+    [{"inner": True}, {"inner": 1.0}, {"inner": -1}, {"hidden": 1}, {"inner": 10_001}],
+)
 def test_malformed_or_unrepresented_counts_cannot_become_targets(counts):
     with pytest.raises(ValueError):
         _targets(xch_counts=counts)
 
 
-@pytest.mark.parametrize("value", [True, 1.0, Decimal("NaN"), Decimal("Infinity"),
-                                   Decimal("-1"), Decimal("0"), Decimal("10000000")])
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        1.0,
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-1"),
+        Decimal("0"),
+        Decimal("10000000"),
+    ],
+)
 def test_bad_prepared_amounts_cannot_become_atomic_effects(value):
     with pytest.raises(ValueError):
-        _targets(xch_sizes={"inner": value, "mid": Decimal("0.5"), "fees": Decimal("0.001")})
+        _targets(
+            xch_sizes={"inner": value, "mid": Decimal("0.5"), "fees": Decimal("0.001")}
+        )
 
 
 @pytest.mark.parametrize("decimals", [True, 3.0, -1, 19])

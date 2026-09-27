@@ -454,9 +454,14 @@ def test_tier_verification_uses_effective_residual_topup_budget(page):
     # 1 XCH / 1.03 XCH per CAT * 1.1 headroom, rounded up to a CAT mojo.
     # Two 1.068 CAT outputs leave 1000 - 100 reserve - 2.136 = 897.864 CAT.
     backend = prepared_cat_sizes(
-        live_sizes={"inner": "1"}, price="1", headroom_multiplier="1.1",
-        cat_decimals=3, sell_counts={"inner": 1}, max_offers=1,
-        spread_bps="300", min_edge_bps="300",
+        live_sizes={"inner": "1"},
+        price="1",
+        headroom_multiplier="1.1",
+        cat_decimals=3,
+        sell_counts={"inner": 1},
+        max_offers=1,
+        spread_bps="300",
+        min_edge_bps="300",
     )
     assert str(backend["inner"]) == "1.068"
     _ready_setup(page, "allowed")

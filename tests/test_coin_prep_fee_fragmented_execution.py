@@ -14,15 +14,26 @@ from test_coin_prep_fee_worker_dispatch import active_worker  # noqa: F401
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
-@pytest.mark.parametrize("mode,root_count,amount,expected_batches,estimate,maximum_fee,reserve", [
-    ("two_sided", 61, 2_000_000_000, 3, 100, 100, 40),
-    ("two_sided", 153, 800_000_000, 4, 140, 140, 40),
-    # The fixture has prior two-sided consent: its 40-mojo protection remains.
-    ("buy_only", 61, 2_000_000_000, 2, 60, 80, 40),
-    ("buy_only", 153, 800_000_000, 3, 100, 120, 40),
-])
+@pytest.mark.parametrize(
+    "mode,root_count,amount,expected_batches,estimate,maximum_fee,reserve",
+    [
+        ("two_sided", 61, 2_000_000_000, 3, 100, 100, 40),
+        ("two_sided", 153, 800_000_000, 4, 140, 140, 40),
+        # The fixture has prior two-sided consent: its 40-mojo protection remains.
+        ("buy_only", 61, 2_000_000_000, 2, 60, 80, 40),
+        ("buy_only", 153, 800_000_000, 3, 100, 120, 40),
+    ],
+)
 def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
-    active_worker, monkeypatch, mode, root_count, amount, expected_batches, estimate, maximum_fee, reserve,
+    active_worker,
+    monkeypatch,
+    mode,
+    root_count,
+    amount,
+    expected_batches,
+    estimate,
+    maximum_fee,
+    reserve,
 ):
     # This would fail if pricing or hold reconstruction refused the very
     # prerequisite the public preview already charged/obtained consent for.
@@ -49,11 +60,15 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
     assert preview["estimated_total_fee_mojos"] == estimate
     if mode == "buy_only" and root_count == 61:
         assert [(s["stage_id"], s["cost_kind"]) for s in preview["stages"]] == [
-            ("prep_xch_consolidation", "exact_unsigned"), ("prep_xch", "projected"),
-            ("cancel_xch", "projected")]
+            ("prep_xch_consolidation", "exact_unsigned"),
+            ("prep_xch", "projected"),
+            ("cancel_xch", "projected"),
+        ]
     approval = service.approve_coin_prep_fees(
-        preview_id=preview["preview_id"], maximum_fee_mojos=maximum_fee,
-        cancellation_reserve_mojos=reserve)
+        preview_id=preview["preview_id"],
+        maximum_fee_mojos=maximum_fee,
+        cancellation_reserve_mojos=reserve,
+    )
     state["worker"].fee_approval_id = approval["approval_id"]
     sent, observations = [], []
 
@@ -74,7 +89,9 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
         for output in outputs:
             output["coin_id"] = output["coin_id"].removeprefix("0x")
         inputs = unsigned["summary"]["inputs"]
-        parents = {o["coin_id"]: row["coin_id"] for row in inputs for o in row["outputs"]}
+        parents = {
+            o["coin_id"]: row["coin_id"] for row in inputs for o in row["outputs"]
+        }
         spent = {row["coin_id"] for row in inputs}
         for asset in ("xch", "cat"):
             state[asset] = [row for row in state[asset] if row["coin_id"] not in spent]
@@ -83,20 +100,30 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
             ph = decode_puzzle_hash(output["address"])
             if asset == "cat":
                 ph = _cat_puzzle_hash(bytes.fromhex(utils.ASSET), ph)
-            coin = Coin(bytes.fromhex(parents[output["coin_id"]]), ph, output["amount_mojos"])
+            coin = Coin(
+                bytes.fromhex(parents[output["coin_id"]]), ph, output["amount_mojos"]
+            )
             assert coin.name().hex() == output["coin_id"]
             row = utils._coin(0, str(coin.amount))
             row["coin_id"] = coin.name().hex()
             state[asset].append(row)
             state["unsigned_roots"][coin.name().hex()] = (
-                coin, native if asset == "xch" else cat, None if asset == "xch" else utils.ASSET)
+                coin,
+                native if asset == "xch" else cat,
+                None if asset == "xch" else utils.ASSET,
+            )
         observations.append(operation)
-        return {"expected_outputs": outputs, "authoritative_view": {
-            "fresh": True, "complete": True,
-            "wallet_identity": json.loads(operation["wallet_identity_json"]),
-            "observed_at": "2026-08-21T12:00:01.000000Z",
-            "expires_at": "2026-08-21T12:00:16.000000Z", "coins": outputs,
-        }}
+        return {
+            "expected_outputs": outputs,
+            "authoritative_view": {
+                "fresh": True,
+                "complete": True,
+                "wallet_identity": json.loads(operation["wallet_identity_json"]),
+                "observed_at": "2026-08-21T12:00:01.000000Z",
+                "expires_at": "2026-08-21T12:00:16.000000Z",
+                "coins": outputs,
+            },
+        }
 
     monkeypatch.setattr(state["module"], "submit_built_transaction_rpc", submit)
     worker = state["worker"]

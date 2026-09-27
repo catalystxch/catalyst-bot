@@ -67,7 +67,9 @@ def test_recovery_confirmation_keeps_cancel_only_intent(page, action):
     page.locator("#cpConfirmBtn").click()
     page.wait_for_function("() => !_coinPrepFeeConfirmBusy")
     if action == "approval_refused":
-        expect(page.locator("#coinPrepConfirmOverlay")).to_have_class("coin-prep-overlay active")
+        expect(page.locator("#coinPrepConfirmOverlay")).to_have_class(
+            "coin-prep-overlay active"
+        )
         expect(page.locator("#cancelConfirmModal")).not_to_have_class("modal active")
     else:
         expect(page.locator("#cancelAllConfirmBtn")).to_be_visible()
@@ -76,19 +78,24 @@ def test_recovery_confirmation_keeps_cancel_only_intent(page, action):
             "window.__recoveryCalls.some(c => c.path.endsWith('/offers/cancel_all'))"
         )
         if action == "keep_offers":
-            page.locator("#cancelConfirmModal").get_by_role("button", name="Keep Offers").click()
+            page.locator("#cancelConfirmModal").get_by_role(
+                "button", name="Keep Offers"
+            ).click()
         else:
             page.locator("#cancelAllConfirmBtn").click()
             page.wait_for_function("() => !_cancelAllInProgress", timeout=10000)
 
     calls = page.evaluate("window.__recoveryCalls")
     approvals = [call for call in calls if "/coin-prep/fee-approval" in call["path"]]
-    cancellations = [call for call in calls if call["path"].endswith("/offers/cancel_all")]
+    cancellations = [
+        call for call in calls if call["path"].endswith("/offers/cancel_all")
+    ]
     assert len(approvals) == 1
     assert len(cancellations) == (1 if action == "confirm" else 0)
     if cancellations:
         assert json.loads(cancellations[0]["body"]) == {
-            "source": "coin_prep", "fee_approval_id": "d" * 64,
+            "source": "coin_prep",
+            "fee_approval_id": "d" * 64,
         }
     assert not [call for call in calls if "/coin-prep/trigger" in call["path"]]
     assert page.evaluate("window.__historyPrompts") == 0

@@ -97,9 +97,7 @@ def test_generic_cancel_cannot_spend_above_owning_campaign_fee_cap(
         offer_manager, "get_effective_transaction_fee_mojos", lambda: 13_079_100
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(
-        reserve=lambda minimum_amount_mojos=0: "e" * 64
-    )
+    manager._fee_pool = SimpleNamespace(reserve=lambda minimum_amount_mojos=0: "e" * 64)
 
     try:
         manager.cancel_offers(

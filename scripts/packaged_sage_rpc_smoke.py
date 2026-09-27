@@ -177,8 +177,12 @@ def _start_mock_sage(
         temp_dir, "server", "mock-sage-server", ca_key, ca_cert, is_server=True
     )
     client_cert, client_key = _create_signed_cert(
-        temp_dir / "sage-data" / "ssl", "wallet", "mock-sage-client",
-        ca_key, ca_cert, is_server=False
+        temp_dir / "sage-data" / "ssl",
+        "wallet",
+        "mock-sage-client",
+        ca_key,
+        ca_cert,
+        is_server=False,
     )
 
     httpd = MockSageServer(("127.0.0.1", 0), MockSageHandler)

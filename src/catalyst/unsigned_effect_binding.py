@@ -14,7 +14,9 @@ from chia_rs import Coin
 from sage_offer_wire import decode_wallet_puzzle_hash
 
 
-CAT2_MOD_HASH = bytes.fromhex("37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a")
+CAT2_MOD_HASH = bytes.fromhex(
+    "37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a"
+)
 
 
 def _atom_hash(value: bytes) -> bytes:
@@ -36,11 +38,17 @@ def _cat_puzzle_hash(asset_id: bytes, inner_hash: bytes) -> bytes:
     # Hash the canonical (a (q . MOD) (c (q . ARG) ... 1)) curry expression.
     nil, one = _atom_hash(b""), _atom_hash(b"\x01")
     environment = one
-    for argument in reversed((_atom_hash(CAT2_MOD_HASH), _atom_hash(asset_id), inner_hash)):
-        environment = _pair_hash(_atom_hash(b"\x04"), _pair_hash(
-            _pair_hash(one, argument), _pair_hash(environment, nil)))
-    return _pair_hash(_atom_hash(b"\x02"), _pair_hash(
-        _pair_hash(one, CAT2_MOD_HASH), _pair_hash(environment, nil)))
+    for argument in reversed(
+        (_atom_hash(CAT2_MOD_HASH), _atom_hash(asset_id), inner_hash)
+    ):
+        environment = _pair_hash(
+            _atom_hash(b"\x04"),
+            _pair_hash(_pair_hash(one, argument), _pair_hash(environment, nil)),
+        )
+    return _pair_hash(
+        _atom_hash(b"\x02"),
+        _pair_hash(_pair_hash(one, CAT2_MOD_HASH), _pair_hash(environment, nil)),
+    )
 
 
 def _cat_asset_id(program) -> bytes | None:
@@ -53,9 +61,13 @@ def _cat_asset_id(program) -> bytes | None:
         values.append(value)
         if len(values) > 3:
             raise ValueError("unexpected CAT arguments")
-    if (arguments.atom != b"" or len(values) != 3
-            or values[0].atom != CAT2_MOD_HASH
-            or values[1].atom is None or len(values[1].atom) != 32):
+    if (
+        arguments.atom != b""
+        or len(values) != 3
+        or values[0].atom != CAT2_MOD_HASH
+        or values[1].atom is None
+        or len(values[1].atom) != 32
+    ):
         raise ValueError("malformed CAT identity")
     return values[1].atom
 
@@ -67,22 +79,31 @@ def executable_matches_summary(spends, conditions, summary: dict, exact_amount) 
         by_id = {item["coin_id"].removeprefix("0x").lower(): item for item in inputs}
         actual = {spend.coin.name().hex(): spend for spend in spends}
         executed = {spend.coin_id.hex(): spend for spend in conditions.spends}
-        if (len(by_id) != len(inputs) or len(actual) != len(spends)
-                or len(executed) != len(conditions.spends)
-                or set(by_id) != set(actual) or set(actual) != set(executed)):
+        if (
+            len(by_id) != len(inputs)
+            or len(actual) != len(spends)
+            or len(executed) != len(conditions.spends)
+            or set(by_id) != set(actual)
+            or set(actual) != set(executed)
+        ):
             return False
-        if (int(conditions.removal_amount) - int(conditions.addition_amount)
-                != exact_amount(summary["fee"])):
+        if int(conditions.removal_amount) - int(
+            conditions.addition_amount
+        ) != exact_amount(summary["fee"]):
             return False
         for coin_id, spend in actual.items():
             item = by_id[coin_id]
-            if (spend.puzzle_reveal.get_tree_hash() != spend.coin.puzzle_hash
-                    or int(spend.coin.amount) != exact_amount(item["amount"])):
+            if spend.puzzle_reveal.get_tree_hash() != spend.coin.puzzle_hash or int(
+                spend.coin.amount
+            ) != exact_amount(item["amount"]):
                 return False
             executable_asset = _cat_asset_id(spend.puzzle_reveal)
             asset = item.get("asset")
-            summary_asset = None if asset is None or asset.get("asset_id") is None else bytes.fromhex(
-                asset["asset_id"].removeprefix("0x"))
+            summary_asset = (
+                None
+                if asset is None or asset.get("asset_id") is None
+                else bytes.fromhex(asset["asset_id"].removeprefix("0x"))
+            )
             if summary_asset != executable_asset:
                 return False
             expected = Counter()
@@ -91,13 +112,19 @@ def executable_matches_summary(spends, conditions, summary: dict, exact_amount) 
                 if executable_asset is not None:
                     puzzle_hash = _cat_puzzle_hash(executable_asset, puzzle_hash)
                 amount = exact_amount(output["amount"])
-                output_id = Coin(bytes.fromhex(coin_id), puzzle_hash, amount).name().hex()
+                output_id = (
+                    Coin(bytes.fromhex(coin_id), puzzle_hash, amount).name().hex()
+                )
                 if output_id != output["coin_id"].removeprefix("0x").lower():
                     return False
                 expected[(output_id, amount)] += 1
-            additions = Counter((Coin(bytes.fromhex(coin_id), puzzle_hash, amount).name().hex(),
-                                 int(amount))
-                                for puzzle_hash, amount, _hint in executed[coin_id].create_coin)
+            additions = Counter(
+                (
+                    Coin(bytes.fromhex(coin_id), puzzle_hash, amount).name().hex(),
+                    int(amount),
+                )
+                for puzzle_hash, amount, _hint in executed[coin_id].create_coin
+            )
             if expected != additions:
                 return False
         return True

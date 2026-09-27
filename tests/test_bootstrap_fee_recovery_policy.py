@@ -152,7 +152,11 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
         lambda: {
             key: state["campaign"][key]
             for key in (
-                "network", "wallet_type", "wallet_fingerprint", "wallet_id", "asset_id"
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
             )
         },
     )
@@ -162,7 +166,9 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
         return {
             "success": True,
             "wallet_balance": {
-                "confirmed_wallet_balance": 200_000_000_000 if wallet_id == 1 else 20_000
+                "confirmed_wallet_balance": 200_000_000_000
+                if wallet_id == 1
+                else 20_000
             },
         }
 
@@ -179,9 +185,13 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
     monkeypatch.setattr(
         database,
         "_bootstrap_campaign_authoritative_fee_spent_mojos",
-        lambda _conn, campaign_id, **_context: 10_000_000_010 if campaign_id == state["campaign_id"] else 0,
+        lambda _conn, campaign_id, **_context: (
+            10_000_000_010 if campaign_id == state["campaign_id"] else 0
+        ),
     )
-    with pytest.raises(ValueError, match="bootstrap_coin_prep_not_authorized:fee_reserve"):
+    with pytest.raises(
+        ValueError, match="bootstrap_coin_prep_not_authorized:fee_reserve"
+    ):
         real_context(options)
     before = utils._counts()
     app = Flask(__name__)
@@ -189,12 +199,17 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
     response = app.test_client().post("/api/coin-prep/fee-preview", json=options)
     payload = response.get_json()
 
-    assert utils._counts() == before, "a recovery preview must not grant spending authority"
+    assert utils._counts() == before, (
+        "a recovery preview must not grant spending authority"
+    )
     assert response.status_code == 200, payload
     assert payload["available"] is True, payload
     assert payload["fee_accounting"]["spent_fee_mojos"] == "10000000010"
     assert payload["dispatch_authorized"] is False
-    assert database.get_bootstrap_campaign(state["campaign_id"])["fee_budget_xch"] == "0.01"
+    assert (
+        database.get_bootstrap_campaign(state["campaign_id"])["fee_budget_xch"]
+        == "0.01"
+    )
 
     # The frozen plan is exposed only to price/approve cancellation recovery;
     # it must not become executable Coin Prep or offer-creation authority.
@@ -209,9 +224,7 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
     )
     service = import_module("coin_prep_fee_approval")
     assert service.preview_coin_prep_fees(options)["available"] is True
-    stopped_preview = app.test_client().post(
-        "/api/coin-prep/fee-preview", json=options
-    )
+    stopped_preview = app.test_client().post("/api/coin-prep/fee-preview", json=options)
     assert stopped_preview.status_code == 200, stopped_preview.get_json()
     recovered = runtime.read_approved_prep_fee_snapshot(
         state["approval"]["approval_id"], allow_campaign_fee_recovery=True

@@ -13,7 +13,11 @@ import time
 
 from replacement_capacity import COIN_PURPOSES
 import database
-from fee_estimation import fee_failure_diagnostics, fee_quote_network_evidence, quote_fee
+from fee_estimation import (
+    fee_failure_diagnostics,
+    fee_quote_network_evidence,
+    quote_fee,
+)
 
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
@@ -60,8 +64,13 @@ def _canonical_json(value):
 
 
 _IDENTITY_FIELDS = (
-    "network", "wallet_type", "wallet_fingerprint", "wallet_id",
-    "xch_wallet_id", "asset_id", "ticker",
+    "network",
+    "wallet_type",
+    "wallet_fingerprint",
+    "wallet_id",
+    "xch_wallet_id",
+    "asset_id",
+    "ticker",
 )
 
 
@@ -70,13 +79,15 @@ def _canonical_fee_identity(scope: dict) -> dict:
     _closed_dict(scope, _IDENTITY_FIELDS)
     if scope["wallet_type"] not in ("sage", "chia"):
         raise ValueError("fee contract wallet backend is unsupported")
-    if type(scope["network"]) is not str or re.fullmatch(
-        r"mainnet|testnet[0-9]+", scope["network"]
-    ) is None:
+    if (
+        type(scope["network"]) is not str
+        or re.fullmatch(r"mainnet|testnet[0-9]+", scope["network"]) is None
+    ):
         raise ValueError("fee contract network is invalid")
-    if type(scope["ticker"]) is not str or re.fullmatch(
-        r"[A-Za-z0-9_\-]{1,64}", scope["ticker"]
-    ) is None:
+    if (
+        type(scope["ticker"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", scope["ticker"]) is None
+    ):
         raise ValueError("fee contract ticker is invalid")
     _exact_int(scope["wallet_fingerprint"], 1, 2**32 - 1)
     _exact_int(scope["wallet_id"], 1)
@@ -95,7 +106,9 @@ def resolve_server_fee_scope(*, identity: dict, campaign_id: str | None = None) 
     identity = _canonical_fee_identity(identity)
     if campaign_id is not None:
         return {**identity, "campaign_id": _digest(campaign_id), "session_id": None}
-    session = database.get_or_create_coin_prep_fee_session(identity_json=_canonical_json(identity))
+    session = database.get_or_create_coin_prep_fee_session(
+        identity_json=_canonical_json(identity)
+    )
     return {**identity, "campaign_id": None, "session_id": session["session_id"]}
 
 
@@ -111,12 +124,16 @@ def _prove_approved_coin_prep_targets(context):
     if funding["principal_funded"] is not True:
         raise ValueError("FEE_SESSION_INCOMPLETE")
     plan = plan_batch(
-        funding["snapshot"], recipe["targets"],
+        funding["snapshot"],
+        recipe["targets"],
         BatchConstraints(reserve_floors=floors, fee_mojos=0),
     )
-    if (type(plan) is not BatchPlan or plan.transaction_required is not False
-            or len(plan.reused_target_ids) != len(recipe["targets"])
-            or len(plan.reused_coin_ids) != len(recipe["targets"])):
+    if (
+        type(plan) is not BatchPlan
+        or plan.transaction_required is not False
+        or len(plan.reused_target_ids) != len(recipe["targets"])
+        or len(plan.reused_coin_ids) != len(recipe["targets"])
+    ):
         raise ValueError("FEE_SESSION_INCOMPLETE")
     return plan
 
@@ -138,10 +155,19 @@ def complete_coin_prep_fee_scope(approval_id: str) -> dict:
     context = read_approved_prep_fee_snapshot(approval_id)
     first = _prove_approved_coin_prep_targets(context)
     after = read_approved_prep_fee_snapshot(approval_id)
-    if any(after[key] != context[key] for key in (
-        "identity", "configuration", "receive_address", "snapshot", "recipe",
-        "campaign", "scope", "approval",
-    )):
+    if any(
+        after[key] != context[key]
+        for key in (
+            "identity",
+            "configuration",
+            "receive_address",
+            "snapshot",
+            "recipe",
+            "campaign",
+            "scope",
+            "approval",
+        )
+    ):
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     second = _prove_approved_coin_prep_targets(after)
     if second != first:
@@ -167,7 +193,8 @@ def complete_coin_prep_fee_scope(approval_id: str) -> dict:
             "dispatch_authorized": False,
         }
     return database.record_coin_prep_fee_session_completion(
-        approval_id=approval_id, session_id=session_id,
+        approval_id=approval_id,
+        session_id=session_id,
         target_coin_ids=list(second.reused_coin_ids),
     )
 
@@ -197,13 +224,26 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
     _digest(scope["session_id"] or scope["campaign_id"])
     normalized_scope = dict(scope)
 
-    _closed_dict(economic_plan, (
-        "target_seconds", "coin_multiplier", "headroom_pct", "liquidity_mode",
-        "reserve_floors_mojos", "campaign_revision", "cancellation_policy", "outputs",
-    ))
+    _closed_dict(
+        economic_plan,
+        (
+            "target_seconds",
+            "coin_multiplier",
+            "headroom_pct",
+            "liquidity_mode",
+            "reserve_floors_mojos",
+            "campaign_revision",
+            "cancellation_policy",
+            "outputs",
+        ),
+    )
     target = _exact_int(economic_plan["target_seconds"])
-    multiplier = _decimal_text(economic_plan["coin_multiplier"], Decimal("0.5"), Decimal("3"))
-    headroom = _decimal_text(economic_plan["headroom_pct"], Decimal("0"), Decimal("100"))
+    multiplier = _decimal_text(
+        economic_plan["coin_multiplier"], Decimal("0.5"), Decimal("3")
+    )
+    headroom = _decimal_text(
+        economic_plan["headroom_pct"], Decimal("0"), Decimal("100")
+    )
     if economic_plan["liquidity_mode"] not in ("two_sided", "buy_only", "sell_only"):
         raise ValueError("fee contract liquidity mode is invalid")
     if economic_plan["cancellation_policy"] != "protected_no_prep":
@@ -220,8 +260,13 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
     normalized_outputs = []
     identities = set()
     for output in outputs:
-        _closed_dict(output, ("asset", "purpose", "tier_rank", "amount_mojos", "ordinal"))
-        if output["asset"] not in ("xch", "cat") or output["purpose"] not in COIN_PURPOSES:
+        _closed_dict(
+            output, ("asset", "purpose", "tier_rank", "amount_mojos", "ordinal")
+        )
+        if (
+            output["asset"] not in ("xch", "cat")
+            or output["purpose"] not in COIN_PURPOSES
+        ):
             raise ValueError("fee contract output asset or purpose is invalid")
         _exact_int(output["tier_rank"])
         _exact_int(output["amount_mojos"], 1)
@@ -253,8 +298,12 @@ def canonical_fee_contract(scope: dict, economic_plan: dict) -> dict:
 
 
 def estimate_coin_prep_fee_preview(
-    *, scope: dict, economic_plan: dict, stages: list,
-    fee_funding_mojos: int, request_options: dict,
+    *,
+    scope: dict,
+    economic_plan: dict,
+    stages: list,
+    fee_funding_mojos: int,
+    request_options: dict,
     stage_quotes: dict | None = None,
     stage_profiles: dict | None = None,
     execution_context: dict | None = None,
@@ -273,24 +322,38 @@ def estimate_coin_prep_fee_preview(
     if execution_context is not None:
         from coin_prep_fee_execution import validate_execution_context
 
-        validate_execution_context(execution_context, contract["scope"], contract["plan"])
+        validate_execution_context(
+            execution_context, contract["scope"], contract["plan"]
+        )
     funding = _exact_int(fee_funding_mojos)
     if type(request_options) is not dict or type(stages) is not list:
         raise ValueError("fee preview options/stages are invalid")
     stage_ids = set()
     # Validate the complete plan before any provider request or persistence.
     for stage in stages:
-        _closed_dict(stage, (
-            "stage_id", "cost", "cost_kind", "transaction_count_min",
-            "transaction_count_max", "cancellation",
-        ))
-        if type(stage["stage_id"]) is not str or re.fullmatch(
-            r"[a-z0-9_\-]{1,64}", stage["stage_id"]
-        ) is None or stage["stage_id"] in stage_ids:
+        _closed_dict(
+            stage,
+            (
+                "stage_id",
+                "cost",
+                "cost_kind",
+                "transaction_count_min",
+                "transaction_count_max",
+                "cancellation",
+            ),
+        )
+        if (
+            type(stage["stage_id"]) is not str
+            or re.fullmatch(r"[a-z0-9_\-]{1,64}", stage["stage_id"]) is None
+            or stage["stage_id"] in stage_ids
+        ):
             raise ValueError("fee preview stage identity is invalid or duplicated")
         stage_ids.add(stage["stage_id"])
         _exact_int(stage["cost"], 1)
-        lower = _exact_int(stage["transaction_count_min"], 0 if stage["cost_kind"] == "projected" else 1)
+        lower = _exact_int(
+            stage["transaction_count_min"],
+            0 if stage["cost_kind"] == "projected" else 1,
+        )
         upper = _exact_int(stage["transaction_count_max"], max(1, lower))
         if stage["cost_kind"] not in ("projected", "exact_unsigned"):
             raise ValueError("fee preview stage cost is unproven")
@@ -307,13 +370,25 @@ def estimate_coin_prep_fee_preview(
     if type(stage_profiles) is not dict or not set(stage_profiles) <= stage_ids:
         raise ValueError("fee preview profiles have unsupported stage identities")
     for profile in stage_profiles.values():
-        _closed_dict(profile, ("input_count_max", "output_count_max",
-                               "ephemeral_spend_count_max", "assumptions"))
+        _closed_dict(
+            profile,
+            (
+                "input_count_max",
+                "output_count_max",
+                "ephemeral_spend_count_max",
+                "assumptions",
+            ),
+        )
         for key in ("input_count_max", "output_count_max", "ephemeral_spend_count_max"):
             _exact_int(profile[key], 0, 10000)
-        if (type(profile["assumptions"]) is not list or len(profile["assumptions"]) > 16
-                or any(type(a) is not str or re.fullmatch(r"[a-z0-9_]{1,64}", a) is None
-                       for a in profile["assumptions"])):
+        if (
+            type(profile["assumptions"]) is not list
+            or len(profile["assumptions"]) > 16
+            or any(
+                type(a) is not str or re.fullmatch(r"[a-z0-9_]{1,64}", a) is None
+                for a in profile["assumptions"]
+            )
+        ):
             raise ValueError("fee preview profile assumptions are invalid")
     now = _exact_int(_now())
     prep = cancel = minimum = 0
@@ -325,23 +400,45 @@ def estimate_coin_prep_fee_preview(
     from coin_prep_fee_pricing import is_current_fee_quote
 
     for stage in stages:
-        quote = (stage_quotes[stage["stage_id"]] if stage["stage_id"] in stage_quotes else
-                 quote_fee(stage["cost"], target_seconds=contract["plan"]["target_seconds"]))
+        quote = (
+            stage_quotes[stage["stage_id"]]
+            if stage["stage_id"] in stage_quotes
+            else quote_fee(
+                stage["cost"], target_seconds=contract["plan"]["target_seconds"]
+            )
+        )
         if not is_current_fee_quote(
-            quote, stage["cost"], contract["plan"]["target_seconds"], now=_now(),
+            quote,
+            stage["cost"],
+            contract["plan"]["target_seconds"],
+            now=_now(),
         ):
             # Invalid matched guidance must not fall back to a different quote.
             # Do not persist a malformed usable fee or untrusted extra fields.
-            quote = {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE",
-                     "fee_mojos": None, "provider_failures": fee_failure_diagnostics(quote)}
+            quote = {
+                "available": False,
+                "reason": "FEE_ESTIMATE_UNAVAILABLE",
+                "fee_mojos": None,
+                "provider_failures": fee_failure_diagnostics(quote),
+            }
         else:
             diagnostics = fee_quote_network_evidence(quote)
-            quote = {key: quote[key] for key in (
-                "available", "source", "cost", "target_seconds", "fee_mojos",
-                "observed_at", "expires_at",
-            )}
+            quote = {
+                key: quote[key]
+                for key in (
+                    "available",
+                    "source",
+                    "cost",
+                    "target_seconds",
+                    "fee_mojos",
+                    "observed_at",
+                    "expires_at",
+                )
+            }
             quote["reason"] = "network_fee_estimate"
-            quote["fee_xch"] = format(Decimal(quote["fee_mojos"]) / Decimal(10**12), "f")
+            quote["fee_xch"] = format(
+                Decimal(quote["fee_mojos"]) / Decimal(10**12), "f"
+            )
             # Keep large mempool fee totals exact through HTTP/native JSON.
             quote["network_evidence"] = {
                 key: str(value) if type(value) is int else value
@@ -366,10 +463,13 @@ def estimate_coin_prep_fee_preview(
         if not stage["cancellation"]:
             count_min = _exact_int(count_min + stage["transaction_count_min"])
             count_max = _exact_int(count_max + stage["transaction_count_max"])
-    principal = _exact_int(sum(
-        output["amount_mojos"] for output in contract["plan"]["outputs"]
-        if output["asset"] == "xch" and output["purpose"] == "fee_reserve"
-    ))
+    principal = _exact_int(
+        sum(
+            output["amount_mojos"]
+            for output in contract["plan"]["outputs"]
+            if output["asset"] == "xch" and output["purpose"] == "fee_reserve"
+        )
+    )
     total = _exact_int(prep + cancel) if available else None
     # Recheck age after the last transport: a slow multistage preview must not
     # become confirmable merely because its earliest request was once fresh.
@@ -386,10 +486,12 @@ def estimate_coin_prep_fee_preview(
         protected = max(cancel, accounting["protected_cancellation_fee_mojos"])
         # Cancellation commitments already consumed part of the lifetime total;
         # do not double-count them as preparation or discard prior protection.
-        minimum_cumulative = _exact_int(max(
-            accounting["noncancellation_committed_fee_mojos"] + prep + protected,
-            accounting["committed_fee_mojos"] + prep + cancel,
-        ))
+        minimum_cumulative = _exact_int(
+            max(
+                accounting["noncancellation_committed_fee_mojos"] + prep + protected,
+                accounting["committed_fee_mojos"] + prep + cancel,
+            )
+        )
     result = {
         "available": available,
         "reason": "network_fee_estimate" if available else "FEE_ESTIMATE_UNAVAILABLE",
@@ -410,20 +512,39 @@ def estimate_coin_prep_fee_preview(
         "fee_accounting": accounting,
         "fee_coin_principal_mojos": principal,
         "fee_funding_mojos": funding,
-        "funded": available and minimum_cumulative - accounting["committed_fee_mojos"] <= funding,
+        "funded": available
+        and minimum_cumulative - accounting["committed_fee_mojos"] <= funding,
         "observed_at": observed,
         "expires_at": expires,
         "inclusion_is_guaranteed": False,
-        "provider_failures": fee_failure_diagnostics({"provider_failures": [
-            failure for stage in priced_stages for failure in stage["quote"].get("provider_failures", [])]}),
+        "provider_failures": fee_failure_diagnostics(
+            {
+                "provider_failures": [
+                    failure
+                    for stage in priced_stages
+                    for failure in stage["quote"].get("provider_failures", [])
+                ]
+            }
+        ),
     }
     saved = database.store_coin_prep_fee_preview(
-        scope_sha256=contract["scope_sha256"], plan_sha256=contract["plan_sha256"],
-        scope_json=contract["scope_json"], plan_json=contract["plan_json"],
+        scope_sha256=contract["scope_sha256"],
+        plan_sha256=contract["plan_sha256"],
+        scope_json=contract["scope_json"],
+        plan_json=contract["plan_json"],
         request_options_json=_canonical_json(request_options),
-        quote_json=_canonical_json({**result, **(
-            {"execution_context": execution_context} if execution_context is not None else {})}),
-        observed_at=observed, expires_at=expires,
+        quote_json=_canonical_json(
+            {
+                **result,
+                **(
+                    {"execution_context": execution_context}
+                    if execution_context is not None
+                    else {}
+                ),
+            }
+        ),
+        observed_at=observed,
+        expires_at=expires,
     )
     return {**result, "preview_id": saved["preview_id"]}
 
@@ -440,14 +561,22 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
 
     context = read_staged_prep_fee_snapshot(request_options, quote_provider=quote_fee)
     if context["available"] is not True:
-        return {"available": False, "reason": context["reason"], "dispatch_authorized": False,
-                "provider_failures": fee_failure_diagnostics(context)}
+        return {
+            "available": False,
+            "reason": context["reason"],
+            "dispatch_authorized": False,
+            "provider_failures": fee_failure_diagnostics(context),
+        }
     campaign = context["campaign"]
-    scope = resolve_server_fee_scope(identity=context["identity"],
-                                    campaign_id=campaign["campaign_id"] if campaign else None)
+    scope = resolve_server_fee_scope(
+        identity=context["identity"],
+        campaign_id=campaign["campaign_id"] if campaign else None,
+    )
     result = estimate_coin_prep_fee_preview(
-        scope=scope, economic_plan=context["recipe"]["economic_plan"],
-        stages=context["stages"], stage_quotes=context["stage_quotes"],
+        scope=scope,
+        economic_plan=context["recipe"]["economic_plan"],
+        stages=context["stages"],
+        stage_quotes=context["stage_quotes"],
         stage_profiles=context["stage_profiles"],
         fee_funding_mojos=context["funding"]["fee_funding_mojos"],
         request_options=context["request_options"],
@@ -457,7 +586,10 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
 
 
 def approve_coin_prep_fees(
-    *, preview_id: str, maximum_fee_mojos: int, cancellation_reserve_mojos: int,
+    *,
+    preview_id: str,
+    maximum_fee_mojos: int,
+    cancellation_reserve_mojos: int,
 ) -> dict:
     """Record deliberate confirmation against fresh server-owned economics.
 
@@ -477,9 +609,13 @@ def approve_coin_prep_fees(
     )
     if persisted["scope"]["session_id"] is not None:
         session = database.get_coin_prep_fee_session(persisted["scope"]["session_id"])
-        identity_json = _canonical_json({key: persisted["scope"][key] for key in _IDENTITY_FIELDS})
-        if (session["current_session_id"] != persisted["scope"]["session_id"]
-                or session["identity_json"] != identity_json):
+        identity_json = _canonical_json(
+            {key: persisted["scope"][key] for key in _IDENTITY_FIELDS}
+        )
+        if (
+            session["current_session_id"] != persisted["scope"]["session_id"]
+            or session["identity_json"] != identity_json
+        ):
             raise ValueError("FEE_APPROVAL_STALE")
     from coin_prep_fee_funding import prepare_fee_inventory
     from coin_prep_fee_runtime import read_fee_economic_snapshot
@@ -488,28 +624,38 @@ def approve_coin_prep_fees(
     campaign = context["campaign"]
     if (campaign is None) != (persisted["scope"]["campaign_id"] is None):
         raise ValueError("FEE_APPROVAL_STALE")
-    scope = {**context["identity"],
-             "campaign_id": campaign["campaign_id"] if campaign is not None else None,
-             "session_id": persisted["scope"]["session_id"] if campaign is None else None}
+    scope = {
+        **context["identity"],
+        "campaign_id": campaign["campaign_id"] if campaign is not None else None,
+        "session_id": persisted["scope"]["session_id"] if campaign is None else None,
+    }
     current = canonical_fee_contract(scope, context["recipe"]["economic_plan"])
-    if any(current[key] != preview[key] for key in (
-            "scope_sha256", "plan_sha256", "scope_json", "plan_json")):
+    if any(
+        current[key] != preview[key]
+        for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")
+    ):
         raise ValueError("FEE_APPROVAL_STALE")
     stored_quote = json.loads(preview["quote_json"])
     if "execution_context" in stored_quote:
-        from coin_prep_fee_execution import freeze_execution_context, validate_execution_context
+        from coin_prep_fee_execution import (
+            freeze_execution_context,
+            validate_execution_context,
+        )
 
         binding = stored_quote["execution_context"]
         validate_execution_context(binding, persisted["scope"], persisted["plan"])
         if freeze_execution_context(context) != binding:
             raise ValueError("FEE_APPROVAL_STALE")
     funding = prepare_fee_inventory(
-        context["snapshot"], context["recipe"]["targets"],
+        context["snapshot"],
+        context["recipe"]["targets"],
         current["plan"]["reserve_floors_mojos"],
     )
     result = database.approve_coin_prep_fee_preview(
-        preview_id=preview_id, scope_sha256=current["scope_sha256"],
-        plan_sha256=current["plan_sha256"], maximum_fee_mojos=maximum_fee_mojos,
+        preview_id=preview_id,
+        scope_sha256=current["scope_sha256"],
+        plan_sha256=current["plan_sha256"],
+        maximum_fee_mojos=maximum_fee_mojos,
         cancellation_reserve_mojos=cancellation_reserve_mojos,
         current_fee_funding_mojos=funding["fee_funding_mojos"],
         current_principal_funded=funding["principal_funded"],

@@ -30,10 +30,20 @@ def _plan():
         "campaign_revision": None,
         "cancellation_policy": "protected_no_prep",
         "outputs": [
-            {"asset": "xch", "purpose": "replacement", "tier_rank": 0,
-             "amount_mojos": 1_000, "ordinal": 0},
-            {"asset": "cat", "purpose": "replacement", "tier_rank": 0,
-             "amount_mojos": 100, "ordinal": 0},
+            {
+                "asset": "xch",
+                "purpose": "replacement",
+                "tier_rank": 0,
+                "amount_mojos": 1_000,
+                "ordinal": 0,
+            },
+            {
+                "asset": "cat",
+                "purpose": "replacement",
+                "tier_rank": 0,
+                "amount_mojos": 100,
+                "ordinal": 0,
+            },
         ],
     }
 
@@ -43,6 +53,7 @@ def _contract(scope=None, plan=None):
         "canonical fee consent service is missing"
     )
     import coin_prep_fee_approval as service
+
     return service.canonical_fee_contract(scope or _scope(), plan or _plan())
 
 
@@ -65,16 +76,26 @@ def test_signed_zero_headroom_is_the_same_economic_plan():
     positive["headroom_pct"] = "0.00"
     negative = _plan()
     negative["headroom_pct"] = "-0.00"
-    assert _contract(plan=positive)["plan_sha256"] == _contract(plan=negative)["plan_sha256"]
+    assert (
+        _contract(plan=positive)["plan_sha256"]
+        == _contract(plan=negative)["plan_sha256"]
+    )
     assert _contract(plan=negative)["plan"]["headroom_pct"] == "0"
 
 
-@pytest.mark.parametrize("field,value", [
-    ("wallet_fingerprint", 3702373391), ("wallet_id", 3),
-    ("xch_wallet_id", 4), ("network", "testnet11"),
-    ("wallet_type", "chia"), ("asset_id", "a" * 64),
-    ("ticker", "DBX_XCH"), ("session_id", "e" * 64),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("wallet_fingerprint", 3702373391),
+        ("wallet_id", 3),
+        ("xch_wallet_id", 4),
+        ("network", "testnet11"),
+        ("wallet_type", "chia"),
+        ("asset_id", "a" * 64),
+        ("ticker", "DBX_XCH"),
+        ("session_id", "e" * 64),
+    ],
+)
 def test_wallet_network_asset_and_session_change_scope(field, value):
     baseline = _contract()
     scope = _scope()
@@ -82,12 +103,17 @@ def test_wallet_network_asset_and_session_change_scope(field, value):
     assert _contract(scope)["scope_sha256"] != baseline["scope_sha256"]
 
 
-@pytest.mark.parametrize("field,value", [
-    ("target_seconds", 600), ("coin_multiplier", "2"),
-    ("headroom_pct", "5"), ("liquidity_mode", "buy_only"),
-    ("reserve_floors_mojos", {"xch": 10_001, "cat": 100}),
-    ("campaign_revision", 2),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_seconds", 600),
+        ("coin_multiplier", "2"),
+        ("headroom_pct", "5"),
+        ("liquidity_mode", "buy_only"),
+        ("reserve_floors_mojos", {"xch": 10_001, "cat": 100}),
+        ("campaign_revision", 2),
+    ],
+)
 def test_economic_choice_changes_plan_not_wallet_scope(field, value):
     baseline = _contract()
     plan = _plan()
@@ -104,11 +130,17 @@ def test_exact_output_amount_changes_plan():
     assert _contract(plan=plan)["plan_sha256"] != baseline["plan_sha256"]
 
 
-@pytest.mark.parametrize("path,value", [
-    (("wallet_fingerprint",), True), (("wallet_id",), 2.0),
-    (("asset_id",), "B8" * 32), (("session_id",), "client-session"),
-    (("campaign_id",), "bad"), (("wallet_type",), "unknown"),
-])
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("wallet_fingerprint",), True),
+        (("wallet_id",), 2.0),
+        (("asset_id",), "B8" * 32),
+        (("session_id",), "client-session"),
+        (("campaign_id",), "bad"),
+        (("wallet_type",), "unknown"),
+    ],
+)
 def test_invalid_scope_cannot_become_consent_authority(path, value):
     scope = _scope()
     scope[path[0]] = value
@@ -116,13 +148,20 @@ def test_invalid_scope_cannot_become_consent_authority(path, value):
         _contract(scope)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("target_seconds", True), ("coin_multiplier", "NaN"),
-    ("coin_multiplier", "0.4"), ("coin_multiplier", "3.1"),
-    ("headroom_pct", "Infinity"), ("liquidity_mode", "anything"),
-    ("campaign_revision", 1.0), ("cancellation_policy", "spend_protection_on_prep"),
-    ("reserve_floors_mojos", {"xch": True, "cat": 100}),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_seconds", True),
+        ("coin_multiplier", "NaN"),
+        ("coin_multiplier", "0.4"),
+        ("coin_multiplier", "3.1"),
+        ("headroom_pct", "Infinity"),
+        ("liquidity_mode", "anything"),
+        ("campaign_revision", 1.0),
+        ("cancellation_policy", "spend_protection_on_prep"),
+        ("reserve_floors_mojos", {"xch": True, "cat": 100}),
+    ],
+)
 def test_invalid_economic_choices_cannot_be_approved(field, value):
     plan = _plan()
     plan[field] = value
@@ -130,11 +169,17 @@ def test_invalid_economic_choices_cannot_be_approved(field, value):
         _contract(plan=plan)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("amount_mojos", 1.0), ("amount_mojos", True),
-    ("amount_mojos", 0), ("amount_mojos", 2**63),
-    ("ordinal", True), ("asset", "other"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("amount_mojos", 1.0),
+        ("amount_mojos", True),
+        ("amount_mojos", 0),
+        ("amount_mojos", 2**63),
+        ("ordinal", True),
+        ("asset", "other"),
+    ],
+)
 def test_invalid_output_atoms_are_rejected(field, value):
     plan = _plan()
     plan["outputs"][0][field] = value
@@ -171,4 +216,7 @@ def test_fresh_bootstrap_revision_zero_is_bound_without_inventing_a_revision():
     plan = {**_plan(), "campaign_revision": 0}
     initial = _contract(scope, plan)
     assert initial["plan"]["campaign_revision"] == 0
-    assert _contract(scope, {**plan, "campaign_revision": 1})["plan_sha256"] != initial["plan_sha256"]
+    assert (
+        _contract(scope, {**plan, "campaign_revision": 1})["plan_sha256"]
+        != initial["plan_sha256"]
+    )

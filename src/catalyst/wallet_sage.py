@@ -5635,7 +5635,9 @@ def cancel_offers_batch(
 
     def _validate_unsigned_component(result, expected_fee, expected_root_ids=None):
         """Use the same executable boundary for priced and ordinary cohorts."""
-        return _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids)
+        return _validate_cancel_unsigned_component(
+            result, expected_fee, expected_root_ids
+        )
 
     if not _require_signing_capability():
         return _for_every_member(

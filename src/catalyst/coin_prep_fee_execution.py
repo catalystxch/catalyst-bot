@@ -24,8 +24,9 @@ def _decimal_text(value):
         return "0"
     sign, digits, exponent = value.as_tuple()
     # Bound the fixed-point expansion BEFORE formatting a compact exponent.
-    length = (len(digits) + exponent if exponent >= 0
-              else max(len(digits) + 1, 2 - exponent)) + sign
+    length = (
+        len(digits) + exponent if exponent >= 0 else max(len(digits) + 1, 2 - exponent)
+    ) + sign
     if length > 128:
         raise ValueError("FEE_EXECUTION_CONTEXT_INVALID")
     text = format(value, "f")
@@ -67,10 +68,12 @@ def _decode_configuration(encoded):
                 value = Decimal(value)
             except InvalidOperation as exc:
                 raise ValueError("FEE_EXECUTION_CONTEXT_INVALID") from exc
-        elif not ((kind == "none" and value is None)
-                  or (kind == "bool" and type(value) is bool)
-                  or (kind == "int" and type(value) is int)
-                  or (kind == "str" and type(value) is str)):
+        elif not (
+            (kind == "none" and value is None)
+            or (kind == "bool" and type(value) is bool)
+            or (kind == "int" and type(value) is int)
+            or (kind == "str" and type(value) is str)
+        ):
             raise ValueError("FEE_EXECUTION_CONTEXT_INVALID")
         configuration[key] = value
     if encode_execution_configuration(configuration) != encoded:
@@ -80,15 +83,22 @@ def _decode_configuration(encoded):
 
 def validate_execution_context(binding, identity, economic_plan):
     """Reconstruct exact prepared targets and refuse resizing CLI overrides."""
-    if (type(binding) is not dict or set(binding) != {
-            "version", "configuration", "receive_address", "worker_args"}
-            or type(binding["version"]) is not int or binding["version"] != 1):
+    if (
+        type(binding) is not dict
+        or set(binding)
+        != {"version", "configuration", "receive_address", "worker_args"}
+        or type(binding["version"]) is not int
+        or binding["version"] != 1
+    ):
         raise ValueError("FEE_EXECUTION_CONTEXT_INVALID")
     configuration = _decode_configuration(binding["configuration"])
     expected = {
-        "network": identity["network"], "WALLET_TYPE": identity["wallet_type"],
-        "CAT_WALLET_ID": identity["wallet_id"], "WALLET_ID_XCH": identity["xch_wallet_id"],
-        "CAT_ASSET_ID": identity["asset_id"], "CAT_TICKER_ID": identity["ticker"],
+        "network": identity["network"],
+        "WALLET_TYPE": identity["wallet_type"],
+        "CAT_WALLET_ID": identity["wallet_id"],
+        "WALLET_ID_XCH": identity["xch_wallet_id"],
+        "CAT_ASSET_ID": identity["asset_id"],
+        "CAT_TICKER_ID": identity["ticker"],
         "SAGE_FINGERPRINT": str(identity["wallet_fingerprint"]),
     }
     if any(configuration[key] != value for key, value in expected.items()):
@@ -100,16 +110,22 @@ def validate_execution_context(binding, identity, economic_plan):
         if not address.startswith(prefix):
             raise ValueError("wrong network address")
         recipe = build_exact_prep_economics(
-            configuration=configuration, worker_args=binding["worker_args"],
+            configuration=configuration,
+            worker_args=binding["worker_args"],
             campaign_revision=economic_plan["campaign_revision"] or 0,
             target_seconds=economic_plan["target_seconds"],
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("FEE_EXECUTION_CONTEXT_INVALID") from exc
-    generated = sorted((asdict(t) for t in recipe["targets"]), key=lambda t: (t["asset"], t["ordinal"]))
-    if (generated != economic_plan["outputs"]
-            or recipe["economic_plan"]["reserve_floors_mojos"] != economic_plan["reserve_floors_mojos"]
-            or recipe["economic_plan"]["liquidity_mode"] != economic_plan["liquidity_mode"]):
+    generated = sorted(
+        (asdict(t) for t in recipe["targets"]), key=lambda t: (t["asset"], t["ordinal"])
+    )
+    if (
+        generated != economic_plan["outputs"]
+        or recipe["economic_plan"]["reserve_floors_mojos"]
+        != economic_plan["reserve_floors_mojos"]
+        or recipe["economic_plan"]["liquidity_mode"] != economic_plan["liquidity_mode"]
+    ):
         raise ValueError("FEE_EXECUTION_CONTEXT_INVALID")
     # Keep approved multiplier/headroom metadata, but NEVER apply it a second time.
     return {**recipe, "economic_plan": economic_plan}
@@ -124,6 +140,9 @@ def freeze_execution_context(context):
         "worker_args": dict(context["recipe"]["worker_args"]),
     }
     plan = context["recipe"]["economic_plan"]
-    canonical_plan = {**plan, "outputs": sorted(plan["outputs"], key=lambda t: (t["asset"], t["ordinal"]))}
+    canonical_plan = {
+        **plan,
+        "outputs": sorted(plan["outputs"], key=lambda t: (t["asset"], t["ordinal"])),
+    }
     validate_execution_context(binding, context["identity"], canonical_plan)
     return binding

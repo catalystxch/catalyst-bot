@@ -403,23 +403,42 @@ def test_exact_journal_evidence_settles_once(
     # while released-no-effect fees do not inflate the cumulative ceiling.
     stored = database.get_coin_prep_fee_approval_context(approval["approval_id"])
     now = int(time.time())
-    monkeypatch.setattr(fee_service, "quote_fee", lambda cost, target_seconds: {
-        "available": True, "source": "coinset", "observed_at": now,
-        "expires_at": now + 60, "cost": cost, "target_seconds": target_seconds,
-        "fee_mojos": 30 if cost == 1000 else 5,
-    })
+    monkeypatch.setattr(
+        fee_service,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "source": "coinset",
+            "observed_at": now,
+            "expires_at": now + 60,
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "fee_mojos": 30 if cost == 1000 else 5,
+        },
+    )
     preview = fee_service.estimate_coin_prep_fee_preview(
-        scope=json.loads(stored["scope_json"]), economic_plan=json.loads(stored["plan_json"]),
-        stages=[{"stage_id": name, "cost": cost, "cost_kind": "projected",
-                 "transaction_count_min": 1, "transaction_count_max": 1,
-                 "cancellation": cancel}
-                for name, cost, cancel in (("prep", 1000, False), ("cancel", 100, True))],
-        fee_funding_mojos=50, request_options={},
+        scope=json.loads(stored["scope_json"]),
+        economic_plan=json.loads(stored["plan_json"]),
+        stages=[
+            {
+                "stage_id": name,
+                "cost": cost,
+                "cost_kind": "projected",
+                "transaction_count_min": 1,
+                "transaction_count_max": 1,
+                "cancellation": cancel,
+            }
+            for name, cost, cancel in (("prep", 1000, False), ("cancel", 100, True))
+        ],
+        fee_funding_mojos=50,
+        request_options={},
     )
     assert preview["fee_accounting"]["spent_fee_mojos"] == spent
     assert preview["fee_accounting"]["held_fee_mojos"] == 0
     assert preview["minimum_cancellation_reserve_mojos"] == 20
-    assert preview["suggested_maximum_fee_mojos"] == (60 if outcome == "CONFIRMED" else 50)
+    assert preview["suggested_maximum_fee_mojos"] == (
+        60 if outcome == "CONFIRMED" else 50
+    )
     assert preview["funded"] is True
     if outcome == "FAILED":
         database.reserve_approved_fee(

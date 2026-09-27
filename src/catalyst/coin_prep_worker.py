@@ -2192,7 +2192,10 @@ class CoinPrepWorker:
         """Close the approved standalone scope before reporting prep success."""
 
         approval_id = getattr(self, "fee_approval_id", None)
-        if type(approval_id) is not str or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None:
+        if (
+            type(approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
+        ):
             raise ValueError("FEE_APPROVAL_REQUIRED")
         from coin_prep_fee_approval import complete_coin_prep_fee_scope
 
@@ -2385,31 +2388,41 @@ class CoinPrepWorker:
             )
         return max(plan.fee_mojos, exact_cost * 6)
 
-    def _submit_direct_batch_plan(self, plan, address: str, *, priced_batch=None) -> bool:
+    def _submit_direct_batch_plan(
+        self, plan, address: str, *, priced_batch=None
+    ) -> bool:
         """Hold the approved exact fee before the existing Sage dispatch fence."""
 
         from coin_prep_fee_dispatch import (
-            price_approved_prep_batch, recheck_approved_prep_dispatch,
+            price_approved_prep_batch,
+            recheck_approved_prep_dispatch,
             reserve_approved_prep_dispatch,
         )
         from coin_prep_unsigned import batch_target_contract
         from replacement_capacity import canonical_coin_prep_contract
 
         approval_id = getattr(self, "fee_approval_id", None)
-        if type(approval_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", approval_id):
+        if type(approval_id) is not str or not re.fullmatch(
+            r"[0-9a-f]{64}", approval_id
+        ):
             raise ValueError("FEE_APPROVAL_REQUIRED")
         if priced_batch is None:
             priced_batch = price_approved_prep_batch(approval_id)
         if priced_batch.get("available") is not True:
             raise ValueError(priced_batch["reason"])
         pricing = priced_batch["pricing"]
-        if (pricing.get("transaction_required") is not True or pricing["plan"] != plan
-                or priced_batch["receive_address"] != address):
+        if (
+            pricing.get("transaction_required") is not True
+            or pricing["plan"] != plan
+            or priced_batch["receive_address"] != address
+        ):
             raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
         fee_coin_ids = [plan.fee_source_id] if plan.fee_source_id else []
         # Neither the worker's independently sized tiers nor a CLI/env asset
         # override may replace the canonical economic contract confirmed in UI.
-        target = batch_target_contract(plan, address, priced_batch["identity"]["asset_id"])
+        target = batch_target_contract(
+            plan, address, priced_batch["identity"]["asset_id"]
+        )
         canonical = canonical_coin_prep_contract(
             operation_kind="split",
             purpose="replacement",
@@ -2451,16 +2464,22 @@ class CoinPrepWorker:
             return False
         try:
             hold = reserve_approved_prep_dispatch(
-                approval_id=approval_id, operation_id=canonical["operation_id"],
-                priced_batch=priced_batch)
+                approval_id=approval_id,
+                operation_id=canonical["operation_id"],
+                priced_batch=priced_batch,
+            )
             validated = hold["validated_unsigned"]
             recheck_approved_prep_dispatch(
-                approval_id=approval_id, operation_id=canonical["operation_id"],
-                priced_batch=priced_batch)
+                approval_id=approval_id,
+                operation_id=canonical["operation_id"],
+                priced_batch=priced_batch,
+            )
         except Exception:
             retain_wallet_effect_claim_for_reconciliation(
-                claim["claim_token"], claim["generation"],
-                reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED")
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED",
+            )
             raise
         if not wallet_effect_claim_is_current(
             claim["claim_token"],
@@ -2484,12 +2503,17 @@ class CoinPrepWorker:
                 operation_id=canonical["operation_id"],
                 source_coin_ids=list(plan.source_coin_ids),
                 fee_coin_ids=fee_coin_ids,
-                prep_fee_context={"approval_id": approval_id, "quote": pricing["quote"]},
+                prep_fee_context={
+                    "approval_id": approval_id,
+                    "quote": pricing["quote"],
+                },
             )
         except Exception:
             retain_wallet_effect_claim_for_reconciliation(
-                claim["claim_token"], claim["generation"],
-                reason_code="DIRECT_BATCH_FEE_DISPATCH_DENIED")
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_FEE_DISPATCH_DENIED",
+            )
             raise
         if dispatch is None:
             retain_wallet_effect_claim_for_reconciliation(
@@ -2503,8 +2527,11 @@ class CoinPrepWorker:
         try:
             with wallet_effect_adapter_dispatch_authority(dispatch):
                 recheck_approved_prep_dispatch(
-                    approval_id=approval_id, operation_id=canonical["operation_id"],
-                    priced_batch=priced_batch, dispatch_capability=dispatch)
+                    approval_id=approval_id,
+                    operation_id=canonical["operation_id"],
+                    priced_batch=priced_batch,
+                    dispatch_capability=dispatch,
+                )
                 if self._is_subprocess:
                     result = _guarded_wallet_mutation(
                         "coin_prep.create_final_batch",
@@ -2614,12 +2641,15 @@ class CoinPrepWorker:
         """Consume frozen approved targets; never fall back to unpriced signing."""
 
         approval_id = getattr(self, "fee_approval_id", None)
-        if type(approval_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", approval_id):
+        if type(approval_id) is not str or not re.fullmatch(
+            r"[0-9a-f]{64}", approval_id
+        ):
             raise ValueError("FEE_APPROVAL_REQUIRED")
         if not self.is_sage or not DB_AVAILABLE:
             raise ValueError("FEE_DISPATCH_UNSUPPORTED")
         from coin_prep_fee_dispatch import price_approved_prep_batch
         from coin_prep_fee_pricing import MAX_PREP_BATCHES
+
         with self.status_lock:
             self.status.execution_mode = "direct_final_batch_v2"
             self.status.compatibility_reason = None
@@ -2657,7 +2687,9 @@ class CoinPrepWorker:
                     else f"Building direct final-output batch {batch_number}..."
                 ),
             )
-            if not self._submit_direct_batch_plan(plan, priced["receive_address"], priced_batch=priced):
+            if not self._submit_direct_batch_plan(
+                plan, priced["receive_address"], priced_batch=priced
+            ):
                 return False
             with self.status_lock:
                 self.status.batch_confirmed = batch_number
@@ -3191,9 +3223,7 @@ class CoinPrepWorker:
                 # pricing; standalone/legacy callers continue to use their
                 # CLI output counts below.
                 sell_tier_counts = {
-                    tier_name: max(
-                        0, int(explicit_live_counts.get(tier_name, 0) or 0)
-                    )
+                    tier_name: max(0, int(explicit_live_counts.get(tier_name, 0) or 0))
                     for tier_name in TIER_ORDER
                 }
                 max_sell_offers = sum(sell_tier_counts.values())
@@ -3203,9 +3233,7 @@ class CoinPrepWorker:
             else:
                 # Legacy in-process callers may not provide CLI counts.
                 sell_tier_counts = {
-                    tier_name: _env_int(
-                        f"SELL_{tier_name.upper()}_TIER_COUNT", 0
-                    )
+                    tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
                     for tier_name in TIER_ORDER
                 }
                 max_sell_offers = _env_int(
@@ -3220,11 +3248,14 @@ class CoinPrepWorker:
             from coin_prep_economics import prepared_cat_sizes
 
             result = prepared_cat_sizes(
-                live_sizes=live_sizes, price=price,
+                live_sizes=live_sizes,
+                price=price,
                 headroom_multiplier=self.coin_prep_headroom_multiplier,
-                cat_decimals=self.cat_decimals, sell_counts=sell_tier_counts,
+                cat_decimals=self.cat_decimals,
+                sell_counts=sell_tier_counts,
                 max_offers=max_sell_offers,
-                spread_bps=spread_fraction * Decimal("10000"), min_edge_bps=min_edge_bps,
+                spread_bps=spread_fraction * Decimal("10000"),
+                min_edge_bps=min_edge_bps,
             )
             self.log(
                 f"   Tier CAT sizes derived from generated SELL ladder prices "

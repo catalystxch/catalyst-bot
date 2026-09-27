@@ -53,7 +53,9 @@ def test_manual_fee_toggle_does_not_describe_prep_as_manual_or_free(
     expect(hint).to_contain_text(re.compile(r"Coin Prep.*fresh.*estimat", re.S))
     expect(hint).to_contain_text(re.compile(r"approved.*budget", re.S))
     expect(hint).to_contain_text(re.compile(r"protected cancellation", re.I))
-    expect(hint).not_to_contain_text(re.compile(r"will be sent with zero fee|transactions will use"))
+    expect(hint).not_to_contain_text(
+        re.compile(r"will be sent with zero fee|transactions will use")
+    )
     if enabled:
         expect(hint).to_contain_text("0.0000130791 XCH")
     else:
@@ -61,7 +63,9 @@ def test_manual_fee_toggle_does_not_describe_prep_as_manual_or_free(
 
 
 @pytest.mark.parametrize("tiered", [False, True])
-def test_configured_fee_pool_is_retained_principal_for_flat_and_tiered_prep(page, tiered):
+def test_configured_fee_pool_is_retained_principal_for_flat_and_tiered_prep(
+    page, tiered
+):
     """Uniform prep also freezes fee outputs; they are not fees already spent."""
     page.route("http://**/*", lambda route: route.abort())
     page.route("https://**/*", lambda route: route.abort())
@@ -83,8 +87,12 @@ def test_configured_fee_pool_is_retained_principal_for_flat_and_tiered_prep(page
     expect(hint).not_to_contain_text("only prepared during tiered")
 
 
-@pytest.mark.parametrize("fee_enabled, want_coins, want_total", [(True, 56, 0.65), (False, 6, 0.6)])
-def test_flat_prep_summary_accounts_for_fee_outputs(page, fee_enabled, want_coins, want_total):
+@pytest.mark.parametrize(
+    "fee_enabled, want_coins, want_total", [(True, 56, 0.65), (False, 6, 0.6)]
+)
+def test_flat_prep_summary_accounts_for_fee_outputs(
+    page, fee_enabled, want_coins, want_total
+):
     """The flat Settings preview must not omit fifty approved fee-reserve outputs."""
     page.route("http://**/*", lambda route: route.abort())
     page.route("https://**/*", lambda route: route.abort())
@@ -119,8 +127,12 @@ def test_flat_prep_summary_accounts_for_fee_outputs(page, fee_enabled, want_coin
 
 @pytest.mark.parametrize(
     "mode,multiplier,want_xch,want_cat",
-    [("two_sided", 0.5, 2, 2), ("two_sided", 1.5, 7, 7),
-     ("buy_only", 1.5, 7, 0), ("sell_only", 1.5, 0, 7)],
+    [
+        ("two_sided", 0.5, 2, 2),
+        ("two_sided", 1.5, 7, 7),
+        ("buy_only", 1.5, 7, 0),
+        ("sell_only", 1.5, 0, 7),
+    ],
 )
 def test_uniform_summary_uses_frozen_backend_multiplier_semantics(
     page, mode, multiplier, want_xch, want_cat
@@ -145,11 +157,13 @@ def test_uniform_summary_uses_frozen_backend_multiplier_semantics(
 
 @pytest.mark.parametrize(
     "decimals,price,headroom,want_amount,want_text",
-    [(3, 0.000075, 0, 1333.334, "1,333.334"),
-     (3, 0.000075, 10, 1466.667, "1,466.667"),
-     (3, 0.0001, 10, 1100, "1,100"),
-     (0, 0.000075, 0, 1334, "1,334"),
-     (6, 0.000075, 0, 1333.333334, "1,333.333334")],
+    [
+        (3, 0.000075, 0, 1333.334, "1,333.334"),
+        (3, 0.000075, 10, 1466.667, "1,466.667"),
+        (3, 0.0001, 10, 1100, "1,100"),
+        (0, 0.000075, 0, 1334, "1,334"),
+        (6, 0.000075, 0, 1333.333334, "1,333.333334"),
+    ],
 )
 def test_uniform_cat_preview_rounds_capacity_up_to_the_actual_mojo(
     page, decimals, price, headroom, want_amount, want_text
@@ -188,10 +202,14 @@ def test_tiered_cat_sizes_match_actual_ladder_mojo_capacities(page, surface):
 
     expected = {"inner": "1466.667", "mid": "2793.651"}
     backend = prepared_cat_sizes(
-        live_sizes={"inner": "0.1", "mid": "0.2"}, price="0.000075",
-        headroom_multiplier="1.1", cat_decimals=3,
-        sell_counts={"inner": 1, "mid": 2}, max_offers=3,
-        spread_bps="1000", min_edge_bps="0",
+        live_sizes={"inner": "0.1", "mid": "0.2"},
+        price="0.000075",
+        headroom_multiplier="1.1",
+        cat_decimals=3,
+        sell_counts={"inner": 1, "mid": 2},
+        max_offers=3,
+        spread_bps="1000",
+        min_edge_bps="0",
     )
     assert {key: str(value) for key, value in backend.items()} == expected
     page.route("http://**/*", lambda route: route.abort())
@@ -286,7 +304,9 @@ def test_tier_preflight_respects_explicit_zero_price_settings(page, spread, edge
 
 @pytest.mark.parametrize("surface", ["settings", "preflight"])
 @pytest.mark.parametrize("tiered", [False, True])
-def test_prep_headroom_does_not_add_binary_dust_before_exact_rounding(page, surface, tiered):
+def test_prep_headroom_does_not_add_binary_dust_before_exact_rounding(
+    page, surface, tiered
+):
     """1 XCH / .01 XCH per CAT with 14% headroom is exactly 114 CAT."""
     page.route("http://**/*", lambda route: route.abort())
     page.route("https://**/*", lambda route: route.abort())
@@ -360,8 +380,11 @@ def test_uniform_prep_count_floors_decimal_product_without_binary_loss(page):
 
 @pytest.mark.parametrize(
     "size,price,spread,edge,want",
-    [(0.14, 0.01, 0, 0, 14), (0.0114, 0.01, 2000, 1400, 1),
-     (0.0105, 0.01, 500, 1400, 1)],
+    [
+        (0.14, 0.01, 0, 0, 14),
+        (0.0114, 0.01, 2000, 1400, 1),
+        (0.0105, 0.01, 500, 1400, 1),
+    ],
 )
 def test_tier_capacity_does_not_add_a_mojo_at_exact_price_boundaries(
     page, size, price, spread, edge, want

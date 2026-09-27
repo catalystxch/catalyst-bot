@@ -10,8 +10,11 @@ import database
 import wallet
 import wallet_sage
 from fee_approval_test_utils import (
-    _coin, _counts, confirmation as _confirmation,
-    economic_reads as _economic_reads, live_reads as _live_reads,
+    _coin,
+    _counts,
+    confirmation as _confirmation,
+    economic_reads as _economic_reads,
+    live_reads as _live_reads,
 )
 
 
@@ -35,12 +38,13 @@ def _confirm(state, **overrides):
 
     confirm = getattr(service, "approve_coin_prep_fees", None)
     assert callable(confirm), "server-owned runtime fee confirmation is missing"
-    args = {"preview_id": state["preview"]["preview_id"],
-            "maximum_fee_mojos": 80, "cancellation_reserve_mojos": 20}
+    args = {
+        "preview_id": state["preview"]["preview_id"],
+        "maximum_fee_mojos": 80,
+        "cancellation_reserve_mojos": 20,
+    }
     args.update(overrides)
     return confirm(**args)
-
-
 
 
 def test_confirmation_uses_persisted_scope_and_current_wallet_economics(confirmation):
@@ -50,8 +54,13 @@ def test_confirmation_uses_persisted_scope_and_current_wallet_economics(confirma
     assert result["remaining_preparation_fee_mojos"] == 60
     assert result["dispatch_authorized"] is False
     assert result["preview_id"] == confirmation["preview"]["preview_id"]
-    assert _counts() == {"fee_approvals": 1, "coin_prep_fee_consents": 1,
-                         "approved_fee_reservations": 0, "coin_prep_operations": 0, "wallet_effect_claims": 0}
+    assert _counts() == {
+        "fee_approvals": 1,
+        "coin_prep_fee_consents": 1,
+        "approved_fee_reservations": 0,
+        "coin_prep_operations": 0,
+        "wallet_effect_claims": 0,
+    }
 
 
 def test_restart_status_exposes_saved_choices_without_granting_dispatch(confirmation):
@@ -63,23 +72,46 @@ def test_restart_status_exposes_saved_choices_without_granting_dispatch(confirma
     assert _counts()["approved_fee_reservations"] == 0
 
 
-@pytest.mark.parametrize("owner,reason", [("missing", "FEE_SESSION_REQUIRED"),
-                                         ("foreign", "FEE_APPROVAL_STALE")])
+@pytest.mark.parametrize(
+    "owner,reason",
+    [("missing", "FEE_SESSION_REQUIRED"), ("foreign", "FEE_APPROVAL_STALE")],
+)
 def test_unowned_session_preview_cannot_be_confirmed(confirmation, owner, reason):
     stored = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
     scope = json.loads(stored["scope_json"])
     scope["session_id"] = "d" * 64
     if owner == "foreign":
-        identity = {key: scope[key] for key in (
-            "network", "wallet_type", "wallet_fingerprint", "wallet_id",
-            "xch_wallet_id", "asset_id", "ticker")}
+        identity = {
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        }
         identity["wallet_fingerprint"] = 3702373391
-        scope["session_id"] = service.resolve_server_fee_scope(identity=identity)["session_id"]
+        scope["session_id"] = service.resolve_server_fee_scope(identity=identity)[
+            "session_id"
+        ]
     contract = service.canonical_fee_contract(scope, json.loads(stored["plan_json"]))
     preview = database.store_coin_prep_fee_preview(
-        **{key: contract[key] for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")},
-        **{key: stored[key] for key in (
-            "request_options_json", "quote_json", "observed_at", "expires_at")},
+        **{
+            key: contract[key]
+            for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")
+        },
+        **{
+            key: stored[key]
+            for key in (
+                "request_options_json",
+                "quote_json",
+                "observed_at",
+                "expires_at",
+            )
+        },
     )
     with pytest.raises(ValueError, match=reason):
         _confirm(confirmation, preview_id=preview["preview_id"])
@@ -87,9 +119,18 @@ def test_unowned_session_preview_cannot_be_confirmed(confirmation, owner, reason
     assert all(count == 0 for count in _counts().values())
 
 
-@pytest.mark.parametrize("field,value", [("wallet_fingerprint", 3702373391),
-                                          ("asset", "37" * 32), ("price", "0.02"), ("reserve", 1)])
-def test_changed_wallet_asset_price_or_reserve_cannot_confirm_old_plan(confirmation, field, value):
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("wallet_fingerprint", 3702373391),
+        ("asset", "37" * 32),
+        ("price", "0.02"),
+        ("reserve", 1),
+    ],
+)
+def test_changed_wallet_asset_price_or_reserve_cannot_confirm_old_plan(
+    confirmation, field, value
+):
     if field == "wallet_fingerprint":
         confirmation["identity"]["fingerprint"] = value
         confirmation["config"].SAGE_FINGERPRINT = str(value)
@@ -124,14 +165,22 @@ def test_current_funding_not_old_preview_balance_limits_confirmation(confirmatio
 
 def test_ended_campaign_cannot_be_confirmed_as_a_standalone_session(confirmation):
     old = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
-    scope = {**json.loads(old["scope_json"]), "session_id": None, "campaign_id": "c" * 64}
+    scope = {
+        **json.loads(old["scope_json"]),
+        "session_id": None,
+        "campaign_id": "c" * 64,
+    }
     plan = {**json.loads(old["plan_json"]), "campaign_revision": 0}
     contract = service.canonical_fee_contract(scope, plan)
     new = database.store_coin_prep_fee_preview(
-        scope_sha256=contract["scope_sha256"], plan_sha256=contract["plan_sha256"],
-        scope_json=contract["scope_json"], plan_json=contract["plan_json"],
-        request_options_json=old["request_options_json"], quote_json=old["quote_json"],
-        observed_at=1000, expires_at=1060,
+        scope_sha256=contract["scope_sha256"],
+        plan_sha256=contract["plan_sha256"],
+        scope_json=contract["scope_json"],
+        plan_json=contract["plan_json"],
+        request_options_json=old["request_options_json"],
+        quote_json=old["quote_json"],
+        observed_at=1000,
+        expires_at=1060,
     )
     with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
         _confirm(confirmation, preview_id=new["preview_id"])
@@ -148,11 +197,19 @@ def test_current_principal_shortfall_cannot_be_hidden_by_preview_funding(confirm
 def test_prior_commitments_are_subtracted_before_checking_current_funding(confirmation):
     preview = confirmation["preview"]
     prior = database.create_fee_approval(
-        scope_sha256=preview["scope_sha256"], plan_sha256=preview["plan_sha256"],
-        total_fee_mojos=80, cancellation_reserve_mojos=20)
+        scope_sha256=preview["scope_sha256"],
+        plan_sha256=preview["plan_sha256"],
+        total_fee_mojos=80,
+        cancellation_reserve_mojos=20,
+    )
     database.reserve_approved_fee(
-        approval_id=prior["approval_id"], scope_sha256=prior["scope_sha256"],
-        plan_sha256=prior["plan_sha256"], operation_id="1" * 64, fee_mojos=50, cancellation=True)
+        approval_id=prior["approval_id"],
+        scope_sha256=prior["scope_sha256"],
+        plan_sha256=prior["plan_sha256"],
+        operation_id="1" * 64,
+        fee_mojos=50,
+        cancellation=True,
+    )
     confirmation["xch"] = [_coin(1, str(112_000_000_040))]
     result = _confirm(confirmation, maximum_fee_mojos=90)
     assert result["held_fee_mojos"] == 50
@@ -160,7 +217,9 @@ def test_prior_commitments_are_subtracted_before_checking_current_funding(confir
     assert result["version"] == 2
 
 
-def test_preview_expiring_during_wallet_reads_cannot_be_confirmed(confirmation, monkeypatch):
+def test_preview_expiring_during_wallet_reads_cannot_be_confirmed(
+    confirmation, monkeypatch
+):
     original = runtime.read_fee_economic_snapshot
 
     def slow_read(options):
@@ -174,7 +233,9 @@ def test_preview_expiring_during_wallet_reads_cannot_be_confirmed(confirmation, 
     assert not any(_counts().values())
 
 
-def test_preview_expiring_while_waiting_for_database_lock_cannot_be_confirmed(confirmation, monkeypatch):
+def test_preview_expiring_while_waiting_for_database_lock_cannot_be_confirmed(
+    confirmation, monkeypatch
+):
     original = database._stability_connection
 
     class DelayedConnection:
@@ -197,7 +258,9 @@ def test_preview_expiring_while_waiting_for_database_lock_cannot_be_confirmed(co
     assert not any(_counts().values())
 
 
-def test_duplicate_confirmation_returns_durable_accounting_not_dispatch_permission(confirmation):
+def test_duplicate_confirmation_returns_durable_accounting_not_dispatch_permission(
+    confirmation,
+):
     first = _confirm(confirmation)
     confirmation["now"] = 2000
     database.close_connection()
@@ -208,11 +271,18 @@ def test_duplicate_confirmation_returns_durable_accounting_not_dispatch_permissi
     assert _counts()["fee_approvals"] == 1
 
 
-def test_duplicate_confirmation_does_not_require_pending_inputs_to_be_selectable(confirmation):
+def test_duplicate_confirmation_does_not_require_pending_inputs_to_be_selectable(
+    confirmation,
+):
     first = _confirm(confirmation)
     database.reserve_approved_fee(
-        approval_id=first["approval_id"], scope_sha256=first["scope_sha256"],
-        plan_sha256=first["plan_sha256"], operation_id="1" * 64, fee_mojos=30, cancellation=False)
+        approval_id=first["approval_id"],
+        scope_sha256=first["scope_sha256"],
+        plan_sha256=first["plan_sha256"],
+        operation_id="1" * 64,
+        fee_mojos=30,
+        cancellation=False,
+    )
     confirmation["xch"] = []
     confirmation["cat"] = []
     second = _confirm(confirmation)
@@ -224,9 +294,16 @@ def test_duplicate_confirmation_does_not_require_pending_inputs_to_be_selectable
     assert _counts()["fee_approvals"] == 1
 
 
-@pytest.mark.parametrize("overrides", [{"maximum_fee_mojos": True}, {"maximum_fee_mojos": 1.5},
-                                      {"maximum_fee_mojos": -1}, {"cancellation_reserve_mojos": "20"},
-                                      {"preview_id": "not-a-server-preview"}])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"maximum_fee_mojos": True},
+        {"maximum_fee_mojos": 1.5},
+        {"maximum_fee_mojos": -1},
+        {"cancellation_reserve_mojos": "20"},
+        {"preview_id": "not-a-server-preview"},
+    ],
+)
 def test_bad_confirmation_is_rejected_before_wallet_reads(confirmation, overrides):
     with pytest.raises(ValueError):
         _confirm(confirmation, **overrides)
@@ -241,8 +318,13 @@ def test_server_preview_id_does_not_accept_client_economic_authority(confirmatio
 
 
 def test_stored_request_options_are_used_not_later_client_defaults(confirmation):
-    persisted = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
-    assert json.loads(persisted["request_options_json"]) == {"coin_multiplier": "1", "target_seconds": 300}
+    persisted = database.get_coin_prep_fee_preview(
+        confirmation["preview"]["preview_id"]
+    )
+    assert json.loads(persisted["request_options_json"]) == {
+        "coin_multiplier": "1",
+        "target_seconds": 300,
+    }
     result = _confirm(confirmation)
     context = database.get_coin_prep_fee_approval_context(result["approval_id"])
     assert context["request_options_json"] == persisted["request_options_json"]

@@ -30,8 +30,28 @@ Interface: `quote_fee(cost: int, target_seconds: int = 300) -> dict`; `normalize
 - [x] Write failing tests with literal expected fee amounts. Start with missing/empty estimate producing unavailable, numeric zero producing an available zero, and Decimal fractional mojos rounded upward.
 
 ```python
-assert normalize_fee_response({'success': True, 'estimates': []}, cost=20_000_000, target_seconds=300, source='coinset', observed_at=100, now=100)['available'] is False
-assert normalize_fee_response({'success': True, 'estimates': [0]}, cost=20_000_000, target_seconds=300, source='coinset', observed_at=100, now=100)['fee_mojos'] == 0
+assert (
+    normalize_fee_response(
+        {"success": True, "estimates": []},
+        cost=20_000_000,
+        target_seconds=300,
+        source="coinset",
+        observed_at=100,
+        now=100,
+    )["available"]
+    is False
+)
+assert (
+    normalize_fee_response(
+        {"success": True, "estimates": [0]},
+        cost=20_000_000,
+        target_seconds=300,
+        source="coinset",
+        observed_at=100,
+        now=100,
+    )["fee_mojos"]
+    == 0
+)
 ```
 
 - [x] Run `python -m pytest tests/test_fee_estimation.py -q`; observe missing-behavior assertion failures before implementation.
@@ -50,9 +70,21 @@ Interfaces: retain create_fee_approval/get_fee_approval/reserve_approved_fee key
 - [x] Write failing real isolated-SQLite tests: two competing reservations cannot spend the same remainder; older-version fees remain counted; protected cancellation allowance is unavailable to prep; schema corruption blocks use.
 
 ```python
-approval = database.create_fee_approval(scope_sha256='a'*64, plan_sha256='b'*64, total_fee_mojos=10_000_000_000, cancellation_reserve_mojos=2_000_000_000)
-with pytest.raises(ValueError, match='FEE_BUDGET_EXCEEDED'):
-    database.reserve_approved_fee(approval_id=approval['approval_id'], scope_sha256='a'*64, plan_sha256='b'*64, operation_id='1'*64, fee_mojos=8_016_000_000, cancellation=False)
+approval = database.create_fee_approval(
+    scope_sha256="a" * 64,
+    plan_sha256="b" * 64,
+    total_fee_mojos=10_000_000_000,
+    cancellation_reserve_mojos=2_000_000_000,
+)
+with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+    database.reserve_approved_fee(
+        approval_id=approval["approval_id"],
+        scope_sha256="a" * 64,
+        plan_sha256="b" * 64,
+        operation_id="1" * 64,
+        fee_mojos=8_016_000_000,
+        cancellation=False,
+    )
 ```
 
 - [x] Run ledger/schema tests to observe failures, then add canonical validated/migrated schema, indexes and append-only approval semantics. Monetary constraints must reject fractional and boolean fees.
@@ -88,8 +120,10 @@ Verified core substeps (do not imply the runtime collector/routes below are comp
 - [x] Write failing API/bridge tests that a preview leaves balances, resets, journals and worker launch untouched, and approval requires a current matching server-owned preview.
 
 ```python
-result = client.post('/api/coin-prep/fee-preview', json={'coin_multiplier': 1}).get_json()
-assert result['target_seconds'] == 300
+result = client.post(
+    "/api/coin-prep/fee-preview", json={"coin_multiplier": 1}
+).get_json()
+assert result["target_seconds"] == 300
 assert fake_wallet.signatures == []
 assert fake_wallet.submissions == []
 ```
@@ -114,7 +148,7 @@ Interfaces: focused fee service produces validated final unsigned effect plus ex
 
 ```python
 worker.run()
-assert status.reason == 'FEE_APPROVAL_REQUIRED'
+assert status.reason == "FEE_APPROVAL_REQUIRED"
 assert fake_wallet.signatures == []
 assert fake_wallet.submissions == []
 ```
@@ -131,9 +165,9 @@ Files: modify bot_gui.html; create tests/e2e/test_coin_prep_fee_approval.py; ext
 - [x] Write failing browser tests through real GUI buttons with mocked transport/wallet effects. Coin Prep opens read-only estimate, not immediate signing; Cancel has no mutations; explicit confirm sends displayed budget only once.
 
 ```python
-page.get_by_role('button', name='Coin Prep', exact=True).click()
-expect(page.get_by_role('dialog')).to_contain_text('Estimated fees')
-page.get_by_role('button', name='Cancel', exact=True).click()
+page.get_by_role("button", name="Coin Prep", exact=True).click()
+expect(page.get_by_role("dialog")).to_contain_text("Estimated fees")
+page.get_by_role("button", name="Cancel", exact=True).click()
 assert fake_wallet.submissions == []
 ```
 

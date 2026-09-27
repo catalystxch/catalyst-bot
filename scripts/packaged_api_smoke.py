@@ -139,8 +139,12 @@ def _start_mock_sage(
         temp_dir, "server", "mock-sage-server", ca_key, ca_cert, is_server=True
     )
     client_cert, client_key = _create_signed_cert(
-        temp_dir / "sage-data" / "ssl", "wallet", "mock-sage-client",
-        ca_key, ca_cert, is_server=False
+        temp_dir / "sage-data" / "ssl",
+        "wallet",
+        "mock-sage-client",
+        ca_key,
+        ca_cert,
+        is_server=False,
     )
 
     httpd = MockSageServer(("127.0.0.1", 0), MockSageHandler)
@@ -209,10 +213,20 @@ def _build_env(
     # can therefore fall back to the shipped public Dexie URL after startup.
     # Persist only known synthetic settings, never the caller's environment.
     profile_keys = (
-        "WALLET_TYPE", "SAGE_RPC_URL", "SAGE_CERT_PATH", "SAGE_KEY_PATH",
-        "SAGE_DATA_DIR", "SAGE_FINGERPRINT", "WALLET_EXPECTED_NAME",
-        "WALLET_EXPECTED_KEY_KIND", "CATALYST_NETWORK_ID", "CAT_ASSET_ID",
-        "CAT_NAME", "CAT_TICKER", "DEXIE_API_BASE", "SPLASH_ENABLED",
+        "WALLET_TYPE",
+        "SAGE_RPC_URL",
+        "SAGE_CERT_PATH",
+        "SAGE_KEY_PATH",
+        "SAGE_DATA_DIR",
+        "SAGE_FINGERPRINT",
+        "WALLET_EXPECTED_NAME",
+        "WALLET_EXPECTED_KEY_KIND",
+        "CATALYST_NETWORK_ID",
+        "CAT_ASSET_ID",
+        "CAT_NAME",
+        "CAT_TICKER",
+        "DEXIE_API_BASE",
+        "SPLASH_ENABLED",
     )
     profile_path = temp_dir / "catalyst-data" / ".env"
     profile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,7 +309,10 @@ def _validate_payload(check: EndpointCheck, payload: Any) -> None:
         raise SmokeFailure(
             f"{check.path} missing required key(s): {', '.join(missing)}"
         )
-    if check.path == "/api/wallet/sage-running" and payload.get("rpc_authenticated") is not True:
+    if (
+        check.path == "/api/wallet/sage-running"
+        and payload.get("rpc_authenticated") is not True
+    ):
         raise SmokeFailure("mock Sage RPC is not authenticated")
     if check.path == "/api/config" and (
         payload.get("DEXIE_API_BASE") != "http://127.0.0.1:1"
@@ -461,10 +478,12 @@ def run_smoke(exe_path: Path, timeout_s: int) -> int:
 
             # Startup can reload credentials asynchronously. Authentication before
             # begin-startup alone cannot establish that the mock remains in use.
-            auth_check = next(c for c in _endpoint_checks()
-                              if c.path == "/api/wallet/sage-running")
+            auth_check = next(
+                c for c in _endpoint_checks() if c.path == "/api/wallet/sage-running"
+            )
             auth_status, auth_payload = _request_json(
-                base_url=base_url, check=auth_check, local_token=local_token)
+                base_url=base_url, check=auth_check, local_token=local_token
+            )
             if auth_status != 200:
                 raise SmokeFailure("mock Sage authentication readback failed")
             _validate_payload(auth_check, auth_payload)
