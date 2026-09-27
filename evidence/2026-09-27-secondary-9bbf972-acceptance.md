@@ -121,4 +121,3 @@ passes the independently repeatable backend, Chromium, static, Windows build,
 package, duplicate-launch, persisted-restart and live Sage read-only recovery
 gates. Remaining live publication work is legitimately blocked by RED market
 confidence. No new CATalyst defect was found in this combined verification.
-
