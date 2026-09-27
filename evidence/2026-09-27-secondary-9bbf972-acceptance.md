@@ -267,3 +267,59 @@ network supplied zero offers. CATalyst therefore correctly retained RED
 single-provider protection. Both diagnostic processes were stopped afterward;
 no `Catalyst.exe` or `splash.exe` remained and ports 4000, 4001, 5000 and 11511
 were clear.
+
+## Final-head Bootstrap and fee-safety non-wallet audit
+
+The final feature branch was fetched at exact HEAD
+`892ceb7f2f6edbe00c454e7ffdbaea7223aee2df`, with exact parent
+`45cac635e60aa085480d50bbe33b1327fe0d23b2`. The parent delta is exactly six
+added lines in `evidence/2026-09-24-live-test7-acceptance.md`. Production source
+`9bbf972a9e8b0b6459e67f483080dc487993a7ca` remains an ancestor, and the full
+post-production range changes only the 24 September and 27 September evidence
+files. Product source was therefore unchanged throughout this audit.
+
+The secondary PC did not launch CATalyst, read the live Sage wallet, approve a
+fee or perform any wallet action. All tests used isolated temporary databases,
+mock wallet contracts and local Chromium route stubs while the primary PC owned
+the live-wallet lane.
+
+The focused backend command covered Bootstrap preview/start gating, Smart
+Settings, mutation gates, durable campaign state, cancellation fee budgeting,
+stopped-campaign fee renewal, recovery stop sequencing and invariants, Coin Prep
+fee confirmation/API/cancellation/Bootstrap integration, approval-ledger and
+approval-recovery rules, consent validation, preview persistence and session
+ownership. Result: **220 passed in 99.57 seconds**.
+
+The focused Chromium command ran the complete files
+`test_coin_prep_fee_approval.py`, `test_campaign_cancel_fee_recovery.py`,
+`test_campaign_cancel_recovery_confirmation.py` and `test_start_safety.py` with
+`--e2e`. It exercised displayed quote aging, unavailable/stale quote blocking,
+explicit confirmation, cap rejection, duplicate/restart behavior, durable
+pending accounting, cancellation-only renewal, cancel approval forwarding,
+recovery choices, Bootstrap legacy-plan separation and force-start bypass
+resistance. Result: **56 passed in 38.08 seconds**.
+
+Direct source audit confirmed the tested safety boundaries:
+
+- Bootstrap preview is pure and reports `financial_action_started=false`.
+  Start recomputes the preview, requires the exact asset warning and matching
+  digest, persists the campaign before Coin Prep, and still starts no financial
+  action.
+- Fee confirmation binds the immutable scope and economic-plan hashes, the
+  latest approval version, fresh available quote, funding and protected
+  cancellation reserve. Duplicate consent is idempotent and never grants a new
+  dispatch.
+- Fee reservations use an immediate SQLite transaction, reject stale approval,
+  scope/plan mismatch, conflicting operation replay and spending that consumes
+  the protected cancellation reserve. Returned records explicitly carry
+  `dispatch_authorized=false`.
+- Coin Prep cancellation derives its operation identity from the durable cohort,
+  requires the exact manifest and prepared journal, verifies wallet identity,
+  current provider quote and fee coin, rejects replay, and also returns no
+  dispatch authority.
+- Restart tests preserved campaign revision, cooldown, fee/loss state, approval
+  accounting and cancellation-only recovery without duplicate wallet effects.
+
+No CATalyst defect was reproduced, so no fix branch or package rebuild was
+created. This checkpoint is evidence-only and does not expand the live result:
+the primary PC remains the sole owner of the concurrent live Bootstrap review.
