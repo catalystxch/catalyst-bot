@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import database
 import offer_manager
 from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
-from offer_manager import OfferManager
 from test_offer_cancel_journal import (
     ASSET_ID,
     _fail_closed_network_guard,  # noqa: F401 - enforce no real wallet/network effects
@@ -96,7 +95,7 @@ def test_generic_cancel_cannot_spend_above_owning_campaign_fee_cap(
     monkeypatch.setattr(
         offer_manager, "get_effective_transaction_fee_mojos", lambda: 13_079_100
     )
-    manager = OfferManager()
+    manager = offer_manager.OfferManager()
     manager._fee_pool = SimpleNamespace(reserve=lambda minimum_amount_mojos=0: "e" * 64)
 
     try:

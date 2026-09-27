@@ -127,7 +127,6 @@ def _fee_json_amounts(value):
 @bp.route("/api/coin-prep/fee-preview", methods=["POST"])
 def api_coin_prep_fee_preview():
     """Estimate a server-owned staged plan without consent or wallet effects."""
-    import re
     from coin_prep_fee_approval import preview_coin_prep_fees
     from super_log import slog
 

@@ -29,11 +29,7 @@ from bootstrap_runtime import (
     plan_bootstrap_state_update,
     superseded_bootstrap_trade_ids,
 )
-from bot_loop import (
-    BotLoop,
-    plan_bootstrap_cycle_mutations,
-    plan_bootstrap_runtime_transition,
-)
+import bot_loop
 import api_server  # noqa: F401 - establishes blueprint import order
 from blueprints.coin_prep import (
     _active_bootstrap_coin_prep_worker_args,
@@ -91,8 +87,6 @@ def _request(**overrides):
 def bootstrap_app(tmp_path, monkeypatch):
     from blueprints import bootstrap
     from blueprints import coin_prep
-    import bot_loop
-
     database.close_connection()
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "bootstrap-e2e.db"))
     monkeypatch.setattr(database, "_db_initialized_path", "")
@@ -257,7 +251,7 @@ def test_mock_wallet_campaign_runs_from_confirmation_to_cancel_and_restart(
         campaign_record=stopped_record,
         unresolved_trade_ids=tuple(cancelled[:2]),
     )
-    transition = plan_bootstrap_runtime_transition(
+    transition = bot_loop.plan_bootstrap_runtime_transition(
         campaign_record=stopped_record,
         decision=decision,
         unresolved_cancellation_count=2,
@@ -859,7 +853,7 @@ def test_runtime_binds_exact_identity_and_only_creates_missing_levels(bootstrap_
 
 
 def test_live_bot_routes_bootstrap_before_follow_creation_and_requote():
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._enter_runtime_effect_phase = lambda phase: phase == "create"
     routed = {
         "buy": {"bootstrap-buy"},
@@ -869,8 +863,8 @@ def test_live_bot_routes_bootstrap_before_follow_creation_and_requote():
 
     assert loop._create_offers_if_needed(Decimal("1"), 0, 0) is routed
 
-    create_source = inspect.getsource(BotLoop._create_offers_if_needed)
-    requote_source = inspect.getsource(BotLoop._handle_requoting)
+    create_source = inspect.getsource(bot_loop.BotLoop._create_offers_if_needed)
+    requote_source = inspect.getsource(bot_loop.BotLoop._handle_requoting)
     assert create_source.index("_route_bootstrap_creation_if_active") < (
         create_source.index("_enter_runtime_effect_phase")
     )
@@ -881,7 +875,7 @@ def test_live_bot_routes_bootstrap_before_follow_creation_and_requote():
 
 
 def test_bootstrap_startup_skips_legacy_tier_readiness(monkeypatch):
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._bootstrap_campaign_context = lambda: {
         "active": True,
         "blocked": False,
@@ -918,7 +912,7 @@ def test_bootstrap_startup_skips_legacy_tier_readiness(monkeypatch):
 
 
 def test_active_bootstrap_suppresses_follow_churn_but_keeps_safety_and_recovery():
-    policy = plan_bootstrap_cycle_mutations(bootstrap_active=True)
+    policy = bot_loop.plan_bootstrap_cycle_mutations(bootstrap_active=True)
 
     assert policy == {
         "toxicity_cancel": False,
@@ -936,9 +930,9 @@ def test_active_bootstrap_suppresses_follow_churn_but_keeps_safety_and_recovery(
         "publication_reconcile": True,
         "fill_reconcile": True,
     }
-    assert all(plan_bootstrap_cycle_mutations(bootstrap_active=False).values())
+    assert all(bot_loop.plan_bootstrap_cycle_mutations(bootstrap_active=False).values())
 
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop.coin_manager = SimpleNamespace(
         check_coin_prep_status=lambda: {"cancelled_ids": []}
     )
@@ -1024,7 +1018,7 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     created_call = {}
     queued_dexie = []
     queued_splash = []
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._publication_discovery_pending = 0
     loop._last_bulk_create_time = 0
     loop._market_confidence_result = SimpleNamespace(
@@ -1083,7 +1077,7 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
 def test_red_market_authorizes_only_current_bootstrap_publication_claim(monkeypatch):
     import bot_loop
 
-    loop = BotLoop.__new__(BotLoop)
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
     loop._enter_runtime_effect_phase = lambda phase: False
     loop._runtime_recovery_cycle_boundary = lambda: True
     loop._bootstrap_campaign_context = lambda: {
@@ -1124,7 +1118,7 @@ def test_red_market_still_drains_current_bootstrap_publication_queues(monkeypatc
     import bot_loop
 
     flushed = []
-    loop = BotLoop.__new__(BotLoop)
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
     loop._enter_runtime_effect_phase = lambda phase: False
     loop._runtime_recovery_cycle_boundary = lambda: True
     loop._bootstrap_campaign_context = lambda: {
@@ -1188,7 +1182,7 @@ def test_live_bot_finalizes_automatic_bootstrap_stop_after_offer_clearance(monke
         lambda record: events.append(record) or "event-id",
     )
 
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._publication_discovery_pending = 0
     loop._market_confidence_result = None
     loop.coin_manager = SimpleNamespace(is_busy=lambda: False)
@@ -1669,7 +1663,7 @@ def test_live_bot_materializes_authoritative_stage_before_creating(
 
     monkeypatch.setattr(wallet, "get_wallet_puzzle_hashes", lambda: {"99" * 32})
     monkeypatch.setattr(bot_loop.database, "get_fills", lambda *_args, **_kwargs: fills)
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._market_confidence_result = confidence
 
     result = loop._refresh_bootstrap_campaign_evidence(
@@ -1725,7 +1719,7 @@ def test_live_bot_blocks_higher_stage_replacement_without_owned_hash_proof(
     import wallet
 
     monkeypatch.setattr(wallet, "get_wallet_puzzle_hashes", lambda: set())
-    loop = object.__new__(BotLoop)
+    loop = object.__new__(bot_loop.BotLoop)
     loop._market_confidence_result = SimpleNamespace(data_valid=True)
     result = loop._refresh_bootstrap_campaign_evidence(
         campaign=record,
