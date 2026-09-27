@@ -19010,6 +19010,38 @@
                     return false;
                 }
 
+                // A completed worker/status record proves that its historical
+                // targets existed, not that the currently active Bootstrap
+                // revision is still ready.  Re-run the same exact, read-only
+                // verification used after saving settings before restoring the
+                // client-only ready flag.  The backend start route also checks
+                // this, but the browser must not advertise or enable a start
+                // that the authoritative preflight will reject.
+                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
+                    ? _bootstrapActiveCampaign : null;
+                if (activeBootstrap) {
+                    if (String(status.bootstrap_campaign_id || '') !== String(activeBootstrap.campaign_id)
+                        || Number(status.bootstrap_campaign_revision) !== Number(activeBootstrap.revision)) {
+                        return false;
+                    }
+                    setCoinPrepStatus('checking');
+                    const configResponse = await apiFetch(`${API_URL}/config`, {
+                        cache: 'no-store'
+                    });
+                    if (!configResponse.ok) return false;
+                    const rawConfig = await configResponse.json();
+                    const getConfig = (key) => rawConfig[key]
+                        ?? rawConfig[key.toUpperCase()]
+                        ?? rawConfig[key.toLowerCase()]
+                        ?? null;
+                    await checkIfCoinPrepNeeded({
+                        liquidity_mode: 'two_sided',
+                        xch_reserve: getConfig('XCH_RESERVE') || 0,
+                        cat_reserve: getConfig('CAT_RESERVE') || 0,
+                    });
+                    return coinPrepStatus === 'done';
+                }
+
                 setCoinPrepStatus('done');
                 debugLog('[CoinPrep] Restored wallet-verified prep readiness after reload');
                 return true;

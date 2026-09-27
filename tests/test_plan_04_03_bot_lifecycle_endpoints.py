@@ -333,6 +333,16 @@ class TestBotStart(_FlaskBase):
                 return_value=[campaign],
             ),
             patch(
+                "blueprints.bot._bootstrap_coin_prep_start_readiness",
+                return_value={
+                    "ready": True,
+                    "reason": "ready",
+                    "campaign_id": campaign_id,
+                    "campaign_revision": 0,
+                },
+                create=True,
+            ),
+            patch(
                 "coin_manager.check_tier_size_drift_standalone",
                 return_value=legacy_drift,
             ) as drift_check,
@@ -343,6 +353,46 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.get_json().get("status"), "started")
         drift_check.assert_not_called()
         bot.start.assert_called_once_with()
+
+    def test_active_bootstrap_start_fails_closed_when_exact_prep_is_not_ready(self):
+        """Historical completion cannot bypass current campaign readiness."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        fake_cfg.WALLET_TYPE = "sage"
+        bot = _make_bot(running=False)
+
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._active_bootstrap_campaign_matches_wallet",
+                return_value=True,
+            ),
+            patch(
+                "blueprints.bot._bootstrap_coin_prep_start_readiness",
+                return_value={
+                    "ready": False,
+                    "reason": "must_resize",
+                    "campaign_id": "cd" * 32,
+                    "campaign_revision": 0,
+                },
+                create=True,
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertTrue(body.get("needs_coin_prep"))
+        self.assertEqual(body.get("reason"), "bootstrap_coin_prep_required")
+        bot.start.assert_not_called()
 
     def test_mismatched_bootstrap_identity_keeps_legacy_tier_drift_gate(self):
         fake_cfg = _fake_cfg()

@@ -156,6 +156,57 @@ def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
     )
 
 
+def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
+    """Re-run exact active-campaign Coin Prep verification before start.
+
+    A historical worker completion is not current readiness authority.  This
+    calls the same read-only verifier used by the GUI with the exact durable
+    campaign identity, so browser state and the mutation boundary cannot drift.
+    """
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    try:
+        from blueprints.coin_prep import api_coin_prep_verify
+        from database import list_active_bootstrap_campaigns_for_asset
+
+        campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+        if len(campaigns) != 1:
+            return {"ready": False, "reason": "bootstrap_campaign_authority_ambiguous"}
+        campaign = campaigns[0]
+        response = api_coin_prep_verify(
+            {
+                "tier_enabled": "true",
+                "liquidity_mode": "two_sided",
+                "bootstrap_campaign_id": campaign["campaign_id"],
+                "bootstrap_campaign_revision": str(campaign["revision"]),
+            }
+        )
+        if isinstance(response, tuple):
+            response = response[0]
+        payload = response.get_json(silent=True) if hasattr(response, "get_json") else None
+        ready = bool(
+            type(payload) is dict
+            and payload.get("success") is True
+            and payload.get("all_sufficient") is True
+            and payload.get("balance_sufficient") is not False
+            and payload.get("bootstrap_campaign_id") == campaign["campaign_id"]
+            and payload.get("bootstrap_campaign_revision") == campaign["revision"]
+        )
+        return {
+            "ready": ready,
+            "reason": "ready" if ready else str((payload or {}).get("reason") or "must_resize"),
+            "campaign_id": campaign["campaign_id"],
+            "campaign_revision": campaign["revision"],
+        }
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Bootstrap Coin Prep start verification failed closed",
+            {"error": str(exc)[:256]},
+            level="warning",
+        )
+        return {"ready": False, "reason": "bootstrap_coin_prep_verification_unavailable"}
+
+
 def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:
     """Only poll wallet RPC while an authorised bot run is active.
 
@@ -339,12 +390,28 @@ def api_bot_start():
     # this — if drift survives that, something's wrong and the bot
     # shouldn't trade until it's fixed.
     if _active_bootstrap_campaign_matches_wallet(cfg):
-        log_event(
-            "info",
-            "bootstrap_tier_drift_not_applicable",
-            "Active Bootstrap campaign uses exact campaign-bound coin sizes; "
-            "legacy Smart Settings tier-drift gate is not applicable",
-        )
+        bootstrap_readiness = _bootstrap_coin_prep_start_readiness(cfg)
+        if bootstrap_readiness.get("ready") is not True:
+            needs_coin_prep = True
+            coin_prep_reason = "bootstrap_coin_prep_required"
+            coin_prep_error = (
+                "Active Bootstrap campaign coin outputs require re-preparation "
+                "before starting the bot"
+            )
+            errors.append(coin_prep_error)
+            log_event(
+                "warning",
+                "bootstrap_coin_prep_start_blocked",
+                "Exact active-campaign Coin Prep verification blocked bot start: "
+                + str(bootstrap_readiness.get("reason") or "not_ready"),
+            )
+        else:
+            log_event(
+                "info",
+                "bootstrap_tier_drift_not_applicable",
+                "Active Bootstrap campaign uses exact campaign-bound coin sizes; "
+                "legacy Smart Settings tier-drift gate is not applicable",
+            )
     else:
         try:
             from coin_manager import check_tier_size_drift_standalone

@@ -877,6 +877,100 @@ def test_completed_campaign_prep_is_not_reopened_as_budget_recovery(page):
     }
 
 
+def test_reload_reverifies_completed_bootstrap_prep_before_enabling_start(page):
+    """Historical completion must not make a changed live plan look ready."""
+    _open_gui(page)
+    campaign_id = "e" * 64
+    asset_id = "a" * 64
+    status = {
+        **_completed_campaign_prep_with_protected_cancellation_status(),
+        "coin_prep_mode": "bootstrap_exact",
+        "bootstrap_campaign_id": campaign_id,
+        "bootstrap_campaign_revision": 0,
+    }
+    result = page.evaluate(
+        """async ({status, campaignId, assetId}) => {
+            const selector = document.getElementById('catSelector');
+            selector.replaceChildren(new Option('MZ', assetId));
+            currentCAT = {asset_id: assetId, wallet_id: 2, name: 'MZ', decimals: 3};
+            _pairSelectedByUser = true;
+            settingsReviewed = true;
+            localStorage.setItem('settingsReviewed', 'true');
+            localStorage.setItem('settingsReviewedAssetId', assetId);
+            _bootstrapActiveCampaign = {
+                campaign_id: campaignId, revision: 0, asset_id: assetId,
+            };
+            bot_state = {
+                running: false,
+                current_cat: currentCAT,
+                offers: {buy: [], sell: []},
+                balances: {xch: {total: 1, spendable: 1}, cat: {total: 1, spendable: 1}},
+                pricing: {mid: 0.000075},
+                chia_health: {wallet_reachable: true, wallet_synced: true},
+                runtime_safety: {
+                    allowed: true, reason_code: '',
+                    lease: {active: true, owned_by_this_run: true},
+                    recovery: {freshness: {
+                        valid: true, age_seconds: 0, max_age_seconds: 30,
+                        observed_at_utc: new Date().toISOString(),
+                        provenance: 'live_gate_and_durable_snapshot',
+                    }},
+                },
+            };
+            window.__reloadReadinessCalls = [];
+            apiFetch = async path => {
+                const value = String(path);
+                window.__reloadReadinessCalls.push(value);
+                if (value.endsWith('/coin-prep/status')) {
+                    return new Response(JSON.stringify(status), {status: 200});
+                }
+                if (value.endsWith('/config')) {
+                    return new Response(JSON.stringify({XCH_RESERVE: '0.1', CAT_RESERVE: '100'}), {status: 200});
+                }
+                if (value.includes('/coin-prep/verify?')) {
+                    return new Response(JSON.stringify({
+                        success: true,
+                        all_sufficient: false,
+                        balance_sufficient: true,
+                        reason: 'must_resize',
+                        message: 'Current campaign outputs require re-preparation.',
+                        bootstrap_campaign_id: campaignId,
+                        bootstrap_campaign_revision: 0,
+                        tiers: {},
+                    }), {status: 200});
+                }
+                if (value.endsWith('/coin-prep/fee-preview')) {
+                    return new Response(JSON.stringify({
+                        success: false, available: false,
+                        reason: 'FEE_ESTIMATE_UNAVAILABLE', dispatch_authorized: false,
+                    }), {status: 503});
+                }
+                throw new Error(`Unexpected request: ${value}`);
+            };
+            coinPrepStatus = 'none';
+            const restored = await restoreCoinPrepReadiness();
+            updateStartupChecklist(bot_state);
+            return {
+                restored,
+                coinPrepStatus,
+                canStart: canAttemptBotStart(),
+                calls: window.__reloadReadinessCalls,
+                modalOpen: document.getElementById('coinPrepConfirmOverlay')
+                    .classList.contains('active'),
+                prepText: document.getElementById('startupStepCoinPrep').textContent,
+            };
+        }""",
+        {"status": status, "campaignId": campaign_id, "assetId": asset_id},
+    )
+
+    assert result["restored"] is False
+    assert result["coinPrepStatus"] == "checking"
+    assert result["canStart"] is False
+    assert result["modalOpen"] is True
+    assert "Prepared coin sizes look ready" not in result["prepText"]
+    assert any("/coin-prep/verify?" in call for call in result["calls"])
+
+
 def test_live_completion_wins_over_campaign_cancellation_reserve_recovery(page):
     _open_gui(page)
     status = _completed_campaign_prep_with_protected_cancellation_status()
