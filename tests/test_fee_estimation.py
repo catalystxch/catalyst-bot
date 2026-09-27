@@ -35,23 +35,42 @@ def test_missing_guidance_is_unavailable_not_zero(response):
     assert quote["fee_xch"] is None
 
 
-def test_failed_provider_metadata_cannot_expose_arbitrary_transport_details(monkeypatch):
+def test_failed_provider_metadata_cannot_expose_arbitrary_transport_details(
+    monkeypatch,
+):
     module = importlib.import_module("fee_estimation")
     fees = importlib.import_module("tx_fees")
-    monkeypatch.setattr(fees, "get_suggested_transaction_fee", lambda **_: {
-        "available": False, "source": "unavailable", "reason": "secret-test-key",
-        "provider_failures": [
-            {"source": "coinset", "reason": "fee_provider_unsynced", "observed_at": 100,
-             "raw": "secret-test-key"},
-            {"source": "coinset", "reason": "secret-test-key", "observed_at": True},
-            {"source": "https://secret-test-key", "reason": "fee_provider_unsynced"},
-        ],
-    })
+    monkeypatch.setattr(
+        fees,
+        "get_suggested_transaction_fee",
+        lambda **_: {
+            "available": False,
+            "source": "unavailable",
+            "reason": "secret-test-key",
+            "provider_failures": [
+                {
+                    "source": "coinset",
+                    "reason": "fee_provider_unsynced",
+                    "observed_at": 100,
+                    "raw": "secret-test-key",
+                },
+                {"source": "coinset", "reason": "secret-test-key", "observed_at": True},
+                {
+                    "source": "https://secret-test-key",
+                    "reason": "fee_provider_unsynced",
+                },
+            ],
+        },
+    )
     quote = module.quote_fee(20_000_000)
     assert quote["available"] is False and quote["fee_mojos"] is None
     assert quote.get("provider_failures") == [
         {"source": "coinset", "reason": "fee_provider_unsynced", "observed_at": 100},
-        {"source": "coinset", "reason": "fee_provider_unavailable", "observed_at": None},
+        {
+            "source": "coinset",
+            "reason": "fee_provider_unavailable",
+            "observed_at": None,
+        },
     ]
     assert "secret-test-key" not in str(quote)
 
@@ -202,14 +221,20 @@ def test_missing_sync_and_congestion_evidence_is_unknown_not_fabricated():
     quote = normalize({"success": True, "estimates": [0]})
     assert quote["available"] is True
     assert quote["network_evidence"] == {
-        "full_node_synced": None, "mempool_size": None,
-        "mempool_fees": None, "last_block_cost": None,
+        "full_node_synced": None,
+        "mempool_size": None,
+        "mempool_fees": None,
+        "last_block_cost": None,
     }
 
 
 def test_network_diagnostics_retain_real_observed_zero_and_nonzero_values():
-    evidence = {"full_node_synced": True, "mempool_size": 0,
-                "mempool_fees": 123456789, "last_block_cost": 20000000}
+    evidence = {
+        "full_node_synced": True,
+        "mempool_size": 0,
+        "mempool_fees": 123456789,
+        "last_block_cost": 20000000,
+    }
     quote = normalize({"success": True, "estimates": [0], **evidence})
     assert quote["available"] is True
     assert quote["network_evidence"] == evidence
@@ -227,10 +252,16 @@ def test_public_quote_revalidates_unsynced_raw_evidence(monkeypatch):
     module = importlib.import_module("fee_estimation")
     tx_fees = importlib.import_module("tx_fees")
     monkeypatch.setattr(module.time, "time", lambda: 100)
-    monkeypatch.setattr(tx_fees, "get_suggested_transaction_fee", lambda **_kwargs: {
-        "available": True, "source": "coinset", "observed_at": 100,
-        "raw": {"success": True, "estimates": [0], "full_node_synced": False},
-    })
+    monkeypatch.setattr(
+        tx_fees,
+        "get_suggested_transaction_fee",
+        lambda **_kwargs: {
+            "available": True,
+            "source": "coinset",
+            "observed_at": 100,
+            "raw": {"success": True, "estimates": [0], "full_node_synced": False},
+        },
+    )
     quote = module.quote_fee(20_000_000)
     assert quote["available"] is False
     assert quote["fee_mojos"] is None

@@ -1,4 +1,5 @@
 """Local lease-owner evidence must not depend on Windows DNS availability."""
+
 import ctypes
 import os
 import socket
@@ -10,8 +11,10 @@ import mutation_gate
 import read_only_diagnostics
 
 
-@pytest.fixture(params=[mutation_gate.pid_liveness, read_only_diagnostics._pid_liveness],
-                ids=["runtime", "startup_preflight"])
+@pytest.fixture(
+    params=[mutation_gate.pid_liveness, read_only_diagnostics._pid_liveness],
+    ids=["runtime", "startup_preflight"],
+)
 def pid_liveness(request):
     return request.param
 
@@ -38,13 +41,18 @@ def test_current_hostname_owner_is_recognized_without_dns(monkeypatch, pid_liven
 @pytest.mark.skipif(os.name != "nt", reason="Windows configured-name API")
 @pytest.mark.parametrize(
     ("owner_host", "expected"),
-    [("catalyst-host.example.test", True),
-     ("CATALYST-HOST.EXAMPLE.TEST", True),
-     ("remote-host.example.test", None),
-     ("catalyst-host.attacker.test", None)],
+    [
+        ("catalyst-host.example.test", True),
+        ("CATALYST-HOST.EXAMPLE.TEST", True),
+        ("remote-host.example.test", None),
+        ("catalyst-host.attacker.test", None),
+    ],
 )
 def test_windows_owner_uses_configured_physical_fqdn_not_dns(
-    monkeypatch, pid_liveness, owner_host, expected,
+    monkeypatch,
+    pid_liveness,
+    owner_host,
+    expected,
 ):
     monkeypatch.setattr(socket, "gethostname", lambda: "catalyst-host")
     dns_calls = _forbid_dns(monkeypatch)
@@ -56,8 +64,11 @@ def test_windows_owner_uses_configured_physical_fqdn_not_dns(
         buffer.value = "catalyst-host.example.test"
         return True
 
-    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **kw: SimpleNamespace(
-        GetComputerNameExW=configured_name))
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *a, **kw: SimpleNamespace(GetComputerNameExW=configured_name),
+    )
 
     assert pid_liveness(os.getpid(), owner_host) is expected
     assert dns_calls == []
@@ -65,7 +76,9 @@ def test_windows_owner_uses_configured_physical_fqdn_not_dns(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows configured-name API")
 @pytest.mark.parametrize("failure", ["unavailable", "error"])
-def test_windows_uncertain_host_cannot_prove_local_pid_ownership(monkeypatch, pid_liveness, failure):
+def test_windows_uncertain_host_cannot_prove_local_pid_ownership(
+    monkeypatch, pid_liveness, failure
+):
     monkeypatch.setattr(socket, "gethostname", lambda: "catalyst-host")
     dns_calls = _forbid_dns(monkeypatch)
 
@@ -74,14 +87,19 @@ def test_windows_uncertain_host_cannot_prove_local_pid_ownership(monkeypatch, pi
             raise OSError("configured computer name unavailable")
         return False
 
-    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **kw: SimpleNamespace(
-        GetComputerNameExW=unavailable))
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda *a, **kw: SimpleNamespace(GetComputerNameExW=unavailable),
+    )
 
     assert pid_liveness(os.getpid(), "catalyst-host.example.test") is None
     assert dns_calls == []
 
 
-def test_unavailable_local_hostname_is_uncertain_not_an_exception(monkeypatch, pid_liveness):
+def test_unavailable_local_hostname_is_uncertain_not_an_exception(
+    monkeypatch, pid_liveness
+):
     def unavailable():
         raise OSError("local name unavailable")
 

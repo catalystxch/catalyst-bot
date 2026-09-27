@@ -1,4 +1,5 @@
 """Local hostname evidence for lease ownership; safe before writable imports."""
+
 from __future__ import annotations
 
 import os

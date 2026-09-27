@@ -7747,9 +7747,8 @@ class OfferManager:
             bootstrap_campaign_ids.add(parts[1])
             bootstrap_member_count += 1
         if bootstrap_campaign_ids:
-            if (
-                len(bootstrap_campaign_ids) != 1
-                or bootstrap_member_count != len(canonical_intents)
+            if len(bootstrap_campaign_ids) != 1 or bootstrap_member_count != len(
+                canonical_intents
             ):
                 raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
             campaign_id = next(iter(bootstrap_campaign_ids))

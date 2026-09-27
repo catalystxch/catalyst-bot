@@ -41,7 +41,9 @@ def _worker():
         cat_coins_target=76,
     )
     worker._tx_fee_mojos = lambda: 10
-    worker.update_status = lambda phase=None, progress=None, message=None, error=None: None
+    worker.update_status = lambda phase=None, progress=None, message=None, error=None: (
+        None
+    )
     worker.log = lambda _message: None
     return worker
 
@@ -308,7 +310,9 @@ def test_submitted_batch_does_not_confirm_while_exact_sage_tx_is_pending(monkeyp
     assert worker.status.confirmation_elapsed_seconds == 10
 
 
-def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(monkeypatch):
+def test_submitted_batch_fails_closed_when_sage_pending_view_is_unavailable(
+    monkeypatch,
+):
     worker = _worker()
     clock = {"now": 0.0}
     observations = []

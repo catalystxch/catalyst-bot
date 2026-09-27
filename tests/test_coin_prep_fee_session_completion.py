@@ -38,13 +38,21 @@ def test_incomplete_current_wallet_cannot_complete_or_rotate_session(approved):
         identity=runtime.read_fee_economic_snapshot({})["identity"]
     )
     assert original_scope["session_id"]
-    assert database.get_coin_prep_fee_session(original_scope["session_id"])["generation"] == 1
-    assert database.get_connection().execute(
-        "SELECT COUNT(*) FROM coin_prep_fee_session_completions"
-    ).fetchone()[0] == 0
+    assert (
+        database.get_coin_prep_fee_session(original_scope["session_id"])["generation"]
+        == 1
+    )
+    assert (
+        database.get_connection()
+        .execute("SELECT COUNT(*) FROM coin_prep_fee_session_completions")
+        .fetchone()[0]
+        == 0
+    )
 
 
-def test_exact_current_targets_complete_once_and_next_preview_rotates_generation(approved):
+def test_exact_current_targets_complete_once_and_next_preview_rotates_generation(
+    approved,
+):
     approval = approved["approval"]
     old_context = database.get_coin_prep_fee_approval_context(approval["approval_id"])
     old_session_id = json.loads(old_context["scope_json"])["session_id"]
@@ -61,14 +69,19 @@ def test_exact_current_targets_complete_once_and_next_preview_rotates_generation
 
     identity = runtime.read_fee_economic_snapshot({})["identity"]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        scopes = list(pool.map(
-            lambda _: service.resolve_server_fee_scope(identity=identity), range(8)
-        ))
+        scopes = list(
+            pool.map(
+                lambda _: service.resolve_server_fee_scope(identity=identity), range(8)
+            )
+        )
     assert len({scope["session_id"] for scope in scopes}) == 1
     new_session_id = scopes[0]["session_id"]
     assert new_session_id != old_session_id
     assert database.get_coin_prep_fee_session(new_session_id)["generation"] == 2
-    assert database.get_coin_prep_fee_session(old_session_id)["current_session_id"] == new_session_id
+    assert (
+        database.get_coin_prep_fee_session(old_session_id)["current_session_id"]
+        == new_session_id
+    )
     with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
         runtime.read_approved_prep_fee_snapshot(approval["approval_id"])
 
@@ -86,9 +99,12 @@ def test_unresolved_fee_hold_blocks_completion_even_when_targets_exist(approved)
     )
     with pytest.raises(ValueError, match="FEE_SESSION_EFFECT_UNRESOLVED"):
         service.complete_coin_prep_fee_session(approval["approval_id"])
-    assert database.get_connection().execute(
-        "SELECT COUNT(*) FROM coin_prep_fee_session_completions"
-    ).fetchone()[0] == 0
+    assert (
+        database.get_connection()
+        .execute("SELECT COUNT(*) FROM coin_prep_fee_session_completions")
+        .fetchone()[0]
+        == 0
+    )
 
 
 def test_generation_two_cannot_be_injected_without_completion_evidence(approved):
@@ -103,7 +119,10 @@ def test_generation_two_cannot_be_injected_without_completion_evidence(approved)
             ("e" * 64, session["identity_sha256"], session["identity_json"], 2, 1001),
         )
     conn.rollback()
-    assert database.get_coin_prep_fee_session(session_id)["current_session_id"] == session_id
+    assert (
+        database.get_coin_prep_fee_session(session_id)["current_session_id"]
+        == session_id
+    )
 
 
 def test_fee_approval_status_survives_restart_without_granting_dispatch(approved):
@@ -144,7 +163,8 @@ def test_fee_approval_status_survives_restart_without_granting_dispatch(approved
 
 
 def test_campaign_scope_proves_exact_targets_without_standalone_rotation(
-    approved, monkeypatch,
+    approved,
+    monkeypatch,
 ):
     approval = approved["approval"]
     targets = _install_completed_targets(approved, approval["approval_id"])
@@ -156,7 +176,9 @@ def test_campaign_scope_proves_exact_targets_without_standalone_rotation(
         "campaign_id": campaign_id,
     }
     context["campaign"] = {"campaign_id": campaign_id, "revision": 7}
-    monkeypatch.setattr(runtime, "read_approved_prep_fee_snapshot", lambda _approval: context)
+    monkeypatch.setattr(
+        runtime, "read_approved_prep_fee_snapshot", lambda _approval: context
+    )
     monkeypatch.setattr(
         database,
         "get_coin_prep_fee_approval_status",
@@ -179,6 +201,9 @@ def test_campaign_scope_proves_exact_targets_without_standalone_rotation(
         "idempotent": True,
         "dispatch_authorized": False,
     }
-    assert database.get_connection().execute(
-        "SELECT COUNT(*) FROM coin_prep_fee_session_completions"
-    ).fetchone()[0] == 0
+    assert (
+        database.get_connection()
+        .execute("SELECT COUNT(*) FROM coin_prep_fee_session_completions")
+        .fetchone()[0]
+        == 0
+    )

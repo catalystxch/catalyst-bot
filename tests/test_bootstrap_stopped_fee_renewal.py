@@ -38,7 +38,9 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
         operation_id=operation_id,
         event_id=f"{operation_id}:prepared",
         run_id="stopped-renewal",
-        wallet_fingerprint_hash=import_module("mutation_gate").wallet_fingerprint_hash(736588221),
+        wallet_fingerprint_hash=import_module("mutation_gate").wallet_fingerprint_hash(
+            736588221
+        ),
         network="mainnet",
         asset_id=utils.ASSET,
         side="buy",
@@ -63,7 +65,9 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
         evidence_json={"effect_attempted": True},
         finalized_at="2026-09-22T12:00:01Z",
     )
-    assert import_module("blueprints.bootstrap")._campaign_trade_ids(state["campaign_id"]) == [trade_id]
+    assert import_module("blueprints.bootstrap")._campaign_trade_ids(
+        state["campaign_id"]
+    ) == [trade_id]
 
     # A higher network quote needs renewed consent even when the original
     # campaign cap has never been exceeded. No wallet effect is performed.
@@ -83,7 +87,9 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     monkeypatch.setattr(
         database,
         "_bootstrap_campaign_authoritative_fee_spent_mojos",
-        lambda _conn, campaign_id, **_context: spent if campaign_id == state["campaign_id"] else 0,
+        lambda _conn, campaign_id, **_context: (
+            spent if campaign_id == state["campaign_id"] else 0
+        ),
     )
     assert database.stop_bootstrap_campaign(
         state["campaign_id"], "manual", "2026-09-22T12:01:00.000000Z"
@@ -104,7 +110,9 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     response = app.test_client().post("/api/coin-prep/fee-preview", json=options)
     payload = response.get_json()
 
-    assert utils._counts() == before, "preview must not create consent or dispatch authority"
+    assert utils._counts() == before, (
+        "preview must not create consent or dispatch authority"
+    )
     assert response.status_code == 200, payload
     assert payload["available"] is True, payload
     assert payload["fee_accounting"]["spent_fee_mojos"] == str(spent)
@@ -140,7 +148,11 @@ def automatically_stopped_campaign(request, monkeypatch):
         lambda: {
             key: state["campaign"][key]
             for key in (
-                "network", "wallet_type", "wallet_fingerprint", "wallet_id", "asset_id"
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
             )
         },
     )
@@ -179,9 +191,12 @@ def automatically_stopped_campaign(request, monkeypatch):
         campaign_record=campaign, evidence=evidence, decision=decision, now=now
     )
     assert materialized["stage"] == "stopped"
-    assert database.update_bootstrap_campaign_state(
-        state["campaign_id"], expected_revision=0, record=materialized
-    ) == 1
+    assert (
+        database.update_bootstrap_campaign_state(
+            state["campaign_id"], expected_revision=0, record=materialized
+        )
+        == 1
+    )
     database.close_connection()
     restored = database.get_bootstrap_campaign(state["campaign_id"])
     assert restored["status"] == "active"
@@ -209,7 +224,9 @@ def test_automatic_policy_stop_preserves_read_only_recovery_preview(
     )
     payload = response.get_json()
 
-    assert utils._counts() == before, "preview must not create consent or wallet authority"
+    assert utils._counts() == before, (
+        "preview must not create consent or wallet authority"
+    )
     assert response.status_code == 200, payload
     assert payload["available"] is True, payload
     assert payload["fee_accounting"]["spent_fee_mojos"] == "10000000010"

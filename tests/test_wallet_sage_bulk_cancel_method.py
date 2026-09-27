@@ -25,22 +25,42 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
         fee_mojos = 13_079_100
         # Use real executable CAT/native effects. A summary claiming outputs
         # with empty puzzle solutions must be refused by the adapter.
-        cat = json.loads((Path(__file__).parent / "fixtures" / "coin_prep_unsigned_cat2.json").read_text())
+        cat = json.loads(
+            (
+                Path(__file__).parent / "fixtures" / "coin_prep_unsigned_cat2.json"
+            ).read_text()
+        )
         puzzle = Program.to(1)
         destination = bytes32(b"d" * 32)
 
         def native(parent, amount, fee):
             coin = Coin(parent, puzzle.get_tree_hash(), amount)
             output = Coin(coin.name(), destination, amount - fee)
-            spend = CoinSpend(coin, puzzle, Program.to([[51, destination, amount - fee]]))
-            return spend, {"coin_id": coin.name().hex(), "amount": amount, "asset": None,
-                           "outputs": [{"coin_id": output.name().hex(), "amount": amount - fee,
-                                        "address": encode_puzzle_hash(destination, "xch"),
-                                        "receiving": True, "burning": False}]}
+            spend = CoinSpend(
+                coin, puzzle, Program.to([[51, destination, amount - fee]])
+            )
+            return spend, {
+                "coin_id": coin.name().hex(),
+                "amount": amount,
+                "asset": None,
+                "outputs": [
+                    {
+                        "coin_id": output.name().hex(),
+                        "amount": amount - fee,
+                        "address": encode_puzzle_hash(destination, "xch"),
+                        "receiving": True,
+                        "burning": False,
+                    }
+                ],
+            }
 
         native_spend, native_summary = native(b"2" * 32, 2_000, 0)
         fee_spend, fee_summary = native(b"3" * 32, 1_000_000_000, fee_mojos)
-        spends = [CoinSpend.from_json_dict(cat["coin_spends"][0]), native_spend, fee_spend]
+        spends = [
+            CoinSpend.from_json_dict(cat["coin_spends"][0]),
+            native_spend,
+            fee_spend,
+        ]
         source_coin_ids = [spend.coin.name().hex() for spend in spends[:2]]
         fee_coin_id = fee_spend.coin.name().hex()
         trade_ids = ["a" * 64, "b" * 64]

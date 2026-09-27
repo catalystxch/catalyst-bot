@@ -162,7 +162,9 @@ def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[D
         return None
 
 
-def _coinset_fee_estimate(target_seconds: int, cost: int, *, diagnostics=None) -> Optional[Dict]:
+def _coinset_fee_estimate(
+    target_seconds: int, cost: int, *, diagnostics=None
+) -> Optional[Dict]:
     """Query Coinset cloud API for a fee estimate.
 
     Used as the primary auto-fee source for Sage users who have no local
@@ -172,11 +174,19 @@ def _coinset_fee_estimate(target_seconds: int, cost: int, *, diagnostics=None) -
     Returns a normalised snapshot dict (same shape as full-node path) or
     None if Coinset is disabled, unreachable, or returns bad data.
     """
+
     def unavailable(reason, observed_at=None):
         if diagnostics is not None:
-            diagnostics.extend(fee_failure_diagnostics({
-                "available": False, "source": "coinset", "reason": reason,
-                "observed_at": observed_at}))
+            diagnostics.extend(
+                fee_failure_diagnostics(
+                    {
+                        "available": False,
+                        "source": "coinset",
+                        "reason": reason,
+                        "observed_at": observed_at,
+                    }
+                )
+            )
         return None
 
     if not getattr(cfg, "COINSET_ENABLED", True):
@@ -226,8 +236,11 @@ def _coinset_fee_estimate(target_seconds: int, cost: int, *, diagnostics=None) -
             if _attempt < 2:
                 time.sleep(1 + _attempt * 2)  # 1s, 3s
         if r is None or r.status_code != 200:
-            return unavailable("fee_provider_rate_limited" if r is not None and r.status_code == 429
-                               else "fee_provider_unavailable")
+            return unavailable(
+                "fee_provider_rate_limited"
+                if r is not None and r.status_code == 429
+                else "fee_provider_unavailable"
+            )
         observed_at = int(time.time())
         try:
             data = r.json()
@@ -310,10 +323,20 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
         return dict(snapshot)
 
     # No local full node — try Coinset cloud API before giving up
-    failures = fee_failure_diagnostics(quote if result is not None else {
-        "available": False, "source": "full_node_rpc", "observed_at": None,
-        "reason": ("fee_provider_unavailable" if env.get("supports_auto_estimate")
-                   else "fee_provider_not_configured")})
+    failures = fee_failure_diagnostics(
+        quote
+        if result is not None
+        else {
+            "available": False,
+            "source": "full_node_rpc",
+            "observed_at": None,
+            "reason": (
+                "fee_provider_unavailable"
+                if env.get("supports_auto_estimate")
+                else "fee_provider_not_configured"
+            ),
+        }
+    )
     coinset_result = _coinset_fee_estimate(target, cost_val, diagnostics=failures)
     if coinset_result:
         _SUGGESTED_FEE_CACHE[cache_key] = (now, coinset_result)

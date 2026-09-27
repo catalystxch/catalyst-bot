@@ -5,12 +5,20 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
 QUOTE_MAX_AGE_SECONDS = 60
-_FAILURE_REASONS = frozenset({
-    "invalid_fee_quote_request", "stale_or_future_fee_quote", "invalid_fee_response",
-    "invalid_network_evidence", "fee_provider_unsynced", "fee_provider_unavailable",
-    "fee_provider_disabled", "fee_provider_not_configured", "fee_provider_rate_limited",
-    "fee_provider_http_error",
-})
+_FAILURE_REASONS = frozenset(
+    {
+        "invalid_fee_quote_request",
+        "stale_or_future_fee_quote",
+        "invalid_fee_response",
+        "invalid_network_evidence",
+        "fee_provider_unsynced",
+        "fee_provider_unavailable",
+        "fee_provider_disabled",
+        "fee_provider_not_configured",
+        "fee_provider_rate_limited",
+        "fee_provider_http_error",
+    }
+)
 
 
 def _integer(value, minimum=0):
@@ -26,13 +34,23 @@ def fee_failure_diagnostics(value):
         rows = [value] if value.get("available") is not True else []
     result = []
     for row in rows[:8]:
-        if type(row) is not dict or row.get("source") not in ("coinset", "full_node_rpc"):
+        if type(row) is not dict or row.get("source") not in (
+            "coinset",
+            "full_node_rpc",
+        ):
             continue
         reason = row.get("reason")
-        reason = reason if type(reason) is str and reason in _FAILURE_REASONS else "fee_provider_unavailable"
+        reason = (
+            reason
+            if type(reason) is str and reason in _FAILURE_REASONS
+            else "fee_provider_unavailable"
+        )
         observed = row.get("observed_at")
-        diagnostic = {"source": row["source"], "reason": reason,
-                      "observed_at": observed if _integer(observed) else None}
+        diagnostic = {
+            "source": row["source"],
+            "reason": reason,
+            "observed_at": observed if _integer(observed) else None,
+        }
         if diagnostic not in result:
             result.append(diagnostic)
     return result
@@ -40,15 +58,25 @@ def fee_failure_diagnostics(value):
 
 def fee_quote_network_evidence(quote):
     """Return validated internal diagnostics; legacy absent evidence is unknown."""
-    unknown = {"full_node_synced": None, "mempool_size": None,
-               "mempool_fees": None, "last_block_cost": None}
+    unknown = {
+        "full_node_synced": None,
+        "mempool_size": None,
+        "mempool_fees": None,
+        "last_block_cost": None,
+    }
     evidence = quote.get("network_evidence", unknown)
     if type(evidence) is not dict or set(evidence) != set(unknown):
         raise ValueError("invalid_network_evidence")
-    if evidence["full_node_synced"] is not None and evidence["full_node_synced"] is not True:
+    if (
+        evidence["full_node_synced"] is not None
+        and evidence["full_node_synced"] is not True
+    ):
         raise ValueError("invalid_network_evidence")
-    if any(value is not None and not _integer(value) for key, value in evidence.items()
-           if key != "full_node_synced"):
+    if any(
+        value is not None and not _integer(value)
+        for key, value in evidence.items()
+        if key != "full_node_synced"
+    ):
         raise ValueError("invalid_network_evidence")
     return dict(evidence)
 
@@ -70,8 +98,10 @@ def normalize_fee_response(response, *, cost, target_seconds, source, observed_a
         "observed_at": observed_at,
         "expires_at": None,
         "network_evidence": {
-            "full_node_synced": None, "mempool_size": None,
-            "mempool_fees": None, "last_block_cost": None,
+            "full_node_synced": None,
+            "mempool_size": None,
+            "mempool_fees": None,
+            "last_block_cost": None,
         },
     }
     if not (
@@ -172,5 +202,6 @@ def quote_fee(cost: int, target_seconds: int = 300) -> dict:
     )
     if quote["available"] is not True:
         quote["provider_failures"] = fee_failure_diagnostics(
-            snapshot if snapshot.get("available") is not True else quote)
+            snapshot if snapshot.get("available") is not True else quote
+        )
     return quote

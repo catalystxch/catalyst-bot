@@ -26,8 +26,15 @@ def staged(tmp_path, monkeypatch):
     def quote(cost, target_seconds):
         if state.get("quote_hook"):
             state["quote_hook"]()
-        return {"available": True, "fee_mojos": 20, "source": "coinset", "cost": cost,
-                "target_seconds": target_seconds, "observed_at": 1000, "expires_at": 1060}
+        return {
+            "available": True,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": 1000,
+            "expires_at": 1060,
+        }
 
     monkeypatch.setattr(service, "quote_fee", quote)
     monkeypatch.setattr(pricing, "quote_fee", quote)
@@ -41,7 +48,9 @@ def staged(tmp_path, monkeypatch):
 
 
 def preview(options=None):
-    function = getattr(import_module("coin_prep_fee_approval"), "preview_coin_prep_fees", None)
+    function = getattr(
+        import_module("coin_prep_fee_approval"), "preview_coin_prep_fees", None
+    )
     assert callable(function), "full staged runtime fee preview is missing"
     return function({} if options is None else options)
 
@@ -51,30 +60,44 @@ def test_runtime_preview_prices_exact_cat_future_native_and_protected_cancels(st
     assert result["available"] is True and result["funded"] is True
     assert result["dispatch_authorized"] is False
     assert result["target_seconds"] == 300
-    assert [(s["stage_id"], s["cost_kind"], s["cancellation"], s["transaction_count_max"])
-            for s in result["stages"]] == [
-        ("prep_cat", "exact_unsigned", False, 1), ("prep_xch", "projected", False, 1),
-        ("cancel_xch", "projected", True, 1), ("cancel_cat", "projected", True, 1)]
+    assert [
+        (s["stage_id"], s["cost_kind"], s["cancellation"], s["transaction_count_max"])
+        for s in result["stages"]
+    ] == [
+        ("prep_cat", "exact_unsigned", False, 1),
+        ("prep_xch", "projected", False, 1),
+        ("cancel_xch", "projected", True, 1),
+        ("cancel_cat", "projected", True, 1),
+    ]
     assert result["estimated_preparation_fee_mojos"] == 40
     assert result["estimated_cancellation_fee_mojos"] == 40
     assert result["estimated_total_fee_mojos"] == 80
     assert result["fee_coin_principal_mojos"] == 2_000_000_000
     assert result["fee_funding_mojos"] == 88_000_000_000
-    assert "native_output_ephemeral_spends" in result["stages"][1]["profile"]["assumptions"]
+    assert (
+        "native_output_ephemeral_spends"
+        in result["stages"][1]["profile"]["assumptions"]
+    )
     saved = database.get_coin_prep_fee_preview(result["preview_id"])
     assert json.loads(saved["quote_json"])["stages"] == result["stages"]
     assert not any(utils._counts().values())
-    assert "validated_unsigned" not in json.dumps(result) and "coin_spends" not in json.dumps(result)
+    assert "validated_unsigned" not in json.dumps(
+        result
+    ) and "coin_spends" not in json.dumps(result)
 
 
-@pytest.mark.parametrize("options", [{"stages": []}, {"scope": {}}, {"funding": 100}, {"cost": 1}])
+@pytest.mark.parametrize(
+    "options", [{"stages": []}, {"scope": {}}, {"funding": 100}, {"cost": 1}]
+)
 def test_client_authority_is_rejected_before_wallet_reads(staged, options):
     with pytest.raises(ValueError, match="FEE_PREP_OPTIONS_INVALID"):
         preview(options)
     assert staged["reads"] == [] and not staged.get("builds")
 
 
-def test_projection_quote_unavailable_cannot_produce_confirmable_preview(staged, monkeypatch):
+def test_projection_quote_unavailable_cannot_produce_confirmable_preview(
+    staged, monkeypatch
+):
     service = import_module("coin_prep_fee_approval")
     monkeypatch.setattr(service, "quote_fee", lambda *_a, **_k: {"available": False})
     result = preview()
@@ -94,10 +117,17 @@ def test_changed_wallet_during_projected_quote_is_rejected_before_persistence(st
     staged["quote_hook"] = change_after_exact_quotes
     with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
         preview()
-    assert database.get_connection().execute("SELECT COUNT(*) FROM coin_prep_fee_previews").fetchone()[0] == 0
+    assert (
+        database.get_connection()
+        .execute("SELECT COUNT(*) FROM coin_prep_fee_previews")
+        .fetchone()[0]
+        == 0
+    )
 
 
-def test_sage_bare_hex_unsigned_spends_can_supply_verified_projection_templates(staged, monkeypatch):
+def test_sage_bare_hex_unsigned_spends_can_supply_verified_projection_templates(
+    staged, monkeypatch
+):
     wallet = import_module("wallet")
     build = wallet.build_transaction_rpc
 
@@ -117,7 +147,9 @@ def test_sage_bare_hex_unsigned_spends_can_supply_verified_projection_templates(
     assert not any(utils._counts().values())
 
 
-def test_latency_cannot_refresh_original_quote_age_or_persist_confirmable_preview(staged):
+def test_latency_cannot_refresh_original_quote_age_or_persist_confirmable_preview(
+    staged,
+):
     calls = []
 
     def expire_last_quote():
@@ -127,16 +159,23 @@ def test_latency_cannot_refresh_original_quote_age_or_persist_confirmable_previe
 
     staged["quote_hook"] = expire_last_quote
     result = preview()
-    assert result["available"] is False and result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert (
+        result["available"] is False and result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    )
     assert result.get("preview_id") is None
     assert not any(utils._counts().values())
 
 
-@pytest.mark.parametrize("mode,stages,total", [
-    ("buy_only", ["prep_xch", "cancel_xch"], 40),
-    ("sell_only", ["prep_cat", "prep_xch", "cancel_cat"], 60),
-])
-def test_one_sided_previews_price_only_required_preparation_and_protection(staged, mode, stages, total):
+@pytest.mark.parametrize(
+    "mode,stages,total",
+    [
+        ("buy_only", ["prep_xch", "cancel_xch"], 40),
+        ("sell_only", ["prep_cat", "prep_xch", "cancel_cat"], 60),
+    ],
+)
+def test_one_sided_previews_price_only_required_preparation_and_protection(
+    staged, mode, stages, total
+):
     staged["config"].LIQUIDITY_MODE = mode
     result = preview()
     assert result["available"] is True
@@ -146,12 +185,17 @@ def test_one_sided_previews_price_only_required_preparation_and_protection(stage
     assert not any(utils._counts().values())
 
 
-@pytest.mark.parametrize("root_count,amount,maximum,total", [
-    (61, 2_000_000_000, 1, 100),
-    (153, 800_000_000, 3, 140),
-    (61, 3_000_000_000, 0, 80),
-])
-def test_future_fragmentation_prices_every_bounded_prerequisite(staged, root_count, amount, maximum, total):
+@pytest.mark.parametrize(
+    "root_count,amount,maximum,total",
+    [
+        (61, 2_000_000_000, 1, 100),
+        (153, 800_000_000, 3, 140),
+        (61, 3_000_000_000, 0, 80),
+    ],
+)
+def test_future_fragmentation_prices_every_bounded_prerequisite(
+    staged, root_count, amount, maximum, total
+):
     from chia_rs import Coin
     from fee_projection_test_utils import standard_puzzles
 
@@ -169,12 +213,21 @@ def test_future_fragmentation_prices_every_bounded_prerequisite(staged, root_cou
     assert result["available"] is True and result["funded"] is True
     if maximum == 0:
         assert [stage["stage_id"] for stage in result["stages"]] == [
-            "prep_cat", "prep_xch", "cancel_xch", "cancel_cat"]
+            "prep_cat",
+            "prep_xch",
+            "cancel_xch",
+            "cancel_cat",
+        ]
         assert result["estimated_total_fee_mojos"] == 80
         assert not any(utils._counts().values())
         return
     assert [stage["stage_id"] for stage in result["stages"]] == [
-        "prep_cat", "prep_xch_consolidation", "prep_xch", "cancel_xch", "cancel_cat"]
+        "prep_cat",
+        "prep_xch_consolidation",
+        "prep_xch",
+        "cancel_xch",
+        "cancel_cat",
+    ]
     consolidation = result["stages"][1]
     assert consolidation["cost_kind"] == "projected"
     assert consolidation["transaction_count_min"] == 1
@@ -187,7 +240,9 @@ def test_future_fragmentation_prices_every_bounded_prerequisite(staged, root_cou
 
 
 @pytest.mark.parametrize("mode", ["two_sided", "buy_only"])
-def test_workflow_exceeding_worker_batch_limit_is_refused_before_initial_effect(staged, mode):
+def test_workflow_exceeding_worker_batch_limit_is_refused_before_initial_effect(
+    staged, mode
+):
     from chia_rs import Coin
     from fee_projection_test_utils import standard_puzzles
 

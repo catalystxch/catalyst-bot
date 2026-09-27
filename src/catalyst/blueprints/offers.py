@@ -1038,11 +1038,7 @@ def api_cancel_all():
                         "FEE_CAMPAIGN_BUDGET_EXCEEDED",
                     }
                     _reason_code = next(
-                        (
-                            code
-                            for code in _fee_reason_codes
-                            if code in str(_e).upper()
-                        ),
+                        (code for code in _fee_reason_codes if code in str(_e).upper()),
                         None,
                     )
                     _set_cancel_all_state(

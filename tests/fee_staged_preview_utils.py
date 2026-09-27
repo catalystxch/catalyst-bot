@@ -16,8 +16,10 @@ def prepare_unsigned_wallet(state, monkeypatch):
     native_coin = Coin(b"n" * 32, native.get_tree_hash(), 200_000_000_000)
     cat_parent = Coin(b"c" * 32, cat.get_tree_hash(), 20_000)
     cat_coin = Coin(cat_parent.name(), cat.get_tree_hash(), 20_000)
-    roots = {coin.name().hex(): (coin, puzzle, asset)
-             for coin, puzzle, asset in ((native_coin, native, None), (cat_coin, cat, ASSET))}
+    roots = {
+        coin.name().hex(): (coin, puzzle, asset)
+        for coin, puzzle, asset in ((native_coin, native, None), (cat_coin, cat, ASSET))
+    }
     state["unsigned_roots"] = roots
     for asset, coin in (("xch", native_coin), ("cat", cat_coin)):
         row = _coin(1, str(coin.amount))
@@ -33,50 +35,115 @@ def prepare_unsigned_wallet(state, monkeypatch):
         for coin, puzzle, asset in selected:
             first_for_asset = asset not in assigned_assets
             assigned_assets.add(asset)
-            sends = [a for a in actions if a["type"] == "send"
-                     and (a["id"]["type"] == "xch") == (asset is None) and first_for_asset]
+            sends = [
+                a
+                for a in actions
+                if a["type"] == "send"
+                and (a["id"]["type"] == "xch") == (asset is None)
+                and first_for_asset
+            ]
             destination = decode_puzzle_hash(ADDRESS)
-            conditions, output_rows, duplicate_amounts, ephemeral_spends = [], [], set(), []
+            conditions, output_rows, duplicate_amounts, ephemeral_spends = (
+                [],
+                [],
+                set(),
+                [],
+            )
             for action in sends:
                 assert action["address"] == ADDRESS and action["memos"] == []
                 amount = int(action["amount"])
                 parent = coin
                 if amount in duplicate_amounts:
                     assert asset is None, "fixture only needs duplicate native sends"
-                    parent = Coin(coin.name(), native.get_tree_hash(), len(ephemeral_spends))
+                    parent = Coin(
+                        coin.name(), native.get_tree_hash(), len(ephemeral_spends)
+                    )
                     conditions.append([51, native.get_tree_hash(), parent.amount])
-                    output_rows.append({"coin_id": parent.name().hex(), "amount": str(parent.amount),
-                                        "address": encode_puzzle_hash(native.get_tree_hash(), "xch"),
-                                        "receiving": True, "burning": False})
+                    output_rows.append(
+                        {
+                            "coin_id": parent.name().hex(),
+                            "amount": str(parent.amount),
+                            "address": encode_puzzle_hash(
+                                native.get_tree_hash(), "xch"
+                            ),
+                            "receiving": True,
+                            "burning": False,
+                        }
+                    )
                 else:
                     duplicate_amounts.add(amount)
-                ph = destination if asset is None else _cat_puzzle_hash(bytes.fromhex(ASSET), destination)
-                row = {"coin_id": Coin(parent.name(), ph, amount).name().hex(), "amount": str(amount),
-                       "address": ADDRESS, "receiving": True, "burning": False}
+                ph = (
+                    destination
+                    if asset is None
+                    else _cat_puzzle_hash(bytes.fromhex(ASSET), destination)
+                )
+                row = {
+                    "coin_id": Coin(parent.name(), ph, amount).name().hex(),
+                    "amount": str(amount),
+                    "address": ADDRESS,
+                    "receiving": True,
+                    "burning": False,
+                }
                 if parent == coin:
                     conditions.append([51, destination, amount])
                     output_rows.append(row)
                 else:
-                    ephemeral_spends.append(CoinSpend(parent, native,
-                        Program.to([[], (1, [[51, destination, amount]]), []])))
-                    summaries.append({"coin_id": parent.name().hex(), "amount": str(parent.amount),
-                                      "address": ADDRESS, "asset": None, "outputs": [row]})
+                    ephemeral_spends.append(
+                        CoinSpend(
+                            parent,
+                            native,
+                            Program.to([[], (1, [[51, destination, amount]]), []]),
+                        )
+                    )
+                    summaries.append(
+                        {
+                            "coin_id": parent.name().hex(),
+                            "amount": str(parent.amount),
+                            "address": ADDRESS,
+                            "asset": None,
+                            "outputs": [row],
+                        }
+                    )
             if asset is None and fee and first_for_asset:
                 conditions.append([52, fee])
             inner_solution = [[], (1, conditions), []]
-            solution = inner_solution if asset is None else [inner_solution,
-                [cat_parent.parent_coin_info, native.get_tree_hash(), cat_parent.amount],
-                coin.name(), [coin.parent_coin_info, coin.puzzle_hash, coin.amount],
-                [coin.parent_coin_info, native.get_tree_hash(), coin.amount], 0, 0]
+            solution = (
+                inner_solution
+                if asset is None
+                else [
+                    inner_solution,
+                    [
+                        cat_parent.parent_coin_info,
+                        native.get_tree_hash(),
+                        cat_parent.amount,
+                    ],
+                    coin.name(),
+                    [coin.parent_coin_info, coin.puzzle_hash, coin.amount],
+                    [coin.parent_coin_info, native.get_tree_hash(), coin.amount],
+                    0,
+                    0,
+                ]
+            )
             spends.append(CoinSpend(coin, puzzle, Program.to(solution)))
             spends += ephemeral_spends
-            summaries.append({"coin_id": coin.name().hex(), "amount": str(coin.amount),
-                              "address": ADDRESS, "asset": {"asset_id": ASSET} if asset else None,
-                              "outputs": output_rows})
-        return {"summary": {"fee": str(fee), "inputs": summaries},
-                "coin_spends": [spend.to_json_dict() for spend in spends]}
+            summaries.append(
+                {
+                    "coin_id": coin.name().hex(),
+                    "amount": str(coin.amount),
+                    "address": ADDRESS,
+                    "asset": {"asset_id": ASSET} if asset else None,
+                    "outputs": output_rows,
+                }
+            )
+        return {
+            "summary": {"fee": str(fee), "inputs": summaries},
+            "coin_spends": [spend.to_json_dict() for spend in spends],
+        }
 
     monkeypatch.setattr(wallet, "build_transaction_rpc", build)
-    monkeypatch.setattr(wallet, "submit_built_transaction_rpc",
-                        lambda *_a, **_k: pytest.fail("preview attempted submission"))
+    monkeypatch.setattr(
+        wallet,
+        "submit_built_transaction_rpc",
+        lambda *_a, **_k: pytest.fail("preview attempted submission"),
+    )
     return state

@@ -35,22 +35,31 @@ def test_repeated_stop_recovery_refuses_changed_canonical_context(
         from chia_rs.sized_bytes import bytes32
 
         other_address = encode_puzzle_hash(bytes32(b"a" * 32), "xch")
-        monkeypatch.setattr(wallet, "get_next_address", lambda *args, **kwargs: {
-            "success": True, "address": other_address,
-        })
+        monkeypatch.setattr(
+            wallet,
+            "get_next_address",
+            lambda *args, **kwargs: {
+                "success": True,
+                "address": other_address,
+            },
+        )
     before = utils._counts()
     app = Flask(__name__)
     app.register_blueprint(import_module("blueprints.coin_prep").bp)
-    response = app.test_client().post("/api/coin-prep/fee-preview", json={
-        "bootstrap_campaign_id": state["campaign_id"],
-        "bootstrap_campaign_revision": 2,
-    })
+    response = app.test_client().post(
+        "/api/coin-prep/fee-preview",
+        json={
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 2,
+        },
+    )
     payload = response.get_json()
 
     assert response.status_code == 409, payload
     assert payload["success"] is False, payload
     assert payload["reason"] == (
-        "FEE_WALLET_IDENTITY_UNAVAILABLE" if change == "fingerprint"
+        "FEE_WALLET_IDENTITY_UNAVAILABLE"
+        if change == "fingerprint"
         else "FEE_PREP_CAMPAIGN_UNAVAILABLE"
     )
     assert payload["dispatch_authorized"] is False

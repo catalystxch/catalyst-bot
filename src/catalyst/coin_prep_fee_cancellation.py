@@ -105,9 +105,9 @@ def price_approved_cancellation(
                 raise ValueError("FEE_APPROVAL_STALE")
             campaign = after.get("campaign")
             if type(campaign) is dict:
-                original_budget = Decimal(str(campaign.get("fee_budget_xch"))) * Decimal(
-                    10**12
-                )
+                original_budget = Decimal(
+                    str(campaign.get("fee_budget_xch"))
+                ) * Decimal(10**12)
                 if (
                     original_budget != original_budget.to_integral_value()
                     or original_budget < 0

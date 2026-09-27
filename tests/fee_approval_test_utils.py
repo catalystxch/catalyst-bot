@@ -14,16 +14,33 @@ ADDRESS = "xch1xgeryv3jxgeryv3jxgeryv3jxgeryv3jxgeryv3jxgeryv3jxgequ6kqev"
 
 def _coin(index, amount="2000"):
     parent, puzzle = index.to_bytes(32, "big"), bytes.fromhex("32" * 32)
-    return {"coin_id": Coin(parent, puzzle, int(amount)).name().hex(),
-            "address": ADDRESS, "amount": amount, "transaction_id": None,
-            "offer_id": None, "clawback_timestamp": None, "created_height": 1,
-            "spent_height": None, "spent_timestamp": None, "created_timestamp": 100}
+    return {
+        "coin_id": Coin(parent, puzzle, int(amount)).name().hex(),
+        "address": ADDRESS,
+        "amount": amount,
+        "transaction_id": None,
+        "offer_id": None,
+        "clawback_timestamp": None,
+        "created_height": 1,
+        "spent_height": None,
+        "spent_timestamp": None,
+        "created_timestamp": 100,
+    }
 
 
 def _cat():
-    return {"asset_id": ASSET, "name": "Test CAT", "ticker": "MZ", "precision": 3,
-            "description": None, "icon_url": None, "visible": True, "balance": 2000,
-            "selectable_balance": 2000, "revocation_address": None}
+    return {
+        "asset_id": ASSET,
+        "name": "Test CAT",
+        "ticker": "MZ",
+        "precision": 3,
+        "description": None,
+        "icon_url": None,
+        "visible": True,
+        "balance": 2000,
+        "selectable_balance": 2000,
+        "revocation_address": None,
+    }
 
 
 def live_reads(tmp_path, monkeypatch):
@@ -38,17 +55,47 @@ def live_reads(tmp_path, monkeypatch):
     database.init_database()
     monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
     monkeypatch.setattr(wallet, "_wallet_adapter", wallet_sage)
-    identity = {"success": True, "backend": "sage", "fingerprint": 736588221,
-                "network_id": "mainnet", "has_secrets": True, "kind": "hot", "name": "TEST 7"}
-    config = SimpleNamespace(WALLET_TYPE="sage", CAT_WALLET_ID=2, WALLET_ID_XCH=1,
-                             CAT_ASSET_ID=ASSET, CAT_TICKER_ID="MZ_XCH", CAT_DECIMALS=3,
-                             SAGE_FINGERPRINT="736588221", XCH_RESERVE=Decimal("0"),
-                             CAT_RESERVE=Decimal("0"))
-    state = {"identity": identity, "config": config, "cats": {"cats": [_cat()]},
-             "xch": [_coin(1)], "cat": [_coin(10001)], "reads": [], "monkeypatch": monkeypatch}
-    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: copy.deepcopy(state["identity"]))
-    monkeypatch.setattr(wallet, "get_next_address", lambda wid, new_address: {
-        "success": True, "address": ADDRESS} if wid == 1 and new_address is False else pytest.fail("address mutation"))
+    identity = {
+        "success": True,
+        "backend": "sage",
+        "fingerprint": 736588221,
+        "network_id": "mainnet",
+        "has_secrets": True,
+        "kind": "hot",
+        "name": "TEST 7",
+    }
+    config = SimpleNamespace(
+        WALLET_TYPE="sage",
+        CAT_WALLET_ID=2,
+        WALLET_ID_XCH=1,
+        CAT_ASSET_ID=ASSET,
+        CAT_TICKER_ID="MZ_XCH",
+        CAT_DECIMALS=3,
+        SAGE_FINGERPRINT="736588221",
+        XCH_RESERVE=Decimal("0"),
+        CAT_RESERVE=Decimal("0"),
+    )
+    state = {
+        "identity": identity,
+        "config": config,
+        "cats": {"cats": [_cat()]},
+        "xch": [_coin(1)],
+        "cat": [_coin(10001)],
+        "reads": [],
+        "monkeypatch": monkeypatch,
+    }
+    monkeypatch.setattr(
+        wallet, "get_wallet_identity", lambda: copy.deepcopy(state["identity"])
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_next_address",
+        lambda wid, new_address: (
+            {"success": True, "address": ADDRESS}
+            if wid == 1 and new_address is False
+            else pytest.fail("address mutation")
+        ),
+    )
     monkeypatch.setenv("CATALYST_NETWORK_ID", "mainnet")
 
     def transport(endpoint, payload, *, timeout):
@@ -62,7 +109,10 @@ def live_reads(tmp_path, monkeypatch):
         if payload["sort_mode"] == "coin_id" and payload["ascending"] is True:
             values = sorted(values, key=lambda row: row["coin_id"])
         offset, limit = payload["offset"], payload["limit"]
-        result = {"coins": copy.deepcopy(values[offset:offset + limit]), "total": len(values)}
+        result = {
+            "coins": copy.deepcopy(values[offset : offset + limit]),
+            "total": len(values),
+        }
         if state.get("switch_on_coins"):
             state["identity"]["fingerprint"] = 12345
         if state.get("change_config"):
@@ -86,28 +136,43 @@ def live_reads(tmp_path, monkeypatch):
     database.close_connection()
 
 
-
 def economic_reads(live_reads, monkeypatch):
     import api_server
     from blueprints import coin_prep
     import tx_fees
 
     configuration = live_reads["config"]
-    for key, value in {"TIER_ENABLED": True, "BUY_LADDER_REVERSED": False,
-                       "LIQUIDITY_MODE": "two_sided", "COIN_PREP_HEADROOM_PCT": Decimal("10"),
-                       "SPREAD_BPS": Decimal("10000"), "MIN_EDGE_BPS": Decimal("0"),
-                       "MAX_ACTIVE_BUY_OFFERS": 1, "MAX_ACTIVE_SELL_OFFERS": 1,
-                       "DEFAULT_TRADE_XCH": Decimal("0.1"), "FEE_PREP_COUNT": 2,
-                       "SNIPER_ENABLED": False, "SNIPER_PREP_COUNT": 0,
-                       "SNIPER_SIZE_XCH": Decimal("0"),
-                       "FEE_COIN_SIZE_XCH": Decimal("0.001"), "TRANSACTION_FEE_MODE": "manual",
-                       "TRANSACTION_FEE_XCH": Decimal("0.00001")}.items():
+    for key, value in {
+        "TIER_ENABLED": True,
+        "BUY_LADDER_REVERSED": False,
+        "LIQUIDITY_MODE": "two_sided",
+        "COIN_PREP_HEADROOM_PCT": Decimal("10"),
+        "SPREAD_BPS": Decimal("10000"),
+        "MIN_EDGE_BPS": Decimal("0"),
+        "MAX_ACTIVE_BUY_OFFERS": 1,
+        "MAX_ACTIVE_SELL_OFFERS": 1,
+        "DEFAULT_TRADE_XCH": Decimal("0.1"),
+        "FEE_PREP_COUNT": 2,
+        "SNIPER_ENABLED": False,
+        "SNIPER_PREP_COUNT": 0,
+        "SNIPER_SIZE_XCH": Decimal("0"),
+        "FEE_COIN_SIZE_XCH": Decimal("0.001"),
+        "TRANSACTION_FEE_MODE": "manual",
+        "TRANSACTION_FEE_XCH": Decimal("0.00001"),
+    }.items():
         setattr(configuration, key, value)
-    for tier, size in (("INNER", "0.1"), ("MID", "0.075"), ("OUTER", "0.05"), ("EXTREME", "0.01")):
+    for tier, size in (
+        ("INNER", "0.1"),
+        ("MID", "0.075"),
+        ("OUTER", "0.05"),
+        ("EXTREME", "0.01"),
+    ):
         setattr(configuration, f"{tier}_SIZE_XCH", Decimal(size))
         for side in ("BUY", "SELL"):
             setattr(configuration, f"{side}_{tier}_SIZE_XCH", Decimal(size))
-            setattr(configuration, f"{side}_{tier}_TIER_COUNT", 1 if tier == "INNER" else 0)
+            setattr(
+                configuration, f"{side}_{tier}_TIER_COUNT", 1 if tier == "INNER" else 0
+            )
             setattr(configuration, f"{side}_{tier}_TIER_SPARE_COUNT", 0)
     monkeypatch.setattr(tx_fees, "cfg", configuration)
     monkeypatch.setattr(coin_prep, "cfg", configuration)
@@ -142,25 +207,46 @@ def confirmation(economic_reads, monkeypatch):
     context = _economic_collect(state)
     scope = service.resolve_server_fee_scope(identity=context["identity"])
     monkeypatch.setattr(service, "_now", lambda: state.get("now", 1000))
-    monkeypatch.setattr(database, "time", SimpleNamespace(time=lambda: state.get("now", 1000)))
-    monkeypatch.setattr(service, "quote_fee", lambda cost, target_seconds: {
-        "available": True, "fee_mojos": 10 if cost == 100 else 30,
-        "observed_at": 1000, "expires_at": 1060, "source": "coinset",
-        "cost": cost, "target_seconds": target_seconds,
-    })
+    monkeypatch.setattr(
+        database, "time", SimpleNamespace(time=lambda: state.get("now", 1000))
+    )
+    monkeypatch.setattr(
+        service,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 10 if cost == 100 else 30,
+            "observed_at": 1000,
+            "expires_at": 1060,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+        },
+    )
     preview = service.estimate_coin_prep_fee_preview(
-        scope=scope, economic_plan=context["recipe"]["economic_plan"],
-        stages=[{"stage_id": name, "cost": cost, "cost_kind": "projected",
-                 "transaction_count_min": 1, "transaction_count_max": 1,
-                 "cancellation": cancel}
-                for name, cost, cancel in (("prep", 1000, False), ("cancel", 100, True))],
-        fee_funding_mojos=1000, request_options=context["request_options"],
+        scope=scope,
+        economic_plan=context["recipe"]["economic_plan"],
+        stages=[
+            {
+                "stage_id": name,
+                "cost": cost,
+                "cost_kind": "projected",
+                "transaction_count_min": 1,
+                "transaction_count_max": 1,
+                "cancellation": cancel,
+            }
+            for name, cost, cancel in (("prep", 1000, False), ("cancel", 100, True))
+        ],
+        fee_funding_mojos=1000,
+        request_options=context["request_options"],
     )
     state["preview"] = preview
     state["reads"].clear()
 
     def forbidden(*_args, **_kwargs):
-        pytest.fail("confirmation attempted to build, sign, submit or reprice instead of recording consent")
+        pytest.fail(
+            "confirmation attempted to build, sign, submit or reprice instead of recording consent"
+        )
 
     monkeypatch.setattr(wallet, "build_transaction_rpc", forbidden)
     monkeypatch.setattr(wallet, "submit_built_transaction_rpc", forbidden)
@@ -171,6 +257,15 @@ def confirmation(economic_reads, monkeypatch):
 def _counts():
     import database
 
-    return {table: database.get_connection().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("fee_approvals", "coin_prep_fee_consents", "approved_fee_reservations",
-                          "coin_prep_operations", "wallet_effect_claims")}
+    return {
+        table: database.get_connection()
+        .execute(f"SELECT COUNT(*) FROM {table}")
+        .fetchone()[0]
+        for table in (
+            "fee_approvals",
+            "coin_prep_fee_consents",
+            "approved_fee_reservations",
+            "coin_prep_operations",
+            "wallet_effect_claims",
+        )
+    }

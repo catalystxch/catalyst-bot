@@ -20909,7 +20909,8 @@ def _fee_operation_identity(value: Any) -> str:
 
 
 def _fee_scope_legacy_cancellation_holds(
-    conn: sqlite3.Connection, scope: str,
+    conn: sqlite3.Connection,
+    scope: str,
 ) -> List[Dict[str, Any]]:
     """Project unresolved pre-ledger effects without inventing reservations.
 
@@ -20953,43 +20954,63 @@ def _fee_scope_legacy_cancellation_holds(
                 "AND attempt=? ORDER BY sequence",
                 (member["operation_id"], member["attempt"]),
             ).fetchall()
-            prepared = validate_offer_cancel_cohort_prepared_event(dict(journal[0]), manifest)
+            prepared = validate_offer_cancel_cohort_prepared_event(
+                dict(journal[0]), manifest
+            )
             effect = json.loads(prepared["evidence_json"]).get("wallet_effect")
             if type(effect) is not dict:
                 raise ValueError("FEE_CANCELLATION_EVIDENCE_INVALID")
             fees.add(_fee_amount(effect.get("fee_mojos")))
             terminal = validate_offer_operation_event(dict(journal[-1]))
             evidence = json.loads(terminal["evidence_json"])
-            claimed = conn.execute(
-                "SELECT 1 FROM offer_cancel_effect_claims WHERE operation_id=? AND attempt=?",
-                (member["operation_id"], member["attempt"]),
-            ).fetchone() is not None
+            claimed = (
+                conn.execute(
+                    "SELECT 1 FROM offer_cancel_effect_claims WHERE operation_id=? AND attempt=?",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                is not None
+            )
             attempted |= claimed or evidence.get("effect_attempted") is True
             unattempted = (
-                terminal["phase"] == "FINALIZED" and terminal["outcome"] == "CANCEL_FAILED"
+                terminal["phase"] == "FINALIZED"
+                and terminal["outcome"] == "CANCEL_FAILED"
                 and terminal["blocks_mutation"] == 0
-                and evidence.get("effect_attempted") is False and not claimed
+                and evidence.get("effect_attempted") is False
+                and not claimed
             )
             rejected = (
-                terminal["phase"] == "RECONCILED" and terminal["outcome"] == "CANCEL_FAILED"
+                terminal["phase"] == "RECONCILED"
+                and terminal["outcome"] == "CANCEL_FAILED"
                 and terminal["reason_code"] == "SAGE_RELAY_REJECTED"
                 and terminal["blocks_mutation"] == 0
             )
             confirmed = (
-                terminal["phase"] == "RECONCILED" and terminal["outcome"] == "CANCEL_CONFIRMED"
+                terminal["phase"] == "RECONCILED"
+                and terminal["outcome"] == "CANCEL_CONFIRMED"
                 and terminal["reason_code"] == "AUTHORITATIVE_TERMINAL_PROOF"
                 and terminal["blocks_mutation"] == 0
             )
-            states.add("released" if unattempted or rejected else "spent" if confirmed else "held")
+            states.add(
+                "released"
+                if unattempted or rejected
+                else "spent"
+                if confirmed
+                else "held"
+            )
         if len(fees) != 1:
             raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
         fee = fees.pop()
         reservation = conn.execute(
             "SELECT scope_sha256, cancellation, fee_mojos FROM approved_fee_reservations "
-            "WHERE operation_id=?", (_coin_prep_cancellation_fee_operation_id(manifest),),
+            "WHERE operation_id=?",
+            (_coin_prep_cancellation_fee_operation_id(manifest),),
         ).fetchone()
         if reservation is not None:
-            if (reservation["scope_sha256"], reservation["cancellation"], reservation["fee_mojos"]) != (scope, 1, fee):
+            if (
+                reservation["scope_sha256"],
+                reservation["cancellation"],
+                reservation["fee_mojos"],
+            ) != (scope, 1, fee):
                 raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
             continue  # The append-only reservation/outcome already accounts for this batch.
         if states == {"released"} or states == {"spent"} or not attempted:
@@ -20997,10 +21018,15 @@ def _fee_scope_legacy_cancellation_holds(
         if "spent" in states:
             # Partial/mixed terminal proof cannot be attributed twice or refunded.
             raise ValueError("FEE_CANCELLATION_EFFECT_UNRESOLVED")
-        holds.append({
-            "fee_mojos": fee, "cancellation": 1,
-            "accounting_outcome": None, "effect_outcome": "SUBMITTED_UNKNOWN", "dispatched": 1,
-        })
+        holds.append(
+            {
+                "fee_mojos": fee,
+                "cancellation": 1,
+                "accounting_outcome": None,
+                "effect_outcome": "SUBMITTED_UNKNOWN",
+                "dispatched": 1,
+            }
+        )
     return holds
 
 
@@ -21038,10 +21064,15 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
         # into the append-only scope totals: reservations already represented
         # in both ledgers must never be counted twice.
         authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
-            conn, campaign_ids.pop(), held_scope=scope,
+            conn,
+            campaign_ids.pop(),
+            held_scope=scope,
         )
         spent += max(0, authoritative - spent)
-        held += sum(row["fee_mojos"] for row in _fee_scope_legacy_cancellation_holds(conn, scope))
+        held += sum(
+            row["fee_mojos"]
+            for row in _fee_scope_legacy_cancellation_holds(conn, scope)
+        )
     return {
         "held_fee_mojos": held,
         "spent_fee_mojos": spent,
@@ -21090,11 +21121,14 @@ def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
         conn.execute("BEGIN")
         protected = conn.execute(
             "SELECT cancellation_reserve_mojos FROM fee_approvals "
-            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1", (scope,),
+            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
+            (scope,),
         ).fetchone()
         return {
             **_fee_scope_totals(conn, scope),
-            "protected_cancellation_fee_mojos": _fee_amount(protected[0]) if protected else 0,
+            "protected_cancellation_fee_mojos": _fee_amount(protected[0])
+            if protected
+            else 0,
         }
     finally:
         conn.close()
@@ -21696,7 +21730,9 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             (context["scope_sha256"],),
         ).fetchall()
         unresolved = [row for row in rows if row["accounting_outcome"] is None]
-        unresolved.extend(_fee_scope_legacy_cancellation_holds(conn, context["scope_sha256"]))
+        unresolved.extend(
+            _fee_scope_legacy_cancellation_holds(conn, context["scope_sha256"])
+        )
         confirmed_count = sum(
             1 for row in rows if row["accounting_outcome"] == "CONFIRMED_SPENT"
         )
@@ -35757,7 +35793,10 @@ def get_bootstrap_campaign_authoritative_fee_spent_mojos(campaign_id: str) -> in
 
 
 def _bootstrap_campaign_authoritative_fee_spent_mojos(
-    conn: sqlite3.Connection, campaign_id: str, *, held_scope: Optional[str] = None,
+    conn: sqlite3.Connection,
+    campaign_id: str,
+    *,
+    held_scope: Optional[str] = None,
 ) -> int:
     """Aggregate terminal evidence in the caller's single accounting snapshot."""
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
@@ -35771,7 +35810,8 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
         " SELECT 1 FROM coin_prep_fee_previews AS preview "
         " WHERE preview.scope_sha256=reservation.scope_sha256 "
         " AND json_extract(preview.scope_json, '$.campaign_id')=?"
-        ")", (safe_id,),
+        ")",
+        (safe_id,),
     ).fetchone()
     prep_fee = _fee_amount(prep_row[0] if prep_row is not None else 0)
     cancellation_batches: Dict[str, int] = {}
@@ -35783,20 +35823,27 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
         "WHERE intent.purpose LIKE ? "
         "AND journal.operation_type='CANCEL' "
         "AND journal.phase='RECONCILED' "
-        "AND journal.outcome='CANCEL_CONFIRMED'", (prefix + "%",),
+        "AND journal.outcome='CANCEL_CONFIRMED'",
+        (prefix + "%",),
     ).fetchall()
     for row in rows:
         evidence = json.loads(row[0])
         exact_subset = evidence.get("exact_subset") if type(evidence) is dict else None
-        cancel_context = exact_subset.get("cancel_context") if type(exact_subset) is dict else None
-        classification = exact_subset.get("classification") if type(exact_subset) is dict else None
+        cancel_context = (
+            exact_subset.get("cancel_context") if type(exact_subset) is dict else None
+        )
+        classification = (
+            exact_subset.get("classification") if type(exact_subset) is dict else None
+        )
         if (
             type(cancel_context) is not dict
             or type(classification) is not dict
             or classification.get("classification") != "CANCELLED_PROVEN"
         ):
             raise ValueError("Bootstrap cancellation fee evidence is invalid")
-        cohort_id = _required_stability_text(cancel_context.get("cohort_id"), "cancellation cohort_id")
+        cohort_id = _required_stability_text(
+            cancel_context.get("cohort_id"), "cancellation cohort_id"
+        )
         fee = _fee_amount(classification.get("fee_mojos"))
         prior = cancellation_batches.setdefault(cohort_id, fee)
         if prior != fee:
@@ -35807,7 +35854,9 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
         # import that same batch as additional spend. The public campaign view
         # still reports the full proven spend; settlement later moves the hold.
         for cohort_id, fee in list(cancellation_batches.items()):
-            operation_id = hashlib.sha256(f"coin-prep-cancel:{cohort_id}".encode()).hexdigest()
+            operation_id = hashlib.sha256(
+                f"coin-prep-cancel:{cohort_id}".encode()
+            ).hexdigest()
             pending = conn.execute(
                 "SELECT reservation.fee_mojos FROM approved_fee_reservations AS reservation "
                 "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "

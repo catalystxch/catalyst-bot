@@ -415,12 +415,11 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
         "_campaign_trade_ids",
         lambda exact_id: ["trade-a", "trade-b"] if exact_id == campaign_id else [],
     )
+
     def cancel_while_authority_is_active(trade_ids):
         assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
         cancelled.extend(trade_ids)
-        return {
-            trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids
-        }
+        return {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids}
 
     monkeypatch.setattr(
         bootstrap,

@@ -81,7 +81,9 @@ def approved_bootstrap(tmp_path, monkeypatch):
             "cat_decimals": 3,
         }
 
-    monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", bootstrap_context)
+    monkeypatch.setattr(
+        coin_prep, "_active_bootstrap_coin_prep_context", bootstrap_context
+    )
 
     def quote(cost, target_seconds):
         return {

@@ -265,9 +265,7 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(
             body["fee_approval"]["state"], "submitted_awaiting_confirmation"
         )
-        self.assertEqual(
-            body["fee_approval"]["held_fee_mojos"], "9007199254740993"
-        )
+        self.assertEqual(body["fee_approval"]["held_fee_mojos"], "9007199254740993")
         self.assertEqual(body["fee_approval"]["spent_fee_mojos"], "7")
         self.assertFalse(body["fee_approval"]["dispatch_authorized"])
         self.assertTrue(body["overlapping_coin_prep_blocked"])
@@ -335,7 +333,9 @@ class TestCoinPrepStatus(_FlaskBase):
         latest.assert_called_once_with(campaign_id)
         read_status.assert_called_once_with(renewed_approval_id)
 
-    def test_completed_bootstrap_status_keeps_latest_fee_renewal_after_campaign_closes(self):
+    def test_completed_bootstrap_status_keeps_latest_fee_renewal_after_campaign_closes(
+        self,
+    ):
         """A terminal campaign must not make status fall back to the worker cap."""
 
         worker_approval_id = "d" * 64
@@ -866,7 +866,9 @@ class TestCoinPrepVerify(_FlaskBase):
             )
         self.assertEqual(resp.status_code, 200)
 
-    def test_tier_verify_ignores_retired_sniper_query_even_when_stale_settings_enable_it(self):
+    def test_tier_verify_ignores_retired_sniper_query_even_when_stale_settings_enable_it(
+        self,
+    ):
         with (
             patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
@@ -1540,9 +1542,7 @@ class TestCoinPrepTrigger(_FlaskBase):
                 patch(
                     "coin_manager._coin_prep_worker_command", return_value=["worker"]
                 ),
-                patch(
-                    "coin_manager._coin_prep_worker_environment", return_value={}
-                ),
+                patch("coin_manager._coin_prep_worker_environment", return_value={}),
                 patch(
                     "coin_manager._issue_coin_prep_worker_delegation",
                     return_value=MagicMock(to_environment=lambda: {}),
