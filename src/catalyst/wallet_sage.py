@@ -6666,7 +6666,8 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
 
     Walks Sage's get_derivations endpoint (both unhardened and hardened
     keys) and decodes each bech32 address to a 32-byte puzzle hash via
-    chia.util.bech32m. Results are cached for 10 minutes so repeated
+    CATalyst's dependency-light canonical codec. Results are cached for 10
+    minutes so repeated
     calls during fill verification are cheap.
 
     Returns a set of lowercase hex strings WITHOUT the '0x' prefix so
@@ -6688,16 +6689,7 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
     ):
         return _puzzle_hash_cache
 
-    try:
-        from chia.util.bech32m import decode_puzzle_hash
-    except ImportError:
-        log_event(
-            "warning",
-            "puzzle_hash_cache_no_bech32m",
-            "chia.util.bech32m not available — wallet PH cache disabled. "
-            "Install chia-blockchain to enable fill-vs-cancel disambiguation.",
-        )
-        return set()
+    from sage_offer_wire import decode_wallet_puzzle_hash
 
     collected: set = set()
     page_size = 200
@@ -6733,7 +6725,7 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
                 if not addr:
                     continue
                 try:
-                    ph_bytes = decode_puzzle_hash(addr)
+                    ph_bytes = decode_wallet_puzzle_hash(addr)
                     collected.add(ph_bytes.hex().lower())
                 except Exception:
                     # Unknown address format — skip, don't raise

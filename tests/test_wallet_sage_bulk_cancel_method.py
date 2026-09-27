@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import wallet_sage
+from sage_offer_wire import encode_wallet_puzzle_hash
 from cancel_outcomes import (
     CANCEL_FAILED,
     CANCEL_SUBMITTED_UNCONFIRMED,
@@ -19,8 +20,6 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
     def test_fee_bearing_batch_adds_one_explicit_fee_spend_before_one_submission(self):
         from chia_rs import Coin, CoinSpend, G2Element, Program, SpendBundle
         from chia_rs.sized_bytes import bytes32
-
-        from chia.util.bech32m import encode_puzzle_hash
 
         fee_mojos = 13_079_100
         # Use real executable CAT/native effects. A summary claiming outputs
@@ -47,7 +46,7 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
                     {
                         "coin_id": output.name().hex(),
                         "amount": amount - fee,
-                        "address": encode_puzzle_hash(destination, "xch"),
+                        "address": encode_wallet_puzzle_hash(destination, "xch"),
                         "receiving": True,
                         "burning": False,
                     }

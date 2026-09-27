@@ -35,17 +35,28 @@ class TestWalletSageLogEventImport(unittest.TestCase):
                     result = wallet_sage.get_wallet_puzzle_hashes(force=True)
         self.assertIsInstance(result, set)
 
-    def test_get_puzzle_hashes_import_error_no_name_error(self):
-        """NameError must NOT propagate when chia.util.bech32m is missing."""
+    def test_get_puzzle_hashes_decodes_without_chia_blockchain(self):
+        """Packaged ownership detection must not depend on chia-blockchain."""
         import wallet_sage
+        from sage_offer_wire import encode_wallet_puzzle_hash
+
+        address = encode_wallet_puzzle_hash(bytes.fromhex("ab" * 32), "xch")
 
         with patch.dict(
             "sys.modules", {"chia": None, "chia.util": None, "chia.util.bech32m": None}
         ):
             with patch.object(wallet_sage, "_puzzle_hash_cache", set()):
                 with patch.object(wallet_sage, "_puzzle_hash_cache_at", 0.0):
-                    result = wallet_sage.get_wallet_puzzle_hashes(force=True)
-        self.assertIsInstance(result, set)
+                    with patch.object(
+                        wallet_sage,
+                        "rpc",
+                        side_effect=[
+                            {"success": True, "derivations": [{"address": address}]},
+                            {"success": True, "derivations": [{"address": address}]},
+                        ],
+                    ):
+                        result = wallet_sage.get_wallet_puzzle_hashes(force=True)
+        self.assertEqual(result, {"ab" * 32})
 
 
 # ---------------------------------------------------------------------------

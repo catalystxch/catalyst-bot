@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "catalys
 
 import dexie_incentives  # noqa: E402
 from dexie_claims import _b58encode, compute_offer_hash, puzzle_hash_to_address  # noqa: E402
+from sage_offer_wire import decode_wallet_puzzle_hash  # noqa: E402
 
 
 SBX_ASSET_ID = "a628c1c2c6fcb74d53746157e438e108eab5c0bb3e5c80ff9b1910b3e4832913"
@@ -136,32 +137,26 @@ class TestBase58(unittest.TestCase):
             )
 
 
-try:
-    import chia.util.bech32m as _bech32m_mod  # noqa: F401
-
-    _CHIA_AVAILABLE = True
-except ImportError:
-    _CHIA_AVAILABLE = False
-
-
-@unittest.skipUnless(_CHIA_AVAILABLE, "chia-blockchain not installed")
 class TestPuzzleHashToAddress(unittest.TestCase):
     def test_round_trip(self):
-        from chia.util.bech32m import decode_puzzle_hash
-
         ph = "8b9b8c0e7f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c"
         # Force the mainnet prefix without poking the wallet.
         with patch("dexie_claims._network_prefix", return_value="xch"):
             addr = puzzle_hash_to_address(ph)
         self.assertTrue(addr.startswith("xch1"))
-        self.assertEqual(decode_puzzle_hash(addr).hex(), ph)
+        self.assertEqual(decode_wallet_puzzle_hash(addr).hex(), ph)
 
-    def test_returns_empty_when_chia_missing(self):
-        # The production helper falls back gracefully when chia isn't
-        # importable (CI environments). Confirm the contract by patching
-        # encode_puzzle_hash to None — same as a missing-import code path.
-        with patch("dexie_claims.encode_puzzle_hash", None):
-            self.assertEqual(puzzle_hash_to_address("ab" * 32), "")
+    def test_round_trip_does_not_require_chia_blockchain(self):
+        with (
+            patch.dict(
+                "sys.modules",
+                {"chia": None, "chia.util": None, "chia.util.bech32m": None},
+            ),
+            patch("dexie_claims._network_prefix", return_value="txch"),
+        ):
+            addr = puzzle_hash_to_address("ab" * 32)
+        self.assertTrue(addr.startswith("txch1"))
+        self.assertEqual(decode_wallet_puzzle_hash(addr), bytes.fromhex("ab" * 32))
 
 
 if __name__ == "__main__":

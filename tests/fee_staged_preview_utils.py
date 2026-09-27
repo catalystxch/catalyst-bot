@@ -1,11 +1,11 @@
 """Executable unsigned Sage responses for read-only staged preview tests."""
 
 from chia_rs import Coin, CoinSpend, Program
-from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 import pytest
 
 from fee_approval_test_utils import ADDRESS, ASSET, _coin
 from fee_projection_test_utils import standard_puzzles
+from sage_offer_wire import decode_wallet_puzzle_hash, encode_wallet_puzzle_hash
 
 
 def prepare_unsigned_wallet(state, monkeypatch):
@@ -42,7 +42,7 @@ def prepare_unsigned_wallet(state, monkeypatch):
                 and (a["id"]["type"] == "xch") == (asset is None)
                 and first_for_asset
             ]
-            destination = decode_puzzle_hash(ADDRESS)
+            destination = decode_wallet_puzzle_hash(ADDRESS)
             conditions, output_rows, duplicate_amounts, ephemeral_spends = (
                 [],
                 [],
@@ -63,7 +63,7 @@ def prepare_unsigned_wallet(state, monkeypatch):
                         {
                             "coin_id": parent.name().hex(),
                             "amount": str(parent.amount),
-                            "address": encode_puzzle_hash(
+                            "address": encode_wallet_puzzle_hash(
                                 native.get_tree_hash(), "xch"
                             ),
                             "receiving": True,
