@@ -182,7 +182,9 @@ def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
         )
         if isinstance(response, tuple):
             response = response[0]
-        payload = response.get_json(silent=True) if hasattr(response, "get_json") else None
+        payload = (
+            response.get_json(silent=True) if hasattr(response, "get_json") else None
+        )
         ready = bool(
             type(payload) is dict
             and payload.get("success") is True
@@ -193,7 +195,9 @@ def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
         )
         return {
             "ready": ready,
-            "reason": "ready" if ready else str((payload or {}).get("reason") or "must_resize"),
+            "reason": "ready"
+            if ready
+            else str((payload or {}).get("reason") or "must_resize"),
             "campaign_id": campaign["campaign_id"],
             "campaign_revision": campaign["revision"],
         }
@@ -204,7 +208,10 @@ def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
             {"error": str(exc)[:256]},
             level="warning",
         )
-        return {"ready": False, "reason": "bootstrap_coin_prep_verification_unavailable"}
+        return {
+            "ready": False,
+            "reason": "bootstrap_coin_prep_verification_unavailable",
+        }
 
 
 def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:

@@ -1974,14 +1974,10 @@ def api_coin_prep_verify(_args=None):
             or "two_sided"
         )
         bootstrap_context = None
-        bootstrap_campaign_id = str(
-            args.get("bootstrap_campaign_id") or ""
-        ).strip()
+        bootstrap_campaign_id = str(args.get("bootstrap_campaign_id") or "").strip()
         if bootstrap_campaign_id:
             try:
-                bootstrap_revision = int(
-                    args.get("bootstrap_campaign_revision", "")
-                )
+                bootstrap_revision = int(args.get("bootstrap_campaign_revision", ""))
             except (TypeError, ValueError) as exc:
                 raise ValueError("bootstrap_coin_prep_confirmation_required") from exc
             bootstrap_context = _active_bootstrap_coin_prep_context(
