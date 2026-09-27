@@ -1359,6 +1359,7 @@ def api_coin_prep_status():
     try:
         result = {"success": True, **api_server._coin_prep_state}
         worker_fee_approval_id = None
+        durable_fee = None
         bootstrap_campaign = None
         asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
         if len(asset_id) == 64:
@@ -1452,6 +1453,15 @@ def api_coin_prep_status():
                     and re.fullmatch(r"[0-9a-f]{64}", candidate_approval_id)
                 ):
                     worker_fee_approval_id = candidate_approval_id
+                    if bootstrap_campaign is None:
+                        try:
+                            from database import get_coin_prep_fee_approval_status
+
+                            durable_fee = get_coin_prep_fee_approval_status(
+                                worker_fee_approval_id
+                            )
+                        except Exception:
+                            durable_fee = None
 
                 # Check if this status file belongs to the CURRENT run.
                 # If it has a different run_id (or none), it's stale from
@@ -1613,10 +1623,36 @@ def api_coin_prep_status():
                                 _all_ok = True
                                 if _last.get("tier_enabled"):
                                     _offer_tsxch = _last.get("offer_tier_sizes_xch")
+                                    _approval_options = (
+                                        durable_fee.get("request_options") or {}
+                                        if isinstance(durable_fee, dict)
+                                        else {}
+                                    )
+                                    _approval_is_bootstrap = bool(
+                                        isinstance(durable_fee, dict)
+                                        and (
+                                            durable_fee.get("campaign_id")
+                                            or _approval_options.get(
+                                                "bootstrap_campaign_id"
+                                            )
+                                        )
+                                    )
+                                    # An authoritative standard fee approval
+                                    # distinguishes normal prep from Bootstrap.
+                                    # If approval provenance is unavailable,
+                                    # retain the conservative legacy inference.
+                                    _strict_bootstrap = bool(
+                                        isinstance(_offer_tsxch, dict)
+                                        and _offer_tsxch
+                                        and (
+                                            bootstrap_campaign is not None
+                                            or durable_fee is None
+                                            or _approval_is_bootstrap
+                                        )
+                                    )
                                     _tsxch = (
                                         _offer_tsxch
-                                        if isinstance(_offer_tsxch, dict)
-                                        and _offer_tsxch
+                                        if _strict_bootstrap
                                         else _last.get("tier_sizes_xch", {})
                                     )
                                     _tscat = _last.get("tier_sizes_cat", {})
@@ -1659,9 +1695,6 @@ def api_coin_prep_status():
                                     # coin below that exact spend is unusable,
                                     # even when it lies within the historical
                                     # five-percent reuse tolerance.
-                                    _strict_bootstrap = bool(
-                                        isinstance(_offer_tsxch, dict) and _offer_tsxch
-                                    )
                                     _xa = _alloc_match(
                                         _xch_coins,
                                         _xreqs,
@@ -1771,24 +1804,25 @@ def api_coin_prep_status():
         # after the worker completed.  Prefer the campaign's latest immutable
         # approval so status never reports a superseded ceiling with cumulative
         # scope spend (which can otherwise render a misleading negative balance).
-        durable_fee = None
         campaign_id = (
             bootstrap_campaign.get("campaign_id")
             if bootstrap_campaign is not None
             else None
         )
         if campaign_id is None and worker_fee_approval_id is not None:
-            try:
-                from database import get_coin_prep_fee_approval_status
+            if durable_fee is None:
+                try:
+                    from database import get_coin_prep_fee_approval_status
 
-                durable_fee = get_coin_prep_fee_approval_status(
-                    worker_fee_approval_id
-                )
+                    durable_fee = get_coin_prep_fee_approval_status(
+                        worker_fee_approval_id
+                    )
+                except Exception:
+                    durable_fee = None
+            if isinstance(durable_fee, dict):
                 campaign_id = durable_fee.get("campaign_id") or (
                     durable_fee.get("request_options") or {}
                 ).get("bootstrap_campaign_id")
-            except Exception:
-                durable_fee = None
         if campaign_id is not None:
             try:
                 from database import get_latest_coin_prep_fee_approval_for_campaign
