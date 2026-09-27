@@ -741,3 +741,5 @@ than funds being exposed under fabricated pricing authority.
   exercised fail-closed lease, recovery and authoritative-reconciliation test
   paths; no test failed and the preserved live TEST 7 Bootstrap review was not
   submitted or mutated by the suite.
+- A fresh repository-wide `python -m ruff check .` completed immediately after
+  the full suite with `All checks passed!` and exit code 0.
