@@ -210,3 +210,60 @@ ask depth and single-provider dependency still blocking it. Therefore no fee
 budget proposal was generated or approved and no wallet effect was attempted.
 The exact supervised package process was then stopped; zero CATalyst processes
 and no port-5000 listener remained.
+
+## Splash provider diagnostic checkpoint
+
+The feature branch was fetched and verified at exact remote HEAD
+`4a32108c4f212ac62e8879917c888daf0ffc2339`. This diagnostic was read-only:
+the bot remained stopped, no offer was submitted or fabricated, no confidence
+gate was bypassed, and no wallet action or fee was incurred.
+During final verification the remote advanced to evidence-only successor
+`3a4f7c456a373cc4f63b41d5fb01188e914ac73c`; its sole delta from the assigned
+head is a 22-line addition to `evidence/2026-09-24-live-test7-acceptance.md`, so
+the tested product source is unchanged and this checkpoint remains scoped to
+the assigned exact head.
+
+The isolated live profile contained `splash.exe` version `Splash! 0.2.0`, size
+13,702,144 bytes, with SHA-256
+`52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8`.
+Its documented options include the exact submission, P2P, metrics and webhook
+arguments used by CATalyst. With the locally built CATalyst package running in
+Flask-only mode, the Splash binary was launched with CATalyst's exact supervised
+command:
+
+```text
+splash.exe --listen-offer-submission 127.0.0.1:4000 --listen-address /ip4/0.0.0.0/tcp/11511 --listen-metrics 127.0.0.1:4001 --offer-hook http://127.0.0.1:5000/api/splash/incoming
+```
+
+The daemon started normally, bound TCP ports 4000, 4001 and 11511, returned the
+expected HTTP 405 from the submission-only root endpoint, and served valid JSON
+from `/metrics`. It discovered mainnet peers without manual peers: the observed
+count progressed from one to three and settled at two after one disconnect.
+The final metrics snapshot was `peers=2`, `offers_received=0`,
+`offers_broadcasted=0`, `total_connections=0`. No MZ or other offer arrived at
+the CATalyst webhook during the bounded observation.
+
+CATalyst's Flask-only diagnostics correctly did not attribute this separately
+launched process to its in-process supervisor: the externally reachable submit
+endpoint was healthy, while managed-process and managed-metrics fields remained
+false and the bot-owned receive worker remained inactive. Source and regression
+contracts confirm that CATalyst starts and owns Splash with the bot, requires
+actual normalized webhook offers for confidence, treats an empty exact offer
+set as degraded, and never fabricates provider redundancy from peer connectivity
+alone. Splash's `total_connections=0` counter did not affect CATalyst health,
+which uses the live `peers` count.
+
+Focused provider, runtime, confidence-retention and UI-copy verification passed
+13 tests in 1.02 seconds on the final run. The real Chromium supervisor-restart
+test passed separately in 9.03 seconds with `--e2e`. A first selector-only command collected
+no tests because three UI function names had changed; the corrected exact
+selectors produced the reported pass result.
+
+Classification: **external empty/sparse Splash gossip state**, not a CATalyst
+packaging, configuration or environment failure and not a proven CATalyst
+defect. The executable, command line, listeners, submission API, metrics API,
+DNS/peer discovery and multiple peer connections all worked, but the peer
+network supplied zero offers. CATalyst therefore correctly retained RED
+single-provider protection. Both diagnostic processes were stopped afterward;
+no `Catalyst.exe` or `splash.exe` remained and ports 4000, 4001, 5000 and 11511
+were clear.
