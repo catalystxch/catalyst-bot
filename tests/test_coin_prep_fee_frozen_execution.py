@@ -12,6 +12,7 @@ import api_server
 import database
 import fee_approval_test_utils as utils
 from fee_staged_preview_utils import prepare_unsigned_wallet
+from sage_offer_wire import encode_wallet_puzzle_hash
 
 
 @pytest.fixture
@@ -259,11 +260,10 @@ def test_changed_inventory_is_not_resizing_or_intermediate_completion_proof(appr
 def test_changed_receive_address_cannot_inherit_existing_consent(
     approved, monkeypatch, action
 ):
-    from chia.util.bech32m import encode_puzzle_hash
     from chia_rs.sized_bytes import bytes32
     import wallet
 
-    new_address = encode_puzzle_hash(bytes32(b"a" * 32), "xch")
+    new_address = encode_wallet_puzzle_hash(bytes32(b"a" * 32), "xch")
     monkeypatch.setattr(
         wallet,
         "get_next_address",

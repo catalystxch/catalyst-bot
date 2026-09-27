@@ -16,8 +16,8 @@ Implements the protocol used by the official ``dexie-rewards`` Python CLI
        batches roughly every 15 minutes. No XCH leaves the wallet.
 
 This module deliberately avoids extra dependencies — base58 is implemented
-inline (Bitcoin alphabet, the default Dexie expects) and bech32 conversion
-uses ``chia.util.bech32m`` which is already installed.
+inline (Bitcoin alphabet, the default Dexie expects) and wallet address
+conversion uses CATalyst's dependency-light canonical Bech32m codec.
 """
 
 from __future__ import annotations
@@ -27,17 +27,12 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from sage_offer_wire import decode_wallet_puzzle_hash, encode_wallet_puzzle_hash
 
 try:
     from config import cfg
 except Exception:
     cfg = None  # type: ignore
-
-try:
-    from chia.util.bech32m import encode_puzzle_hash
-except Exception:
-    encode_puzzle_hash = None  # type: ignore
-
 
 _DEFAULT_BASE = "https://api.dexie.space"
 _API_VERSION = "/v1"
@@ -99,13 +94,13 @@ def _network_prefix() -> str:
 
 def puzzle_hash_to_address(maker_puzzle_hash_hex: str) -> str:
     """Bech32m-encode a puzzle hash hex string to an xch1/txch1 address."""
-    if not maker_puzzle_hash_hex or encode_puzzle_hash is None:
+    if not maker_puzzle_hash_hex:
         return ""
     h = maker_puzzle_hash_hex.lower()
     if h.startswith("0x"):
         h = h[2:]
     try:
-        return encode_puzzle_hash(bytes.fromhex(h), _network_prefix())
+        return encode_wallet_puzzle_hash(bytes.fromhex(h), _network_prefix())
     except Exception:
         return ""
 
@@ -277,9 +272,9 @@ def claim_all(target_address: Optional[str] = None) -> Dict[str, Any]:
     if target_address:
         target_address_clean = target_address.strip()
         try:
-            from chia.util.bech32m import decode_puzzle_hash
-
-            target_puzzle_hash_hex = decode_puzzle_hash(target_address_clean).hex()
+            target_puzzle_hash_hex = decode_wallet_puzzle_hash(
+                target_address_clean
+            ).hex()
         except Exception:
             return {"success": False, "error": "invalid_target_address"}
 

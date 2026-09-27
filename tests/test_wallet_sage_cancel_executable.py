@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 from chia_rs import Coin, CoinSpend, Program
-from chia.util.bech32m import encode_puzzle_hash
 from chia_rs.sized_bytes import bytes32
+from sage_offer_wire import encode_wallet_puzzle_hash
 
 
 PUZZLE = Program.to(1)
@@ -29,13 +29,13 @@ def native_bundle(root, fee):
                 {
                     "coin_id": root.name().hex(),
                     "amount": str(root.amount),
-                    "address": encode_puzzle_hash(root.puzzle_hash, "xch"),
+                    "address": encode_wallet_puzzle_hash(root.puzzle_hash, "xch"),
                     "asset": None,
                     "outputs": [
                         {
                             "coin_id": output.name().hex(),
                             "amount": str(amount),
-                            "address": encode_puzzle_hash(DESTINATION, "xch"),
+                            "address": encode_wallet_puzzle_hash(DESTINATION, "xch"),
                             "receiving": True,
                             "burning": False,
                         }

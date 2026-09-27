@@ -5,11 +5,11 @@ from importlib import import_module
 
 import pytest
 from chia_rs import Coin
-from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 
 import fee_approval_test_utils as utils
 import fee_staged_preview_utils as unsigned_utils
 from fee_projection_test_utils import standard_puzzles
+from sage_offer_wire import decode_wallet_puzzle_hash, encode_wallet_puzzle_hash
 from test_coin_prep_fee_worker_dispatch import active_worker  # noqa: F401
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
@@ -43,7 +43,7 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
     from unsigned_effect_binding import _cat_puzzle_hash
 
     native, cat = standard_puzzles()
-    address = encode_puzzle_hash(native.get_tree_hash(), "xch")
+    address = encode_wallet_puzzle_hash(native.get_tree_hash(), "xch")
     monkeypatch.setattr(utils, "ADDRESS", address)
     monkeypatch.setattr(unsigned_utils, "ADDRESS", address)
     state["config"].LIQUIDITY_MODE = mode
@@ -97,7 +97,7 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
             state[asset] = [row for row in state[asset] if row["coin_id"] not in spent]
         for output in outputs:
             asset = output["asset"]
-            ph = decode_puzzle_hash(output["address"])
+            ph = decode_wallet_puzzle_hash(output["address"])
             if asset == "cat":
                 ph = _cat_puzzle_hash(bytes.fromhex(utils.ASSET), ph)
             coin = Coin(

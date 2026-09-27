@@ -9,6 +9,7 @@ import pytest
 import api_server  # noqa: F401 - establish this file's isolated blueprint graph
 import fee_approval_test_utils as utils
 from bootstrap_fee_fixture import approved_bootstrap  # noqa: F401
+from sage_offer_wire import encode_wallet_puzzle_hash
 from test_bootstrap_stopped_fee_renewal import automatically_stopped_campaign  # noqa: F401
 
 
@@ -31,10 +32,9 @@ def test_repeated_stop_recovery_refuses_changed_canonical_context(
     elif change == "fingerprint":
         state["identity"]["fingerprint"] = 12345
     else:
-        from chia.util.bech32m import encode_puzzle_hash
         from chia_rs.sized_bytes import bytes32
 
-        other_address = encode_puzzle_hash(bytes32(b"a" * 32), "xch")
+        other_address = encode_wallet_puzzle_hash(bytes32(b"a" * 32), "xch")
         monkeypatch.setattr(
             wallet,
             "get_next_address",
