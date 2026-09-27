@@ -176,3 +176,37 @@ remaining boundary is live acceptance only: RED market confidence prevented a
 real Sage offer, Dexie acknowledgement/discovery, fee-consuming cancellation,
 requote and remake cycle. Mock evidence is not treated as live acceptance. No
 wallet mutation or fee was incurred during this audit.
+
+## Integrated-head read-only live refresh
+
+The primary feature branch was fetched at exact HEAD
+`464ef56213618b7e525dc4ab811ae1b1b425e8cb`, with exact parent
+`e2a9c8fe03677abcf1d0c3cbee49e4115839ffb3`. Its parent diff is exactly the
+55-line addition to this evidence file from the lifecycle coverage checkpoint;
+`git diff --check` passed.
+
+At approximately 27 September 2026 13:28 BST, the locally built integrated
+package was launched in Flask-only mode against the established isolated live
+profile for one read-only refresh. Live Sage identity matched the authorized
+secondary wallet exactly: mainnet, Sage, label `Harvestr test wallet`,
+fingerprint `3702373391`, CAT wallet ID `2`, ticker `MZ_XCH`, and MZ asset ID
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+Sage RPC was listening and authenticated.
+
+CATalyst remained stopped with zero open buy/sell offers, zero XCH/CAT locks,
+zero pending cancellations and zero unresolved operation, reservation,
+publication or prepared-creation blockers. Runtime safety was allowed. Market
+Intel refreshed Dexie's public book successfully: nine buys, 29 sells, best
+bid `0.00004`, best ask `0.00011`, 0.3-second reported book age, one refresh
+and zero order-book errors. The visible 100 XCH bid was external, not ours.
+Splash remained unavailable/empty and Spacescan had no token context.
+
+The supported read-only Smart Settings calculation returned HTTP 409 with
+`market_confidence=RED`, `market_data_valid=false`, stage `INVALID`, provider
+redundancy 1 and follow capacity 0. Exact current reason codes were
+`out_of_range_depth_excluded`, `insufficient_ask_depth` and
+`single_provider_dependency`; Bootstrap was only suggested, with insufficient
+ask depth and single-provider dependency still blocking it. Therefore no fee
+budget proposal was generated or approved and no wallet effect was attempted.
+The exact supervised package process was then stopped; zero CATalyst processes
+and no port-5000 listener remained.
