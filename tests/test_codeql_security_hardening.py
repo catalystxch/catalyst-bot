@@ -24,6 +24,7 @@ def test_gui_does_not_reinterpret_confirmation_text_as_html():
 
     assert "msgEl.innerHTML = message" not in source
     assert "msgEl.innerHTML = String(message)" not in source
+    assert "allowHtml: true" not in source
 
 
 def test_gui_external_links_use_protocol_allowlist_not_scheme_denylist():

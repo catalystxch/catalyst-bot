@@ -12530,7 +12530,7 @@
                             <strong>Settings audit log</strong> — every config change is recorded with who/when/what so you can investigate after the fact.<br>
                             <strong>Light mode polish</strong> — every panel and modal now reads cleanly on a light background.<br>
                             <strong>PnL statistics</strong> — volume, avg fill size, avg trip time, avg profit per trip, open legs panel.<br>
-                            <strong>Token icons</strong> — live token logo throughout the app, sourced from Dexie CDN.
+                            <strong>Token identity</strong> — canonical ticker and asset identity are shown without loading remote token artwork into the wallet UI.
                         </div>
                     </div>
                     <div class="v4-modal-panel v4-modal-panel--warning">
@@ -13362,12 +13362,11 @@
             const result = await showStyledConfirm({
                 icon: '↺',
                 title: 'Start Fresh To Change Settings',
-                message: 'This session is resuming <strong>existing live offers</strong>. Core settings are locked in resume mode so the live book stays consistent.<br><br>Use <strong>Live Controls</strong> for safe live quote changes, or choose <strong>View Settings</strong> to browse current settings (read-only), or <strong>Start Fresh</strong> to cancel all offers and rebuild from scratch.',
+                message: 'This session is resuming existing live offers. Core settings are locked in resume mode so the live book stays consistent.\n\nUse Live Controls for safe live quote changes, or choose View Settings to browse current settings (read-only), or Start Fresh to cancel all offers and rebuild from scratch.',
                 confirmText: 'Start Fresh',
                 cancelText: 'Back',
                 extraText: 'View Settings',
-                style: 'warning',
-                allowHtml: true
+                style: 'warning'
             });
 
             if (result === 'extra') {
@@ -16044,15 +16043,14 @@
                         return await showStyledConfirm({
                             icon: '🎯',
                             title: 'Sniper has live probes',
-                            message: `You currently have <strong>${liveProbes}</strong> active sniper probe(s) ` +
+                            message: `You currently have ${liveProbes} active sniper probe(s) ` +
                                      `on the book. Turning sniper OFF stops new probe activity but does ` +
-                                     `<strong>NOT cancel</strong> these existing probes — they will stay ` +
+                                     `NOT cancel these existing probes — they will stay ` +
                                      `live until they fill, expire, or you manually cancel them. ` +
-                                     `<br><br>Continue?`,
+                                     `\n\nContinue?`,
                             confirmText: 'Yes, turn OFF',
                             cancelText: 'Keep ON',
-                            style: 'warning',
-                            allowHtml: true
+                            style: 'warning'
                         });
                     }
                 }
@@ -16067,15 +16065,14 @@
                         return await showStyledConfirm({
                             icon: '⚖️',
                             title: 'Position is non-zero',
-                            message: `Your net position is currently <strong>${netPos.toFixed(2)} CAT</strong> ` +
+                            message: `Your net position is currently ${netPos.toFixed(2)} CAT ` +
                                      `(${direction}). Turning Inventory Mgmt OFF means your spreads will ` +
-                                     `<strong>stop rebalancing</strong> back toward neutral — position drift ` +
+                                     `stop rebalancing back toward neutral — position drift ` +
                                      `will continue unchecked and could grow further. ` +
-                                     `<br><br>Continue?`,
+                                     `\n\nContinue?`,
                             confirmText: 'Yes, turn OFF',
                             cancelText: 'Keep ON',
-                            style: 'warning',
-                            allowHtml: true
+                            style: 'warning'
                         });
                     }
                 }
@@ -16085,16 +16082,15 @@
                     return await showStyledConfirm({
                         icon: '📐',
                         title: 'Switching to fixed spread',
-                        message: `Turning Dynamic Spreads OFF means the bot will use the <strong>fixed ` +
-                                 `Spread</strong> value from your settings (not the Base Spread slider above). ` +
-                                 `<br><br>Volatility and fill-rate scaling will <strong>stop</strong>. ` +
+                        message: `Turning Dynamic Spreads OFF means the bot will use the fixed ` +
+                                 `Spread value from your settings (not the Base Spread slider above). ` +
+                                 `\n\nVolatility and fill-rate scaling will stop. ` +
                                  `Offer-book confidence safeguards remain active. Existing offers stay ` +
                                  `live; eligible new requotes will use the fixed spread. ` +
-                                 `<br><br>Continue?`,
+                                 `\n\nContinue?`,
                         confirmText: 'Yes, turn OFF',
                         cancelText: 'Keep ON',
-                        style: 'warning',
-                        allowHtml: true
+                        style: 'warning'
                     });
                 }
             } catch (e) {
@@ -20180,12 +20176,11 @@
                         const choice = await showStyledConfirm({
                             icon: '🏆',
                             title: `${selectedCAT.name || 'Selected CAT'} earns ${rewardToken} rewards`,
-                            message: `Dexie pays ${rewardToken} on offers within <strong>${capPct}%</strong> of market price (estimated ${aprPct}% APR).<br><br>` +
+                            message: `Dexie pays ${rewardToken} on offers within ${capPct}% of market price (estimated ${aprPct}% APR).\n\n` +
                                      `Cap your spread at ${capPct}% so all tiers stay reward-eligible? Otherwise Smart Settings will use the calculated spread for this pair's volatility.`,
                             confirmText: `Maximize ${rewardToken} (cap at ${capPct}%)`,
                             cancelText: 'Use calculated spread',
                             style: 'success',
-                            allowHtml: true,
                         });
                         if (choice) {
                             params.set('dbx_cap', 'true');
@@ -31302,14 +31297,13 @@
             await showStyledConfirm({
                 icon: '🔄',
                 title: 'Restart Sage Manually',
-                message: 'Sage must be restarted outside the bot:<br><br>' +
-                    '<b>1.</b> Close the Sage application<br>' +
-                    '<b>2.</b> Reopen it and wait for sync<br>' +
-                    '<b>3.</b> The bot will reconnect automatically',
+                message: 'Sage must be restarted outside the bot:\n\n' +
+                    '1. Close the Sage application\n' +
+                    '2. Reopen it and wait for sync\n' +
+                    '3. The bot will reconnect automatically',
                 confirmText: 'Got it',
                 cancelText: '',
-                style: 'info',
-                allowHtml: true
+                style: 'info'
             });
         }
         const restartChia = restartSage;
@@ -34829,11 +34823,10 @@
                 const proceed = await showStyledConfirm({
                     icon: '📉',
                     title: 'Low Spread Warning',
-                    message: 'A spread below 2% is risky. You may <strong>lose money</strong> on trades due to fees and slippage.',
+                    message: 'A spread below 2% is risky. You may lose money on trades due to fees and slippage.',
                     confirmText: 'Save Anyway',
                     cancelText: 'Go Back',
-                    style: 'warning',
-                    allowHtml: true
+                    style: 'warning'
                 });
                 if (!proceed) {
                     setSaveConfigButtonState(false);
@@ -34854,21 +34847,21 @@
                 const _hardMax = parseFloat(document.getElementById('configMaxMid')?.value) || 0;
                 if (_midPrice > 0 && _hardMax > 0 && _midPrice > _hardMax) {
                     _riskBlockers.push(
-                        `<strong>Max Price (${_hardMax.toFixed(8)})</strong> is BELOW the current ` +
+                        `Max Price (${_hardMax.toFixed(8)}) is BELOW the current ` +
                         `market price (${_midPrice.toFixed(8)}). The bot will refuse to trade and ` +
                         `cancel all offers next cycle.`
                     );
                 }
                 if (_midPrice > 0 && _hardMin > 0 && _midPrice < _hardMin) {
                     _riskBlockers.push(
-                        `<strong>Min Price (${_hardMin.toFixed(8)})</strong> is ABOVE the current ` +
+                        `Min Price (${_hardMin.toFixed(8)}) is ABOVE the current ` +
                         `market price (${_midPrice.toFixed(8)}). The bot will refuse to trade and ` +
                         `cancel all offers next cycle.`
                     );
                 }
                 if (_hardMin > 0 && _hardMax > 0 && _hardMin >= _hardMax) {
                     _riskBlockers.push(
-                        `<strong>Min Price ≥ Max Price</strong> — these rails are inverted. ` +
+                        `Min Price ≥ Max Price — these rails are inverted. ` +
                         `The bot will refuse every quote.`
                     );
                 }
@@ -34880,8 +34873,8 @@
                 const _maxSpread = parseFloat(document.getElementById('configMaxSpreadBps')?.value) || 0;
                 if (_minSpread > 0 && _maxSpread > 0 && _minSpread >= _maxSpread) {
                     _riskBlockers.push(
-                        `<strong>Min Spread (${_minSpread.toFixed(2)}%)</strong> ≥ <strong>Max Spread ` +
-                        `(${_maxSpread.toFixed(2)}%)</strong> — these bounds are inverted. The dynamic ` +
+                        `Min Spread (${_minSpread.toFixed(2)}%) ≥ Max Spread ` +
+                        `(${_maxSpread.toFixed(2)}%) — these bounds are inverted. The dynamic ` +
                         `spread engine will produce broken values.`
                     );
                 }
@@ -34896,14 +34889,14 @@
                     const _currentPosXch = Math.abs(_currentNet * _midPrice2);
                     if (_currentPosXch > _maxPos) {
                         _riskWarnings.push(
-                            `<strong>Max Position (${_maxPos.toFixed(2)} XCH)</strong> is below your ` +
+                            `Max Position (${_maxPos.toFixed(2)} XCH) is below your ` +
                             `current position (${_currentPosXch.toFixed(2)} XCH equivalent). The bot ` +
                             `will skew aggressively toward neutral on the next cycle.`
                         );
                     }
                 }
                 if (_maxPos < 0) {
-                    _riskBlockers.push(`<strong>Max Position cannot be negative.</strong>`);
+                    _riskBlockers.push(`Max Position cannot be negative.`);
                 }
             } catch (_e) {}
 
@@ -34912,12 +34905,12 @@
                 const _tradeSize = parseFloat(document.getElementById('configTradeXch')?.value) || 0;
                 if (_tradeSize > 0 && _tradeSize > 50) {
                     _riskWarnings.push(
-                        `<strong>Trade Size (${_tradeSize} XCH)</strong> is unusually large. ` +
+                        `Trade Size (${_tradeSize} XCH) is unusually large. ` +
                         `Most fills will require significant counterparty liquidity.`
                     );
                 }
                 if (_tradeSize < 0) {
-                    _riskBlockers.push(`<strong>Trade Size cannot be negative.</strong>`);
+                    _riskBlockers.push(`Trade Size cannot be negative.`);
                 }
             } catch (_e) {}
 
@@ -34944,11 +34937,11 @@
                         (_modeState.buyActive ? _buyTotalTier : 0) +
                         (_modeState.sellActive ? _sellTotalTier : 0);
                     if (_negTier) {
-                        _riskBlockers.push(`<strong>Tier counts cannot be negative.</strong>`);
+                        _riskBlockers.push(`Tier counts cannot be negative.`);
                     }
                     if (_activeTierTotal === 0) {
                         _riskBlockers.push(
-                            `<strong>All active-side tier counts are zero</strong> with TIER_ENABLED = ON. ` +
+                            `All active-side tier counts are zero with TIER_ENABLED = ON. ` +
                             `The bot will not create any offers.`
                         );
                     }
@@ -34957,17 +34950,16 @@
 
             // Show critical blockers first — these MUST be fixed
             if (_riskBlockers.length > 0) {
-                const _blockerHtml = _riskBlockers.map(m => '• ' + m).join('<br><br>');
+                const _blockerText = _riskBlockers.map(m => '• ' + m).join('\n\n');
                 await showStyledConfirm({
                     icon: '⛔',
                     title: 'Settings would break the bot',
                     message: 'These settings have critical issues that need to be fixed before saving:' +
-                             '<br><br>' + _blockerHtml +
-                             '<br><br>Fix them and try again.',
+                             '\n\n' + _blockerText +
+                             '\n\nFix them and try again.',
                     confirmText: 'OK',
                     cancelText: 'OK',
-                    style: 'danger',
-                    allowHtml: true
+                    style: 'danger'
                 });
                 setSaveConfigButtonState(false);
                 return;
@@ -34975,17 +34967,16 @@
 
             // Show non-blocking warnings — user can save anyway if they understand
             if (_riskWarnings.length > 0) {
-                const _warnHtml = _riskWarnings.map(m => '• ' + m).join('<br><br>');
+                const _warnText = _riskWarnings.map(m => '• ' + m).join('\n\n');
                 const _proceed = await showStyledConfirm({
                     icon: '⚠️',
                     title: 'Risky settings detected',
                     message: 'These settings will work but carry risk:' +
-                             '<br><br>' + _warnHtml +
-                             '<br><br>Save anyway?',
+                             '\n\n' + _warnText +
+                             '\n\nSave anyway?',
                     confirmText: 'Save Anyway',
                     cancelText: 'Go Back',
-                    style: 'warning',
-                    allowHtml: true
+                    style: 'warning'
                 });
                 if (!_proceed) {
                     setSaveConfigButtonState(false);
@@ -35259,16 +35250,15 @@
                     }
                     const warnItems = validationWarnings
                         .map(w => w.message || w)
-                        .map(msg => `• ${escapeHtml(msg)}`)
-                        .join('<br>');
+                        .map(msg => `• ${String(msg)}`)
+                        .join('\n');
                     const proceed = await showStyledConfirm({
                         icon: '⚠️',
                         title: 'Review Settings Warning',
-                        message: `${warnItems}<br><br>Save these settings anyway and continue to the next step?`,
+                        message: `${warnItems}\n\nSave these settings anyway and continue to the next step?`,
                         confirmText: 'Continue',
                         cancelText: 'Back to Settings',
-                        style: 'warning',
-                        allowHtml: true
+                        style: 'warning'
                     });
                     if (!proceed) {
                         setSaveConfigButtonState(false);
