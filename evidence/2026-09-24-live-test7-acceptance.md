@@ -536,6 +536,10 @@ than funds being exposed under fabricated pricing authority.
   Packaged API (nine endpoint checks), synthetic mTLS Sage RPC,
   interrupted-publication recovery, and native
   clean/duplicate/persisted/safety launch smokes all exited successfully.
+- Bandit scanned 162,993 lines under the repository's configured policy with
+  zero medium- or high-severity findings. The completed archive was then
+  extracted independently: its executable reproduced the expected hash and
+  the extracted package passed the full nine-endpoint packaged API smoke.
 - Exact executable: `dist/Catalyst/Catalyst.exe`; SHA-256
   `8E109AD62089C5DD5E8C729AF7C363F3D6745BD07BC0D0980531F77620C5D568`.
   Immutable handoff archive:
