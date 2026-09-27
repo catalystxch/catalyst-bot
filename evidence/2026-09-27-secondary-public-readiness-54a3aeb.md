@@ -4,7 +4,7 @@
 
 - Repository: `catalystxch/catalyst-bot`.
 - Remote branch: `codex/coin-prep-fee-approval`.
-- Final exact head: `54a3aebf398b61c7952b03573c223c6f66497816`.
+- Final exact head: `4ebd9e7a369bd53f974ae421261d173396dc84fd`.
 - The candidate was tested in a detached isolated worktree. The remote ref and
   `git rev-parse HEAD` matched before final-head testing and packaging.
 - No CATalyst process was pointed at the live Sage profile. No wallet read,
@@ -23,8 +23,23 @@
   3.30s**. The backend Start mutation-boundary regression passed **1/1 in
   0.95s** and logged the expected `must_resize` fail-closed decision.
 - Both inline JavaScript blocks parsed successfully under Node 24.14.0.
-- Repository-wide `python -m ruff check .`: passed. Ruff check and format-check
-  on both changed Python blueprints passed. `git diff --check` passed.
+- A complete serial suite on the exact production tree at `54a3aeb` (the only
+  additional commit was this evidence Markdown) passed **7,054 tests, 166
+  skipped and 422 subtests in 1,284.55s**, with the same single pytest
+  deprecation warning.
+- Reconciliation merge `fbe56b95e0a9cb8bbfb443cd3ece2f6c1ff86508` has parents
+  `54a3aebf398b61c7952b03573c223c6f66497816` and current `main`
+  `bfa25b6eac12faa4585dcf6c710ad63278431509`. Both parents are ancestors and
+  its tree is byte-identical to `54a3aeb` (`git diff --quiet` exited zero).
+- Formatting commit `e3123b53a2303d48ec9357d033e04aa547eb0d32`
+  changed 67 Python files. An AST comparison of every changed Python file
+  against `fbe56b9` found all 67 semantically equivalent. Final head
+  `4ebd9e7` changes only the fee-approval plan's Python examples.
+- On exact final head, repository-wide `python -m ruff check .` passed,
+  `python -m ruff format --check .` reported all 530 files formatted,
+  `compileall src scripts tests` passed, 24 CodeQL/readiness regressions passed
+  in 1.73s, the exact reload E2E passed 1/1 in 2.89s, and
+  `git diff --check` passed.
 
 The secondary review caught a presentation regression at intermediate head
 `a0c5e82`: the secure switch to `textContent` left ten callers passing HTML
@@ -43,11 +58,11 @@ follow-ups. No further final-head CATalyst defect was reproduced.
   known optional `pycparser.lextab` and `pycparser.yacctab` hidden imports.
 - Executable: `dist/Catalyst/Catalyst.exe`.
 - Executable SHA-256:
-  `C533379A74592C08174C3F03E2D128036D049099DDFA48A474F094D302B43755`.
+  `5F7076A7C5EAFEB37F98D67A1296E114ED94A370835E834A85C2100260FAFE52`.
 - ZIP:
-  `acceptance-artifacts/54a3aeb/CATalyst-54a3aeb-secondary-public-readiness.zip`.
+  `acceptance-artifacts/4ebd9e7/CATalyst-4ebd9e7-secondary-public-readiness.zip`.
 - ZIP SHA-256:
-  `1F5BE9EFB0154C702076B78386C78DD1AC5F198BAE558DF415670116EAF29C71`.
+  `8E8AEEBE6715ABF81BF3010E13CB24ECA0D96C1DED6D82382E362EE58142D23F`.
 - The ZIP was extracted into a new directory. Its executable hash exactly
   matched the build hash, and no `.env`, database, log, Coin Prep status,
   secrets or backup runtime artifact was present.
@@ -68,14 +83,14 @@ The prior accepted package
 Its extracted executable matched the recorded SHA-256
 `3210144F8DB7E6D85D13193D2B0CB5B59EF4F5089F581CD602534F20C13C8649`.
 
-That prior package created a new isolated profile. Exact `54a3aeb` then opened
+That prior package created a new isolated profile. Exact `4ebd9e7` then opened
 the same profile and was relaunched once more. Both current launches reported
 v1.4.0 health, preserved the migration marker and database, and remained
 fail-closed with `WALLET_IDENTITY_BINDING_INVALID` because the synthetic
 profile deliberately had no wallet identity. No wallet service was contacted.
 Evidence is at
-`outputs/54a3aeb-upgrade-smoke/upgrade-result.json` and
-`outputs/54a3aeb-upgrade-smoke/upgrade-smoke.log`.
+`outputs/4ebd9e7-upgrade-smoke/upgrade-result.json` and
+`outputs/4ebd9e7-upgrade-smoke/upgrade-smoke.log`.
 
 ## Remaining public-release gates
 
@@ -84,7 +99,10 @@ authority to publish a release. The repository release checklist still leaves
 these external/process gates open:
 
 - both required 24-hour clean windows;
-- merge of PR #214 to `main` and the approved v1.4.0 tag/workflow;
+- PR #220 remains a draft. At the final-head check, GitHub reported the exact
+  head SHA, ten successful checks, no failures, and `unit-tests` still in
+  progress; mergeability was `true` but state `unstable`;
+- approved merge of PR #220 to `main` and the v1.4.0 tag/workflow;
 - installer version, signature/hash, clean installation and updater-path test;
 - live website update and clean-Windows download verification;
 - closure or supersession of older integration PRs.
