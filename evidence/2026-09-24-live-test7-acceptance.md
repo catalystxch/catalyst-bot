@@ -671,3 +671,25 @@ than funds being exposed under fabricated pricing authority.
   wallet evidence. Verified balances remain protected by the balance snapshot
   cache and frontend merge logic; exact regressions cover transient-zero
   preservation.
+
+### Splash provider-redundancy diagnostic — 27 September 2026
+
+- Primary verified the bundled Splash binary SHA-256 as
+  `52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8` and
+  version `0.2.0`, matching the current upstream Splash release used by the
+  package. An isolated instance on alternate ports started normally, announced
+  local listen addresses, and served valid JSON from `/`, `/metrics` and
+  `/health`; each reported zero peers, zero total connections and zero offers.
+- The official `_dnsaddr.splash.dexie.space` TXT introducer resolved normally
+  to four advertised peers. Both advertised IPv4 TCP endpoints were
+  unreachable from the primary PC, and the primary host had no IPv6 default
+  route for the remaining two peers. After more than 40 seconds the isolated
+  daemon still had zero connections; it was then stopped cleanly with no
+  wallet or CATalyst effect.
+- This locates the primary zero-peer condition before CATalyst's offer-hook or
+  evidence-normalization boundaries. A separate secondary-PC diagnostic did
+  connect the same v0.2.0 transport to an introducer-derived peer, ruling out a
+  universal packaged-binary or launch-command defect. The remaining primary
+  limitation is host/network reachability, while an empty Splash gossip stream
+  remains legitimate degraded evidence rather than permission to fabricate
+  provider redundancy.
