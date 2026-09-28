@@ -343,6 +343,35 @@ def _create_reviewed_campaign(
     return {**preview, "campaign_id": campaign_id}
 
 
+def _campaign_expiry_has_elapsed(campaign: dict[str, Any], now: datetime) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(
+            str(campaign.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        return False
+    return now.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc)
+
+
+def _status_campaign_view(campaign: dict[str, Any] | None) -> dict[str, Any] | None:
+    if campaign is None:
+        return None
+    view = dict(campaign)
+    expired = _campaign_expiry_has_elapsed(campaign, _utcnow())
+    trade_ids = _campaign_trade_ids(str(campaign.get("campaign_id") or ""))
+    view["expired"] = expired
+    view["cancel_required"] = expired
+    view["cancel_reason"] = "bootstrap_expired" if expired else None
+    view["manual_restart_required"] = expired
+    view["open_offer_count"] = len(trade_ids)
+    view["active_authority_retained"] = (
+        expired and str(campaign.get("status") or "") == "active"
+    )
+    return view
+
+
 @bp.get("/api/bootstrap/status")
 def api_bootstrap_status():
     try:
@@ -358,7 +387,11 @@ def api_bootstrap_status():
                     "success": True,
                     "identity": identity,
                     "active": active is not None,
-                    "campaign": active,
+                    "campaign": _status_campaign_view(active),
+                    "needs_attention": bool(
+                        active is not None
+                        and _campaign_expiry_has_elapsed(active, _utcnow())
+                    ),
                 }
             )
         )

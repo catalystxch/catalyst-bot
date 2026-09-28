@@ -106,7 +106,7 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
-def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
+def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
     """Prove one active Bootstrap authority matches the live Sage identity.
 
     Bootstrap offer sizes are derived from the immutable campaign plan, not
@@ -117,7 +117,7 @@ def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     wallet_id = getattr(cfg_obj, "CAT_WALLET_ID", 0)
     if len(asset_id) != 64 or type(wallet_id) is not int or wallet_id <= 0:
-        return False
+        return None
 
     try:
         from database import list_active_bootstrap_campaigns_for_asset
@@ -125,26 +125,26 @@ def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
 
         campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
         if len(campaigns) != 1:
-            return False
+            return None
         campaign = campaigns[0]
         identity = get_wallet_identity()
     except Exception:
-        return False
+        return None
 
     if type(identity) is not dict or identity.get("success") is not True:
-        return False
+        return None
     if str(identity.get("backend") or "").strip().lower() != "sage":
-        return False
+        return None
     if identity.get("has_secrets") is not True:
-        return False
+        return None
 
     network = str(identity.get("network_id") or "").strip().lower()
     if network.startswith("testnet"):
         network = "testnet"
     elif network != "mainnet":
-        return False
+        return None
 
-    return all(
+    if all(
         (
             str(campaign.get("asset_id") or "").strip().lower() == asset_id,
             str(campaign.get("network") or "").strip().lower() == network,
@@ -153,7 +153,39 @@ def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
             campaign.get("wallet_id") == wallet_id,
             str(campaign.get("status") or "").strip().lower() == "active",
         )
-    )
+    ):
+        return campaign
+    return None
+
+
+def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
+    return _matching_active_bootstrap_campaign(cfg_obj) is not None
+
+
+def _bootstrap_campaign_expired(campaign: dict[str, Any]) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(
+            str(campaign.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        return False
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        return False
+    return datetime.now(timezone.utc) >= expires_at.astimezone(timezone.utc)
+
+
+def _bootstrap_start_block(campaign: dict[str, Any] | None) -> dict[str, Any] | None:
+    if campaign is None or not _bootstrap_campaign_expired(campaign):
+        return None
+    return {
+        "reason": "bootstrap_campaign_expired",
+        "error": (
+            "Active Bootstrap campaign has expired — cancel campaign-owned "
+            "offers before starting or renewing"
+        ),
+        "campaign_id": campaign.get("campaign_id"),
+        "revision": campaign.get("revision"),
+    }
 
 
 def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
@@ -396,7 +428,23 @@ def api_bot_start():
     # split TX confirms. Coin prep's reclassify pass should have caught
     # this — if drift survives that, something's wrong and the bot
     # shouldn't trade until it's fixed.
-    if _active_bootstrap_campaign_matches_wallet(cfg):
+    bootstrap_campaign = _matching_active_bootstrap_campaign(cfg)
+    bootstrap_start_block = _bootstrap_start_block(bootstrap_campaign)
+    if bootstrap_start_block is not None:
+        error = bootstrap_start_block["error"]
+        errors.append(error)
+        coin_prep_reason = bootstrap_start_block["reason"]
+        coin_prep_error = error
+        log_event(
+            "warning",
+            "bootstrap_expired_start_blocked",
+            error,
+            data={
+                "campaign_id": bootstrap_start_block.get("campaign_id"),
+                "revision": bootstrap_start_block.get("revision"),
+            },
+        )
+    elif bootstrap_campaign is not None:
         bootstrap_readiness = _bootstrap_coin_prep_start_readiness(cfg)
         if bootstrap_readiness.get("ready") is not True:
             needs_coin_prep = True
@@ -569,6 +617,14 @@ def api_bot_start():
             "errors": errors,
             "warnings": warnings,
         }
+        if coin_prep_reason == "bootstrap_campaign_expired":
+            payload.update(
+                {
+                    "reason": coin_prep_reason,
+                    "error": coin_prep_error or errors[-1],
+                    "message": coin_prep_error or errors[-1],
+                }
+            )
         if needs_coin_prep:
             payload.update(
                 {

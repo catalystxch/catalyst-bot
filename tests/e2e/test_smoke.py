@@ -925,6 +925,89 @@ def test_bootstrap_banner_shows_minutes_near_expiry(page):
     assert "1h remaining" not in label
 
 
+def test_expired_bootstrap_banner_blocks_start_and_surfaces_cancel_action(page):
+    """Expired active Bootstrap authority must be visibly fail-closed."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'b8'.repeat(32);
+            const observed = new Date().toISOString();
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `<option value="${assetId}" data-ticker="MZ_XCH" data-name="Monkeyzoo Token">MZ</option>`;
+            selector.value = assetId;
+            _pairSelectedByUser = true;
+            currentCAT = {
+                asset_id: assetId,
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'done';
+            bot_state = {
+                running: false,
+                runtime_safety: {
+                    allowed: true,
+                    reason_code: '',
+                    lease: {active: true, owned_by_this_run: true},
+                    recovery: {
+                        freshness: {
+                            valid: true,
+                            age_seconds: 0,
+                            max_age_seconds: SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS,
+                            provenance: 'live_gate_and_durable_snapshot',
+                            observed_at_utc: observed,
+                        },
+                    },
+                },
+            };
+            _bootstrapRenderStatus({
+                success: true,
+                active: true,
+                needs_attention: true,
+                identity: { ticker: 'MZ_XCH' },
+                campaign: {
+                    campaign_id: 'expired-campaign',
+                    asset_id: assetId,
+                    stage: 'bootstrap',
+                    deployment_fraction: '0.1',
+                    expires_at: '2000-01-01T00:00:00Z',
+                    revision: 4,
+                    minimum_price: '0.0000375',
+                    maximum_price: '0.00015',
+                    xch_budget: '0.9',
+                    cat_budget: '12000',
+                    fee_budget_xch: '0.01',
+                    expired: true,
+                    cancel_required: true,
+                    cancel_reason: 'bootstrap_expired',
+                    manual_restart_required: true,
+                    open_offer_count: 6,
+                    active_authority_retained: true,
+                },
+            });
+            checkSettingsReviewed();
+            return {
+                globalStatus: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboardStatus: document.getElementById('bootstrapDashboardStatus').textContent,
+                canStart: canAttemptBotStart(),
+                safety: getStartSafetyState(),
+                startDisabled: document.getElementById('startBtn').disabled,
+            };
+        }"""
+    )
+
+    assert result["startDisabled"] is True
+    assert result["canStart"] is False
+    assert result["safety"]["allowed"] is False
+    assert "expired" in result["globalStatus"].lower()
+    assert "cancel" in result["globalStatus"].lower()
+    assert "6" in result["globalStatus"]
+    assert "requires cancellation" in result["dashboardStatus"].lower()
+
+
 def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
     """Confidence arriving after dashboard data must immediately reconcile the card."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
