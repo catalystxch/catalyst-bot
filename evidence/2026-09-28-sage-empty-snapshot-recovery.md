@@ -542,3 +542,33 @@ directory and recovered roughly 159 MiB free. A later optional narrowed
 test invocation failed at collection because a PowerShell glob was passed
 literally; it provides no test result. The primary complete suite above
 passed. Secondary full-suite and live-trading acceptance remain open.
+
+## Exact `a9cd077` primary profile read-only startup
+
+At approximately 17:20 UTC, the stopped old `8beb3a9` primary process
+(PID 122184, EXE SHA-256 `BEB72BE5...`) was shut down through CATalyst's
+authenticated `/api/shutdown` endpoint with `cancel_offers=false`. It
+exited through the normal shutdown path and port 5000 became free. The exact
+`a9cd077` acceptance EXE started with the
+existing `%APPDATA%\Catalyst` profile as PID 133984, bound port 5000, and
+its running executable hash matched `04CE2D09CDD433E52504A7DA57F6EADF8B2FAA327DC67C5690764B8E30BC46CA`.
+
+The new process reports bot stopped, the same mainnet Sage fingerprint
+736588221, CAT wallet ID 2 and exact MZ asset. Its Bootstrap status marks
+the persisted active campaign `expired=true`, `cancel_required=true` and
+`open_offer_count=6`; the approved 14:53:02 UTC deadline and campaign ID
+are unchanged. Sage and the local database each report three open buys and
+three open sells, no DB-only or wallet-only rows, no wallet error and a
+consistent local book. `/api/safety/status` reports allowed with zero
+blocking operations, prepared creations, publication claims, reservations,
+submitted cancels or contradictory history. The existing fee approval still
+shows 561,860,690 mojos total, 60,190,086 spent, zero held, 501,670,604
+remaining, six confirmed operations and zero unresolved operations.
+
+The exact packaged UI shows the Risk Disclosure overlay. Behind it, the
+dashboard banner reads `Bootstrap expired — cancellation required for 6
+open offers`; Start is disabled with an explanation that the six offers
+require cancellation before restart or renewal. The disclosure requires
+the operator's own acknowledgement before wallet connection and protected
+cancellation can proceed. No wallet effect occurred during the package
+swap or these read-only checks.
