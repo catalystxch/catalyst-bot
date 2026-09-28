@@ -269,3 +269,68 @@ The old primary window remains a failure due to the Sage outage and false
 coin snapshots. The existing campaign expiry prevents assuming a new
 24-hour window under the same authorization. PR #220 stays draft; no main
 merge, tag, or release is justified by these checks.
+
+## Later frontend and Doctor corrections: source `7ca6fa8`
+
+The primary live UI displayed `1h remaining` during the final minutes of
+the approved campaign. `_bootstrapRenderStatus` rounded any positive
+fraction of an hour up to a whole hour. A new Chromium regression reproduced
+`1h remaining` at exactly 14 minutes before expiry; after the fix it shows
+`14m remaining`. The affected `test_smoke.py` file passed 68 Chromium tests.
+This source change supersedes the `8beb3a9` package as a final candidate.
+
+The secondary PC independently found that Doctor could report the configured
+CAT as `found in wallet` during a synthetic Sage RPC outage. The CAT mapping
+check independently consulted Sage's configured fallback wallet metadata
+instead of observing the failed wallet reachability result. Secondary commit
+`1f7c01a22467c5470fc33220ad56dbbd18265a60` added a red/green test and
+made Doctor skip the mapping check when the wallet is unreachable; the
+primary reviewed and cherry-picked it as
+`7ca6fa857f28083e2f34138fa75e4728621e6497`. The primary Doctor module
+passed 14 tests and Ruff; the secondary reported the same focused pass and
+its independent read-only synthetic outage reproduction. Secondary PR #227
+is superseded by this integration and remains separate from draft PR #220.
+
+The exact `7ca6fa8` source built successfully from a clean detached checkout
+at `C:\catalyst\.superpowers\public-ready-7ca6fa8`. Only generated
+`_version.py` line endings changed during build; they were restored, leaving
+the source checkout clean. The package API, synthetic Sage RPC,
+upgrade/publication recovery, native clean/duplicate/persisted/safety
+smokes passed. A new unsigned 1.4.0 installer installed the exact EXE in an
+isolated current-user location; native smoke passed there. The old
+`d048f44` installer replaced it with the exact old EXE hash, and the new
+installer restored the exact new hash, followed by another native smoke
+pass. The isolated install was uninstalled and its registration removed.
+The complete Chromium suite passed **171 tests in 107.51 seconds**; the
+complete final-source Python suite and PR CI were still running at this
+checkpoint. Ruff check and format verification passed all 480 tracked
+Python files.
+
+| Artifact | SHA-256 | Bytes |
+| --- | --- | ---: |
+| `C:\catalyst\.superpowers\public-ready-7ca6fa8\dist\Catalyst\Catalyst.exe` | `CFE177F4CD8265878829C2A6F4056722F0DCC78C9F5A47B8A02BE3D4040F898A` | 11,249,233 |
+| `C:\catalyst\.superpowers\public-ready-7ca6fa8\CATalyst-7ca6fa8-secondary-acceptance.zip` | `4E83EC8941335451E2C7072CC777A3D9CF837B7ACAB80DCBA613ABEEBA647AE6` | 36,441,838 |
+| `C:\catalyst\.superpowers\public-ready-7ca6fa8\Output\Catalyst-Setup-1.4.0.exe` | `EB93F9D5DF937CB4C1B34FC27412113D66843C57F22DF02FF577C3338D9958CE` | 38,368,273 |
+
+The ZIP contains 192 files, including `.env.example`, and no runtime
+`.env`, database or log. The ZIP's EXE hash matches the built EXE. It was
+committed and pushed, with a SHA-256 sidecar, on the acceptance-artifact
+branch at `9856190eb850399a34f25871e6c9d496f268af16`; the secondary PC
+has been assigned independent verification of that exact artifact. An
+initial Inno invocation omitted the 1.4.0 version define and produced an
+unrelated `Catalyst-Setup-1.0.0.exe` in this isolated build worktree. The
+correct 1.4.0 installer above was then built and tested. Automatic approval
+review blocked deletion of the extra generated 1.0.0 file with the stated
+reason `blocked by policy`; it remains outside the acceptance ZIP and is
+not an accepted installer artifact.
+
+At `2026-09-28T14:53:18Z`, after the existing campaign's approved
+`2026-09-28T14:53:02Z` end time, the stopped primary `8beb3a9` process still
+reported the campaign's durable status as `active` and six live offers via
+read-only APIs. The bot had been stopped for the package swap, so those
+offers were unmanaged. This is a failed live end-state gate requiring
+operator cancellation/renewal decisions and investigation of idle expiry
+behavior. It does not establish a new-candidate trading window. The
+secondary PC was assigned independent source investigation without wallet
+effects. The fresh `7ca6fa8` EXE has not replaced the stopped primary
+process or been used with the primary wallet at this checkpoint.
