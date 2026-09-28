@@ -18972,6 +18972,27 @@
                     return false;
                 }
 
+                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
+                    ? _bootstrapActiveCampaign : null;
+                if (activeBootstrap && (
+                    String(status.bootstrap_campaign_id || '') !== String(activeBootstrap.campaign_id)
+                    || Number(status.bootstrap_campaign_revision) !== Number(activeBootstrap.revision)
+                )) {
+                    return false;
+                }
+                const offers = bot_state?.offers || {};
+                const activeOfferCount = Number(offers.buy_count || 0)
+                    + Number(offers.sell_count || 0)
+                    + (Array.isArray(offers.buy) ? offers.buy.length : 0)
+                    + (Array.isArray(offers.sell) ? offers.sell.length : 0);
+                if (bot_state?.running === true && activeOfferCount > 0) {
+                    // The current book already owns its prepared coins. A free-
+                    // coin verification would report those locks as missing and
+                    // incorrectly reopen fee approval over a running bot.
+                    setCoinPrepStatus('skipped-safe');
+                    return true;
+                }
+
                 // A completed worker/status record proves that its historical
                 // targets existed, not that the currently active Bootstrap
                 // revision is still ready.  Re-run the same exact, read-only
@@ -18979,13 +19000,7 @@
                 // client-only ready flag.  The backend start route also checks
                 // this, but the browser must not advertise or enable a start
                 // that the authoritative preflight will reject.
-                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
-                    ? _bootstrapActiveCampaign : null;
                 if (activeBootstrap) {
-                    if (String(status.bootstrap_campaign_id || '') !== String(activeBootstrap.campaign_id)
-                        || Number(status.bootstrap_campaign_revision) !== Number(activeBootstrap.revision)) {
-                        return false;
-                    }
                     setCoinPrepStatus('checking');
                     const configResponse = await apiFetch(`${API_URL}/config`, {
                         cache: 'no-store'
@@ -31592,6 +31607,12 @@
                 const publication = offer.publication || {};
                 const publicationDisplay = ['dexie', 'splash'].map(provider => {
                     const state = String((publication[provider] || {}).state || 'not queued');
+                    if (provider === 'splash' && state === 'succeeded') {
+                        // Splash's HTTP 2xx only confirms receipt by the local
+                        // daemon. Peer broadcast can still fail (for example,
+                        // InsufficientPeers); exact discovery is shown below.
+                        return 'Splash local submit acknowledged; peer broadcast unverified';
+                    }
                     return provider.charAt(0).toUpperCase() + provider.slice(1) + ' ' + state.replace(/_/g, ' ');
                 }).join(' · ');
                 const discoveries = (offer.discovery && offer.discovery.providers) || {};
