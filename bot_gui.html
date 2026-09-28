@@ -37471,7 +37471,12 @@ function startupShowRiskDisclosure() {
     const section = document.getElementById('startupDisclaimerSection');
     if (section) section.style.display = 'block';
     startupSetDisclosureExtraInfoVisible(false);
-    document.getElementById('startupDisclaimerContinueBtn')?.focus();
+    // Focus the dialog without jumping past the disclosure on short windows.
+    const overlay = document.getElementById('startupOverlay');
+    if (overlay) {
+        overlay.scrollTop = 0;
+        overlay.focus({ preventScroll: true });
+    }
 }
 
 document.addEventListener('keydown', (event) => {

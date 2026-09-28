@@ -134,3 +134,18 @@ def test_startup_risk_dialog_keeps_keyboard_focus_inside(page):
     continue_button.focus()
     page.keyboard.press("Shift+Tab")
     assert close_button.evaluate("element => document.activeElement === element")
+
+
+def test_startup_risk_dialog_opens_at_top_on_small_window(page):
+    """Focus must not skip the disclosure text above the Continue button."""
+    page.set_viewport_size({"width": 360, "height": 640})
+    _open_gui(page)
+    page.evaluate("startupShowRiskDisclosure()")
+    overlay = page.locator("#startupOverlay")
+
+    assert overlay.evaluate("element => element.scrollTop") == 0
+    assert overlay.evaluate("element => element.contains(document.activeElement)")
+    page.keyboard.press("Tab")
+    assert page.locator("#startupDisclaimerContinueBtn").evaluate(
+        "element => document.activeElement === element"
+    )

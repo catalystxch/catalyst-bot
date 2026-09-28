@@ -102,8 +102,12 @@ It had neither a keyboard focus trap nor an initial focus target.
 
 The new `test_startup_risk_dialog_keeps_keyboard_focus_inside` failed on the
 original behavior when Tab left Close app. The correction labels the startup
-overlay as a dialog, focuses Continue when the risk screen opens, and wraps
-Tab/Shift+Tab between its two enabled actions. If both actions are disabled
-while checking wallet status, focus stays on the dialog. The focused E2E file
-then passed all three tests. Full suites and a new exact-commit package are
-required for this further source change.
+overlay as a dialog and wraps Tab/Shift+Tab between its two enabled actions.
+If both actions are disabled while checking wallet status, focus stays on the
+dialog. The first version focused Continue immediately, but a 360-pixel-window
+regression showed that this scrolled the overlay down 402 pixels, hiding the
+risk explanation. `test_startup_risk_dialog_opens_at_top_on_small_window`
+failed with that exact scroll offset. The corrected initial focus is the
+dialog container with `preventScroll`, and Tab moves to Continue. The focused
+E2E file then passed all four tests. Full suites and a new exact-commit
+package are required for this further source change.
