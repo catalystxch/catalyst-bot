@@ -194,3 +194,78 @@ checks passed all **480 tracked Python files**, and `git diff --check` passed.
 Its exact source commit and fresh package hashes are recorded in the next
 checkpoint after building; the `c5c3218` artifacts above are not reused as
 that final source's package.
+
+## Exact corrected candidate and package checkpoint
+
+The corrected source commit is
+`8beb3a9068dce8709d670e06ee4605f526315e28`. A clean detached checkout
+at `C:\catalyst\.superpowers\public-ready-8beb3a9` built the Windows
+package. Build-generated `_version.py` line endings were restored; the
+checkout has no semantic source diff. PyInstaller reported only the accepted
+optional `importlib_resources.trees` hidden import warning.
+
+| Artifact | SHA-256 | Bytes |
+| --- | --- | ---: |
+| `C:\catalyst\.superpowers\public-ready-8beb3a9\dist\Catalyst\Catalyst.exe` | `BEB72BE54D81ABD2FC863D065995C533353C1F1F815253232E9399578831A834` | 11,249,146 |
+| `C:\catalyst\.superpowers\public-ready-8beb3a9\CATalyst-8beb3a9-secondary-acceptance.zip` | `C6675C8CCE53C1EF116280E244F6D11F0265AA4ED7D2E0EF8ACA7968EF8BE4B4` | 37,310,717 |
+| `C:\catalyst\.superpowers\public-ready-8beb3a9\Output\Catalyst-Setup-1.4.0.exe` | `C79CF5E736DD53C3FB780776DE70DB22BA756C9DF88BC46AB3A50B0ADA0F01FE` | 38,366,613 |
+
+The ZIP contains 206 entries, including the environment template and no
+runtime `.env`, database or log. Its extracted EXE hash matched the built
+EXE. Packaged API, synthetic Sage RPC, upgrade/publication recovery, and
+native clean/duplicate/persisted/safety smokes passed. The unsigned test
+installer completed an isolated current-user clean install, registered
+version 1.4.0.0 and installed the exact EXE hash; native smoke passed. An
+old `d048f44` installer installed the exact old EXE, and the new installer
+restored the exact `8beb3a9` EXE with a second native smoke pass. The
+isolated installation was uninstalled cleanly. PR #220 CI checks for
+`8beb3a9` all passed, including unit, lint, security, CodeQL and analysis.
+
+The acceptance ZIP and SHA-256 sidecar were committed and pushed on the
+separate `codex/coin-prep-fee-approval-artifacts` branch at
+`c826439e7017e9b1d2e8e24be360c909e5565a2c`. The secondary PC downloaded
+the ZIP and independently matched the ZIP and extracted EXE hashes above.
+It passed packaged API, synthetic Sage RPC, upgrade/publication recovery,
+and native clean/duplicate/persisted/safety smokes. In a separate isolated
+read-only package launch, it verified mainnet Sage fingerprint `3702373391`,
+the exact MZ asset ID and CATalyst CAT wallet ID 2. Safety reported allowed
+with no blockers; Doctor reported eight passes and one warning for an
+unconfigured Spacescan API key. The secondary package UI rendered the
+dashboard, offers, P&L, Market Intel, Settings, Logs, Data Reset, Help,
+About and Doctor with no browser console errors. No secondary wallet
+transaction or campaign activation occurred. The secondary old `d048f44`
+wallet-blocked monitor remains separate; it cannot count as new-candidate
+live acceptance.
+
+## Primary package swap and live acceptance state
+
+At approximately 14:29 UTC, the exact old `d048f44` primary executable was
+stopped through the authenticated CATalyst UI and shut down. The shutdown
+dialog showed six active offers and `Cancel all offers` unchecked. It
+reported that the six offers remained live. PID 19568 then exited and port
+5000 became free. The exact new EXE above started as PID 122184 at about
+14:30 UTC under the existing primary profile; it now owns `127.0.0.1:5000`.
+
+Read-only API calls from the new process reported the existing campaign
+`aaf64855aef9e1919d7cdfd4b15c1f589e7acf9321d71787b0b8122df9e16405`
+at revision 0, mainnet Sage fingerprint 736588221, CAT wallet ID 2 and
+exact MZ asset. Corridor, budgets, deployment and expiry are unchanged:
+0.0000375–0.00015 XCH/MZ, 0.9 XCH / 12,000 MZ, 0.001 XCH fee budget,
+10% deployed, expiry `2026-09-28T14:53:02.170881Z`. The offer API shows
+three active buys and three active sells using six distinct coins, matching
+the database open count. `/api/safety/status` reports allowed with no
+blocking operations, reservations, publication claims, submitted cancels or
+contradictory history. The existing fee approval is 561,860,690 mojos total,
+60,190,086 spent, zero held and 501,670,604 remaining; six operations are
+confirmed, with no unresolved operation.
+
+The new process was stopped at this checkpoint. Its fresh browser session
+showed the Risk Disclosure before wallet connection; CATalyst's read-only
+`/api/fingerprint` and Sage startup status remained `not_started`/`idle`.
+Consequently the read-only counts and durable safety gate do **not** yet
+prove a freshly connected, synced wallet or a resumed live bot. The primary
+new-candidate 24-hour stability window and full lifecycle are unfinished.
+The old primary window remains a failure due to the Sage outage and false
+coin snapshots. The existing campaign expiry prevents assuming a new
+24-hour window under the same authorization. PR #220 stays draft; no main
+merge, tag, or release is justified by these checks.
