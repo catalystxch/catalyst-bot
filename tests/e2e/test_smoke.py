@@ -884,6 +884,47 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
 
 
+def test_bootstrap_banner_shows_minutes_near_expiry(page):
+    """A campaign with minutes left must not look like it has an hour left."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    label = page.evaluate(
+        """() => {
+            const now = Date.parse('2030-01-01T12:00:00Z');
+            const originalNow = Date.now;
+            Date.now = () => now;
+            try {
+                currentCAT = { ticker_id: 'MZ_XCH' };
+                bot_state = {};
+                _bootstrapRenderStatus({
+                    active: true,
+                    identity: { ticker: 'MZ_XCH' },
+                    campaign: {
+                        campaign_id: 'near-expiry',
+                        asset_id: 'b8'.repeat(32),
+                        stage: 'bootstrap',
+                        deployment_fraction: '0.1',
+                        expires_at: '2030-01-01T12:14:00Z',
+                        revision: 0,
+                        minimum_price: '0.0000375',
+                        maximum_price: '0.00015',
+                        xch_budget: '0.9',
+                        cat_budget: '12000',
+                        fee_budget_xch: '0.001',
+                    },
+                });
+                return document.getElementById('bootstrapGlobalStatus').textContent;
+            } finally {
+                Date.now = originalNow;
+            }
+        }"""
+    )
+
+    assert "14m remaining" in label
+    assert "1h remaining" not in label
+
+
 def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
     """Confidence arriving after dashboard data must immediately reconcile the card."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

@@ -39857,13 +39857,18 @@ function _bootstrapRenderStatus(payload) {
     if (_bootstrapActiveCampaign) {
         const campaign = _bootstrapActiveCampaign;
         const expiryMs = Date.parse(campaign.expires_at || '');
-        const remainingHours = Number.isFinite(expiryMs)
-            ? Math.max(0, Math.ceil((expiryMs - Date.now()) / 3600000))
-            : null;
+        const remainingMs = Number.isFinite(expiryMs) ? expiryMs - Date.now() : null;
+        const remainingTime = remainingMs == null
+            ? 'expiry unknown'
+            : remainingMs <= 0
+                ? 'expired'
+                : remainingMs < 3600000
+                    ? `${Math.ceil(remainingMs / 60000)}m remaining`
+                    : `${Math.ceil(remainingMs / 3600000)}h remaining`;
         const cooldowns = Array.isArray(campaign.adverse_fill_times)
             ? campaign.adverse_fill_times.length
             : 0;
-        summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingHours == null ? 'expiry unknown' : remainingHours + 'h remaining'} · revision ${campaign.revision}`;
+        summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
         campaign._uiCooldownCount = cooldowns;
     }
     if (globalStatus) {
