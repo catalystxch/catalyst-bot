@@ -452,3 +452,73 @@ deadline is rejected. Focused expiry and Bootstrap/journal regressions passed lo
 the complete test, package, and independent acceptance results for this
 new source candidate are pending. The `8e89558` binaries and their earlier
 results must be treated as historical for release readiness.
+
+The corrected source commit is
+`ebfe18a3828bf8512918e059e16dfafc30fb3b49`. A fresh detached Windows
+build from that exact commit passed the build's asset checks and packaged
+API, synthetic Sage RPC worker, upgrade/publication recovery, and native
+clean/duplicate/persisted/safety smokes. The ZIP passed its CRC check and
+contains `Catalyst/Catalyst.exe`. The unsigned installer compiled with
+version `1.4.0`. Its isolated current-user clean install registered the
+expected path and version and installed the exact executable hash; the
+installed native smoke passed, and uninstall removed the executable and
+registration. The upgrade path also passed: old `8e89558` installed its
+expected `A08D5D95...` executable, new `ebfe18a` replaced it with the exact
+`E2105E78...` executable, native smoke passed, rollback restored the old
+hash, and reinstall restored the new hash. Final uninstall again removed the
+isolated executable and registration.
+
+| Exact `ebfe18a` artifact | SHA-256 | Bytes |
+|---|---|---:|
+| `C:\catalyst\.superpowers\public-ready-ebfe18a\dist\Catalyst\Catalyst.exe` | `E2105E78789687AA0BB33C622F4A9C456B8377C156DC83CD88D4FAB1E9E7A8B3` | 11,251,777 |
+| `C:\catalyst\.superpowers\public-ready-ebfe18a\CATalyst-ebfe18a-secondary-acceptance.zip` | `A60B28D6D8F35EB484692A8E99CA0F3CE57E7FABFF1F3F158FA6658E7B8A720E` | 37,318,330 |
+| `C:\catalyst\.superpowers\public-ready-ebfe18a\Output\Catalyst-Setup-1.4.0.exe` | `CD72EFA9DD2D743536EA3A7B0B64977BBCB12712D67EA8BF3B50DA1A6C9815D2` | 38,370,795 |
+
+The ZIP and installer, renamed with `ebfe18a` for unambiguous acceptance
+identity, were committed on the separate artifact branch at `03a2b71` and
+sent to the secondary PC for independent checks. These are unsigned test
+artifacts, not a public release.
+
+Independent review then identified a replay edge: an already `created`
+Bootstrap intent could return its persisted overlong offer deadline as a
+successful idempotent result, even though no new wallet call occurred. A
+focused regression failed on `ebfe18a` and passed after the additional
+guard. Source commit `a9cd0775c8499fb5f31dc327a54e44bc45a67ef7` now
+checks the persisted deadline against the current campaign before returning
+that result. The 125 focused Bootstrap/offer-journal tests pass. The
+`ebfe18a` package and installer checks above are historical.
+
+The detached `a9cd077` Windows build passed asset checks, packaged API,
+synthetic Sage RPC worker, upgrade/publication recovery and native
+clean/duplicate/persisted/safety smokes. The ZIP contains the expected
+`Catalyst/Catalyst.exe` and passed its CRC check. The unsigned 1.4.0
+installer passed isolated current-user clean installation with exact EXE
+hash and registration, installed native smoke, and clean uninstall. The
+isolated update path passed old `8e89558` install, new `a9cd077` upgrade,
+native smoke, rollback to the old EXE hash, restoration of the new hash,
+and final uninstall with no registration left behind.
+
+| Exact `a9cd077` artifact | SHA-256 | Bytes |
+|---|---|---:|
+| `C:\catalyst\.superpowers\public-ready-a9cd077\dist\Catalyst\Catalyst.exe` | `04CE2D09CDD433E52504A7DA57F6EADF8B2FAA327DC67C5690764B8E30BC46CA` | 11,251,907 |
+| `C:\catalyst\.superpowers\public-ready-a9cd077\CATalyst-a9cd077-secondary-acceptance.zip` | `338B25D1486DFC19E62FD8C0A097AAA24A1A126E90F4DEB77DFBC60C352CE424` | 37,318,612 |
+| `C:\catalyst\.superpowers\public-ready-a9cd077\Output\Catalyst-Setup-1.4.0.exe` | `40B8465B55BB98B839F02113EC559A4D210113655C319274590D166F436449DF` | 38,370,512 |
+
+The ZIP and installer are available to the secondary PC on the separate
+acceptance-artifact branch at `d81fc14` with SHA-256 sidecars. They are
+unsigned test artifacts. Independent secondary acceptance and live 24-hour
+trading windows remain pending.
+
+The full Chromium end-to-end suite passed **172 tests in 96.41 seconds**
+against the `a9cd077` source checkout.
+PR #220 CI on the exact `a9cd077` head is green, including unit tests
+(7,059 passed, 187 skipped, 4 warnings), lint/syntax, security scan,
+CodeQL, Gitleaks and Semgrep. The complete local Windows Python suite also
+passed **7,073 tests, 173 skipped and 422 subtests** in 799.87 seconds using
+two workers and file-local distribution.
+
+A read-only primary API recheck during this build found the bot still
+stopped. Sage and the local DB each reported three open buys and three open
+sells, with zero DB-only and zero wallet-only offers and
+`local_book_consistent=true`. The six earlier offers were not changed by
+package testing and still require the protected cancellation decision.
