@@ -522,3 +522,23 @@ stopped. Sage and the local DB each reported three open buys and three open
 sells, with zero DB-only and zero wallet-only offers and
 `local_book_consistent=true`. The six earlier offers were not changed by
 package testing and still require the protected cancellation decision.
+
+The secondary PC independently checked out exact source `a9cd077`, passed
+the affected Bootstrap/offer-journal suite (125 tests), Ruff, format,
+Bandit and Vulture, and verified the downloaded ZIP SHA-256
+`338B25D1...` and extracted EXE SHA-256 `04CE2D09...` and byte sizes. Its
+exact package passed API, synthetic Sage RPC worker,
+upgrade/publication recovery and native clean/duplicate/persisted/safety
+smokes. It verified the unsigned installer SHA-256 `40B8465B...`,
+installed the exact EXE in an isolated directory, passed API/native smokes
+from that installation, uninstalled it and restored its original v1.3.20
+current-user installer registration. The original live profile and the
+older read-only monitor were left intact; no secondary wallet effect was
+performed for this candidate.
+
+The secondary full Python run was stopped when free C: space fell below
+50 MiB. It removed only the interrupted run's disposable pytest scratch
+directory and recovered roughly 159 MiB free. A later optional narrowed
+test invocation failed at collection because a PowerShell glob was passed
+literally; it provides no test result. The primary complete suite above
+passed. Secondary full-suite and live-trading acceptance remain open.
