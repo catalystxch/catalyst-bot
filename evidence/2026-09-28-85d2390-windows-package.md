@@ -8,6 +8,9 @@ built from a fresh detached checkout at
 `C:\catalyst\.superpowers\public-ready-85d2390` around 11:50 UTC. Build
 metadata synchronized to 1.4.0 and changed only `_version.py` line endings;
 its semantic diff was empty and the detached checkout was restored clean.
+The source ancestry contains integrated fixes `922ae5b` and `54f5f33`
+corresponding to the closed, unmerged PRs #221 and #222; their implementation
+is present in this candidate.
 
 | Artifact | Location | SHA-256 | Bytes |
 | --- | --- | --- | ---: |
@@ -34,6 +37,11 @@ nor installer has been uploaded or released.
   browser regressions; they passed in the separate Chromium run above.
 - All draft PR #220 checks were green for exact head `85d2390`, including
   unit-tests, lint, CodeQL, Semgrep, Gitleaks and security-scan.
+  After the evidence-only head advanced to `27e12d1`, all PR checks passed
+  again. Runtime and source files remain byte-identical to `85d2390` across
+  those evidence commits. Earlier automated PR review comments reference
+  older revisions; current CodeQL and security checks pass. Final code review
+  remains a separate gate.
 - Packaged API, synthetic Sage RPC, interrupted-publication/upgrade recovery,
   and native clean/duplicate/persisted/safety launch smokes passed. API smoke
   passed again from the extracted ZIP.
@@ -73,6 +81,17 @@ The old package's later status readback showed 138.471039414354 XCH and
 780212.284 MZ total, 138.381039414354 XCH and 779012.284 MZ spendable,
 with saved reserves 13.847 XCH and 78021 MZ. These are display-level wallet
 readbacks, not new immutable campaign approvals.
+At 12:16 UTC the old bot had completed 230 loops with zero reported errors,
+three historical fills and the same three-buy/three-sell book.
+At 12:23 UTC, the exact old executable was still PID 19568. Its status showed
+235 completed loops, zero errors, a healthy Chia connection, three buys and
+three sells, and the exact MZ asset. The Bootstrap status API still bound the
+active campaign to mainnet, Sage fingerprint 736588221, wallet 2, and revision
+0, with expiry `2026-09-28T14:53:02.170881Z`. Coin Prep reported complete and
+fee approval version 3: 561,860,690 mojos total, 60,190,086 spent, zero held,
+501,670,604 remaining, six confirmed operations and zero unresolved. The
+`fee_resume_required` flag is the expected protection against an unapproved
+post-completion Coin Prep resume for this live campaign.
 
 At a later read-only offer check all six prior-package offers remained active
 and exactly discovered on Dexie. Splash discovery remained pending for all
