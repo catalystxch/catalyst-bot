@@ -2,8 +2,6 @@
 
 from types import SimpleNamespace
 
-import database
-import offer_manager
 from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
 from test_offer_cancel_journal import (
     ASSET_ID,
@@ -11,6 +9,8 @@ from test_offer_cancel_journal import (
     _seed_task7_created_offer,
     _stub_cancel_continuation_authority,
     isolated_database,  # noqa: F401 - real disposable SQLite journal
+    database,
+    offer_manager,
 )
 
 

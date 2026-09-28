@@ -16616,6 +16616,17 @@ class BotLoop:
             if result.get("error") or result.get("success") is False:
                 return False
 
+        # During a Sage restart either coin endpoint can briefly return HTTP
+        # 200 with an empty list after a run of 401s. That is not evidence
+        # that the wallet's previously tracked coins were all spent.
+        for wallet_type, result in (("xch", xch_result), ("cat", cat_result)):
+            if not (result.get("confirmed_records") or result.get("records")) and any(
+                coin.get("source") == "wallet"
+                and coin.get("wallet_type") == wallet_type
+                for coin in self._coin_snapshot.values()
+            ):
+                return False
+
         return True
 
     def _handle_coin_watcher_snapshot(

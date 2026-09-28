@@ -28,6 +28,7 @@ import database
 import mutation_gate
 import wallet
 from offer_manager import OfferManager
+from coin_manager import FeeCoinPool
 from boost_manager import BoostManager
 
 
@@ -1715,6 +1716,51 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     ) == [f"cancel:{trade_id}" for trade_id in trade_ids]
 
 
+def test_coin_prep_cancel_releases_fee_coin_if_authority_fails_before_dispatch(
+    isolated_database, monkeypatch
+):
+    trade_id = "a" * 64
+    source_coin_id = "c" * 64
+    fee_coin_id = "e" * 64
+    _seed_task7_created_offer(
+        trade_id=trade_id,
+        coin_id=source_coin_id,
+        intent_seed="protected-cancel-pre-dispatch-authority-failure",
+    )
+    pool = FeeCoinPool()
+    pool.refresh([{"coin_id": fee_coin_id, "coin": {"amount": 1_000_000_000}}])
+    manager = OfferManager()
+    manager._fee_pool = pool
+
+    pricing = __import__("coin_prep_fee_cancellation")
+    monkeypatch.setattr(
+        pricing,
+        "price_approved_cancellation",
+        lambda **kwargs: {
+            "available": True,
+            "trade_ids": kwargs["trade_ids"],
+            "source_coin_ids": kwargs["source_coin_ids"],
+            "fee_coin_id": kwargs["fee_coin_id"],
+            "fee_mojos": 42,
+        },
+    )
+
+    def identity_unavailable(_intent):
+        raise ValueError("FEE_WALLET_IDENTITY_UNAVAILABLE")
+
+    monkeypatch.setattr(manager, "_acquire_cancel_authority", identity_unavailable)
+
+    with pytest.raises(ValueError, match="FEE_WALLET_IDENTITY_UNAVAILABLE"):
+        manager.cancel_offers(
+            [trade_id],
+            reason="coin_prep_cancel_all",
+            force_storm=True,
+            fee_approval_id="f" * 64,
+        )
+
+    assert pool.available_count == 1
+
+
 @pytest.mark.parametrize("member_count", [1, 2])
 @pytest.mark.parametrize("approved_fee_mojos", [0, 42])
 def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
@@ -1819,7 +1865,12 @@ def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
         identity_count=8,
     )
     manager = OfferManager()
-    manager._fee_pool = SimpleNamespace(reserve_largest=lambda: (fee_coin_id, 1_000))
+    manager._fee_pool = SimpleNamespace(
+        reserve_largest_with_ticket=lambda: (fee_coin_id, 1_000, 1),
+        release_ticket=lambda _coin_id, _ticket: pytest.fail(
+            "submitted cancellation must retain its fee input reservation"
+        ),
+    )
 
     results = manager.cancel_offers(
         trade_ids,

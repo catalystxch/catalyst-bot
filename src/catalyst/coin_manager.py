@@ -722,6 +722,8 @@ class FeeCoinPool:
     def __init__(self):
         self._available: list = []  # [(coin_id, amount_mojos), ...]
         self._reserved: set = set()  # coin IDs handed out this cycle
+        self._reservation_tickets: dict[str, int] = {}
+        self._next_reservation_ticket = 0
         self._lock = threading.Lock()
 
     # ---- pool management ----
@@ -731,6 +733,7 @@ class FeeCoinPool:
         with self._lock:
             self._available = []
             self._reserved = set()
+            self._reservation_tickets = {}
             for rec in fee_coin_records:
                 cid = _coin_id_from_record(rec)
                 if cid:
@@ -771,6 +774,32 @@ class FeeCoinPool:
             amount, coin_id = max(candidates)
             self._reserved.add(coin_id)
             return coin_id, amount
+
+    def reserve_largest_with_ticket(self) -> tuple[str, int, int] | None:
+        """Reserve a fee coin with a token for safe pre-dispatch release."""
+        with self._lock:
+            candidates = [
+                (amount, coin_id)
+                for coin_id, amount in self._available
+                if coin_id not in self._reserved
+            ]
+            if not candidates:
+                return None
+            amount, coin_id = max(candidates)
+            self._next_reservation_ticket += 1
+            ticket = self._next_reservation_ticket
+            self._reserved.add(coin_id)
+            self._reservation_tickets[coin_id] = ticket
+            return coin_id, amount, ticket
+
+    def release_ticket(self, coin_id: str, ticket: int) -> bool:
+        """Release only the same in-memory reservation, never a newer one."""
+        with self._lock:
+            if self._reservation_tickets.get(coin_id) != ticket:
+                return False
+            del self._reservation_tickets[coin_id]
+            self._reserved.discard(coin_id)
+            return True
 
     # ---- introspection ----
 

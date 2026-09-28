@@ -6342,11 +6342,6 @@ class OfferManager:
 
         if len(members) < 1 or get_wallet_type() != "sage" or self._fee_pool is None:
             raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
-        largest = self._fee_pool.reserve_largest()
-        if largest is None:
-            raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
-        fee_coin_id, fee_coin_amount = largest
-        fee_coin_id = str(fee_coin_id).strip().lower().removeprefix("0x")
         trade_ids = []
         source_coin_ids = []
         for intent, _attempt, _member_id in members:
@@ -6363,34 +6358,48 @@ class OfferManager:
             source_coin_ids.append(coin_id)
         from coin_prep_fee_cancellation import price_approved_cancellation
 
-        priced = price_approved_cancellation(
-            approval_id=fee_approval_id,
-            trade_ids=trade_ids,
-            source_coin_ids=source_coin_ids,
-            fee_coin_id=fee_coin_id,
-        )
-        if priced.get("available") is not True:
-            raise ValueError(str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE"))
-        if priced["fee_mojos"] > fee_coin_amount:
+        fee_pool = self._fee_pool
+        largest = fee_pool.reserve_largest_with_ticket()
+        if largest is None:
             raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
-        contract = {
-            "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
-            "trade_ids": list(priced["trade_ids"]),
-            "source_coin_ids": list(priced["source_coin_ids"]),
-            "fee_coin_id": priced["fee_coin_id"],
-            "fee_mojos": priced["fee_mojos"],
-        }
-        wallet_effect = {
-            "secure": True,
-            "timeout": 60,
-            "fee_mojos": priced["fee_mojos"],
-            "batch": {
-                key: value for key, value in contract.items() if key != "fee_mojos"
-            },
-        }
-        if not self._is_exact_cancel_wallet_effect(wallet_effect):
-            raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
-        return contract, priced
+        reserved_coin_id, fee_coin_amount, ticket = largest
+        fee_coin_id = str(reserved_coin_id).strip().lower().removeprefix("0x")
+        try:
+            priced = price_approved_cancellation(
+                approval_id=fee_approval_id,
+                trade_ids=trade_ids,
+                source_coin_ids=source_coin_ids,
+                fee_coin_id=fee_coin_id,
+            )
+            if priced.get("available") is not True:
+                raise ValueError(
+                    str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE")
+                )
+            if priced["fee_mojos"] > fee_coin_amount:
+                raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+            contract = {
+                "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+                "trade_ids": list(priced["trade_ids"]),
+                "source_coin_ids": list(priced["source_coin_ids"]),
+                "fee_coin_id": priced["fee_coin_id"],
+                "fee_mojos": priced["fee_mojos"],
+            }
+            wallet_effect = {
+                "secure": True,
+                "timeout": 60,
+                "fee_mojos": priced["fee_mojos"],
+                "batch": {
+                    key: value for key, value in contract.items() if key != "fee_mojos"
+                },
+            }
+            if not self._is_exact_cancel_wallet_effect(wallet_effect):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            return contract, priced, (fee_pool, reserved_coin_id, ticket)
+        except Exception:
+            # Pricing and plan validation are read-only. An exception here
+            # cannot have spent the fee input, so undo only this reservation.
+            fee_pool.release_ticket(reserved_coin_id, ticket)
+            raise
 
     @staticmethod
     def _prepare_cancel_member(
@@ -7930,6 +7939,8 @@ class OfferManager:
 
         batch_contract = None
         priced_cancellation = None
+        fee_reservation = None
+        fee_dispatch_started = False
         if (
             is_cohort
             and manifest is not None
@@ -7940,9 +7951,11 @@ class OfferManager:
             if fee_approval_id is None:
                 batch_contract = self._plan_sage_bulk_cancel(members)
             else:
-                batch_contract, priced_cancellation = self._plan_coin_prep_cancel(
-                    members, fee_approval_id
-                )
+                (
+                    batch_contract,
+                    priced_cancellation,
+                    fee_reservation,
+                ) = self._plan_coin_prep_cancel(members, fee_approval_id)
         elif fee_approval_id is not None:
             raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
 
@@ -8057,6 +8070,7 @@ class OfferManager:
                 )
 
             if batch_contract is not None and not recovering_interrupted_cohort:
+                fee_dispatch_started = True
                 batch_results = self._cancel_prepared_sage_batch(
                     members=members,
                     manifest=manifest,
@@ -8242,6 +8256,12 @@ class OfferManager:
                     self._pending_cancel_retries.pop(intent.trade_id, None)
             return results
         finally:
+            if fee_reservation is not None and not fee_dispatch_started:
+                # Authority/journal failures above occurred before wallet
+                # dispatch. The ticket can be released without risking reuse
+                # of an input from a submitted or ambiguous spend.
+                fee_pool, coin_id, ticket = fee_reservation
+                fee_pool.release_ticket(coin_id, ticket)
             for continuation, _journal, _wallet_hash, _network in authorities.values():
                 wallet.close_offer_cancel_continuation(continuation)
 
