@@ -916,3 +916,28 @@ than funds being exposed under fabricated pricing authority.
   transaction still require action-time confirmation through the real UI;
   PR #220 therefore remains draft and neither `main` nor a release has been
   changed.
+
+### Exact-candidate live resume preflight — 28 September 2026
+
+- The operator gave action-time confirmation for the visible **Start Bot Now**
+  control. Before the click, the UI and authenticated endpoints again proved
+  mainnet Sage fingerprint `736588221`, MZ wallet 2, the exact asset, three
+  buys plus three sells, zero pending cancellation, zero runtime errors, and an
+  allowed safety lease with every blocker count zero.
+- The exact `d048f44` package accepted the confirmed click and ran its normal
+  preflight. It did not silently resume or spend. Instead, it detected that the
+  active Bootstrap campaign's current output plan requires fresh Coin Prep and
+  opened the real fee-approval workflow. The six existing offers and their
+  `0.09 XCH` / `1,200 MZ` locks remained unchanged.
+- The first displayed estimate was correctly rejected as expired. A visible
+  **Refresh fee estimate** action made no wallet mutation and produced a fresh
+  Coinset-backed quote with the default 300-second target. The UI binds it to
+  Sage `736588221`, wallet 2, MZ/XCH and mainnet; shows two preparation
+  transactions; one exact and three projected cost components; fee funding of
+  `123.628039666446 XCH`; `0.000059937994 XCH` already spent and zero held; and
+  `0.006 XCH` fee-coin principal explicitly excluded from spent fees.
+- The refreshed remaining preparation estimate is `0.000997600557 XCH`, the
+  protected cancellation allowance is `0.00050514693 XCH`, and the proposed
+  cumulative maximum is `0.001057538551 XCH`. The final **Yes, Prepare Coins**
+  action remains untouched pending action-time approval of that exact cap. No
+  Coin Prep transaction or additional fee has been submitted.
