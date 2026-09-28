@@ -62,6 +62,43 @@ nor installer has been uploaded or released.
 Build, package, installation and recovery logs remain in the detached checkout
 as `public-readiness-build.log` and `.tmp-*.log` files.
 
+## Independent secondary-PC package acceptance
+
+The secondary PC checked out exact source commit
+`85d23909bdc436add66671249904e1a4777cbb8f` in an isolated worktree and
+left its original `d048f44` monitor process running. Its independent checks
+passed: five focused public-readiness browser regressions, 34 affected
+Chromium tests, the full **170-test Chromium suite**, Ruff check and format
+check (535 Python files), `compileall`, `git diff --check`, a focused backend
+suite (**368 passed, six subtests**), and the complete serial Python suite
+(**7,062 passed, 171 skipped, 422 subtests, one pytest deprecation warning**
+in 1356.10 seconds). The warning concerns an iterator used in a parametrized
+test in `tests/test_offer_registry.py`; it did not fail the run.
+
+Its independent Python 3.12.10/PyInstaller 6.22.3 build produced:
+
+| Secondary artifact | SHA-256 | Bytes |
+| --- | --- | ---: |
+| `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\work\catalyst-acceptance-85d2390\dist\Catalyst\Catalyst.exe` | `959D32B6AC0B43614A6EEA1F084768DA50EA2F4375173DBCBFFE2932F757B59A` | not recorded |
+| `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\acceptance-artifacts\85d2390\secondary-build\CATalyst-85d2390-secondary-build-20260928-1319.zip` | `07F2CB96FF02427D76B8E0A44AA9404812487F028B674E4A0A414C12D6024F39` | 37,262,027 |
+
+The independently built ZIP scan found no runtime `.env`, database, log,
+wallet state, or offer JSON. An initial smoke attempt was invalid because
+the secondary C: drive reached zero free bytes; SQLite reported a full disk.
+After clearing only obsolete generated Git worktrees, packaged API, synthetic
+Sage RPC, upgrade/publication recovery, and native clean, duplicate,
+persisted-profile and safety smokes all passed on retry. The secondary
+machine had only about 225 MB free after testing; it is inspecting safe
+reclamation before any long live run.
+
+The secondary launched its own EXE against an isolated profile on local port
+50994 with no wallet mutation. At a 360 x 640 Chromium viewport, the packaged
+risk disclosure opened at scroll position zero, kept focus inside the startup
+dialog, and wrapped Tab at the disclosure buttons. In wallet-choice phase,
+Tab and Shift+Tab wrapped between the two visible controls. This independently
+passes the packaged narrow-window startup focus/scroll smoke. The secondary
+performed no live wallet lifecycle on `85d2390` in this checkpoint.
+
 ## Preserved prior live process
 
 At 11:56:44 UTC the original primary `d048f44` process was rediscovered as
@@ -101,17 +138,16 @@ must be observed from the new package before that live UI gate can pass.
 
 ## Unfinished gates
 
-At this checkpoint the secondary PC is independently building and testing this exact
-commit. The primary live process and secondary monitored process remain on
+At this checkpoint the secondary PC has independently built and tested this exact
+commit, including packaged startup behavior. The primary live process and secondary monitored process remain on
 the previous exact `d048f44` package; neither has been replaced for this
 checkpoint. The original 24-hour windows, new-candidate live lifecycle and
-stability, wallet fee/accounting recovery, independent acceptance, official
+stability, wallet fee/accounting recovery, live independent acceptance, official
 download/update path and final review remain open. No merge, tag, upload or
 release occurred.
 
 A primary attempt to launch an additional persistent, isolated packaged UI
 process for the prior checkpoint was rejected by automatic command approval
 review with only "blocked by policy" given as the reason. This candidate was
-exercised by the short-lived native smokes above; interactive packaged
-startup/focus review is assigned to the secondary PC and remains pending for
-this exact candidate.
+exercised by the short-lived native smokes above; the secondary PC completed
+the independent packaged startup/focus review described above.
