@@ -85,3 +85,25 @@ cannot establish acceptance of the revised candidate. Both 24-hour windows
 and all final release gates remain open until the exact revised artifacts are
 verified. PR #220 remains draft. No merge, tag, upload or public release was
 performed.
+
+## Defect 3: Startup risk dialog leaked keyboard focus
+
+The secondary PC independently tested the exact d048f44 package at 360, 480,
+768 and 1280 pixel widths using a separate isolated profile. The startup risk
+disclosure scrolled correctly, but Tab moved from its Close app button into
+background navigation. Shift+Tab also escaped from the Continue button. The
+monitored secondary process was preserved. Its focused stale-fee, provider
+outage and recovery E2E checks passed. The secondary evidence is in its
+`outputs/d048f44-packaged-ui-readonly-20260928` directory.
+
+Root cause: the generic modal observer only watches `.active` transitions,
+while the startup overlay is visible by default and never receives `.active`.
+It had neither a keyboard focus trap nor an initial focus target.
+
+The new `test_startup_risk_dialog_keeps_keyboard_focus_inside` failed on the
+original behavior when Tab left Close app. The correction labels the startup
+overlay as a dialog, focuses Continue when the risk screen opens, and wraps
+Tab/Shift+Tab between its two enabled actions. If both actions are disabled
+while checking wallet status, focus stays on the dialog. The focused E2E file
+then passed all three tests. Full suites and a new exact-commit package are
+required for this further source change.

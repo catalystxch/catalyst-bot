@@ -8311,7 +8311,7 @@
     </div>
 
 <!-- ========== Sage Startup Modal ========== -->
-    <div class="startup-overlay" id="startupOverlay">
+    <div class="startup-overlay" id="startupOverlay" role="dialog" aria-modal="true" aria-labelledby="startupTitle" tabindex="-1">
         <div class="startup-shell">
         <div class="startup-header">
             <div class="startup-header-app"><img src="/favicon.ico" alt="CATalyst logo"></div>
@@ -37471,7 +37471,37 @@ function startupShowRiskDisclosure() {
     const section = document.getElementById('startupDisclaimerSection');
     if (section) section.style.display = 'block';
     startupSetDisclosureExtraInfoVisible(false);
+    document.getElementById('startupDisclaimerContinueBtn')?.focus();
 }
+
+document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab') return;
+    const overlay = document.getElementById('startupOverlay');
+    const section = document.getElementById('startupDisclaimerSection');
+    if (!overlay || !section || overlay.classList.contains('hidden')
+        || getComputedStyle(overlay).display === 'none'
+        || getComputedStyle(section).display === 'none') return;
+
+    const buttons = [
+        document.getElementById('startupDisclaimerContinueBtn'),
+        document.getElementById('startupDisclaimerCloseBtn'),
+    ].filter(button => button && !button.disabled && button.getClientRects().length);
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (!first) {
+        event.preventDefault();
+        overlay.focus();
+    } else if (!overlay.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && (document.activeElement === first || document.activeElement === overlay)) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === overlay)) {
+        event.preventDefault();
+        first.focus();
+    }
+}, true);
 
 async function startupAcceptRiskDisclosure() {
     if (_startupRiskDisclosureBusy) return;

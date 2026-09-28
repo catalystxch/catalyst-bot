@@ -118,3 +118,19 @@ def test_splash_local_acknowledgement_is_not_labeled_published(page):
     assert "Splash local submit acknowledged" in details
     assert "Splash succeeded" not in details
     assert "Splash pending" in details
+
+
+def test_startup_risk_dialog_keeps_keyboard_focus_inside(page):
+    """Tab and Shift+Tab must not reach background trading controls."""
+    _open_gui(page)
+    page.evaluate("startupShowRiskDisclosure()")
+    continue_button = page.locator("#startupDisclaimerContinueBtn")
+    close_button = page.locator("#startupDisclaimerCloseBtn")
+
+    close_button.focus()
+    page.keyboard.press("Tab")
+    assert continue_button.evaluate("element => document.activeElement === element")
+
+    continue_button.focus()
+    page.keyboard.press("Shift+Tab")
+    assert close_button.evaluate("element => document.activeElement === element")
