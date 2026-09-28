@@ -2512,6 +2512,20 @@ class OfferManager:
                     network=str(existing["network"]),
                 )
                 return OfferManager._creation_reconciliation_result(intent)
+            try:
+                require_active_bootstrap_intent_authority(
+                    purpose=intent.purpose,
+                    asset_id=intent.asset_id,
+                    offer_max_time=offer_max_time,
+                )
+            except ValueError:
+                return {
+                    "success": False,
+                    "error": "Offer creation authority denied",
+                    "reason": "OFFER_CREATION_AUTHORITY_DENIED",
+                    "_catalyst_effect_attempted": False,
+                    "_catalyst_intent_id": intent.intent_id,
+                }
             return {
                 "success": True,
                 "trade_id": trade_id,

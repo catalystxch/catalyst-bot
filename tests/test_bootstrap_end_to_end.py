@@ -675,6 +675,54 @@ def test_bootstrap_authority_denies_offer_expiring_after_campaign(
         )
 
 
+def test_bootstrap_created_intent_replay_rejects_persisted_overlong_offer(
+    monkeypatch,
+):
+    campaign_id = "a" * 64
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    monkeypatch.setattr(
+        "offer_manager.database.get_bootstrap_campaign",
+        lambda exact_id: (
+            {
+                "status": "active",
+                "revision": 0,
+                "asset_id": ASSET_ID,
+                "expires_at": deadline.isoformat().replace("+00:00", "Z"),
+            }
+            if exact_id == campaign_id
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        OfferManager,
+        "_persisted_creation_offer_max_time",
+        staticmethod(lambda _intent, _existing: int(deadline.timestamp()) + 1),
+    )
+    intent = SimpleNamespace(
+        purpose=f"bootstrap:{campaign_id}:revision:0",
+        asset_id=ASSET_ID,
+        intent_id="b" * 64,
+        selected_coin_id="c" * 64,
+    )
+    result = OfferManager._existing_creation_result(
+        intent,
+        {"lifecycle_state": "created", "sage_trade_id": "d" * 64},
+    )
+    assert result["success"] is False
+    assert result["reason"] == "OFFER_CREATION_AUTHORITY_DENIED"
+    monkeypatch.setattr(
+        OfferManager,
+        "_persisted_creation_offer_max_time",
+        staticmethod(lambda _intent, _existing: int(deadline.timestamp())),
+    )
+    accepted = OfferManager._existing_creation_result(
+        intent,
+        {"lifecycle_state": "created", "sage_trade_id": "d" * 64},
+    )
+    assert accepted["success"] is True
+    assert accepted["offer_max_time"] == int(deadline.timestamp())
+
+
 def test_bootstrap_offer_is_projected_before_it_can_be_published(
     bootstrap_app, monkeypatch
 ):
