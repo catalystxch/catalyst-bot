@@ -334,3 +334,57 @@ behavior. It does not establish a new-candidate trading window. The
 secondary PC was assigned independent source investigation without wallet
 effects. The fresh `7ca6fa8` EXE has not replaced the stopped primary
 process or been used with the primary wallet at this checkpoint.
+
+## Expired campaign guard and exact `8e89558` package
+
+The secondary PC reproduced the stopped-bot expiry gap and submitted PR #228.
+Primary review integrated its final six-file patch as
+`8e89558871d8cdba0206304ae02a0f98b2c8b87f`; PR #228 was then closed
+as superseded. The status API now labels an active but elapsed campaign
+`expired` and `cancel_required`, reports campaign-owned open offer count,
+and preserves the durable active authority until protected cancellation.
+The frontend shows cancellation required and disables Start Bot. The backend
+independently rejects Start Bot for the matching expired campaign before
+`bot.start()` is called. Neither GET nor start preflight submits cancels.
+
+Focused Bootstrap, lifecycle, and Doctor tests passed **109** on the
+integrated source. Ruff passed the repository Python check. The complete
+Chromium suite passed **172 tests in 108.87 seconds**. The full serial Python
+suite and new PR CI were still running at this checkpoint.
+PR #220 CI subsequently passed all checks on exact head `8e89558`; its
+`unit-tests` job reported **7,056 passed, 187 skipped, four warnings in
+553.39 seconds** on the CI runner. The duplicate local Windows serial Python
+run was stopped intentionally after reaching 42%, because the complete
+exact-source CI suite, focused Windows backend suite, complete Windows
+Chromium suite, and package checks had passed. No complete local Windows
+Python result is claimed for `8e89558`.
+
+A clean detached checkout at
+`C:\catalyst\.superpowers\public-ready-8e89558` built exact source
+`8e89558`. Generated `_version.py` line endings were restored; the tracked
+checkout is clean. The ZIP has 192 entries, includes `.env.example`, excludes
+runtime `.env`/database/log files, passes `testzip()`, and contains the exact
+built executable. The package API, synthetic Sage RPC, upgrade/publication
+recovery, and native clean/duplicate/persisted/safety smokes passed. The
+1.4.0 unsigned installer installed the exact executable to an isolated
+current-user location (hash and version matched), the native smoke passed
+from that install, and the uninstaller removed the isolated executable and
+registration.
+The isolated installer update path also passed: old `d048f44` install
+(`C200D870...` EXE), new `8e89558` replacement (`A08D5D95...`), old
+rollback, and new restore each produced the expected complete EXE SHA-256.
+The final uninstaller again removed the isolated executable and registration.
+
+| Artifact | SHA-256 | Bytes |
+| --- | --- | ---: |
+| `C:\catalyst\.superpowers\public-ready-8e89558\dist\Catalyst\Catalyst.exe` | `A08D5D958519E5A3DD5575CB442500DF05DE52A66CC7022661225E5598544FE7` | 11,250,960 |
+| `C:\catalyst\.superpowers\public-ready-8e89558\CATalyst-8e89558-secondary-acceptance.zip` | `C1D08667F12EF5293542667D1458AD4E9637EFC81662851EEBC2B7A8A1C2DC15` | 36,441,777 |
+| `C:\catalyst\.superpowers\public-ready-8e89558\Output\Catalyst-Setup-1.4.0.exe` | `D4BE7443EEAA952F3BEA821A566CC44257A61D1C75D3715D0D63E7A3603E8ED9` | 38,367,980 |
+
+The ZIP and SHA-256 sidecar were committed to the acceptance-artifact
+branch as `819456d`; the raw ZIP endpoint returned HTTP 200 with content
+length 36,441,777. Exact hashes and URL were sent to the secondary PC for
+independent acceptance. The primary live process still runs the older
+`8beb3a9` package with the bot stopped. At 15:16 UTC, read-only APIs still
+reported the expired campaign as durable `active` and six open offers.
+No `8e89558` live wallet action or new-candidate 24-hour window has occurred.
