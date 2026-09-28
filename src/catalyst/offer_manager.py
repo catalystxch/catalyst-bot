@@ -157,6 +157,7 @@ def require_active_bootstrap_intent_authority(
     purpose: str,
     asset_id: str,
     now: Optional[datetime] = None,
+    offer_max_time: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
     """Re-read the exact campaign revision encoded in a Bootstrap intent."""
 
@@ -198,11 +199,31 @@ def require_active_bootstrap_intent_authority(
         raise ValueError("Bootstrap campaign expiry is malformed") from exc
     if observed_at.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc):
         raise ValueError("Bootstrap campaign has expired")
+    if offer_max_time is not None:
+        if type(offer_max_time) is not int or not (
+            int(observed_at.timestamp()) < offer_max_time <= int(expires_at.timestamp())
+        ):
+            raise ValueError("Bootstrap offer exceeds campaign expiry")
     return {
         "campaign_id": campaign_id,
         "campaign_revision": revision,
         "status": "active",
     }
+
+
+def _bounded_offer_max_time(offer_max_time: int, cap: int, *, now_second: int) -> int:
+    """Keep a campaign offer's wallet expiry inside its approved window."""
+
+    if (
+        type(offer_max_time) is not int
+        or offer_max_time < 0
+        or type(cap) is not int
+        or type(now_second) is not int
+    ):
+        raise ValueError("Bootstrap offer expiry is invalid")
+    if cap <= now_second:
+        raise ValueError("Bootstrap campaign offer deadline has passed")
+    return min(offer_max_time, cap) if offer_max_time else cap
 
 
 def _bootstrap_level_tier(level: str) -> str:
@@ -2321,6 +2342,7 @@ class OfferManager:
         require_active_bootstrap_intent_authority(
             purpose=purpose,
             asset_id=asset_id,
+            offer_max_time=offer_max_time,
         )
         if parent_intent_id is not None and (
             type(parent_intent_id) is not str
@@ -2928,6 +2950,7 @@ class OfferManager:
             require_active_bootstrap_intent_authority(
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
+                offer_max_time=intent.offer_max_time,
             )
             continuation = wallet.begin_offer_creation_continuation(
                 operation_id=intent.operation_id,
@@ -3031,6 +3054,7 @@ class OfferManager:
             require_active_bootstrap_intent_authority(
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
+                offer_max_time=intent.offer_max_time,
             )
             wallet_call_started = True
             result = wallet.create_offer(
@@ -3290,6 +3314,15 @@ class OfferManager:
         )
         campaign_id = campaign_authority["campaign_id"]
         revision = campaign_authority["revision"]
+        expiry = campaign_authority.get("expires_at")
+        try:
+            if type(expiry) is not str or not expiry.endswith("Z"):
+                raise ValueError("noncanonical expiry")
+            offer_max_time_cap = int(
+                datetime.fromisoformat(expiry[:-1] + "+00:00").timestamp()
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bootstrap campaign expiry is malformed") from exc
         asset_id = str(plan.get("coin_prep", {}).get("campaign_asset_id") or "")
         created: list[dict[str, Any]] = []
         used_coin_ids: set[str] = set()
@@ -3316,6 +3349,7 @@ class OfferManager:
             result = self.create_offer_with_retry(
                 offer_dict,
                 expiry_offset=index,
+                offer_max_time_cap=offer_max_time_cap,
                 used_coins=used_coin_ids,
                 coin_ids_enabled=coin_ids_enabled,
                 preferred_tier=tier,
@@ -3492,6 +3526,7 @@ class OfferManager:
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
         creation_context: dict = None,
+        offer_max_time_cap: int = None,
     ) -> Optional[Dict]:
         """Create a Chia offer with automatic retry on transient errors.
 
@@ -3570,6 +3605,7 @@ class OfferManager:
                 preferred_tier=preferred_tier,
                 strict_preferred_tier=strict_preferred_tier,
                 creation_context=creation_context,
+                offer_max_time_cap=offer_max_time_cap,
             )
         finally:
             if _reservation_id:
@@ -3592,6 +3628,7 @@ class OfferManager:
         preferred_tier: str = None,
         strict_preferred_tier: bool = False,
         creation_context: dict = None,
+        offer_max_time_cap: int = None,
     ) -> Optional[Dict]:
         """Internal implementation — called by create_offer_with_retry after
         the reservation lease is acquired.  See create_offer_with_retry for
@@ -3608,6 +3645,10 @@ class OfferManager:
             offer_max_time = int(time.time()) + _expiry + stagger
         else:
             offer_max_time = 0
+        if offer_max_time_cap is not None:
+            offer_max_time = _bounded_offer_max_time(
+                offer_max_time, offer_max_time_cap, now_second=int(time.time())
+            )
 
         # Coin selection hints — tell the wallet what size coin to use.
         # Range: 80%-200% of spend amount. Tight enough to pick the right

@@ -430,3 +430,25 @@ from failed-copy files only and reported approximately 954 MB free. Its
 final `8e89558` package remains a read-only acceptance monitor, not a
 24-hour live trading pass. Secondary live lifecycle, installer/update,
 interactive UI and 24-hour end state remain unverified.
+
+## Bootstrap offer expiry exceeds the approved campaign window
+
+Source review after the expired-campaign check found a separate expiry
+defect. `create_bootstrap_plan` used the ordinary 24-hour offer expiry and
+staggering without limiting the wallet's `max_time` to the campaign's
+`expires_at`. The six offers created at approximately 09:19 UTC therefore
+requested an offer deadline around 09:19 UTC on 29 September, although the
+approved campaign expired at 14:53:02 UTC on 28 September. Sage still
+reported all six offers active after campaign expiry. Its offer-list response
+did not expose expiry conditions (`valid_times` was empty), so the exact
+network-enforced expiry of those existing offers remains unproven. The
+published offers still require protected operator cancellation.
+
+The next source change limits each new Bootstrap offer's wallet deadline to
+the campaign deadline, rejects a deadline that has already passed, and
+rechecks the durable offer intent against the exact campaign record before
+wallet dispatch. Any attempted wallet dispatch with an overlong canonical
+deadline is rejected. Focused expiry and Bootstrap/journal regressions passed locally;
+the complete test, package, and independent acceptance results for this
+new source candidate are pending. The `8e89558` binaries and their earlier
+results must be treated as historical for release readiness.

@@ -42,6 +42,7 @@ from fill_tracker import derive_bootstrap_settlement_evidence
 from offer_book_policy import derive_bootstrap_plan
 from offer_manager import (
     OfferManager,
+    _bounded_offer_max_time,
     bootstrap_offer_specs,
     require_active_bootstrap_intent_authority,
 )
@@ -619,6 +620,59 @@ def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
         for _offer, kwargs in calls
     )
     assert all(kwargs["coin_ids_enabled"] is True for _offer, kwargs in calls)
+    campaign_expiry_second = int(campaign.expires_at.timestamp())
+    assert all(
+        kwargs["offer_max_time_cap"] == campaign_expiry_second
+        for _offer, kwargs in calls
+    )
+
+
+def test_bootstrap_offer_expiry_is_capped_and_requires_time_to_publish():
+    assert _bounded_offer_max_time(200, 150, now_second=100) == 150
+    assert _bounded_offer_max_time(120, 150, now_second=100) == 120
+    assert _bounded_offer_max_time(0, 150, now_second=100) == 150
+    with pytest.raises(
+        ValueError, match="Bootstrap campaign offer deadline has passed"
+    ):
+        _bounded_offer_max_time(200, 100, now_second=100)
+
+
+def test_bootstrap_authority_denies_offer_expiring_after_campaign(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    monkeypatch.setattr(
+        "offer_manager.database.get_bootstrap_campaign",
+        lambda exact_id: record if exact_id == campaign_id else None,
+    )
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    deadline = int(_campaign_from_record(record).expires_at.timestamp())
+    assert (
+        require_active_bootstrap_intent_authority(
+            purpose=purpose, asset_id=ASSET_ID, now=NOW, offer_max_time=deadline
+        )["campaign_id"]
+        == campaign_id
+    )
+    with pytest.raises(ValueError, match="Bootstrap offer exceeds campaign expiry"):
+        require_active_bootstrap_intent_authority(
+            purpose=purpose,
+            asset_id=ASSET_ID,
+            now=NOW,
+            offer_max_time=deadline + 1,
+        )
+    with pytest.raises(ValueError, match="Bootstrap offer exceeds campaign expiry"):
+        require_active_bootstrap_intent_authority(
+            purpose=purpose, asset_id=ASSET_ID, now=NOW, offer_max_time=0
+        )
 
 
 def test_bootstrap_offer_is_projected_before_it_can_be_published(
