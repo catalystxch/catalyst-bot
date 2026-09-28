@@ -400,3 +400,33 @@ three DB buys and three DB sells. It reported no wallet-only or stale DB
 offers, no duplicated offer coins, no reserve-backed offers, no wallet error,
 and `local_book_consistent=true`. The six offers are therefore a confirmed
 live exposure after campaign expiry, rather than merely stale DB rows.
+
+### Secondary PC exact-package acceptance
+
+The independent secondary task on the connected Windows PC verified the
+`8e89558` acceptance ZIP SHA-256
+`C1D08667F12EF5293542667D1458AD4E9637EFC81662851EEBC2B7A8A1C2DC15`
+and extracted EXE SHA-256
+`A08D5D958519E5A3DD5575CB442500DF05DE52A66CC7022661225E5598544FE7`.
+Its exact-package API, synthetic Sage RPC worker, upgrade/publication
+recovery, and clean/duplicate/persisted/native safety smokes passed. It also
+reported 48 focused source regressions, two Chromium Bootstrap/start-gate
+checks, 104 broader Bootstrap tests, and affected-file Ruff passing.
+
+The secondary launched the package from a clean isolated profile as PID
+13492 and started a read-only monitor as PID 24400. Its first sample reported
+the process alive, bot stopped, no active offers, and Doctor `can_start=true`
+with eight passes and warnings for unreachable Splash and an unset Spacescan
+Pro key. Sage identity was mainnet, fingerprint 3702373391, CAT wallet ID 2,
+and the exact MZ asset. Smart Defaults returned RED/409
+`BOOTSTRAP_SUGGESTED`; fee preview was available with suggested maximum
+0.003224347212 XCH and `dispatch_authorized=false`. No fee approval,
+Coin Prep, bot start, offer mutation, or new campaign occurred. The monitor
+log is at
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\outputs\8e89558-clean-live-profile-20260928-162641\monitor-8e89558-readonly.jsonl`.
+Its original AppData profile was preserved. A recursive backup of older
+nested artifacts initially filled the disk; the secondary recovered space
+from failed-copy files only and reported approximately 954 MB free. Its
+final `8e89558` package remains a read-only acceptance monitor, not a
+24-hour live trading pass. Secondary live lifecycle, installer/update,
+interactive UI and 24-hour end state remain unverified.
