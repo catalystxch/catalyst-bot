@@ -111,3 +111,11 @@ failed with that exact scroll offset. The corrected initial focus is the
 dialog container with `preventScroll`, and Tab moves to Continue. The focused
 E2E file then passed all four tests. Full suites and a new exact-commit
 package are required for this further source change.
+
+The next startup phase exposed the same gap: after risk acknowledgment,
+Tab from the wallet-choice buttons could reach background navigation.
+`test_startup_wallet_choice_keeps_keyboard_focus_inside` failed on the
+four-test version. The trap now selects the enabled, visible controls in
+whichever startup phase is active, including wallet setup and recovery links.
+All five focused UI regressions passed after that correction. Its further
+source change supersedes the earlier package checkpoint too.

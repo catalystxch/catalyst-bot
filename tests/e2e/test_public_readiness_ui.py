@@ -149,3 +149,26 @@ def test_startup_risk_dialog_opens_at_top_on_small_window(page):
     assert page.locator("#startupDisclaimerContinueBtn").evaluate(
         "element => document.activeElement === element"
     )
+
+
+def test_startup_wallet_choice_keeps_keyboard_focus_inside(page):
+    """Later startup steps must not leak focus to background navigation."""
+    _open_gui(page)
+    page.evaluate(
+        """() => {
+            startupShowRiskDisclosure();
+            document.getElementById('startupDisclaimerSection').style.display = 'none';
+            document.getElementById('startupSageLaunchSection').style.display = 'block';
+            startupSetPhase('wallet_choice', 'Connect Wallet', 'Sage is not running', '');
+        }"""
+    )
+    buttons = page.locator("#startupSageLaunchSection button")
+    first, last = buttons.first, buttons.last
+
+    last.focus()
+    page.keyboard.press("Tab")
+    assert first.evaluate("element => document.activeElement === element")
+
+    first.focus()
+    page.keyboard.press("Shift+Tab")
+    assert last.evaluate("element => document.activeElement === element")
