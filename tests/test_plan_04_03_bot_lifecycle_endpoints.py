@@ -372,8 +372,13 @@ class TestBotStart(_FlaskBase):
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
             patch(
-                "blueprints.bot._active_bootstrap_campaign_matches_wallet",
-                return_value=True,
+                "blueprints.bot._matching_active_bootstrap_campaign",
+                return_value={
+                    "campaign_id": "cd" * 32,
+                    "revision": 0,
+                    "status": "active",
+                    "expires_at": "2099-01-01T00:00:00.000000Z",
+                },
             ),
             patch(
                 "blueprints.bot._bootstrap_coin_prep_start_readiness",
@@ -494,6 +499,49 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.status_code, 400)
         body = resp.get_json()
         self.assertIn("Sage cannot sign", body.get("errors", []))
+
+    def test_expired_active_bootstrap_campaign_blocks_start_before_effects(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        bot = _make_bot(running=False, start_returns=True)
+        expired_campaign = {
+            "campaign_id": "cd" * 32,
+            "status": "active",
+            "expires_at": "2000-01-01T00:00:00.000000Z",
+            "revision": 3,
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._matching_active_bootstrap_campaign",
+                return_value=expired_campaign,
+            ) as match_campaign,
+            patch("blueprints.bot.log_event") as log_event,
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertEqual(body.get("reason"), "bootstrap_campaign_expired")
+        self.assertIn("expired", body.get("error", "").lower())
+        self.assertNotIn("open_offer_count", body)
+        match_campaign.assert_called_once_with(fake_cfg)
+        log_event.assert_any_call(
+            "warning",
+            "bootstrap_expired_start_blocked",
+            "Active Bootstrap campaign has expired — cancel campaign-owned offers before starting or renewing",
+            data={"campaign_id": "cd" * 32, "revision": 3},
+        )
+        bot.start.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

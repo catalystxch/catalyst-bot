@@ -380,6 +380,47 @@ def test_status_uses_authoritative_campaign_fee_evidence(
     assert status["campaign"]["fee_spent_xch"] == "0.000008563369"
 
 
+def test_status_flags_expired_active_campaign_as_cancel_required(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post(
+        "/api/bootstrap/preview", json=_request(expires_in_seconds=60)
+    ).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            expires_in_seconds=60,
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_utcnow",
+        lambda: datetime(2026, 9, 12, 12, 1, 1, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: ["trade-a", "trade-b"] if exact_id == campaign_id else [],
+    )
+
+    status = client.get("/api/bootstrap/status").get_json()
+
+    assert status["active"] is True
+    assert status["campaign"]["campaign_id"] == campaign_id
+    assert status["campaign"]["status"] == "active"
+    assert status["campaign"]["expired"] is True
+    assert status["campaign"]["cancel_required"] is True
+    assert status["campaign"]["cancel_reason"] == "bootstrap_expired"
+    assert status["campaign"]["manual_restart_required"] is True
+    assert status["campaign"]["open_offer_count"] == 2
+    assert status["needs_attention"] is True
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+
+
 def test_status_export_and_scoped_stop_use_exact_active_campaign(
     isolated_db, bootstrap_api, monkeypatch
 ):

@@ -19210,7 +19210,29 @@
                 : 'Start blocked: waiting for a fresh runtime safety check. Review Safety Diagnostics if this persists.';
         }
 
+        function getBootstrapCampaignStartBlock() {
+            const campaign = (typeof _bootstrapActiveCampaign !== 'undefined')
+                ? _bootstrapActiveCampaign : null;
+            if (!campaign || !campaign.campaign_id) return null;
+            const expired = campaign.expired === true || campaign.cancel_required === true;
+            if (!expired) return null;
+            const rawCount = Number(campaign.open_offer_count || 0);
+            const openCount = Number.isFinite(rawCount) && rawCount > 0
+                ? Math.floor(rawCount) : 0;
+            const offerPhrase = openCount > 0
+                ? `${openCount} campaign-owned offer${openCount === 1 ? '' : 's'}`
+                : 'campaign-owned offers';
+            return {
+                reason: campaign.cancel_reason || 'bootstrap_expired',
+                message: `Bootstrap campaign expired — ${offerPhrase} require cancellation before restart or renewal.`,
+            };
+        }
+
         function getStartSafetyState(data = bot_state) {
+            const bootstrapBlock = getBootstrapCampaignStartBlock();
+            if (bootstrapBlock) {
+                return { allowed: false, message: bootstrapBlock.message, reason: bootstrapBlock.reason };
+            }
             const safety = data?.runtime_safety;
             const freshness = safety?.recovery?.freshness;
             const observedAt = Date.parse(freshness?.observed_at_utc);
@@ -39868,7 +39890,18 @@ function _bootstrapRenderStatus(payload) {
         const cooldowns = Array.isArray(campaign.adverse_fill_times)
             ? campaign.adverse_fill_times.length
             : 0;
-        summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+        const cancelRequired = campaign.cancel_required === true || campaign.expired === true;
+        if (cancelRequired) {
+            const rawCount = Number(campaign.open_offer_count || 0);
+            const openCount = Number.isFinite(rawCount) && rawCount > 0
+                ? Math.floor(rawCount) : 0;
+            const offerPhrase = openCount > 0
+                ? `${openCount} open offer${openCount === 1 ? '' : 's'}`
+                : 'open offers';
+            summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+        } else {
+            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+        }
         campaign._uiCooldownCount = cooldowns;
     }
     if (globalStatus) {
@@ -39878,7 +39911,11 @@ function _bootstrapRenderStatus(payload) {
     if (dashboardStatus) {
         dashboardStatus.style.display = 'block';
         dashboardStatus.textContent = _bootstrapActiveCampaign
-            ? summary + ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
+            ? summary + (
+                _bootstrapActiveCampaign.cancel_required === true || _bootstrapActiveCampaign.expired === true
+                    ? ` · requires cancellation before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
+                    : ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
+            )
             : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
     }
     if (stop) stop.disabled = !_bootstrapActiveCampaign;
