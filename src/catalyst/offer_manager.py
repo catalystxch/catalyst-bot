@@ -6337,7 +6337,7 @@ class OfferManager:
 
     def _plan_coin_prep_cancel(
         self, members: list[tuple], fee_approval_id: str
-    ) -> tuple[dict, dict]:
+    ) -> tuple[dict, dict, tuple[Any, str, int]]:
         """Price a complete Sage cohort against explicit Coin Prep consent."""
 
         if len(members) < 1 or get_wallet_type() != "sage" or self._fee_pool is None:

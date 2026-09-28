@@ -716,7 +716,9 @@ class FeeCoinPool:
         reservations (coins that were successfully spent are gone from
         the inventory; coins that weren't are re-added automatically).
       • ``reserve()`` hands out one coin ID per call.
-      • No explicit ``release()`` needed — the next ``refresh()`` resets.
+      • Protected cancellation releases a ticket only if planning or
+        authority fails before wallet dispatch. Other reservations reset on
+        the next ``refresh()``.
     """
 
     def __init__(self):

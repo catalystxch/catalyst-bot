@@ -146,3 +146,51 @@ observations only. CATalyst's synthetic CAT wallet ID, profile identity,
 reserves, a bounded campaign, and fee scope must be verified on the corrected
 package before any secondary live action. No wallet selection or mutation was
 performed during this discovery.
+
+## First corrected source/package checkpoint, superseded by review cleanup
+
+Commit `c5c321804380c837dccd1f3be748c6fe96c3c1d3` was pushed to draft
+PR #220 after the 7,067-test full Python pass, 170-test Chromium pass, Ruff,
+and the 218-test affected pass above. A clean detached checkout built the
+Windows EXE. Build metadata synchronized to 1.4.0 and changed only
+`_version.py` line endings; its semantic diff was empty, and the checkout was
+restored clean. The only PyInstaller warning was the previously accepted
+optional `importlib_resources.trees` hidden import warning.
+
+| Artifact | SHA-256 | Bytes |
+| --- | --- | ---: |
+| `C:\catalyst\.superpowers\public-ready-c5c3218\dist\Catalyst\Catalyst.exe` | `DFF98FC93433403FC6C919CFC910EE1CD30C3DB8F1BC6B373B8590C642554BBC` | 11,249,100 |
+| `C:\catalyst\.superpowers\public-ready-c5c3218\CATalyst-c5c3218-public-ready.zip` | `58BF07D48A635AC84FB29685BF90F2D3662AD1A930578D4884903A6F07B702F9` | 37,310,444 |
+| `C:\catalyst\.superpowers\public-ready-c5c3218\Output\Catalyst-Setup-1.4.0.exe` | `6738BC78B2B06DF69E53A6A14BDBFAE1278F787F7A3FE2D89300B98109465F37` | 38,366,173 |
+
+The ZIP had 206 entries, contained the environment template and no runtime
+`.env`, database or log, and its extracted EXE hash matched the built EXE.
+Packaged API, synthetic Sage RPC, interrupted-publication recovery, and
+native clean/duplicate/persisted/safety smokes passed. The unsigned test
+installer completed a clean current-user installation in an isolated
+worktree directory, registered version 1.4.0.0, and installed the exact EXE
+hash; native smoke passed from the installed path. Replacing it with the old
+`d048f44` installer produced the exact old EXE hash. Installing the
+`c5c3218` installer again restored its exact new EXE hash, and native smoke
+passed again. Uninstall removed the isolated EXE and registration. The tests
+did not operate the primary live wallet or alter its old running package.
+
+The secondary PC independently fetched exact `c5c3218` into a clean detached
+worktree, reviewed the full incident diff, passed 303 focused/affected
+backend tests and `git diff --check`, and found no blocking defect. It found
+two stale descriptions: `_plan_coin_prep_cancel()` still annotated a two-item
+return although it now returns three, and `FeeCoinPool` still documented that
+no explicit release occurs. Both were confirmed and corrected in the next
+source revision. They are documentation/type-hint changes, but the exact
+source identity changes. The `c5c3218` package and its test receipts above
+are retained as historical evidence, not final new-candidate acceptance.
+
+The follow-up source changed only those two descriptions: the planner's
+three-item return annotation and the fee pool's pre-dispatch ticket lifecycle
+docstring. The complete serial Python suite passed again on that source:
+**7,067 passed, 171 skipped, 422 subtests passed in 1,214.30 seconds**. The
+complete Chromium suite passed **170 tests in 94.07 seconds**; Ruff and format
+checks passed all **480 tracked Python files**, and `git diff --check` passed.
+Its exact source commit and fresh package hashes are recorded in the next
+checkpoint after building; the `c5c3218` artifacts above are not reused as
+that final source's package.
