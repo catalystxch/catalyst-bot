@@ -1,11 +1,13 @@
 """Tests for doctor.py — preflight/readiness checks."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from doctor import (
     DoctorCheck,
     DoctorReport,
+    run_preflight,
     _check_db_health,
     _check_config_sanity,
     _check_cat_config,
@@ -136,6 +138,64 @@ class TestDoctorCheck_CAT(unittest.TestCase):
             mock_cfg.CAT_ASSET_ID = ""
             check = _check_cat_config()
             self.assertEqual(check.status, "fail")
+
+
+class TestDoctorWalletOutage(unittest.TestCase):
+    def test_cat_mapping_is_skipped_when_wallet_is_unreachable(self):
+        fallback_asset_id = "abc123"
+        mock_get_wallets = MagicMock(return_value=[{"asset_id": fallback_asset_id}])
+
+        with (
+            patch("doctor._check_db_health") as mock_db,
+            patch("doctor._check_config_sanity") as mock_config,
+            patch("doctor._check_cat_config") as mock_cat_config,
+            patch("doctor._check_dexie_reachable") as mock_dexie,
+            patch("doctor._check_tibet_reachable") as mock_tibet,
+            patch("doctor._check_splash_reachable") as mock_splash,
+            patch("doctor._check_spacescan_setup") as mock_spacescan,
+            patch(
+                "doctor._fetch_wallet_sync_once",
+                return_value={"reachable": False, "_wallet_type": "sage"},
+            ),
+            patch("config.cfg") as mock_cfg,
+            patch.dict(
+                "sys.modules",
+                {"wallet": SimpleNamespace(get_wallets=mock_get_wallets)},
+            ),
+        ):
+            mock_db.return_value = DoctorCheck(
+                "database_health", "database", "pass", "ok", "info"
+            )
+            mock_config.return_value = DoctorCheck(
+                "config_validation", "config", "pass", "ok", "info"
+            )
+            mock_cat_config.return_value = DoctorCheck(
+                "cat_identity", "config", "pass", "ok", "info"
+            )
+            mock_dexie.return_value = DoctorCheck(
+                "dexie_reachable", "exchange", "pass", "ok", "info"
+            )
+            mock_tibet.return_value = DoctorCheck(
+                "tibet_reachable", "exchange", "skip", "skip", "info"
+            )
+            mock_splash.return_value = DoctorCheck(
+                "splash_reachable", "exchange", "skip", "skip", "info"
+            )
+            mock_spacescan.return_value = DoctorCheck(
+                "spacescan_setup", "explorer", "skip", "skip", "info"
+            )
+            mock_cfg.CAT_ASSET_ID = fallback_asset_id
+            mock_cfg.WALLET_TYPE = "sage"
+            mock_get_wallets.return_value = [{"asset_id": fallback_asset_id}]
+
+            report = run_preflight(force=True)
+
+        cat_mapping = next(
+            check for check in report.checks if check.name == "cat_wallet_mapping"
+        )
+        self.assertEqual(cat_mapping.status, "skip")
+        self.assertIn("wallet not reachable", cat_mapping.message)
+        mock_get_wallets.assert_not_called()
 
 
 if __name__ == "__main__":
