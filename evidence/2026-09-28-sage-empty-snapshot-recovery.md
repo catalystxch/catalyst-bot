@@ -358,6 +358,12 @@ run was stopped intentionally after reaching 42%, because the complete
 exact-source CI suite, focused Windows backend suite, complete Windows
 Chromium suite, and package checks had passed. No complete local Windows
 Python result is claimed for `8e89558`.
+The complete Windows Python suite was then rerun with two file-distributed
+workers on the same exact source. It passed **7,070 tests, skipped 173, and
+passed 422 subtests in 641.61 seconds**. PR CI also passed all checks on the
+evidence-only head `4458af0`; its unit-test job again passed 7,056 tests,
+skipped 187 and reported four warnings (703.98 seconds). The differing
+platform totals are recorded separately rather than combined.
 
 A clean detached checkout at
 `C:\catalyst\.superpowers\public-ready-8e89558` built exact source
@@ -388,3 +394,9 @@ independent acceptance. The primary live process still runs the older
 `8beb3a9` package with the bot stopped. At 15:16 UTC, read-only APIs still
 reported the expired campaign as durable `active` and six open offers.
 No `8e89558` live wallet action or new-candidate 24-hour window has occurred.
+At 15:36 UTC a fresh read-only `/api/offers/diagnostic` compared Sage's live
+book with the database: three wallet buys and three wallet sells matched
+three DB buys and three DB sells. It reported no wallet-only or stale DB
+offers, no duplicated offer coins, no reserve-backed offers, no wallet error,
+and `local_book_consistent=true`. The six offers are therefore a confirmed
+live exposure after campaign expiry, rather than merely stale DB rows.
