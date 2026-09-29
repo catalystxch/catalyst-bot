@@ -91,10 +91,29 @@ prior fee approval remains at 62,703,765 mojos spent, zero held, and zero
 unresolved operations. No new wallet transaction occurred during the
 handoff.
 
-The fresh `e259f7e` browser session shows Risk Disclosure and
-`/api/fingerprint` reports `not_started`. The agent has not acknowledged it
-or bypassed it via API. The operator was asked to personally acknowledge and
-reconnect Sage. Coin Prep and offer creation require consequential wallet
-handoff after their exact effects and fee scope are displayed. Primary and
-secondary `e259f7e` live lifecycle and 24-hour windows remain unverified;
-there is no public-readiness claim, merge, tag, or release.
+The operator personally acknowledged the fresh `e259f7e` Risk Disclosure
+and reconnected Sage. Read-only `/api/fingerprint` returned `736588221`.
+The agent started the already installed Splash node through the UI and
+continued with the already configured Spacescan key. The Settings UI showed
+the exact active MZ/XCH pair, the locked campaign revision and budgets, and
+the expected fingerprint. The prior saved settings were reviewed and saved;
+the UI warned that the configured 25.2% base spread can stall fills, and the
+operator's existing strategy was retained. No new campaign or wallet action
+was performed in this setup step.
+
+The browser's Coin Prep check then reported that prepared denominations are
+ready. The exact read-only verifier returned `all_sufficient=true`,
+`balance_sufficient=true`, `needs_coin_prep=false`, campaign
+`c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
+revision 0, six 0.001 XCH fee coins, and ten matching XCH and CAT coins at
+each of the three 0.03 XCH / 400 MZ tiers. Its required totals are 0.906
+XCH including fee outputs and 12,000 MZ. The dashboard enabled Start Bot.
+Before that handoff, read-only checks still found zero wallet/database open
+offers, a consistent book, safety allowed with all blocker counts zero, and
+the bot stopped. The old fee approval remains bound to the expired campaign;
+the agent did not reuse it or dispatch Coin Prep.
+
+Start Bot can create and publish consequential mainnet offers, so the final
+UI action was handed to the operator under the computer-use skill. Primary
+and secondary `e259f7e` live lifecycle and 24-hour windows remain
+unverified; there is no public-readiness claim, merge, tag, or release.
