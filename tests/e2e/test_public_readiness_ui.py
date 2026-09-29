@@ -13,6 +13,40 @@ def _open_gui(page):
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+def test_stopped_bootstrap_clears_stale_authority_and_asset_confirmation(page):
+    """A stopped campaign must not leave its old authority review armed in the UI."""
+    _open_gui(page)
+    result = page.evaluate(
+        """() => {
+            const campaignId = 'ab'.repeat(32);
+            _bootstrapActiveCampaign = {campaign_id: campaignId, revision: 0};
+            _bootstrapPreviewDigest = 'old-preview';
+            _bootstrapPreviewBody = {asset_id: 'old-asset'};
+            document.getElementById('bootstrapStatusPanel').textContent =
+                `Campaign ${campaignId} is active and locked to revision 0.`;
+            document.getElementById('bootstrapExactAssetConfirm').checked = true;
+
+            _bootstrapRenderStatus({active: false, campaign: null, identity: null});
+
+            return {
+                panel: document.getElementById('bootstrapStatusPanel').textContent,
+                confirmed: document.getElementById('bootstrapExactAssetConfirm').checked,
+                digest: _bootstrapPreviewDigest,
+                body: _bootstrapPreviewBody,
+                startDisabled: document.getElementById('bootstrapStartBtn').disabled,
+            };
+        }"""
+    )
+
+    assert result == {
+        "panel": "No active Bootstrap campaign. Review exact local budgets and Preview before starting.",
+        "confirmed": False,
+        "digest": "",
+        "body": None,
+        "startDisabled": True,
+    }
+
+
 def test_running_bootstrap_reload_does_not_request_coin_prep_again(page):
     """Locked live offers must not trigger a new fee approval on reload."""
     _open_gui(page)

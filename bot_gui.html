@@ -39892,7 +39892,15 @@ function _bootstrapRenderStatus(payload) {
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
+    const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    if (hadActiveCampaign && !_bootstrapActiveCampaign) {
+        _bootstrapPreviewDigest = '';
+        _bootstrapPreviewBody = null;
+        const exactConfirm = document.getElementById('bootstrapExactAssetConfirm');
+        if (exactConfirm) exactConfirm.checked = false;
+        _bootstrapText('bootstrapStatusPanel', 'No active Bootstrap campaign. Review exact local budgets and Preview before starting.');
+    }
     updateHeroPriceProvenance((_lastMarketConfidence || {}).confidence || {});
     updateOffersEmptyState();
     const bootstrapTicker = String(
