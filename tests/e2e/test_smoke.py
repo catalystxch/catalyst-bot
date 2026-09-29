@@ -702,6 +702,153 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
     )
 
 
+def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(page):
+    """A restored live book must not claim readiness after its campaign expires."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            _resumeSessionSummary = {
+                pair_name: 'Monkeyzoo Token',
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+            };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            bot_state = {
+                running: false,
+                offers: { buy: [{ trade_id: 'buy-1' }], sell: [{ trade_id: 'sell-1' }] },
+            };
+            updateDashboardStartupLayout(bot_state);
+            return {
+                guide: document.getElementById('startupGuideTitle').textContent,
+                summary: document.getElementById('startupResumeTitle').textContent,
+                detail: document.getElementById('startupResumeCopy').textContent,
+                resumeDisabled: document.getElementById('startupResumeContinueBtn').disabled,
+            };
+        }"""
+    )
+
+    assert result["resumeDisabled"] is True
+    for label in (result["guide"], result["summary"], result["detail"]):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+
+
+def test_expired_bootstrap_market_health_calls_for_cancellation(page):
+    """An expired campaign with live offers cannot be labelled active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    for label in (
+        page.locator("#ccHealthMsg").inner_text(),
+        page.locator("#marketConfidenceCountdown").inner_text(),
+    ):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+
+
+def test_expired_bootstrap_recovery_modal_does_not_offer_start(page):
+    """Restoring an expired campaign must lead to cancellation, not Start Bot."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                decimals: 3,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            currentCAT = { ...cat };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            setResumeSessionSummary({
+                can_resume: true,
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+                active_cat: cat,
+            });
+            document.getElementById('startupOverlay').style.display = 'none';
+            document.getElementById('resumeSessionModal').classList.add('active');
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            checkSettingsReviewed = () => {};
+            fetchStatus = async () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => new Response(JSON.stringify(
+                String(path).includes('/check-resume')
+                    ? { can_resume: true, buy_count: 3, sell_count: 3,
+                        offer_count: 6, active_cat: cat }
+                    : { success: true }
+            ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+            const restored = await resumeSession();
+            if (!restored) throw new Error('Test session did not restore');
+            const modal = document.querySelector('#resumeSessionModal > div');
+            return {
+                text: modal.innerText,
+                startButtons: modal.querySelectorAll('button[onclick="resumeStartNow()"]')
+                    .length,
+                closeButtons: modal.querySelectorAll('button[onclick="closeResumeAfterLoad()"]')
+                    .length,
+            };
+        }"""
+    )
+
+    assert "expired" in result["text"].lower()
+    assert "cancel" in result["text"].lower()
+    assert result["startButtons"] == 0
+    assert result["closeButtons"] == 1
+    page.locator('#resumeSessionModal button[onclick="closeResumeAfterLoad()"]').click()
+    assert "active" not in page.locator("#resumeSessionModal").get_attribute("class")
+
+
 def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     """A RED Bootstrap anchor must not be presented as trusted market evidence."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
