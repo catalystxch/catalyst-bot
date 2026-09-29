@@ -61,6 +61,21 @@ independent acceptance on the secondary PC.
 - All eleven PR checks passed on exact source head `bf1abe2`, including CI
   unit tests, lint/syntax, security scan, CodeQL, Gitleaks and Semgrep.
 
+## Independent secondary checkpoint
+
+The secondary PC checked out the exact `bf1abe2` commit in a separate
+detached worktree and independently verified its parent `528ea5d`, two-file
+patch SHA-256 `762683750B90BCDEEE5B7B3FF8EED667005CC7120A020E0F90B843DD82F92064`,
+downloaded ZIP and installer hashes, and extracted EXE hash. Its focused new
+regression passed both cases; 145 affected tests passed under the package
+compatible Python 3.12 runtime. Ruff, format and diff checks passed. The
+downloaded package passed API, synthetic Sage RPC, publication/recovery and
+native clean/duplicate/persisted/safety smokes. Its independent patch review
+found the ticket release limited to the durable no-effect denial paths;
+ambiguous or mixed outcomes retain the reservation. The secondary was still
+reconciling its older build process at this checkpoint and had made no
+`bf1abe2` live wallet effect.
+
 ## Primary live handoff
 
 The old exact `a9cd077` EXE (PID 133984) still had its bot stopped before
@@ -82,6 +97,11 @@ non-reserve offer coins, no wallet-only or DB-only rows, and
 blocking operations, reservations, prepared creations, publication claims,
 submitted cancels and contradictory history. `/api/fingerprint` still showed
 `not_started`; live wallet connection has not occurred in this session.
+`/api/coin-prep/status` read back fee approval
+`c6651480f6044dbbd2833926d3809380c248943f7f507991ff132d7e885e6bdc`:
+561,860,690 mojos total, 60,190,086 spent, zero held, 501,670,604
+remaining, six confirmed operations and zero unresolved. No wallet effect
+was initiated during this handoff.
 
 ## Remaining acceptance
 
