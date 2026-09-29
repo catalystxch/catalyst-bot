@@ -1911,6 +1911,11 @@ def api_coin_prep_status():
                 campaign_id = durable_fee.get("campaign_id") or (
                     durable_fee.get("request_options") or {}
                 ).get("bootstrap_campaign_id")
+        if bootstrap_campaign is not None:
+            # The worker file may belong to a previous campaign. Only the
+            # active campaign's durable consent can authorize recovery.
+            worker_fee_approval_id = None
+            durable_fee = None
         if campaign_id is not None:
             try:
                 from database import get_latest_coin_prep_fee_approval_for_campaign
@@ -1923,7 +1928,9 @@ def api_coin_prep_status():
                         durable_fee = None
                     worker_fee_approval_id = latest_campaign_approval_id
             except Exception:
-                pass
+                if bootstrap_campaign is not None:
+                    result["overlapping_coin_prep_blocked"] = True
+                    result["fee_approval_lookup_unavailable"] = True
         if worker_fee_approval_id is not None:
             result["fee_approval_id"] = worker_fee_approval_id
             try:

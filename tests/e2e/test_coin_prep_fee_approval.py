@@ -805,6 +805,52 @@ def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_la
     expect(page.locator("#coinPrepCancelBtn")).to_be_hidden()
 
 
+def test_restart_does_not_recover_fee_approval_from_another_bootstrap_campaign(page):
+    _open_gui(page)
+    status = {
+        "success": True,
+        "running": False,
+        "complete": False,
+        "phase": "idle",
+        "bootstrap_campaign_id": "current-campaign",
+        "bootstrap_campaign_revision": 0,
+        "overlapping_coin_prep_blocked": True,
+        "fee_resume_required": True,
+        "fee_approval_id": "d" * 64,
+        "fee_approval": {
+            "approval_id": "d" * 64,
+            "campaign_id": "expired-prior-campaign",
+            "state": "approved",
+            "request_options": {
+                "bootstrap_campaign_id": "expired-prior-campaign",
+                "coin_multiplier": "1",
+            },
+        },
+    }
+    result = page.evaluate(
+        """async status => {
+            apiFetch = async path => {
+                if (!String(path).endsWith('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            _bootstrapActiveCampaign = {campaign_id: 'current-campaign', revision: 0};
+            coinPrepStatus = 'none';
+            const restored = await restoreCoinPrepReadiness();
+            return {
+                restored,
+                coinPrepStatus,
+                modalOpen: document.getElementById('coinPrepConfirmOverlay')
+                    .classList.contains('active'),
+            };
+        }""",
+        status,
+    )
+
+    assert result == {"restored": False, "coinPrepStatus": "none", "modalOpen": False}
+
+
 def _paused_recovery_status():
     return {
         "success": True,

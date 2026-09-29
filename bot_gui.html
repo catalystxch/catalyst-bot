@@ -18917,6 +18917,13 @@
                     && status.phase !== 'complete'
                     && status.overlapping_coin_prep_blocked === true
                     && !['complete', 'stale'].includes(feeState);
+                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
+                    ? _bootstrapActiveCampaign : null;
+                if (feeStillBlocks && activeBootstrap) {
+                    const feeCampaignId = String(status.fee_approval?.campaign_id
+                        || status.fee_approval?.request_options?.bootstrap_campaign_id || '');
+                    if (feeCampaignId !== String(activeBootstrap.campaign_id)) return false;
+                }
                 if (feeStillBlocks) {
                     _coinPrepFeeRecoveryBlocking = true;
                     setCoinPrepStatus('checking');
@@ -18972,8 +18979,6 @@
                     return false;
                 }
 
-                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
-                    ? _bootstrapActiveCampaign : null;
                 if (activeBootstrap && (
                     String(status.bootstrap_campaign_id || '') !== String(activeBootstrap.campaign_id)
                     || Number(status.bootstrap_campaign_revision) !== Number(activeBootstrap.revision)

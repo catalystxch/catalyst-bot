@@ -333,6 +333,104 @@ class TestCoinPrepStatus(_FlaskBase):
         latest.assert_called_once_with(campaign_id)
         read_status.assert_called_once_with(renewed_approval_id)
 
+    def test_active_bootstrap_status_ignores_prior_campaign_worker_approval(self):
+        """A new campaign must not inherit recovery from a completed worker."""
+
+        old_approval_id = "b" * 64
+        active_campaign_id = "active-campaign-without-fee-approval"
+        worker_status = {
+            "phase": "splitting",
+            "run_id": "prior-campaign-run",
+            "fee_approval_id": old_approval_id,
+        }
+        prior_approval = {
+            "approval_id": old_approval_id,
+            "campaign_id": "expired-prior-campaign",
+            "state": "approved",
+            "held_fee_mojos": 0,
+            "spent_fee_mojos": 62703765,
+            "unresolved_operation_count": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            api_server._coin_prep_state.update(
+                {"running": False, "complete": False, "error": None, "run_id": None}
+            )
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": active_campaign_id, "revision": 0}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=None,
+                ) as latest,
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=prior_approval,
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertEqual(body["bootstrap_campaign_id"], active_campaign_id)
+        self.assertNotIn("fee_approval_id", body)
+        self.assertNotIn("fee_approval", body)
+        self.assertFalse(body.get("overlapping_coin_prep_blocked", False))
+        self.assertFalse(body.get("fee_resume_required", False))
+        latest.assert_called_once_with(active_campaign_id)
+        read_status.assert_not_called()
+
+    def test_active_bootstrap_status_blocks_when_fee_approval_lookup_fails(self):
+        """A lookup outage must not make a stale worker approval look usable."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"fee_approval_id": "b" * 64}, handle)
+            api_server._coin_prep_state.update(
+                {"running": False, "complete": False, "error": None, "run_id": None}
+            )
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": "current-campaign", "revision": 0}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    side_effect=RuntimeError("database unavailable"),
+                ),
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self.client.get(
+                    "/api/coin-prep/status", environ_base=self._LOOPBACK
+                )
+
+        body = resp.get_json()
+        self.assertNotIn("fee_approval_id", body)
+        self.assertTrue(body["overlapping_coin_prep_blocked"])
+        self.assertTrue(body["fee_approval_lookup_unavailable"])
+
     def test_completed_bootstrap_status_keeps_latest_fee_renewal_after_campaign_closes(
         self,
     ):
