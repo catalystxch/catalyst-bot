@@ -660,7 +660,7 @@ def test_dashboard_fiat_label_uses_cat_ticker_not_pair_id(page, has_price):
 def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
     page,
 ):
-    """RED blocks Follow exposure without claiming Bootstrap was withdrawn."""
+    """RED blocks Follow without claiming an empty Bootstrap book has offers."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -670,6 +670,7 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
                 campaign_id: 'campaign-1',
                 revision: 4,
                 stage: 'bootstrap',
+                open_offer_count: 0,
             };
             window.renderMarketConfidence({
                 confidence: {
@@ -698,7 +699,7 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
         "Bounded Bootstrap active — Follow mode is blocked by RED confidence"
     )
     expect(page.locator("#marketConfidenceCountdown")).to_have_text(
-        "Follow exposure withdrawn; bounded Bootstrap offers remain active"
+        "Follow exposure withdrawn; bounded Bootstrap campaign remains authorized"
     )
 
 
