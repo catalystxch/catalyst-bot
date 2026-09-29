@@ -7465,6 +7465,7 @@ class OfferManager:
         batch_contract: dict,
         fee_approval_id: Optional[str] = None,
         priced_cancellation: Optional[dict] = None,
+        fee_reservation: Optional[tuple] = None,
     ) -> Dict[str, dict]:
         """Run one manifest-bound Sage bulk cancellation wallet effect."""
 
@@ -7479,6 +7480,20 @@ class OfferManager:
         if len(bindings) != 1:
             raise ValueError("cancellation cohort wallet identities do not match")
         wallet_hash, network = next(iter(bindings))
+
+        def release_proven_unattempted_fee_input(results: dict) -> None:
+            if fee_reservation is None or len(results) != len(members):
+                return
+            if not all(
+                result.get("outcome") == CANCEL_FAILED
+                and result.get("method") == "cohort_recovery_unattempted"
+                and result.get("_catalyst_effect_attempted") is False
+                for result in results.values()
+            ):
+                return
+            fee_pool, coin_id, ticket = fee_reservation
+            fee_pool.release_ticket(coin_id, ticket)
+
         self._offer_cancel_crash_boundary("after_prepare", representative)
         validated_unsigned = None
         if fee_approval_id is not None:
@@ -7512,6 +7527,7 @@ class OfferManager:
                         context=context,
                         reason_code="FEE_CANCELLATION_RESERVATION_BLOCKED",
                     )
+                release_proven_unattempted_fee_input(results)
                 return results
             self._offer_cancel_crash_boundary("after_fee_reservation", representative)
             try:
@@ -7539,6 +7555,7 @@ class OfferManager:
                         reason_code="FEE_CANCELLATION_RECHECK_BLOCKED",
                     )
                 database.record_coin_prep_cancellation_fee_outcome(manifest)
+                release_proven_unattempted_fee_input(results)
                 return results
         claim = database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
         if claim != {
@@ -8133,6 +8150,7 @@ class OfferManager:
                     batch_contract=batch_contract,
                     fee_approval_id=fee_approval_id,
                     priced_cancellation=priced_cancellation,
+                    fee_reservation=fee_reservation,
                 )
                 for intent, attempt, _member_id in members:
                     result = batch_results[intent.trade_id]

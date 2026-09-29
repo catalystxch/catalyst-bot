@@ -1909,6 +1909,69 @@ def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
         )
 
 
+@pytest.mark.parametrize("failure_stage", ["reserve", "recheck"])
+def test_protected_cancel_releases_fee_coin_before_wallet_submission(
+    isolated_database, monkeypatch, failure_stage
+):
+    trade_id = "a" * 64
+    fee_coin_id = "e" * 64
+    _seed_task7_created_offer(
+        trade_id=trade_id,
+        coin_id="c" * 64,
+        intent_seed="protected-cancel-reservation-blocked",
+    )
+    pool = FeeCoinPool()
+    pool.refresh([{"coin_id": fee_coin_id, "coin": {"amount": 1_000_000_000}}])
+    manager = OfferManager()
+    manager._fee_pool = pool
+    pricing = __import__("coin_prep_fee_cancellation")
+    monkeypatch.setattr(
+        pricing,
+        "price_approved_cancellation",
+        lambda **kwargs: {
+            "available": True,
+            "trade_ids": list(kwargs["trade_ids"]),
+            "source_coin_ids": list(kwargs["source_coin_ids"]),
+            "fee_coin_id": kwargs["fee_coin_id"],
+            "fee_mojos": 42,
+        },
+    )
+
+    def reserve(**_kwargs):
+        if failure_stage == "reserve":
+            raise ValueError("FEE_APPROVAL_STALE")
+        return {"validated_unsigned": {}, "dispatch_authorized": False}
+
+    def recheck(**_kwargs):
+        raise ValueError("FEE_APPROVAL_STALE")
+
+    monkeypatch.setattr(pricing, "reserve_approved_cancellation", reserve)
+    monkeypatch.setattr(pricing, "recheck_reserved_approved_cancellation", recheck)
+    settled = []
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        lambda manifest: settled.append(manifest),
+    )
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("no wallet effect expected"),
+        batch_effect=lambda *_args, **_kwargs: pytest.fail("no wallet effect expected"),
+        identity_count=8,
+    )
+
+    result = manager.cancel_offers(
+        [trade_id],
+        reason="coin_prep_cancel_all",
+        force_storm=True,
+        fee_approval_id="f" * 64,
+    )
+
+    assert result[trade_id]["outcome"] == CANCEL_FAILED
+    assert pool.available_count == 1
+    assert len(settled) == (1 if failure_stage == "recheck" else 0)
+
+
 def test_sage_bulk_cancel_capacity_is_bounded_by_largest_fee_coin(monkeypatch):
     monkeypatch.setattr(
         offer_manager,
