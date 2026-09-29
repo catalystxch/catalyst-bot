@@ -709,6 +709,9 @@ def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(
 
     result = page.evaluate(
         """() => {
+            currentCAT = {
+                asset_id: 'mz', name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH',
+            };
             _resumeSessionSummary = {
                 pair_name: 'Monkeyzoo Token',
                 buy_count: 3,
@@ -731,6 +734,7 @@ def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(
                 summary: document.getElementById('startupResumeTitle').textContent,
                 detail: document.getElementById('startupResumeCopy').textContent,
                 resumeDisabled: document.getElementById('startupResumeContinueBtn').disabled,
+                resumeText: document.getElementById('startupResumeContinueBtn').textContent,
             };
         }"""
     )
@@ -739,6 +743,8 @@ def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(
     for label in (result["guide"], result["summary"], result["detail"]):
         assert "expired" in label.lower()
         assert "cancel" in label.lower()
+    assert "resume" not in result["resumeText"].lower()
+    assert "cancel" in result["resumeText"].lower()
 
 
 def test_expired_bootstrap_market_health_calls_for_cancellation(page):

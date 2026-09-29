@@ -19201,7 +19201,9 @@
             const continueBtn = document.getElementById('startupResumeContinueBtn');
             if (continueBtn) {
                 continueBtn.disabled = !canAttemptBotStart() || !!(bot_state && bot_state.running);
-                continueBtn.textContent = pair?.selected ? '▶ Resume Bot Now' : 'Choose Pair to Resume';
+                continueBtn.textContent = bootstrapBlock
+                    ? 'Cancel Offers Before Restart'
+                    : (pair?.selected ? '▶ Resume Bot Now' : 'Choose Pair to Resume');
             }
         }
 
