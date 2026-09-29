@@ -113,3 +113,22 @@ annotated `noqa: F401` because it establishes blueprint import order. They
 were inspected but not changed during this frontend correction. Draft PR #220
 must remain unmerged, untagged and unreleased pending the live gates and final
 review.
+
+## Read-only offer expiry checkpoint, 2026-09-29 09:20 UTC
+
+All eleven checks passed on the later evidence-only PR head
+`0a45f6140ddb8dbfe35b84a36c471ab2a1743784`; the PR remains draft.
+The primary bot was still stopped, and protected Cancel All remained idle.
+One of the six offers still marked open in CATalyst's database had reached its
+durable `expires_at` of `2026-09-29T09:19:11+00:00`. Direct read-only Sage
+`get_offer` returned `expired` for inner buy
+`6fe38e0f59c687d4bfd24857725ba25e55eff0ebffda58622be0ec00c89f297f`.
+The other five offers returned `active`. `/api/offers/diagnostic` reported two
+wallet buys and three wallet sells, three DB buys and three DB sells, and that
+exact trade ID in `stale_in_db`, with no `wallet_only` rows or wallet error.
+This is an observed wallet expiry, not proof of a fill or completed local
+reconciliation. The stopped-bot Cancel All path snapshots only wallet-active
+offers; the proof-bound re-prep preflight can examine terminal DB rows later.
+Neither cancellation nor re-prep was run at this checkpoint. The operator's
+protected Cancel All confirmation remains a required handoff, and all final
+wallet and ledger outcomes still need verification.
