@@ -60,6 +60,8 @@ independent acceptance on the secondary PC.
   marked with Internet-origin `ZoneId=3` completed with no matching detection.
 - All eleven PR checks passed on exact source head `bf1abe2`, including CI
   unit tests, lint/syntax, security scan, CodeQL, Gitleaks and Semgrep.
+- All eleven checks also passed on the later evidence-only head `a21de91`;
+  no runtime/source file changed after `bf1abe2`.
 
 ## Independent secondary checkpoint
 
@@ -75,6 +77,35 @@ found the ticket release limited to the durable no-effect denial paths;
 ambiguous or mixed outcomes retain the reservation. The secondary was still
 reconciling its older build process at this checkpoint and had made no
 `bf1abe2` live wallet effect.
+
+The secondary later reported its complete backend suite in eight
+disk-controlled batches: 7,075 passed, one skipped, 422 subtests passed and
+zero failures. Its complete Chromium suite passed 172 tests. Whole-repository
+Ruff passed; `pip-audit` found no known vulnerabilities in
+`requirements.txt`. Bandit reported zero HIGH findings (116 MEDIUM and 595 LOW
+existing findings); the changed runtime file had no MEDIUM/HIGH findings or
+findings on changed lines. These results are secondary-reported evidence,
+separate from the primary full-suite and CI results above.
+
+For a read-only live check, the secondary stopped its superseded process
+before launching the exact `bf1abe2` package from a lean copied profile. It
+preserved an authoritative backup at
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\authoritative-backups\8e89558-profile-20260929-0414`
+with `bot.db` SHA-256
+`12FA89CDBD336D66F0B11800730FCBF0A79F5917F3BB3D7BA87442B40C1641C5`.
+The actual secondary identity was Sage mainnet, fingerprint 3702373391, CAT
+wallet ID 2 and the required MZ asset. The wallet was reachable, synced and
+signing. The bot was stopped with zero active offers, locks, unresolved
+operations, fee reservations and publication claims. Doctor reported
+`can_start=true`, eight passes and two expected warnings (Splash port 4000
+unavailable and Spacescan key absent); Dexie was reachable. Coin Prep verify
+reported `all_sufficient=true` under persisted inactive settings. Smart
+Settings correctly returned RED/INVALID under single-provider dependency,
+insufficient ask depth and excluded out-of-range depth. The UI showed Risk
+Disclosure, and no console error was observed. The secondary screenshot is
+at `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\outputs\bf1abe2-live-ui-initial.png`.
+CATalyst was then stopped on the secondary, with its profile preserved. No
+`bf1abe2` live wallet effect was performed.
 
 ## Primary live handoff
 
