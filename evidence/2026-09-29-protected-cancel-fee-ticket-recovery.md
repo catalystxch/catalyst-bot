@@ -104,8 +104,21 @@ Settings correctly returned RED/INVALID under single-provider dependency,
 insufficient ask depth and excluded out-of-range depth. The UI showed Risk
 Disclosure, and no console error was observed. The secondary screenshot is
 at `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\outputs\bf1abe2-live-ui-initial.png`.
-CATalyst was then stopped on the secondary, with its profile preserved. No
-`bf1abe2` live wallet effect was performed.
+The secondary `bf1abe2` application remained open at the disclosure screen
+as PID 8952, with its bot engine stopped. A later read-only check matched the
+exact EXE hash above, confirmed it owned `127.0.0.1:5000`, and read
+`bot_running=false`, zero buy and sell offers and no API error. The original
+live profile and authoritative backup remained intact. No `bf1abe2` live
+wallet effect was performed.
+
+An optional additional security report exhausted the secondary C: free space
+after the acceptance checks above. The secondary removed only identified
+disposable `bf1abe2` dependency and test scratch directories, leaving source,
+artifacts, evidence, profiles and backups untouched. A fresh disk measurement
+after cleanup reported 1,000,841,216 bytes free. The authoritative backup
+and original live profile each contained 16 files and their `bot.db` hashes
+matched `12FA89CDBD336D66F0B11800730FCBF0A79F5917F3BB3D7BA87442B40C1641C5`.
+No further full suite, scan or package download was attempted on that host.
 
 ## Primary live handoff
 
