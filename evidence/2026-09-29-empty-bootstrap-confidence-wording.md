@@ -78,8 +78,36 @@ but no profile `.env`, database, or runtime logs.
 - ZIP: `https://raw.githubusercontent.com/catalystxch/catalyst-bot/codex/coin-prep-fee-approval-artifacts/acceptance-artifacts/CATalyst-3cb506d-secondary-acceptance.zip`
 - Installer: `https://raw.githubusercontent.com/catalystxch/catalyst-bot/codex/coin-prep-fee-approval-artifacts/acceptance-artifacts/Catalyst-Setup-3cb506d-1.4.0.exe`
 
-The exact `e259f7e` live app remained PID
-125028 with its prior verified executable hash, bot stopped, and zero
-authoritative Sage/database offers. Therefore this new source/package has
-**no live wallet acceptance yet**. PR #220 remains draft; no main merge,
-tag, or public release has occurred.
+## Primary exact-runtime handoff
+
+Before handoff, the `e259f7e` process PID 125028 still owned port 5000 at
+its verified hash. The bot was stopped; the new campaign retained its exact
+mainnet Sage fingerprint 736588221, CAT wallet ID 2, MZ asset, and expiry;
+Sage and the database each showed zero open offers and a consistent book.
+Safety allowed with every blocker count zero. Coin Prep was idle and the
+old approval remained tied to the expired prior campaign at 62,703,765
+mojos spent, zero held, zero unresolved.
+
+An unauthenticated `/api/shutdown` call returned `unauthorized` and did not
+stop the process. The browser's authenticated Shutdown App flow was then
+used with its **Cancel all offers before shutdown** checkbox unchecked.
+The UI reported no open offers left behind; PID 125028 exited and port
+5000 closed. The eight critical files in the primary profile, including
+SQLite database, WAL, and SHM, were copied to
+`C:\catalyst\.superpowers\primary-profile-pre-3cb506d-20260929-1349`.
+Each source/backup SHA-256 matched; `bot.db` SHA-256 was
+`509C6452EA878BF577BBFA6C7A5FA746A0BE3B56D7D555786A3434BD16035174`.
+
+The exact `3cb506d` EXE then started as PID 87740 and owned port 5000.
+Its running executable hash matched the package hash. Read-only recovery
+checks found the same active campaign and expiry, persisted mainnet Sage
+identity, bot stopped, zero Sage/database offers, consistent book, safety
+allowed with zero blockers, and unchanged old fee ledger. The browser now
+shows the corrected authorization-only confidence wording with zero offers.
+It is at fresh Risk Disclosure; `/api/fingerprint` has no active browser
+session fingerprint. The operator was asked to personally acknowledge and
+reconnect Sage. No new wallet transaction occurred during this handoff.
+
+The exact `3cb506d` package has **no live trading lifecycle acceptance
+yet**. PR #220 remains draft; no main merge, tag, or public release has
+occurred.
