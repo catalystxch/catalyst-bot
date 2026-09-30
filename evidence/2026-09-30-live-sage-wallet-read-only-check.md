@@ -111,3 +111,38 @@ open MZ offers, zero campaign fee spend, and no fee approval for this campaign.
 Port 5000 was offline at approximately 09:00 UTC. The other task did not
 restore SQLite or reverse the confirmed wallet fees; the post-Coin-Prep
 balances and database must remain the starting state for subsequent testing.
+
+## Separate isolated v1.3.21 offer cycle
+
+After the older worker was stopped and the primary `.env` restored, the other
+CATalyst test task used an isolated v1.3.21 profile with the same TEST 7 Sage
+wallet for two small live offers. It reported verifying mainnet fingerprint
+`736588221`, the exact MZ asset, zero initially open offers, reserves, and its
+fee scope before wallet effects. It did not use the primary CATalyst profile
+for this cycle.
+
+| Offer | Separate-task result |
+| --- | --- |
+| `af29d59d464e672384de6f0c809823c6b3a2658a8c9075cae45552abf3cf2338` | Created and securely cancelled; Sage terminal `cancelled` |
+| `a218570f91beca8b6df924cc096f6c6f9eb328bcaa97bde58280efd03ea7d48a` | Created, Dexie accepted publication ID `8fz24TU8aAFXJAUvMgR8AUGbtSFCSGAw2q6TkBdryJ59`; Dexie detail changed from status 0 to 3 after secure cancellation; Sage terminal `cancelled` |
+
+The other task reported cancellation transaction IDs
+`2e36fed718a5dcd329e7c3dd36075b4ff649c05f4901e04e701cf436b8cc6b15`
+and `af534d513a2b3f2d84eca4566d9733a4485d82fe4750685b15046317bcb4be46`.
+Each cancellation spent 13,079,100 mojos. Its read-only Sage pending-transaction
+check returned zero.
+
+An independent exact-source wallet-adapter recheck at 09:22 UTC found both
+offer IDs in Sage's complete 4,042-record history with status `cancelled`, zero
+open MZ/XCH buys and sells, and zero open primary database rows. The XCH
+wallet had 219 owned and selectable coins totaling 138,470,919,188,775 mojos,
+equal to its confirmed and spendable balance. That is exactly 26,158,200 mojos
+below the pre-cycle balance. MZ remained 780,212,284 atomic units in one owned
+and selectable coin, also fully spendable. The primary active campaign still
+reported zero fee spend and no Coin Prep fee approval.
+
+The isolated offer cycle confirms behavior of the other task's v1.3.21 code
+and the shared Sage wallet. It does not validate offer creation, Dexie
+publication, or cancellation in the exact `1db16bd` PR #220 candidate. Its
+fees must stay separate from PR #220 campaign accounting. Future primary
+preflight must start from these newer wallet balances.
