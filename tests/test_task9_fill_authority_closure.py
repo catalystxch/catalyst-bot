@@ -826,8 +826,14 @@ def test_migration_never_mints_authority_from_correlated_mutable_economics(
 
 
 def test_market_history_consumes_exact_authoritative_projection(isolated_database):
+    recent_fill = datetime.now(timezone.utc) - timedelta(seconds=2)
+    recent_reconciliation = recent_fill + timedelta(seconds=1)
     for suffix in ("market-history-a", "market-history-b", "market-history-c"):
-        _seed_authoritative_fill(suffix=suffix)
+        _seed_authoritative_fill(
+            suffix=suffix,
+            filled_at=recent_fill.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            reconciled_at=recent_reconciliation.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        )
 
     history = market_data_collector._fetch_internal_db_history(ASSET)
 
@@ -2143,8 +2149,14 @@ def test_round_trip_authority_is_atomic_under_exact_replay_race(
 def test_market_position_uses_authoritative_receipts_not_legacy_inventory(
     isolated_database,
 ):
+    recent_fill = datetime.now(timezone.utc) - timedelta(seconds=2)
     _seed_authoritative_fill(
-        suffix="market-position-authority", size_cat=Decimal("100")
+        suffix="market-position-authority",
+        size_cat=Decimal("100"),
+        filled_at=recent_fill.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        reconciled_at=(recent_fill + timedelta(seconds=1)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        ),
     )
     assert database.record_inventory_snapshot(ASSET, Decimal("877"))
 
