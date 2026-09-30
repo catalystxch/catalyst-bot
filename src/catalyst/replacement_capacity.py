@@ -488,7 +488,7 @@ def verify_coin_prep_post_view(
         return CoinPrepPostViewDecision(False, "source_coin_identity_malformed", ())
     if type(expected_outputs) is not list or not expected_outputs:
         return CoinPrepPostViewDecision(False, "expected_outputs_malformed", ())
-    expected: dict[str, tuple[int, str]] = {}
+    expected: dict[str, tuple[int, str, int | None]] = {}
     try:
         for output in expected_outputs:
             if type(output) is not dict:
@@ -498,15 +498,20 @@ def verify_coin_prep_post_view(
             if type(amount) is not int or amount <= 0:
                 raise ValueError
             purpose = validate_purpose(output.get("purpose"))
+            spent_height = output.get("spent_height")
+            if spent_height is not None and (
+                type(spent_height) is not int or spent_height <= 0
+            ):
+                raise ValueError
             if coin_id in expected:
                 return CoinPrepPostViewDecision(False, "duplicate_expected_output", ())
-            expected[coin_id] = (amount, purpose)
+            expected[coin_id] = (amount, purpose, spent_height)
     except (TypeError, ValueError):
         return CoinPrepPostViewDecision(False, "expected_outputs_malformed", ())
     coins = authoritative_view.get("coins")
     if type(coins) is not list or len(coins) > _MAX_CAPACITY_COINS:
         return CoinPrepPostViewDecision(False, "authoritative_view_malformed", ())
-    observed: dict[str, tuple[Any, Any]] = {}
+    observed: dict[str, tuple[Any, Any, Any]] = {}
     for coin in coins:
         if type(coin) is not dict:
             return CoinPrepPostViewDecision(False, "authoritative_view_malformed", ())
@@ -516,7 +521,16 @@ def verify_coin_prep_post_view(
             return CoinPrepPostViewDecision(False, "authoritative_view_malformed", ())
         if coin_id in observed:
             return CoinPrepPostViewDecision(False, "duplicate_coin_identity", ())
-        observed[coin_id] = (coin.get("amount_mojos"), coin.get("purpose"))
+        spent_height = coin.get("spent_height")
+        if spent_height is not None and (
+            type(spent_height) is not int or spent_height <= 0
+        ):
+            return CoinPrepPostViewDecision(False, "authoritative_view_malformed", ())
+        observed[coin_id] = (
+            coin.get("amount_mojos"),
+            coin.get("purpose"),
+            spent_height,
+        )
     if sources.intersection(observed):
         return CoinPrepPostViewDecision(False, "source_coin_still_present", ())
     if not set(expected).issubset(observed):
