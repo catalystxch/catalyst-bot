@@ -77,14 +77,25 @@ acceptance artifacts, not a public release.
 
 ## Live acceptance boundary
 
+At 14:51 UTC, the other TEST 7 task had authoritatively cancelled its 48
+offers and released that wallet. Secondary acceptance was using an independent
+Harvestr wallet, not TEST 7. A new read-only check through the exact source
+wallet facade found Sage `mainnet`, fingerprint `736588221`, CAT wallet ID 2
+with the exact MZ asset, and a complete 4,095-record offer history with zero
+active offers. The primary database also had zero open MZ offers. Sage reported
+138,470,301,476,875 confirmed and spendable XCH mojos and 780,212,284 MZ
+atomic units, with no pending transactions. There was no CATalyst process or
+port 5000 listener. This establishes a free wallet for future preflight, not
+an exact-candidate live lifecycle result.
+
 The approved PR #220 Bootstrap campaign
 `c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
 expired at `2026-09-30T11:27:42.748405Z` without exact-candidate wallet
 effect or fee approval. Its prior-campaign approval must not be reused.
-Another authorized QA task is now preparing a separate 50% two-sided market
-on the shared TEST 7 wallet, so this PR task is not making concurrent wallet
-writes. Automatic approval review previously rejected a command-tool launch
-of the predecessor exact EXE against the primary profile before execution,
+The campaign remains persisted as `active` but is past its exact expiry, with
+zero authoritative campaign fee spend and no campaign fee approval. No new
+campaign has been approved. Automatic approval review previously rejected a
+command-tool launch of the predecessor exact EXE against the primary profile before execution,
 with reason `blocked by policy`; this task has not retried that live launch
 through another tool. The exact `f41e4d4` package has **not** run against the
 primary live profile. Its Coin Prep, offer lifecycle, restart recovery and 24-hour live
