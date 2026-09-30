@@ -68,3 +68,30 @@ personally acknowledged in any new live session. Primary and secondary exact
 candidate Coin Prep, offer lifecycle, restart recovery and 24-hour stability
 gates remain open. PR #220 remains draft; no main merge, tag, release, or
 public-readiness claim follows from this evidence.
+
+## Independent secondary-PC review
+
+The secondary task independently verified the exact source commit and that
+the branch's next head changed only these acceptance documents. It downloaded
+the ZIP and installer and matched both hashes above, extracted the EXE and
+matched its hash, and confirmed bundled `bot_gui.html` was byte-for-byte equal
+to the exact source (SHA-256
+`8EAEAB212D29F16A4773D516FFBB73BA05941AEADE8FB4D8C845CF4E626EC597`).
+The EXE reported version 1.4.0.0, was unsigned as expected, and a Defender
+custom scan reported zero detections. Its patch review found no new defect.
+Focused checks passed: one saved-setting Chromium regression, four
+calendar-sensitive backend cases, and 39 fee approval, public readiness,
+navigation, reset and browser-console checks. Ruff, formatting and diff
+checks passed. The secondary report is
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\2026-09-30-b4a3daf-independent-readonly.md`
+(SHA-256 `FFEA1D47D88105F63592D2CA2047A752675199DFAD2E8216675394C879B5369B`).
+
+The secondary platform rejected direct startup of the downloaded exact EXE
+before process creation with `blocked by policy`; the task did not route
+around it. Therefore it could not repeat packaged API/native/Sage runtime on
+that PC. Its independent Harvestr profile was preserved, the bot was stopped,
+ports 5000/4000/4001 were closed, and it made no wallet transaction or fee
+approval. The package has no embedded source commit or acceptance manifest;
+exact hashes, source/build records, and bundled UI parity are the available
+provenance evidence. Secondary package-runtime and live lifecycle gates remain
+open.
