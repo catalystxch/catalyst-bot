@@ -59,6 +59,14 @@ ASSET_ID = "b8" * 32
 ADDRESS = "xch1" + "q" * 58
 
 
+class _FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return NOW.replace(tzinfo=None)
+        return NOW.astimezone(tz)
+
+
 def _request(**overrides):
     body = {
         "asset_id": ASSET_ID,
@@ -494,6 +502,7 @@ def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
         ),
     ).get_json()
     monkeypatch.setattr(coin_prep.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
+    monkeypatch.setattr(coin_prep, "datetime", _FrozenDateTime)
     monkeypatch.setattr(coin_prep.cfg, "WALLET_ID_XCH", 1, raising=False)
     monkeypatch.setattr(coin_prep.cfg, "CAT_DECIMALS", 3, raising=False)
     monkeypatch.setattr(
@@ -1066,6 +1075,7 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     import tx_fees
     import wallet
 
+    monkeypatch.setattr(bot_loop, "datetime", _FrozenDateTime)
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID, raising=False)
     monkeypatch.setattr(bot_loop.cfg, "CAT_WALLET_ID", 2, raising=False)
     monkeypatch.setattr(bot_loop.cfg, "WALLET_ID_XCH", 1, raising=False)
