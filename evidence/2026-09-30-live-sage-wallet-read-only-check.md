@@ -89,3 +89,25 @@ These were wallet effects from the separate older-source test, not from the
 exact PR #220 candidate. Any later candidate preflight must use the fresh
 wallet balances and must not attribute or reuse the older test's fees or the
 expired campaign's approval.
+
+## Primary configuration restoration
+
+The separate test task then reported that its Smart Settings save had changed
+68 values in the primary `%APPDATA%\Catalyst\.env`. It restored that file
+atomically from its own pretest backup at
+`C:\catalyst\.codex_tmp\live_test_20260930\before.env`. Independent SHA-256
+checks found both the restored live file and pretest backup to be
+`522FFB318708BEEF93A19EACBCBE0B38414272203433FA3ACFBD1A0001408720`
+(3,251 bytes). This is a newer backup than the separate pre-`1db16bd`
+profile snapshot; the latter's `.env` hash was
+`EF0DA9EDDB8A3F7C115745DAF1FBEEF6B156DEF89214B18B9686AC346468A4FB`
+(3,188 bytes) and was not used for this restoration.
+
+After restoration, the exact-source configuration loader read Sage, fingerprint
+`736588221`, CAT wallet ID `2`, the exact MZ asset, XCH reserve `13.847`, and
+CAT reserve `78021`. A fresh read-only Sage identity check matched mainnet and
+that fingerprint. The database still showed the same active campaign, zero
+open MZ offers, zero campaign fee spend, and no fee approval for this campaign.
+Port 5000 was offline at approximately 09:00 UTC. The other task did not
+restore SQLite or reverse the confirmed wallet fees; the post-Coin-Prep
+balances and database must remain the starting state for subsequent testing.
