@@ -48,3 +48,44 @@ application has not run against the primary profile, and its Coin Prep, offer
 creation/publication, restart recovery, live lifecycle, and 24-hour stability
 gates remain unverified. PR #220 remains draft; no release-readiness conclusion
 follows from this check.
+
+## Separate older-source Coin Prep on the shared wallet
+
+At approximately 08:31 UTC, port 5000 became occupied by a separate Codex
+task's `python desktop_app.py --flask` process from `C:\catalyst`, branch
+`codex/dashboard-live-balances`, source commit
+`15f6aab76327b569bbc100e43b54e09a63c6a77d`. Its `/api/health` identified
+version `1.2.64+1.g15f6aab`, a stopped bot, and a synced Sage wallet. Its
+missing `/api/bootstrap/status` route also showed that it was not the exact
+PR #220 candidate. The other task was warned that the wallet and primary
+profile may be shared, and that this older runtime cannot supply PR #220
+acceptance evidence.
+
+That task reported it had already started Coin Prep on the live TEST 7 wallet.
+Read-only `GET /api/coin-prep/status` at 08:38 UTC showed worker PID 18004 in
+CAT consolidation. The older worker targeted 106 XCH and 56 CAT tier coins,
+with reported tier pools of 92.02589 XCH and 575,237.146 MZ. Those quantities
+are outside the separate active PR #220 Bootstrap campaign's 0.9 XCH and
+12,000 MZ market budgets. This older Coin Prep is therefore not evidence that
+the bounded campaign was prepared or safe to start. Its log reported CAT
+self-send fees of 52,316,400 and 26,158,200 mojos, then a follow-up self-send
+fee of 13,079,100 mojos. The other task cancelled Coin Prep through its UI at
+09:41 local, before an XCH split or offer creation, and reported that it would
+make no further wallet writes from the older runtime.
+
+An independent read-only Sage recheck at approximately 08:43 UTC found the
+correct mainnet fingerprint, 219 owned and selectable XCH coins totaling
+138,470,945,346,975 mojos, and one owned and selectable MZ coin totaling
+780,212,284 atomic units. These sums matched the reported confirmed and
+spendable wallet balances. XCH had decreased by exactly 91,553,700 mojos from
+the pre-Coin-Prep check, equal to the three logged CAT self-send fees. Sage's
+complete 4,040-record offer history still had zero open MZ/XCH buys and sells;
+the CATalyst database still had zero open MZ offers. The active PR #220
+campaign still reported zero authoritative fee spend and no fee approval.
+The prior campaign's approval still reported 62,703,765 mojos spent, zero
+held, and zero unresolved operations. Worker PID 18004 was gone.
+
+These were wallet effects from the separate older-source test, not from the
+exact PR #220 candidate. Any later candidate preflight must use the fresh
+wallet balances and must not attribute or reuse the older test's fees or the
+expired campaign's approval.
