@@ -10118,23 +10118,6 @@ class CoinPrepWorker:
             self._log_coin_snapshot(self.xch_wallet_id, "XCH", "INITIAL")
             self._log_coin_snapshot(self.cat_wallet_id, "CAT", "INITIAL")
 
-            # Clean stale DB rows: mark ALL existing coins as 'gone' before we start.
-            # Consolidation destroys every coin. The final sweep will re-insert
-            # only the coins that actually exist after prep, keeping the DB clean.
-            if self._db_ready:
-                try:
-                    from database import (
-                        mark_unreserved_free_coins_gone_for_preparation,
-                    )
-
-                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
-                    if stale_count > 0:
-                        self.log(
-                            f"   DB: marked {stale_count} stale coins as 'gone' (fresh start)"
-                        )
-                except Exception as e:
-                    self.log(f"   DB: stale cleanup failed: {e}")
-
             self._set_status_coin_counts(xch_total=xch_coins, cat_total=cat_coins)
             self.update_status(
                 PrepPhase.ANALYZING, 0.05, f"Current: XCH={xch_coins}, CAT={cat_coins}"
@@ -10386,6 +10369,23 @@ class CoinPrepWorker:
                     error="DIRECT_BATCH_FAILED",
                 )
                 return False
+
+            # Only the legacy consolidation flow consumes every free input.
+            # Direct batches above preserve reusable, still-owned coins and
+            # journal the exact inputs they actually spend.
+            if self._db_ready:
+                try:
+                    from database import (
+                        mark_unreserved_free_coins_gone_for_preparation,
+                    )
+
+                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
+                    if stale_count > 0:
+                        self.log(
+                            f"   DB: marked {stale_count} stale coins as 'gone' (legacy rebuild)"
+                        )
+                except Exception as e:
+                    self.log(f"   DB: stale cleanup failed: {e}")
 
             self.log(f"\n{'=' * 60}")
             self.log("⚡ PARALLEL CONSOLIDATION")

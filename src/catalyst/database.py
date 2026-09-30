@@ -9982,7 +9982,9 @@ def upsert_coin(
         # Key behavior:
         # - NEW coins: get the provided designation (or 'unknown')
         # - EXISTING coins: keep their current designation (COALESCE preserves it)
-        # - REAPPEARING coins (was 'gone'): reset designation to 'unknown'
+        # - REAPPEARING coins (was 'gone'): reset designation to 'unknown',
+        #   while preserving their validated origin purpose. A prep sweep can
+        #   temporarily park a still-owned coin when liquidity mode changes.
         conn.execute(
             """INSERT INTO coins (coin_id, wallet_type, amount_mojos, tier, status,
                                   first_seen, last_seen, designation, assigned_tier,
@@ -10005,7 +10007,8 @@ def upsert_coin(
                        ELSE COALESCE(coins.assigned_tier, 'none')
                    END,
                    purpose = CASE
-                       WHEN coins.status = 'gone' THEN NULL
+                       WHEN coins.status = 'gone'
+                           THEN COALESCE(coins.purpose, excluded.purpose)
                        ELSE coins.purpose
                    END""",
             (
@@ -10344,12 +10347,16 @@ def mark_coin_spent(coin_id: str) -> bool:
             conn.close()
 
 
-def mark_coins_gone(coin_ids: List[str]) -> int:
+def mark_coins_gone(coin_ids: List[str], *, _preserve_purpose: bool = False) -> int:
     """Batch mark coins as 'gone' (vanished from wallet).
 
     Called after a snapshot when coins that were 'free' in the DB
     are no longer visible in the wallet. This could mean they were
     spent externally, or the wallet hasn't synced yet.
+
+    Preparation's temporary full-inventory park keeps proven output origin
+    so a still-owned coin can be reclassified after a liquidity-mode change.
+    Ordinary disappearance clears that origin as before.
 
     Args:
         coin_ids: List of coin IDs that disappeared
@@ -10390,10 +10397,11 @@ def mark_coins_gone(coin_ids: List[str]) -> int:
         # Batch UPDATE
         cursor = conn.execute(
             f"""UPDATE coins SET status='gone', last_seen=?,
-                designation='unknown', assigned_tier='none', purpose=NULL
+                designation='unknown', assigned_tier='none',
+                purpose=CASE WHEN ? THEN purpose ELSE NULL END
                 WHERE coin_id IN ({safe_placeholders}) AND status='free'
                   AND trade_id IS NULL""",
-            [now] + safe_coin_list,
+            [now, int(_preserve_purpose)] + safe_coin_list,
         )
         count = cursor.rowcount
         conn.commit()
@@ -12078,7 +12086,9 @@ def mark_unreserved_free_coins_gone_for_preparation() -> int:
     )
     if len(rows) > _MAX_PREPARATION_FREE_COIN_CLEANUP:
         raise RuntimeError("free coin preparation cleanup limit exceeded")
-    return mark_coins_gone([str(row["coin_id"]) for row in rows])
+    return mark_coins_gone(
+        [str(row["coin_id"]) for row in rows], _preserve_purpose=True
+    )
 
 
 def _offer_terminal_mutation_is_protected(
