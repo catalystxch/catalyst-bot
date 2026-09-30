@@ -37844,7 +37844,10 @@ async function startupMaybeShowChangeAddressPrompt() {
             signal: AbortSignal.timeout(5000)
         });
         const data = await resp.json();
-        if (data && data.sage_set_change_address) {
+        const savedSetting = data
+            ? (data.SAGE_SET_CHANGE_ADDRESS ?? data.sage_set_change_address)
+            : false;
+        if (savedSetting === true || String(savedSetting).toLowerCase() === 'true') {
             return false;
         }
     } catch (err) {
