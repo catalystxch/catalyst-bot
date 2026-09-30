@@ -108,6 +108,32 @@ def test_running_session_reload_never_shows_risk_disclosure(flask_server, page):
     assert page.evaluate("window.__riskDisclosureEverVisible") is False
 
 
+def test_startup_skips_change_address_prompt_when_saved_setting_is_enabled(
+    flask_server, page
+):
+    """The startup prompt must honor the canonical uppercase config key."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"SAGE_SET_CHANGE_ADDRESS": True}),
+        ),
+    )
+    page.goto(flask_server, wait_until="domcontentloaded")
+    prompted = page.evaluate(
+        """async () => {
+            _startupWalletType = 'sage';
+            _startupChangeAddressPromptShown = false;
+            localStorage.removeItem('sage_change_address_declined');
+            return await startupMaybeShowChangeAddressPrompt();
+        }"""
+    )
+
+    assert prompted is False
+    expect(page.locator("#startupChangeAddressSection")).to_be_hidden()
+
+
 def test_dismissing_disclaimer_reveals_wallet_gate(app_page):
     """Continuing past the disclaimer should land on a Sage startup gate."""
     assert dismiss_disclaimer(app_page) is True
