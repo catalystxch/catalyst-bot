@@ -9906,6 +9906,7 @@ class CoinPrepWorker:
                     return None
                 expected_outputs = []
                 owned_outputs_match = True
+                owned_output_ids = set()
                 for output in constructed:
                     if type(output) is not dict:
                         return None
@@ -9923,6 +9924,8 @@ class CoinPrepWorker:
                         return None
                     if asset_view.get(coin_id) != amount:
                         owned_outputs_match = False
+                    else:
+                        owned_output_ids.add(coin_id)
                     expected_outputs.append(
                         {
                             "coin_id": coin_id,
@@ -9937,7 +9940,7 @@ class CoinPrepWorker:
                     if cat_asset_id.startswith("0x"):
                         cat_asset_id = cat_asset_id[2:]
                     historical_ids = []
-                    asset_hints = {}
+                    expected_assets = {}
                     for output in constructed:
                         coin_id = self._canonical_coin_id(output.get("coin_id"))
                         asset = output.get("asset")
@@ -9950,11 +9953,8 @@ class CoinPrepWorker:
                         else:
                             return None
                         historical_ids.append(coin_id)
-                        asset_hints[coin_id] = asset_id
-                    historical = get_coins_by_ids(
-                        historical_ids,
-                        authoritative_asset_hints=asset_hints,
-                    )
+                        expected_assets[coin_id] = asset_id
+                    historical = get_coins_by_ids(historical_ids)
                     if type(historical) is not dict:
                         return None
                     historical_by_id = {}
@@ -9965,11 +9965,15 @@ class CoinPrepWorker:
                         historical_by_id[coin_id] = record
                     if set(historical_by_id) != set(historical_ids):
                         return None
+                    expected_by_id = {
+                        output["coin_id"]: output for output in expected_outputs
+                    }
                     for output in constructed:
                         coin_id = self._canonical_coin_id(output.get("coin_id"))
                         record = historical_by_id[coin_id]
                         created_height = record.get("created_height")
                         spent_height = record.get("spent_height")
+                        explicit_asset_id = record.get("asset_id")
                         if (
                             type(created_height) is not int
                             or created_height <= 0
@@ -9981,9 +9985,19 @@ class CoinPrepWorker:
                                 )
                             )
                             or record.get("amount") != output.get("amount_mojos")
-                            or record.get("asset_id") != asset_hints[coin_id]
+                            or (
+                                explicit_asset_id is not None
+                                and explicit_asset_id != expected_assets[coin_id]
+                            )
                         ):
                             return None
+                        if coin_id in owned_output_ids:
+                            if spent_height is not None:
+                                return None
+                        else:
+                            if spent_height is None:
+                                return None
+                            expected_by_id[coin_id]["spent_height"] = spent_height
                 observed_text = identity_decision["observed_at_utc"]
                 observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
                 expires_text = (

@@ -2056,7 +2056,9 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                 "+00:00", "Z"
             ),
         }
-        self.worker._get_confirmed_owned_coins_via_rpc = lambda *_args: []
+        self.worker._get_confirmed_owned_coins_via_rpc = lambda *_args: [
+            {"coin_id": unspent_output, "amount_mojos": 60}
+        ]
         self.worker._get_sage_selectable_coin_ids_for_recovery = lambda _wid: set()
         historical = {
             spent_output: {
@@ -2085,6 +2087,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     "coin_id": spent_output,
                     "amount_mojos": 40,
                     "purpose": "replacement",
+                    "spent_height": 950,
                 },
                 {
                     "coin_id": unspent_output,
@@ -2097,6 +2100,15 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
         historical[spent_output] = {
             **historical[spent_output],
             "amount": 41,
+        }
+        self.assertIsNone(
+            self.worker._observe_recoverable_coin_prep_operation(operation)
+        )
+
+        historical[spent_output] = {
+            **historical[spent_output],
+            "amount": 40,
+            "spent_height": None,
         }
         self.assertIsNone(
             self.worker._observe_recoverable_coin_prep_operation(operation)

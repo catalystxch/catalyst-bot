@@ -25792,46 +25792,75 @@ def record_coin_prep_operation_outcome(
                 output_purpose = _validated_coin_purpose(
                     output["purpose"], allow_none=False
                 )
-                if _coin_terminal_mutation_is_protected(conn, output_coin_id):
+                spent_height = output.get("spent_height")
+                output_is_spent = spent_height is not None
+                if output_is_spent and (
+                    type(spent_height) is not int or spent_height <= 0
+                ):
                     raise ValueError(
-                        "coin prep confirmed output has protected permanent history"
+                        "coin prep confirmed output spent height is invalid"
                     )
                 existing_output = conn.execute(
                     "SELECT wallet_type, amount_mojos, status, trade_id, purpose "
                     "FROM coins WHERE coin_id=?",
                     (output_coin_id,),
                 ).fetchone()
-                if existing_output is not None and (
-                    existing_output["wallet_type"] != output_wallet_type
-                    or int(existing_output["amount_mojos"]) != amount_mojos
-                    or existing_output["status"] not in {"free", "gone"}
-                    or existing_output["trade_id"] is not None
-                    or existing_output["purpose"] not in {None, output_purpose}
-                ):
-                    raise ValueError(
-                        "coin prep confirmed output contradicts durable coin state"
+                if _coin_terminal_mutation_is_protected(conn, output_coin_id):
+                    if (
+                        not output_is_spent
+                        or existing_output is None
+                        or existing_output["wallet_type"] != output_wallet_type
+                        or int(existing_output["amount_mojos"]) != amount_mojos
+                        or existing_output["status"] != "spent"
+                    ):
+                        raise ValueError(
+                            "coin prep confirmed output contradicts protected "
+                            "permanent history"
+                        )
+                    continue
+                if existing_output is not None:
+                    allowed_statuses = (
+                        {"free", "gone", "spent"}
+                        if output_is_spent
+                        else {"free", "gone"}
                     )
+                    if (
+                        existing_output["wallet_type"] != output_wallet_type
+                        or int(existing_output["amount_mojos"]) != amount_mojos
+                        or existing_output["status"] not in allowed_statuses
+                        or existing_output["trade_id"] is not None
+                        or existing_output["purpose"] not in {None, output_purpose}
+                    ):
+                        raise ValueError(
+                            "coin prep confirmed output contradicts durable coin state"
+                        )
+                output_status = "spent" if output_is_spent else "free"
+                stored_purpose = None if output_is_spent else output_purpose
                 conn.execute(
                     """
                     INSERT INTO coins (
                         coin_id, wallet_type, amount_mojos, tier, status,
                         first_seen, last_seen, designation, assigned_tier, purpose
-                    ) VALUES (?, ?, ?, NULL, 'free', ?, ?, 'unknown', 'none', ?)
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, 'unknown', 'none', ?)
                     ON CONFLICT(coin_id) DO UPDATE SET
-                        status='free', trade_id=NULL, last_seen=excluded.last_seen,
-                        designation=CASE WHEN coins.status='gone'
+                        status=excluded.status, trade_id=NULL,
+                        last_seen=excluded.last_seen,
+                        designation=CASE WHEN excluded.status='spent'
+                                              OR coins.status='gone'
                                          THEN 'unknown' ELSE coins.designation END,
-                        assigned_tier=CASE WHEN coins.status='gone'
-                                           THEN 'none' ELSE coins.assigned_tier END,
+                        assigned_tier=CASE WHEN excluded.status='spent'
+                                               OR coins.status='gone'
+                                            THEN 'none' ELSE coins.assigned_tier END,
                         purpose=excluded.purpose
                     """,
                     (
                         output_coin_id,
                         output_wallet_type,
                         amount_mojos,
+                        output_status,
                         when,
                         when,
-                        output_purpose,
+                        stored_purpose,
                     ),
                 )
         conn.execute(
