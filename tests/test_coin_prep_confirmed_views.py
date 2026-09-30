@@ -62,6 +62,7 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
             "wallet_sage"
         ].get_spendable_coin_count(wallet_id)
         fake_wallet.get_pending_transactions = lambda: []
+        fake_wallet.get_coins_by_ids = lambda *_args, **_kwargs: None
         fake_wallet.build_transaction_rpc = lambda *args, **kwargs: {"success": True}
         fake_wallet.estimate_unsigned_transaction_cost = lambda *args, **kwargs: None
         fake_wallet.submit_built_transaction_rpc = lambda *args, **kwargs: {
@@ -1978,6 +1979,127 @@ class CoinPrepConfirmedViewTests(unittest.TestCase):
                     "purpose": "fee_reserve",
                 },
             ],
+        )
+
+    def test_v2_recovery_accepts_exact_confirmed_outputs_after_some_are_spent(self):
+        """A confirmed direct batch must not fence startup after later spends."""
+
+        source = hashlib.sha256(b"spent-v2-source").hexdigest()
+        spent_output = hashlib.sha256(b"spent-v2-output").hexdigest()
+        unspent_output = hashlib.sha256(b"unspent-v2-output").hexdigest()
+        now = datetime.now(timezone.utc)
+        identity = {
+            "backend": "sage",
+            "name": "Task 12 Wallet",
+            "fingerprint": 123,
+            "network_id": "mainnet",
+            "kind": "bls",
+            "has_secrets": True,
+            "bound_at_utc": (now - timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "maximum_age_seconds": 300,
+        }
+        constructed = [
+            {
+                "asset": "xch",
+                "address": "xch1owner",
+                "amount_mojos": 40,
+                "purpose": "replacement",
+                "ordinal": 0,
+                "coin_id": spent_output,
+            },
+            {
+                "asset": "xch",
+                "address": "xch1owner",
+                "amount_mojos": 60,
+                "purpose": "top_up",
+                "ordinal": -1,
+                "coin_id": unspent_output,
+            },
+        ]
+        operation = {
+            "operation_id": "coin-prep:" + "a" * 64,
+            "outcome": "SUBMITTED_UNKNOWN",
+            "source_coin_ids_json": json.dumps([source]),
+            "effect_fee_coin_ids_json": "[]",
+            "target_contract_json": json.dumps(
+                {
+                    "contract_version": 2,
+                    "wallet_type": "xch",
+                    "outputs": [
+                        {
+                            "output_index": 0,
+                            "asset": "xch",
+                            "amount_mojos": 40,
+                            "purpose": "replacement",
+                        },
+                        {
+                            "output_index": 1,
+                            "asset": "xch",
+                            "amount_mojos": 60,
+                            "purpose": "top_up",
+                        },
+                    ],
+                }
+            ),
+            "constructed_outputs_json": json.dumps(constructed),
+            "prepared_evidence_json": json.dumps({"pre_view_coin_ids": [source]}),
+            "wallet_identity_json": json.dumps(identity),
+        }
+        self.worker.xch_wallet_id = 1
+        self.worker.cat_wallet_id = 2
+        self.coin_prep_worker.get_wallet_identity = lambda: {
+            **identity,
+            "success": True,
+            "observed_at_utc": now.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        }
+        self.worker._get_confirmed_owned_coins_via_rpc = lambda *_args: []
+        self.worker._get_sage_selectable_coin_ids_for_recovery = lambda _wid: set()
+        historical = {
+            spent_output: {
+                "amount": 40,
+                "asset_id": "xch",
+                "created_height": 900,
+                "spent_height": 950,
+            },
+            unspent_output: {
+                "amount": 60,
+                "asset_id": "xch",
+                "created_height": 900,
+                "spent_height": None,
+            },
+        }
+        self.coin_prep_worker.get_coins_by_ids = lambda coin_ids, **_kwargs: dict(
+            historical
+        )
+
+        observation = self.worker._observe_recoverable_coin_prep_operation(operation)
+
+        self.assertEqual(
+            observation["expected_outputs"],
+            [
+                {
+                    "coin_id": spent_output,
+                    "amount_mojos": 40,
+                    "purpose": "replacement",
+                },
+                {
+                    "coin_id": unspent_output,
+                    "amount_mojos": 60,
+                    "purpose": "top_up",
+                },
+            ],
+        )
+
+        historical[spent_output] = {
+            **historical[spent_output],
+            "amount": 41,
+        }
+        self.assertIsNone(
+            self.worker._observe_recoverable_coin_prep_operation(operation)
         )
 
     def test_sage_native_split_contract_matches_ceil_then_final_output(self):

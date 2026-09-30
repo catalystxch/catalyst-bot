@@ -98,6 +98,22 @@ _WORKER_DELEGATION_ENV_NAMES = (
 _worker_delegation_environment = None
 
 
+def get_coins_by_ids(coin_ids: list[str], **kwargs) -> dict | None:
+    """Read exact historical records when the selected wallet exposes them."""
+
+    try:
+        import wallet as wallet_facade
+
+        callback = getattr(wallet_facade, "get_coins_by_ids", None)
+        if callable(callback):
+            result = callback(coin_ids, **kwargs)
+            if type(result) is dict:
+                return result
+    except Exception:
+        pass
+    return None
+
+
 def get_transaction_relay_outcome(transaction_id: str) -> dict:
     """Read optional native-wallet relay evidence without requiring adapters."""
 
@@ -9889,6 +9905,7 @@ class CoinPrepWorker:
                 ):
                     return None
                 expected_outputs = []
+                owned_outputs_match = True
                 for output in constructed:
                     if type(output) is not dict:
                         return None
@@ -9902,9 +9919,10 @@ class CoinPrepWorker:
                         or type(amount) is not int
                         or amount <= 0
                         or type(purpose) is not str
-                        or asset_view.get(coin_id) != amount
                     ):
                         return None
+                    if asset_view.get(coin_id) != amount:
+                        owned_outputs_match = False
                     expected_outputs.append(
                         {
                             "coin_id": coin_id,
@@ -9912,6 +9930,60 @@ class CoinPrepWorker:
                             "purpose": purpose,
                         }
                     )
+                if len(expected_outputs) != len(constructed):
+                    return None
+                if not owned_outputs_match:
+                    cat_asset_id = str(target.get("cat_asset_id") or "").lower()
+                    if cat_asset_id.startswith("0x"):
+                        cat_asset_id = cat_asset_id[2:]
+                    historical_ids = []
+                    asset_hints = {}
+                    for output in constructed:
+                        coin_id = self._canonical_coin_id(output.get("coin_id"))
+                        asset = output.get("asset")
+                        if asset == "xch":
+                            asset_id = "xch"
+                        elif asset == "cat" and re.fullmatch(
+                            r"[0-9a-f]{64}", cat_asset_id
+                        ):
+                            asset_id = cat_asset_id
+                        else:
+                            return None
+                        historical_ids.append(coin_id)
+                        asset_hints[coin_id] = asset_id
+                    historical = get_coins_by_ids(
+                        historical_ids,
+                        authoritative_asset_hints=asset_hints,
+                    )
+                    if type(historical) is not dict:
+                        return None
+                    historical_by_id = {}
+                    for raw_coin_id, record in historical.items():
+                        coin_id = self._canonical_coin_id(raw_coin_id)
+                        if type(record) is not dict or coin_id in historical_by_id:
+                            return None
+                        historical_by_id[coin_id] = record
+                    if set(historical_by_id) != set(historical_ids):
+                        return None
+                    for output in constructed:
+                        coin_id = self._canonical_coin_id(output.get("coin_id"))
+                        record = historical_by_id[coin_id]
+                        created_height = record.get("created_height")
+                        spent_height = record.get("spent_height")
+                        if (
+                            type(created_height) is not int
+                            or created_height <= 0
+                            or (
+                                spent_height is not None
+                                and (
+                                    type(spent_height) is not int
+                                    or spent_height < created_height
+                                )
+                            )
+                            or record.get("amount") != output.get("amount_mojos")
+                            or record.get("asset_id") != asset_hints[coin_id]
+                        ):
+                            return None
                 observed_text = identity_decision["observed_at_utc"]
                 observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
                 expires_text = (
