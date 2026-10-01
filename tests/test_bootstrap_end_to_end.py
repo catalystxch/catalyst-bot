@@ -833,6 +833,15 @@ def test_bootstrap_created_intent_replay_rejects_persisted_overlong_offer(
     )
     assert accepted["success"] is True
     assert accepted["offer_max_time"] == int(deadline.timestamp())
+    monkeypatch.setattr("offer_manager.cfg.LIQUIDITY_MODE", "sell_only")
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_BUY", False)
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_SELL", True)
+    replayed = OfferManager._existing_creation_result(
+        intent,
+        {"lifecycle_state": "created", "sage_trade_id": "d" * 64},
+    )
+    assert replayed["success"] is True
+    assert replayed["_catalyst_idempotent_replay"] is True
 
 
 def test_bootstrap_offer_is_projected_before_it_can_be_published(

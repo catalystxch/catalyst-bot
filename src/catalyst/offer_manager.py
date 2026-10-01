@@ -2518,11 +2518,13 @@ class OfferManager:
                 )
                 return OfferManager._creation_reconciliation_result(intent)
             try:
+                # This offer is already in Sage. Replaying its durable result
+                # makes no wallet mutation, even if the operator disabled its
+                # side after creation; retain campaign/expiry validation.
                 require_active_bootstrap_intent_authority(
                     purpose=intent.purpose,
                     asset_id=intent.asset_id,
                     offer_max_time=offer_max_time,
-                    side=intent.side,
                 )
             except ValueError:
                 return {
