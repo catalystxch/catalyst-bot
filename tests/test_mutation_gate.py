@@ -7012,6 +7012,70 @@ def test_desktop_rechecks_authority_after_coin_prep_recovery_attempt(monkeypatch
     ]
 
 
+def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
+    """An unresolved fresh decision must still route startup to diagnostics."""
+
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+        "failed_check": "unresolved_operations",
+    }
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+            return True
+
+    monkeypatch.setattr(
+        read_only_diagnostics, "acquire_startup_arbiter", lambda: Arbiter()
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or dict(blocked),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_wallet_setup_bootstrap",
+        lambda _authorization: events.append("bootstrap_denied") or False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(
+            recover_coin_prep_operations_at_startup=lambda: (
+                events.append("coin_prep_recovery") or False
+            )
+        ),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert desktop_app._startup_diagnostics_status["reason_code"] == (
+        "COIN_PREP_RECOVERY_REQUIRED"
+    )
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+        "bootstrap_denied",
+        "arbiter_release",
+    ]
+
+
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     lease = {
