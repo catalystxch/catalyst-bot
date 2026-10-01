@@ -132,7 +132,13 @@ def test_preview_rejects_full_wave_principal_that_consumes_reserve_and_fee_coins
     monkeypatch.setattr(
         bootstrap,
         "cfg",
-        SimpleNamespace(XCH_RESERVE="24.082", CAT_RESERVE="338152.172"),
+        SimpleNamespace(
+            XCH_RESERVE="24.082",
+            CAT_RESERVE="338152.172",
+            LIQUIDITY_MODE="two_sided",
+            ENABLE_BUY=True,
+            ENABLE_SELL=True,
+        ),
     )
     body = _request(
         anchor_price="0.000075",
@@ -166,7 +172,13 @@ def test_preview_rejects_cat_budget_that_consumes_configured_reserve(
     monkeypatch.setattr(
         bootstrap,
         "cfg",
-        SimpleNamespace(XCH_RESERVE="0", CAT_RESERVE="200"),
+        SimpleNamespace(
+            XCH_RESERVE="0",
+            CAT_RESERVE="200",
+            LIQUIDITY_MODE="two_sided",
+            ENABLE_BUY=True,
+            ENABLE_SELL=True,
+        ),
     )
 
     response = client.post("/api/bootstrap/preview", json=_request(cat_budget="1900"))
