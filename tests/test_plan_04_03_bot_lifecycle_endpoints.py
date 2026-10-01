@@ -134,6 +134,126 @@ def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStart(_FlaskBase):
+    def test_one_sided_start_rejects_unclassified_open_sage_offer(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        malformed = {
+            "trade_id": "unknown-pair",
+            "status": 0,
+            "summary": {"offered": {asset_id: 1000}, "requested": {}},
+        }
+        with (
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [malformed],
+                    "end_of_history": True,
+                },
+            ),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            block = bot_blueprint._one_sided_open_offer_start_block(fake_cfg)
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["reason"], "OFF_SIDE_OFFER_PROOF_UNAVAILABLE")
+
+    def test_one_sided_start_allows_proven_unrelated_pair(self):
+        from blueprints import bot as bot_blueprint
+
+        fake_cfg = _fake_cfg()
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        unrelated = {
+            "trade_id": "other-cat-sell",
+            "status": 0,
+            "summary": {
+                "offered": {"cd" * 32: 1000},
+                "requested": {"xch": 100_000_000},
+            },
+        }
+        with (
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [unrelated],
+                    "end_of_history": True,
+                },
+            ),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            block = bot_blueprint._one_sided_open_offer_start_block(fake_cfg)
+
+        self.assertIsNone(block)
+
+    def test_one_sided_start_allows_expired_current_pair_offer(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        expired_sell = {
+            "trade_id": "expired-sell",
+            "status": 0,
+            "valid_times": {"max_time": 1},
+            "summary": {
+                "offered": {asset_id: 1000},
+                "requested": {"xch": 100_000_000},
+            },
+        }
+        with (
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [expired_sell],
+                    "end_of_history": True,
+                },
+            ),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            block = bot_blueprint._one_sided_open_offer_start_block(fake_cfg)
+
+        self.assertIsNone(block)
+
+    def test_one_sided_start_rejects_duplicate_and_missing_current_pair_ids(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        active_buy = {
+            "status": 0,
+            "summary": {
+                "offered": {"xch": 100_000_000},
+                "requested": {asset_id: 1000},
+            },
+        }
+        for offers in (
+            [{**active_buy, "trade_id": ""}],
+            [
+                {**active_buy, "trade_id": "duplicate"},
+                {**active_buy, "trade_id": "duplicate"},
+            ],
+        ):
+            with (
+                patch(
+                    "wallet.get_authoritative_offer_history",
+                    return_value={
+                        "success": True,
+                        "offers": offers,
+                        "end_of_history": True,
+                    },
+                ),
+                patch("database.get_open_offers", return_value=[]),
+            ):
+                block = bot_blueprint._one_sided_open_offer_start_block(fake_cfg)
+            self.assertIsNotNone(block)
+            self.assertEqual(block["reason"], "OFF_SIDE_OFFER_PROOF_UNAVAILABLE")
+
     def test_buy_only_start_blocks_existing_wallet_sell_offer(self):
         asset_id = "ab" * 32
         fake_cfg = _fake_cfg(cat_asset_id=asset_id)

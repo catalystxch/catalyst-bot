@@ -102,7 +102,11 @@ def _one_sided_open_offer_start_block(cfg_obj) -> dict[str, Any] | None:
     disabled_side = "sell" if mode == "buy_only" else "buy"
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     from database import get_open_offers
-    from wallet import classify_offers_from_list, get_authoritative_offer_history
+    from wallet import (
+        classify_offers_from_list,
+        get_authoritative_offer_history,
+        is_offer_time_expired,
+    )
 
     try:
         history = get_authoritative_offer_history(
@@ -123,9 +127,61 @@ def _one_sided_open_offer_start_block(cfg_obj) -> dict[str, Any] | None:
             or any(type(offer) is not dict for offer in wallet_offers)
         ):
             raise ValueError("Wallet offer history is incomplete")
-        wallet_buys, wallet_sells, _ = classify_offers_from_list(
+        wallet_buys, wallet_sells, wallet_closed = classify_offers_from_list(
             wallet_offers, asset_id
         )
+        open_row_ids = {id(row) for row in [*wallet_buys, *wallet_sells]}
+        closed_row_ids = {id(row) for row in wallet_closed}
+        relevant_trade_ids = set()
+        observed_trade_ids = set()
+        for row in wallet_offers:
+            summary = row.get("summary")
+            offered = summary.get("offered") if type(summary) is dict else None
+            requested = summary.get("requested") if type(summary) is dict else None
+            if type(offered) is not dict or type(requested) is not dict:
+                raise ValueError("Wallet offer summary is malformed")
+            offered_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in offered
+            }
+            requested_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in requested
+            }
+            related = asset_id in offered_assets or asset_id in requested_assets
+            trade_id = str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            status = row.get("status")
+            terminal = status in (3, 4, 5) or (
+                isinstance(status, str)
+                and status.upper()
+                in {
+                    "CANCELLED",
+                    "CANCELED",
+                    "CONFIRMED",
+                    "COMPLETED",
+                    "FAILED",
+                    "EXPIRED",
+                    "SUCCESS",
+                }
+            )
+            if (
+                related
+                and id(row) in closed_row_ids
+                and (terminal or is_offer_time_expired(row))
+            ):
+                continue
+            if related and (
+                id(row) not in open_row_ids
+                or not trade_id
+                or trade_id in observed_trade_ids
+            ):
+                raise ValueError(
+                    "Current-pair wallet offer cannot be proven unique and classified"
+                )
+            if related:
+                relevant_trade_ids.add(trade_id)
+            elif not offered or not requested or trade_id in relevant_trade_ids:
+                raise ValueError("Wallet offer cannot be proven unrelated")
+            if trade_id:
+                observed_trade_ids.add(trade_id)
         db_offers = get_open_offers(side=disabled_side, cat_asset_id=asset_id)
         if type(db_offers) is not list:
             raise ValueError("Database offer book is unavailable")
