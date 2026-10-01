@@ -1311,6 +1311,8 @@ def _calculate_smart_defaults(
     _rp = _RISK_PROFILES.get(
         str(risk_profile).lower().strip(), _RISK_PROFILES["balanced"]
     )
+    active_buy_only = liquidity_mode == "buy_only"
+    active_sell_only = liquidity_mode == "sell_only"
     _risk_profile_name = str(risk_profile).lower().strip()
     if _risk_profile_name not in _RISK_PROFILES:
         _risk_profile_name = "balanced"
@@ -2262,12 +2264,10 @@ def _calculate_smart_defaults(
     _smart_sniper_prep = 0
     _sniper_pool_xch = 0.0
 
-    # ── Bottleneck-driven capital allocation ─────────────────────────────────
-    # The bot is symmetric: every buy needs XCH, every sell needs CAT.
-    # Whichever side has less spending power (in XCH-equivalent terms) is
-    # the bottleneck — use ALL of the smaller side (after fees/sniper pools
-    # are carved off), carve 10% for a topup buffer, and the remaining 90%
-    # becomes the trading budget.
+    # ── Active-side capital allocation ───────────────────────────────────────
+    # Every buy needs XCH and every sell needs CAT. Two-sided mode uses the
+    # smaller budget; a single-sided mode sizes from its active asset only.
+    # XCH fee coins remain a separate allocation in every mode.
     #
     # Tim's mental model:
     #   1. Subtract the user's reserve (do not touch).
@@ -2288,10 +2288,18 @@ def _calculate_smart_defaults(
         _cat_xch_equiv = float(
             round(_xch_value_for_cat_exact(_avail_cat, mid_price_decimal), 4)
         )
+    else:
+        _cat_xch_equiv = None
+    if active_buy_only:
+        _bottleneck_xch = _post_pools_xch
+        _cat_limited_trading = False
+    elif active_sell_only:
+        _bottleneck_xch = _cat_xch_equiv or 0.0
+        _cat_limited_trading = False
+    elif _cat_xch_equiv is not None:
         _bottleneck_xch = min(_post_pools_xch, _cat_xch_equiv)
         _cat_limited_trading = _cat_xch_equiv < _post_pools_xch
     else:
-        _cat_xch_equiv = None
         _bottleneck_xch = _post_pools_xch
         _cat_limited_trading = False
     # Kept for downstream message formatting — same value as bottleneck when
@@ -2547,6 +2555,10 @@ def _calculate_smart_defaults(
             )
 
         def _solve_base(n):
+            if active_buy_only:
+                return _solve_base_xch(n)
+            if active_sell_only:
+                return _solve_base_cat(n)
             return min(_solve_base_xch(n), _solve_base_cat(n))
 
         _base_size = _solve_base(_target_n)
@@ -2558,7 +2570,12 @@ def _calculate_smart_defaults(
             _n_xch = int(
                 (_xch_units - _BUY_SPARE_OVERHEAD) / max(1e-9, _BUY_TIER_FACTOR)
             )
-            if mid_price and mid_price > 0 and _avail_cat > 0:
+            if (
+                liquidity_mode != "buy_only"
+                and mid_price
+                and mid_price > 0
+                and _avail_cat > 0
+            ):
                 _cat_units = float(
                     _xch_value_for_cat_exact(_avail_cat, mid_price_decimal)
                     / Decimal(str(_MIN_OFFER_XCH * _CP_HEADROOM_MULT))
@@ -2586,7 +2603,13 @@ def _calculate_smart_defaults(
 
         # CAT-backed sell capacity at the trial base size.
         _n_sell = _target_n
-        if mid_price and mid_price > 0 and _avail_cat > 0 and _base_size > 0:
+        if (
+            liquidity_mode != "buy_only"
+            and mid_price
+            and mid_price > 0
+            and _avail_cat > 0
+            and _base_size > 0
+        ):
             _cat_base = float(_cat_units_for_xch_exact(_base_size, mid_price_decimal))
             if _cat_base > 0:
                 _cat_units_avail = _avail_cat / _cat_base
@@ -2600,14 +2623,24 @@ def _calculate_smart_defaults(
         elif _avail_cat <= 0:
             _n_sell = 0
 
-        # Symmetric — same depth on both sides
-        _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
+        # In two-sided mode, keep the same depth on both sides.
+        if active_buy_only:
+            _n_final = max(1, _n_buy)
+        elif active_sell_only:
+            _n_final = max(1, _n_sell)
+        else:
+            _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
 
         # Recalculate base size with agreed n (uses the binding constraint).
         _base_size = max(_MIN_OFFER_XCH, round(_solve_base(_n_final), 4))
 
         # Re-check CAT capacity against the definitive final base_size.
-        if mid_price and mid_price > 0 and _base_size > 0:
+        if (
+            liquidity_mode != "buy_only"
+            and mid_price
+            and mid_price > 0
+            and _base_size > 0
+        ):
             _cat_per_offer_final = float(
                 _cat_units_for_xch_exact(_base_size, mid_price_decimal)
             )
@@ -2839,7 +2872,12 @@ def _calculate_smart_defaults(
         #
         # If the total exceeds avail_cat, scale ALL tier sizes down by the
         # ratio (avail_cat / total), then re-floor at _MIN_OFFER_XCH.
-        if mid_price and mid_price > 0 and _avail_cat > 0:
+        if (
+            liquidity_mode != "buy_only"
+            and mid_price
+            and mid_price > 0
+            and _avail_cat > 0
+        ):
             _cp_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
             # Use the actual configured spares the frontend will build with.
             # PREVIOUSLY this also took max() against (live × 3) as a "what if
@@ -3184,7 +3222,7 @@ def _calculate_smart_defaults(
     # The launcher's effective formula (after frontend swap → env → _flip_tiers)
     # collapses to: pool = sum_i((live[size_i] + spare[size_i]) × size_xch[i]) × headroom
     # where size_xch[i] = base_size × size_mults[i] = _smart_inner/_smart_mid/etc.
-    if _smart_inner > 0:
+    if liquidity_mode != "sell_only" and _smart_inner > 0:
         # Position counts as the env will hold them (no frontend swap —
         # values go directly from API response → form inputs → .env).
         _env_buy_inner = _buy_n_inner + _buy_spare_inner
@@ -3276,7 +3314,8 @@ def _calculate_smart_defaults(
     #                  drop buy offers entirely so the warning is correctly
     #                  suppressed (only fires when max_buy > 0)
     if (
-        xch_spendable > 0
+        liquidity_mode != "sell_only"
+        and xch_spendable > 0
         and _smart_max_buy > 0
         and "_smart_trade_size" in dir()
         and _smart_trade_size > 0
@@ -3610,7 +3649,7 @@ def _calculate_smart_defaults(
     # guard (line 8501) can increase _topup_buffer_xch AFTER _orig_xch_budget
     # was captured.  This guard recomputes the buy-side coin-prep total with
     # the F62 sizes and scales them down if they exceed the available budget.
-    if _smart_buy_inner > 0 and _avail_xch > 0:
+    if liquidity_mode != "sell_only" and _smart_buy_inner > 0 and _avail_xch > 0:
         _f66_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
         # Build (count, size) pairs in SLOT-indexed order.
         # Under reverse-buy the slot-indexed buy counts are position counts;
@@ -4070,7 +4109,13 @@ def _calculate_smart_defaults(
     # scale sell sizes down if the total exceeds _avail_cat.
     # This catches any overshoot regardless of origin: F64 budget drift,
     # rounding accumulation, mid_price movement, or future code changes.
-    if _avail_cat > 0 and mid_price and mid_price > 0 and _smart_sell_inner > 0:
+    if (
+        liquidity_mode != "buy_only"
+        and _avail_cat > 0
+        and mid_price
+        and mid_price > 0
+        and _smart_sell_inner > 0
+    ):
         _f65_hm = 1.0 + (coin_prep_headroom_pct / 100.0)
         _f65_tier_cat = _sell_ladder_cat_prep_total(
             mid_price=mid_price_decimal,
@@ -4766,8 +4811,8 @@ def _calculate_smart_defaults(
     )
 
     # ── LIQUIDITY MODE POST-PROCESS ──────────────────────────────────────
-    # The capital-plan solver always computes a two-sided plan. When the
-    # caller pinned a single side via `liquidity_mode`, scrub the
+    # The capital-plan solver sizes the active side. When the caller pinned a
+    # single side via `liquidity_mode`, scrub the
     # disabled side's fields so the save layer writes a clean config
     # without stale SELL_* or BUY_* residue.
     #
