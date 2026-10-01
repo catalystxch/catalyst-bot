@@ -125,6 +125,59 @@ def test_preview_is_pure_and_returns_bounded_plan(
     assert len(payload["plan"]["sides"]["sell"]["levels"]) == 3
 
 
+def test_preview_rejects_full_wave_principal_that_consumes_reserve_and_fee_coins(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    monkeypatch.setattr(
+        bootstrap,
+        "cfg",
+        SimpleNamespace(XCH_RESERVE="24.082", CAT_RESERVE="338152.172"),
+    )
+    body = _request(
+        anchor_price="0.000075",
+        xch_budget="216.72070779727",
+        cat_budget="3043369.548",
+        balances={
+            "xch_available": "240.800786441412",
+            "cat_available": "3381521.72",
+            "fee_spent_xch": "0",
+            "subsidy_spent_xch": "0",
+            "network_fee_xch": "0.0000130791",
+            "minimum_profit_xch": "0",
+            "fee_coin_size_xch": "0.001",
+            "expected_cancel_requotes": 1,
+        },
+    )
+
+    response = client.post("/api/bootstrap/preview", json=body)
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "bootstrap_xch_prep_principal_unfunded"
+    assert (
+        database.get_active_bootstrap_campaign(ASSET_ID, 736588221, "mainnet") is None
+    )
+
+
+def test_preview_rejects_cat_budget_that_consumes_configured_reserve(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    monkeypatch.setattr(
+        bootstrap,
+        "cfg",
+        SimpleNamespace(XCH_RESERVE="0", CAT_RESERVE="200"),
+    )
+
+    response = client.post("/api/bootstrap/preview", json=_request(cat_budget="1900"))
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "bootstrap_cat_prep_principal_unfunded"
+    assert (
+        database.get_active_bootstrap_campaign(ASSET_ID, 736588221, "mainnet") is None
+    )
+
+
 def test_start_requires_exact_asset_warning_and_persists_before_coin_prep(
     isolated_db, bootstrap_api
 ):

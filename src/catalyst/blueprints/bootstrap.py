@@ -303,6 +303,25 @@ def _derive_preview(body: dict[str, Any], identity: dict[str, Any]) -> dict[str,
     )
     decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=now)
     plan = derive_bootstrap_plan(campaign, decision, balances)
+    # Coin Prep can prepare every replacement wave, so retain the full market
+    # budget as principal even though the first offer deployment is smaller.
+    fee_principal = sum(
+        (row["amount_xch"] for row in plan["coin_prep"]["fee_coins"]), Decimal("0")
+    )
+    for asset, reserve_key, budget, principal in (
+        ("xch", "XCH_RESERVE", campaign.xch_budget, fee_principal),
+        ("cat", "CAT_RESERVE", campaign.cat_budget, Decimal("0")),
+    ):
+        try:
+            reserve = Decimal(str(getattr(cfg, reserve_key)))
+            if not reserve.is_finite() or reserve < 0:
+                raise ValueError("invalid reserve")
+        except (AttributeError, InvalidOperation, ValueError) as exc:
+            raise BootstrapApiError(
+                f"bootstrap_{asset}_reserve_unavailable", 409
+            ) from exc
+        if budget + reserve + principal > balances[f"{asset}_available"]:
+            raise BootstrapApiError(f"bootstrap_{asset}_prep_principal_unfunded")
     return {
         "reviewed": reviewed,
         "preview_digest": _preview_digest(reviewed),
