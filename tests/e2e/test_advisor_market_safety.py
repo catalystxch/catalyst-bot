@@ -127,3 +127,33 @@ def test_market_block_does_not_hide_wallet_connectivity_warning(page):
         saUpdateAdvisor(window._lastDashboard);
     }""")
     expect(page.locator("#saList")).to_contain_text("cannot reach your wallet")
+
+
+def test_advisor_ignores_retired_amm_gap_metrics(page):
+    """Historical AMM gap fields cannot revive retired venue guidance."""
+    load_advisor(page, competitors=2, base_bps=800)
+    page.evaluate(
+        """() => {
+            Object.assign(window._lastDashboard.performance, {
+                open_buys: 3,
+                open_sells: 3,
+                fill_rate_per_hour: 0,
+            });
+            Object.assign(window._lastDashboard.market_health.metrics, {
+                effective_buy_target: 3,
+                effective_sell_target: 3,
+                competitor_best_bid: '0.000074',
+                competitor_best_ask: '0.000076',
+                arb_gap_bps: 250,
+            });
+            renderMarketConfidence({confidence: {
+                state: 'GREEN', data_valid: true,
+                trusted_midpoint: '0.000075',
+            }});
+            saUpdateAdvisor(window._lastDashboard);
+        }"""
+    )
+
+    expect(page.locator("#saList")).not_to_contain_text("TibetSwap")
+    expect(page.locator("#saList")).not_to_contain_text("Close the Gap")
+    expect(page.locator("#saList")).not_to_contain_text("arb floor")

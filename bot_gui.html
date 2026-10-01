@@ -10379,7 +10379,6 @@
                             <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Rapid add/remove score</div>
                         </div>
                     </div>
-                    <div id="intelTibetContext" style="margin-top: 10px; color: rgba(255,255,255,0.58); font-size: 11px;">TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives a live decision.</div>
                     <div id="intelPoolRatio" style="display:none;">—</div>
                     <div id="intelSlippage" style="display:none;">—</div>
                 </div>
@@ -12504,7 +12503,7 @@
                     <div class="v4-modal-panel v4-modal-panel--info">
                         <div class="v4-modal-panel-title">What the app does</div>
                         <div class="v4-modal-panel-copy">
-                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, and updates confirmed PnL. Follow mode progressively withdraws exposure when attributable market evidence degrades; an explicitly approved, budget-bound Bootstrap campaign can remain active inside its signed corridor. TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives live trading.
+                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, and updates confirmed PnL. Follow mode progressively withdraws exposure when attributable market evidence degrades; an explicitly approved, budget-bound Bootstrap campaign can remain active inside its signed corridor.
                         </div>
                     </div>
                     <div class="v4-modal-panel">
@@ -12855,7 +12854,6 @@
                         <li><strong>Rate-limited</strong> — repeated undercutting cannot trigger an offer war</li>
                         <li><strong>Publication-proven</strong> — the exact offer must be rediscovered within 90 seconds</li>
                     </ul>
-                    <p>TibetSwap shut down. Its historical pool and sniper records remain read-only for continuity and never affect a live quote.</p>
                 </div>
 
                 <!-- CLOSE THE GAP -->
@@ -16799,34 +16797,6 @@
         let _saLastSuggestions = [];
         let _saLastActionKey = '';
         let _advisorActionItems = [];
-        const _SA_CLOSE_GAP_PROMOTE_BPS = 200;
-        const _SA_CLOSE_GAP_CLEAR_BPS = 120;
-        const _SA_CLOSE_GAP_CONFIRM_UPDATES = 3;
-        let _saCloseGapSignal = { key: '', hits: 0, misses: 0, confirmed: false };
-
-        function saCloseGapSignalReady(candidate, key, holdAllowed) {
-            const nextKey = String(key || 'default');
-            if (candidate) {
-                if (_saCloseGapSignal.key !== nextKey) {
-                    _saCloseGapSignal = { key: nextKey, hits: 0, misses: 0, confirmed: false };
-                }
-                _saCloseGapSignal.hits += 1;
-                _saCloseGapSignal.misses = 0;
-                if (_saCloseGapSignal.hits >= _SA_CLOSE_GAP_CONFIRM_UPDATES) {
-                    _saCloseGapSignal.confirmed = true;
-                }
-                return _saCloseGapSignal.confirmed;
-            }
-
-            if (_saCloseGapSignal.confirmed && holdAllowed && _saCloseGapSignal.misses < 2) {
-                _saCloseGapSignal.misses += 1;
-                return true;
-            }
-
-            _saCloseGapSignal = { key: '', hits: 0, misses: 0, confirmed: false };
-            return false;
-        }
-
         function getAdvisorActionTitle(actionType) {
             switch (String(actionType || '')) {
                 case 'enableInventory':
@@ -17008,7 +16978,6 @@
                 mhMetrics.market_intel_state ?? mh.market_intel_state ?? ''
             ).toLowerCase();
             const competitorCount = parseInt(mhMetrics.competitor_count ?? 0, 10) || 0;
-            const arbGapBps = parseFloat(mhMetrics.arb_gap_bps ?? 0) || 0;
             const minBps = parseFloat(spreads.min_spread_bps) || 100;
             const maxBps = parseFloat(spreads.max_spread_bps) || 1500;
             const inventoryMgmtEnabled = !!(s.features && s.features.inventory_mgmt);
@@ -17076,44 +17045,8 @@
             const walletReachable = (bot_state?.chia_health?.wallet_reachable ?? bot_state?.wallet_reachable) !== false;
             const uptimeSecs = parseInt(perf.uptime_secs ?? 0, 10) || 0;
             const totalFills = parseInt(perf.total_fills ?? 0, 10) || 0;
-            const sniperEnabled = !!(s.features && s.features.sniper);
             const isRunning = !!(bot_state && bot_state.running);
             const _spreadCooldownActive = Date.now() < _saSpreadActionCooldownUntil;
-            const _arbDataReliable = competitorBestBid > 0 && competitorBestAsk > 0;
-            const closeGapSafeRoom = baseBps - Math.max(arbGapBps + 20, 80);
-            const closeGapWideEnough = competitorBps > 0
-                ? baseBps >= Math.max(600, competitorBps * 1.75)
-                : baseBps >= 600;
-            const closeGapKey = [
-                currentCAT && currentCAT.asset_id ? currentCAT.asset_id : 'pair',
-                Math.round(baseBps / 50) * 50,
-                Math.round(competitorBps / 50) * 50
-            ].join(':');
-            const closeGapCandidate = isRunning
-                && hasTrustedMarketContext
-                && !ladderStillBuilding
-                && liveOpenBuys > 0
-                && liveOpenSells > 0
-                && !_gapCloserActive
-                && baseBps > 400
-                && !_spreadCooldownActive
-                && arbGapBps >= _SA_CLOSE_GAP_PROMOTE_BPS
-                && closeGapSafeRoom > 150
-                && _arbDataReliable
-                && closeGapWideEnough
-                && uptimeSecs >= 900;
-            const closeGapHoldAllowed = isRunning
-                && hasTrustedMarketContext
-                && !ladderStillBuilding
-                && !_gapCloserActive
-                && !_spreadCooldownActive
-                && arbGapBps >= _SA_CLOSE_GAP_CLEAR_BPS;
-            const closeGapReady = saCloseGapSignalReady(
-                closeGapCandidate,
-                closeGapKey,
-                closeGapHoldAllowed
-            );
-
             function pushSuggestion(item) {
                 if (!item) return;
                 // Errors always show; cap softer messages at 3 total
@@ -17340,63 +17273,17 @@
                     });
                 }
 
-                if (arbGapBps >= 100 && !closeGapReady) {
-                    const edgeMsg = bothSidesAtEdge
-                        ? ' Your live book is already sitting on the edge, so tightening now would mostly feed arb.'
-                        : '';
-                    const gapAdvice = arbGapBps >= _SA_CLOSE_GAP_PROMOTE_BPS
-                        ? ' Waiting for the gap to hold across multiple cycles before recommending Close the Gap.'
-                        : ' Let the gap settle before changing spreads aggressively.';
-                    pushSuggestion({
-                        type: 'info',
-                        icon: '<>',
-                        msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap.' + edgeMsg + gapAdvice,
-                        action: null
-                    });
-                }
-
-                // Smart action: adapts to market conditions.
-                //  • Arb gap present (≥50 bps) → "Close the Gap" (probe for arb floor)
-                //  • Arb gap calm, BASE wide, no fills → "Tighten Spread" (reduce BASE_SPREAD_BPS)
-                //
+                // When a quiet pair has no attributable competitor data, a
+                // wide configured base can be tightened without consulting
+                // retired AMM gap fields. Current advice is derived only from
+                // the live offer book and authoritative confidence snapshot.
                 // Gate and target derivation use `configBaseBps` (the actual
                 // BASE_SPREAD_BPS config) — NOT the adjusted `baseBps` which
                 // reflects competitor/pool widening. Anchoring on the adjusted
                 // spread produced targets wider than BASE and the "Tighten"
                 // button silently widened the user's config.
-                if (!_gapCloserActive && !maxSpreadClampActive && baseBps > 400 && !_spreadCooldownActive) {
-                    // Arb-gap reliability gate: the arb gap is computed
-                    // against Dexie's price, which falls back to a stale
-                    // 24h average for thin/illiquid pairs. Without legit
-                    // competitor offers on BOTH sides of Dexie's book the
-                    // gap doesn't reflect a real opportunity arbers would
-                    // act on, so probing is futile and the recommendation
-                    // becomes misleading. Require a real two-sided Dexie
-                    // market before suggesting Close the Gap.
-                    if (closeGapReady) {
-                        // Active arb gap WITH a real two-sided Dexie market — probe makes sense
-                        pushSuggestion({
-                            type: 'warning',
-                            icon: '📈',
-                            msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap while your spread is ' + fmtPct(baseBps) + '. Close the Gap will probe for the arb floor with small offers, stepping tighter every 60s. When it finds the floor it plants an inner-tier offer at the proven safe price.',
-                            action: 'Close the Gap',
-                            actionType: 'activateGapCloser'
-                        });
-                    } else if (arbGapBps >= 50 && !_arbDataReliable) {
-                        // Arb gap looks tradeable on paper but Dexie's
-                        // book has no real competitors near market — the
-                        // gap is computed against historical price data,
-                        // not live opportunity. Probing won't catch real
-                        // arbers because there aren't any.
-                        pushSuggestion({
-                            type: 'info',
-                            icon: '...',
-                            msg: 'Arb gap reads ' + fmtPct(arbGapBps) + ' but Dexie has no live two-sided market for this pair — the gap is calculated against stale historical price data, not a real opportunity. Probing for the arb floor here would just expire offers without proving anything.',
-                            action: null
-                        });
-                    } else if (arbGapBps < 50 && fillsHr === 0 && closeGapSafeRoom > 100 && configBaseBps > 400) {
-                        // No arb gap, but BASE is wide with zero fills — tighten the actual config.
-                        //
+                if (!maxSpreadClampActive && baseBps > 400 && !_spreadCooldownActive
+                        && fillsHr === 0 && configBaseBps > 400) {
                         // Only fire this when we have NO competitor data. The
                         // "no fills + competitors visible" branch below makes
                         // a smarter call (tighten only if competitors are
@@ -17415,20 +17302,19 @@
                                 pushSuggestion({
                                     type: 'info',
                                     icon: '📐',
-                                    msg: 'No arb risk (' + fmtPct(arbGapBps) + ') and your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills. Tightening the base is more effective than probing with small offers in a quiet market.',
+                                    msg: 'Your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills and no attributable competitor book. Tightening the base may improve participation in this quiet market.',
                                     action: 'Tighten base to ' + fmtPct(targetBps),
                                     actionType: 'applySpread',
                                     actionValue: String(targetBps)
                                 });
                             }
                         }
-                    }
                 }
 
                 // Suppress the price-gap tip when the Spacescan cache is
                 // stale — the "explorer price" we'd compare against is no
                 // longer a reliable sanity check.
-                if (scHasData && !scStale && scPriceGapBps >= 1500 && arbGapBps < 100) {
+                if (scHasData && !scStale && scPriceGapBps >= 1500) {
                     pushSuggestion({
                         type: 'info',
                         icon: 'SC',
@@ -17500,7 +17386,7 @@
                 // and saying "competitors are tighter at 0.0%" is internally
                 // contradictory. Gate the entire branch on competitorBps > 0.
                 const spreadGapBps = baseBps - competitorBps;
-                if (fillsHr === 0 && !maxSpreadClampActive && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge && !_spreadCooldownActive) {
+                if (fillsHr === 0 && !maxSpreadClampActive && competitorCount > 0 && competitorBps > 0 && !bothSidesAtEdge && !_spreadCooldownActive) {
                     // The Spacescan "token still maturing" tip relies on
                     // holder/activity levels that may be stale (rate-limited
                     // 24h cache). If the cache is past the 12h freshness
@@ -17552,7 +17438,7 @@
                     }
                 }
 
-                if (competitorCount === 0 && arbGapBps < 40 && configBaseBps < 500 && !_spreadCooldownActive) {
+                if (competitorCount === 0 && configBaseBps < 500 && !_spreadCooldownActive) {
                     // Skip the "stay disciplined" Spacescan tip when the
                     // underlying holder/activity data is stale — the token
                     // regime may have shifted while the cache sat stale.
@@ -26470,7 +26356,6 @@
             // Context strings
             const contextIds = [
                 'intelSpacescanContext',
-                'intelTibetContext',
                 'intelDbxContext',
             ];
             contextIds.forEach(id => {
@@ -27397,15 +27282,10 @@
             // External links
             if (d.links) {
                 const dexieLink = el('ccDexieLink');
-                const tibetLink = el('ccTibetLink');
                 const spacescanLink = el('ccSpacescanLink');
                 if (d.links.dexie_orderbook && dexieLink) {
                     dexieLink.href = d.links.dexie_orderbook;
                     dexieLink.style.display = 'inline-flex';
-                }
-                if (d.links.tibetswap_pool && tibetLink) {
-                    tibetLink.href = d.links.tibetswap_pool;
-                    tibetLink.style.display = 'inline-flex';
                 }
                 if (d.links.spacescan_token && spacescanLink) {
                     spacescanLink.href = d.links.spacescan_token;
@@ -29986,7 +29866,6 @@
                 const ss = data.spacescan   || {};
                 const cs = data.coinset     || {};
                 const dx = data.dexie       || {};
-                const ts = data.tibetswap   || {};
                 const sp = data.splash      || {};
                 const cg = data.coingecko   || {};
                 const gh = data.github      || {};
@@ -30104,29 +29983,6 @@
                             </div>` : ''}
                           ${fmtEndpointFooter('Direct calls', dx.direct_calls_by_endpoint)}
                         ` : '<div style="color:var(--text-tertiary);">Dexie manager not running.</div>'}
-                    </div>
-                    <div class="v4-modal-panel">
-                        <div class="v4-modal-panel-title">TibetSwap · retired</div>
-                        ${ts.available ? `
-                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
-                            <div style="color:var(--text-secondary);">AMM price</div><div>${ts.amm_price ? Number(ts.amm_price).toFixed(8) : '—'}</div>
-                            <div style="color:var(--text-secondary);">Drift from quoted</div><div>${ts.drift_bps != null ? (ts.drift_bps / 100).toFixed(2) + '%' : '—'}</div>
-                            <div style="color:var(--text-secondary);">Arb pressure</div><div>${escapeHtml(ts.arb_pressure_label || '—')}</div>
-                            <div style="color:var(--text-secondary);">Total polls</div><div>${fmtN(ts.total_polls)}</div>
-                            <div style="color:var(--text-secondary);">Failed polls</div><div>${fmtN(ts.failed_polls)}</div>
-                            <div style="color:var(--text-secondary);">Consecutive failures</div><div>${fmtN(ts.consecutive_failures)}</div>
-                            <div style="color:var(--text-secondary);">Last success</div><div>${ts.last_success_ago_secs != null ? fmtN(Math.round(ts.last_success_ago_secs)) + 's ago' : '—'}</div>
-                            <div style="color:var(--text-secondary);">Price cache age</div><div>${ts.price_cache_age_secs != null ? fmtN(Math.round(ts.price_cache_age_secs)) + 's' : '—'}</div>
-                            ${ts.direct_calls ? `<div style="color:var(--text-secondary);">Direct calls (token discovery)</div><div>${fmtN(ts.direct_calls)}</div>` : ''}
-                          </div>
-                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
-                        ` : (ts.direct_calls ? `
-                          <div style="color:var(--text-tertiary); margin-bottom: 6px;">AMM monitor not running, but token-discovery calls have hit /pairs:</div>
-                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
-                            <div style="color:var(--text-secondary);">Direct calls</div><div>${fmtN(ts.direct_calls)}</div>
-                          </div>
-                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
-                        ` : '<div style="color:var(--text-tertiary);">TibetSwap is retired. Historical counters are read-only and no live AMM capability is used.</div>')}
                     </div>
                     <div class="v4-modal-panel">
                         <div class="v4-modal-panel-title">Splash ${sp.available ? (sp.healthy ? '✅' : '⚠️') : '❌'}</div>

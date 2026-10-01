@@ -423,17 +423,23 @@ def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
     )
 
 
-def test_market_intel_explains_tibetswap_retirement(page):
-    """Market Intel must explain that TibetSwap is historical-only in v1.4."""
+def test_current_operator_ui_omits_retired_tibetswap_brand(page):
+    """Current Market Intel, About, and Help surfaces omit the retired venue."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
-    expect(page.locator("#intelTibetContext")).to_have_text(
-        "TibetSwap shut down; historical TibetSwap data is retained as read-only "
-        "history and never drives a live decision."
-    )
+    page.evaluate("window.v4SwitchView('intel')")
+    expect(page.locator("#v4View-intel")).not_to_contain_text("TibetSwap")
+    assert page.locator("#intelTibetContext").count() == 0
     expect(page.locator("#intelSlippage")).to_be_hidden()
     expect(page.locator("#intelPoolRatio")).to_be_hidden()
+
+    page.evaluate("window.openAboutModal()")
+    expect(page.locator("#aboutModal")).not_to_contain_text("TibetSwap")
+    page.evaluate("window.closeAboutModal()")
+
+    page.evaluate("window.openHelpModal(); window.switchHelpTab('sniper')")
+    expect(page.locator("#help_sniper")).not_to_contain_text("TibetSwap")
 
 
 def test_dashboard_confidence_does_not_invent_tradable_depth(page):
