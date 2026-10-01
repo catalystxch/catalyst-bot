@@ -28,6 +28,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
+from liquidity_side import bootstrap_side_enabled
 from ladder_sizing import classify_slot_tier, ladder_price_for_slot
 from database import (
     add_offer,
@@ -158,6 +159,7 @@ def require_active_bootstrap_intent_authority(
     asset_id: str,
     now: Optional[datetime] = None,
     offer_max_time: Optional[int] = None,
+    side: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Re-read the exact campaign revision encoded in a Bootstrap intent."""
 
@@ -165,6 +167,8 @@ def require_active_bootstrap_intent_authority(
         raise ValueError("offer purpose must be canonical text")
     if not purpose.startswith("bootstrap:"):
         return None
+    if side is not None and not bootstrap_side_enabled(cfg, side):
+        raise ValueError("Bootstrap creation side is disabled")
     parts = purpose.split(":")
     if len(parts) != 4 or parts[0] != "bootstrap" or parts[2] != "revision":
         raise ValueError("Bootstrap offer purpose is malformed")
@@ -2343,6 +2347,7 @@ class OfferManager:
             purpose=purpose,
             asset_id=asset_id,
             offer_max_time=offer_max_time,
+            side=side,
         )
         if parent_intent_id is not None and (
             type(parent_intent_id) is not str
@@ -2517,6 +2522,7 @@ class OfferManager:
                     purpose=intent.purpose,
                     asset_id=intent.asset_id,
                     offer_max_time=offer_max_time,
+                    side=intent.side,
                 )
             except ValueError:
                 return {
@@ -2965,6 +2971,7 @@ class OfferManager:
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
                 offer_max_time=intent.offer_max_time,
+                side=intent.side,
             )
             continuation = wallet.begin_offer_creation_continuation(
                 operation_id=intent.operation_id,
@@ -3069,6 +3076,7 @@ class OfferManager:
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
                 offer_max_time=intent.offer_max_time,
+                side=intent.side,
             )
             wallet_call_started = True
             result = wallet.create_offer(
@@ -3345,6 +3353,8 @@ class OfferManager:
                 continue
             if getattr(self, "_stop_requested", False):
                 break
+            if not bootstrap_side_enabled(cfg, spec["side"]):
+                continue
             xch_mojos = xch_to_mojos(spec["xch_amount"])
             cat_mojos = cat_to_mojos(spec["cat_amount"], cat_decimals)
             if xch_mojos <= 0 or cat_mojos <= 0:

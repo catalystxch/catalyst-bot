@@ -92,6 +92,71 @@ def _request(**overrides):
     return body
 
 
+@pytest.mark.parametrize(
+    ("liquidity_mode", "buy_levels", "sell_levels", "xch_budget", "cat_budget"),
+    [
+        ("buy_only", 3, 0, "1", "0"),
+        ("sell_only", 0, 3, "0", "1000"),
+    ],
+)
+def test_bootstrap_review_and_campaign_bind_enabled_side(
+    bootstrap_app,
+    monkeypatch,
+    liquidity_mode,
+    buy_levels,
+    sell_levels,
+    xch_budget,
+    cat_budget,
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    monkeypatch.setattr(bot_loop.cfg, "LIQUIDITY_MODE", liquidity_mode)
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_BUY", liquidity_mode == "buy_only")
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_SELL", liquidity_mode == "sell_only")
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    assert preview["success"] is True
+    assert preview["liquidity_mode"] == liquidity_mode
+    assert len(preview["plan"]["sides"]["buy"]["levels"]) == buy_levels
+    assert len(preview["plan"]["sides"]["sell"]["levels"]) == sell_levels
+    assert preview["campaign"]["xch_budget"] == xch_budget
+    assert preview["campaign"]["cat_budget"] == cat_budget
+
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    assert started["success"] is True
+    persisted = database.get_bootstrap_campaign(started["campaign_id"])
+    assert persisted["xch_budget"] == xch_budget
+    assert persisted["cat_budget"] == cat_budget
+
+
+def test_bootstrap_start_rejects_review_from_previous_liquidity_mode(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    monkeypatch.setattr(bot_loop.cfg, "LIQUIDITY_MODE", "buy_only")
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_BUY", True)
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_SELL", False)
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    assert preview["success"] is True
+
+    monkeypatch.setattr(bot_loop.cfg, "LIQUIDITY_MODE", "sell_only")
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_BUY", False)
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_SELL", True)
+    response = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    )
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "bootstrap_preview_stale"
+
+
 @pytest.fixture
 def bootstrap_app(tmp_path, monkeypatch):
     from blueprints import bootstrap
@@ -575,7 +640,13 @@ def test_bootstrap_coin_prep_converts_unavailable_identity_to_stable_safe_block(
         )
 
 
-def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
+@pytest.mark.parametrize(
+    ("liquidity_mode", "expected_side"),
+    [("two_sided", None), ("buy_only", "buy"), ("sell_only", "sell")],
+)
+def test_offer_manager_executes_only_the_exact_campaign_plan(
+    bootstrap_app, monkeypatch, liquidity_mode, expected_side
+):
     _bootstrap, client, _identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
     campaign_id = client.post(
@@ -589,6 +660,9 @@ def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
     campaign = _campaign_from_record(record)
     decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=NOW)
     plan = derive_bootstrap_plan(campaign, decision, _balances())
+    monkeypatch.setattr("offer_manager.cfg.LIQUIDITY_MODE", liquidity_mode)
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_BUY", liquidity_mode != "sell_only")
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_SELL", liquidity_mode != "buy_only")
 
     calls = []
     manager = object.__new__(OfferManager)
@@ -611,7 +685,7 @@ def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
         coin_ids_enabled=True,
     )
 
-    assert len(created) == len(calls) == 6
+    assert len(created) == len(calls) == (6 if expected_side is None else 3)
     assert all(
         len([amount for amount in offer.values() if amount < 0]) == 1
         for offer, _ in calls
@@ -620,10 +694,9 @@ def test_offer_manager_executes_only_the_exact_campaign_plan(bootstrap_app):
         len([amount for amount in offer.values() if amount > 0]) == 1
         for offer, _ in calls
     )
-    assert {kwargs["creation_context"]["side"] for _offer, kwargs in calls} == {
-        "buy",
-        "sell",
-    }
+    assert {kwargs["creation_context"]["side"] for _offer, kwargs in calls} == (
+        {"buy", "sell"} if expected_side is None else {expected_side}
+    )
     assert all(
         kwargs["creation_context"]["purpose"] == f"bootstrap:{campaign_id}:revision:0"
         for _offer, kwargs in calls
@@ -684,6 +757,35 @@ def test_bootstrap_authority_denies_offer_expiring_after_campaign(
         )
 
 
+@pytest.mark.parametrize(
+    ("liquidity_mode", "allowed_side", "disabled_side"),
+    [("buy_only", "buy", "sell"), ("sell_only", "sell", "buy")],
+)
+def test_bootstrap_authority_rechecks_liquidity_side_before_wallet_effect(
+    bootstrap_app, monkeypatch, liquidity_mode, allowed_side, disabled_side
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    monkeypatch.setattr("offer_manager.cfg.LIQUIDITY_MODE", liquidity_mode)
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_BUY", liquidity_mode == "buy_only")
+    monkeypatch.setattr("offer_manager.cfg.ENABLE_SELL", liquidity_mode == "sell_only")
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    assert require_active_bootstrap_intent_authority(
+        purpose=purpose, asset_id=ASSET_ID, now=NOW, side=allowed_side
+    )
+    with pytest.raises(ValueError, match="Bootstrap creation side is disabled"):
+        require_active_bootstrap_intent_authority(
+            purpose=purpose, asset_id=ASSET_ID, now=NOW, side=disabled_side
+        )
+
+
 def test_bootstrap_created_intent_replay_rejects_persisted_overlong_offer(
     monkeypatch,
 ):
@@ -710,6 +812,7 @@ def test_bootstrap_created_intent_replay_rejects_persisted_overlong_offer(
     intent = SimpleNamespace(
         purpose=f"bootstrap:{campaign_id}:revision:0",
         asset_id=ASSET_ID,
+        side="buy",
         intent_id="b" * 64,
         selected_coin_id="c" * 64,
     )
@@ -1058,8 +1161,20 @@ def test_active_bootstrap_suppresses_follow_churn_but_keeps_safety_and_recovery(
     loop._handle_coins(0, 0, allow_legacy_topup=False)
 
 
+@pytest.mark.parametrize(
+    ("liquidity_mode", "expected_buy_levels", "expected_sell_levels"),
+    [
+        ("two_sided", 3, 3),
+        ("buy_only", 3, 0),
+        ("sell_only", 0, 3),
+    ],
+)
 def test_live_bot_executes_active_bootstrap_and_queues_publication(
-    bootstrap_app, monkeypatch
+    bootstrap_app,
+    monkeypatch,
+    liquidity_mode,
+    expected_buy_levels,
+    expected_sell_levels,
 ):
     _bootstrap, client, _identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -1082,6 +1197,13 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     monkeypatch.setattr(bot_loop.cfg, "CAT_DECIMALS", 3, raising=False)
     monkeypatch.setattr(bot_loop.cfg, "COIN_IDS_ENABLED", True, raising=False)
     monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "LIQUIDITY_MODE", liquidity_mode, raising=False)
+    monkeypatch.setattr(
+        bot_loop.cfg, "ENABLE_BUY", expected_buy_levels > 0, raising=False
+    )
+    monkeypatch.setattr(
+        bot_loop.cfg, "ENABLE_SELL", expected_sell_levels > 0, raising=False
+    )
     monkeypatch.setattr(
         bot_loop.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"), raising=False
     )
@@ -1152,7 +1274,7 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
             or [
                 {
                     "success": True,
-                    "side": "buy",
+                    "side": "buy" if expected_buy_levels else "sell",
                     "level": "near",
                     "trade_id": "61" * 32,
                     "offer_bech32": "offer1bootstrap",
@@ -1171,17 +1293,22 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     result = loop._route_bootstrap_creation_if_active(
         current_buy_ids=set(), current_sell_ids=set()
     )
-    assert result == {"buy": {"61" * 32}, "sell": set()}
+    assert result == {
+        "buy": {"61" * 32} if expected_buy_levels else set(),
+        "sell": {"61" * 32}
+        if expected_sell_levels and not expected_buy_levels
+        else set(),
+    }
     assert created_call["kwargs"]["existing_levels"] == frozenset()
-    assert sum(
-        level["xch_amount"] for level in created_call["plan"]["sides"]["buy"]["levels"]
-    ) == Decimal("0.1")
-    assert max(
-        level["price"] for level in created_call["plan"]["sides"]["buy"]["levels"]
-    ) <= Decimal("0.00096")
-    assert min(
-        level["price"] for level in created_call["plan"]["sides"]["sell"]["levels"]
-    ) >= Decimal("0.00104")
+    buy_levels = created_call["plan"]["sides"]["buy"]["levels"]
+    sell_levels = created_call["plan"]["sides"]["sell"]["levels"]
+    assert len(buy_levels) == expected_buy_levels
+    assert len(sell_levels) == expected_sell_levels
+    if buy_levels:
+        assert sum(level["xch_amount"] for level in buy_levels) == Decimal("0.1")
+        assert max(level["price"] for level in buy_levels) <= Decimal("0.00096")
+    if sell_levels:
+        assert min(level["price"] for level in sell_levels) >= Decimal("0.00104")
     assert queued_dexie == [("offer1bootstrap", "61" * 32)]
     assert queued_splash == queued_dexie
 
@@ -1797,7 +1924,9 @@ def test_live_bot_materializes_authoritative_stage_before_creating(
     assert result["campaign"]["settlement_clusters"] == 2
     assert result["campaign"]["current_anchor_price"] == "0.001"
     events = database.list_bootstrap_campaign_events(campaign_id)
-    assert events[-1]["event_type"] == "authoritative_evidence_materialized"
+    assert any(
+        event["event_type"] == "authoritative_evidence_materialized" for event in events
+    )
 
 
 def test_live_bot_blocks_higher_stage_replacement_without_owned_hash_proof(

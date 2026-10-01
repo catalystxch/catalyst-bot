@@ -30,6 +30,7 @@ from bootstrap_manifest import MANIFEST_SCHEMA, ManifestError, safe_import_manif
 from bootstrap_proof import build_participation_report, participation_report_id
 from config import cfg
 import database
+from liquidity_side import bootstrap_side_enabled
 from offer_book_policy import derive_bootstrap_plan
 from partial_offer_capability import evaluate_partial_offer_capability
 from providers.dexie import DexieOrderbookProvider
@@ -249,12 +250,21 @@ def _campaign_inputs(
             balances[optional] = _canonical_decimal(
                 balances_raw[optional], optional, allow_zero=False
             )
+    mode = getattr(cfg, "LIQUIDITY_MODE", None)
+    buy_enabled = bootstrap_side_enabled(cfg, "buy")
+    sell_enabled = bootstrap_side_enabled(cfg, "sell")
+    if not buy_enabled and not sell_enabled:
+        raise BootstrapApiError("bootstrap_liquidity_side_disabled", 409)
+    effective_xch_budget = fields["xch_budget"] if buy_enabled else Decimal("0")
+    effective_cat_budget = fields["cat_budget"] if sell_enabled else Decimal("0")
+    if effective_xch_budget == 0 and effective_cat_budget == 0:
+        raise BootstrapApiError("bootstrap_enabled_side_unfunded")
     if (
-        fields["xch_budget"] + fields["fee_budget_xch"] + fields["subsidy_budget_xch"]
+        effective_xch_budget + fields["fee_budget_xch"] + fields["subsidy_budget_xch"]
         > balances["xch_available"]
     ):
         raise BootstrapApiError("bootstrap_xch_budget_exceeds_available")
-    if fields["cat_budget"] > balances["cat_available"]:
+    if effective_cat_budget > balances["cat_available"]:
         raise BootstrapApiError("bootstrap_cat_budget_exceeds_available")
 
     reviewed = {
@@ -268,6 +278,9 @@ def _campaign_inputs(
         "ticker": ticker,
         "expires_in_seconds": duration,
         **fields,
+        "liquidity_mode": mode,
+        "effective_xch_budget": effective_xch_budget,
+        "effective_cat_budget": effective_cat_budget,
         "balances": balances,
     }
     return reviewed, balances
@@ -294,8 +307,8 @@ def _derive_preview(body: dict[str, Any], identity: dict[str, Any]) -> dict[str,
         wallet_id=identity["wallet_id"],
         asset_id=identity["asset_id"],
         anchor_price=reviewed["anchor_price"],
-        xch_budget=reviewed["xch_budget"],
-        cat_budget=reviewed["cat_budget"],
+        xch_budget=reviewed["effective_xch_budget"],
+        cat_budget=reviewed["effective_cat_budget"],
         fee_budget_xch=reviewed["fee_budget_xch"],
         subsidy_budget_xch=reviewed["subsidy_budget_xch"],
         created_at=now,
@@ -325,6 +338,7 @@ def _derive_preview(body: dict[str, Any], identity: dict[str, Any]) -> dict[str,
     return {
         "reviewed": reviewed,
         "preview_digest": _preview_digest(reviewed),
+        "liquidity_mode": reviewed["liquidity_mode"],
         "campaign_object": campaign,
         "campaign": campaign.to_record(),
         "plan": plan,
@@ -442,6 +456,7 @@ def api_bootstrap_preview():
                 {
                     "success": True,
                     "preview_digest": preview["preview_digest"],
+                    "liquidity_mode": preview["liquidity_mode"],
                     "campaign": preview["campaign"],
                     "plan": preview["plan"],
                     "financial_action_started": False,
@@ -461,6 +476,7 @@ def api_bootstrap_start():
                 {
                     "success": True,
                     "campaign_id": created["campaign_id"],
+                    "liquidity_mode": created["liquidity_mode"],
                     "campaign": created["campaign"],
                     "plan": created["plan"],
                     "coin_prep_required": True,

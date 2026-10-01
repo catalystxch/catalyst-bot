@@ -39856,9 +39856,10 @@ async function bootstrapPreviewCampaign() {
         const plan = payload.plan || {};
         const buyLevels = plan.sides?.buy?.levels?.length || 0;
         const sellLevels = plan.sides?.sell?.levels?.length || 0;
+        const mode = String(payload.liquidity_mode || 'unknown').replaceAll('_', ' ');
         _bootstrapText(
             'bootstrapStatusPanel',
-            `REVIEW ONLY — no wallet action. Asset ${campaign.asset_id}. Anchor ${campaign.anchor_price}; fixed corridor ${campaign.minimum_price}–${campaign.maximum_price}; first stage ${Number(plan.deployment_fraction || 0) * 100}%; ${buyLevels} buy / ${sellLevels} sell offers. Confirm the exact asset ID to enable Start Campaign.`
+            `REVIEW ONLY — no wallet action. Asset ${campaign.asset_id}. Liquidity mode ${mode}; effective market budgets ${campaign.xch_budget} XCH / ${campaign.cat_budget} CAT. Anchor ${campaign.anchor_price}; fixed corridor ${campaign.minimum_price}–${campaign.maximum_price}; first stage ${Number(plan.deployment_fraction || 0) * 100}%; ${buyLevels} buy / ${sellLevels} sell offers. Confirm the exact asset ID to enable Start Campaign.`
         );
         const start = document.getElementById('bootstrapStartBtn');
         if (start) start.disabled = !document.getElementById('bootstrapExactAssetConfirm')?.checked;

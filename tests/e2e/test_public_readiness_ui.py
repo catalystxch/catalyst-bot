@@ -13,6 +13,53 @@ def _open_gui(page):
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+@pytest.mark.parametrize(
+    ("mode", "xch_budget", "cat_budget", "buy_count", "sell_count"),
+    [
+        ("buy_only", "1", "0", 3, 0),
+        ("sell_only", "0", "1000", 0, 3),
+    ],
+)
+def test_bootstrap_preview_shows_effective_one_sided_authority(
+    page, mode, xch_budget, cat_budget, buy_count, sell_count
+):
+    _open_gui(page)
+    panel = page.evaluate(
+        """async ({mode, xchBudget, catBudget, buyCount, sellCount}) => {
+            _bootstrapBuildReviewBody = () => ({asset_id: 'ab'.repeat(32)});
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true,
+                preview_digest: 'reviewed-digest',
+                liquidity_mode: mode,
+                campaign: {
+                    asset_id: 'ab'.repeat(32), anchor_price: '0.001',
+                    minimum_price: '0.0005', maximum_price: '0.002',
+                    xch_budget: xchBudget, cat_budget: catBudget,
+                },
+                plan: {
+                    deployment_fraction: '0.1',
+                    sides: {
+                        buy: {levels: Array(buyCount).fill({})},
+                        sell: {levels: Array(sellCount).fill({})},
+                    },
+                },
+            }), {status: 200});
+            await bootstrapPreviewCampaign();
+            return document.getElementById('bootstrapStatusPanel').textContent;
+        }""",
+        {
+            "mode": mode,
+            "xchBudget": xch_budget,
+            "catBudget": cat_budget,
+            "buyCount": buy_count,
+            "sellCount": sell_count,
+        },
+    )
+    assert f"Liquidity mode {mode.replace('_', ' ')}" in panel
+    assert f"effective market budgets {xch_budget} XCH / {cat_budget} CAT" in panel
+    assert f"{buy_count} buy / {sell_count} sell offers" in panel
+
+
 def test_stopped_bootstrap_clears_stale_authority_and_asset_confirmation(page):
     """A stopped campaign must not leave its old authority review armed in the UI."""
     _open_gui(page)
