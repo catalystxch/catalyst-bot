@@ -55,6 +55,18 @@ def test_offer_tab_has_visible_parked_side_state_hooks():
     assert html.index('id="intelSellDepthPanel"') > orderbook_depth
 
 
+def test_mode_switch_copy_warns_that_old_offers_remain_live_until_cancelled():
+    html = _html()
+
+    assert (
+        "Existing opposite-side offers remain live until you use protected Cancel All"
+        in html
+    )
+    assert "Start is blocked while any remain open" in html
+    assert "Existing offers on the opposite side will be cancelled" not in html
+    assert "XCH is reserved separately for fees" in html
+
+
 def test_save_and_coin_prep_paths_sanitize_inactive_side_from_liquidity_mode():
     html = _html()
 

@@ -93,6 +93,77 @@ def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     )
 
 
+def _one_sided_open_offer_start_block(cfg_obj) -> dict[str, Any] | None:
+    """Keep an old opposite-side book from trading under a new one-sided mode."""
+    mode = str(getattr(cfg_obj, "LIQUIDITY_MODE", "two_sided") or "").lower()
+    if mode not in {"buy_only", "sell_only"}:
+        return None
+
+    disabled_side = "sell" if mode == "buy_only" else "buy"
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    from database import get_open_offers
+    from wallet import classify_offers_from_list, get_authoritative_offer_history
+
+    try:
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
+        if type(history) is dict:
+            wallet_offers = history.get("offers")
+            complete = (
+                history.get("success") is True and history.get("end_of_history") is True
+            )
+        else:
+            # Chia returns one bounded page; a full page does not prove the end.
+            wallet_offers = history
+            complete = type(history) is list and len(history) < 500
+        if (
+            not complete
+            or type(wallet_offers) is not list
+            or any(type(offer) is not dict for offer in wallet_offers)
+        ):
+            raise ValueError("Wallet offer history is incomplete")
+        wallet_buys, wallet_sells, _ = classify_offers_from_list(
+            wallet_offers, asset_id
+        )
+        db_offers = get_open_offers(side=disabled_side, cat_asset_id=asset_id)
+        if type(db_offers) is not list:
+            raise ValueError("Database offer book is unavailable")
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "One-sided start blocked: opposite-side offer proof unavailable",
+            {"mode": mode, "error": str(exc)[:160]},
+            level="warning",
+        )
+        return {
+            "reason": "OFF_SIDE_OFFER_PROOF_UNAVAILABLE",
+            "error": "Could not verify that opposite-side offers are closed; retry after wallet and book reconciliation",
+            "disabled_side": disabled_side,
+            "offer_count": None,
+        }
+
+    wallet_rows = wallet_sells if disabled_side == "sell" else wallet_buys
+    offer_ids = {
+        str(row.get("trade_id") or row.get("offer_id") or "").strip()
+        for row in [*wallet_rows, *db_offers]
+    }
+    offer_ids.discard("")
+    count = max(len(offer_ids), len(wallet_rows), len(db_offers))
+    if count == 0:
+        return None
+    return {
+        "reason": "OFF_SIDE_OFFERS_OPEN",
+        "error": (
+            f"Cannot start {mode.replace('_', '-')} while {count} "
+            f"{disabled_side} offer(s) remain open. Stop and use protected Cancel All, "
+            "then wait for authoritative terminal reconciliation."
+        ),
+        "disabled_side": disabled_side,
+        "offer_count": count,
+    }
+
+
 def _api_server():
     """Return the currently loaded api_server module.
 
@@ -608,6 +679,22 @@ def api_bot_start():
                     "migration": migration,
                 }
             ), 400
+
+    if not errors:
+        mode_block = _one_sided_open_offer_start_block(cfg)
+        if mode_block is not None:
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": mode_block["reason"],
+                    "error": mode_block["error"],
+                    "errors": [mode_block["error"]],
+                    "warnings": warnings,
+                    "disabled_side": mode_block["disabled_side"],
+                    "offer_count": mode_block["offer_count"],
+                }
+            ), 409
 
     # Block start on critical errors
     if errors:

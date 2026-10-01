@@ -10785,7 +10785,7 @@
                             Liquidity Mode
                             <span class="cc-help">?<span class="cc-tooltip" style="min-width:320px; text-align:left;">
                                 Pick the shape of your market presence before anything else. Two-sided runs a full market maker quoting both buy and sell. One-sided modes place only buy OR only sell orders — useful for accumulation (buy at ladder prices) or distribution (sell at ladder prices) without needing inventory on both sides.<br><br>
-                                Changing the mode requires stopping the bot. Existing offers on the opposite side will be cancelled when the new mode takes effect.
+                                Changing the mode requires stopping the bot. Existing opposite-side offers remain live until you use protected Cancel All and they are confirmed terminal. Start is blocked while any remain open.
                             </span></span>
                         </div>
                         <div class="v4-settings-hint" style="margin-bottom: 12px;">
@@ -10812,7 +10812,7 @@
                             </label>
                         </div>
                         <div id="liquidityModeLockedHint" style="display:none; margin-top: 10px; padding: 8px 12px; background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); border-radius: 6px; font-size: 0.82em; color: var(--warning-300); line-height: 1.5;">
-                            🔒 Stop the bot to change the liquidity mode. Existing offers on the opposite side will be cancelled when the new mode starts.
+                            🔒 Stop the bot to change the liquidity mode. Existing opposite-side offers stay live; use protected Cancel All before starting the new mode.
                         </div>
                         <!-- Wallet-balance suggestion: appears when the wallet is
                              clearly lopsided (lots of XCH and ~no CAT, or vice
@@ -22688,7 +22688,7 @@
             },
             sell_only: {
                 title: 'Auto-Fill — Distribution Plan',
-                subtitle: 'Set your <strong>Token Reserve</strong> above first, then choose a risk profile, then click — the sell ladder is sized from the tokens left over. No buy ladder or sniper in this mode; XCH balance stays untouched.',
+                subtitle: 'Set your <strong>Token Reserve</strong> above first, then choose a risk profile, then click — the sell ladder is sized from the tokens left over. No buy ladder or sniper in this mode; XCH is reserved separately for fees.',
             },
         };
         function applySmartDefaultsLabels(mode) {

@@ -134,6 +134,133 @@ def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStart(_FlaskBase):
+    def test_buy_only_start_blocks_existing_wallet_sell_offer(self):
+        asset_id = "ab" * 32
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        bot = _make_bot(running=False, start_returns=True)
+        old_sell = {
+            "trade_id": "old-sell",
+            "status": 0,
+            "summary": {
+                "offered": {asset_id: 1000},
+                "requested": {"xch": 100_000_000},
+            },
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [old_sell],
+                    "end_of_history": True,
+                },
+            ),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "OFF_SIDE_OFFERS_OPEN")
+        bot.start.assert_not_called()
+
+    def test_sell_only_start_blocks_existing_database_buy_offer(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.LIQUIDITY_MODE = "sell_only"
+        bot = _make_bot(running=False, start_returns=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "database.get_open_offers",
+                return_value=[{"trade_id": "old-buy", "side": "buy"}],
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "OFF_SIDE_OFFERS_OPEN")
+        self.assertEqual(resp.get_json().get("disabled_side"), "buy")
+        bot.start.assert_not_called()
+
+    def test_one_sided_start_fails_closed_when_offer_history_is_unavailable(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        bot = _make_bot(running=False, start_returns=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": False,
+                    "offers": [],
+                    "end_of_history": False,
+                },
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"), "OFF_SIDE_OFFER_PROOF_UNAVAILABLE"
+        )
+        bot.start.assert_not_called()
+
+    def test_buy_only_start_allows_active_side_offers_only(self):
+        asset_id = "ab" * 32
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+        fake_cfg.LIQUIDITY_MODE = "buy_only"
+        bot = _make_bot(running=False, start_returns=True)
+        active_buy = {
+            "trade_id": "current-buy",
+            "status": 0,
+            "summary": {
+                "offered": {"xch": 100_000_000},
+                "requested": {asset_id: 1000},
+            },
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [active_buy],
+                    "end_of_history": True,
+                },
+            ),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json().get("status"), "started")
+        bot.start.assert_called_once()
+
     def test_requires_token(self):
         resp = self._post("/api/bot/start", auth=False)
         self.assertEqual(resp.status_code, 401)
