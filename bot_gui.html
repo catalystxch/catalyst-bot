@@ -9810,7 +9810,7 @@
                     </div>
                     <div class="lc-manual-actions">
                         <div id="lcGapDisplay" style="font-size:0.85em; color: var(--text-secondary); margin-bottom: 8px;">Current arb gap: <strong id="lcGapValue">—</strong></div>
-                        <button class="btn" id="boostBtn" hidden onclick="toggleGapCloser()" style="width: 100%;">Retired</button>
+                        <button class="btn" id="boostBtn" hidden style="width: 100%;">Retired</button>
                     </div>
                 </div>
             </div>
@@ -10182,7 +10182,7 @@
                         <div style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: var(--space-3);">Sniper Stats <span class="cc-help">?<span class="cc-tooltip">All sniper probe activity — automatic arb snipes plus manual Close the Gap probes. Both use the sniper pool to probe price levels.</span></span></div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--space-2); margin-bottom: var(--space-3);">
                             <div>
-                                <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Arb Snipes <span class="cc-help">?<span class="cc-tooltip">Automatic arb snipes executed this session. Triggered when gap between Dexie and TibetSwap exceeds threshold.</span></span></div>
+                                <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Arb Snipes <span class="cc-help">?<span class="cc-tooltip">Historical automatic probe activity retained for prior sessions.</span></span></div>
                                 <div id="sniperTotal" style="font-size: var(--text-lg); font-weight: 700; font-family: var(--font-mono); color: var(--status-warning);">0</div>
                             </div>
                             <div>
@@ -10197,7 +10197,7 @@
 
                         <!-- Close the Gap floor discovery summary -->
                         <div style="border-top: 1px solid var(--border-subtle); padding-top: var(--space-3);">
-                            <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: var(--space-2); text-transform: uppercase; letter-spacing: 0.5px;">Close the Gap — last completed run <span class="cc-help">?<span class="cc-tooltip">Most recent inverted-probe floor discovery results. Shows the depth at which arbers fired on each side. The cascade plants tight inner ladder offers (immune to TibetSwap arb) after the floors are proven.</span></span></div>
+                            <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: var(--space-2); text-transform: uppercase; letter-spacing: 0.5px;">Close the Gap — last completed run <span class="cc-help">?<span class="cc-tooltip">Historical inverted-probe floor discovery results retained for prior sessions.</span></span></div>
                             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: var(--space-2);">
                                 <div>
                                     <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">BUY Floor</div>
@@ -16803,8 +16803,6 @@
                     return 'Enable inventory protection';
                 case 'applySpread':
                     return 'Adjust live spread';
-                case 'activateGapCloser':
-                    return 'Probe for arb floor';
                 case 'openLiveControls':
                     return 'Open Live Controls';
                 case 'openSettings':
@@ -17735,16 +17733,8 @@
                     }, 300);
                     return;
                 }
-                case 'activateGapCloser': {
-                    // Directly open the gap closer confirmation modal
-                    const boostBtn = document.getElementById('boostBtn');
-                    if (boostBtn && !_gapCloserActive) {
-                        boostBtn.click();
-                    }
-                    return;
-                }
                 case 'openLiveControls': {
-                    // Scroll to and expand Live Controls, then highlight the gap-closer button
+                    // Scroll to and expand Live Controls.
                     // First switch to dashboard view if not already there
                     if (typeof v4SwitchView === 'function') v4SwitchView('dashboard');
                     else if (typeof switchView === 'function') switchView('dashboard');
@@ -17759,13 +17749,7 @@
                         const toggleBtn = document.querySelector('[onclick*="liveControlsBody"]');
                         if (toggleBtn) toggleBtn.classList.remove('collapsed');
                     }
-                    const boostBtn = document.getElementById('boostBtn');
-                    if (boostBtn) {
-                        boostBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        boostBtn.style.outline = '2px solid var(--warning-200)';
-                        boostBtn.style.outlineOffset = '3px';
-                        setTimeout(() => { boostBtn.style.outline = ''; boostBtn.style.outlineOffset = ''; }, 3000);
-                    }
+                    if (liveControlsEl) liveControlsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
                     return;
                 }
                 default:
@@ -29153,7 +29137,7 @@
             if (eventType === 'startup_wallet_sync')
                 return { icon: '🔗', msg: 'Syncing with wallet...', cls: 'la-info' };
 
-            // --- TibetSwap / AMM protection ---
+            // --- Legacy AMM protection history ---
             if (eventType === 'mempool_swap_detected' || eventType === 'mempool_imminent_wake') {
                 return { icon: '🔭', msg: 'Tibet swap spotted early — watching pool confirmation', cls: 'la-info' };
             }
@@ -29468,7 +29452,6 @@
             'applySpread',
             'openSettings',
             'openLiveControls',
-            'activateGapCloser',
             'reviewTopupPool',
             'reviewMaxSpread',
             'reserveFloor'
@@ -33238,7 +33221,7 @@
                         `<div style="color: var(--status-warning); text-align: center; padding: 10px;">` +
                         `⚠️ <strong>Waiting for market data...</strong><br>` +
                         `<span style="font-size: 0.85em;">The bot needs to complete at least one loop cycle ` +
-                        `to get pricing from TibetSwap and Dexie. Start the bot and wait a moment, then try again.</span>` +
+                        `to get current offer-book pricing. Start the bot and wait a moment, then try again.</span>` +
                         `</div>`;
                 }
                 const riskEl = document.getElementById('boostRiskInfo');
@@ -34974,8 +34957,6 @@
                 tibet_shock_cancel_trigger_pct: Math.max(0, parseFloat(document.getElementById('configTibetShockCancelPct')?.value || 0) || 0),
                 min_mid: document.getElementById('configMinMid').value || '',
                 max_mid: document.getElementById('configMaxMid').value || '',
-                // TibetSwap (with null checks)
-                // enable_tibetswap: REMOVED - TibetSwap always enabled
                 // price_strategy: NOT sent from GUI — managed via .env only to prevent accidental overwrite
                 arb_threshold_bps: _pct2bps(document.getElementById('configArbThreshold')?.value || '2.0'),
 
@@ -37146,8 +37127,8 @@ function previewCtgOffers() {
 
 // Confirm and start Close the Gap
 
-// TibetSwap live polling was retired in v1.4. Market confidence is fetched
-// from /api/market/confidence as one coherent, durable offer-book snapshot.
+// Market confidence is fetched from /api/market/confidence as one coherent,
+// durable offer-book snapshot.
 document.addEventListener('DOMContentLoaded', () => {
     loadAlerts();
 });
@@ -38724,7 +38705,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 // Console + Sage Dashboard auto-open is now handled by startupDismiss()
     // (opens only after startup warnings/fingerprint selection are cleared)
 
-    // Start status polling (separate from TibetSwap polling)
+    // Start status polling.
     // Note: Sage wallet RPC is slow (~4s per balance call), so use longer interval
     // to avoid request pile-up. SSE provides real-time updates anyway.
     setInterval(async () => {

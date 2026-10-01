@@ -581,6 +581,9 @@ def test_post_tibet_help_and_about_describe_provider_authority_truthfully():
     assert "Coinset and Spacescan provide corroborating chain evidence" in html
     assert "TibetSwap · retired" not in html
     assert "historical TibetSwap data is retained as read-only history" not in html
+    assert "TibetSwap" not in html
+    assert "activateGapCloser" not in html
+    assert 'onclick="toggleGapCloser()"' not in html
 
     advisor = html[html.index("function saUpdateAdvisor") :]
     advisor = advisor[: advisor.index("function runAdvisorAction")]
