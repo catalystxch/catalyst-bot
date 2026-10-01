@@ -60,6 +60,32 @@ from that commit matched the local ZIP and installer hashes:
 
 These are acceptance artifacts, not a public release.
 
+## Independent secondary PC verification
+
+The secondary PC fetched the exact `b352516c491f57a72758a9d25c82052c16444956`
+source and verified that the later PR head `946fc8f6bc9ac76655e3afb41a226843ec02f77d`
+changes only documentation. Its independent download matched the ZIP, extracted
+EXE, and unsigned installer hashes above. Embedded `bot_gui.html`, `splash.html`,
+and `.env.example` matched the exact source byte for byte. Focused recovery
+verification passed **77 tests** in 10.99 seconds; Ruff and diff checks passed.
+
+Read-only Sage RPC from an isolated minimal profile proved Chia mainnet,
+Harvestr test wallet fingerprint `3702373391`, CAT wallet ID `2`, and exact MZ
+asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+Balances were 240.800786441412 XCH and 3,381,521.720 MZ, with zero fillable
+Sage offers. No CATalyst process was running. The original secondary profile
+and its authoritative backup were left untouched. No wallet action or fee
+occurred.
+
+The secondary PC could not start packaged runtime/UI acceptance: automatic
+approval review had rejected direct execution of a prior candidate EXE on
+that host before process creation, so this exact EXE was not launched by an
+alternate mechanism. Windows UI inspection also failed twice during its own
+initialization with `failed to write kernel assets: The system cannot find the
+path specified (os error 3)`, before reaching Sage or CATalyst. The secondary
+did not route around either block. Its live Coin Prep, offers, native UI, and
+stability gates remain unverified.
+
 ## Native and live acceptance boundaries
 
 The isolated native first-launch smoke displayed the first-run window and
