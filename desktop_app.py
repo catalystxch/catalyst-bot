@@ -1874,8 +1874,14 @@ def _initialize_startup_ownership() -> dict:
         try:
             from coin_prep_worker import recover_coin_prep_operations_at_startup
 
-            if recover_coin_prep_operations_at_startup() is True:
-                authorization = api_server.initialize_mutation_runtime()
+            recover_coin_prep_operations_at_startup()
+            # Recovery's return value summarizes its own observations; it is
+            # not the durable startup authorization decision. Always refresh
+            # that decision after a completed recovery attempt so a terminal
+            # operation cannot leave the launcher displaying its stale,
+            # pre-recovery blocker. Any remaining ambiguity still fails closed
+            # in initialize_mutation_runtime().
+            authorization = api_server.initialize_mutation_runtime()
         except Exception:
             # Recovery is fail-closed. The original authorization keeps the
             # app in diagnostics mode with its durable reason intact.

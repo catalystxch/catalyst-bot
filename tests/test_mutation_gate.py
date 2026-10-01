@@ -6966,6 +6966,52 @@ def test_desktop_retries_startup_after_exact_coin_prep_recovery(
     ]
 
 
+def test_desktop_rechecks_authority_after_coin_prep_recovery_attempt(monkeypatch):
+    """A completed recovery must not leave the initial blocked snapshot onscreen."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    recovery_state = {"complete": False}
+
+    def authorize():
+        events.append("authorize")
+        if recovery_state["complete"]:
+            return {"allowed": True, "reason_code": "", "failed_check": None}
+        return {
+            "allowed": False,
+            "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+            "failed_check": "unresolved_operations",
+        }
+
+    def recover():
+        events.append("coin_prep_recovery")
+        recovery_state["complete"] = True
+        # The recovery helper's boolean is not an authorization decision. For
+        # example, a separately checked legacy recovery may remain false even
+        # after durable coin-prep evidence becomes terminal.
+        return False
+
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(recover_coin_prep_operations_at_startup=recover),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+    ]
+
+
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     lease = {
