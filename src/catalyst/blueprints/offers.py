@@ -178,10 +178,10 @@ def _classify_offer_diagnostic_sets(db_rows, wallet_ids):
             continue
         status = _norm_offer_state(row.get("status"))
         lifecycle = _norm_offer_state(row.get("lifecycle_state")) or status
-        if lifecycle in _CANCEL_PENDING_LIFECYCLES:
-            pending_cancel_ids.add(trade_id)
-        elif status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
+        if status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
             terminal_db_ids.add(trade_id)
+        elif lifecycle in _CANCEL_PENDING_LIFECYCLES:
+            pending_cancel_ids.add(trade_id)
         elif status == "open":
             active_db_ids.add(trade_id)
 
