@@ -302,6 +302,136 @@ class TestBotStart(_FlaskBase):
             result["reason"], "existing_offer_resume_proof_unavailable"
         )
 
+    def test_bootstrap_resume_readiness_rejects_unresolved_current_revision_intent(
+        self,
+    ):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        trade_id = "01" * 32
+        campaign = {"campaign_id": "cd" * 32, "revision": 7}
+        purpose = f"bootstrap:{campaign['campaign_id']}:revision:7"
+        visible = {
+            "asset_id": asset_id,
+            "purpose": purpose,
+            "lifecycle_state": "visible",
+            "sage_trade_id": trade_id,
+        }
+        unresolved = {
+            "asset_id": asset_id,
+            "purpose": purpose,
+            "lifecycle_state": "creation_unknown",
+            "sage_trade_id": None,
+        }
+        wallet_offer = {
+            "trade_id": trade_id,
+            "status": 0,
+            "summary": {
+                "offered": {asset_id: 5_000_000},
+                "requested": {"xch": 550_000_000_000},
+            },
+        }
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        with (
+            patch(
+                "database.get_offer_intents_for_registry",
+                return_value=[visible, unresolved],
+            ),
+            patch(
+                "database.get_open_offers", return_value=[{"trade_id": trade_id}]
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [wallet_offer],
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "wallet.classify_offers_from_list",
+                return_value=([], [wallet_offer], []),
+            ),
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                fake_cfg, campaign
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(
+            result["reason"], "existing_offer_resume_proof_unavailable"
+        )
+
+    def test_bootstrap_resume_readiness_rejects_nonterminal_closed_classification(
+        self,
+    ):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        trade_id = "01" * 32
+        extra_trade_id = "02" * 32
+        campaign = {"campaign_id": "cd" * 32, "revision": 7}
+        purpose = f"bootstrap:{campaign['campaign_id']}:revision:7"
+        intent = {
+            "asset_id": asset_id,
+            "purpose": purpose,
+            "lifecycle_state": "visible",
+            "sage_trade_id": trade_id,
+        }
+        live = {
+            "trade_id": trade_id,
+            "status": 0,
+            "summary": {
+                "offered": {asset_id: 5_000_000},
+                "requested": {"xch": 550_000_000_000},
+            },
+        }
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        for status in ("PENDING_CANCEL", "UNRECOGNIZED_STATUS"):
+            with self.subTest(status=status):
+                extra = {
+                    "trade_id": extra_trade_id,
+                    "status": status,
+                    "summary": {
+                        "offered": {asset_id: 7_000_000},
+                        "requested": {"xch": 770_000_000_000},
+                    },
+                }
+                with (
+                    patch(
+                        "database.get_offer_intents_for_registry",
+                        return_value=[intent],
+                    ),
+                    patch(
+                        "database.get_open_offers",
+                        return_value=[{"trade_id": trade_id}],
+                    ),
+                    patch(
+                        "wallet.get_authoritative_offer_history",
+                        return_value={
+                            "success": True,
+                            "offers": [live, extra],
+                            "end_of_history": True,
+                        },
+                    ),
+                    patch(
+                        "wallet.classify_offers_from_list",
+                        return_value=([], [live], [extra]),
+                    ),
+                ):
+                    result = (
+                        bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                            fake_cfg, campaign
+                        )
+                    )
+
+                self.assertFalse(result["ready"])
+                self.assertEqual(
+                    result["reason"], "existing_offer_resume_proof_unavailable"
+                )
+
     def test_one_sided_start_rejects_unclassified_open_sage_offer(self):
         from blueprints import bot as bot_blueprint
 

@@ -422,6 +422,12 @@ def _bootstrap_existing_offer_resume_readiness(
             for row in current_intents
         ):
             raise ValueError("Campaign intent asset identity disagrees")
+        if any(
+            str(row.get("lifecycle_state") or "").strip().lower()
+            not in active_states | {"terminal"}
+            for row in current_intents
+        ):
+            raise ValueError("Current campaign revision has unresolved offer intents")
         active_intents = [
             row
             for row in current_intents
@@ -486,10 +492,29 @@ def _bootstrap_existing_offer_resume_readiness(
                 str(key).strip().lower().removeprefix("0x") for key in requested
             }
             related = asset_id in offered_assets or asset_id in requested_assets
-            if related and id(row) not in open_row_ids | closed_row_ids:
-                raise ValueError(
-                    "Current-pair wallet offer cannot be authoritatively classified"
+            if related and id(row) not in open_row_ids:
+                status = row.get("status")
+                explicitly_terminal = (
+                    (type(status) is int and status in {3, 4, 5})
+                    or (
+                        isinstance(status, str)
+                        and status.strip().upper()
+                        in {
+                            "CANCELLED",
+                            "CANCELED",
+                            "CONFIRMED",
+                            "COMPLETED",
+                            "FAILED",
+                            "EXPIRED",
+                            "SUCCESS",
+                        }
+                    )
                 )
+                if id(row) not in closed_row_ids or not explicitly_terminal:
+                    raise ValueError(
+                        "Current-pair wallet offer is unresolved or cannot be "
+                        "authoritatively classified"
+                    )
         wallet_ids = [
             str(row.get("trade_id") or row.get("offer_id") or "").strip()
             for row in wallet_open
