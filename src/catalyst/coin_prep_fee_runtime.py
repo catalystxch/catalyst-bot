@@ -345,12 +345,16 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             campaign_has_cleanup = bool(
                 _campaign_trade_ids(options["bootstrap_campaign_id"])
             )
-        if type(stopped) is dict and (
-            campaign_has_cleanup
-            or (
-                _campaign_is_stopped_for_fee_recovery(stopped)
-                and Decimal(str(stopped.get("fee_spent_xch", "0")))
-                > Decimal(str(stopped.get("fee_budget_xch", "0")))
+        if (
+            cancellation_recovery
+            and type(stopped) is dict
+            and (
+                campaign_has_cleanup
+                or (
+                    _campaign_is_stopped_for_fee_recovery(stopped)
+                    and Decimal(str(stopped.get("fee_spent_xch", "0")))
+                    > Decimal(str(stopped.get("fee_budget_xch", "0")))
+                )
             )
         ):
             raise ValueError("bootstrap_coin_prep_not_authorized:fee_reserve")
@@ -523,12 +527,20 @@ def read_approved_prep_fee_snapshot(
     binding = quote.get("execution_context")
     request_options = json.loads(consent["request_options_json"])
     recovery_only = request_options.get("cancellation_recovery") is True
-    if (
-        scope["campaign_id"] is not None
-        and type(quote.get("cancellation_recovery")) is not bool
-    ):
+    marker = quote.get("cancellation_recovery")
+    if marker is None and scope["campaign_id"] is not None:
+        legacy_cancellation_only = (
+            quote.get("preparation_transaction_count_max") == 0
+            and bool(quote.get("stages"))
+            and all(stage.get("cancellation") is True for stage in quote["stages"])
+        )
+        if legacy_cancellation_only and not allow_campaign_fee_recovery:
+            raise ValueError("FEE_APPROVAL_STALE")
+    elif type(marker) is not bool:
         raise ValueError("FEE_APPROVAL_STALE")
-    if quote.get("cancellation_recovery", False) is not recovery_only:
+    if (marker is not None and marker is not recovery_only) or (
+        marker is None and recovery_only
+    ):
         raise ValueError("FEE_APPROVAL_STALE")
     if recovery_only and not allow_campaign_fee_recovery:
         raise ValueError("FEE_APPROVAL_STALE")

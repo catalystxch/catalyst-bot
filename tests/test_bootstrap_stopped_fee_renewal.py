@@ -330,14 +330,6 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
 
     app = Flask(__name__)
     app.register_blueprint(coin_prep.bp)
-    ordinary = app.test_client().post(
-        "/api/coin-prep/fee-preview",
-        json={
-            "bootstrap_campaign_id": state["campaign_id"],
-            "bootstrap_campaign_revision": 1,
-        },
-    )
-    assert ordinary.status_code == 409, ordinary.get_json()
     response = app.test_client().post(
         "/api/coin-prep/fee-preview",
         json={
@@ -369,6 +361,44 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
     assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
     assert recovered["campaign"]["revision"] == 1
     assert approval["dispatch_authorized"] is False
+    original_approval_context = database.get_coin_prep_fee_approval_context
+
+    def legacy_approval_context(approval_id):
+        context = dict(original_approval_context(approval_id))
+        options = json.loads(context["request_options_json"])
+        options.pop("cancellation_recovery")
+        context["request_options_json"] = json.dumps(options)
+        quote = json.loads(context["quote_json"])
+        quote.pop("cancellation_recovery")
+        context["quote_json"] = json.dumps(quote)
+        return context
+
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_context", legacy_approval_context
+    )
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
+            approval["approval_id"]
+        )
+
+
+def test_active_campaign_offers_keep_ordinary_prep_context(request, monkeypatch):
+    state = request.getfixturevalue("approved_bootstrap")
+    bootstrap = import_module("blueprints.bootstrap")
+    runtime = import_module("coin_prep_fee_runtime")
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda campaign_id: ["a" * 64] if campaign_id == state["campaign_id"] else [],
+    )
+    context = runtime.read_fee_economic_snapshot(
+        {
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 0,
+        }
+    )
+    assert context["recovery_only"] is False
+    assert context["request_options"].get("cancellation_recovery") is None
 
 
 @pytest.fixture

@@ -39596,6 +39596,7 @@ document.addEventListener('DOMContentLoaded', () => {
 let _bootstrapPreviewDigest = '';
 let _bootstrapPreviewBody = null;
 let _bootstrapActiveCampaign = null;
+let _bootstrapPendingStopRetry = null;
 
 function _bootstrapCanonicalDecimal(value, fallback = '') {
     let text = String(value == null || value === '' ? fallback : value).trim();
@@ -39807,6 +39808,7 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    if (_bootstrapActiveCampaign) _bootstrapPendingStopRetry = null;
     if (hadActiveCampaign && !_bootstrapActiveCampaign) {
         _bootstrapPreviewDigest = '';
         _bootstrapPreviewBody = null;
@@ -39821,7 +39823,16 @@ function _bootstrapRenderStatus(payload) {
     ).replace(/_XCH$/i, '').replace(/\/XCH$/i, '').trim() || 'CAT';
     if (_bootstrapActiveCampaign) syncBootstrapCampaignPairIntoSelectors(payload);
     hydrateBootstrapCampaignControls(_bootstrapActiveCampaign);
+    if (_bootstrapPendingStopRetry) {
+        const preview = document.getElementById('bootstrapPreviewBtn');
+        const start = document.getElementById('bootstrapStartBtn');
+        if (preview) preview.disabled = true;
+        if (start) start.disabled = true;
+    }
     let summary = 'Follow mode · no active Bootstrap campaign';
+    if (!_bootstrapActiveCampaign && _bootstrapPendingStopRetry) {
+        summary = 'Bootstrap stopped · campaign cancellation retry required';
+    }
     if (_bootstrapActiveCampaign) {
         const campaign = _bootstrapActiveCampaign;
         const expiryMs = Date.parse(campaign.expires_at || '');
@@ -39862,9 +39873,15 @@ function _bootstrapRenderStatus(payload) {
                     ? ` · requires cancellation before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
                     : ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
             )
-            : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
+            : _bootstrapPendingStopRetry
+                ? summary
+                : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
     }
-    if (stop) stop.disabled = !_bootstrapActiveCampaign;
+    if (stop) {
+        stop.disabled = !_bootstrapActiveCampaign && !_bootstrapPendingStopRetry;
+        stop.textContent = _bootstrapPendingStopRetry
+            ? 'Retry Campaign Cancellation' : 'Stop & Cancel Campaign Offers';
+    }
     if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
     const proofExporter = document.getElementById('bootstrapParticipationExportBtn');
     if (proofExporter) proofExporter.disabled = !_bootstrapActiveCampaign;
@@ -39970,14 +39987,17 @@ async function bootstrapStartCampaign() {
 }
 
 async function bootstrapStopCampaign() {
-    const campaign = _bootstrapActiveCampaign;
+    const campaign = _bootstrapPendingStopRetry || _bootstrapActiveCampaign;
     if (!campaign) return;
+    const retrying = !!_bootstrapPendingStopRetry;
     try {
         const approved = await showStyledConfirm({
             icon: '⏹',
-            title: 'Stop Bootstrap campaign?',
-            message: 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
-            confirmText: 'Stop and cancel',
+            title: retrying ? 'Retry campaign cancellation?' : 'Stop Bootstrap campaign?',
+            message: retrying
+                ? 'The campaign is already stopped. Retry cancellation only for offers owned by this exact campaign after checking the wallet service is available.'
+                : 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
+            confirmText: retrying ? 'Retry cancellation' : 'Stop and cancel',
             cancelText: 'Keep running',
             style: 'warning'
         });
@@ -39993,9 +40013,15 @@ async function bootstrapStopCampaign() {
             'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
             'FEE_PREP_FUNDING_INSUFFICIENT',
         ];
+        if (!payload?.success && payload?.stopped === true) {
+            _bootstrapPendingStopRetry = payload.financial_action_started === false
+                && !feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))
+                ? {campaign_id: String(payload.campaign_id), revision: Number(payload.campaign_revision)}
+                : null;
+            await bootstrapRefreshStatus();
+        }
         if (!payload?.success && payload?.stopped === true
             && feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))) {
-            await bootstrapRefreshStatus();
             _bootstrapText('bootstrapStatusPanel', 'Campaign creation is stopped. Review and approve the fresh cancellation-only fee estimate to finish removing its offers.');
             await reviewCancelAllFeeBudgetFailure({
                 ...payload,
@@ -40005,7 +40031,16 @@ async function bootstrapStopCampaign() {
             });
             return;
         }
+        if (!payload?.success && payload?.stopped === true) {
+            const message = payload.financial_action_started === false
+                ? 'Campaign creation is stopped. Cancellation did not start; review the offer state, then retry this campaign cancellation.'
+                : 'Campaign creation is stopped. Cancellation outcome is unresolved; verify Sage and CATalyst before retrying.';
+            _bootstrapText('bootstrapStatusPanel', message);
+            showToast(message, 'warning');
+            return;
+        }
         if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap stop failed');
+        _bootstrapPendingStopRetry = null;
         _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
         showToast('Bootstrap campaign stopped', 'success');
         await bootstrapRefreshStatus();
@@ -40027,8 +40062,15 @@ async function resumeBootstrapStopAfterFeeApproval(intent, feeApprovalId) {
     });
     const payload = await response.json();
     if (!payload?.success) {
+        if (payload?.stopped === true) {
+            _bootstrapPendingStopRetry = payload.financial_action_started === false
+                ? {campaign_id: String(payload.campaign_id), revision: Number(payload.campaign_revision)}
+                : null;
+            await bootstrapRefreshStatus();
+        }
         throw new Error(payload?.code || payload?.error || 'Bootstrap cancellation retry failed');
     }
+    _bootstrapPendingStopRetry = null;
     _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
     showToast('Bootstrap campaign cancellation resumed', 'success');
     await bootstrapRefreshStatus();
