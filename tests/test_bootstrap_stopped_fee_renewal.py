@@ -99,11 +99,15 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     )
     # The immutable prior approval retains revision 0; stop increments the
     # campaign to revision 1 without changing its economics or fee ceiling.
-    options = {
+    ordinary_options = {
         "bootstrap_campaign_id": state["campaign_id"],
         "bootstrap_campaign_revision": 0,
     }
-    assert real_context(options) is None
+    assert real_context(ordinary_options) is None
+    options = {
+        **ordinary_options,
+        "cancellation_recovery_action": "bootstrap_stop",
+    }
     with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
         runtime.read_approved_prep_fee_snapshot(state["approval"]["approval_id"])
     before = utils._counts()
@@ -224,6 +228,7 @@ def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
     options = {
         "bootstrap_campaign_id": state["campaign_id"],
         "bootstrap_campaign_revision": 1,
+        "cancellation_recovery_action": "bootstrap_stop",
     }
     preview = import_module("coin_prep_fee_approval").preview_coin_prep_fees(options)
     assert preview["available"] is True
@@ -246,17 +251,22 @@ def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
         maximum_fee_mojos=int(payload["suggested_maximum_fee_mojos"]),
         cancellation_reserve_mojos=int(payload["minimum_cancellation_reserve_mojos"]),
     )
-    recovered = import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
-        approval["approval_id"], allow_campaign_fee_recovery=True
+    runtime = import_module("coin_prep_fee_runtime")
+    with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ACTION_MISMATCH"):
+        runtime.read_approved_prep_fee_snapshot(
+            approval["approval_id"], expected_recovery_action="cancel_all"
+        )
+    recovered = runtime.read_approved_prep_fee_snapshot(
+        approval["approval_id"], expected_recovery_action="bootstrap_stop"
     )
     assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
     assert approval["dispatch_authorized"] is False
 
 
-def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
+def test_active_campaign_requires_explicit_cancellation_recovery_intent(
     request, monkeypatch
 ):
-    """A policy heartbeat must not strand cancellation of its live offers."""
+    """Live offers alone must not turn ordinary prep into cancel-only consent."""
 
     import_module("api_server")
     coin_prep = import_module("blueprints.coin_prep")
@@ -264,6 +274,16 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
     state = request.getfixturevalue("approved_bootstrap")
     monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", real_context)
     database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+
+    with pytest.raises(ValueError, match="FEE_PREP_CAMPAIGN_UNAVAILABLE"):
+        runtime.read_fee_economic_snapshot(
+            {
+                "bootstrap_campaign_id": state["campaign_id"],
+                "bootstrap_campaign_revision": 0,
+                "cancellation_recovery_action": "cancel_all",
+            }
+        )
 
     intent_id, trade_id = "6" * 64, "7" * 64
     operation_id = f"create:{intent_id}"
@@ -326,6 +346,30 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
     )
     assert database.get_bootstrap_campaign(state["campaign_id"])["status"] == "active"
 
+    def active_context(options):
+        assert "cancellation_recovery_action" not in options
+        return {
+            "campaign": database.get_bootstrap_campaign(state["campaign_id"]),
+            "worker_args": state["worker_args"],
+            "xch_balance_mojos": 200_000_000_000,
+            "cat_balance_mojos": 20_000,
+            "cat_decimals": 3,
+        }
+
+    monkeypatch.setattr(
+        coin_prep, "_active_bootstrap_coin_prep_context", active_context
+    )
+
+    ordinary = runtime.read_fee_economic_snapshot(
+        {
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 1,
+        }
+    )
+    assert ordinary["recovery_only"] is False
+    assert ordinary["recipe"]["economic_plan"]["campaign_revision"] == 1
+    assert ordinary["recipe"]["targets"]
+
     app = Flask(__name__)
     app.register_blueprint(coin_prep.bp)
     response = app.test_client().post(
@@ -333,6 +377,7 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
         json={
             "bootstrap_campaign_id": state["campaign_id"],
             "bootstrap_campaign_revision": 1,
+            "cancellation_recovery_action": "cancel_all",
         },
     )
     payload = response.get_json()
@@ -348,12 +393,94 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
         maximum_fee_mojos=int(payload["suggested_maximum_fee_mojos"]),
         cancellation_reserve_mojos=int(payload["minimum_cancellation_reserve_mojos"]),
     )
-    recovered = import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
-        approval["approval_id"], allow_campaign_fee_recovery=True
+    with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ONLY"):
+        runtime.read_approved_prep_fee_snapshot(approval["approval_id"])
+    with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ACTION_MISMATCH"):
+        runtime.read_approved_prep_fee_snapshot(
+            approval["approval_id"],
+            expected_recovery_action="bootstrap_stop",
+        )
+    recovered = runtime.read_approved_prep_fee_snapshot(
+        approval["approval_id"], expected_recovery_action="cancel_all"
     )
     assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
     assert recovered["campaign"]["revision"] == 1
     assert approval["dispatch_authorized"] is False
+
+
+def test_legacy_campaign_approval_without_server_authority_marker_is_rejected(
+    request, monkeypatch
+):
+    """A profile copied from the buggy candidate must require fresh consent."""
+
+    import_module("api_server")
+    coin_prep = import_module("blueprints.coin_prep")
+    real_context = coin_prep._active_bootstrap_coin_prep_context
+    state = request.getfixturevalue("approved_bootstrap")
+    monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", real_context)
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+
+    current = database.get_coin_prep_fee_approval_context(
+        state["approval"]["approval_id"]
+    )
+    legacy_quote = json.loads(current["quote_json"])
+    legacy_quote.pop("approval_authority", None)
+    legacy_preview = database.store_coin_prep_fee_preview(
+        scope_sha256=current["scope_sha256"],
+        plan_sha256=current["plan_sha256"],
+        scope_json=current["scope_json"],
+        plan_json=current["plan_json"],
+        request_options_json=current["request_options_json"],
+        quote_json=json.dumps(legacy_quote, sort_keys=True, separators=(",", ":")),
+        observed_at=1000,
+        expires_at=1060,
+    )
+    legacy = database.approve_coin_prep_fee_preview(
+        preview_id=legacy_preview["preview_id"],
+        scope_sha256=current["scope_sha256"],
+        plan_sha256=current["plan_sha256"],
+        maximum_fee_mojos=state["approval"]["total_fee_mojos"],
+        cancellation_reserve_mojos=state["approval"]["cancellation_reserve_mojos"],
+        now=1000,
+    )
+
+    with pytest.raises(ValueError, match="FEE_APPROVAL_LEGACY_UNSCOPED"):
+        runtime.read_approved_prep_fee_snapshot(legacy["approval_id"])
+    with pytest.raises(ValueError, match="FEE_APPROVAL_LEGACY_UNSCOPED"):
+        runtime.read_approved_prep_fee_snapshot(
+            legacy["approval_id"],
+            expected_recovery_action="cancel_all",
+        )
+
+
+def test_normal_campaign_approval_remains_valid_for_named_cancellation_routes(
+    request, monkeypatch
+):
+    """The original reserve may cancel; only renewed consent is action-specific."""
+
+    import_module("api_server")
+    coin_prep = import_module("blueprints.coin_prep")
+    real_context = coin_prep._active_bootstrap_coin_prep_context
+    state = request.getfixturevalue("approved_bootstrap")
+    monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", real_context)
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+
+    cancel_all = runtime.read_approved_prep_fee_snapshot(
+        state["approval"]["approval_id"],
+        expected_recovery_action="cancel_all",
+    )
+    assert cancel_all["recovery_only"] is False
+    assert database.stop_bootstrap_campaign(
+        state["campaign_id"], "manual", "2026-09-22T12:01:00Z"
+    )
+    bootstrap_stop = runtime.read_approved_prep_fee_snapshot(
+        state["approval"]["approval_id"],
+        expected_recovery_action="bootstrap_stop",
+    )
+    assert bootstrap_stop["recovery_only"] is False
+    assert bootstrap_stop["campaign"]["status"] == "stopped"
 
 
 @pytest.fixture
@@ -436,7 +563,13 @@ def automatically_stopped_campaign(request, monkeypatch):
     assert restored["stage"] == "stopped"
     assert restored["revision"] == 1
     assert restored["fee_budget_xch"] == "0.01"
-    return {**state, "recovery_options": options}
+    return {
+        **state,
+        "recovery_options": {
+            **options,
+            "cancellation_recovery_action": "bootstrap_stop",
+        },
+    }
 
 
 def test_automatic_policy_stop_preserves_read_only_recovery_preview(
@@ -466,7 +599,7 @@ def test_automatic_policy_stop_preserves_read_only_recovery_preview(
     assert payload["dispatch_authorized"] is False
 
 
-def test_automatic_policy_stop_preserves_only_cancellation_recovery_context(
+def test_automatic_policy_stop_requires_fresh_action_bound_recovery_consent(
     automatically_stopped_campaign,
 ):
     state = automatically_stopped_campaign
@@ -475,12 +608,10 @@ def test_automatic_policy_stop_preserves_only_cancellation_recovery_context(
     with pytest.raises(ValueError):
         runtime.read_approved_prep_fee_snapshot(state["approval"]["approval_id"])
 
-    recovered = runtime.read_approved_prep_fee_snapshot(
-        state["approval"]["approval_id"], allow_campaign_fee_recovery=True
-    )
+    with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ACTION_MISMATCH"):
+        runtime.read_approved_prep_fee_snapshot(
+            state["approval"]["approval_id"],
+            expected_recovery_action="bootstrap_stop",
+        )
 
     assert utils._counts() == before, "readback must not create new consent or holds"
-    assert recovered["campaign"]["stage"] == "stopped"
-    assert recovered["campaign"]["fee_budget_xch"] == "0.01"
-    assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
-    assert recovered["dispatch_authorized"] is False

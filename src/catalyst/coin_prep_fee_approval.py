@@ -21,6 +21,7 @@ from fee_estimation import (
 
 
 MAX_ATOMIC_AMOUNT = 2**63 - 1
+_CANCELLATION_RECOVERY_ACTIONS = {"cancel_all", "bootstrap_stop"}
 
 
 def _now():
@@ -61,6 +62,20 @@ def _closed_dict(value, keys):
 
 def _canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def fee_approval_authority(request_options: dict) -> dict:
+    """Return the server-owned approval-purpose marker persisted in a preview."""
+
+    if type(request_options) is not dict:
+        raise ValueError("fee preview options are invalid")
+    action = request_options.get("cancellation_recovery_action")
+    if action is not None and action not in _CANCELLATION_RECOVERY_ACTIONS:
+        raise ValueError("fee preview recovery action is invalid")
+    return {
+        "schema_version": 1,
+        "cancellation_recovery_action": action,
+    }
 
 
 _IDENTITY_FIELDS = (
@@ -536,6 +551,7 @@ def estimate_coin_prep_fee_preview(
         quote_json=_canonical_json(
             {
                 **result,
+                "approval_authority": fee_approval_authority(request_options),
                 **(
                     {"execution_context": execution_context}
                     if execution_context is not None
@@ -636,6 +652,10 @@ def approve_coin_prep_fees(
     ):
         raise ValueError("FEE_APPROVAL_STALE")
     stored_quote = json.loads(preview["quote_json"])
+    if stored_quote.get("approval_authority") != fee_approval_authority(
+        json.loads(preview["request_options_json"])
+    ):
+        raise ValueError("FEE_APPROVAL_LEGACY_UNSCOPED")
     if "execution_context" in stored_quote:
         from coin_prep_fee_execution import (
             freeze_execution_context,

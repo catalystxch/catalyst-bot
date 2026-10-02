@@ -293,6 +293,7 @@ def _seed_task7_created_offer(
     intent_seed: str,
     expires_at: str | None = None,
     wallet_fingerprint_hash: str = "f" * 64,
+    purpose: str = "normal_lifecycle",
 ) -> str:
     """Persist one Task 7 creation journal and its confirmed trade binding."""
 
@@ -316,7 +317,7 @@ def _seed_task7_created_offer(
         asset_id=ASSET_ID,
         side="buy",
         tier="inner",
-        purpose="normal_lifecycle",
+        purpose=purpose,
         slot_key=f"slot:{intent_seed}",
         generation=0,
         offered_amount_atomic="1000",
@@ -1761,6 +1762,65 @@ def test_coin_prep_cancel_releases_fee_coin_if_authority_fails_before_dispatch(
     assert pool.available_count == 1
 
 
+def test_bootstrap_stop_passes_only_bootstrap_stop_recovery_authority(
+    isolated_database, monkeypatch
+):
+    campaign_id = "9" * 64
+    approval_id = "f" * 64
+    trade_id = "a" * 64
+    source_coin_id = "c" * 64
+    fee_coin_id = "e" * 64
+    _seed_task7_created_offer(
+        trade_id=trade_id,
+        coin_id=source_coin_id,
+        intent_seed="bootstrap-stop-action-scope",
+        purpose=f"bootstrap:{campaign_id}:revision:0",
+    )
+    monkeypatch.setattr(
+        database,
+        "get_latest_coin_prep_fee_approval_for_campaign",
+        lambda selected_campaign_id: (
+            approval_id if selected_campaign_id == campaign_id else None
+        ),
+    )
+    pool = FeeCoinPool()
+    pool.refresh([{"coin_id": fee_coin_id, "coin": {"amount": 1_000_000_000}}])
+    manager = OfferManager()
+    manager._fee_pool = pool
+    calls = []
+    pricing = __import__("coin_prep_fee_cancellation")
+
+    def price(**kwargs):
+        calls.append(kwargs)
+        return {
+            "available": True,
+            "trade_ids": list(kwargs["trade_ids"]),
+            "source_coin_ids": list(kwargs["source_coin_ids"]),
+            "fee_coin_id": kwargs["fee_coin_id"],
+            "fee_mojos": 42,
+        }
+
+    monkeypatch.setattr(pricing, "price_approved_cancellation", price)
+    monkeypatch.setattr(
+        manager,
+        "_acquire_cancel_authority",
+        lambda _intent: (_ for _ in ()).throw(
+            ValueError("FEE_WALLET_IDENTITY_UNAVAILABLE")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="FEE_WALLET_IDENTITY_UNAVAILABLE"):
+        manager.cancel_offers(
+            [trade_id],
+            reason="bootstrap_manual_stop",
+            force_storm=True,
+            fee_approval_id=approval_id,
+        )
+
+    assert calls[0]["expected_recovery_action"] == "bootstrap_stop"
+    assert pool.available_count == 1
+
+
 @pytest.mark.parametrize("member_count", [1, 2])
 @pytest.mark.parametrize("approved_fee_mojos", [0, 42])
 def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
@@ -1885,10 +1945,13 @@ def test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee(
         "trade_ids": trade_ids,
         "source_coin_ids": source_coin_ids,
         "fee_coin_id": fee_coin_id,
+        "expected_recovery_action": "cancel_all",
     }
     assert calls[1][1]["approval_id"] == approval_id
+    assert calls[1][1]["expected_recovery_action"] == "cancel_all"
     assert calls[1][1]["priced_cancellation"]["fee_mojos"] == approved_fee_mojos
     assert calls[2][1]["manifest"] == calls[1][1]["manifest"]
+    assert calls[2][1]["expected_recovery_action"] == "cancel_all"
     assert settlement_attempts == [calls[1][1]["manifest"]]
     assert batch_effects == [
         {

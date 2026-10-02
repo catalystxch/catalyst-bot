@@ -541,8 +541,17 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "FEE_APPROVAL_STALE",
+        "FEE_APPROVAL_LEGACY_UNSCOPED",
+        "FEE_APPROVAL_RECOVERY_ONLY",
+        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+    ],
+)
 def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
-    isolated_db, bootstrap_api, monkeypatch
+    isolated_db, bootstrap_api, monkeypatch, reason
 ):
     bootstrap, client, _identity = bootstrap_api
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -562,7 +571,7 @@ def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
 
     def stale_after_stop(_trade_ids):
         assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
-        raise ValueError("FEE_APPROVAL_STALE")
+        raise ValueError(reason)
 
     monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", stale_after_stop)
     response = client.post(
@@ -574,8 +583,8 @@ def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
     assert response.status_code == 409, payload
     assert payload == {
         "success": False,
-        "code": "FEE_APPROVAL_STALE",
-        "error": "FEE_APPROVAL_STALE",
+        "code": reason,
+        "error": reason,
         "stopped": True,
         "campaign_id": campaign_id,
         "campaign_revision": 1,

@@ -51,6 +51,7 @@ def test_repeated_stop_recovery_refuses_changed_canonical_context(
         json={
             "bootstrap_campaign_id": state["campaign_id"],
             "bootstrap_campaign_revision": 2,
+            "cancellation_recovery_action": "bootstrap_stop",
         },
     )
     payload = response.get_json()
@@ -65,7 +66,8 @@ def test_repeated_stop_recovery_refuses_changed_canonical_context(
     assert payload["dispatch_authorized"] is False
     with pytest.raises(ValueError):
         runtime.read_approved_prep_fee_snapshot(
-            state["approval"]["approval_id"], allow_campaign_fee_recovery=True
+            state["approval"]["approval_id"],
+            expected_recovery_action="bootstrap_stop",
         )
     assert utils._counts() == before
     campaign = database.get_bootstrap_campaign(state["campaign_id"])

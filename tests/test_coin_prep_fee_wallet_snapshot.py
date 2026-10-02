@@ -298,6 +298,17 @@ def test_runtime_fee_snapshot_ignores_retired_sniper_pool_settings(economic_read
         {"coin_multiplier": 1.5},
         {"target_seconds": True},
         {"bootstrap_campaign_id": "38" * 32},
+        {"cancellation_recovery_action": "cancel_all"},
+        {
+            "bootstrap_campaign_id": "38" * 32,
+            "bootstrap_campaign_revision": 0,
+            "cancellation_recovery_action": "prepare_coins",
+        },
+        {
+            "bootstrap_campaign_id": "38" * 32,
+            "bootstrap_campaign_revision": 0,
+            "cancellation_recovery_action": True,
+        },
     ],
 )
 def test_client_cannot_supply_economic_authority_or_malformed_choices(

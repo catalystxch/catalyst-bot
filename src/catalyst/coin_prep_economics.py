@@ -53,6 +53,7 @@ def normalize_fee_prep_options(options):
         "target_seconds",
         "bootstrap_campaign_id",
         "bootstrap_campaign_revision",
+        "cancellation_recovery_action",
     }
     try:
         if type(options) is not dict or set(options) - allowed:
@@ -81,6 +82,15 @@ def normalize_fee_prep_options(options):
                     options.get("bootstrap_campaign_revision")
                 ),
             )
+        if "cancellation_recovery_action" in options:
+            action = options.get("cancellation_recovery_action")
+            if (
+                type(action) is not str
+                or action not in {"cancel_all", "bootstrap_stop"}
+                or "bootstrap_campaign_id" not in result
+            ):
+                raise ValueError("invalid cancellation recovery intent")
+            result["cancellation_recovery_action"] = action
         return result
     except ValueError:
         raise ValueError("FEE_PREP_OPTIONS_INVALID") from None

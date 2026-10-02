@@ -324,6 +324,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
 
     validate_fee_pool_configuration(config)
     fee_pool = get_fee_pool_plan()
+    recovery_action = options.get("cancellation_recovery_action")
     recovery_recipe = None
     recovery_execution_context = None
     try:
@@ -333,7 +334,11 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             else None
         )
         campaign_has_cleanup = False
-        if type(stopped) is dict and stopped.get("status") in {"active", "stopped"}:
+        if (
+            recovery_action is not None
+            and type(stopped) is dict
+            and stopped.get("status") in {"active", "stopped"}
+        ):
             # A campaign can own live offers whose exact network cancellation
             # cost exceeds or outlives its old approval. Permit a read-only,
             # cancellation-only renewal quote whenever cleanup is genuinely
@@ -344,20 +349,20 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             campaign_has_cleanup = bool(
                 _campaign_trade_ids(options["bootstrap_campaign_id"])
             )
-        if type(stopped) is dict and (
-            campaign_has_cleanup
-            or (
-                _campaign_is_stopped_for_fee_recovery(stopped)
-                and Decimal(str(stopped.get("fee_spent_xch", "0")))
-                > Decimal(str(stopped.get("fee_budget_xch", "0")))
-            )
-        ):
+        server_recovery_ready = campaign_has_cleanup or (
+            recovery_action == "bootstrap_stop"
+            and _campaign_is_stopped_for_fee_recovery(stopped)
+        )
+        if recovery_action is not None and not server_recovery_ready:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        if recovery_action is not None:
             raise ValueError("bootstrap_coin_prep_not_authorized:fee_reserve")
         bootstrap = _active_bootstrap_coin_prep_context(options)
     except ValueError as exc:
         if (
             str(exc) != "bootstrap_coin_prep_not_authorized:fee_reserve"
             or "bootstrap_campaign_id" not in options
+            or recovery_action is None
         ):
             raise
         # Creation authority remains stopped after a campaign fee overrun or
@@ -484,7 +489,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
 
 
 def read_approved_prep_fee_snapshot(
-    approval_id: str, *, allow_campaign_fee_recovery: bool = False
+    approval_id: str, *, expected_recovery_action: str | None = None
 ) -> dict:
     """Read fresh selectable inventory under immutable approved economics.
 
@@ -503,9 +508,33 @@ def read_approved_prep_fee_snapshot(
     )
 
     consent = database.get_coin_prep_fee_approval_context(approval_id)
-    approved = canonical_fee_contract(
-        json.loads(consent["scope_json"]), json.loads(consent["plan_json"])
+    from coin_prep_economics import normalize_fee_prep_options
+    from coin_prep_fee_approval import fee_approval_authority
+
+    request_options = normalize_fee_prep_options(
+        json.loads(consent["request_options_json"])
     )
+    recovery_action = request_options.get("cancellation_recovery_action")
+    if expected_recovery_action is not None and expected_recovery_action not in {
+        "cancel_all",
+        "bootstrap_stop",
+    }:
+        raise ValueError("FEE_APPROVAL_RECOVERY_ACTION_INVALID")
+    raw_scope = json.loads(consent["scope_json"])
+    stored_authority = json.loads(consent["quote_json"]).get("approval_authority")
+    if raw_scope.get(
+        "campaign_id"
+    ) is not None and stored_authority != fee_approval_authority(request_options):
+        # Campaign approvals written by the buggy pre-marker candidate cannot
+        # prove whether they were ordinary prep or cancellation-only consent.
+        # Require a fresh displayed approval after upgrade instead of guessing.
+        raise ValueError("FEE_APPROVAL_LEGACY_UNSCOPED")
+    if recovery_action is not None and expected_recovery_action is None:
+        raise ValueError("FEE_APPROVAL_RECOVERY_ONLY")
+    if recovery_action is not None and recovery_action != expected_recovery_action:
+        raise ValueError("FEE_APPROVAL_RECOVERY_ACTION_MISMATCH")
+    allow_campaign_fee_recovery = expected_recovery_action is not None
+    approved = canonical_fee_contract(raw_scope, json.loads(consent["plan_json"]))
     if any(
         approved[key] != consent[key]
         for key in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")
@@ -553,6 +582,18 @@ def read_approved_prep_fee_snapshot(
     else:
         campaign = database.get_bootstrap_campaign(scope["campaign_id"])
         approved_revision = approved["plan"]["campaign_revision"]
+        if (
+            allow_campaign_fee_recovery
+            and recovery_action is None
+            and type(campaign) is dict
+            and campaign.get("status") == "active"
+            and campaign.get("stage") == "stopped"
+        ):
+            # An ordinary preparation approval may reserve its original
+            # cancellation allowance, including an explicit manual stop. A
+            # policy-materialized stop keeps the campaign active solely for
+            # cleanup and needs newly displayed, action-bound consent.
+            raise ValueError("FEE_APPROVAL_RECOVERY_ACTION_MISMATCH")
         campaign_has_cleanup = False
         if (
             allow_campaign_fee_recovery
@@ -619,7 +660,9 @@ def read_approved_prep_fee_snapshot(
         "recipe": recipe,
         "campaign": campaign,
         "scope": scope,
-        "request_options": json.loads(consent["request_options_json"]),
+        "request_options": request_options,
+        "recovery_only": recovery_action is not None,
+        "recovery_action": recovery_action,
         "approval": approval,
         "dispatch_authorized": False,
     }

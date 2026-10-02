@@ -6403,7 +6403,10 @@ class OfferManager:
         return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
 
     def _plan_coin_prep_cancel(
-        self, members: list[tuple], fee_approval_id: str
+        self,
+        members: list[tuple],
+        fee_approval_id: str,
+        expected_recovery_action: Optional[str] = None,
     ) -> tuple[dict, dict, tuple[Any, str, int]]:
         """Price a complete Sage cohort against explicit Coin Prep consent."""
 
@@ -6437,6 +6440,7 @@ class OfferManager:
                 trade_ids=trade_ids,
                 source_coin_ids=source_coin_ids,
                 fee_coin_id=fee_coin_id,
+                expected_recovery_action=expected_recovery_action,
             )
             if priced.get("available") is not True:
                 raise ValueError(
@@ -7478,6 +7482,7 @@ class OfferManager:
         fee_approval_id: Optional[str] = None,
         priced_cancellation: Optional[dict] = None,
         fee_reservation: Optional[tuple] = None,
+        expected_recovery_action: Optional[str] = None,
     ) -> Dict[str, dict]:
         """Run one manifest-bound Sage bulk cancellation wallet effect."""
 
@@ -7519,6 +7524,7 @@ class OfferManager:
                     approval_id=fee_approval_id,
                     manifest=manifest,
                     priced_cancellation=priced_cancellation,
+                    expected_recovery_action=expected_recovery_action,
                 )
                 validated_unsigned = hold["validated_unsigned"]
             except Exception:
@@ -7547,6 +7553,7 @@ class OfferManager:
                     approval_id=fee_approval_id,
                     manifest=manifest,
                     priced_cancellation=priced_cancellation,
+                    expected_recovery_action=expected_recovery_action,
                 )
             except Exception:
                 results = {}
@@ -7779,6 +7786,10 @@ class OfferManager:
                 or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
             ):
                 raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        expected_recovery_action = {
+            "coin_prep_cancel_all": "cancel_all",
+            "bootstrap_manual_stop": "bootstrap_stop",
+        }.get(reason)
 
         # F20: cancel-storm protection
         if not force_storm:
@@ -8039,7 +8050,11 @@ class OfferManager:
                     batch_contract,
                     priced_cancellation,
                     fee_reservation,
-                ) = self._plan_coin_prep_cancel(members, fee_approval_id)
+                ) = self._plan_coin_prep_cancel(
+                    members,
+                    fee_approval_id,
+                    expected_recovery_action,
+                )
         elif fee_approval_id is not None:
             raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
 
@@ -8163,6 +8178,7 @@ class OfferManager:
                     fee_approval_id=fee_approval_id,
                     priced_cancellation=priced_cancellation,
                     fee_reservation=fee_reservation,
+                    expected_recovery_action=expected_recovery_action,
                 )
                 for intent, attempt, _member_id in members:
                     result = batch_results[intent.trade_id]

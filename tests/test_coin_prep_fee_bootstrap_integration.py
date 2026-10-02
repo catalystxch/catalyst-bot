@@ -260,10 +260,14 @@ def test_explicit_renewed_ceiling_allows_only_the_displayed_campaign_recovery(
             external_spend if campaign_id == state["campaign_id"] else 0
         ),
     )
+    assert database.stop_bootstrap_campaign(
+        state["campaign_id"], "manual", "2026-09-22T12:01:00Z"
+    )
     renewed_preview = service.preview_coin_prep_fees(
         {
             "bootstrap_campaign_id": state["campaign_id"],
-            "bootstrap_campaign_revision": 0,
+            "bootstrap_campaign_revision": 1,
+            "cancellation_recovery_action": "bootstrap_stop",
         }
     )
     renewed = service.approve_coin_prep_fees(
@@ -303,6 +307,7 @@ def test_explicit_renewed_ceiling_allows_only_the_displayed_campaign_recovery(
         trade_ids=["a" * 64],
         source_coin_ids=["b" * 64],
         fee_coin_id="c" * 64,
+        expected_recovery_action="bootstrap_stop",
     )
 
     assert renewed["version"] == 2

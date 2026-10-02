@@ -86,6 +86,10 @@ def test_recovery_confirmation_keeps_cancel_only_intent(page, action):
             page.wait_for_function("() => !_cancelAllInProgress", timeout=10000)
 
     calls = page.evaluate("window.__recoveryCalls")
+    previews = [call for call in calls if "/coin-prep/fee-preview" in call["path"]]
+    assert (
+        json.loads(previews[0]["body"])["cancellation_recovery_action"] == "cancel_all"
+    )
     approvals = [call for call in calls if "/coin-prep/fee-approval" in call["path"]]
     cancellations = [
         call for call in calls if call["path"].endswith("/offers/cancel_all")

@@ -32806,7 +32806,7 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
-                                    if (['FEE_APPROVAL_STALE', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
                                         await reviewCancelAllFeeBudgetFailure(st);
                                     }
                                 }
@@ -32898,7 +32898,7 @@
             if (banner) {
                 banner.style.display = '';
                 const reason = String(status?.reason_code || status?.code || '');
-                banner.textContent = reason === 'FEE_APPROVAL_STALE'
+                banner.textContent = ['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH'].includes(reason)
                     ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                     : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
                         ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
@@ -35938,12 +35938,16 @@ function closeCtgErrorModal() {
                 coin_multiplier: String(rawMultiplier),
                 target_seconds: 300,
             };
+            const recoveryAction = String(_coinPrepFeeRecoveryIntent?.action || '');
             const recoveryCampaign = _coinPrepFeeRecoveryIntent?.campaign_id
                 ? _coinPrepFeeRecoveryIntent : null;
             const campaign = recoveryCampaign || _bootstrapActiveCampaign;
             if (campaign?.campaign_id) {
                 options.bootstrap_campaign_id = String(campaign.campaign_id);
                 options.bootstrap_campaign_revision = Number(campaign.campaign_revision ?? campaign.revision);
+            }
+            if (campaign?.campaign_id && ['cancel_all', 'bootstrap_stop'].includes(recoveryAction)) {
+                options.cancellation_recovery_action = recoveryAction;
             }
             return options;
         }
@@ -39986,7 +39990,9 @@ async function bootstrapStopCampaign() {
         });
         const payload = await response.json();
         const feeRecoveryReasons = [
-            'FEE_APPROVAL_STALE', 'FEE_BUDGET_APPROVAL_REQUIRED',
+            'FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED',
+            'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH',
+            'FEE_BUDGET_APPROVAL_REQUIRED',
             'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
             'FEE_PREP_FUNDING_INSUFFICIENT',
         ];

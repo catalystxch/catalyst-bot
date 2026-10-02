@@ -17,6 +17,9 @@ pytestmark = pytest.mark.e2e
     ("recovery_reason", "reason_text"),
     [
         ("FEE_APPROVAL_STALE", "expired"),
+        ("FEE_APPROVAL_LEGACY_UNSCOPED", "expired"),
+        ("FEE_APPROVAL_RECOVERY_ONLY", "expired"),
+        ("FEE_APPROVAL_RECOVERY_ACTION_MISMATCH", "expired"),
         ("FEE_PREP_FUNDING_INSUFFICIENT", "funding"),
     ],
 )
@@ -102,6 +105,7 @@ def test_bootstrap_stop_fee_recovery_renews_then_retries_only_campaign(
     assert len(previews) == 1
     assert previews[0]["body"]["bootstrap_campaign_id"] == campaign_id
     assert previews[0]["body"]["bootstrap_campaign_revision"] == 1
+    assert previews[0]["body"]["cancellation_recovery_action"] == "bootstrap_stop"
     assert not [call for call in calls if "/offers/cancel_all" in call["path"]]
     assert not [call for call in calls if "/coin-prep/trigger" in call["path"]]
     assert page.evaluate("window.__historyChoiceCalls") == 0

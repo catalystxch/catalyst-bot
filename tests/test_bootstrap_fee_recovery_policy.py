@@ -126,7 +126,7 @@ def approved_bootstrap(tmp_path, monkeypatch):
         pass
 
 
-def test_overrun_recovery_preview_does_not_require_creation_authority(
+def test_overrun_recovery_requires_stopped_campaign_and_explicit_intent(
     request, monkeypatch
 ):
     # Save the real function before the shared fixture substitutes its recipe.
@@ -202,9 +202,9 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
     assert utils._counts() == before, (
         "a recovery preview must not grant spending authority"
     )
-    assert response.status_code == 200, payload
-    assert payload["available"] is True, payload
-    assert payload["fee_accounting"]["spent_fee_mojos"] == "10000000010"
+    assert response.status_code == 503, payload
+    assert payload["available"] is False, payload
+    assert payload["reason"] == "FEE_PREVIEW_UNAVAILABLE"
     assert payload["dispatch_authorized"] is False
     assert (
         database.get_bootstrap_campaign(state["campaign_id"])["fee_budget_xch"]
@@ -223,10 +223,25 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
         state["campaign_id"], "manual", "2026-09-22T12:01:00.000000Z"
     )
     service = import_module("coin_prep_fee_approval")
-    assert service.preview_coin_prep_fees(options)["available"] is True
-    stopped_preview = app.test_client().post("/api/coin-prep/fee-preview", json=options)
-    assert stopped_preview.status_code == 200, stopped_preview.get_json()
+    recovery_options = {
+        **options,
+        "cancellation_recovery_action": "bootstrap_stop",
+    }
+    assert service.preview_coin_prep_fees(recovery_options)["available"] is True
+    stopped_preview = app.test_client().post(
+        "/api/coin-prep/fee-preview", json=recovery_options
+    )
+    stopped_payload = stopped_preview.get_json()
+    assert stopped_preview.status_code == 200, stopped_payload
+    recovery_approval = service.approve_coin_prep_fees(
+        preview_id=stopped_payload["preview_id"],
+        maximum_fee_mojos=int(stopped_payload["suggested_maximum_fee_mojos"]),
+        cancellation_reserve_mojos=int(
+            stopped_payload["minimum_cancellation_reserve_mojos"]
+        ),
+    )
     recovered = runtime.read_approved_prep_fee_snapshot(
-        state["approval"]["approval_id"], allow_campaign_fee_recovery=True
+        recovery_approval["approval_id"],
+        expected_recovery_action="bootstrap_stop",
     )
     assert recovered["campaign"]["status"] == "stopped"

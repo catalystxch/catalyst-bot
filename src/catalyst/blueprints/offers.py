@@ -1035,6 +1035,9 @@ def api_cancel_all():
                 except Exception as _e:
                     _fee_reason_codes = {
                         "FEE_APPROVAL_STALE",
+                        "FEE_APPROVAL_LEGACY_UNSCOPED",
+                        "FEE_APPROVAL_RECOVERY_ONLY",
+                        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
                         "FEE_BUDGET_APPROVAL_REQUIRED",
                         "FEE_BUDGET_EXCEEDED",
                         "FEE_CAMPAIGN_BUDGET_EXCEEDED",

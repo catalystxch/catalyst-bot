@@ -58,6 +58,7 @@ def price_approved_cancellation(
     trade_ids: list,
     source_coin_ids: list,
     fee_coin_id: str,
+    expected_recovery_action: str | None = None,
 ) -> dict:
     """Converge a cancellation fee against the actual Sage unsigned bundle."""
 
@@ -72,7 +73,7 @@ def price_approved_cancellation(
         context = {"approval": accounting}
         return _unavailable(context, "FEE_EFFECT_RECOVERY_REQUIRED")
     context = read_approved_prep_fee_snapshot(
-        approval_id, allow_campaign_fee_recovery=True
+        approval_id, expected_recovery_action=expected_recovery_action
     )
     target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
     fee = 0
@@ -99,7 +100,7 @@ def price_approved_cancellation(
             return _unavailable(context, "FEE_ESTIMATE_UNAVAILABLE")
         if quote["fee_mojos"] == fee:
             after = read_approved_prep_fee_snapshot(
-                approval_id, allow_campaign_fee_recovery=True
+                approval_id, expected_recovery_action=expected_recovery_action
             )
             if any(after[key] != context[key] for key in _CONTEXT_KEYS):
                 raise ValueError("FEE_APPROVAL_STALE")
@@ -159,6 +160,7 @@ def reserve_approved_cancellation(
     approval_id: str,
     manifest: dict,
     priced_cancellation: dict,
+    expected_recovery_action: str | None = None,
 ) -> dict:
     """Bind the sealed cancellation and exact quote to its PREPARED cohort."""
 
@@ -169,7 +171,7 @@ def reserve_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, allow_campaign_fee_recovery=True
+        approval_id, expected_recovery_action=expected_recovery_action
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
@@ -216,6 +218,7 @@ def recheck_reserved_approved_cancellation(
     approval_id: str,
     manifest: dict,
     priced_cancellation: dict,
+    expected_recovery_action: str | None = None,
 ) -> dict:
     """Revalidate the sealed hold immediately before the effect claim.
 
@@ -230,7 +233,7 @@ def recheck_reserved_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, allow_campaign_fee_recovery=True
+        approval_id, expected_recovery_action=expected_recovery_action
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")

@@ -413,19 +413,27 @@ def test_stale_confirmation_refreshes_preview_without_triggering_wallet_work(pag
     result = page.evaluate(
         """async ({first, second}) => {
             window.__feeCalls = [];
+            window.__unexpectedMutations = [];
             let previews = 0;
             window.apiFetch = async (path, options = {}) => {
-                window.__feeCalls.push(String(path));
-                if (String(path).includes('/coin-prep/fee-preview')) {
+                const url = String(path);
+                if (url.includes('/coin-prep/fee-preview')) {
+                    window.__feeCalls.push(url);
                     const value = previews++ === 0 ? first : second;
                     return new Response(JSON.stringify(value), {status: 200});
                 }
-                if (String(path).includes('/coin-prep/fee-approval')) {
+                if (url.includes('/coin-prep/fee-approval')) {
+                    window.__feeCalls.push(url);
                     return new Response(JSON.stringify({
                         success: false, reason: 'FEE_APPROVAL_STALE', dispatch_authorized: false,
                     }), {status: 409});
                 }
-                throw new Error(`Wallet mutation must not run: ${path}`);
+                const method = String(options.method || 'GET').toUpperCase();
+                if (method !== 'GET') {
+                    window.__unexpectedMutations.push(`${method} ${url}`);
+                    throw new Error(`Wallet mutation must not run: ${method} ${url}`);
+                }
+                return new Response(JSON.stringify({success: true}), {status: 200});
             };
             window.askPrepHistoryChoice = async () => ({
                 action: 'proceed', resets: {pnl: false, offers: false, counters: false},
@@ -434,6 +442,7 @@ def test_stale_confirmation_refreshes_preview_without_triggering_wallet_work(pag
             await startCoinPrepFromModal();
             return {
                 calls: window.__feeCalls,
+                unexpectedMutations: window.__unexpectedMutations,
                 activePreview: _coinPrepFeePreview && _coinPrepFeePreview.preview_id,
             };
         }""",
@@ -445,6 +454,7 @@ def test_stale_confirmation_refreshes_preview_without_triggering_wallet_work(pag
         "/api/coin-prep/fee-approval",
         "/api/coin-prep/fee-preview",
     ]
+    assert result["unexpectedMutations"] == []
     assert result["activePreview"] == "e" * 64
     expect(page.locator("#cpConfirmBtn")).to_be_enabled()
 
@@ -703,12 +713,21 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
     assert "new cumulative maximum" in result["banner"]
 
 
-def test_stale_cancel_approval_opens_fresh_fee_review(page):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "FEE_APPROVAL_STALE",
+        "FEE_APPROVAL_LEGACY_UNSCOPED",
+        "FEE_APPROVAL_RECOVERY_ONLY",
+        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+    ],
+)
+def test_stale_cancel_approval_opens_fresh_fee_review(page, reason):
     _open_gui(page)
     preview = _preview()
 
     result = page.evaluate(
-        """async preview => {
+        """async ({preview, reason}) => {
             bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
@@ -717,8 +736,8 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page):
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true, running: false, complete: false,
-                        phase: 'error', reason_code: 'FEE_APPROVAL_STALE',
-                        message: 'Cancel all failed: FEE_APPROVAL_STALE',
+                        phase: 'error', reason_code: reason,
+                        message: `Cancel all failed: ${reason}`,
                     }), {status: 200, headers: {'Content-Type': 'application/json'}});
                 }
                 if (url.includes('/coin-prep/fee-preview')) {
@@ -746,7 +765,7 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page):
                 banner: document.getElementById('cpReasonBanner').textContent,
             };
         }""",
-        preview,
+        {"preview": preview, "reason": reason},
     )
 
     preview_calls = [
