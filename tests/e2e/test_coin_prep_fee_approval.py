@@ -859,6 +859,48 @@ def test_restart_restores_pending_fee_accounting_without_duplicate_preview_or_la
     expect(page.locator("#coinPrepCancelBtn")).to_be_hidden()
 
 
+def test_running_session_keeps_fee_recovery_modal_hidden_until_bot_stops(page):
+    _open_gui(page)
+    status = _paused_recovery_status()
+    status["phase"] = "idle"
+    status["fee_approval"]["state"] = "approved"
+    status["fee_approval"]["held_fee_mojos"] = "0"
+    status["fee_approval"]["unresolved_operation_count"] = 0
+    status["fee_approval"]["pending_operation"] = None
+
+    result = page.evaluate(
+        """async status => {
+            window.apiFetch = async path => {
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'none';
+            bot_state.running = true;
+            const restored = await restoreCoinPrepReadiness();
+            const modal = document.getElementById('coinPrepConfirmOverlay');
+            const whileRunning = modal.classList.contains('active');
+            bot_state.running = false;
+            await pollCoinPrepProgress();
+            const afterStop = modal.classList.contains('active');
+            if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+            coinPrepPollInterval = null;
+            return {restored, whileRunning, afterStop, coinPrepStatus};
+        }""",
+        status,
+    )
+
+    assert result == {
+        "restored": True,
+        "whileRunning": False,
+        "afterStop": True,
+        "coinPrepStatus": "checking",
+    }
+    expect(page.locator("#cpProgressTitle")).to_have_text("Coin Prep Paused Safely")
+
+
 def test_restart_does_not_recover_fee_approval_from_another_bootstrap_campaign(page):
     _open_gui(page)
     status = {

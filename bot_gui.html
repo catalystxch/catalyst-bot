@@ -18801,7 +18801,9 @@
                     updateCoinPrepRecoveryControls(status);
                     showCoinPrepView('progress');
                     const modal = document.getElementById('coinPrepConfirmOverlay');
-                    if (modal) modal.classList.add('active');
+                    if (modal) {
+                        modal.classList.toggle('active', !(bot_state && bot_state.running));
+                    }
                     const title = document.getElementById('cpProgressTitle');
                     if (title) title.textContent = status.fee_resume_required
                         ? 'Coin Prep Paused Safely'
@@ -36686,6 +36688,13 @@ function closeCtgErrorModal() {
                 renderCoinPrepFeeAccounting(status);
                 const recovery = updateCoinPrepRecoveryControls(status);
                 if (recovery.recovering) {
+                    const modal = document.getElementById('coinPrepConfirmOverlay');
+                    const botRunning = !!(bot_state && bot_state.running);
+                    if (modal) modal.classList.toggle('active', !botRunning);
+                    // A restored fee approval still blocks new Coin Prep, but it
+                    // must not cover an already-running trading session. Keep
+                    // polling so the review returns automatically after Stop.
+                    if (botRunning) return;
                     const title = document.getElementById('cpProgressTitle');
                     if (title) title.textContent = 'Coin Prep Paused Safely';
                     setCoinPrepFeeText('cpProgressPhase', coinPrepFeeStateMessage(status.fee_approval?.state));
