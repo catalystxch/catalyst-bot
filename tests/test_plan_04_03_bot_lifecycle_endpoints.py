@@ -277,9 +277,7 @@ class TestBotStart(_FlaskBase):
 
         with (
             patch("database.get_offer_intents_for_registry", return_value=[intent]),
-            patch(
-                "database.get_open_offers", return_value=[{"trade_id": trade_id}]
-            ),
+            patch("database.get_open_offers", return_value=[{"trade_id": trade_id}]),
             patch(
                 "wallet.get_authoritative_offer_history",
                 return_value={
@@ -298,9 +296,7 @@ class TestBotStart(_FlaskBase):
             )
 
         self.assertFalse(result["ready"])
-        self.assertEqual(
-            result["reason"], "existing_offer_resume_proof_unavailable"
-        )
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
 
     def test_bootstrap_resume_readiness_rejects_unresolved_current_revision_intent(
         self,
@@ -338,9 +334,7 @@ class TestBotStart(_FlaskBase):
                 "database.get_offer_intents_for_registry",
                 return_value=[visible, unresolved],
             ),
-            patch(
-                "database.get_open_offers", return_value=[{"trade_id": trade_id}]
-            ),
+            patch("database.get_open_offers", return_value=[{"trade_id": trade_id}]),
             patch(
                 "wallet.get_authoritative_offer_history",
                 return_value={
@@ -359,9 +353,7 @@ class TestBotStart(_FlaskBase):
             )
 
         self.assertFalse(result["ready"])
-        self.assertEqual(
-            result["reason"], "existing_offer_resume_proof_unavailable"
-        )
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
 
     def test_bootstrap_resume_readiness_rejects_nonterminal_closed_classification(
         self,
@@ -421,10 +413,8 @@ class TestBotStart(_FlaskBase):
                         return_value=([], [live], [extra]),
                     ),
                 ):
-                    result = (
-                        bot_blueprint._bootstrap_existing_offer_resume_readiness(
-                            fake_cfg, campaign
-                        )
+                    result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                        fake_cfg, campaign
                     )
 
                 self.assertFalse(result["ready"])
@@ -981,9 +971,7 @@ class TestBotStart(_FlaskBase):
                 create=True,
             ) as resume_readiness,
         ):
-            resp = self._post(
-                "/api/bot/start", {"resume_existing_offers": True}
-            )
+            resp = self._post("/api/bot/start", {"resume_existing_offers": True})
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json().get("status"), "started")
@@ -1026,9 +1014,7 @@ class TestBotStart(_FlaskBase):
                 create=True,
             ) as resume_readiness,
         ):
-            resp = self._post(
-                "/api/bot/start", {"resume_existing_offers": True}
-            )
+            resp = self._post("/api/bot/start", {"resume_existing_offers": True})
 
         self.assertEqual(resp.status_code, 400)
         body = resp.get_json()

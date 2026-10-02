@@ -431,8 +431,7 @@ def _bootstrap_existing_offer_resume_readiness(
         active_intents = [
             row
             for row in current_intents
-            if str(row.get("lifecycle_state") or "").strip().lower()
-            in active_states
+            if str(row.get("lifecycle_state") or "").strip().lower() in active_states
         ]
         intent_ids = [
             str(row.get("sage_trade_id") or "").strip() for row in active_intents
@@ -452,8 +451,7 @@ def _bootstrap_existing_offer_resume_readiness(
         if type(history) is dict:
             wallet_offers = history.get("offers")
             complete = (
-                history.get("success") is True
-                and history.get("end_of_history") is True
+                history.get("success") is True and history.get("end_of_history") is True
             )
         else:
             wallet_offers = history
@@ -494,21 +492,18 @@ def _bootstrap_existing_offer_resume_readiness(
             related = asset_id in offered_assets or asset_id in requested_assets
             if related and id(row) not in open_row_ids:
                 status = row.get("status")
-                explicitly_terminal = (
-                    (type(status) is int and status in {3, 4, 5})
-                    or (
-                        isinstance(status, str)
-                        and status.strip().upper()
-                        in {
-                            "CANCELLED",
-                            "CANCELED",
-                            "CONFIRMED",
-                            "COMPLETED",
-                            "FAILED",
-                            "EXPIRED",
-                            "SUCCESS",
-                        }
-                    )
+                explicitly_terminal = (type(status) is int and status in {3, 4, 5}) or (
+                    isinstance(status, str)
+                    and status.strip().upper()
+                    in {
+                        "CANCELLED",
+                        "CANCELED",
+                        "CONFIRMED",
+                        "COMPLETED",
+                        "FAILED",
+                        "EXPIRED",
+                        "SUCCESS",
+                    }
                 )
                 if id(row) not in closed_row_ids or not explicitly_terminal:
                     raise ValueError(
@@ -519,9 +514,9 @@ def _bootstrap_existing_offer_resume_readiness(
             str(row.get("trade_id") or row.get("offer_id") or "").strip()
             for row in wallet_open
         ]
-        if any(not trade_id for trade_id in wallet_ids) or len(
-            set(wallet_ids)
-        ) != len(wallet_ids):
+        if any(not trade_id for trade_id in wallet_ids) or len(set(wallet_ids)) != len(
+            wallet_ids
+        ):
             raise ValueError("Wallet offer identities are incomplete or duplicated")
     except Exception as exc:
         slog(
