@@ -32797,7 +32797,7 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
-                                    if (['FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                    if (['FEE_APPROVAL_STALE', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
                                         await reviewCancelAllFeeBudgetFailure(st);
                                     }
                                 }
@@ -32869,10 +32869,13 @@
             _coinPrepFeeReviewContract = null;
             _coinPrepFeeRecoveryBlocking = true;
             _coinPrepFeeRecoveryIntent = {
-                action: 'cancel_all',
+                action: String(status?.recovery_action || 'cancel_all'),
                 total: Number(status?.total) || 0,
                 buy: Number(status?.buy_count) || 0,
                 sell: Number(status?.sell_count) || 0,
+                campaign_id: status?.campaign_id ? String(status.campaign_id) : null,
+                campaign_revision: Number.isInteger(Number(status?.campaign_revision))
+                    ? Number(status.campaign_revision) : null,
             };
             _coinPrepConfirmReadyText = 'Approve Fee & Continue Cancellation';
             const modal = document.getElementById('coinPrepConfirmOverlay');
@@ -32885,7 +32888,10 @@
             const banner = document.getElementById('cpReasonBanner');
             if (banner) {
                 banner.style.display = '';
-                banner.textContent = 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
+                const reason = String(status?.reason_code || status?.code || '');
+                banner.textContent = reason === 'FEE_APPROVAL_STALE'
+                    ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                    : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
             }
             modal.classList.add('active');
             return refreshCoinPrepFeePreview(buildCoinPrepFeePreviewOptions());
@@ -35895,9 +35901,12 @@ function closeCtgErrorModal() {
                 coin_multiplier: String(rawMultiplier),
                 target_seconds: 300,
             };
-            if (_bootstrapActiveCampaign?.campaign_id) {
-                options.bootstrap_campaign_id = String(_bootstrapActiveCampaign.campaign_id);
-                options.bootstrap_campaign_revision = Number(_bootstrapActiveCampaign.revision);
+            const recoveryCampaign = _coinPrepFeeRecoveryIntent?.campaign_id
+                ? _coinPrepFeeRecoveryIntent : null;
+            const campaign = recoveryCampaign || _bootstrapActiveCampaign;
+            if (campaign?.campaign_id) {
+                options.bootstrap_campaign_id = String(campaign.campaign_id);
+                options.bootstrap_campaign_revision = Number(campaign.campaign_revision ?? campaign.revision);
             }
             return options;
         }
@@ -36512,7 +36521,9 @@ function closeCtgErrorModal() {
             // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
             // When there's no data worth preserving it short-circuits to
             // 'proceed' with all resets false so first-run UX is frictionless.
-            const historyChoice = recoveryIntent?.action === 'cancel_all'
+            const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
+                .includes(String(recoveryIntent?.action || ''));
+            const historyChoice = cancellationOnlyRecovery
                 ? {action: 'proceed', resets: {}}
                 : await askPrepHistoryChoice();
             if (!historyChoice || historyChoice.action === 'cancel') {
@@ -36561,6 +36572,14 @@ function closeCtgErrorModal() {
                         openSellCount: recoveryIntent.sell,
                         resumeAfterCancel: false,
                     });
+                    return;
+                }
+                if (recoveryIntent?.action === 'bootstrap_stop') {
+                    _coinPrepFeeRecoveryIntent = null;
+                    closeCoinPrepConfirm();
+                    await resumeBootstrapStopAfterFeeApproval(
+                        recoveryIntent, approval.approval_id
+                    );
                     return;
                 }
                 // Send the spare coin multiplier from the GUI to the API
@@ -39920,6 +39939,22 @@ async function bootstrapStopCampaign() {
             body: JSON.stringify({ campaign_id: campaign.campaign_id, revision: campaign.revision })
         });
         const payload = await response.json();
+        const feeRecoveryReasons = [
+            'FEE_APPROVAL_STALE', 'FEE_BUDGET_APPROVAL_REQUIRED',
+            'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
+        ];
+        if (!payload?.success && payload?.stopped === true
+            && feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))) {
+            await bootstrapRefreshStatus();
+            _bootstrapText('bootstrapStatusPanel', 'Campaign creation is stopped. Review and approve the fresh cancellation-only fee estimate to finish removing its offers.');
+            await reviewCancelAllFeeBudgetFailure({
+                ...payload,
+                reason_code: payload.code || payload.error,
+                recovery_action: 'bootstrap_stop',
+                total: Number(payload.cancel_targets || 0),
+            });
+            return;
+        }
         if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap stop failed');
         _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
         showToast('Bootstrap campaign stopped', 'success');
@@ -39928,6 +39963,25 @@ async function bootstrapStopCampaign() {
         _bootstrapText('bootstrapStatusPanel', error?.message || 'Bootstrap stop failed');
         showToast(error?.message || 'Bootstrap stop failed', 'error');
     }
+}
+
+async function resumeBootstrapStopAfterFeeApproval(intent, feeApprovalId) {
+    const response = await apiFetch('/api/bootstrap/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            campaign_id: intent.campaign_id,
+            revision: intent.campaign_revision,
+            fee_approval_id: feeApprovalId,
+        }),
+    });
+    const payload = await response.json();
+    if (!payload?.success) {
+        throw new Error(payload?.code || payload?.error || 'Bootstrap cancellation retry failed');
+    }
+    _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
+    showToast('Bootstrap campaign cancellation resumed', 'success');
+    await bootstrapRefreshStatus();
 }
 
 function _bootstrapDownloadJson(value, filename) {

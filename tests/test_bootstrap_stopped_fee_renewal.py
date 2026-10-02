@@ -3,6 +3,7 @@
 from importlib import import_module
 from datetime import datetime, timezone
 
+from chia_rs import Coin
 from flask import Flask
 import pytest
 
@@ -121,6 +122,89 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     campaign = database.get_bootstrap_campaign(state["campaign_id"])
     assert campaign["status"] == "stopped"
     assert campaign["fee_budget_xch"] == "0.01"
+
+
+def test_stopped_campaign_cancel_review_does_not_require_locked_offer_principal(
+    request, monkeypatch
+):
+    """Live offer roots are unavailable to prep but must not block cancel cover."""
+
+    import_module("api_server")
+    coin_prep = import_module("blueprints.coin_prep")
+    real_context = coin_prep._active_bootstrap_coin_prep_context
+    state = request.getfixturevalue("approved_bootstrap")
+    monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", real_context)
+    database = import_module("database")
+
+    intent_id, trade_id = "1" * 64, "2" * 64
+    operation_id = f"create:{intent_id}"
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:prepared",
+        run_id="locked-principal-renewal",
+        wallet_fingerprint_hash=import_module("mutation_gate").wallet_fingerprint_hash(
+            736588221
+        ),
+        network="mainnet",
+        asset_id=utils.ASSET,
+        side="buy",
+        tier="inner",
+        purpose=f"bootstrap:{state['campaign_id']}:revision:0",
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=["3" * 64],
+        wallet_identity_json={"binding_digest": "4" * 64},
+        evidence_json={"canonical_intent_sha256": intent_id},
+        prepared_at="2026-09-22T12:00:00Z",
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:confirmed",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256="5" * 64,
+        wallet_identity_json={"binding_digest": "4" * 64},
+        evidence_json={"effect_attempted": True},
+        finalized_at="2026-09-22T12:00:01Z",
+    )
+    assert database.stop_bootstrap_campaign(
+        state["campaign_id"], "manual", "2026-09-22T12:01:00.000000Z"
+    )
+
+    # Model the real post-publication wallet: the 0.1 XCH replacement root is
+    # locked in the live offer, while a small selectable XCH fee root remains.
+    original_coin, native_puzzle, _asset = next(
+        value for value in state["unsigned_roots"].values() if value[2] is None
+    )
+    fee_coin = Coin(b"f" * 32, native_puzzle.get_tree_hash(), 10_000_000)
+    state["unsigned_roots"][fee_coin.name().hex()] = (fee_coin, native_puzzle, None)
+    fee_row = utils._coin(77, str(fee_coin.amount))
+    fee_row["coin_id"] = fee_coin.name().hex()
+    state["xch"] = [fee_row]
+    assert original_coin.amount > fee_coin.amount
+
+    app = Flask(__name__)
+    app.register_blueprint(coin_prep.bp)
+    response = app.test_client().post(
+        "/api/coin-prep/fee-preview",
+        json={
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 1,
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200, payload
+    assert payload["available"] is True, payload
+    assert payload["preparation_transaction_count_min"] == 0
+    assert payload["preparation_transaction_count_max"] == 0
+    assert int(payload["estimated_preparation_fee_mojos"]) == 0
+    assert int(payload["estimated_cancellation_fee_mojos"]) > 0
+    assert all(stage["cancellation"] is True for stage in payload["stages"])
+    assert payload["dispatch_authorized"] is False
 
 
 @pytest.fixture

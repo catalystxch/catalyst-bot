@@ -703,6 +703,60 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
     assert "new cumulative maximum" in result["banner"]
 
 
+def test_stale_cancel_approval_opens_fresh_fee_review(page):
+    _open_gui(page)
+    preview = _preview()
+
+    result = page.evaluate(
+        """async preview => {
+            bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                const url = String(path);
+                window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/cancel_all/status')) {
+                    return new Response(JSON.stringify({
+                        success: true, running: false, complete: false,
+                        phase: 'error', reason_code: 'FEE_APPROVAL_STALE',
+                        message: 'Cancel all failed: FEE_APPROVAL_STALE',
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (url.includes('/coin-prep/fee-preview')) {
+                    return new Response(JSON.stringify(preview), {
+                        status: 200, headers: {'Content-Type': 'application/json'},
+                    });
+                }
+                if (url.includes('/offers/cancel_all')) {
+                    return new Response(JSON.stringify({
+                        success: true, async: true, total: 2, timeout_seconds: 180,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                throw new Error(`Unexpected test request: ${url}`);
+            };
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            await cancelAllOffers();
+            await confirmCancelAll();
+            await new Promise(resolve => setTimeout(resolve, 2200));
+            clearCancelAllCompletionTimers();
+            stopCancelAllProgressPolling();
+            return {
+                calls: window.__feeCalls,
+                overlay: document.getElementById('coinPrepConfirmOverlay').classList.contains('active'),
+                banner: document.getElementById('cpReasonBanner').textContent,
+            };
+        }""",
+        preview,
+    )
+
+    preview_calls = [
+        call for call in result["calls"] if "/coin-prep/fee-preview" in call["path"]
+    ]
+    assert len(preview_calls) == 1
+    assert result["overlay"] is True
+    assert "expired" in result["banner"].lower() or "stale" in result["banner"].lower()
+
+
 def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
     _open_gui(page)
     preview = _preview()

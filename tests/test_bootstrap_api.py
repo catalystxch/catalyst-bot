@@ -522,15 +522,15 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
         lambda exact_id: ["trade-a", "trade-b"] if exact_id == campaign_id else [],
     )
 
-    def cancel_while_authority_is_active(trade_ids):
-        assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+    def cancel_after_creation_authority_is_stopped(trade_ids):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
         cancelled.extend(trade_ids)
         return {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids}
 
     monkeypatch.setattr(
         bootstrap,
         "_cancel_campaign_offers",
-        cancel_while_authority_is_active,
+        cancel_after_creation_authority_is_stopped,
     )
     stopped = client.post(
         "/api/bootstrap/stop",
@@ -539,3 +539,102 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
     assert stopped.status_code == 200
     assert cancelled == ["trade-a", "trade-b"]
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+
+
+def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: ["trade-a"] if exact_id == campaign_id else [],
+    )
+
+    def stale_after_stop(_trade_ids):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+        raise ValueError("FEE_APPROVAL_STALE")
+
+    monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", stale_after_stop)
+    response = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 409, payload
+    assert payload == {
+        "success": False,
+        "code": "FEE_APPROVAL_STALE",
+        "error": "FEE_APPROVAL_STALE",
+        "stopped": True,
+        "campaign_id": campaign_id,
+        "campaign_revision": 1,
+        "cancel_targets": 1,
+        "financial_action_started": False,
+    }
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    assert campaign["status"] == "stopped"
+    assert campaign["stage"] == "stopped"
+    assert campaign["revision"] == 1
+
+
+def test_stopped_campaign_retry_passes_exact_fee_approval_to_scoped_cancellation(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    trade_id = "a" * 64
+    approval_id = "f" * 64
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: [trade_id] if exact_id == campaign_id else [],
+    )
+    attempts = []
+
+    def cancel_after_stop(trade_ids, *, fee_approval_id=None):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+        attempts.append((trade_ids, fee_approval_id))
+        if fee_approval_id is None:
+            raise ValueError("FEE_APPROVAL_STALE")
+        return {trade_id: {"outcome": "CANCEL_SUBMITTED"}}
+
+    monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", cancel_after_stop)
+    first = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    retry = client.post(
+        "/api/bootstrap/stop",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 1,
+            "fee_approval_id": approval_id,
+        },
+    )
+
+    assert first.status_code == 409
+    assert retry.status_code == 200, retry.get_json()
+    assert retry.get_json()["success"] is True
+    assert attempts == [([trade_id], None), ([trade_id], approval_id)]
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    assert campaign["status"] == "stopped"
+    assert campaign["revision"] == 1

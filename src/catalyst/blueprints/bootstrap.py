@@ -506,7 +506,9 @@ def _campaign_trade_ids(campaign_id: str) -> list[str]:
     return sorted(trade_ids)
 
 
-def _cancel_campaign_offers(trade_ids: list[str]) -> dict[str, Any]:
+def _cancel_campaign_offers(
+    trade_ids: list[str], *, fee_approval_id: str | None = None
+) -> dict[str, Any]:
     if not trade_ids:
         return {}
     owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
@@ -514,11 +516,13 @@ def _cancel_campaign_offers(trade_ids: list[str]) -> dict[str, Any]:
     manager = getattr(getattr(server, "bot", None), "offer_manager", None)
     if manager is None:
         raise BootstrapApiError("bootstrap_cancel_manager_unavailable", 409)
-    result = manager.cancel_offers(
-        trade_ids,
-        reason="bootstrap_manual_stop",
-        force_storm=True,
-    )
+    cancel_options = {
+        "reason": "bootstrap_manual_stop",
+        "force_storm": True,
+    }
+    if fee_approval_id is not None:
+        cancel_options["fee_approval_id"] = fee_approval_id
+    result = manager.cancel_offers(trade_ids, **cancel_options)
     if type(result) is not dict:
         raise BootstrapApiError("bootstrap_cancel_result_invalid", 500)
     return result
@@ -547,27 +551,82 @@ def api_bootstrap_stop():
         revision = body.get("revision")
         if type(revision) is not int or revision != campaign["revision"]:
             raise BootstrapApiError("bootstrap_revision_stale", 409)
+        fee_approval_id = body.get("fee_approval_id")
+        if fee_approval_id is not None and (
+            type(fee_approval_id) is not str
+            or _ASSET_ID_RE.fullmatch(fee_approval_id) is None
+        ):
+            raise BootstrapApiError("invalid_fee_approval", 400)
         trade_ids = _campaign_trade_ids(campaign_id)
         stopped_at = _utcnow()
-        # Keep the exact campaign authority active while protected cancellation
-        # is priced and reserved. Stopping first would invalidate the approved
-        # campaign scope and tempt callers to fall back to an unbudgeted generic
-        # cancellation path.
-        cancel_results = _cancel_campaign_offers(trade_ids)
+        was_active = campaign.get("status") == "active"
+        # Disable creation before any cancellation attempt. The cancellation
+        # fee runtime explicitly accepts the frozen prior campaign recipe for a
+        # stopped campaign, so a stale or insufficient approval can now enter a
+        # bounded renewal flow without leaving creation authority live.
         if not database.stop_bootstrap_campaign(campaign_id, "manual", stopped_at):
             raise BootstrapApiError("bootstrap_stop_failed", 409)
-        database.append_bootstrap_campaign_event(
-            {
-                "campaign_id": campaign_id,
-                "event_type": "campaign_stopped",
-                "occurred_at": stopped_at,
-                "data": {
-                    "reason": "manual",
-                    "cancel_targets": trade_ids,
-                    "cancel_result_count": len(cancel_results),
-                },
+        stopped_campaign = database.get_bootstrap_campaign(campaign_id)
+        if type(stopped_campaign) is not dict:
+            raise BootstrapApiError("bootstrap_stop_failed", 409)
+        try:
+            cancel_results = (
+                _cancel_campaign_offers(trade_ids)
+                if fee_approval_id is None
+                else _cancel_campaign_offers(trade_ids, fee_approval_id=fee_approval_id)
+            )
+        except ValueError as exc:
+            reason = str(exc).strip().upper()
+            recoverable = {
+                "FEE_APPROVAL_STALE",
+                "FEE_BUDGET_APPROVAL_REQUIRED",
+                "FEE_BUDGET_EXCEEDED",
+                "FEE_CAMPAIGN_BUDGET_EXCEEDED",
             }
-        )
+            if reason not in recoverable:
+                raise
+            if was_active:
+                database.append_bootstrap_campaign_event(
+                    {
+                        "campaign_id": campaign_id,
+                        "event_type": "campaign_stopped",
+                        "occurred_at": stopped_at,
+                        "data": {
+                            "reason": "manual",
+                            "cancel_targets": trade_ids,
+                            "cancel_result_count": 0,
+                            "cancel_error": reason,
+                        },
+                    }
+                )
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "code": reason,
+                        "error": reason,
+                        "stopped": True,
+                        "campaign_id": campaign_id,
+                        "campaign_revision": stopped_campaign["revision"],
+                        "cancel_targets": len(trade_ids),
+                        "financial_action_started": False,
+                    }
+                ),
+                409,
+            )
+        if was_active:
+            database.append_bootstrap_campaign_event(
+                {
+                    "campaign_id": campaign_id,
+                    "event_type": "campaign_stopped",
+                    "occurred_at": stopped_at,
+                    "data": {
+                        "reason": "manual",
+                        "cancel_targets": trade_ids,
+                        "cancel_result_count": len(cancel_results),
+                    },
+                }
+            )
         return jsonify(
             {
                 "success": True,

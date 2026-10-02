@@ -331,23 +331,23 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             if "bootstrap_campaign_id" in options
             else None
         )
-        stopped_has_cleanup = False
-        if _campaign_is_stopped_for_fee_recovery(stopped):
-            # A stopped campaign can still own live offers whose exact network
-            # cancellation cost exceeds its old protected allowance.  Permit a
-            # read-only renewal quote whenever cleanup is genuinely outstanding;
-            # preparation dispatch remains blocked by the stopped status.
+        campaign_has_cleanup = False
+        if type(stopped) is dict and stopped.get("status") in {"active", "stopped"}:
+            # A campaign can own live offers whose exact network cancellation
+            # cost exceeds or outlives its old approval. Permit a read-only,
+            # cancellation-only renewal quote whenever cleanup is genuinely
+            # outstanding. This also covers an operator pressing wallet-wide
+            # Cancel All before explicitly stopping an otherwise active campaign.
             from blueprints.bootstrap import _campaign_trade_ids
 
-            stopped_has_cleanup = bool(
+            campaign_has_cleanup = bool(
                 _campaign_trade_ids(options["bootstrap_campaign_id"])
             )
-        if (
-            type(stopped) is dict
-            and _campaign_is_stopped_for_fee_recovery(stopped)
-            and (
-                stopped_has_cleanup
-                or Decimal(str(stopped.get("fee_spent_xch", "0")))
+        if type(stopped) is dict and (
+            campaign_has_cleanup
+            or (
+                _campaign_is_stopped_for_fee_recovery(stopped)
+                and Decimal(str(stopped.get("fee_spent_xch", "0")))
                 > Decimal(str(stopped.get("fee_budget_xch", "0")))
             )
         ):
@@ -460,6 +460,9 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         **context,
         "recipe": recipe,
         "campaign": campaign,
+        "recovery_only": bool(
+            type(bootstrap) is dict and bootstrap.get("recovery_only") is True
+        ),
         "request_options": options,
         "fee_pool": fee_pool,
         "dispatch_authorized": False,
@@ -599,7 +602,19 @@ def read_next_prep_fee_snapshot(request_options: dict) -> dict:
     context = read_fee_economic_snapshot(request_options)
     recipe = context["recipe"]
     floors = recipe["economic_plan"]["reserve_floors_mojos"]
-    funding = prepare_fee_inventory(context["snapshot"], recipe["targets"], floors)
+    recovery_only = context["recovery_only"] is True
+    funding = prepare_fee_inventory(
+        context["snapshot"], () if recovery_only else recipe["targets"], floors
+    )
+    if recovery_only:
+        return {
+            **context,
+            "funding": funding,
+            "pricing": None,
+            "available": True,
+            "reason": "cancellation_recovery",
+            "dispatch_authorized": False,
+        }
     if funding["principal_funded"] is not True:
         return {
             **context,
@@ -687,7 +702,8 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
     context = read_next_prep_fee_snapshot(request_options)
     if context["available"] is not True:
         return context
-    plan = context["pricing"]["plan"]
+    recovery_only = context["recovery_only"] is True
+    plan = None if recovery_only else context["pricing"]["plan"]
     stages, quotes, profiles, templates = [], {}, {}, {}
     target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
 
@@ -724,12 +740,13 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         return True
 
     native_prerequisite = (
-        plan.transaction_required
+        plan is not None
+        and plan.transaction_required
         and plan.asset == "xch"
         and bool(plan.outputs)
         and all(o.ordinal < 0 and o.purpose == "change" for o in plan.outputs)
     )
-    if plan.transaction_required:
+    if plan is not None and plan.transaction_required:
         inspection = context["pricing"]["inspection"]
         remember(inspection)
         name = "prep_xch_consolidation" if native_prerequisite else f"prep_{plan.asset}"
@@ -755,10 +772,13 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
     missing_native = [
         t
         for t in context["recipe"]["targets"]
-        if t.asset == "xch" and (t.asset, t.ordinal) not in plan.reused_target_ids
+        if plan is not None
+        and t.asset == "xch"
+        and (t.asset, t.ordinal) not in plan.reused_target_ids
     ]
     need_future_native = (
-        plan.transaction_required
+        plan is not None
+        and plan.transaction_required
         and missing_native
         and (plan.asset == "cat" or native_prerequisite)
     )
@@ -964,6 +984,7 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             "snapshot",
             "recipe",
             "campaign",
+            "recovery_only",
             "fee_pool",
         )
     ):
