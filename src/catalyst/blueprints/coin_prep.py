@@ -336,7 +336,7 @@ def bootstrap_coin_prep_worker_args(
     for side, count in replacement_waves.items():
         if type(count) is not int or count < 0:
             raise ValueError(f"Bootstrap {side} replacement wave count is invalid")
-    if xch_sizes and replacement_waves["buy"] == 0:
+    if any(tier != "fees" for tier in xch_sizes) and replacement_waves["buy"] == 0:
         raise ValueError("Bootstrap buy replacement capacity is exhausted")
     if cat_sizes and replacement_waves["sell"] == 0:
         raise ValueError("Bootstrap sell replacement capacity is exhausted")

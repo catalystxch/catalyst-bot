@@ -429,6 +429,54 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     assert worker._derive_tier_cat_sizes() == worker.exact_tier_cat_sizes
 
 
+def test_sell_only_bootstrap_coin_prep_allows_fee_only_xch_targets(
+    bootstrap_app, monkeypatch
+):
+    _bootstrap, client, _identity, _clock = bootstrap_app
+    monkeypatch.setattr(bot_loop.cfg, "LIQUIDITY_MODE", "sell_only")
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_BUY", False)
+    monkeypatch.setattr(bot_loop.cfg, "ENABLE_SELL", True)
+    preview = client.post(
+        "/api/bootstrap/preview",
+        json=_request(xch_budget="0", cat_budget="1000"),
+    ).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            xch_budget="0",
+            cat_budget="1000",
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()["campaign_id"]
+    record = database.get_bootstrap_campaign(campaign_id)
+    runtime = derive_bootstrap_runtime(
+        campaign_record=record,
+        identity={
+            key: record[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        },
+        balances=_balances(),
+        now=NOW,
+    )
+
+    args = bootstrap_coin_prep_worker_args(
+        runtime["plan"], replacement_waves={"buy": 0, "sell": 10}
+    )
+
+    assert args["buy_tier_sizes"] == "fees=0.001"
+    assert args["tier_counts_xch"] == "fees=3"
+    assert args["xch_target"] == 3
+    assert args["cat_target"] == 30
+    assert args["tier_counts_cat"] == "inner=10,mid=10,outer=10"
+
+
 @pytest.mark.parametrize(
     ("stage", "deployment_fraction", "expected_waves"),
     [
