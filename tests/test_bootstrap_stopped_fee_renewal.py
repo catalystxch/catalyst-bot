@@ -253,6 +253,98 @@ def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
     assert approval["dispatch_authorized"] is False
 
 
+def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
+    request, monkeypatch
+):
+    """A policy heartbeat must not strand cancellation of its live offers."""
+
+    import_module("api_server")
+    coin_prep = import_module("blueprints.coin_prep")
+    real_context = coin_prep._active_bootstrap_coin_prep_context
+    state = request.getfixturevalue("approved_bootstrap")
+    monkeypatch.setattr(coin_prep, "_active_bootstrap_coin_prep_context", real_context)
+    database = import_module("database")
+
+    intent_id, trade_id = "6" * 64, "7" * 64
+    operation_id = f"create:{intent_id}"
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:prepared",
+        run_id="active-revision-renewal",
+        wallet_fingerprint_hash=import_module("mutation_gate").wallet_fingerprint_hash(
+            736588221
+        ),
+        network="mainnet",
+        asset_id=utils.ASSET,
+        side="sell",
+        tier="inner",
+        purpose=f"bootstrap:{state['campaign_id']}:revision:0",
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=["8" * 64],
+        wallet_identity_json={"binding_digest": "9" * 64},
+        evidence_json={"canonical_intent_sha256": intent_id},
+        prepared_at="2026-09-22T12:00:00Z",
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:confirmed",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=trade_id,
+        offer_text_sha256="a" * 64,
+        wallet_identity_json={"binding_digest": "9" * 64},
+        evidence_json={"effect_attempted": True},
+        finalized_at="2026-09-22T12:00:01Z",
+    )
+    campaign = database.get_bootstrap_campaign(state["campaign_id"])
+    next_state = {
+        key: campaign[key]
+        for key in (
+            "stage",
+            "deployment_fraction",
+            "current_anchor_price",
+            "stable_since",
+            "confirmed_fills",
+            "settlement_clusters",
+            "independent_depth_sides",
+            "suspected_linked_activity",
+            "adverse_fill_times",
+            "fee_spent_xch",
+            "realized_loss_xch",
+            "marked_inventory_loss_xch",
+            "updated_at",
+        )
+    }
+    assert (
+        database.update_bootstrap_campaign_state(
+            state["campaign_id"], expected_revision=0, record=next_state
+        )
+        == 1
+    )
+    assert database.get_bootstrap_campaign(state["campaign_id"])["status"] == "active"
+
+    app = Flask(__name__)
+    app.register_blueprint(coin_prep.bp)
+    response = app.test_client().post(
+        "/api/coin-prep/fee-preview",
+        json={
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 1,
+        },
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 200, payload
+    assert payload["available"] is True, payload
+    assert payload["preparation_transaction_count_min"] == 0
+    assert payload["preparation_transaction_count_max"] == 0
+    assert int(payload["estimated_cancellation_fee_mojos"]) > 0
+    assert payload["dispatch_authorized"] is False
+
+
 @pytest.fixture
 def automatically_stopped_campaign(request, monkeypatch):
     import_module("api_server")

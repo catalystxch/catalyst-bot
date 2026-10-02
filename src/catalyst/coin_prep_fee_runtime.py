@@ -383,7 +383,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         approved_revision = plan.get("campaign_revision")
         requested_revision = options["bootstrap_campaign_revision"]
         recovery_revision_matches = approved_revision == requested_revision or (
-            _campaign_is_stopped_for_fee_recovery(stopped)
+            (campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(stopped))
             and stopped.get("revision") == requested_revision
             and type(approved_revision) is int
             and requested_revision > approved_revision
