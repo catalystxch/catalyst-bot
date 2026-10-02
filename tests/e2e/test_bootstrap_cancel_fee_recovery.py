@@ -13,13 +13,22 @@ from .test_coin_prep_fee_approval import _open_gui, _preview
 pytestmark = pytest.mark.e2e
 
 
-def test_stale_bootstrap_stop_approval_renews_then_retries_only_campaign(page):
+@pytest.mark.parametrize(
+    ("recovery_reason", "reason_text"),
+    [
+        ("FEE_APPROVAL_STALE", "expired"),
+        ("FEE_PREP_FUNDING_INSUFFICIENT", "funding"),
+    ],
+)
+def test_bootstrap_stop_fee_recovery_renews_then_retries_only_campaign(
+    page, recovery_reason, reason_text
+):
     _open_gui(page)
     preview = _preview()
     campaign_id = "e" * 64
     preview["wallet"]["campaign_id"] = campaign_id
     page.evaluate(
-        """({preview, campaignId}) => {
+        """({preview, campaignId, recoveryReason}) => {
             document.getElementById('startupOverlay').style.display = 'none';
             _bootstrapActiveCampaign = {
                 campaign_id: campaignId, revision: 0, status: 'active', stage: 'bootstrap',
@@ -44,8 +53,8 @@ def test_stale_bootstrap_stop_approval_renews_then_retries_only_campaign(page):
                     if (window.__stopAttempts === 1) {
                         status = 409;
                         data = {
-                            success: false, code: 'FEE_APPROVAL_STALE',
-                            error: 'FEE_APPROVAL_STALE', stopped: true,
+                            success: false, code: recoveryReason,
+                            error: recoveryReason, stopped: true,
                             campaign_id: campaignId, campaign_revision: 1,
                             cancel_targets: 3, financial_action_started: false,
                         };
@@ -64,14 +73,18 @@ def test_stale_bootstrap_stop_approval_renews_then_retries_only_campaign(page):
                 });
             };
         }""",
-        {"preview": preview, "campaignId": campaign_id},
+        {
+            "preview": preview,
+            "campaignId": campaign_id,
+            "recoveryReason": recovery_reason,
+        },
     )
 
     page.evaluate("bootstrapStopCampaign()")
     expect(page.locator("#coinPrepConfirmOverlay")).to_have_class(
         "coin-prep-overlay active"
     )
-    expect(page.locator("#cpReasonBanner")).to_contain_text("expired")
+    expect(page.locator("#cpReasonBanner")).to_contain_text(reason_text)
     expect(page.locator("#cpConfirmBtn")).to_be_enabled()
     page.locator("#cpConfirmBtn").click()
     page.wait_for_function("() => !_coinPrepFeeConfirmBusy")

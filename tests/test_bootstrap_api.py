@@ -588,6 +588,51 @@ def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
     assert campaign["revision"] == 1
 
 
+def test_stop_fee_prep_funding_shortfall_enters_approval_recovery(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: ["trade-a"] if exact_id == campaign_id else [],
+    )
+
+    def funding_shortfall_after_stop(_trade_ids):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+        raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+
+    monkeypatch.setattr(
+        bootstrap, "_cancel_campaign_offers", funding_shortfall_after_stop
+    )
+    response = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 409, payload
+    assert payload == {
+        "success": False,
+        "code": "FEE_PREP_FUNDING_INSUFFICIENT",
+        "error": "FEE_PREP_FUNDING_INSUFFICIENT",
+        "stopped": True,
+        "campaign_id": campaign_id,
+        "campaign_revision": 1,
+        "cancel_targets": 1,
+        "financial_action_started": False,
+    }
+
+
 def test_stopped_campaign_retry_passes_exact_fee_approval_to_scoped_cancellation(
     isolated_db, bootstrap_api, monkeypatch
 ):

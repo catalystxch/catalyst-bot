@@ -32891,7 +32891,9 @@
                 const reason = String(status?.reason_code || status?.code || '');
                 banner.textContent = reason === 'FEE_APPROVAL_STALE'
                     ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
-                    : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
+                    : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
+                        ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                        : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
             }
             modal.classList.add('active');
             return refreshCoinPrepFeePreview(buildCoinPrepFeePreviewOptions());
@@ -39942,6 +39944,7 @@ async function bootstrapStopCampaign() {
         const feeRecoveryReasons = [
             'FEE_APPROVAL_STALE', 'FEE_BUDGET_APPROVAL_REQUIRED',
             'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
+            'FEE_PREP_FUNDING_INSUFFICIENT',
         ];
         if (!payload?.success && payload?.stopped === true
             && feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))) {

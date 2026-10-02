@@ -582,6 +582,7 @@ def api_bootstrap_stop():
                 "FEE_BUDGET_APPROVAL_REQUIRED",
                 "FEE_BUDGET_EXCEEDED",
                 "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                "FEE_PREP_FUNDING_INSUFFICIENT",
             }
             if reason not in recoverable:
                 raise
