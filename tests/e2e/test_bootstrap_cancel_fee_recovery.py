@@ -13,6 +13,22 @@ from .test_coin_prep_fee_approval import _open_gui, _preview
 pytestmark = pytest.mark.e2e
 
 
+def test_ordinary_campaign_prep_omits_cancellation_intent(page):
+    _open_gui(page)
+    options = page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'e'.repeat(64), revision: 2, status: 'active',
+            };
+            _coinPrepFeeRecoveryIntent = null;
+            return buildCoinPrepFeePreviewOptions();
+        }"""
+    )
+    assert options["bootstrap_campaign_id"] == "e" * 64
+    assert options["bootstrap_campaign_revision"] == 2
+    assert "cancellation_recovery_action" not in options
+
+
 @pytest.mark.parametrize(
     ("recovery_reason", "reason_text"),
     [
@@ -109,3 +125,185 @@ def test_bootstrap_stop_fee_recovery_renews_then_retries_only_campaign(
     assert not [call for call in calls if "/offers/cancel_all" in call["path"]]
     assert not [call for call in calls if "/coin-prep/trigger" in call["path"]]
     assert page.evaluate("window.__historyChoiceCalls") == 0
+
+
+@pytest.mark.parametrize(
+    ("code", "financial_action_started", "expected"),
+    [
+        ("bootstrap_cancel_manager_unavailable", False, "Cancellation did not start"),
+        (
+            "bootstrap_cancel_outcome_unknown",
+            None,
+            "Cancellation outcome is unresolved",
+        ),
+    ],
+)
+def test_bootstrap_stop_failure_refreshes_durable_state(
+    page, code, financial_action_started, expected
+):
+    _open_gui(page)
+    campaign_id = "e" * 64
+    page.evaluate(
+        """({campaignId, code, financialActionStarted}) => {
+            _bootstrapActiveCampaign = {
+                campaign_id: campaignId, revision: 0, status: 'active', stage: 'bootstrap',
+            };
+            window.__statusRefreshes = 0;
+            window.__stopBodies = [];
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {
+                window.__statusRefreshes++;
+                _bootstrapRenderStatus({success: true, active: false, campaign: null});
+            };
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path) !== '/api/bootstrap/stop') throw new Error(String(path));
+                window.__stopBodies.push(JSON.parse(options.body));
+                if (window.__stopBodies.length > 1) {
+                    return new Response(JSON.stringify({
+                        success: true, stopped: true, cancel_targets: 3,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                return new Response(JSON.stringify({
+                    success: false, code, stopped: true,
+                    campaign_id: campaignId, campaign_revision: 1,
+                    cancel_targets: 3, financial_action_started: financialActionStarted,
+                }), {status: financialActionStarted === false ? 409 : 503,
+                    headers: {'Content-Type': 'application/json'}});
+            };
+        }""",
+        {
+            "campaignId": campaign_id,
+            "code": code,
+            "financialActionStarted": financial_action_started,
+        },
+    )
+    page.evaluate("bootstrapStopCampaign()")
+    assert page.evaluate("window.__statusRefreshes") == 1
+    expect(page.locator("#bootstrapStatusPanel")).to_contain_text(expected)
+    retry = page.locator("#bootstrapStopBtn")
+    if financial_action_started is False:
+        expect(retry).to_be_enabled()
+        expect(retry).to_contain_text("Retry")
+        expect(page.locator("#bootstrapDashboardStatus")).to_contain_text(
+            "cancellation retry required"
+        )
+        page.evaluate("bootstrapStopCampaign()")
+        assert page.evaluate("window.__stopBodies") == [
+            {"campaign_id": campaign_id, "revision": 0},
+            {"campaign_id": campaign_id, "revision": 1},
+        ]
+    else:
+        expect(retry).to_be_disabled()
+
+
+def test_approved_stop_retry_keeps_targeted_retry_after_no_effect(page):
+    _open_gui(page)
+    campaign_id = "e" * 64
+    result = page.evaluate(
+        """async campaignId => {
+            _bootstrapPendingStopRetry = null;
+            window.__statusRefreshes = 0;
+            bootstrapRefreshStatus = async () => {
+                window.__statusRefreshes++;
+                _bootstrapRenderStatus({success: true, active: false, campaign: null});
+            };
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: false, code: 'bootstrap_cancel_manager_unavailable',
+                stopped: true, campaign_id: campaignId, campaign_revision: 2,
+                financial_action_started: false,
+            }), {status: 409, headers: {'Content-Type': 'application/json'}});
+            try {
+                await resumeBootstrapStopAfterFeeApproval(
+                    {campaign_id: campaignId, campaign_revision: 1}, 'd'.repeat(64)
+                );
+            } catch (_) {}
+            return {refreshes: window.__statusRefreshes,
+                retry: _bootstrapPendingStopRetry};
+        }""",
+        campaign_id,
+    )
+    assert result == {
+        "refreshes": 1,
+        "retry": {"campaign_id": campaign_id, "revision": 2},
+    }
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+
+
+def test_stopped_campaign_retry_rehydrates_after_page_reload(page):
+    _open_gui(page)
+    campaign_id = "e" * 64
+    page.evaluate(
+        """campaignId => {
+            _bootstrapPendingStopRetry = null;
+            _bootstrapActiveCampaign = null;
+            window.__stopBodies = [];
+            showStyledConfirm = async () => true;
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path) === '/api/bootstrap/status') {
+                    return new Response(JSON.stringify({
+                        success: true, active: false, campaign: null,
+                        stopped_cancellation: {
+                            campaign_id: campaignId, revision: 1,
+                            financial_action_started: false,
+                            code: 'bootstrap_cancel_manager_unavailable',
+                        },
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (String(path) === '/api/bootstrap/stop') {
+                    window.__stopBodies.push(JSON.parse(options.body));
+                    return new Response(JSON.stringify({
+                        success: true, stopped: true, cancel_targets: 1,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                throw new Error(String(path));
+            };
+        }""",
+        campaign_id,
+    )
+    page.evaluate("bootstrapRefreshStatus()")
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+    expect(page.locator("#bootstrapStopBtn")).to_contain_text("Retry")
+    page.evaluate("bootstrapStopCampaign()")
+    assert page.evaluate("window.__stopBodies") == [
+        {"campaign_id": campaign_id, "revision": 1}
+    ]
+
+
+def test_active_stop_and_older_stopped_retry_remain_separately_available(page):
+    _open_gui(page)
+    active_id, stopped_id = "a" * 64, "b" * 64
+    page.evaluate(
+        """({activeId, stoppedId}) => {
+            window.__stopBodies = [];
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {};
+            window.__dualStatus = {
+                success: true, active: true,
+                campaign: {campaign_id: activeId, revision: 0, status: 'active'},
+                stopped_cancellation: {
+                    campaign_id: stoppedId, revision: 1,
+                    financial_action_started: false,
+                    code: 'bootstrap_cancel_manager_unavailable',
+                },
+            };
+            _bootstrapRenderStatus(window.__dualStatus);
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path) !== '/api/bootstrap/stop') throw new Error(String(path));
+                window.__stopBodies.push(JSON.parse(options.body));
+                return new Response(JSON.stringify({
+                    success: true, stopped: true, cancel_targets: 1,
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            };
+        }""",
+        {"activeId": active_id, "stoppedId": stopped_id},
+    )
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+    expect(page.locator("#bootstrapStopBtn")).to_contain_text("Stop & Cancel")
+    expect(page.locator("#bootstrapRetryStoppedBtn")).to_be_enabled()
+    page.evaluate("bootstrapStopCampaign()")
+    page.evaluate("_bootstrapRenderStatus(window.__dualStatus)")
+    page.evaluate("bootstrapStopCampaign('pending')")
+    assert page.evaluate("window.__stopBodies") == [
+        {"campaign_id": active_id, "revision": 0},
+        {"campaign_id": stopped_id, "revision": 1},
+    ]

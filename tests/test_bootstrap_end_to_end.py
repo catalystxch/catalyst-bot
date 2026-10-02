@@ -308,9 +308,14 @@ def test_mock_wallet_campaign_runs_from_confirmation_to_cancel_and_restart(
     )
     monkeypatch.setattr(
         bootstrap,
+        "_campaign_cancel_manager",
+        lambda: SimpleNamespace(cancel_offers=lambda *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(
+        bootstrap,
         "_cancel_campaign_offers",
         lambda trade_ids: {
-            trade_id: {"outcome": "CANCEL_SUBMITTED"}
+            trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}
             for trade_id in (cancelled.extend(trade_ids) or trade_ids)
         },
     )
