@@ -373,6 +373,170 @@ def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
         }
 
 
+def _bootstrap_existing_offer_resume_readiness(
+    cfg_obj, campaign: dict[str, Any]
+) -> dict[str, Any]:
+    """Prove a recovered campaign book exactly before resuming its manager.
+
+    Coin Prep correctly reports campaign coins unavailable while those coins
+    are locked by the campaign's already-live offers.  That is safe to bypass
+    only for an explicit resume request, and only when durable intent, local
+    open-book, and a fresh complete Sage snapshot agree on the exact nonempty
+    trade-id set for the current campaign revision.
+    """
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    campaign_id = str(campaign.get("campaign_id") or "").strip()
+    revision = campaign.get("revision")
+    if (
+        len(asset_id) != 64
+        or not campaign_id
+        or type(revision) is not int
+        or revision < 0
+    ):
+        return {"ready": False, "reason": "campaign_identity_invalid"}
+
+    purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+    active_states = {"created", "visible"}
+    try:
+        from database import get_offer_intents_for_registry, get_open_offers
+        from wallet import (
+            classify_offers_from_list,
+            get_authoritative_offer_history,
+        )
+
+        intents = get_offer_intents_for_registry()
+        db_offers = get_open_offers(cat_asset_id=asset_id)
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
+        if type(intents) is not list or type(db_offers) is not list:
+            raise ValueError("Durable offer authority is unavailable")
+        if any(type(row) is not dict for row in [*intents, *db_offers]):
+            raise ValueError("Durable offer authority is malformed")
+
+        current_intents = [
+            row for row in intents if str(row.get("purpose") or "") == purpose
+        ]
+        if any(
+            str(row.get("asset_id") or "").strip().lower() != asset_id
+            for row in current_intents
+        ):
+            raise ValueError("Campaign intent asset identity disagrees")
+        active_intents = [
+            row
+            for row in current_intents
+            if str(row.get("lifecycle_state") or "").strip().lower()
+            in active_states
+        ]
+        intent_ids = [
+            str(row.get("sage_trade_id") or "").strip() for row in active_intents
+        ]
+        db_ids = [
+            str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            for row in db_offers
+        ]
+        if (
+            not intent_ids
+            or any(not trade_id for trade_id in [*intent_ids, *db_ids])
+            or len(set(intent_ids)) != len(intent_ids)
+            or len(set(db_ids)) != len(db_ids)
+        ):
+            raise ValueError("Campaign offer identities are incomplete or duplicated")
+
+        if type(history) is dict:
+            wallet_offers = history.get("offers")
+            complete = (
+                history.get("success") is True
+                and history.get("end_of_history") is True
+            )
+        else:
+            wallet_offers = history
+            complete = type(history) is list and len(history) < 500
+        if (
+            not complete
+            or type(wallet_offers) is not list
+            or any(type(row) is not dict for row in wallet_offers)
+        ):
+            raise ValueError("Wallet offer history is incomplete")
+
+        wallet_buys, wallet_sells, wallet_closed = classify_offers_from_list(
+            wallet_offers, asset_id
+        )
+        if (
+            type(wallet_buys) is not list
+            or type(wallet_sells) is not list
+            or type(wallet_closed) is not list
+        ):
+            raise ValueError("Wallet current-pair offer classification failed")
+        wallet_open = [*wallet_buys, *wallet_sells]
+        if any(type(row) is not dict for row in [*wallet_open, *wallet_closed]):
+            raise ValueError("Wallet current-pair offer authority is malformed")
+        open_row_ids = {id(row) for row in wallet_open}
+        closed_row_ids = {id(row) for row in wallet_closed}
+        for row in wallet_offers:
+            summary = row.get("summary")
+            offered = summary.get("offered") if type(summary) is dict else None
+            requested = summary.get("requested") if type(summary) is dict else None
+            if type(offered) is not dict or type(requested) is not dict:
+                raise ValueError("Wallet offer summary is malformed")
+            offered_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in offered
+            }
+            requested_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in requested
+            }
+            related = asset_id in offered_assets or asset_id in requested_assets
+            if related and id(row) not in open_row_ids | closed_row_ids:
+                raise ValueError(
+                    "Current-pair wallet offer cannot be authoritatively classified"
+                )
+        wallet_ids = [
+            str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            for row in wallet_open
+        ]
+        if any(not trade_id for trade_id in wallet_ids) or len(
+            set(wallet_ids)
+        ) != len(wallet_ids):
+            raise ValueError("Wallet offer identities are incomplete or duplicated")
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Recovered Bootstrap offer resume proof failed closed",
+            {"error": str(exc)[:256]},
+            level="warning",
+        )
+        return {
+            "ready": False,
+            "reason": "existing_offer_resume_proof_unavailable",
+        }
+
+    intent_set = set(intent_ids)
+    db_set = set(db_ids)
+    wallet_set = set(wallet_ids)
+    if intent_set != db_set or intent_set != wallet_set:
+        slog(
+            "SAFETY",
+            "Recovered Bootstrap offer authorities disagree",
+            {
+                "campaign_id": campaign_id,
+                "revision": revision,
+                "intent_count": len(intent_set),
+                "database_count": len(db_set),
+                "wallet_count": len(wallet_set),
+            },
+            level="warning",
+        )
+        return {"ready": False, "reason": "offer_authority_mismatch"}
+
+    return {
+        "ready": True,
+        "reason": "exact_live_book",
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+        "offer_count": len(intent_set),
+    }
+
+
 def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:
     """Only poll wallet RPC while an authorised bot run is active.
 
@@ -462,6 +626,12 @@ def api_bot_start():
 
     if bot.is_running():
         return jsonify({"success": True, "status": "already_running"})
+
+    request_payload = request.get_json(silent=True)
+    resume_existing_offers = bool(
+        type(request_payload) is dict
+        and request_payload.get("resume_existing_offers") is True
+    )
 
     try:
         has_pending_restart_changes = getattr(
@@ -574,19 +744,39 @@ def api_bot_start():
     elif bootstrap_campaign is not None:
         bootstrap_readiness = _bootstrap_coin_prep_start_readiness(cfg)
         if bootstrap_readiness.get("ready") is not True:
-            needs_coin_prep = True
-            coin_prep_reason = "bootstrap_coin_prep_required"
-            coin_prep_error = (
-                "Active Bootstrap campaign coin outputs require re-preparation "
-                "before starting the bot"
+            resume_readiness = (
+                _bootstrap_existing_offer_resume_readiness(cfg, bootstrap_campaign)
+                if resume_existing_offers
+                else {"ready": False, "reason": "resume_not_requested"}
             )
-            errors.append(coin_prep_error)
-            log_event(
-                "warning",
-                "bootstrap_coin_prep_start_blocked",
-                "Exact active-campaign Coin Prep verification blocked bot start: "
-                + str(bootstrap_readiness.get("reason") or "not_ready"),
-            )
+            if resume_readiness.get("ready") is True:
+                log_event(
+                    "info",
+                    "bootstrap_existing_offer_resume_ready",
+                    "Exact recovered Bootstrap offer book authoritatively proven; "
+                    "free-coin Coin Prep readiness is not applicable",
+                    data={
+                        "campaign_id": resume_readiness.get("campaign_id"),
+                        "revision": resume_readiness.get("campaign_revision"),
+                        "offer_count": resume_readiness.get("offer_count"),
+                    },
+                )
+            else:
+                needs_coin_prep = True
+                coin_prep_reason = "bootstrap_coin_prep_required"
+                coin_prep_error = (
+                    "Active Bootstrap campaign coin outputs require re-preparation "
+                    "before starting the bot"
+                )
+                errors.append(coin_prep_error)
+                log_event(
+                    "warning",
+                    "bootstrap_coin_prep_start_blocked",
+                    "Exact active-campaign Coin Prep verification blocked bot start: "
+                    + str(bootstrap_readiness.get("reason") or "not_ready")
+                    + "; recovered offer proof: "
+                    + str(resume_readiness.get("reason") or "not_requested"),
+                )
         else:
             log_event(
                 "info",

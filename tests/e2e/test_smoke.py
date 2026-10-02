@@ -888,6 +888,48 @@ def test_expired_bootstrap_recovery_modal_does_not_offer_start(page):
     assert "active" not in page.locator("#resumeSessionModal").get_attribute("class")
 
 
+def test_resume_start_sends_explicit_existing_offer_authority_request(page):
+    """Only the recovered-book CTA may request the exact live-offer start path."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            settingsReviewed = true;
+            currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            coinPrepStatus = 'skipped-safe';
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkForResume = async () => false;
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            window.__capturedStartRequest = null;
+            apiFetch = async (path, options = {}) => {
+                if (String(path).includes('/bot/start')) {
+                    window.__capturedStartRequest = {
+                        path: String(path),
+                        method: options.method,
+                        contentType: options.headers?.['Content-Type'],
+                        body: options.body,
+                    };
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await resumeStartNow();
+            return window.__capturedStartRequest;
+        }"""
+    )
+
+    assert result["path"].endswith("/bot/start")
+    assert result["method"] == "POST"
+    assert result["contentType"] == "application/json"
+    assert result["body"] == '{"resume_existing_offers":true}'
+
+
 def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     """A RED Bootstrap anchor must not be presented as trusted market evidence."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

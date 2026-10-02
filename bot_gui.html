@@ -32255,10 +32255,10 @@
         // Called from the "Start Bot Now" button in the post-load modal
         async function resumeStartNow() {
             document.getElementById('resumeSessionModal').classList.remove('active');
-            await startBot();
+            await startBot({ resumeExistingOffers: true });
         }
 
-        async function startBot() {
+        async function startBot(options = {}) {
             const safety = getStartSafetyState();
             if (!safety.allowed) {
                 updateStartupChecklist(bot_state);
@@ -32329,7 +32329,12 @@
                 }
 
                 // Start the bot directly
-                const response = await apiFetch(`${API_URL}/bot/start`, { method: 'POST' });
+                const startRequest = { method: 'POST' };
+                if (options.resumeExistingOffers === true) {
+                    startRequest.headers = { 'Content-Type': 'application/json' };
+                    startRequest.body = JSON.stringify({ resume_existing_offers: true });
+                }
+                const response = await apiFetch(`${API_URL}/bot/start`, startRequest);
                 const result = await response.json();
 
                 if (result.success) {
