@@ -343,6 +343,17 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
     assert payload["preparation_transaction_count_max"] == 0
     assert int(payload["estimated_cancellation_fee_mojos"]) > 0
     assert payload["dispatch_authorized"] is False
+    approval = import_module("coin_prep_fee_approval").approve_coin_prep_fees(
+        preview_id=payload["preview_id"],
+        maximum_fee_mojos=int(payload["suggested_maximum_fee_mojos"]),
+        cancellation_reserve_mojos=int(payload["minimum_cancellation_reserve_mojos"]),
+    )
+    recovered = import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
+        approval["approval_id"], allow_campaign_fee_recovery=True
+    )
+    assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
+    assert recovered["campaign"]["revision"] == 1
+    assert approval["dispatch_authorized"] is False
 
 
 @pytest.fixture

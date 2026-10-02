@@ -553,10 +553,21 @@ def read_approved_prep_fee_snapshot(
     else:
         campaign = database.get_bootstrap_campaign(scope["campaign_id"])
         approved_revision = approved["plan"]["campaign_revision"]
-        stopped_recovery_revision = (
+        campaign_has_cleanup = False
+        if (
             allow_campaign_fee_recovery
             and type(campaign) is dict
-            and _campaign_is_stopped_for_fee_recovery(campaign)
+            and campaign.get("status") in {"active", "stopped"}
+        ):
+            from blueprints.bootstrap import _campaign_trade_ids
+
+            campaign_has_cleanup = bool(_campaign_trade_ids(scope["campaign_id"]))
+        cleanup_recovery_revision = (
+            allow_campaign_fee_recovery
+            and type(campaign) is dict
+            and (
+                campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(campaign)
+            )
             and type(approved_revision) is int
             and type(campaign.get("revision")) is int
             and campaign.get("revision") > approved_revision
@@ -569,7 +580,7 @@ def read_approved_prep_fee_snapshot(
             )
             or (
                 campaign.get("revision") != approved_revision
-                and not stopped_recovery_revision
+                and not cleanup_recovery_revision
             )
             or any(
                 campaign.get(key) != scope[key]

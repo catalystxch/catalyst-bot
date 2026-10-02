@@ -176,3 +176,23 @@ def test_trusted_bounds_shift_each_bootstrap_ladder_without_collapsing_tiers():
     assert sell_prices[0] < sell_prices[1] < sell_prices[2]
     assert all(campaign.minimum_price <= price for price in buy_prices)
     assert all(price <= campaign.maximum_price for price in sell_prices)
+
+
+def test_trusted_boundary_with_no_room_for_three_levels_pauses_that_side():
+    campaign = _campaign(
+        anchor=Decimal("0.000075"),
+        xch_budget=Decimal("0"),
+        cat_budget=Decimal("150000"),
+    )
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            cat_available=Decimal("150000"),
+            minimum_profit_xch=Decimal("0"),
+            trusted_ask=campaign.maximum_price,
+        ),
+    )
+
+    assert plan["sides"]["sell"] == {"paused": True, "levels": []}
+    assert "sell_trusted_range_insufficient_corridor" in plan["reason_codes"]
