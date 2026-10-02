@@ -530,7 +530,10 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
     def cancel_after_creation_authority_is_stopped(trade_ids):
         assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
         cancelled.extend(trade_ids)
-        return {trade_id: {"outcome": "CANCEL_SUBMITTED"} for trade_id in trade_ids}
+        return {
+            trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}
+            for trade_id in trade_ids
+        }
 
     monkeypatch.setattr(
         bootstrap,
@@ -656,6 +659,28 @@ def test_stop_manager_unavailable_still_freezes_creation_authority(
     assert response.get_json()["financial_action_started"] is False
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
     assert database.get_bootstrap_campaign(campaign_id)["revision"] == 1
+    status = client.get("/api/bootstrap/status").get_json()
+    assert status["active"] is False
+    assert status["stopped_cancellation"]["campaign_id"] == campaign_id
+    assert status["stopped_cancellation"]["revision"] == 1
+    assert status["stopped_cancellation"]["financial_action_started"] is False
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_cancel_manager",
+        lambda: SimpleNamespace(
+            cancel_offers=lambda *_args, **_kwargs: {
+                "trade-a": {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}
+            }
+        ),
+    )
+    retry = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 1},
+    )
+    assert retry.status_code == 200, retry.get_json()
+    assert (
+        client.get("/api/bootstrap/status").get_json()["stopped_cancellation"] is None
+    )
 
 
 def test_stop_transport_failure_reports_committed_revision_and_unknown_effect(
@@ -688,6 +713,9 @@ def test_stop_transport_failure_reports_committed_revision_and_unknown_effect(
     assert payload["campaign_revision"] == 1
     assert payload["code"] == "bootstrap_cancel_outcome_unknown"
     assert payload["financial_action_started"] is None
+    status = client.get("/api/bootstrap/status").get_json()
+    assert status["stopped_cancellation"]["campaign_id"] == campaign_id
+    assert status["stopped_cancellation"]["financial_action_started"] is None
 
 
 def test_stop_invalid_manager_result_does_not_claim_no_financial_action(
@@ -718,6 +746,41 @@ def test_stop_invalid_manager_result_does_not_claim_no_financial_action(
     assert payload["stopped"] is True
     assert payload["campaign_revision"] == 1
     assert payload["financial_action_started"] is None
+
+
+@pytest.mark.parametrize("outcome", ["CANCEL_UNKNOWN", "CANCEL_FAILED", None])
+def test_stop_unknown_per_offer_result_remains_unresolved_after_reload(
+    isolated_db, bootstrap_api, monkeypatch, outcome
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(bootstrap, "_campaign_trade_ids", lambda _id: ["trade-a"])
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_cancel_manager",
+        lambda: SimpleNamespace(
+            cancel_offers=lambda *_args, **_kwargs: (
+                {} if outcome is None else {"trade-a": {"outcome": outcome}}
+            )
+        ),
+    )
+    response = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    assert response.status_code == 503, response.get_json()
+    assert response.get_json()["financial_action_started"] is None
+    status = client.get("/api/bootstrap/status").get_json()
+    assert status["stopped_cancellation"]["campaign_id"] == campaign_id
+    assert status["stopped_cancellation"]["financial_action_started"] is None
 
 
 def test_stop_fee_prep_funding_shortfall_enters_approval_recovery(
@@ -792,7 +855,7 @@ def test_stopped_campaign_retry_passes_exact_fee_approval_to_scoped_cancellation
         attempts.append((trade_ids, fee_approval_id))
         if fee_approval_id is None:
             raise ValueError("FEE_APPROVAL_STALE")
-        return {trade_id: {"outcome": "CANCEL_SUBMITTED"}}
+        return {trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}}
 
     monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", cancel_after_stop)
     first = client.post(

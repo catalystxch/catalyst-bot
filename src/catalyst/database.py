@@ -35952,6 +35952,53 @@ def get_active_bootstrap_campaign(
     )
 
 
+def list_stopped_bootstrap_campaigns_for_identity(
+    asset_id: str, fingerprint: int, network: str
+) -> List[Dict[str, Any]]:
+    """Read stopped campaigns for the exact Sage identity and CAT asset."""
+
+    safe_asset = _bootstrap_identity(asset_id, "asset_id")
+    safe_fingerprint = _exact_integer(fingerprint, "fingerprint", minimum=1)
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("network is invalid")
+    rows = (
+        get_connection()
+        .execute(
+            """
+            SELECT * FROM bootstrap_campaigns
+            WHERE asset_id=? AND wallet_fingerprint=? AND network=? AND status='stopped'
+            ORDER BY updated_at DESC, campaign_id DESC
+            """,
+            (safe_asset, safe_fingerprint, safe_network),
+        )
+        .fetchall()
+    )
+    return [_decode_bootstrap_campaign(row) for row in rows]
+
+
+def get_latest_bootstrap_cancel_attempt(campaign_id: str) -> Optional[Dict[str, Any]]:
+    """Read the last durable stop/cancel outcome in insertion order."""
+
+    safe_id = _bootstrap_identity(campaign_id, "campaign_id")
+    row = (
+        get_connection()
+        .execute(
+            """
+            SELECT event_type, data_json FROM bootstrap_campaign_events
+            WHERE campaign_id=? AND event_type IN
+                ('campaign_cancel_attempt', 'campaign_stopped')
+            ORDER BY rowid DESC LIMIT 1
+            """,
+            (safe_id,),
+        )
+        .fetchone()
+    )
+    if row is None:
+        return None
+    return {"event_type": row["event_type"], "data": json.loads(row["data_json"])}
+
+
 def list_active_bootstrap_campaigns_for_asset(asset_id: str) -> List[Dict[str, Any]]:
     """Return every active local authority for one exact CAT asset."""
 

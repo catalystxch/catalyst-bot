@@ -528,19 +528,18 @@ def read_approved_prep_fee_snapshot(
     request_options = json.loads(consent["request_options_json"])
     recovery_only = request_options.get("cancellation_recovery") is True
     marker = quote.get("cancellation_recovery")
-    if marker is None and scope["campaign_id"] is not None:
-        legacy_cancellation_only = (
-            quote.get("preparation_transaction_count_max") == 0
-            and bool(quote.get("stages"))
-            and all(stage.get("cancellation") is True for stage in quote["stages"])
-        )
-        if legacy_cancellation_only and not allow_campaign_fee_recovery:
+    if marker is None:
+        if recovery_only:
             raise ValueError("FEE_APPROVAL_STALE")
-    elif type(marker) is not bool:
-        raise ValueError("FEE_APPROVAL_STALE")
-    if (marker is not None and marker is not recovery_only) or (
-        marker is None and recovery_only
-    ):
+        if scope["campaign_id"] is not None:
+            legacy_cancellation_only = (
+                quote.get("preparation_transaction_count_max") == 0
+                and bool(quote.get("stages"))
+                and all(stage.get("cancellation") is True for stage in quote["stages"])
+            )
+            if legacy_cancellation_only and not allow_campaign_fee_recovery:
+                raise ValueError("FEE_APPROVAL_STALE")
+    elif type(marker) is not bool or marker is not recovery_only:
         raise ValueError("FEE_APPROVAL_STALE")
     if recovery_only and not allow_campaign_fee_recovery:
         raise ValueError("FEE_APPROVAL_STALE")

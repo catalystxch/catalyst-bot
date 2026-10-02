@@ -315,7 +315,7 @@ def test_mock_wallet_campaign_runs_from_confirmation_to_cancel_and_restart(
         bootstrap,
         "_cancel_campaign_offers",
         lambda trade_ids: {
-            trade_id: {"outcome": "CANCEL_SUBMITTED"}
+            trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}
             for trade_id in (cancelled.extend(trade_ids) or trade_ids)
         },
     )

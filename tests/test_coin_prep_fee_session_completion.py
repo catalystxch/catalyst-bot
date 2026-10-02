@@ -29,6 +29,26 @@ def _install_completed_targets(state, approval_id):
     return targets
 
 
+def test_legacy_standalone_quote_remains_usable_for_ordinary_prep(
+    approved, monkeypatch
+):
+    approval_id = approved["approval"]["approval_id"]
+    original_context = database.get_coin_prep_fee_approval_context
+
+    def without_new_marker(exact_id):
+        context = dict(original_context(exact_id))
+        quote = json.loads(context["quote_json"])
+        quote.pop("cancellation_recovery")
+        context["quote_json"] = json.dumps(quote)
+        return context
+
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_context", without_new_marker
+    )
+    context = runtime.read_approved_prep_fee_snapshot(approval_id)
+    assert context["scope"]["session_id"] is not None
+
+
 def test_incomplete_current_wallet_cannot_complete_or_rotate_session(approved):
     approval = approved["approval"]
     with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):

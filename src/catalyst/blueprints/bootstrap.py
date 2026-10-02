@@ -405,6 +405,40 @@ def _status_campaign_view(campaign: dict[str, Any] | None) -> dict[str, Any] | N
     return view
 
 
+def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | None:
+    """Hydrate a durable campaign retry or unresolved cancel outcome."""
+
+    for campaign in database.list_stopped_bootstrap_campaigns_for_identity(
+        identity["asset_id"], identity["wallet_fingerprint"], identity["network"]
+    ):
+        if (
+            campaign["wallet_type"] != identity["wallet_type"]
+            or campaign["wallet_id"] != identity["wallet_id"]
+        ):
+            continue
+        trade_ids = _campaign_trade_ids(campaign["campaign_id"])
+        if not trade_ids:
+            continue
+        attempt = database.get_latest_bootstrap_cancel_attempt(campaign["campaign_id"])
+        if attempt is None:
+            continue
+        data = attempt["data"]
+        code = data.get("code") or data.get("cancel_error")
+        if not code:
+            continue
+        financial_action_started = data.get("financial_action_started")
+        if attempt["event_type"] == "campaign_stopped":
+            financial_action_started = False
+        return {
+            "campaign_id": campaign["campaign_id"],
+            "revision": campaign["revision"],
+            "code": code,
+            "financial_action_started": financial_action_started,
+            "cancel_targets": len(trade_ids),
+        }
+    return None
+
+
 @bp.get("/api/bootstrap/status")
 def api_bootstrap_status():
     try:
@@ -421,6 +455,7 @@ def api_bootstrap_status():
                     "identity": identity,
                     "active": active is not None,
                     "campaign": _status_campaign_view(active),
+                    "stopped_cancellation": _stopped_cancellation_status(identity),
                     "needs_attention": bool(
                         active is not None
                         and _campaign_expiry_has_elapsed(active, _utcnow())
@@ -533,6 +568,37 @@ def _cancel_campaign_offers(
     return result
 
 
+def _record_campaign_cancel_attempt(
+    campaign_id: str,
+    *,
+    revision: int,
+    cancel_targets: int,
+    code: str | None,
+    financial_action_started: bool | None,
+) -> None:
+    try:
+        database.append_bootstrap_campaign_event(
+            {
+                "campaign_id": campaign_id,
+                "event_type": "campaign_cancel_attempt",
+                "occurred_at": _utcnow(),
+                "data": {
+                    "campaign_revision": revision,
+                    "cancel_targets": cancel_targets,
+                    "code": code,
+                    "financial_action_started": financial_action_started,
+                },
+            }
+        )
+    except Exception:
+        slog(
+            "BOOTSTRAP",
+            "Campaign cancellation attempt could not be recorded",
+            {"campaign_id": campaign_id},
+            level="error",
+        )
+
+
 @bp.post("/api/bootstrap/stop")
 def api_bootstrap_stop():
     try:
@@ -580,6 +646,22 @@ def api_bootstrap_stop():
                 if fee_approval_id is None
                 else _cancel_campaign_offers(trade_ids, fee_approval_id=fee_approval_id)
             )
+            safe_cancel_results = _json_safe(cancel_results)
+            json.dumps(safe_cancel_results)
+            submitted_or_confirmed = {
+                "CANCEL_CONFIRMED",
+                "CANCEL_SUBMITTED_UNCONFIRMED",
+            }
+            if trade_ids and (
+                set(safe_cancel_results) != set(trade_ids)
+                or any(
+                    type(safe_cancel_results[trade_id]) is not dict
+                    or safe_cancel_results[trade_id].get("outcome")
+                    not in submitted_or_confirmed
+                    for trade_id in trade_ids
+                )
+            ):
+                raise BootstrapApiError("bootstrap_cancel_result_unresolved", 503)
         except Exception as exc:
             no_effect_refusals = {
                 "FEE_APPROVAL_STALE",
@@ -625,6 +707,13 @@ def api_bootstrap_stop():
                         "Campaign stop event recording failed after cancellation error",
                         level="error",
                     )
+            _record_campaign_cancel_attempt(
+                campaign_id,
+                revision=stopped_campaign["revision"],
+                cancel_targets=len(trade_ids),
+                code=reason,
+                financial_action_started=financial_action_started,
+            )
             return (
                 jsonify(
                     {
@@ -641,25 +730,39 @@ def api_bootstrap_stop():
                 status,
             )
         if was_active:
-            database.append_bootstrap_campaign_event(
-                {
-                    "campaign_id": campaign_id,
-                    "event_type": "campaign_stopped",
-                    "occurred_at": stopped_at,
-                    "data": {
-                        "reason": "manual",
-                        "cancel_targets": trade_ids,
-                        "cancel_result_count": len(cancel_results),
-                    },
-                }
-            )
+            try:
+                database.append_bootstrap_campaign_event(
+                    {
+                        "campaign_id": campaign_id,
+                        "event_type": "campaign_stopped",
+                        "occurred_at": stopped_at,
+                        "data": {
+                            "reason": "manual",
+                            "cancel_targets": trade_ids,
+                            "cancel_result_count": len(cancel_results),
+                        },
+                    }
+                )
+            except Exception:
+                slog(
+                    "BOOTSTRAP",
+                    "Campaign stop event recording failed after cancellation response",
+                    level="error",
+                )
+        _record_campaign_cancel_attempt(
+            campaign_id,
+            revision=stopped_campaign["revision"],
+            cancel_targets=len(trade_ids),
+            code=None,
+            financial_action_started=True if trade_ids else False,
+        )
         return jsonify(
             {
                 "success": True,
                 "campaign_id": campaign_id,
                 "stopped": True,
                 "cancel_targets": len(trade_ids),
-                "cancel_results": _json_safe(cancel_results),
+                "cancel_results": safe_cancel_results,
             }
         )
     except Exception as exc:

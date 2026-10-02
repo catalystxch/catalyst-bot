@@ -224,3 +224,43 @@ def test_approved_stop_retry_keeps_targeted_retry_after_no_effect(page):
         "retry": {"campaign_id": campaign_id, "revision": 2},
     }
     expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+
+
+def test_stopped_campaign_retry_rehydrates_after_page_reload(page):
+    _open_gui(page)
+    campaign_id = "e" * 64
+    page.evaluate(
+        """campaignId => {
+            _bootstrapPendingStopRetry = null;
+            _bootstrapActiveCampaign = null;
+            window.__stopBodies = [];
+            showStyledConfirm = async () => true;
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path) === '/api/bootstrap/status') {
+                    return new Response(JSON.stringify({
+                        success: true, active: false, campaign: null,
+                        stopped_cancellation: {
+                            campaign_id: campaignId, revision: 1,
+                            financial_action_started: false,
+                            code: 'bootstrap_cancel_manager_unavailable',
+                        },
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                if (String(path) === '/api/bootstrap/stop') {
+                    window.__stopBodies.push(JSON.parse(options.body));
+                    return new Response(JSON.stringify({
+                        success: true, stopped: true, cancel_targets: 1,
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                throw new Error(String(path));
+            };
+        }""",
+        campaign_id,
+    )
+    page.evaluate("bootstrapRefreshStatus()")
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+    expect(page.locator("#bootstrapStopBtn")).to_contain_text("Retry")
+    page.evaluate("bootstrapStopCampaign()")
+    assert page.evaluate("window.__stopBodies") == [
+        {"campaign_id": campaign_id, "revision": 1}
+    ]
