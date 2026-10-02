@@ -16,6 +16,7 @@ from enum import Enum
 import hashlib
 import json
 import re
+import secrets
 import sys
 from typing import Any
 
@@ -428,7 +429,17 @@ def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | N
             continue
         financial_action_started = data.get("financial_action_started")
         if attempt["event_type"] == "campaign_stopped":
-            financial_action_started = False
+            known_no_effect = {
+                "FEE_APPROVAL_STALE",
+                "FEE_BUDGET_APPROVAL_REQUIRED",
+                "FEE_BUDGET_EXCEEDED",
+                "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                "FEE_PREP_FUNDING_INSUFFICIENT",
+                "BOOTSTRAP_CANCEL_MANAGER_UNAVAILABLE",
+            }
+            financial_action_started = (
+                False if str(code).upper() in known_no_effect else None
+            )
         return {
             "campaign_id": campaign["campaign_id"],
             "revision": campaign["revision"],
@@ -575,7 +586,7 @@ def _record_campaign_cancel_attempt(
     cancel_targets: int,
     code: str | None,
     financial_action_started: bool | None,
-) -> None:
+) -> bool:
     try:
         database.append_bootstrap_campaign_event(
             {
@@ -583,6 +594,7 @@ def _record_campaign_cancel_attempt(
                 "event_type": "campaign_cancel_attempt",
                 "occurred_at": _utcnow(),
                 "data": {
+                    "attempt_nonce": secrets.token_hex(16),
                     "campaign_revision": revision,
                     "cancel_targets": cancel_targets,
                     "code": code,
@@ -590,6 +602,7 @@ def _record_campaign_cancel_attempt(
                 },
             }
         )
+        return True
     except Exception:
         slog(
             "BOOTSTRAP",
@@ -597,6 +610,7 @@ def _record_campaign_cancel_attempt(
             {"campaign_id": campaign_id},
             level="error",
         )
+        return False
 
 
 @bp.post("/api/bootstrap/stop")
@@ -641,6 +655,14 @@ def api_bootstrap_stop():
         if type(stopped_campaign) is not dict:
             raise BootstrapApiError("bootstrap_stop_failed", 409)
         try:
+            if trade_ids and not _record_campaign_cancel_attempt(
+                campaign_id,
+                revision=stopped_campaign["revision"],
+                cancel_targets=len(trade_ids),
+                code="bootstrap_cancel_attempt_started",
+                financial_action_started=None,
+            ):
+                raise BootstrapApiError("bootstrap_cancel_journal_unavailable", 503)
             cancel_results = (
                 _cancel_campaign_offers(trade_ids)
                 if fee_approval_id is None
@@ -749,13 +771,29 @@ def api_bootstrap_stop():
                     "Campaign stop event recording failed after cancellation response",
                     level="error",
                 )
-        _record_campaign_cancel_attempt(
+        recorded = not trade_ids or _record_campaign_cancel_attempt(
             campaign_id,
             revision=stopped_campaign["revision"],
             cancel_targets=len(trade_ids),
             code=None,
-            financial_action_started=True if trade_ids else False,
+            financial_action_started=True,
         )
+        if not recorded:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "code": "bootstrap_cancel_outcome_unknown",
+                        "error": "bootstrap_cancel_outcome_unknown",
+                        "stopped": True,
+                        "campaign_id": campaign_id,
+                        "campaign_revision": stopped_campaign["revision"],
+                        "cancel_targets": len(trade_ids),
+                        "financial_action_started": None,
+                    }
+                ),
+                503,
+            )
         return jsonify(
             {
                 "success": True,

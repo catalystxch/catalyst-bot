@@ -264,3 +264,43 @@ def test_stopped_campaign_retry_rehydrates_after_page_reload(page):
     assert page.evaluate("window.__stopBodies") == [
         {"campaign_id": campaign_id, "revision": 1}
     ]
+
+
+def test_active_stop_and_older_stopped_retry_remain_separately_available(page):
+    _open_gui(page)
+    active_id, stopped_id = "a" * 64, "b" * 64
+    page.evaluate(
+        """({activeId, stoppedId}) => {
+            window.__stopBodies = [];
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {};
+            window.__dualStatus = {
+                success: true, active: true,
+                campaign: {campaign_id: activeId, revision: 0, status: 'active'},
+                stopped_cancellation: {
+                    campaign_id: stoppedId, revision: 1,
+                    financial_action_started: false,
+                    code: 'bootstrap_cancel_manager_unavailable',
+                },
+            };
+            _bootstrapRenderStatus(window.__dualStatus);
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path) !== '/api/bootstrap/stop') throw new Error(String(path));
+                window.__stopBodies.push(JSON.parse(options.body));
+                return new Response(JSON.stringify({
+                    success: true, stopped: true, cancel_targets: 1,
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            };
+        }""",
+        {"activeId": active_id, "stoppedId": stopped_id},
+    )
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+    expect(page.locator("#bootstrapStopBtn")).to_contain_text("Stop & Cancel")
+    expect(page.locator("#bootstrapRetryStoppedBtn")).to_be_enabled()
+    page.evaluate("bootstrapStopCampaign()")
+    page.evaluate("_bootstrapRenderStatus(window.__dualStatus)")
+    page.evaluate("bootstrapStopCampaign('pending')")
+    assert page.evaluate("window.__stopBodies") == [
+        {"campaign_id": active_id, "revision": 0},
+        {"campaign_id": stopped_id, "revision": 1},
+    ]

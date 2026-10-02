@@ -630,8 +630,9 @@ def test_stop_manager_unavailable_reports_committed_revision(
     assert database.get_bootstrap_campaign(campaign_id)["revision"] == 1
 
 
+@pytest.mark.parametrize("final_recorded", [True, False])
 def test_stop_manager_unavailable_still_freezes_creation_authority(
-    isolated_db, bootstrap_api, monkeypatch
+    isolated_db, bootstrap_api, monkeypatch, final_recorded
 ):
     bootstrap, client, _identity = bootstrap_api
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -673,18 +674,40 @@ def test_stop_manager_unavailable_still_freezes_creation_authority(
             }
         ),
     )
+    if not final_recorded:
+        append_event = database.append_bootstrap_campaign_event
+
+        def fail_final_event(record):
+            if (
+                record["event_type"] == "campaign_cancel_attempt"
+                and record["data"]["code"] is None
+            ):
+                raise RuntimeError("event storage unavailable")
+            return append_event(record)
+
+        monkeypatch.setattr(
+            database, "append_bootstrap_campaign_event", fail_final_event
+        )
     retry = client.post(
         "/api/bootstrap/stop",
         json={"campaign_id": campaign_id, "revision": 1},
     )
-    assert retry.status_code == 200, retry.get_json()
-    assert (
-        client.get("/api/bootstrap/status").get_json()["stopped_cancellation"] is None
-    )
+    if final_recorded:
+        assert retry.status_code == 200, retry.get_json()
+        assert (
+            client.get("/api/bootstrap/status").get_json()["stopped_cancellation"]
+            is None
+        )
+    else:
+        assert retry.status_code == 503, retry.get_json()
+        assert retry.get_json()["financial_action_started"] is None
+        status = client.get("/api/bootstrap/status").get_json()
+        assert status["stopped_cancellation"]["financial_action_started"] is None
 
 
+@pytest.mark.parametrize("record_attempt", [True, False])
 def test_stop_transport_failure_reports_committed_revision_and_unknown_effect(
-    isolated_db, bootstrap_api, monkeypatch
+    isolated_db, bootstrap_api, monkeypatch, record_attempt
 ):
     bootstrap, client, _identity = bootstrap_api
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -703,6 +726,10 @@ def test_stop_transport_failure_reports_committed_revision_and_unknown_effect(
         raise RuntimeError("transport failed after cancellation submission")
 
     monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", uncertain)
+    if not record_attempt:
+        monkeypatch.setattr(
+            bootstrap, "_record_campaign_cancel_attempt", lambda *_args, **_kwargs: None
+        )
     response = client.post(
         "/api/bootstrap/stop",
         json={"campaign_id": campaign_id, "revision": 0},

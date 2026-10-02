@@ -35978,22 +35978,27 @@ def list_stopped_bootstrap_campaigns_for_identity(
 
 
 def get_latest_bootstrap_cancel_attempt(campaign_id: str) -> Optional[Dict[str, Any]]:
-    """Read the last durable stop/cancel outcome in insertion order."""
+    """Read the last attempt, falling back to pre-journal stop events."""
 
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
-    row = (
-        get_connection()
-        .execute(
+    connection = get_connection()
+    row = connection.execute(
+        """
+        SELECT event_type, data_json FROM bootstrap_campaign_events
+        WHERE campaign_id=? AND event_type='campaign_cancel_attempt'
+        ORDER BY rowid DESC LIMIT 1
+        """,
+        (safe_id,),
+    ).fetchone()
+    if row is None:
+        row = connection.execute(
             """
             SELECT event_type, data_json FROM bootstrap_campaign_events
-            WHERE campaign_id=? AND event_type IN
-                ('campaign_cancel_attempt', 'campaign_stopped')
+            WHERE campaign_id=? AND event_type='campaign_stopped'
             ORDER BY rowid DESC LIMIT 1
             """,
             (safe_id,),
-        )
-        .fetchone()
-    )
+        ).fetchone()
     if row is None:
         return None
     return {"event_type": row["event_type"], "data": json.loads(row["data_json"])}
