@@ -5,26 +5,25 @@
 **READY** for primary-PC review and merge decision. Do not merge automatically.
 
 The accepted runtime source is commit
-`9080b60695648d36ba398608a6e14c4a3ea0d8ec` on
+`794e3412b16cc837a58cf270f3cc2d4af427f9a1` on
 `codex/fix-bootstrap-cancel-fee-renewal`. Pull request:
 <https://github.com/catalystxch/catalyst-bot/pull/237>.
 
 PR #237 targets `codex/coin-prep-fee-approval` at accepted base
-`364c49f3279f144b786ff0306ce2881be6e5a887`. At the end of acceptance the
-GitHub API reported the PR open, mergeable, and clean, with remote head exactly
-`9080b60695648d36ba398608a6e14c4a3ea0d8ec`.
+`364c49f3279f144b786ff0306ce2881be6e5a887`. The primary PC retains review and
+merge responsibility; this secondary PC did not merge the PR.
 
 ## Build and package identity
 
 - Windows build command: `.venv\Scripts\python.exe build.py`
-- Runtime source commit: `9080b60695648d36ba398608a6e14c4a3ea0d8ec`
+- Runtime source commit: `794e3412b16cc837a58cf270f3cc2d4af427f9a1`
 - `Catalyst.exe` SHA-256:
-  `3E551E8C9B9179B33FE05D73C74D3E8F9CBA80A9C53D89919C16CDDDD2707653`
+  `0A41CAD8508D06938291EF7DD8160D07F58B172E2E348823C70282B629BF6B79`
 - Acceptance ZIP SHA-256:
-  `E60C44322F6F041176B0E76AE6B21B84EB2A5D3C432C74F2060603E614B22228`
-- ZIP size: 35,842,621 bytes
+  `AA5E05B1497EF49C6D94C1FA07C69520123A7086DFE6E6B200F8E878A0A78CB1`
+- ZIP size: 35,844,136 bytes
 - Local ZIP:
-  `evidence/fifth-fix-live/CATalyst-9080b60-secondary-acceptance.zip`
+  `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\acceptance-artifacts\794e341\CATalyst-794e341-secondary-acceptance.zip`
 - The ZIP was extracted to a new directory. The extracted executable had the
   same SHA-256 and passed both packaged smokes.
 - The last wallet-affecting cancellation used the packaged `b28601f` build,
@@ -157,6 +156,21 @@ branch contains these fix commits after accepted base `364c49f`:
 - `b28601f` — cover campaign cancellation recovery's negative fail-closed
   matrix.
 - `9080b60` — formatting-only final gate cleanup.
+- `794e341` — bind cancellation fee recovery approvals to an explicit
+  `cancel_all` or `bootstrap_stop` action, reject pre-marker legacy campaign
+  approvals, and prevent recovery-only consent from entering ordinary Coin Prep
+  dispatch.
+
+The final P1 review found that the previous recovery path inferred
+cancellation-only authority from campaign state and reused the same request
+shape for ordinary preparation and recovery. An approval could therefore be
+ambiguous after restart or policy stop. The fix adds a server-owned immutable
+approval-authority marker, propagates the exact recovery action through quote,
+reserve, recheck and wallet-effect boundaries, rejects mismatched or legacy
+approval scope, and sends users back through the displayed fee-review flow.
+Ordinary campaign consent remains usable only for its original cancellation
+allowance; a policy-materialized recovery requires fresh action-bound consent.
+No additional wallet action or fee was used to verify this P1 fix.
 
 The final user-visible defect was a stale Coin Prep recovery overlay after
 Stop. The fee approval correctly remained approved to preserve the
@@ -169,13 +183,16 @@ mismatch, zero reserve, and zero live offers.
 
 ## Verification commands and exact results
 
-- `.venv\Scripts\python.exe -m pytest -q --basetemp C:\Users\M920q\AppData\Local\Temp\pytest-final-9080b60`
-  — **7,124 passed, 193 skipped, 424 subtests passed**, one known
-  `PytestRemovedIn10Warning`, 1,625.77s.
-- `.venv\Scripts\python.exe -m pytest tests\e2e --e2e -q --basetemp C:\Users\M920q\AppData\Local\Temp\pytest-e2e-final-9080b60`
-  — **192 passed** in 171.03s.
+- `.venv\Scripts\python.exe -m pytest -q --basetemp C:\Users\M920q\AppData\Local\Temp\pytest-p1-final-clean`
+  — **7,133 passed, 199 skipped, 424 subtests passed**, one known
+  `PytestRemovedIn10Warning`, 3,664.31s.
+- `.venv\Scripts\python.exe -m pytest tests\e2e --e2e -q --basetemp C:\Users\M920q\AppData\Local\Temp\pytest-e2e-p1-clean`
+  — **198 passed** in 454.02s.
+- Focused affected backend matrix — **245 passed** in 633.64s.
+- The E2E startup-race regression was made deterministic and passed three
+  consecutive isolated runs before the clean 198-test suite.
 - `.venv\Scripts\python.exe -m ruff check .` — passed.
-- `.venv\Scripts\python.exe -m ruff format --check .` — 554 files already
+- `.venv\Scripts\python.exe -m ruff format --check .` — 555 files already
   formatted.
 - `.venv\Scripts\python.exe -m vulture src/catalyst scripts desktop_app.py build.py scripts/vulture_whitelist.py --min-confidence 90`
   — passed.
@@ -208,5 +225,9 @@ crossed the prior point and finished 100% with exit code 0.
   `evidence/fifth-fix-live/cancel-all-complete-b28601f.png`
 - Original stale-overlay defect screenshot:
   `evidence/fifth-fix-live/stale-coinprep-overlay-blocks-cancel-after-stop-d931414.png`
+- P1 action-bound recovery package:
+  `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\acceptance-artifacts\794e341\CATalyst-794e341-secondary-acceptance.zip`
+- P1 package SHA-256:
+  `AA5E05B1497EF49C6D94C1FA07C69520123A7086DFE6E6B200F8E878A0A78CB1`
 
 No wallet action, offer, fee hold, or unresolved mutation remains active.
