@@ -957,6 +957,62 @@ def test_stopped_campaign_with_live_offers_keeps_cancel_all_accessible(page):
     }
 
 
+@pytest.mark.parametrize(
+    ("held_fee", "unresolved", "approval_campaign", "reserve", "offer_count"),
+    [
+        ("1", 0, "match", "4000000", 1),
+        ("0", 1, "match", "4000000", 1),
+        ("0", 0, "other", "4000000", 1),
+        ("0", 0, "match", "0", 1),
+        ("0", 0, "match", "4000000", 0),
+    ],
+)
+def test_stopped_campaign_cancellation_overlay_remains_fail_closed(
+    page, held_fee, unresolved, approval_campaign, reserve, offer_count
+):
+    _open_gui(page)
+    status = _paused_recovery_status()
+    campaign_id = "e" * 64
+    status["phase"] = "idle"
+    status["fee_approval"].update(
+        {
+            "campaign_id": campaign_id if approval_campaign == "match" else "f" * 64,
+            "state": "approved",
+            "held_fee_mojos": held_fee,
+            "unresolved_operation_count": unresolved,
+            "pending_operation": {"effect_state": "held_before_submission"}
+            if unresolved
+            else None,
+            "cancellation_reserve_mojos": reserve,
+            "stale": False,
+        }
+    )
+
+    modal_open = page.evaluate(
+        """async ({status, campaignId, offerCount}) => {
+            window.apiFetch = async path => {
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            _bootstrapActiveCampaign = {
+                campaign_id: campaignId, revision: 1, status: 'active', stage: 'bootstrap',
+            };
+            bot_state.running = false;
+            bot_state.offers = {
+                buy: [], sell: Array.from({length: offerCount}, (_, index) => ({offer_id: `${index}`})),
+            };
+            document.getElementById('coinPrepConfirmOverlay').classList.remove('active');
+            await pollCoinPrepProgress();
+            return document.getElementById('coinPrepConfirmOverlay').classList.contains('active');
+        }""",
+        {"status": status, "campaignId": campaign_id, "offerCount": offer_count},
+    )
+
+    assert modal_open is True
+
+
 def test_restart_does_not_recover_fee_approval_from_another_bootstrap_campaign(page):
     _open_gui(page)
     status = {
