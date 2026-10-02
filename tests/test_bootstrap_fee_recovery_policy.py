@@ -196,7 +196,10 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
     before = utils._counts()
     app = Flask(__name__)
     app.register_blueprint(coin_prep.bp)
-    response = app.test_client().post("/api/coin-prep/fee-preview", json=options)
+    recovery_options = {**options, "cancellation_recovery": True}
+    response = app.test_client().post(
+        "/api/coin-prep/fee-preview", json=recovery_options
+    )
     payload = response.get_json()
 
     assert utils._counts() == before, (
@@ -223,8 +226,10 @@ def test_overrun_recovery_preview_does_not_require_creation_authority(
         state["campaign_id"], "manual", "2026-09-22T12:01:00.000000Z"
     )
     service = import_module("coin_prep_fee_approval")
-    assert service.preview_coin_prep_fees(options)["available"] is True
-    stopped_preview = app.test_client().post("/api/coin-prep/fee-preview", json=options)
+    assert service.preview_coin_prep_fees(recovery_options)["available"] is True
+    stopped_preview = app.test_client().post(
+        "/api/coin-prep/fee-preview", json=recovery_options
+    )
     assert stopped_preview.status_code == 200, stopped_preview.get_json()
     recovered = runtime.read_approved_prep_fee_snapshot(
         state["approval"]["approval_id"], allow_campaign_fee_recovery=True

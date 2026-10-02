@@ -494,6 +494,7 @@ def estimate_coin_prep_fee_preview(
         )
     result = {
         "available": available,
+        "cancellation_recovery": request_options.get("cancellation_recovery") is True,
         "reason": "network_fee_estimate" if available else "FEE_ESTIMATE_UNAVAILABLE",
         "scope_sha256": contract["scope_sha256"],
         "plan_sha256": contract["plan_sha256"],
@@ -636,6 +637,10 @@ def approve_coin_prep_fees(
     ):
         raise ValueError("FEE_APPROVAL_STALE")
     stored_quote = json.loads(preview["quote_json"])
+    if stored_quote.get("cancellation_recovery") is not (
+        context.get("recovery_only") is True
+    ):
+        raise ValueError("FEE_APPROVAL_STALE")
     if "execution_context" in stored_quote:
         from coin_prep_fee_execution import (
             freeze_execution_context,

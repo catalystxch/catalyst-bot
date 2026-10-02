@@ -37,6 +37,7 @@ def test_explicit_stop_after_policy_stop_can_preview_new_cleanup_consent(
         json={
             "bootstrap_campaign_id": state["campaign_id"],
             "bootstrap_campaign_revision": 2,
+            "cancellation_recovery": True,
         },
     )
     payload = response.get_json()

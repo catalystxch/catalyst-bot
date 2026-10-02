@@ -68,6 +68,11 @@ def bootstrap_api(monkeypatch):
     monkeypatch.setattr(bootstrap, "_read_bootstrap_identity", lambda: dict(identity))
     monkeypatch.setattr(
         bootstrap,
+        "_campaign_cancel_manager",
+        lambda: SimpleNamespace(cancel_offers=lambda *_args, **_kwargs: {}),
+    )
+    monkeypatch.setattr(
+        bootstrap,
         "_utcnow",
         lambda: datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc),
     )
@@ -586,6 +591,68 @@ def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
     assert campaign["status"] == "stopped"
     assert campaign["stage"] == "stopped"
     assert campaign["revision"] == 1
+
+
+def test_stop_manager_unavailable_reports_committed_revision(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(bootstrap, "_campaign_trade_ids", lambda exact_id: ["trade-a"])
+
+    def unavailable(_trade_ids):
+        assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+        raise bootstrap.BootstrapApiError("bootstrap_cancel_manager_unavailable", 409)
+
+    monkeypatch.setattr(bootstrap, "_cancel_campaign_offers", unavailable)
+    response = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    payload = response.get_json()
+
+    assert response.status_code == 409, payload
+    assert payload["stopped"] is True
+    assert payload["campaign_revision"] == 1
+    assert payload["code"] == "bootstrap_cancel_manager_unavailable"
+    assert payload["cancel_targets"] == 1
+    assert database.get_bootstrap_campaign(campaign_id)["revision"] == 1
+
+
+def test_stop_preflight_keeps_campaign_active_when_manager_is_unavailable(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json=_request(
+            preview_digest=preview["preview_digest"],
+            exact_asset_warning_accepted=True,
+        ),
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(bootstrap, "_campaign_trade_ids", lambda _id: ["trade-a"])
+
+    def no_manager():
+        raise bootstrap.BootstrapApiError("bootstrap_cancel_manager_unavailable", 409)
+
+    monkeypatch.setattr(bootstrap, "_campaign_cancel_manager", no_manager)
+    response = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    assert response.status_code == 409
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+    assert database.get_bootstrap_campaign(campaign_id)["revision"] == 0
 
 
 def test_stop_fee_prep_funding_shortfall_enters_approval_recovery(

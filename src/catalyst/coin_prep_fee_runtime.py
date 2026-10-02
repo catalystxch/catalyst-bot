@@ -316,6 +316,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
     )
 
     options = normalize_fee_prep_options(request_options)
+    cancellation_recovery = options.get("cancellation_recovery") is True
     context = read_fee_wallet_snapshot()
     config, identity = context["configuration"], context["identity"]
     from blueprints.coin_prep import _active_bootstrap_coin_prep_context
@@ -354,12 +355,16 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         ):
             raise ValueError("bootstrap_coin_prep_not_authorized:fee_reserve")
         bootstrap = _active_bootstrap_coin_prep_context(options)
+        if cancellation_recovery:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
     except ValueError as exc:
         if (
             str(exc) != "bootstrap_coin_prep_not_authorized:fee_reserve"
             or "bootstrap_campaign_id" not in options
         ):
             raise
+        if not cancellation_recovery:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
         # Creation authority remains stopped after a campaign fee overrun or
         # while its offers still need cleanup, but the operator still needs a
         # truthful cancellation-only recovery quote.
@@ -513,7 +518,20 @@ def read_approved_prep_fee_snapshot(
         raise ValueError("FEE_APPROVAL_STALE")
     if consent["version"] != consent["latest_version"]:
         raise ValueError("FEE_APPROVAL_STALE")
-    binding = json.loads(consent["quote_json"]).get("execution_context")
+    scope = approved["scope"]
+    quote = json.loads(consent["quote_json"])
+    binding = quote.get("execution_context")
+    request_options = json.loads(consent["request_options_json"])
+    recovery_only = request_options.get("cancellation_recovery") is True
+    if (
+        scope["campaign_id"] is not None
+        and type(quote.get("cancellation_recovery")) is not bool
+    ):
+        raise ValueError("FEE_APPROVAL_STALE")
+    if quote.get("cancellation_recovery", False) is not recovery_only:
+        raise ValueError("FEE_APPROVAL_STALE")
+    if recovery_only and not allow_campaign_fee_recovery:
+        raise ValueError("FEE_APPROVAL_STALE")
     if binding is None:
         raise ValueError("FEE_EXECUTION_CONTEXT_REQUIRED")
     recipe = validate_execution_context(binding, approved["scope"], approved["plan"])
@@ -529,7 +547,6 @@ def read_approved_prep_fee_snapshot(
     if not configuration_matches(encode_execution_configuration(_configuration())):
         raise ValueError("FEE_APPROVAL_STALE")
     context = read_fee_wallet_snapshot()
-    scope = approved["scope"]
     if (
         any(context["identity"][key] != scope[key] for key in context["identity"])
         or not configuration_matches(
@@ -619,7 +636,7 @@ def read_approved_prep_fee_snapshot(
         "recipe": recipe,
         "campaign": campaign,
         "scope": scope,
-        "request_options": json.loads(consent["request_options_json"]),
+        "request_options": request_options,
         "approval": approval,
         "dispatch_authorized": False,
     }

@@ -102,6 +102,7 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     options = {
         "bootstrap_campaign_id": state["campaign_id"],
         "bootstrap_campaign_revision": 0,
+        "cancellation_recovery": True,
     }
     assert real_context(options) is None
     with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
@@ -224,6 +225,7 @@ def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
     options = {
         "bootstrap_campaign_id": state["campaign_id"],
         "bootstrap_campaign_revision": 1,
+        "cancellation_recovery": True,
     }
     preview = import_module("coin_prep_fee_approval").preview_coin_prep_fees(options)
     assert preview["available"] is True
@@ -328,11 +330,20 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
 
     app = Flask(__name__)
     app.register_blueprint(coin_prep.bp)
+    ordinary = app.test_client().post(
+        "/api/coin-prep/fee-preview",
+        json={
+            "bootstrap_campaign_id": state["campaign_id"],
+            "bootstrap_campaign_revision": 1,
+        },
+    )
+    assert ordinary.status_code == 409, ordinary.get_json()
     response = app.test_client().post(
         "/api/coin-prep/fee-preview",
         json={
             "bootstrap_campaign_id": state["campaign_id"],
             "bootstrap_campaign_revision": 1,
+            "cancellation_recovery": True,
         },
     )
     payload = response.get_json()
@@ -348,6 +359,10 @@ def test_active_campaign_revision_advance_preserves_cancellation_only_renewal(
         maximum_fee_mojos=int(payload["suggested_maximum_fee_mojos"]),
         cancellation_reserve_mojos=int(payload["minimum_cancellation_reserve_mojos"]),
     )
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
+            approval["approval_id"]
+        )
     recovered = import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
         approval["approval_id"], allow_campaign_fee_recovery=True
     )
@@ -436,7 +451,7 @@ def automatically_stopped_campaign(request, monkeypatch):
     assert restored["stage"] == "stopped"
     assert restored["revision"] == 1
     assert restored["fee_budget_xch"] == "0.01"
-    return {**state, "recovery_options": options}
+    return {**state, "recovery_options": {**options, "cancellation_recovery": True}}
 
 
 def test_automatic_policy_stop_preserves_read_only_recovery_preview(

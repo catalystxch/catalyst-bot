@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from playwright.sync_api import expect
 
@@ -56,6 +58,9 @@ def test_cancel_fee_review_confirmation_does_not_dispatch_coin_prep(page):
     page.wait_for_function("() => !_coinPrepFeeConfirmBusy")
 
     calls = page.evaluate("window.__feeCalls")
+    preview_calls = [call for call in calls if "/coin-prep/fee-preview" in call["path"]]
+    assert len(preview_calls) == 1
+    assert json.loads(preview_calls[0]["body"])["cancellation_recovery"] is True
     approvals = [call for call in calls if "/coin-prep/fee-approval" in call["path"]]
     assert len(approvals) == 1
     assert not [call for call in calls if "/coin-prep/trigger" in call["path"]], (

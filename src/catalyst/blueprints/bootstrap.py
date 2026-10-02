@@ -506,16 +506,21 @@ def _campaign_trade_ids(campaign_id: str) -> list[str]:
     return sorted(trade_ids)
 
 
+def _campaign_cancel_manager():
+    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+    server = owner or sys.modules.get("api_server")
+    manager = getattr(getattr(server, "bot", None), "offer_manager", None)
+    if manager is None or not callable(getattr(manager, "cancel_offers", None)):
+        raise BootstrapApiError("bootstrap_cancel_manager_unavailable", 409)
+    return manager
+
+
 def _cancel_campaign_offers(
     trade_ids: list[str], *, fee_approval_id: str | None = None
 ) -> dict[str, Any]:
     if not trade_ids:
         return {}
-    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
-    server = owner or sys.modules.get("api_server")
-    manager = getattr(getattr(server, "bot", None), "offer_manager", None)
-    if manager is None:
-        raise BootstrapApiError("bootstrap_cancel_manager_unavailable", 409)
+    manager = _campaign_cancel_manager()
     cancel_options = {
         "reason": "bootstrap_manual_stop",
         "force_storm": True,
@@ -558,6 +563,8 @@ def api_bootstrap_stop():
         ):
             raise BootstrapApiError("invalid_fee_approval", 400)
         trade_ids = _campaign_trade_ids(campaign_id)
+        if trade_ids:
+            _campaign_cancel_manager()
         stopped_at = _utcnow()
         was_active = campaign.get("status") == "active"
         # Disable creation before any cancellation attempt. The cancellation
@@ -576,15 +583,17 @@ def api_bootstrap_stop():
                 else _cancel_campaign_offers(trade_ids, fee_approval_id=fee_approval_id)
             )
         except ValueError as exc:
-            reason = str(exc).strip().upper()
+            reason = str(exc).strip()
             recoverable = {
                 "FEE_APPROVAL_STALE",
                 "FEE_BUDGET_APPROVAL_REQUIRED",
                 "FEE_BUDGET_EXCEEDED",
                 "FEE_CAMPAIGN_BUDGET_EXCEEDED",
                 "FEE_PREP_FUNDING_INSUFFICIENT",
+                "BOOTSTRAP_CANCEL_MANAGER_UNAVAILABLE",
+                "BOOTSTRAP_CANCEL_RESULT_INVALID",
             }
-            if reason not in recoverable:
+            if reason.upper() not in recoverable:
                 raise
             if was_active:
                 database.append_bootstrap_campaign_event(

@@ -35945,6 +35945,9 @@ function closeCtgErrorModal() {
                 options.bootstrap_campaign_id = String(campaign.campaign_id);
                 options.bootstrap_campaign_revision = Number(campaign.campaign_revision ?? campaign.revision);
             }
+            if (campaign?.campaign_id && ['cancel_all', 'bootstrap_stop'].includes(String(_coinPrepFeeRecoveryIntent?.action))) {
+                options.cancellation_recovery = true;
+            }
             return options;
         }
 
