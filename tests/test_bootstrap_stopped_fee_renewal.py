@@ -2,6 +2,8 @@
 
 from importlib import import_module
 from datetime import datetime, timezone
+from decimal import Decimal
+import json
 
 from chia_rs import Coin
 from flask import Flask
@@ -124,8 +126,13 @@ def test_stopped_campaign_can_review_cancel_budget_without_prior_overrun(
     assert campaign["fee_budget_xch"] == "0.01"
 
 
-def test_stopped_campaign_cancel_review_does_not_require_locked_offer_principal(
-    request, monkeypatch
+@pytest.mark.parametrize(
+    "restored_session_mode",
+    [False, True],
+    ids=["original-settings", "restored-buy-only-settings"],
+)
+def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
+    request, monkeypatch, restored_session_mode
 ):
     """Live offer roots are unavailable to prep but must not block cancel cover."""
 
@@ -173,6 +180,32 @@ def test_stopped_campaign_cancel_review_does_not_require_locked_offer_principal(
     assert database.stop_bootstrap_campaign(
         state["campaign_id"], "manual", "2026-09-22T12:01:00.000000Z"
     )
+    if restored_session_mode:
+        runtime = import_module("coin_prep_fee_runtime")
+        cfg = runtime.cfg
+        monkeypatch.setattr(cfg, "LIQUIDITY_MODE", "buy_only")
+        monkeypatch.setattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0)
+        for tier in ("INNER", "MID", "OUTER", "EXTREME"):
+            monkeypatch.setattr(cfg, f"SELL_{tier}_SIZE_XCH", Decimal("0"))
+            monkeypatch.setattr(cfg, f"SELL_{tier}_TIER_COUNT", 0)
+            monkeypatch.setattr(cfg, f"SELL_{tier}_TIER_SPARE_COUNT", 0)
+            monkeypatch.setattr(cfg, f"{tier}_SIZE_XCH", Decimal("0"))
+            monkeypatch.setattr(
+                cfg,
+                f"BUY_{tier}_TIER_SPARE_COUNT",
+                getattr(cfg, f"BUY_{tier}_TIER_SPARE_COUNT") + 1,
+            )
+        execution = import_module("coin_prep_fee_execution")
+        approval_id = database.get_latest_coin_prep_fee_approval_for_campaign(
+            state["campaign_id"]
+        )
+        consent = database.get_coin_prep_fee_approval_context(approval_id)
+        binding = json.loads(consent["quote_json"])["execution_context"]
+        current_config = runtime._configuration()
+        assert current_config["LIQUIDITY_MODE"] == "buy_only"
+        assert binding["configuration"] != execution.encode_execution_configuration(
+            current_config
+        )
 
     # Model the real post-publication wallet: the 0.1 XCH replacement root is
     # locked in the live offer, while a small selectable XCH fee root remains.
@@ -188,12 +221,15 @@ def test_stopped_campaign_cancel_review_does_not_require_locked_offer_principal(
 
     app = Flask(__name__)
     app.register_blueprint(coin_prep.bp)
+    options = {
+        "bootstrap_campaign_id": state["campaign_id"],
+        "bootstrap_campaign_revision": 1,
+    }
+    preview = import_module("coin_prep_fee_approval").preview_coin_prep_fees(options)
+    assert preview["available"] is True
     response = app.test_client().post(
         "/api/coin-prep/fee-preview",
-        json={
-            "bootstrap_campaign_id": state["campaign_id"],
-            "bootstrap_campaign_revision": 1,
-        },
+        json=options,
     )
     payload = response.get_json()
 
@@ -205,6 +241,16 @@ def test_stopped_campaign_cancel_review_does_not_require_locked_offer_principal(
     assert int(payload["estimated_cancellation_fee_mojos"]) > 0
     assert all(stage["cancellation"] is True for stage in payload["stages"])
     assert payload["dispatch_authorized"] is False
+    approval = import_module("coin_prep_fee_approval").approve_coin_prep_fees(
+        preview_id=payload["preview_id"],
+        maximum_fee_mojos=int(payload["suggested_maximum_fee_mojos"]),
+        cancellation_reserve_mojos=int(payload["minimum_cancellation_reserve_mojos"]),
+    )
+    recovered = import_module("coin_prep_fee_runtime").read_approved_prep_fee_snapshot(
+        approval["approval_id"], allow_campaign_fee_recovery=True
+    )
+    assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
+    assert approval["dispatch_authorized"] is False
 
 
 @pytest.fixture

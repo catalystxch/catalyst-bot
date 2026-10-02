@@ -648,7 +648,7 @@ def approve_coin_prep_fees(
             raise ValueError("FEE_APPROVAL_STALE")
     funding = prepare_fee_inventory(
         context["snapshot"],
-        context["recipe"]["targets"],
+        () if context.get("recovery_only") is True else context["recipe"]["targets"],
         current["plan"]["reserve_floors_mojos"],
     )
     result = database.approve_coin_prep_fee_preview(

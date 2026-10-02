@@ -325,6 +325,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
     validate_fee_pool_configuration(config)
     fee_pool = get_fee_pool_plan()
     recovery_recipe = None
+    recovery_execution_context = None
     try:
         stopped = (
             database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
@@ -374,6 +375,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         plan = json.loads(consent["plan_json"])
         binding = json.loads(consent["quote_json"]).get("execution_context")
         from coin_prep_fee_execution import (
+            cancellation_recovery_configuration_matches,
             encode_execution_configuration,
             validate_execution_context,
         )
@@ -393,11 +395,22 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             or options["target_seconds"] != plan.get("target_seconds")
             or any(identity.get(key) != scope.get(key) for key in identity)
             or binding is None
-            or binding.get("configuration") != encode_execution_configuration(config)
+            or type(binding.get("configuration")) is not dict
+            or not cancellation_recovery_configuration_matches(
+                encode_execution_configuration(config), binding.get("configuration")
+            )
             or binding.get("receive_address") != context["receive_address"]
         ):
             raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+        # A stopped campaign can be recovered after startup/session projection
+        # has changed ordinary trading settings (for example, two-sided to
+        # buy-only).  Cancellation-only renewal reuses the validated frozen
+        # recipe and creates a fresh approval bound to the current wallet
+        # snapshot, so old-vs-current trading configuration equality is not an
+        # authority boundary here. Identity and receive-address equality above
+        # remain mandatory.
         recovery_recipe = validate_execution_context(binding, scope, plan)
+        recovery_execution_context = binding
         campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
         if type(campaign) is not dict or campaign.get("status") not in {
             "active",
@@ -463,6 +476,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         "recovery_only": bool(
             type(bootstrap) is dict and bootstrap.get("recovery_only") is True
         ),
+        "recovery_execution_context": recovery_execution_context,
         "request_options": options,
         "fee_pool": fee_pool,
         "dispatch_authorized": False,
@@ -483,6 +497,7 @@ def read_approved_prep_fee_snapshot(
     """
     from coin_prep_fee_approval import canonical_fee_contract, validate_fee_consent
     from coin_prep_fee_execution import (
+        cancellation_recovery_configuration_matches,
         encode_execution_configuration,
         validate_execution_context,
     )
@@ -502,14 +517,24 @@ def read_approved_prep_fee_snapshot(
     if binding is None:
         raise ValueError("FEE_EXECUTION_CONTEXT_REQUIRED")
     recipe = validate_execution_context(binding, approved["scope"], approved["plan"])
-    if encode_execution_configuration(_configuration()) != binding["configuration"]:
+
+    def configuration_matches(encoded):
+        return encoded == binding["configuration"] or (
+            allow_campaign_fee_recovery
+            and cancellation_recovery_configuration_matches(
+                encoded, binding["configuration"]
+            )
+        )
+
+    if not configuration_matches(encode_execution_configuration(_configuration())):
         raise ValueError("FEE_APPROVAL_STALE")
     context = read_fee_wallet_snapshot()
     scope = approved["scope"]
     if (
         any(context["identity"][key] != scope[key] for key in context["identity"])
-        or encode_execution_configuration(context["configuration"])
-        != binding["configuration"]
+        or not configuration_matches(
+            encode_execution_configuration(context["configuration"])
+        )
         or context["receive_address"] != binding["receive_address"]
     ):
         raise ValueError("FEE_APPROVAL_STALE")
@@ -576,7 +601,7 @@ def read_approved_prep_fee_snapshot(
     approval = validate_fee_consent(
         approval_id=approval_id, scope=scope, economic_plan=approved["plan"]
     )
-    if encode_execution_configuration(_configuration()) != binding["configuration"]:
+    if not configuration_matches(encode_execution_configuration(_configuration())):
         raise ValueError("FEE_APPROVAL_STALE")
     return {
         **context,

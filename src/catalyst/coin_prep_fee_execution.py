@@ -11,6 +11,26 @@ from coin_prep_economics import build_exact_prep_economics
 from sage_offer_wire import decode_wallet_puzzle_hash
 
 
+_CANCELLATION_RECOVERY_DRIFT_KEYS = {
+    "LIQUIDITY_MODE",
+    "MAX_ACTIVE_BUY_OFFERS",
+    "MAX_ACTIVE_SELL_OFFERS",
+    "INNER_SIZE_XCH",
+    "MID_SIZE_XCH",
+    "OUTER_SIZE_XCH",
+    "EXTREME_SIZE_XCH",
+} | {
+    key
+    for side in ("BUY", "SELL")
+    for tier in ("INNER", "MID", "OUTER", "EXTREME")
+    for key in (
+        f"{side}_{tier}_SIZE_XCH",
+        f"{side}_{tier}_TIER_COUNT",
+        f"{side}_{tier}_TIER_SPARE_COUNT",
+    )
+}
+
+
 def _configuration_keys():
     from coin_prep_fee_runtime import _CONTEXT_KEYS
 
@@ -81,6 +101,16 @@ def _decode_configuration(encoded):
     return configuration
 
 
+def cancellation_recovery_configuration_matches(current, frozen):
+    """Allow only restored ladder projection drift for cancellation recovery."""
+    current_values = _decode_configuration(current)
+    frozen_values = _decode_configuration(frozen)
+    return all(
+        current_values[key] == frozen_values[key]
+        for key in _configuration_keys() - _CANCELLATION_RECOVERY_DRIFT_KEYS
+    )
+
+
 def validate_execution_context(binding, identity, economic_plan):
     """Reconstruct exact prepared targets and refuse resizing CLI overrides."""
     if (
@@ -133,16 +163,25 @@ def validate_execution_context(binding, identity, economic_plan):
 
 def freeze_execution_context(context):
     """Persist trusted collector settings, not executable bundles or coin IDs."""
+    plan = context["recipe"]["economic_plan"]
+    canonical_plan = {
+        **plan,
+        "outputs": sorted(plan["outputs"], key=lambda t: (t["asset"], t["ordinal"])),
+    }
+    if context.get("recovery_only") is True:
+        # Cancellation-only recovery must retain the already validated campaign
+        # binding.  Combining its frozen plan with ordinary settings projected
+        # by a restored session creates an impossible hybrid context.
+        binding = context.get("recovery_execution_context")
+        validate_execution_context(binding, context["identity"], canonical_plan)
+        if binding["receive_address"] != context["receive_address"]:
+            raise ValueError("FEE_EXECUTION_CONTEXT_INVALID")
+        return binding
     binding = {
         "version": 1,
         "configuration": encode_execution_configuration(context["configuration"]),
         "receive_address": context["receive_address"],
         "worker_args": dict(context["recipe"]["worker_args"]),
-    }
-    plan = context["recipe"]["economic_plan"]
-    canonical_plan = {
-        **plan,
-        "outputs": sorted(plan["outputs"], key=lambda t: (t["asset"], t["ordinal"])),
     }
     validate_execution_context(binding, context["identity"], canonical_plan)
     return binding
