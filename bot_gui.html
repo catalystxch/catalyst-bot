@@ -18802,7 +18802,9 @@
                     showCoinPrepView('progress');
                     const modal = document.getElementById('coinPrepConfirmOverlay');
                     if (modal) {
-                        modal.classList.toggle('active', !(bot_state && bot_state.running));
+                        modal.classList.toggle('active',
+                            !(bot_state && bot_state.running)
+                            && !isProtectedCampaignCancellationReady(status));
                     }
                     const title = document.getElementById('cpProgressTitle');
                     if (title) title.textContent = status.fee_resume_required
@@ -35777,6 +35779,32 @@ function closeCtgErrorModal() {
         let _coinPrepRecoveryReviewBusy = false;
         let _coinPrepFeeRecoveryIntent = null;
 
+        function isProtectedCampaignCancellationReady(status) {
+            const campaign = _bootstrapActiveCampaign;
+            const accounting = status?.fee_approval;
+            if (!campaign?.campaign_id || !accounting || accounting.stale !== false) return false;
+            const approvalCampaignId = String(accounting.campaign_id
+                || accounting.request_options?.bootstrap_campaign_id || '');
+            if (approvalCampaignId !== String(campaign.campaign_id)) return false;
+            if (!['approved', 'paused_budget'].includes(String(accounting.state || ''))) return false;
+            if (Number(accounting.unresolved_operation_count) !== 0
+                    || String(accounting.held_fee_mojos ?? '') !== '0'
+                    || accounting.pending_operation) return false;
+            let cancellationReserve;
+            try {
+                cancellationReserve = BigInt(String(accounting.cancellation_reserve_mojos ?? ''));
+            } catch (_) {
+                return false;
+            }
+            if (cancellationReserve <= 0n) return false;
+            const offers = bot_state?.offers || {};
+            const buyCount = Array.isArray(offers.buy)
+                ? offers.buy.length : Number(offers.buy_count || 0);
+            const sellCount = Array.isArray(offers.sell)
+                ? offers.sell.length : Number(offers.sell_count || 0);
+            return buyCount + sellCount > 0;
+        }
+
         function updateCoinPrepRecoveryControls(status) {
             _coinPrepRecoveryStatus = status;
             const accounting = status?.fee_approval;
@@ -36695,11 +36723,13 @@ function closeCtgErrorModal() {
                 if (recovery.recovering) {
                     const modal = document.getElementById('coinPrepConfirmOverlay');
                     const botRunning = !!(bot_state && bot_state.running);
-                    if (modal) modal.classList.toggle('active', !botRunning);
+                    const cancellationReady = isProtectedCampaignCancellationReady(status);
+                    if (modal) modal.classList.toggle('active', !botRunning && !cancellationReady);
                     // A restored fee approval still blocks new Coin Prep, but it
-                    // must not cover an already-running trading session. Keep
-                    // polling so the review returns automatically after Stop.
-                    if (botRunning) return;
+                    // must not cover an already-running trading session or the
+                    // protected Cancel All path for that campaign's live offers.
+                    // Keep polling so unresolved evidence remains fail-closed.
+                    if (botRunning || cancellationReady) return;
                     const title = document.getElementById('cpProgressTitle');
                     if (title) title.textContent = 'Coin Prep Paused Safely';
                     setCoinPrepFeeText('cpProgressPhase', coinPrepFeeStateMessage(status.fee_approval?.state));

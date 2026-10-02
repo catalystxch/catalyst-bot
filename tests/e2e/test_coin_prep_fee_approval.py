@@ -901,6 +901,62 @@ def test_running_session_keeps_fee_recovery_modal_hidden_until_bot_stops(page):
     expect(page.locator("#cpProgressTitle")).to_have_text("Coin Prep Paused Safely")
 
 
+def test_stopped_campaign_with_live_offers_keeps_cancel_all_accessible(page):
+    _open_gui(page)
+    status = _paused_recovery_status()
+    campaign_id = "e" * 64
+    status["phase"] = "idle"
+    status["fee_approval"].update(
+        {
+            "campaign_id": campaign_id,
+            "state": "approved",
+            "held_fee_mojos": "0",
+            "unresolved_operation_count": 0,
+            "pending_operation": None,
+            "cancellation_reserve_mojos": "4000000",
+            "stale": False,
+        }
+    )
+
+    result = page.evaluate(
+        """async ({status, campaignId}) => {
+            window.apiFetch = async path => {
+                if (!String(path).includes('/coin-prep/status')) {
+                    throw new Error(`Unexpected request: ${path}`);
+                }
+                return new Response(JSON.stringify(status), {status: 200});
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'none';
+            _bootstrapActiveCampaign = {
+                campaign_id: campaignId, revision: 1, status: 'active', stage: 'bootstrap',
+            };
+            bot_state.running = true;
+            bot_state.offers = {buy: [], sell: [{offer_id: 'offer-1'}]};
+            const restored = await restoreCoinPrepReadiness();
+            bot_state.running = false;
+            await pollCoinPrepProgress();
+            if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+            coinPrepPollInterval = null;
+            const overlay = document.getElementById('coinPrepConfirmOverlay');
+            return {
+                restored,
+                modalOpen: overlay.classList.contains('active'),
+                recoveryBlocking: _coinPrepFeeRecoveryBlocking,
+                liveOffers: bot_state.offers.buy.length + bot_state.offers.sell.length,
+            };
+        }""",
+        {"status": status, "campaignId": campaign_id},
+    )
+
+    assert result == {
+        "restored": True,
+        "modalOpen": False,
+        "recoveryBlocking": True,
+        "liveOffers": 1,
+    }
+
+
 def test_restart_does_not_recover_fee_approval_from_another_bootstrap_campaign(page):
     _open_gui(page)
     status = {
