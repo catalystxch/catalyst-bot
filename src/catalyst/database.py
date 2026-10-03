@@ -8346,6 +8346,20 @@ def _stability_wall_clock() -> str:
     return _stability_timestamp(datetime.now(timezone.utc), "wall clock")
 
 
+def _post_lock_lease_expiry(requested_at: str, expiry: str, safety_at: str) -> str:
+    """Preserve a requested lease duration after waiting for the write lock."""
+
+    if expiry <= safety_at:
+        raise ValueError("lease_expires_at must be later than post-lock wall clock")
+    duration = _parse_iso_timestamp(
+        expiry, "lease_expires_at", require_timezone=True
+    ) - _parse_iso_timestamp(requested_at, "lease timestamp", require_timezone=True)
+    locked_at = _parse_iso_timestamp(
+        safety_at, "post-lock wall clock", require_timezone=True
+    )
+    return _stability_timestamp(locked_at + duration, "lease_expires_at")
+
+
 def _get_reconcile_tier_sizes_mojos(wallet_type: str) -> Dict[str, int]:
     """Build tier sizes for reconcile-time auto-designation.
 
@@ -32477,8 +32491,7 @@ def acquire_runtime_mutation_lease(
         if not can_acquire:
             conn.commit()
             return {"acquired": False, "reason": "not_available", "lease": current}
-        if expiry <= safety_at:
-            raise ValueError("lease_expires_at must be later than post-lock wall clock")
+        effective_expiry = _post_lock_lease_expiry(at, expiry, safety_at)
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -32497,7 +32510,7 @@ def acquire_runtime_mutation_lease(
                 owner,
                 safety_at,
                 safety_at,
-                expiry,
+                effective_expiry,
                 safety_at,
                 version,
             ),
@@ -32584,8 +32597,7 @@ def heartbeat_runtime_mutation_lease(
                 "reason": "new_expiry_not_monotonic",
                 "lease": current,
             }
-        if expiry <= safety_at:
-            raise ValueError("lease_expires_at must be later than post-lock wall clock")
+        effective_expiry = _post_lock_lease_expiry(at, expiry, safety_at)
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -32593,7 +32605,7 @@ def heartbeat_runtime_mutation_lease(
             WHERE singleton_id=1 AND active=1 AND owner_run_id=?
               AND lease_version=? AND expires_at>?
             """,
-            (safety_at, expiry, safety_at, owner, version, safety_at),
+            (safety_at, effective_expiry, safety_at, owner, version, safety_at),
         )
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"

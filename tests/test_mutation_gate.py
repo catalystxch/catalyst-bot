@@ -831,6 +831,73 @@ def test_expired_heartbeat_cannot_resurrect_lease(isolated_gate_database):
         gate.require_allowed("offer.create")
 
 
+def test_heartbeat_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is True
+    lease = result["lease"]
+    heartbeat_at = datetime.fromisoformat(lease["heartbeat_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert heartbeat_at == post_lock
+    assert expires_at - heartbeat_at == timedelta(seconds=30)
+
+
+def test_acquire_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    gate = _gate(clock)
+
+    result = gate.acquire()
+
+    assert result["acquired"] is True
+    lease = result["lease"]
+    acquired_at = datetime.fromisoformat(lease["acquired_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert acquired_at == post_lock
+    assert expires_at - acquired_at == timedelta(seconds=30)
+
+
+def test_heartbeat_lock_wait_cannot_extend_already_expired_lease(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=21)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is False
+    assert result["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
 def test_concurrent_require_observes_process_fence_after_release(
     isolated_gate_database, monkeypatch
 ):
