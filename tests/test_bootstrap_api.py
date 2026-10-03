@@ -723,7 +723,9 @@ def test_stop_does_not_claim_clearance_for_unknown_creation_without_trade_id(
     assert stopped.get_json()["success"] is False
     assert stopped.get_json()["code"] == "bootstrap_cancel_outcome_unknown"
     assert stopped.get_json()["stopped"] is True
-    retry = client.get("/api/bootstrap/status").get_json()["stopped_cancellation"]
+    stopped_status = client.get("/api/bootstrap/status").get_json()
+    assert stopped_status["needs_attention"] is True
+    retry = stopped_status["stopped_cancellation"]
     assert retry["code"] == "bootstrap_cancel_outcome_unknown"
     assert retry["cancel_targets"] == 0
     assert retry["unresolved_creation_count"] == 1

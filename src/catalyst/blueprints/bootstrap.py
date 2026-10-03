@@ -494,6 +494,7 @@ def api_bootstrap_status():
             identity["network"],
         )
         campaign_view = _status_campaign_view(active)
+        stopped_cancellation = _stopped_cancellation_status(identity)
         return jsonify(
             _json_safe(
                 {
@@ -501,12 +502,15 @@ def api_bootstrap_status():
                     "identity": identity,
                     "active": active is not None,
                     "campaign": campaign_view,
-                    "stopped_cancellation": _stopped_cancellation_status(identity),
+                    "stopped_cancellation": stopped_cancellation,
                     "needs_attention": bool(
-                        campaign_view is not None
-                        and (
-                            campaign_view["expired"]
-                            or campaign_view["unresolved_creation_count"]
+                        stopped_cancellation is not None
+                        or (
+                            campaign_view is not None
+                            and (
+                                campaign_view["expired"]
+                                or campaign_view["unresolved_creation_count"]
+                            )
                         )
                     ),
                 }
