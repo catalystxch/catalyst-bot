@@ -35,6 +35,14 @@ ZIP and installer returned zero matching detections. Independent HTTP
 downloads of the immutable ZIP and installer matched the hashes above.
 These were isolated checks with no original profile or wallet effect.
 
+A separate same-version update sequence used another unique AppId and QA
+directory: exact `f937a0c` installed, upgraded to `f97efd7`, rolled back to
+`f937a0c`, and restored to `f97efd7`. After each completed installer log,
+the installed EXE hash matched the expected source package. The restored
+`f97efd7` passed packaged API smoke. Final uninstall reported success and
+left neither the QA directory nor its uninstall registry key. The sequence
+did not open the original profile or contact the live wallet.
+
 ## Open live gates
 
 The exact `f97efd7` EXE has not run against the original TEST 7 profile.
