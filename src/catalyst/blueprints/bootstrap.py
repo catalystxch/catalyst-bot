@@ -937,7 +937,19 @@ def api_bootstrap_renew():
             raise BootstrapApiError("bootstrap_campaign_not_found", 404)
         if prior.get("status") != "stopped":
             raise BootstrapApiError("bootstrap_renew_requires_stopped_campaign", 409)
-        created = _create_reviewed_campaign(body, _read_bootstrap_identity())
+        identity = _read_bootstrap_identity()
+        if any(
+            prior[key] != identity[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        ):
+            raise BootstrapApiError("bootstrap_identity_mismatch", 409)
+        created = _create_reviewed_campaign(body, identity)
         return jsonify(
             _json_safe(
                 {

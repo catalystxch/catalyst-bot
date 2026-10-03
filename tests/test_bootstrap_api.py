@@ -865,6 +865,75 @@ def test_submitted_prior_cancellation_blocks_start_and_renew_until_terminal(
 
 
 @pytest.mark.parametrize(
+    "identity_field, changed_value",
+    [
+        ("wallet_fingerprint", 123456789),
+        ("wallet_id", 3),
+        ("asset_id", OTHER_ASSET_ID),
+        ("network", "testnet"),
+    ],
+)
+def test_renew_rejects_stopped_campaign_from_another_wallet(
+    isolated_db, bootstrap_api, identity_field, changed_value
+):
+    _bootstrap, client, identity = bootstrap_api
+    prior_id = _start_campaign(client)
+    stopped = client.post(
+        "/api/bootstrap/stop", json={"campaign_id": prior_id, "revision": 0}
+    )
+    assert stopped.status_code == 200
+
+    identity[identity_field] = changed_value
+    request = _request(asset_id=identity["asset_id"], expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    response = client.post(
+        "/api/bootstrap/renew",
+        json={
+            **request,
+            "prior_campaign_id": prior_id,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "bootstrap_identity_mismatch"
+    assert (
+        database.get_active_bootstrap_campaign(
+            identity["asset_id"],
+            identity["wallet_fingerprint"],
+            identity["network"],
+        )
+        is None
+    )
+
+
+def test_renew_accepts_stopped_campaign_for_same_wallet(isolated_db, bootstrap_api):
+    _bootstrap, client, _identity = bootstrap_api
+    prior_id = _start_campaign(client)
+    assert (
+        client.post(
+            "/api/bootstrap/stop", json={"campaign_id": prior_id, "revision": 0}
+        ).status_code
+        == 200
+    )
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    response = client.post(
+        "/api/bootstrap/renew",
+        json={
+            **request,
+            "prior_campaign_id": prior_id,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["prior_campaign_id"] == prior_id
+
+
+@pytest.mark.parametrize(
     "reason, expected",
     [
         ("FEE_APPROVAL_STALE", "FEE_APPROVAL_STALE"),
