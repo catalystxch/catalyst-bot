@@ -269,6 +269,30 @@ def test_stopped_campaign_retry_rehydrates_after_page_reload(page):
     ]
 
 
+def test_submitted_unconfirmed_stop_keeps_campaign_controls_locked(page):
+    _open_gui(page)
+    page.evaluate(
+        """() => _bootstrapRenderStatus({
+            success: true,
+            active: false,
+            campaign: null,
+            needs_attention: true,
+            stopped_cancellation: {
+                campaign_id: 'e'.repeat(64),
+                revision: 1,
+                financial_action_started: true,
+                cancel_targets: 1,
+                code: 'bootstrap_cancel_outcome_unknown',
+            },
+        })"""
+    )
+    expect(page.locator("#bootstrapPreviewBtn")).to_be_disabled()
+    expect(page.locator("#bootstrapStartBtn")).to_be_disabled()
+    expect(page.locator("#bootstrapDashboardStatus")).to_contain_text(
+        "cancellation outcome unresolved"
+    )
+
+
 def test_active_stop_and_older_stopped_retry_remain_separately_available(page):
     _open_gui(page)
     active_id, stopped_id = "a" * 64, "b" * 64

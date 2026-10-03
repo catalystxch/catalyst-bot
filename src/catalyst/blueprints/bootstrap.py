@@ -365,9 +365,11 @@ def _create_reviewed_campaign(
         if (
             prior["wallet_type"] == identity["wallet_type"]
             and prior["wallet_id"] == identity["wallet_id"]
-            and _campaign_unresolved_creation_count(prior["campaign_id"])
         ):
-            raise BootstrapApiError("bootstrap_prior_creation_unresolved", 409)
+            if _campaign_unresolved_creation_count(prior["campaign_id"]):
+                raise BootstrapApiError("bootstrap_prior_creation_unresolved", 409)
+            if _campaign_trade_ids(prior["campaign_id"]):
+                raise BootstrapApiError("bootstrap_prior_cancel_unconfirmed", 409)
     campaign_id = database.create_bootstrap_campaign(
         preview["campaign_object"].to_record()
     )
@@ -456,7 +458,14 @@ def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | N
         data = attempt["data"]
         code = data.get("code") or data.get("cancel_error")
         if not code:
-            continue
+            return {
+                "campaign_id": campaign["campaign_id"],
+                "revision": campaign["revision"],
+                "code": "bootstrap_cancel_outcome_unknown",
+                "financial_action_started": data.get("financial_action_started"),
+                "cancel_targets": len(trade_ids),
+                "unresolved_creation_count": unresolved_count,
+            }
         financial_action_started = data.get("financial_action_started")
         if attempt["event_type"] == "campaign_stopped":
             known_no_effect = {

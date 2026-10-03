@@ -805,6 +805,65 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
 
 
+def test_submitted_prior_cancellation_blocks_start_and_renew_until_terminal(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    pending = True
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: ["trade-a"] if exact_id == campaign_id and pending else [],
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_cancel_campaign_offers",
+        lambda _trade_ids: {"trade-a": {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}},
+    )
+    stopped = client.post(
+        "/api/bootstrap/stop", json={"campaign_id": campaign_id, "revision": 0}
+    )
+    assert stopped.status_code == 200
+    assert stopped.get_json()["cancel_results"]["trade-a"]["outcome"] == (
+        "CANCEL_SUBMITTED_UNCONFIRMED"
+    )
+
+    status = client.get("/api/bootstrap/status").get_json()
+    assert status["needs_attention"] is True
+    assert status["stopped_cancellation"]["campaign_id"] == campaign_id
+    assert status["stopped_cancellation"]["cancel_targets"] == 1
+
+    next_preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    confirmed = {
+        **request,
+        "preview_digest": next_preview["preview_digest"],
+        "exact_asset_warning_accepted": True,
+    }
+    for path, body in (
+        ("/api/bootstrap/start", confirmed),
+        ("/api/bootstrap/renew", {**confirmed, "prior_campaign_id": campaign_id}),
+    ):
+        response = client.post(path, json=body)
+        assert response.status_code == 409
+        assert response.get_json()["code"] == "bootstrap_prior_cancel_unconfirmed"
+
+    pending = False  # Authoritative reconciliation made the intent terminal.
+    assert (
+        client.get("/api/bootstrap/status").get_json()["stopped_cancellation"] is None
+    )
+    assert client.post("/api/bootstrap/start", json=confirmed).status_code == 200
+
+
 @pytest.mark.parametrize(
     "reason, expected",
     [
@@ -963,9 +1022,10 @@ def test_stop_manager_unavailable_still_freezes_creation_authority(
     )
     if final_recorded:
         assert retry.status_code == 200, retry.get_json()
-        assert (
-            client.get("/api/bootstrap/status").get_json()["stopped_cancellation"]
-            is None
+        status = client.get("/api/bootstrap/status").get_json()
+        assert status["needs_attention"] is True
+        assert status["stopped_cancellation"]["code"] == (
+            "bootstrap_cancel_outcome_unknown"
         )
     else:
         assert retry.status_code == 503, retry.get_json()
