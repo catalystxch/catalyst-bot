@@ -39812,8 +39812,12 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const unresolvedCreationCount = Number(_bootstrapActiveCampaign?.unresolved_creation_count || 0);
+    const hasUnresolvedCreation = Number.isSafeInteger(unresolvedCreationCount)
+        && unresolvedCreationCount > 0;
     const noActiveCampaignOffers = _bootstrapActiveCampaign?.open_offer_count != null
-        && Number(_bootstrapActiveCampaign.open_offer_count) === 0;
+        && Number(_bootstrapActiveCampaign.open_offer_count) === 0
+        && !hasUnresolvedCreation;
     if (Object.prototype.hasOwnProperty.call(payload || {}, 'stopped_cancellation')) {
         const stopped = payload.stopped_cancellation;
         const exact = /^[0-9a-f]{64}$/.test(String(stopped?.campaign_id || ''))
@@ -39868,7 +39872,9 @@ function _bootstrapRenderStatus(payload) {
             ? campaign.adverse_fill_times.length
             : 0;
         const cancelRequired = campaign.cancel_required === true || campaign.expired === true;
-        if (cancelRequired) {
+        if (hasUnresolvedCreation) {
+            summary = `Bootstrap unresolved offer creation — verify Sage before restart or renewal · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+        } else if (cancelRequired) {
             const rawCount = Number(campaign.open_offer_count || 0);
             const openCount = Number.isFinite(rawCount) && rawCount > 0
                 ? Math.floor(rawCount) : 0;
@@ -39898,7 +39904,9 @@ function _bootstrapRenderStatus(payload) {
         dashboardStatus.style.display = 'block';
         dashboardStatus.textContent = _bootstrapActiveCampaign
             ? summary + (
-                _bootstrapActiveCampaign.cancel_required === true || _bootstrapActiveCampaign.expired === true
+                hasUnresolvedCreation
+                    ? ` · unresolved offer creation; verify Sage before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
+                    : _bootstrapActiveCampaign.cancel_required === true || _bootstrapActiveCampaign.expired === true
                     ? ` · ${noActiveCampaignOffers ? 'stop campaign' : 'requires cancellation'} before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
                     : ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
             )
@@ -39910,7 +39918,8 @@ function _bootstrapRenderStatus(payload) {
         stop.disabled = !_bootstrapActiveCampaign && !_bootstrapPendingStopRetry;
         stop.textContent = !_bootstrapActiveCampaign && _bootstrapPendingStopRetry
             ? 'Retry Campaign Cancellation'
-            : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
+            : hasUnresolvedCreation ? 'Stop & Review Campaign'
+                : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
     }
     if (stoppedRetry) {
         const separateRetry = !!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry;
@@ -40037,18 +40046,26 @@ async function bootstrapStopCampaign(target = 'active') {
     const observedOpenOfferCount = !retrying && campaign.open_offer_count != null
         && Number.isSafeInteger(displayedCount) && displayedCount >= 0
         ? displayedCount : undefined;
+    const unresolvedCreationCount = Number(campaign.unresolved_creation_count || 0);
+    const hasUnresolvedCreation = !retrying
+        && Number.isSafeInteger(unresolvedCreationCount)
+        && unresolvedCreationCount > 0;
     const noCampaignOffers = !retrying && campaign.open_offer_count != null
-        && Number(campaign.open_offer_count) === 0;
+        && Number(campaign.open_offer_count) === 0 && !hasUnresolvedCreation;
     try {
         const approved = await showStyledConfirm({
             icon: '⏹',
             title: retrying ? 'Retry campaign cancellation?' : 'Stop Bootstrap campaign?',
             message: retrying
                 ? 'The campaign is already stopped. Retry cancellation only for offers owned by this exact campaign after checking the wallet service is available.'
+                : hasUnresolvedCreation
+                    ? 'This stops the exact active campaign. At least one offer creation has an unknown wallet outcome. CATalyst will not submit cancellation until Sage and the operation journal are reconciled.'
                 : noCampaignOffers
                     ? 'This stops the exact active campaign. There are no campaign-owned offers to cancel. History and unrelated offers remain untouched.'
                 : 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
-            confirmText: retrying ? 'Retry cancellation' : noCampaignOffers ? 'Stop campaign' : 'Stop and cancel',
+            confirmText: retrying ? 'Retry cancellation'
+                : hasUnresolvedCreation ? 'Stop and review'
+                    : noCampaignOffers ? 'Stop campaign' : 'Stop and cancel',
             cancelText: 'Keep running',
             style: 'warning'
         });

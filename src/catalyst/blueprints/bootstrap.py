@@ -359,6 +359,15 @@ def _create_reviewed_campaign(
 ) -> dict[str, Any]:
     preview = _derive_preview(body, identity)
     _require_review_confirmation(body, preview)
+    for prior in database.list_stopped_bootstrap_campaigns_for_identity(
+        identity["asset_id"], identity["wallet_fingerprint"], identity["network"]
+    ):
+        if (
+            prior["wallet_type"] == identity["wallet_type"]
+            and prior["wallet_id"] == identity["wallet_id"]
+            and _campaign_unresolved_creation_count(prior["campaign_id"])
+        ):
+            raise BootstrapApiError("bootstrap_prior_creation_unresolved", 409)
     campaign_id = database.create_bootstrap_campaign(
         preview["campaign_object"].to_record()
     )
@@ -401,6 +410,9 @@ def _status_campaign_view(campaign: dict[str, Any] | None) -> dict[str, Any] | N
     view["cancel_reason"] = "bootstrap_expired" if expired else None
     view["manual_restart_required"] = expired
     view["open_offer_count"] = len(trade_ids)
+    view["unresolved_creation_count"] = _campaign_unresolved_creation_count(
+        str(campaign.get("campaign_id") or "")
+    )
     view["active_authority_retained"] = (
         expired and str(campaign.get("status") or "") == "active"
     )
@@ -419,8 +431,18 @@ def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | N
         ):
             continue
         trade_ids = _campaign_trade_ids(campaign["campaign_id"])
-        if not trade_ids:
+        unresolved_count = _campaign_unresolved_creation_count(campaign["campaign_id"])
+        if not trade_ids and not unresolved_count:
             continue
+        if unresolved_count:
+            return {
+                "campaign_id": campaign["campaign_id"],
+                "revision": campaign["revision"],
+                "code": "bootstrap_cancel_outcome_unknown",
+                "financial_action_started": None,
+                "cancel_targets": len(trade_ids),
+                "unresolved_creation_count": unresolved_count,
+            }
         attempt = database.get_latest_bootstrap_cancel_attempt(campaign["campaign_id"])
         if attempt is None:
             return {
@@ -429,6 +451,7 @@ def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | N
                 "code": "bootstrap_cancel_outcome_unknown",
                 "financial_action_started": None,
                 "cancel_targets": len(trade_ids),
+                "unresolved_creation_count": unresolved_count,
             }
         data = attempt["data"]
         code = data.get("code") or data.get("cancel_error")
@@ -456,6 +479,7 @@ def _stopped_cancellation_status(identity: dict[str, Any]) -> dict[str, Any] | N
             "code": code,
             "financial_action_started": financial_action_started,
             "cancel_targets": len(trade_ids),
+            "unresolved_creation_count": unresolved_count,
         }
     return None
 
@@ -469,17 +493,21 @@ def api_bootstrap_status():
             identity["wallet_fingerprint"],
             identity["network"],
         )
+        campaign_view = _status_campaign_view(active)
         return jsonify(
             _json_safe(
                 {
                     "success": True,
                     "identity": identity,
                     "active": active is not None,
-                    "campaign": _status_campaign_view(active),
+                    "campaign": campaign_view,
                     "stopped_cancellation": _stopped_cancellation_status(identity),
                     "needs_attention": bool(
-                        active is not None
-                        and _campaign_expiry_has_elapsed(active, _utcnow())
+                        campaign_view is not None
+                        and (
+                            campaign_view["expired"]
+                            or campaign_view["unresolved_creation_count"]
+                        )
                     ),
                 }
             )
@@ -560,6 +588,21 @@ def _campaign_trade_ids(campaign_id: str) -> list[str]:
         if trade_id:
             trade_ids.add(trade_id)
     return sorted(trade_ids)
+
+
+def _campaign_unresolved_creation_count(campaign_id: str) -> int:
+    """Count campaign intents whose wallet offer identity is not yet known."""
+
+    prefix = f"bootstrap:{campaign_id}:revision:"
+    return sum(
+        1
+        for intent in database.get_offer_intents_for_registry()
+        if type(intent) is dict
+        and str(intent.get("purpose") or "").startswith(prefix)
+        and str(intent.get("lifecycle_state") or "").lower()
+        in _NONTERMINAL_INTENT_STATES
+        and not str(intent.get("sage_trade_id") or "").strip()
+    )
 
 
 def _campaign_cancel_manager():
@@ -687,6 +730,8 @@ def api_bootstrap_stop():
             # wallet call and its journal result before selecting cancel targets.
             _await_campaign_creation_quiescence()
             trade_ids = _campaign_trade_ids(campaign_id)
+            if _campaign_unresolved_creation_count(campaign_id):
+                raise BootstrapApiError("bootstrap_cancel_outcome_unknown", 503)
             if (
                 trade_ids
                 and observed_count is not None

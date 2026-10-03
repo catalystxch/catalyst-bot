@@ -664,6 +664,87 @@ def test_stop_requires_new_review_when_offer_count_changes_during_stop(
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
 
 
+def test_stop_does_not_claim_clearance_for_unknown_creation_without_trade_id(
+    isolated_db, bootstrap_api
+):
+    _bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    intent_id = "a" * 64
+    operation_id = f"create:{intent_id}"
+    database.prepare_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:prepared",
+        run_id="unknown-creation-stop",
+        wallet_fingerprint_hash="b" * 64,
+        network="mainnet",
+        asset_id=ASSET_ID,
+        side="buy",
+        tier="inner",
+        purpose=f"bootstrap:{campaign_id}:revision:0",
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=["c" * 64],
+        wallet_identity_json={"binding_digest": "d" * 64},
+        evidence_json={"canonical_intent_sha256": intent_id},
+        prepared_at="2026-09-12T12:00:00Z",
+    )
+    database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=operation_id,
+        event_id=f"{operation_id}:unknown",
+        lifecycle_state="creation_unknown",
+        outcome="UNKNOWN",
+        wallet_identity_json={"binding_digest": "d" * 64},
+        evidence_json={"effect_attempted": True},
+        reason_code="CREATE_RESPONSE_AMBIGUOUS",
+        finalized_at="2026-09-12T12:00:01Z",
+    )
+    active_status = client.get("/api/bootstrap/status").get_json()
+    assert active_status["campaign"]["open_offer_count"] == 0
+    assert active_status["campaign"]["unresolved_creation_count"] == 1
+    assert active_status["needs_attention"] is True
+
+    stopped = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+
+    assert stopped.status_code == 503
+    assert stopped.get_json()["success"] is False
+    assert stopped.get_json()["code"] == "bootstrap_cancel_outcome_unknown"
+    assert stopped.get_json()["stopped"] is True
+    retry = client.get("/api/bootstrap/status").get_json()["stopped_cancellation"]
+    assert retry["code"] == "bootstrap_cancel_outcome_unknown"
+    assert retry["cancel_targets"] == 0
+    assert retry["unresolved_creation_count"] == 1
+    assert retry["financial_action_started"] is None
+
+    next_request = _request(expires_in_seconds=60)
+    next_preview = client.post("/api/bootstrap/preview", json=next_request).get_json()
+    confirmed = {
+        **next_request,
+        "preview_digest": next_preview["preview_digest"],
+        "exact_asset_warning_accepted": True,
+    }
+    for path, body in (
+        ("/api/bootstrap/start", confirmed),
+        ("/api/bootstrap/renew", {**confirmed, "prior_campaign_id": campaign_id}),
+    ):
+        response = client.post(path, json=body)
+        assert response.status_code == 409
+        assert response.get_json()["code"] == "bootstrap_prior_creation_unresolved"
+
+
 def test_status_export_and_scoped_stop_use_exact_active_campaign(
     isolated_db, bootstrap_api, monkeypatch
 ):
@@ -1014,6 +1095,7 @@ def test_stop_journal_failure_remains_visible_after_status_reload(
         "code": "bootstrap_cancel_outcome_unknown",
         "financial_action_started": None,
         "cancel_targets": 1,
+        "unresolved_creation_count": 0,
     }
 
 

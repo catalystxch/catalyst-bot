@@ -411,3 +411,31 @@ def test_stop_count_change_requests_new_operator_review_without_cancellation(pag
     assert result["retry"] == {"campaign_id": "c" * 64, "revision": 1}
     assert "offer count changed to 1" in result["message"]
     assert "no wallet cancellation started" in result["message"]
+
+
+def test_unknown_creation_is_not_described_as_zero_offer_clearance(page):
+    _open_gui(page)
+    page.evaluate(
+        """() => {
+            _bootstrapRenderStatus({
+                success: true, active: true,
+                campaign: {
+                    campaign_id: 'c'.repeat(64), revision: 0,
+                    status: 'active', stage: 'bootstrap', expired: true,
+                    cancel_required: true, open_offer_count: 0,
+                    unresolved_creation_count: 1, asset_id: 'b8'.repeat(32),
+                },
+            });
+            showStyledConfirm = async options => {
+                window.__unknownCreationConfirmation = options;
+                return false;
+            };
+        }"""
+    )
+    expect(page.locator("#bootstrapGlobalStatus")).to_contain_text(
+        "unresolved offer creation"
+    )
+    expect(page.locator("#bootstrapStopBtn")).to_have_text("Stop & Review Campaign")
+    page.evaluate("bootstrapStopCampaign()")
+    confirmation = page.evaluate("window.__unknownCreationConfirmation")
+    assert "unknown wallet outcome" in confirmation["message"]
