@@ -13,8 +13,8 @@ established lowercase Bootstrap codes. A mixed-case fee refusal regression
 failed before the fix and passed afterward. The affected Bootstrap tests
 passed **35**; Ruff, formatting and `git diff --check` passed. CodeQL now
 marks alert #91 **fixed**, and all **11 PR #220 checks** passed on exact
-`f937a0c`. A full primary Windows backend run on this exact source is in
-progress; no result is claimed here.
+`f937a0c`. The full primary Windows backend run on this exact source
+passed **7,145 tests, 205 skipped, 425 subtests** in 24m47s.
 
 ## Exact Windows package
 
@@ -32,9 +32,24 @@ clean-installed, matched the package EXE/UI hashes, passed installed API
 and Sage smokes, and uninstalled without leftover QA registration. Defender
 custom scans of the bundle, ZIP and installer returned zero matching
 detections. Independent HTTP downloads of the immutable ZIP and installer
-matched the hashes above. No original profile or wallet effect occurred.
+matched the hashes above. The focused Bootstrap cancellation browser suite
+passed **11** tests against the exact source. No original profile or wallet
+effect occurred.
 
 ## Open live gates
+
+At approximately 2026-10-03 04:32 UTC, a separate read-only process used
+the exact-source wallet facade and the primary SQLite database in read-only
+mode. Sage was reachable, synced to mainnet TEST 7 fingerprint `736588221`,
+and held the exact MZ asset in configured CAT wallet ID `2`. XCH confirmed
+and spendable were both `138470301476875` mojos; MZ confirmed and spendable
+were both `780212284` atomic units. Sage returned a complete 4,095-offer
+history with zero open MZ/XCH buys or sells and zero pending transactions.
+The primary database had zero open MZ offers. Its latest campaign
+`c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
+remained stored as `active` despite expiry at
+`2026-09-30T11:27:42.748405Z`; it had zero recorded fee spend and zero fee
+approvals. This read did not modify wallet or database state.
 
 The exact `f937a0c` EXE has not run against the original TEST 7 profile.
 The operator has been asked to launch it manually, personally acknowledge
