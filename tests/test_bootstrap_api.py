@@ -809,7 +809,9 @@ def test_stop_journal_failure_remains_visible_after_status_reload(
     monkeypatch.setattr(
         bootstrap,
         "_campaign_cancel_manager",
-        lambda: SimpleNamespace(cancel_offers=lambda *_args, **_kwargs: manager_calls.append(1)),
+        lambda: SimpleNamespace(
+            cancel_offers=lambda *_args, **_kwargs: manager_calls.append(1)
+        ),
     )
     monkeypatch.setattr(
         database,
