@@ -1578,6 +1578,7 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=expiry,
+                    lease_duration_seconds=self.lease_seconds,
                     now=now,
                     allow_expired_takeover=allow_takeover,
                     expected_lease_version=expected_version,
@@ -1669,6 +1670,7 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    lease_duration_seconds=self.lease_seconds,
                     expected_lease_version=int(current["lease_version"]),
                     prior_owner_liveness_proven_dead=prior_dead,
                     now=now,
@@ -2247,6 +2249,7 @@ class MutationGate:
                         expected_lease_version=version,
                         heartbeat_at=now,
                         lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                        lease_duration_seconds=self.lease_seconds,
                     )
                     result = _lease_public_result(result)
                 except Exception:

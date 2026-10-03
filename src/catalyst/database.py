@@ -8346,14 +8346,27 @@ def _stability_wall_clock() -> str:
     return _stability_timestamp(datetime.now(timezone.utc), "wall clock")
 
 
-def _post_lock_lease_expiry(requested_at: str, expiry: str, safety_at: str) -> str:
-    """Preserve a requested lease duration after waiting for the write lock."""
+def _post_lock_lease_expiry(
+    requested_at: str,
+    expiry: str,
+    safety_at: str,
+    *,
+    duration_seconds: Optional[int] = None,
+) -> str:
+    """Preserve an explicit duration; otherwise retain an absolute expiry."""
 
     if expiry <= safety_at:
         raise ValueError("lease_expires_at must be later than post-lock wall clock")
-    duration = _parse_iso_timestamp(
+    if duration_seconds is None:
+        return expiry
+    duration = timedelta(
+        seconds=_exact_integer(duration_seconds, "lease_duration_seconds", minimum=1)
+    )
+    requested_duration = _parse_iso_timestamp(
         expiry, "lease_expires_at", require_timezone=True
     ) - _parse_iso_timestamp(requested_at, "lease timestamp", require_timezone=True)
+    if requested_duration != duration:
+        raise ValueError("lease_expires_at does not match lease_duration_seconds")
     locked_at = _parse_iso_timestamp(
         safety_at, "post-lock wall clock", require_timezone=True
     )
@@ -31618,6 +31631,7 @@ def adopt_runtime_recovery_epoch(
     expected_lease_version: int,
     prior_owner_liveness_proven_dead: bool,
     now: Any = None,
+    lease_duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Atomically acquire and append a successor for one frozen recovery.
 
@@ -31646,8 +31660,12 @@ def adopt_runtime_recovery_epoch(
         conn.execute("BEGIN IMMEDIATE")
         locked_at = _stability_wall_clock()
         adopted_at = max(requested_at, locked_at)
-        if expiry <= adopted_at:
-            raise ValueError("lease_expires_at must be later than adoption time")
+        effective_expiry = _post_lock_lease_expiry(
+            requested_at,
+            expiry,
+            adopted_at,
+            duration_seconds=lease_duration_seconds,
+        )
         epoch_row = conn.execute(
             "SELECT * FROM runtime_recovery_epochs WHERE recovery_id=?",
             (recovery,),
@@ -31718,7 +31736,7 @@ def adopt_runtime_recovery_epoch(
                 safe_network,
                 adopted_at,
                 adopted_at,
-                expiry,
+                effective_expiry,
                 adopted_at,
                 version,
             ),
@@ -32345,6 +32363,7 @@ def acquire_runtime_mutation_lease(
     now: Any = None,
     allow_expired_takeover: bool = False,
     expected_lease_version: Optional[int] = None,
+    lease_duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Acquire/renew the singleton lease with explicit expired-takeover CAS."""
 
@@ -32491,7 +32510,9 @@ def acquire_runtime_mutation_lease(
         if not can_acquire:
             conn.commit()
             return {"acquired": False, "reason": "not_available", "lease": current}
-        effective_expiry = _post_lock_lease_expiry(at, expiry, safety_at)
+        effective_expiry = _post_lock_lease_expiry(
+            at, expiry, safety_at, duration_seconds=lease_duration_seconds
+        )
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
@@ -32554,6 +32575,7 @@ def heartbeat_runtime_mutation_lease(
     expected_lease_version: int,
     lease_expires_at: Any,
     heartbeat_at: Any = None,
+    lease_duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     owner = _required_stability_text(owner_run_id, "owner_run_id")
     version = _exact_integer(expected_lease_version, "expected_lease_version")
@@ -32597,7 +32619,9 @@ def heartbeat_runtime_mutation_lease(
                 "reason": "new_expiry_not_monotonic",
                 "lease": current,
             }
-        effective_expiry = _post_lock_lease_expiry(at, expiry, safety_at)
+        effective_expiry = _post_lock_lease_expiry(
+            at, expiry, safety_at, duration_seconds=lease_duration_seconds
+        )
         cursor = conn.execute(
             """
             UPDATE runtime_mutation_lease
