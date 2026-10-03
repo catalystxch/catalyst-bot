@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -177,10 +178,10 @@ def _classify_offer_diagnostic_sets(db_rows, wallet_ids):
             continue
         status = _norm_offer_state(row.get("status"))
         lifecycle = _norm_offer_state(row.get("lifecycle_state")) or status
-        if lifecycle in _CANCEL_PENDING_LIFECYCLES:
-            pending_cancel_ids.add(trade_id)
-        elif status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
+        if status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
             terminal_db_ids.add(trade_id)
+        elif lifecycle in _CANCEL_PENDING_LIFECYCLES:
+            pending_cancel_ids.add(trade_id)
         elif status == "open":
             active_db_ids.add(trade_id)
 
@@ -478,6 +479,22 @@ def api_open_offer_count():
 def api_cancel_all():
     """Cancel all open offers when the bot is not actively managing the book."""
     bot = api_server.bot
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if type(body) is not dict:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    fee_approval_id = body.get("fee_approval_id")
+    if fee_approval_id is None:
+        if body:
+            return jsonify({"success": False, "error": "invalid_request"}), 400
+    elif (
+        set(body) != {"source", "fee_approval_id"}
+        or body.get("source") != "coin_prep"
+        or type(fee_approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+    ):
+        return jsonify({"success": False, "error": "invalid_fee_approval"}), 400
     slog("GUI_ACTION", ">>> BUTTON: Cancel All Offers")
     cancelled = 0
     failed = 0
@@ -654,7 +671,10 @@ def api_cancel_all():
             def on_progress(payload):
                 _set_cancel_all_state(**payload)
 
-            result = bot.offer_manager.cancel_all(progress_callback=on_progress)
+            result = bot.offer_manager.cancel_all(
+                progress_callback=on_progress,
+                fee_approval_id=fee_approval_id,
+            )
             for tid, res in result.items():
                 if res and res.get("success"):
                     cancelled += 1
@@ -896,9 +916,15 @@ def api_cancel_all():
                             ),
                         )
                         _cancel_kwargs = {
-                            "reason": "manual_cancel_all",
+                            "reason": (
+                                "coin_prep_cancel_all"
+                                if fee_approval_id
+                                else "manual_cancel_all"
+                            ),
                             "force_storm": True,
                         }
+                        if fee_approval_id:
+                            _cancel_kwargs["fee_approval_id"] = fee_approval_id
                         _batch_retry_attempts = {
                             trade_id: _retry_failed_attempts[trade_id]
                             for trade_id in _batch_targets
@@ -1007,10 +1033,24 @@ def api_cancel_all():
                         "authoritatively terminal offer(s)",
                     )
                 except Exception as _e:
+                    _fee_reason_codes = {
+                        "FEE_APPROVAL_STALE",
+                        "FEE_APPROVAL_LEGACY_UNSCOPED",
+                        "FEE_APPROVAL_RECOVERY_ONLY",
+                        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+                        "FEE_BUDGET_APPROVAL_REQUIRED",
+                        "FEE_BUDGET_EXCEEDED",
+                        "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                    }
+                    _reason_code = next(
+                        (code for code in _fee_reason_codes if code in str(_e).upper()),
+                        None,
+                    )
                     _set_cancel_all_state(
                         running=False,
                         complete=False,
                         error=str(_e),
+                        reason_code=_reason_code,
                         phase="error",
                         finished_at=datetime.now(timezone.utc).isoformat(),
                         message=f"Cancel all failed: {_e}",
@@ -2456,6 +2496,7 @@ def _new_cancel_all_state():
         "running": False,
         "complete": False,
         "error": None,
+        "reason_code": None,
         "phase": "idle",
         "message": "",
         "started_at": None,

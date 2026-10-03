@@ -78,6 +78,49 @@ def test_offer_wire_rejects_noncanonical_padding_and_zlib_boundaries(offer_text)
     assert sage_offer_wire.canonical_sage_offer_text(offer_text) is None
 
 
+@pytest.mark.parametrize(
+    "puzzle_hash,prefix,expected",
+    [
+        (
+            bytes(32),
+            "xch",
+            "xch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2u30kz",
+        ),
+        (
+            bytes(range(32)),
+            "xch",
+            "xch1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0srg6dkm",
+        ),
+        (
+            bytes(range(32)),
+            "txch",
+            "txch1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sw0amhg",
+        ),
+    ],
+)
+def test_wallet_puzzle_hash_encoder_matches_chia_reference_vectors(
+    puzzle_hash, prefix, expected
+):
+    address = sage_offer_wire.encode_wallet_puzzle_hash(puzzle_hash, prefix)
+    assert address == expected
+    assert sage_offer_wire.decode_wallet_puzzle_hash(address) == puzzle_hash
+
+
+@pytest.mark.parametrize(
+    "puzzle_hash,prefix",
+    [
+        (bytes(31), "xch"),
+        (bytes(33), "xch"),
+        (bytes(32), "offer"),
+        (bytes(32), "XCH"),
+        ("not-bytes", "xch"),
+    ],
+)
+def test_wallet_puzzle_hash_encoder_rejects_noncanonical_input(puzzle_hash, prefix):
+    with pytest.raises(ValueError):
+        sage_offer_wire.encode_wallet_puzzle_hash(puzzle_hash, prefix)
+
+
 def _encode_test_offer(payload: bytes) -> str:
     data = sage_offer_wire._convertbits(payload, 8, 5, pad=True)
     checksum_value = (

@@ -65,6 +65,7 @@ except ImportError:
 
 from price_engine import PriceEngine
 from offer_manager import OfferManager
+from liquidity_side import bootstrap_side_enabled
 from fill_tracker import FillTracker
 from dexie_manager import DexieManager, get_offer_detail
 from splash_manager import SplashManager
@@ -13082,17 +13083,42 @@ class BotLoop:
             )
             return empty
 
+        allowed_sides = {
+            side for side in ("buy", "sell") if bootstrap_side_enabled(cfg, side)
+        }
+        if not allowed_sides:
+            log_event(
+                "warning",
+                "bootstrap_creation_sides_disabled",
+                "Market Bootstrap has no enabled liquidity side for offer creation",
+            )
+            return empty
+        plan = {
+            **runtime["plan"],
+            "sides": {
+                side: (
+                    runtime["plan"]["sides"][side]
+                    if side in allowed_sides
+                    else {
+                        **runtime["plan"]["sides"][side],
+                        "levels": [],
+                        "paused": True,
+                    }
+                )
+                for side in ("buy", "sell")
+            },
+        }
         existing = active_bootstrap_levels(
             intents,
             campaign_id=campaign["campaign_id"],
             revision=campaign["revision"],
         )
-        if len(existing) >= sum(
-            len(runtime["plan"]["sides"][side]["levels"]) for side in ("buy", "sell")
+        if len({item for item in existing if item[0] in allowed_sides}) >= sum(
+            len(plan["sides"][side]["levels"]) for side in allowed_sides
         ):
             return empty
         created = self.offer_manager.create_bootstrap_plan(
-            runtime["plan"],
+            plan,
             campaign_authority=campaign,
             xch_wallet_id=int(getattr(cfg, "WALLET_ID_XCH", 1)),
             cat_wallet_id=int(getattr(cfg, "CAT_WALLET_ID", 0)),
@@ -16614,6 +16640,17 @@ class BotLoop:
             if not isinstance(result, dict):
                 return False
             if result.get("error") or result.get("success") is False:
+                return False
+
+        # During a Sage restart either coin endpoint can briefly return HTTP
+        # 200 with an empty list after a run of 401s. That is not evidence
+        # that the wallet's previously tracked coins were all spent.
+        for wallet_type, result in (("xch", xch_result), ("cat", cat_result)):
+            if not (result.get("confirmed_records") or result.get("records")) and any(
+                coin.get("source") == "wallet"
+                and coin.get("wallet_type") == wallet_type
+                for coin in self._coin_snapshot.values()
+            ):
                 return False
 
         return True

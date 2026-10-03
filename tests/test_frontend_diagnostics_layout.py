@@ -353,14 +353,14 @@ def test_market_diagnostics_uses_offer_book_confidence_and_provider_health():
     assert "summaryTibetXch" not in html
 
 
-def test_close_gap_recommendation_has_confidence_gate():
+def test_retired_amm_gap_metrics_do_not_drive_current_advisor():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    assert "_SA_CLOSE_GAP_PROMOTE_BPS = 200" in html
-    assert "_SA_CLOSE_GAP_CONFIRM_UPDATES = 3" in html
-    assert "saCloseGapSignalReady(" in html
-    assert "closeGapCandidate" in html
-    assert "if (closeGapReady)" in html
+    advisor = html[html.index("function saUpdateAdvisor") :]
+    advisor = advisor[: advisor.index("function runAdvisorAction")]
+    assert "arb_gap_bps" not in advisor
+    assert "saCloseGapSignalReady(" not in advisor
+    assert "activateGapCloser" not in advisor
 
 
 def test_min_spread_clamp_copy_is_diagnostic_not_directive():
@@ -396,7 +396,7 @@ def test_spread_tighten_recommendations_pause_at_max_spread_clamp():
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
     assert "const maxSpreadClampActive" in html
-    assert "if (!_gapCloserActive && !maxSpreadClampActive" in html
+    assert "if (!maxSpreadClampActive && baseBps > 400" in html
     assert "fillsHr === 0 && !maxSpreadClampActive" in html
 
 

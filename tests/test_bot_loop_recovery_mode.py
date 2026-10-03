@@ -442,6 +442,57 @@ class RecoveryModeTests(unittest.TestCase):
             loop._is_coin_watcher_snapshot_reliable(empty_result, empty_result)
         )
 
+    def test_coin_watcher_ignores_transient_empty_wallets_after_live_baseline(self):
+        """Sage's brief 200/empty restart response must not report mass spends."""
+        loop = bot_loop.BotLoop()
+        baseline = {
+            "xch-old": {
+                "amount": 2_000_000_000_000,
+                "wallet_type": "xch",
+                "source": "wallet",
+            },
+            "cat-old": {
+                "amount": 42_000,
+                "wallet_type": "cat",
+                "source": "wallet",
+            },
+        }
+        loop._coin_snapshot = dict(baseline)
+        empty_result = {"success": True, "records": [], "confirmed_records": []}
+
+        reliable = loop._is_coin_watcher_snapshot_reliable(empty_result, empty_result)
+        loop._handle_coin_watcher_snapshot({}, {}, snapshot_reliable=reliable)
+
+        self.assertFalse(reliable)
+        self.assertEqual(loop._coin_snapshot, baseline)
+        self.assertFalse(
+            any(
+                event in {"coin_watcher_gone", "coin_watcher_new"}
+                for _, event, _, _ in self.logged
+            )
+        )
+
+    def test_coin_watcher_ignores_one_empty_wallet_after_live_baseline(self):
+        """A partial Sage recovery must not report the other wallet spent."""
+        loop = bot_loop.BotLoop()
+        loop._coin_snapshot = {
+            "xch-old": {
+                "amount": 2_000_000_000_000,
+                "wallet_type": "xch",
+                "source": "wallet",
+            },
+            "cat-old": {"amount": 42_000, "wallet_type": "cat", "source": "wallet"},
+        }
+        xch_result = {
+            "success": True,
+            "records": [{"coin": {"amount": 2_000_000_000_000}}],
+        }
+        cat_result = {"success": True, "records": []}
+
+        reliable = loop._is_coin_watcher_snapshot_reliable(xch_result, cat_result)
+
+        self.assertFalse(reliable)
+
     def test_recovery_mode_enters_after_persistent_under_target(self):
         loop = bot_loop.BotLoop()
         loop._running = True

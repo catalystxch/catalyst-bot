@@ -1,0 +1,943 @@
+# Live TEST 7 acceptance evidence — 24 September 2026
+
+Latest artifact note: secondary-PC corrections were subsequently combined at
+`088d9d6`. This file's live receipts remain valid for the executable identified
+below; they do not certify a later build. See
+`2026-09-24-combined-candidate-verification.md` for current combined-build tests,
+the test-first Doctor-probe isolation correction, the recorded same-build native
+acceptance and the completed 6,999-test regression run,
+and the correction that Sage was running as `sage-tauri.exe` while CATalyst's
+local service was unavailable. The secondary PC used a different fingerprint;
+its receipts must not be relabelled TEST 7.
+
+## Identity and services
+
+- Current-candidate executable SHA-256 remains recorded as
+  `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
+- Sage v0.13.0 connected through the packaged first-launch flow.
+- Selected fingerprint: `736588221` (TEST 7), network: mainnet.
+- Selected CAT wallet: wallet ID `2`, Monkeyzoo Token (`MZ_XCH`), asset ID
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- Live balances loaded: 138.472852133099 XCH and 780212.284 MZ spendable.
+  Splash started and reported connected. The configured Spacescan path
+  continued successfully and returned holder/activity context.
+
+## Live start / stop and safety result
+
+- Existing 3-buy / 3-sell, 0.1 XCH settings were reviewed and saved through
+  the packaged browser UI. Existing prepared coins were verified as ready, so
+  no new fee consent or wallet mutation was required for that plan.
+- The operator confirmed the live start/stop action at the action boundary.
+  CATalyst passed all 10 preflight checks, reconciled 0 open wallet offers,
+  found no unknown offers or orphan-looking locks, and started normally.
+- One complete live loop finished in 2.9 seconds with zero errors. Current
+  offer-book confidence was RED (`out of range depth excluded`, `insufficient
+  ask depth`, `single provider dependency`), so adaptive targets remained
+  zero. CATalyst created zero buy offers and zero sell offers and logged that
+  new exposure and requotes remained blocked because no attributable trusted
+  price was available.
+- Stop completed cleanly. Post-stop state had zero active offers, zero locked
+  coins, zero unresolved operations/reservations/publications, and runtime
+  safety remained allowed.
+
+## Smart Settings and balance rejection
+
+- Balanced Smart Settings in Follow mode failed closed because current market
+  evidence was unsuitable; the form retained the existing 3/3 values.
+- Loading the saved `pre-fee-live-acceptance` preset produced the expected
+  unsaved 45/45 Bootstrap form. It rejected the plan: 45 sell offers required
+  about 783,289 MZ, and the full 72-coin preparation plan required about
+  1,443,328.718 MZ after headroom versus 780,212 available. The preset was
+  discarded without saving. Reload confirmed the persisted 3/3 strategy.
+
+## Fresh dynamic fee quote
+
+- A temporary affordable 4-buy / 4-sell plan was saved solely to force a fresh
+  Coin Prep estimate. Verification recommended re-preparation for two
+  transactions and displayed the correct wallet/pair identity.
+- The first estimate was marked expired at 69 seconds and blocked approval
+  until Refresh. Refresh returned a current Coinset quote, 25 seconds old,
+  with the default 300-second target:
+  - cumulative maximum / remaining plan estimate: `0.000401997224 XCH`;
+  - protected cancellation allowance: `0.0000902074 XCH`;
+  - existing commitments: `0 XCH` spent and `0 XCH` held;
+  - fee-coin principal: `0.05 XCH`, identified as principal, not fee spend;
+  - fee funding available: `124.502663594778 XCH`;
+  - evidence: one exact unsigned cost and three projected costs;
+  - exact CAT prep: `0.000015034908 XCH`;
+  - projected XCH prep: `0.000296754916 XCH`;
+  - projected cancellation XCH: `0.000003288565 XCH` each for 1-8;
+  - projected cancellation CAT: `0.00000798736 XCH` each for 1-8.
+- The UI enabled `Yes, Prepare Coins (+0% headroom)` only after the fresh
+  quote arrived. At that pre-approval checkpoint no mutation had occurred; the
+  later explicit approval, dispatch, and authoritative outcome are recorded
+  below.
+
+## Still open
+
+- Live offer publication/requote/cancel/remake cannot be observed while
+  attributable market confidence remains RED. The live loop proved the
+  fail-closed path; it did not fabricate market evidence or bypass safety.
+
+## Focused automated regression rerun
+
+- A fresh focused run covering all `test_coin_prep_fee_*` and `test_fee_*`
+  modules plus unsigned preview, worker cancellation, split retry, cancellation
+  outcomes/journal, cancel-all integration, startup recovery, and publication
+  recovery completed successfully: **948 passed in 346.62 seconds**.
+- After the run, the packaged UI refreshed the live Coinset estimate. The
+  identity remained Sage fingerprint `736588221`, wallet `2`, MZ/XCH mainnet;
+  the estimate remained current at `0.000401997224 XCH` cumulative maximum,
+  with `0.0000902074 XCH` protected cancellation allowance, zero spent, zero
+  held, and the same 1 exact / 3 projected evidence split.
+
+## Approved live Coin Prep and exact accounting
+
+- The operator explicitly approved the refreshed `0.000401997224 XCH`
+  cumulative maximum. The app recorded approval
+  `cae3170fdf37da6c24627bc93d6b25d0a7d92df2eecde7443d8e4b2a0fe89a50`
+  for plan `7be772c324866231b479f6a97007a885f109fbc050015b0bc7c44048ac92f9cf`.
+- Existing P&L, three fills, and 2,554 historical offer rows were preserved;
+  no history-reset option was selected.
+- CAT batch 1 reserved and then authoritatively confirmed an exact
+  `0.000015034908 XCH` fee. XCH batch 2 reserved and then authoritatively
+  confirmed an exact `0.000000528036 XCH` fee. The UI remained fail-closed
+  with `COIN_PREP_EFFECT_UNKNOWN` while each submitted effect was unresolved.
+- Final authoritative fee state was `complete`: `0.000015562944 XCH` spent,
+  zero held, zero unresolved operations, two confirmed reservations, no
+  released reservations, and `0.000386434280 XCH` of the approved cap unused.
+  The protected `0.000090207400 XCH` cancellation allowance was never consumed.
+- Direct-final-batch-v2 preparation completed successfully with two confirmed
+  batches, 66 target outputs, and visible 8/8 XCH plus 8/8 MZ trading-coin
+  readiness. Wallet totals remained 138.472836570155 XCH and 780212.284 MZ;
+  fee-coin/output principal was not misreported as fee spend.
+
+## Restart, recovery, and restored strategy
+
+- The packaged candidate shut down cleanly and restarted from the same EXE.
+  Before any new wallet mutation, `/api/coin-prep/status` recovered the fee
+  session as complete with `15562944` mojos spent, zero held, zero unresolved,
+  and `session_completed=true`; no duplicate transaction was dispatched.
+- Restarted startup reverified Sage mainnet fingerprint `736588221`, wallet
+  `2`, MZ asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  Splash, and the configured Spacescan path.
+- The temporary 4/4 settings were replaced with the intended 3-buy / 3-sell
+  strategy. The app recognized the prepared 8/8 XCH and 8/8 MZ ladder as
+  sufficient for 3/3 without requesting another fee approval.
+- A post-restart live start passed all 10 checks, reconciled zero wallet
+  offers and zero orphan locks, ran one 2.83-second loop with zero errors, and
+  again created no offers because attributable market confidence was RED.
+  Stop completed cleanly; authoritative `/api/status` reported
+  `running=false`, zero open offers, zero locked coins, and runtime safety
+  allowed with zero unresolved operations, reservations, or publications.
+  The browser converged to the same STOPPED state on its subsequent status
+  poll.
+
+## Specification acceptance matrix
+
+| Requirement group | Evidence | Result |
+|---|---|---|
+| Transaction-specific estimates | Strict normalization covers missing versus zero, malformed/NaN/negative/boolean values, integer bounds, matching cost/target, source provenance, original observation age, and upward Decimal rounding. Exact current unsigned costs and clearly labelled projections are exercised by focused and full regressions. | PASS |
+| Freshness and providers | Quotes expire after 60 seconds without cache-age renewal. The live stale quote blocked approval until Refresh; current Coinset guidance used the 300-second target. Outage, malformed evidence, source disagreement, and manual-fee bypass attempts fail closed in tests and package probes. | PASS |
+| Canonical preview and consent | HTTP/native/GUI previews are read-only and server-owned. The GUI showed wallet/pair, exact/projected counts and costs, source/age, target, retained principal, funding, editable maximum, and protected cancellation allowance. Approval is durable and scope/plan-bound. Cancel and duplicate confirmation have no unintended effects. | PASS |
+| Exact dispatch enforcement | Supported direct CAT/XCH and bounded prerequisite paths rebuild and inspect unsigned effects, converge fee/cost with bounded retries, reserve the exact final fee atomically, permit only within-cap repricing, and pause unsupported or over-cap paths. Bootstrap, retry, direct API, and native bridge bypass cases are covered. | PASS |
+| Protected cancellation | Preparation cannot borrow the protected allowance. Exact Sage cancellation uses its own inspected bundle and durable hold; cancellation/no-effect/recovery and insufficient-allowance behavior are covered across backend, API, native, and browser regressions. The live prep did not consume the reserve. | PASS |
+| Durable accounting and recovery | Concurrency, conflicting replay, crash-before-signing, submitted/unknown, confirmed, authoritative no-effect, later approval versions, reset preservation, and restart idempotency are covered. Live restart recovered 15,562,944 mojos spent, zero held/unresolved, with no duplicate dispatch. | PASS |
+| Accurate UI/API status | Projected versus exact evidence, source age, funding/principal, cumulative/remaining totals, waiting/paused/preparing/submitted/complete states, reload recovery, and actionable failures are exercised by 156 Chromium cases and focused regressions. Live `/api/coin-prep/status` agreed with the GUI and ledger. | PASS |
+| Build and package | Full suite: 6,981 passed, 157 skipped, 422 subtests. Focused fee/live-acceptance selection: 948 passed. Fresh Windows EXE SHA-256 `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`; API/Sage/recovery/fee-denial probes and operator native clean/duplicate/persisted/safety launches passed. | PASS |
+| Live TEST 7 Coin Prep | Sage mainnet fingerprint `736588221`, MZ wallet `2`, and the exact asset ID were verified. Genuine GUI approval covered `0.000401997224 XCH`; two batches confirmed for `0.000015562944 XCH`, produced 8/8 XCH and 8/8 MZ readiness, and survived restart without double accounting. | PASS |
+| Live bot start/stop and fail-closed market gate | Intended 3/3 strategy was restored. Preflight, reconciliation, start, loop, stop, zero-lock and zero-unresolved checks passed before and after restart. Current attributable market confidence remains RED, so zero offers were created as designed. | PASS |
+| Live create/requote/cancel/remake | Automated publication, requote, cancellation, retry and recovery coverage is green, but a live cycle cannot be honestly produced while the market gate has no attributable trusted executable price. CATalyst correctly refuses to fabricate price evidence or bypass the gate. | BLOCKED — external market evidence |
+
+Ruling: the approved fee feature meets its own completion contract because its
+live preview, consent, exact prep, accounting, restart, supported-path and
+no-bypass gates are proven. The broader other-PC handoff goal remains active
+because it explicitly also asks for a live create/requote/cancel/remake cycle.
+Waiting for genuine non-RED market evidence is safer than altering production
+confidence thresholds; if this ruling is wrong, acceptance is delayed rather
+than funds being exposed under fabricated pricing authority.
+
+## Latest read-only runtime audit
+
+- At 24 September 2026 10:53 BST, `/api/status` still reported the intended
+  Sage/MZ identity, `running=false`, 8 prepared XCH and 8 prepared CAT trading
+  coins, zero locked coins, zero open offers, zero pending cancellations, zero
+  unresolved operations/reservations/publications, and runtime safety allowed.
+- The latest loop evidence still said `No attributable trusted offer-book price
+  is available; new exposure and requotes remain blocked`. This is the only
+  outstanding live-cycle gate, not a missing permission or fee-consent gate.
+- The operator has now authorized acceptance of displayed fee prices during
+  continued testing as well as start/stop, Coin Prep, Smart Settings,
+  cancellation, requoting and offer remake actions. CATalyst's plan-bound
+  recorded caps and safety checks remain mandatory.
+
+## Fresh market-gate retry — 24 September 2026 10:59 BST
+
+- Immediately before the authorized start, the GUI showed Sage fingerprint
+  `736588221`, MZ wallet ID `2`, the expected asset, 8/8 prepared trade coins,
+  and zero active offers or locked coins. Startup reconciled the wallet to zero
+  open/unknown offers and passed the effect-safety checks.
+- Coinset's optional early-fill lookup timed out during startup. CATalyst
+  classified this as one non-critical service failure and retained wallet-RPC
+  fill detection; it did not weaken price or transaction authority.
+- A fresh live cycle replaced the expired confidence snapshot. Dexie evidence
+  was current, but confidence remained RED because out-of-range depth was
+  excluded, ask-side independent depth remained insufficient, and only one
+  provider supplied usable price evidence. Splash had an empty offer set and
+  the other evidence sources supplied no current independent executable price.
+- Two loops completed with zero errors, zero buy/sell offers, zero XCH/CAT
+  locks, and no wallet mutation. The bot was then stopped through the GUI.
+  Authoritative `/api/status` confirmed `running=false`, zero pending
+  cancellations, zero unresolved operations/reservations/publications, and
+  `runtime_safety.allowed=true`.
+- Result: the live offer-cycle gate remains externally blocked by genuine
+  market evidence after an active retry. Permission, wallet readiness, fee
+  consent, application startup, and Coin Prep are not the blocker.
+
+## Blocked-state audit — 24 September 2026 11:00 BST
+
+- A third consecutive goal audit re-read authoritative `/api/status` after the
+  fresh cycle. The candidate remained stopped on Sage/MZ wallet `2` with the
+  expected asset, two completed loops, zero errors, zero offers, zero XCH/CAT
+  locks, zero pending cancellations, and zero unresolved operations,
+  reservations, or publication claims. Runtime safety remained allowed.
+- The latest authoritative market log still stated: `No attributable trusted
+  offer-book price is available; new exposure and requotes remain blocked`.
+  There is no remaining independent test or code change that can create honest
+  live create/requote/cancel/remake evidence without an external market-state
+  change. The active goal is therefore blocked, not complete; all completed
+  fee-prep and package evidence remains valid and no safety gate was weakened.
+
+## Read-only receipt reconciliation — 24 September 2026 12:03 BST
+
+- Re-read the new native/operator and live acceptance receipts rather than
+  treating the earlier pending-operator checkpoint as current. Native success
+  remains operator-reported; it was not independently rerun in this audit.
+- The process listening on localhost:5000 was PID 72524, running the exact
+  `candidate-review-fixes-dns-20260923/dist/Catalyst/Catalyst.exe`. A fresh hash
+  matched `703E707F74977FEE071C93B0940FBEE665446C3620782B393A72DF229C990223`.
+- Fresh GETs of `/api/status` and `/api/coin-prep/status` independently
+  corroborated the recorded completed fee session: approval `cae3170f...`,
+  `15562944` mojos spent, two confirmed reservations, zero held/unresolved,
+  `session_completed=true`, and `dispatch_authorized=false`. Protected
+  cancellation remains `90207400` mojos; unused total budget is `386434280`.
+- Current status reported stopped, two loops and zero errors, no active buy
+  or sell offers, no locked XCH/CAT coins, no pending cancellations, and zero
+  runtime safety blockers. Selected MZ asset and CAT wallet ID 2 match the
+  target. The public fingerprint is hashed, so this read alone is not a new
+  full Sage identity attestation. No wallet action was attempted.
+- `/api/market/confidence` at `2026-09-24T12:03:06.592046+01:00` returned RED,
+  `data_valid=false`, and all creation/requote/exposure permissions false.
+  Its underlying assessment is from `2026-09-24T09:59:42.218421Z`, with the
+  recorded depth/provider reasons plus expired snapshot/evidence flags.
+  This confirms the current app gate, not a fresh external market survey;
+  stopped-runtime observations cannot prove the market has not changed.
+- The registered goal remains blocked, not complete. Native-result requests
+  must not be repeated. Only live offer lifecycle acceptance remains open;
+  no strategy/consent change, bot restart, transaction, push, merge or release
+  was performed during this reconciliation.
+
+## Public-book refresh without trading — 24 September 2026 13:05 BST
+
+- Inspected `/api/market/intel` and its order-book refresh path, then used
+  that existing GET endpoint while the bot remained stopped. It returned a
+  0.7-second-old book, six refreshes and zero book errors. Public display
+  source was `dexie_v3_orderbook`, best bid `0.00004` and ask `0.00011` XCH/MZ.
+  Its aggregate depth is not independently attributable eligible depth and
+  must not be used as authority to trade or replace the confidence policy.
+- The subsequent confidence read still denied creation/requotes: its policy
+  assessment remained the expired `2026-09-24T09:59:42.218421Z` snapshot. The
+  public-book refresh does not run or approve a new trading cycle.
+- Status remained stopped, two loops/zero errors, zero locks, zero runtime
+  blockers, and no own offers. Fee status stayed complete with `15562944`
+  mojos spent, two confirmations and zero held/unresolved. No wallet action,
+  settings change, fee approval or bot start was performed. This establishes
+  a read-only monitoring path, not a passed live offer-cycle gate.
+
+## Runtime unavailable — 24 September 2026, 13:03 UTC heartbeat
+
+- The status and public-market GETs to localhost:5000 were both connection
+  refused. A subsequent listener check found no port-5000 listener; the
+  expected `Catalyst` and `sage` processes were not found. This establishes
+  service unavailability, not whether shutdown was deliberate or a crash.
+- Failed GETs yielded no authoritative status. Null-derived placeholder
+  fields printed by the diagnostic wrapper, including offer counts, are
+  discarded; they do not describe the wallet or app. The last successful
+  status/fee observations remain the earlier recorded receipts.
+- Worktree HEAD is `29f893d`; the intervening temporary artifact-workflow
+  commits have no net tree difference from `5b54d94`. Tracked files were clean
+  before this note. No app or wallet was relaunched, no setting was changed,
+  and no wallet action occurred. Further local runtime observation needs the
+  tested candidate and Sage reopened; the native smoke test does not need
+  repeating. Live offer-cycle acceptance remains incomplete.
+
+## Live Bootstrap lifecycle acceptance — 25 September 2026
+
+- Relaunched the freshly rebuilt package and reverified Sage mainnet
+  fingerprint `736588221`, CAT wallet ID `2`, and exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`
+  before wallet mutation. The active campaign remained revision `0` of
+  `a6d5a1d32659ee250e9f7cf45bee19c4320748dd9644bf776f04fff3ea8fa2ac`:
+  anchor `0.000075 XCH/MZ`, corridor `0.0000375-0.00015`, one-day expiry,
+  budgets `1 XCH / 10000 MZ / 0.001 XCH fees`, subsidy disabled, 10% stage.
+- Genuine GUI approval bound Coin Prep to approval
+  `66cb34a8c79f881cb1c2332954f9e67c61e0ba5c0b42ebf08164a061acaac096`.
+  The displayed cap was `0.000040060559 XCH`, including a protected
+  `0.000011111490 XCH` cancellation allowance. Two exact operations confirmed
+  for `0.000008563369 XCH` total actual fee, with 66 targets, zero held fee,
+  and zero unresolved operations.
+- A post-completion UI defect was reproduced: because the campaign approval
+  deliberately remains `paused_budget` to retain cancellation cover, the
+  browser reopened the fee-recovery view even though Coin Prep status was
+  complete. Two Chromium regressions were added first and failed. The minimal
+  fix gives authoritative `complete=true` / `phase=complete` priority over an
+  overlapping active approval in both initial restoration and live recovery
+  controls. The focused regressions then passed, the full fee browser file
+  passed `26/26`, and 104 related backend/API/lifecycle tests passed.
+- Fresh Windows build SHA-256:
+  `DD9971CD19890E728D32459E9CFC63C7016DE06D642BBA52D49DC65667BA20DC`.
+  Packaged API, Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all passed. Restarting that
+  exact EXE restored Coin Prep as complete and enabled Start Bot without a
+  duplicate preparation transaction.
+- The first live Bootstrap start created exactly six bounded offers: three
+  buys totalling `0.1000 XCH` at `0.0000675`, `0.00007125`, and `0.0000735`;
+  three sells totalling `1000.00 MZ` at `0.0000765`, `0.00007875`, and
+  `0.0000825`. All six were exactly rediscovered by Dexie. Splash submission
+  acknowledgement remained provisional: exact Splash rediscovery was pending
+  and daemon observations included `InsufficientPeers`. It is not counted as
+  authoritative Splash publication acceptance. RED Follow confidence did not
+  suppress the explicitly bounded Bootstrap book.
+- The bot was stopped, then GUI Cancel All processed the book in two balanced
+  batches. CATalyst remained fail-closed with `UNRESOLVED_OPERATIONS` while
+  Sage proof was pending, advanced from `0/6` to `3/6`, and completed only at
+  `6/6` authoritatively terminal, zero failures. Wallet locks then read zero
+  XCH and zero CAT, and runtime safety returned to allowed with zero unresolved
+  operations, reservations, or publications. Subsequent audit proved that the
+  dashboard invoked the generic manual cancellation path, not the campaign's
+  protected approval path. The two confirmed native batches each spent
+  `864000000` mojos, so this operation is defect evidence rather than a passing
+  protected-cancellation acceptance result.
+- The same saved settings were revalidated. Coin Prep correctly reused the
+  already prepared denominations without a new preparation or approval. A
+  second live start remade the exact six-offer book; the first four loops each
+  completed with 3 buys / 3 sells, zero errors, zero pending cancellations,
+  exact Dexie rediscovery for all six offers. Current locks are the intended
+  `0.1000 XCH` and `1000.00 MZ`. CATalyst was then terminated without another
+  cancellation, leaving these offers live while fee safety is repaired.
+- Durable reconciliation now attributes `1728000000` cancellation mojos plus
+  `8563369` Coin Prep mojos to the campaign: `0.001736563369 XCH` total against
+  its displayed `0.001 XCH` campaign fee budget. The materialized campaign row
+  incorrectly remained `fee_spent_xch=0`, and its Coin Prep approval still
+  showed the protected allowance untouched. This is a release-blocking fee
+  accounting and enforcement defect; the live create/cancel/remake gate is not
+  closed.
+- Focused red regressions reproduce both failures: campaign status ignored
+  authoritative fee evidence, and generic Cancel All dispatched a
+  `678000000`-mojo mock cancellation under a `500000000`-mojo campaign cap.
+  The repair derives campaign spend from confirmed non-cancellation approval
+  outcomes plus deduplicated authoritative cancellation cohorts, automatically
+  binds every campaign-owned cancellation path to the latest explicit approval,
+  checks the fixed campaign fee budget after exact pricing, and keeps campaign
+  authority active until protected cancellation has been reserved. No further
+  live fee-bearing action is permitted until full regression/package evidence
+  is green and a genuine displayed recovery budget is available.
+
+### Recovery-budget correction — 25 September 2026
+
+- The journal-proven `0.001736563369 XCH` historical campaign spend now enters
+  the exact approval scope as cumulative spent fee. The immutable original
+  `0.001 XCH` campaign budget is preserved rather than silently rewritten.
+- A fresh read-only preview discloses that prior spend and prices recovery
+  against current unsigned CLVM cost and network guidance. Only deliberate
+  confirmation creates a newer append-only approval whose displayed cumulative
+  ceiling can exceed the original campaign budget.
+- Exact cancellation and its atomic reservation both count the journal-only
+  historical difference. The old approval remains blocked; direct and
+  concurrent callers cannot reuse the missing-accounting gap.
+- Red-first tests covered historical disclosure and explicit renewed-ceiling
+  recovery. Current focused evidence: cancellation journal **121 passed**;
+  Bootstrap/cancellation/API/lifecycle **89 passed**; approval-ledger,
+  restart, confirmation and dispatch **176 passed**; Chromium fee workflow
+  **26 passed**; Ruff passed.
+- The app remains stopped and the second six-offer wave remains live pending a
+  fresh package and genuine confirmation of the displayed recovery ceiling.
+  No additional wallet effect occurred during this correction.
+
+### Full regression and package checkpoint — 25 September 2026
+
+- Added explicit stopped-campaign cleanup recovery: a stopped campaign with
+  campaign-owned live offers may obtain a new read-only cancellation quote,
+  while ordinary offer creation remains blocked. Recovery accepts only the
+  single stop-induced revision increment over the frozen approved revision;
+  it does not mutate the original campaign cap or create spend authority.
+- Removed two whole-suite isolation hazards. Fee-estimation tests now block
+  accidental Coinset access when switching to auto mode, and cancellation
+  journal tests pin every lazily imported reconciliation/database dependency
+  to their isolated test graph. The previously ordering-dependent proof-only
+  cancellation failure was reproduced at 37%, fixed in the fixture, and then
+  cleared under the complete suite order.
+- Combined stopped-renewal/recovery/Bootstrap integration tests: **9 passed**.
+  Complete Python suite: **7009 passed, 160 skipped, 422 subtests passed** in
+  1089.53 seconds. Full Ruff check passed. Chromium E2E with `--e2e`:
+  **159 passed** in 72.40 seconds.
+- Fresh Windows build succeeded. The exact unpackaged working-tree executable
+  is `dist/Catalyst/Catalyst.exe`, SHA-256
+  `6C3B69255833CDC5D9B86318FC4E71C928EA9956F920A39D249D1F0855D675B3`.
+  Packaged API, mock Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all passed.
+- Source base HEAD is
+  `45f3df8505fb966b921df32791e8459a10d24cc1`; the candidate also contains the
+  tracked working-tree corrections listed above, so this hash is provenance,
+  not yet a final handoff commit identity. No merge or release occurred.
+- No wallet action occurred during this checkpoint. The app remains stopped
+  and the existing second-wave offers were deliberately left untouched. Live
+  recovery still requires fresh TEST 7 identity verification and genuine
+  confirmation of the displayed cancellation-recovery fee ceiling through the
+  implemented workflow.
+
+### Automatic-stop recovery correction and superseding package — 25 September 2026
+
+- Live readback exposed the exact automatic-stop representation as campaign
+  `status=active`, `stage=stopped`, revision `approved_revision + 1`. Recovery
+  had recognized only `status=stopped`, so the read-only fee preview returned
+  `FEE_PREVIEW_UNAVAILABLE` and recovery readback returned
+  `FEE_APPROVAL_STALE`. Red-first regressions reproduce both failures.
+- The recovery predicate now accepts this exact automatic-stop shape while
+  retaining the one-revision bound, frozen plan identity and original campaign
+  cap. It grants no dispatch authority and ordinary Coin Prep remains blocked.
+  Focused stopped-renewal, recovery-policy and Bootstrap integration evidence:
+  **11 passed**.
+- Superseding complete Python suite: **7011 passed, 160 skipped, 422 subtests
+  passed** in 1117.30 seconds. Full Ruff check passed. Chromium E2E with
+  `--e2e`: **159 passed** in 93.04 seconds.
+- A fresh Windows build completed after the old packaged process was verified
+  and stopped. Exact executable: `dist/Catalyst/Catalyst.exe`; SHA-256
+  `768CDE4B55B3335CB2652F10A455FB5FAAA0E4DB0ABF6FD43CBF561CFD26FD3B`.
+  Packaged API, mock Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all passed against this build.
+- Source base HEAD is
+  `c404f5082b9cd1d473b5202c16737d30891e2088`; tracked working-tree corrections
+  remain uncommitted, so this remains test evidence rather than immutable final
+  handoff provenance. No merge or release occurred.
+- No wallet effect occurred during this correction or its automated/package
+  verification. The six second-wave offers remain live and the bot remains
+  stopped pending exact TEST 7 identity verification and genuine confirmation
+  of the displayed recovery ceiling.
+
+### Live protected cancellation, status repair, and final package — 25 September 2026
+
+- The refreshed recovery quote disclosed a cumulative maximum of
+  `0.001746988850 XCH`, including `0.001736563369 XCH` prior authoritative
+  spend and `0.000011111490 XCH` protected cancellation allowance. The quote
+  used fresh Coinset guidance for the default 300-second target. The operator
+  approved this exact displayed ceiling through the implemented workflow; no
+  blanket or fabricated approval record was used.
+- Generic Cancel All first failed closed against the old cap with
+  `FEE_CAMPAIGN_BUDGET_EXCEEDED` and produced zero effects. After the renewed
+  approval and the separate explicit Cancel Offers confirmation, all six live
+  offers reached authoritative terminal state in two batches: **6/6 terminal,
+  0 pending, 0 failures**. Post-operation reconciliation found zero open buy
+  or sell offers, zero wallet-only/stale offers, zero XCH/MZ locks, zero held
+  fees and zero unresolved operations. The cancellation increased cumulative
+  spend by only `0.000000402346 XCH`, to `0.001736965715 XCH`, below the
+  displayed approved ceiling. The bot remained stopped.
+- Restart readback exposed a reporting defect: `/api/coin-prep/status` selected
+  the completed worker's older approval instead of the latest immutable
+  campaign renewal. A red-first endpoint regression reproduced the mismatch.
+  The endpoint now resolves the latest approval for the active Bootstrap
+  campaign before materializing fee accounting. Focused post-fix verification:
+  **3 passed**; broader approval/recovery group: **182 passed**; Ruff and diff
+  checks passed.
+- Superseding complete Python suite: **7042 passed, 165 skipped, 422 subtests
+  passed** in 1821.60 seconds. Complete real-Chromium E2E: **164 passed** in
+  124.07 seconds.
+- A fresh Windows build completed after the exact prior packaged PID was
+  verified and stopped. Exact executable: `dist/Catalyst/Catalyst.exe`;
+  SHA-256
+  `5B3D259964A8537D214E150F853B19B99ED6297D96A00B247F1E97BBFA07F6D4`.
+  Packaged API, mock Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all passed.
+- Real-profile restart of that exact executable returned health `ok`, version
+  `1.4.0`, zero open offers, and the correct latest approval
+  `fe95e93d02ebe2b73650b61f4f590c57606766b77ab23961e228dea47328d8df`
+  at version 3. Its durable accounting is total `1746988850`, spent
+  `1736965715`, held `0`, remaining `10023135` mojos, `stale=false`, and zero
+  unresolved operations. Sage RPC is authenticated and listening; configured
+  identity remains TEST 7, CAT wallet 2 and the authorized MZ asset.
+- Market publication remains legitimately fail-closed while confidence is RED
+  (insufficient attributable in-range ask depth and provider independence).
+  The saved pre-fee strategy still exceeds available MZ and was neither
+  silently resized nor activated. No merge or release occurred.
+
+### Fresh confidence and live start/stop gate — 25 September 2026
+
+- The exact final package was connected through the normal GUI workflow to
+  Sage mainnet fingerprint `736588221`, CAT wallet 2 and the authorized MZ
+  asset. Splash was started locally and the configured Spacescan credential
+  was accepted through the existing startup flow. Coin Prep remained complete;
+  no new fee approval or wallet spend was requested.
+- After explicit operator confirmation, live Start passed all ten preflight
+  checks. Startup reconciliation found zero wallet or database offers, runtime
+  safety was allowed, and the first two 45-second cycles completed with zero
+  errors.
+- The running bot replaced the stale snapshot with fresh attributable evidence
+  at `2026-09-25T22:31:37.43154Z`. The decision remained **RED** for the current
+  substantive reasons `out_of_range_depth_excluded`, `insufficient_ask_depth`
+  and `single_provider_dependency`; the running UI showed Dexie evidence valid,
+  Splash degraded because its offer set was empty, all exposure withdrawn, and
+  `can_create=false`, `can_requote=false`.
+- CATalyst therefore created no offers and attempted no requote. The bot was
+  stopped normally after the fresh decision. Final readback: running false,
+  two loops, zero errors, zero open offers, zero XCH/CAT locks and runtime
+  safety allowed. Once stopped, the short-lived evidence correctly aged back
+  to fail-closed expired status; this does not alter the fresh-cycle proof.
+
+### Terminal-campaign approval status correction — 26 September 2026
+
+- Read-only monitoring after the fresh start/stop cycle exposed one remaining
+  status-only defect: once the completed Bootstrap campaign left the active
+  campaign list, `/api/coin-prep/status` fell back to the worker's superseded
+  version-2 approval and displayed a misleading negative remaining amount.
+  Durable spend, holds and wallet safety were unaffected.
+- A red-first regression reproduces the terminal-campaign transition. Status
+  now follows the worker approval's durable campaign identity to the latest
+  immutable renewal even when no active campaign row remains.
+- Focused renewal/status checks: **4 passed**. Broader approval, recovery and
+  ledger group: **183 passed**. Superseding complete Python suite: **7043
+  passed, 165 skipped, 422 subtests passed** in 1556.10 seconds. Ruff and diff
+  checks passed.
+- Fresh Windows build and packaged API, mock Sage RPC, upgrade/publication
+  recovery and native clean/duplicate/persisted/safety smokes all passed.
+  Exact executable SHA-256:
+  `0F5E3A29C4B5AEA2285E22E23E157F191B07E27B7DCEFB01A0F2A7E322FDF224`.
+- Real-profile restart now reports renewal
+  `fe95e93d02ebe2b73650b61f4f590c57606766b77ab23961e228dea47328d8df`,
+  version 3, total `1746988850`, spent `1736965715`, held `0`, remaining
+  `10023135`, `stale=false`, zero unresolved operations and zero open offers.
+
+### Combined secondary-fix integration candidate — 27 September 2026
+
+- PR #223 (standard Coin Prep must ignore retired sniper-tier query hints) and
+  PR #225 (restart status must use durable campaign provenance instead of
+  inferring Bootstrap from offer-tier sizes) were independently reproduced
+  red-first on the primary PC, reviewed, and integrated into the feature
+  branch only. No merge to `main` and no release occurred.
+- The exact combined source identity is
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca`; local HEAD and
+  `github/codex/coin-prep-fee-approval` resolved to that same full SHA after
+  push. The tracked worktree was clean.
+- Primary affected regression group: **165 passed**. Superseding complete
+  Python suite: **7047 passed, 165 skipped, 422 subtests passed** in 1061.59
+  seconds. Complete real-Chromium E2E: **164 passed** in 99.17 seconds. Ruff
+  and `git diff --check` passed.
+- A fresh Windows build from that exact SHA passed after the exact stale
+  packaged PID holding the previous `dist` DLL was identified and stopped.
+  Packaged API (nine endpoint checks), synthetic mTLS Sage RPC,
+  interrupted-publication recovery, and native
+  clean/duplicate/persisted/safety launch smokes all exited successfully.
+- Bandit scanned 162,993 lines under the repository's configured policy with
+  zero medium- or high-severity findings. The completed archive was then
+  extracted independently: its executable reproduced the expected hash and
+  the extracted package passed the full nine-endpoint packaged API smoke.
+- Exact executable: `dist/Catalyst/Catalyst.exe`; SHA-256
+  `8E109AD62089C5DD5E8C729AF7C363F3D6745BD07BC0D0980531F77620C5D568`.
+  Immutable handoff archive:
+  `CATalyst-9bbf972-primary-acceptance.zip`; SHA-256
+  `E1D773FC88698B7B41AE542685174A41A7EB733265DA8F4881210B782D92326A`.
+- The secondary PC was instructed to fetch and independently retest this
+  exact combined SHA, commit and push its evidence checkpoint, and remain the
+  sole live-wallet owner during the cross-PC run. Its complete combined-SHA
+  result is still pending and is not represented as passed here.
+- Existing live-market limitations remain legitimate acceptance facts rather
+  than bypass candidates: confidence is RED for excluded out-of-range depth,
+  insufficient attributable ask depth, and single-provider dependency. The
+  saved pre-fee strategy remains preserved and inactive because it exceeds
+  available MZ.
+
+### Cross-PC checkpoint integration and fresh primary live cycle — 27 September 2026
+
+- The secondary PC independently verified production candidate
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca` and pushed evidence head
+  `35d70f77b63dd3074c02bb11fdeb2e26e41a30f8`. Primary review confirmed the
+  exact base ancestry, evidence-only one-file diff and clean diff check before
+  cherry-picking both commits. The secondary then fetched final integration
+  head `0b1c7765f4859ebc8867e7a3b84bd49f5e42491a`, verified that all four
+  post-production commits were evidence-only, reproduced a clean range diff,
+  and matched the integrated secondary evidence content hash exactly.
+- The exact primary package built from `9bbf972` was restarted in Flask mode
+  after its executable hash was rechecked as
+  `8E109AD62089C5DD5E8C729AF7C363F3D6745BD07BC0D0980531F77620C5D568`.
+  Health returned v1.4.0 with the bot stopped. The normal protected startup
+  flow listed and selected TEST 7, then freshly verified Sage 0.13.0 healthy,
+  mainnet fingerprint `736588221`, CAT wallet 2 and the exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- One authorized Start/Stop cycle completed two live loops with zero errors.
+  Fresh confidence snapshots at `2026-09-27T11:52:29.978368Z`,
+  `2026-09-27T11:52:57.670337Z` and `2026-09-27T11:53:14.941879Z` remained
+  RED for the substantive reasons `out_of_range_depth_excluded`,
+  `insufficient_ask_depth` and `single_provider_dependency`. At every readback
+  `can_create=false` and `can_requote=false`; CATalyst correctly created no
+  buy or sell offer.
+- Normal Stop returned `stopped`. Final readback showed running false, two
+  loops, zero errors, zero open offers, zero XCH/CAT locks, runtime safety
+  allowed, Coin Prep complete, zero held fee mojos and zero unresolved fee
+  operations. No wallet transaction or fee spend occurred in this cycle.
+- Campaign-managed approval `fe95e93d...` remains conservatively resumable by
+  design: Bootstrap completion proves frozen targets but intentionally does
+  not create a standalone session-completion record, preserving protected
+  cancellation allowance. This explains `state=approved` and
+  `fee_resume_required=true`; it is not an unresolved-effect or accounting
+  defect.
+- Live create/publication/requote/remake remains unexecuted on this integrated
+  candidate because the authoritative market gate is freshly RED. That gate
+  must not be bypassed and remains the only substantive external live-cycle
+  limitation. No merge to `main` and no release occurred.
+
+### Final-SHA cross-PC lifecycle audit — 27 September 2026
+
+- Both machines fetched and verified exact integration head
+  `cf7ea04605a295f67a59b3e76ccbef489c9949d3`. Production source
+  `9bbf972a9e8b0b6459e67f483080dc487993a7ca` is its ancestor and every later
+  change is confined to the two acceptance-evidence files; the range passes
+  `git diff --check`.
+- The secondary PC reverified Sage 0.13.0 mainnet, its authorized Harvestr
+  test wallet fingerprint `3702373391`, CAT wallet 2 and the exact MZ asset,
+  then performed a read-only Smart Settings/Market Intel refresh. At
+  `2026-09-27T12:04:16.036623Z` confidence remained RED with
+  `can_create=false`, `can_requote=false`, provider redundancy 1 and reasons
+  `out_of_range_depth_excluded`, `insufficient_ask_depth` and
+  `single_provider_dependency`. Dexie evidence was fresh; Splash returned an
+  empty offer set and its local API was unavailable. The app shut down with
+  zero CATalyst processes. No wallet mutation, fee, offer or bot start
+  occurred.
+- The independent campaign-completion audit confirmed that
+  `fee_resume_required=true` with top-level Coin Prep `complete=true` is
+  intentional campaign-managed cancellation protection, not an unresolved
+  accounting effect. Secondary ran the five exact design/source/UI boundary
+  tests successfully. Primary independently reran the three non-browser
+  boundaries successfully; the two browser boundaries are already covered by
+  the green 164-case Chromium suite on each PC.
+- Primary reran a focused lifecycle slice spanning confirmation through
+  cancel/restart, publication gating, Bootstrap requote routing, campaign fee
+  caps, atomic competing holds, no-effect retry accounting, cancellation
+  crash recovery and protected-fee startup recovery: 18 parametrized cases
+  passed in 8.57 seconds.
+- A deeper secondary requirement-to-source-to-test audit of live-blocked
+  create/publication/requote/cancel/remake paths is in progress. Its result is
+  not represented as complete here. Live lifecycle acceptance therefore
+  remains open behind the same external RED market gate; no safety gate was
+  bypassed and no merge or release occurred.
+- Immediately before another authorized primary cycle, the live package
+  listed TEST 7 fingerprint `736588221`, reported Sage synced, and bound CAT
+  wallet 2 to the exact MZ asset. The normal cookie-authenticated Start API
+  then completed one fresh loop and Stop returned `stopped`. Final status was
+  running false, errors zero, zero open offers, zero XCH/CAT locks, zero
+  pending cancellations and no runtime-safety blocker.
+- The cycle produced a fresh confidence snapshot at
+  `2026-09-27T12:19:38.618715Z`: Dexie evidence was valid and fresh, Splash
+  was degraded with `empty_offer_set`, provider redundancy was 1, and state
+  remained RED for `out_of_range_depth_excluded`,
+  `insufficient_ask_depth` and `single_provider_dependency`. Both
+  `can_create` and `can_requote` remained false, so no offer, cancellation,
+  fee or other wallet effect was attempted.
+
+### Integrated lifecycle-audit receipt and another live gate cycle — 27 September 2026
+
+- Primary reviewed secondary evidence commit
+  `43804baf127946fe8bcda7893e669b5ba5d41c06`: it descended from the prior
+  secondary checkpoint, changed only the secondary acceptance evidence file,
+  and passed `git diff --check`. The checkpoint records **47 passed** focused
+  create/publication/requote/remake/cancellation/restart/atomic-ledger/bypass
+  tests in 20.87 seconds and found no production defect or genuine automated
+  safety-coverage gap. It was integrated and pushed as feature head
+  `464ef56213618b7e525dc4ab811ae1b1b425e8cb`.
+- Before another primary wallet-aware cycle, the package freshly listed TEST 7
+  fingerprint `736588221` and bound CAT wallet 2 to exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+  The normal cookie-authenticated Start endpoint succeeded; startup reconciled
+  zero open buys, zero open sells and zero unknown offers. Stop completed
+  cleanly after two loops.
+- The fresh confidence snapshot at `2026-09-27T12:27:46.251673Z` remained RED
+  with Dexie valid, Splash unavailable, provider redundancy 1, and reasons
+  `out_of_range_depth_excluded`, `insufficient_ask_depth` and
+  `single_provider_dependency`. `can_create=false` and `can_requote=false`, so
+  no offer, cancellation, fee or other wallet effect occurred.
+- Final status was running false, errors zero, zero open offers, zero locked
+  XCH/CAT, zero pending cancellation and runtime safety allowed with no
+  unresolved operations, reservations, publication claims or prepared
+  creations. The stopped-bot status response's top-level zero balance fields
+  were investigated: they are intentional read-only polling placeholders, not
+  wallet evidence. Verified balances remain protected by the balance snapshot
+  cache and frontend merge logic; exact regressions cover transient-zero
+  preservation.
+
+### Splash provider-redundancy diagnostic — 27 September 2026
+
+- Primary verified the bundled Splash binary SHA-256 as
+  `52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8` and
+  version `0.2.0`, matching the current upstream Splash release used by the
+  package. An isolated instance on alternate ports started normally, announced
+  local listen addresses, and served valid JSON from `/`, `/metrics` and
+  `/health`; each reported zero peers, zero total connections and zero offers.
+- The official `_dnsaddr.splash.dexie.space` TXT introducer resolved normally
+  to four advertised peers. Both advertised IPv4 TCP endpoints were
+  unreachable from the primary PC, and the primary host had no IPv6 default
+  route for the remaining two peers. After more than 40 seconds the isolated
+  daemon still had zero connections; it was then stopped cleanly with no
+  wallet or CATalyst effect.
+- This locates the primary zero-peer condition before CATalyst's offer-hook or
+  evidence-normalization boundaries. A separate secondary-PC diagnostic did
+  connect the same v0.2.0 transport to an introducer-derived peer, ruling out a
+  universal packaged-binary or launch-command defect. The remaining primary
+  limitation is host/network reachability, while an empty Splash gossip stream
+  remains legitimate degraded evidence rather than permission to fabricate
+  provider redundancy.
+- Primary independently reran ten exact Splash adapter, health-alert and UI
+  boundary regressions covering normalized peer health, future-dated evidence
+  rejection, zero-peer degradation, metrics reachability, hook failure,
+  sparse-gossip disclosure and stopped-listener presentation; all ten passed
+  in 0.64 seconds. An initial command used the wrong unittest class qualifier
+  and collected no cases; the corrected selectors produced this result.
+
+### Bounded Market Bootstrap review and fee-boundary regression — 27 September 2026
+
+- Through the normal browser workflow, primary selected the exact TEST 7 MZ
+  pair, Bootstrap authority, two-sided operation, 10% XCH and MZ reserves and
+  the Balanced profile. The review was bounded to anchor `0.000075 XCH/MZ`,
+  one-day expiry, `0.9 XCH`, `12,000 MZ`, a maximum `0.001 XCH` fee budget,
+  and three buy plus three sell offers.
+- The exact 64-character asset confirmation was supplied and Preview returned
+  `REVIEW ONLY — no wallet action` for asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  fixed corridor `0.0000375–0.00015`, and first stage 10%. Start Campaign was
+  enabled, but was deliberately not invoked without the required action-time
+  confirmation of that displayed plan and fee ceiling. No offer, fee, wallet
+  mutation or campaign row was created by this preview.
+- Primary independently reran the focused Bootstrap API/UI, campaign
+  persistence, stopped-campaign renewal, cancellation-budget, recovery stop,
+  recovery invariant, mutation gate, Coin Prep integration, fee-approval
+  ledger and fee-recovery suites. The fresh result was **88 passed in 37.27
+  seconds** with exit code 0.
+- Primary then ran the complete real-Chromium Coin Prep fee-approval E2E file
+  with `--e2e`: **28 passed in 20.72 seconds**. This covers lossless displayed
+  quote evidence, quote age and expiry, recorded confirmation before launch,
+  unavailable-provider fail-closed behavior, renewal and cumulative caps,
+  cancellation forwarding, native bridge parity, restart accounting,
+  no-effect completion precedence, and deliberate recovery review.
+- Secondary was assigned a complementary non-wallet audit against exact
+  feature head `0253134e64b4f389767d7aee718f0743590afbef`, covering Bootstrap
+  start gating, approval persistence and bypass resistance, protected
+  cancellation allowance, and restart recovery. Its new checkpoint is still
+  in progress and is not represented as complete here.
+
+### Fresh full primary regression — 27 September 2026
+
+- After integrating the secondary final-head safety checkpoint, primary ran
+  `python -m pytest -q tests` from the exact integrated feature branch. The
+  complete result was **7,047 passed, 165 skipped, 422 subtests passed in
+  933.30 seconds (15:33)** with exit code 0.
+- The run used pytest's isolated temporary data directory. Expected warnings
+  exercised fail-closed lease, recovery and authoritative-reconciliation test
+  paths; no test failed and the preserved live TEST 7 Bootstrap review was not
+  submitted or mutated by the suite.
+- A fresh repository-wide `python -m ruff check .` completed immediately after
+  the full suite with `All checks passed!` and exit code 0.
+
+### Exact-head Windows package verification — 27 September 2026
+
+- Primary created an isolated detached worktree at exact feature head
+  `a6bf486c36ded5a1eb11d3d95b5eee380be9fb1c`, preserving the running live
+  package and its user data. `python build.py` completed successfully with
+  PyInstaller 6.21.0 on Python 3.12.6 and verified bundled HTML and certifi CA
+  assets.
+- The fresh executable is
+  `C:\catalyst\.superpowers\build-a6bf486\dist\Catalyst\Catalyst.exe`, with
+  SHA-256
+  `160D52D1593D03F2C99880A20166A22B08DDB78660D198962DAB29C27A175619`.
+- Against that exact executable, packaged API smoke passed all health,
+  Sage-running, startup, configuration, diagnostics, self-test and doctor
+  routes; packaged Sage-RPC worker smoke passed; upgrade/publication recovery
+  smoke passed; and the native desktop smoke passed clean-profile, duplicate
+  handoff, persisted-profile relaunch and startup-safety launches.
+- All package smokes exited 0. They used isolated profiles or mocked Sage RPC;
+  they did not act on TEST 7, approve a fee, create an offer or mutate the
+  preserved live Bootstrap review.
+
+### Confirmed live Bootstrap, Coin Prep and recovery cycle — 27 September 2026
+
+- The operator confirmed the displayed bounded Bootstrap campaign through the
+  normal browser workflow. CATalyst durably created campaign
+  `aaf64855aef9e1919d7cdfd4b15c1f589e7acf9321d71787b0b8122df9e16405`
+  at revision 0 for exact MZ asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  Sage fingerprint `736588221`, CAT wallet 2 and mainnet. The plan remained
+  bounded to anchor `0.000075`, corridor `0.0000375–0.00015`, one-day expiry,
+  `0.9 XCH`, `12,000 MZ`, maximum campaign fees `0.001 XCH`, and a 10% first
+  stage with three buys plus three sells.
+- The fresh Coinset quote targeted 300-second inclusion per transaction and
+  displayed two preparation transactions, one exact plus three projected cost
+  records, `0.000250212184 XCH` cumulative maximum and
+  `0.00006940005 XCH` protected cancellation allowance. The UI separately
+  identified `0.006 XCH` fee-coin principal as prepared principal, not fees.
+  The operator confirmed that exact displayed cap and preserved all historical
+  fills, P&L, offers and runtime evidence.
+- Coin Prep ran through the normal UI. The first authoritative settlement moved
+  `0.000041494074 XCH` from held to confirmed spent; final confirmed spend was
+  `0.00005348811 XCH`, with no held fee remaining. The worker closed the fee
+  scope from authoritative target and journal evidence with 66 targets and two
+  operations. Final readiness was **36/36 XCH** and **30/30 MZ** campaign coins;
+  the wallet showed 218 XCH coins and 99 MZ coins including reserves.
+- Start Bot completed its wallet reconciliation and created exactly six live
+  campaign offers: three buy and three sell. Two full loops completed with zero
+  errors. The active stage locked exactly `0.09 XCH` and `1,200 MZ`; offer rows
+  showed Dexie publication success and exact Dexie rediscovery. Splash remained
+  degraded with `InsufficientPeers`, which was disclosed without weakening the
+  RED confidence gate or interrupting bounded Bootstrap execution.
+- Primary then exercised the authorized stop/cancel/recovery path. Stop completed
+  cleanly after the current cycle. Cancel All used the protected fee workflow,
+  kept restart blocked while operations were unresolved, progressed from 0/6 to
+  3/6 and finally **6/6 authoritatively terminal with zero failures**. Locked
+  inventory returned to zero and Start remained unavailable until the final
+  Sage proof arrived.
+- After terminal reconciliation, primary restarted the same campaign. Wallet
+  reconciliation found zero unknown/open offers, and two new loops recreated
+  exactly three buy plus three sell offers with the same `0.09 XCH` and
+  `1,200 MZ` stage locks. At the checkpoint the bot was RUNNING, errors were
+  zero, campaign revision remained 0, and the RED Follow-market confidence gate
+  remained intact while bounded Bootstrap offers stayed active.
+
+### Exact integrated-head verification and live restart recovery — 27 September 2026
+
+- The authoritative feature head is
+  `60d49f2cf9822d9b8700b1391f75dcec54297c75` (`Remove optional Chia address
+  dependency`). The correction replaces accidental runtime and test reliance
+  on optional `chia.util.bech32m` with CATalyst's audited bundled Bech32m
+  primitives. Focused red/green coverage proved canonical XCH/txch vectors,
+  Dexie reward-address handling and Sage-owned puzzle-hash recovery with the
+  optional Chia package unavailable. The final focused result was 29 passed;
+  the exact former CI surface passed 254 tests with `chia` forced unavailable.
+- GitHub Code Quality, Deep Security Scan, CodeQL for Python/JavaScript/actions,
+  Semgrep and Gitleaks all passed at this exact head. Primary's clean full suite
+  passed **7,062 tests, skipped 166, and passed 422 subtests in 1,044.59
+  seconds**. The complete real-Chromium E2E suite passed **165 tests in 83.76
+  seconds**. Tracked Ruff check and format verification passed all 478 tracked
+  Python files, and no direct `chia.util.bech32m` import remains in application
+  or test code.
+- Primary built an isolated clean Windows package from that exact commit at
+  `C:\catalyst\.superpowers\public-ready-60d49f2`. The executable SHA-256 is
+  `522D5748AC0585AC5F93953606EBFF938BF05C1324D9B3B600DECF5E020A1E3C`.
+  `CATalyst-60d49f2-public-ready.zip` contains 192 files, is 37,309,261 bytes,
+  and has SHA-256
+  `46E978AA0F39D0D37976D633CE12298BBF4F1AEC6C3142982D6B5DC0E9265FD0`.
+  The extracted executable hash matched. The archive contains no runtime
+  `.env`, database/SQLite, log or Coin Prep state artifacts. Packaged API,
+  synthetic Sage RPC, upgrade/publication recovery, and native
+  clean/duplicate/persisted/safety smokes all passed. Current Microsoft
+  Defender reported zero active threats and zero recent detections for the
+  candidate; historical Defender records were not misrepresented as empty.
+- Primary shut down the prior package through its normal UI with `Cancel all
+  offers before shutdown` visibly unchecked, then launched the exact-head
+  executable. This caused no wallet mutation. The recovered process owns port
+  5000 and reports Sage RPC authenticated and listening, mainnet MZ wallet 2,
+  the exact campaign and asset, fee spent 59,937,994 mojos, zero held fee,
+  zero unresolved operations, and runtime safety allowed with every blocker
+  count zero.
+- Exact-head readback then proved recovery of all six live offers rather than
+  relying on the stopped bot's compact status projection. `/api/offers` and
+  `/api/offers/open_count` report three buys plus three sells. The diagnostic
+  endpoint reports that wallet and DB agree, every live offer has a unique
+  non-reserve coin, no wallet-only/stale/pending-cancel rows exist, and local
+  book consistency is true. `/api/coins` reconstructs three XCH locks totalling
+  `0.09 XCH` and three MZ locks totalling `1,200 MZ`. Coin Prep verification is
+  sufficient and read-only. This closes exact-build restart recovery without
+  cancelling, replacing or duplicating any offer.
+- The secondary PC independently repeated the exact `60d49f2` verification in
+  a fresh Python 3.12.10 environment installed only from
+  `requirements-dev.txt`; `chia_rs` was present and the full `chia` package was
+  absent. Its full serial result was **7,062 passed, 166 skipped in 1,370.32
+  seconds**, and its full Chromium result was **165 passed in 117.44 seconds**.
+  Tracked Ruff check/format, compileall, diff check, the clean Windows build,
+  API/Sage/recovery/native smokes, prior-package upgrade/relaunch, archive
+  artifact scan and round-trip executable hash all passed. Its independent EXE
+  SHA-256 was
+  `E1BF66D4A976E158E9F9458D63B0933F820F4605377E2765D6F7DAAD2B510D66`;
+  its ZIP SHA-256 was
+  `08C40097DD440A2E8D7CBC50EBD3D2D1AB0B22568A9864831EDA386E09E71D8A`.
+  The independent receipt is
+  `evidence/2026-09-27-secondary-public-readiness-54a3aeb.md`. It performed no
+  live-wallet mutation; the primary live lane above remains authoritative.
+
+### Public-readiness review cleanup and exact candidate — 27 September 2026
+
+- The exact runtime candidate is
+  `d048f44cacd056abc9dbcc6fae3c588dc4c80e27`. It resolves the final verified
+  duplicate-import review findings without changing fee, wallet, offer or
+  campaign behavior: redundant local `re` imports were removed, Windows
+  `ctypes` imports were consolidated, and test imports were consolidated. The
+  final follow-up is one Ruff-required blank line. All review threads are
+  resolved and every GitHub lint, unit, CodeQL, Semgrep, Gitleaks and security
+  check passes.
+- Primary's complete serial suite passed **7,062 tests, skipped 166, and passed
+  422 subtests in 1,168.16 seconds**. A subsequent exact-head Bootstrap
+  end-to-end rerun passed 33 tests in 8.07 seconds. Tracked Ruff check and
+  format verification pass all 478 Python files; `git diff --check` passes.
+  The full real-Chromium suite passed **165 tests in 88.65 seconds**.
+- Primary built the detached exact candidate at
+  `C:\catalyst\.superpowers\public-ready-d048f44`. The executable SHA-256 is
+  `C200D870F3849A8D8D5E3541F5FBED5C7E36B95C5AD42A967DBCF4CF824CC200`.
+  `CATalyst-d048f44-public-ready.zip` contains 243 entries, is 36,580,312
+  bytes, and has SHA-256
+  `7C0984CCEB17F2A892F5CA74BF8E6CDD3563CE8C85B8EBD624303FBAC14CD01C`.
+  The extracted executable hash matches; the archive scan found zero runtime
+  `.env`, database, SQLite, log or Coin Prep state artifacts. Packaged API,
+  synthetic Sage RPC, interrupted-publication recovery and native
+  clean/duplicate/persisted/safety smokes all pass. Microsoft Defender real-time
+  protection was enabled and reported zero detections for this candidate.
+- Primary replaced only the prior CATalyst process after verifying it was idle.
+  The exact `d048f44` executable recovered mainnet Sage TEST 7 fingerprint
+  `736588221`, MZ wallet 2, exact asset
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+  three live buys plus three live sells, `0.09 XCH` and `1,200 MZ` locks,
+  runtime safety allowed and zero errors. No offer or wallet mutation occurred
+  during the handover. The real UI is staged at **Start Bot Now**; policy-bound
+  action-time confirmation remains required before it may resume transactions.
+- Secondary independently verified and built the same exact commit. Its focused
+  suite passed 168 tests; Ruff check/format, compileall, diff check, fresh build,
+  all packaged smokes, prior-package upgrade and archive round-trip passed. Its
+  executable SHA-256 is
+  `4FC2916E5079ED6B7194A2BFB0F6125DA97AD23AC15C8321F69EDF1DD6D96862`;
+  ZIP SHA-256 is
+  `99127BDC7FCCEF491E0A70DAA3B049D77B3081BDF28E07E2ED746D67FBEB2830`.
+  Its exact-candidate 24-hour clean window began at
+  `2026-09-27T21:30:14.8881775Z` and is monitored every 30 minutes.
+- **Unfinished gates:** both exact-candidate 24-hour clean windows have not yet
+  elapsed; exact-head live Start/Stop and any resulting requote/cancel/remake
+  transaction still require action-time confirmation through the real UI;
+  PR #220 therefore remains draft and neither `main` nor a release has been
+  changed.
+
+### Exact-candidate live resume preflight — 28 September 2026
+
+- The operator gave action-time confirmation for the visible **Start Bot Now**
+  control. Before the click, the UI and authenticated endpoints again proved
+  mainnet Sage fingerprint `736588221`, MZ wallet 2, the exact asset, three
+  buys plus three sells, zero pending cancellation, zero runtime errors, and an
+  allowed safety lease with every blocker count zero.
+- The exact `d048f44` package accepted the confirmed click and ran its normal
+  preflight. It did not silently resume or spend. Instead, it detected that the
+  active Bootstrap campaign's current output plan requires fresh Coin Prep and
+  opened the real fee-approval workflow. The six existing offers and their
+  `0.09 XCH` / `1,200 MZ` locks remained unchanged.
+- The first displayed estimate was correctly rejected as expired. A visible
+  **Refresh fee estimate** action made no wallet mutation and produced a fresh
+  Coinset-backed quote with the default 300-second target. The UI binds it to
+  Sage `736588221`, wallet 2, MZ/XCH and mainnet; shows two preparation
+  transactions; one exact and three projected cost components; fee funding of
+  `123.628039666446 XCH`; `0.000059937994 XCH` already spent and zero held; and
+  `0.006 XCH` fee-coin principal explicitly excluded from spent fees.
+- The refreshed remaining preparation estimate is `0.000997600557 XCH`, the
+  protected cancellation allowance is `0.00050514693 XCH`, and the proposed
+  cumulative maximum is `0.001057538551 XCH`. The final **Yes, Prepare Coins**
+  action remains untouched pending action-time approval of that exact cap. No
+  Coin Prep transaction or additional fee has been submitted.

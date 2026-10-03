@@ -831,6 +831,73 @@ def test_expired_heartbeat_cannot_resurrect_lease(isolated_gate_database):
         gate.require_allowed("offer.create")
 
 
+def test_heartbeat_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is True
+    lease = result["lease"]
+    heartbeat_at = datetime.fromisoformat(lease["heartbeat_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert heartbeat_at == post_lock
+    assert expires_at - heartbeat_at == timedelta(seconds=30)
+
+
+def test_acquire_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    gate = _gate(clock)
+
+    result = gate.acquire()
+
+    assert result["acquired"] is True
+    lease = result["lease"]
+    acquired_at = datetime.fromisoformat(lease["acquired_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert acquired_at == post_lock
+    assert expires_at - acquired_at == timedelta(seconds=30)
+
+
+def test_heartbeat_lock_wait_cannot_extend_already_expired_lease(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=21)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is False
+    assert result["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
 def test_concurrent_require_observes_process_fence_after_release(
     isolated_gate_database, monkeypatch
 ):
@@ -2593,6 +2660,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     """Desktop prep must reach wallet preflight, not lose its permit in Flask g."""
     import api_server
     import app_bridge
+    import coin_prep_fee_dispatch
     from blueprints import coin_prep
 
     _, clock = isolated_gate_database
@@ -2605,6 +2673,11 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     monkeypatch.setattr(api_server, "_coin_prep_proc", None)
     monkeypatch.setattr(api_server, "_coin_prep_thread", None)
     monkeypatch.setattr(api_server, "_coin_prep_state", {"running": False})
+    monkeypatch.setattr(
+        coin_prep_fee_dispatch,
+        "price_approved_prep_batch",
+        lambda _approval_id: {"available": True},
+    )
     # Stop at the external wallet boundary: no wallet calls, resets or worker.
     monkeypatch.setattr(
         coin_prep,
@@ -2612,7 +2685,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
         lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
     )
 
-    result = app_bridge.AppBridge().trigger_coin_prep()
+    result = app_bridge.AppBridge().trigger_coin_prep({"fee_approval_id": "a" * 64})
 
     assert result["error"] == "coin_prep_wallet_offer_check_unavailable"
     assert result["reason"] == "WALLET_OFFER_BOOK_UNAVAILABLE"
@@ -5557,6 +5630,154 @@ def test_windows_existing_window_handoff_fails_when_foreground_is_denied(monkeyp
     )
 
 
+def test_windows_existing_window_handoff_attaches_to_foreground_input_thread(
+    monkeypatch,
+):
+    """A duplicate launcher must recover from Windows' foreground denial."""
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.attached = False
+            self.attachments = []
+            self.foreground = 303
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            if owner_pid is not None:
+                owner_pid._obj.value = 4567
+            return {101: 222, 303: 333}.get(handle, 0)
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return True
+
+        def SetForegroundWindow(self, handle):
+            if not self.attached:
+                return False
+            self.foreground = handle
+            return True
+
+        def GetForegroundWindow(self):
+            return self.foreground
+
+        def AttachThreadInput(self, attach, attach_to, enabled):
+            self.attachments.append((attach, attach_to, bool(enabled)))
+            self.attached = bool(enabled)
+            return True
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 444
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert desktop_app._focus_catalyst_window_with_user32(
+        user32,
+        lambda callback: callback,
+        owner_pid=4567,
+        kernel32=Kernel32(),
+    )
+    assert user32.attachments == [
+        (444, 333, True),
+        (444, 222, True),
+        (444, 222, False),
+        (444, 333, False),
+    ]
+
+
+def test_windows_existing_window_handoff_detaches_after_partial_attach_failure(
+    monkeypatch,
+):
+    """A failed owner-thread join must release the foreground-thread join."""
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.attachments = []
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            if owner_pid is not None:
+                owner_pid._obj.value = 4567
+            return {101: 222, 303: 333}.get(handle, 0)
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(_handle):
+            return False
+
+        @staticmethod
+        def GetForegroundWindow():
+            return 303
+
+        def AttachThreadInput(self, attach, attach_to, enabled):
+            call = (attach, attach_to, bool(enabled))
+            self.attachments.append(call)
+            return not (attach_to == 222 and enabled)
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 444
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert not desktop_app._focus_catalyst_window_with_user32(
+        user32,
+        lambda callback: callback,
+        owner_pid=4567,
+        kernel32=Kernel32(),
+    )
+    assert user32.attachments == [
+        (444, 333, True),
+        (444, 222, True),
+        (444, 333, False),
+    ]
+
+
 def test_windows_window_handoff_rejects_same_title_from_wrong_process(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
@@ -6812,6 +7033,116 @@ def test_desktop_retries_startup_after_exact_coin_prep_recovery(
     ]
 
 
+def test_desktop_rechecks_authority_after_coin_prep_recovery_attempt(monkeypatch):
+    """A completed recovery must not leave the initial blocked snapshot onscreen."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    recovery_state = {"complete": False}
+
+    def authorize():
+        events.append("authorize")
+        if recovery_state["complete"]:
+            return {"allowed": True, "reason_code": "", "failed_check": None}
+        return {
+            "allowed": False,
+            "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+            "failed_check": "unresolved_operations",
+        }
+
+    def recover():
+        events.append("coin_prep_recovery")
+        recovery_state["complete"] = True
+        # The recovery helper's boolean is not an authorization decision. For
+        # example, a separately checked legacy recovery may remain false even
+        # after durable coin-prep evidence becomes terminal.
+        return False
+
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(recover_coin_prep_operations_at_startup=recover),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
+    """An unresolved fresh decision must still route startup to diagnostics."""
+
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+        "failed_check": "unresolved_operations",
+    }
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+            return True
+
+    monkeypatch.setattr(
+        read_only_diagnostics, "acquire_startup_arbiter", lambda: Arbiter()
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or dict(blocked),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_wallet_setup_bootstrap",
+        lambda _authorization: events.append("bootstrap_denied") or False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(
+            recover_coin_prep_operations_at_startup=lambda: (
+                events.append("coin_prep_recovery") or False
+            )
+        ),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert desktop_app._startup_diagnostics_status["reason_code"] == (
+        "COIN_PREP_RECOVERY_REQUIRED"
+    )
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+        "bootstrap_denied",
+        "arbiter_release",
+    ]
+
+
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     lease = {
@@ -7970,7 +8301,10 @@ def _bounded_loopback_candidates(
 
 
 def _wait_for_diagnostics_status(process, port: int) -> dict:
-    deadline = time.monotonic() + 10
+    # A first read-only SQLite snapshot can be delayed by Windows Defender's
+    # initial scan on a fresh test database.  Keep the assertion bounded while
+    # allowing the same cold-start margin used by the browser/server helpers.
+    deadline = time.monotonic() + 30
     url = f"http://127.0.0.1:{port}/api/safety/status"
     while time.monotonic() < deadline:
         if process.poll() is not None:

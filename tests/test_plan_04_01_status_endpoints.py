@@ -13,6 +13,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -124,8 +126,19 @@ class _FlaskBase(unittest.TestCase):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         api_server._rate_limit_log.clear()
+        # Contract tests must not inherit the machine's network availability.
+        # Individual startup-price tests install their own nested requests.get
+        # mock, which temporarily overrides this fail-fast default.
+        self._network_guard = patch(
+            "requests.get",
+            side_effect=requests.RequestException(
+                "unexpected external GET in status contract test"
+            ),
+        )
+        self._network_guard.start()
 
     def tearDown(self):
+        self._network_guard.stop()
         api_server._rate_limit_log.clear()
 
 
@@ -412,6 +425,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
                 patch("database.get_coin_summary", return_value={}),
                 patch("database.get_offer_lifecycle_summary", return_value={}),
                 patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+                patch("blueprints.market._get_startup_price_cached", return_value={}),
             ):
                 resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
         finally:
@@ -490,6 +504,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
                 return_value={"status": "healthy"},
             ),
             patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+            patch("blueprints.market._get_startup_price_cached", return_value={}),
         ):
             resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
 

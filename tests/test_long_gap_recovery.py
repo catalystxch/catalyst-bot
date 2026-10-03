@@ -1239,6 +1239,56 @@ def test_released_recovery_epoch_can_be_adopted_by_exact_successor_and_promoted(
     assert len(rows) == 1
 
 
+def test_recovery_successor_keeps_full_lease_after_database_lock_wait(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "e" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "delayed-successor"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    post_lock = requested + timedelta(seconds=15)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is True
+    successor = adopted["lease"]
+    acquired_at = datetime.fromisoformat(
+        successor["acquired_at"].replace("Z", "+00:00")
+    )
+    expires_at = datetime.fromisoformat(successor["expires_at"].replace("Z", "+00:00"))
+    assert acquired_at == post_lock
+    assert expires_at - acquired_at == timedelta(seconds=30)
+
+
 def test_active_expired_recovery_epoch_requires_dead_owner_proof_for_adoption(
     isolated_database, monkeypatch
 ):

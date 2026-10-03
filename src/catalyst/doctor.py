@@ -113,7 +113,7 @@ def run_preflight(force: bool = False) -> DoctorReport:
     report.checks.append(_check_wallet_reachable(wallet_sync_result))
     report.checks.append(_check_wallet_synced(wallet_sync_result))
     report.checks.append(_check_wallet_can_sign(wallet_sync_result))
-    report.checks.append(_check_cat_wallet_mapping())
+    report.checks.append(_check_cat_wallet_mapping(wallet_sync_result))
     report.checks.append(_check_dexie_reachable())
     report.checks.append(_check_tibet_reachable())
     report.checks.append(_check_splash_reachable())
@@ -453,7 +453,7 @@ def _check_wallet_can_sign(sync_result: dict = None) -> DoctorCheck:
         )
 
 
-def _check_cat_wallet_mapping() -> DoctorCheck:
+def _check_cat_wallet_mapping(sync_result: dict = None) -> DoctorCheck:
     """Verify the wallet has a CAT matching our configured asset ID."""
     try:
         from config import cfg
@@ -465,6 +465,15 @@ def _check_cat_wallet_mapping() -> DoctorCheck:
                 category="wallet",
                 status="skip",
                 message="Skipped — no CAT_ASSET_ID configured",
+                severity="info",
+            )
+
+        if sync_result is not None and not sync_result.get("reachable", False):
+            return DoctorCheck(
+                name="cat_wallet_mapping",
+                category="wallet",
+                status="skip",
+                message="Skipped — wallet not reachable",
                 severity="info",
             )
 

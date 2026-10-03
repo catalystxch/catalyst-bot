@@ -692,7 +692,7 @@ def _is_exact_cancel_wallet_effect(
         or value["timeout"] != 60
         or type(fee_mojos) is not int
         or isinstance(fee_mojos, bool)
-        or fee_mojos <= 0
+        or fee_mojos < 0
         or type(batch) is not dict
         or set(batch)
         != {
@@ -710,7 +710,7 @@ def _is_exact_cancel_wallet_effect(
     if (
         type(trade_ids) is not list
         or type(source_coin_ids) is not list
-        or len(trade_ids) < 2
+        or len(trade_ids) < 1
         or len(trade_ids) != len(source_coin_ids)
         or len(set(trade_ids)) != len(trade_ids)
         or len(set(source_coin_ids)) != len(source_coin_ids)
@@ -956,7 +956,7 @@ def _is_exact_prepared_operation_blocker(
                 or attempt < 1
                 or type(cohort_size) is not int
                 or isinstance(cohort_size, bool)
-                or cohort_size < 2
+                or cohort_size < 1
                 or evidence["operation_id"] != event["operation_id"]
                 or evidence["intent_id"] != event["intent_id"]
                 or event["operation_id"] != f"cancel:{trade_id}"
@@ -1181,8 +1181,10 @@ def pid_liveness(pid: int, owner_host: str) -> Optional[bool]:
         safe_host = _exact_text(owner_host, "owner_host")
     except ValueError:
         return None
-    local_names = {socket.gethostname().casefold(), socket.getfqdn().casefold()}
-    if safe_host.casefold() not in local_names:
+    from local_host_identity import is_local_host
+
+    if not is_local_host(safe_host):
+        # Missing local identity is uncertainty, never evidence of a dead owner.
         return None
     if safe_pid == os.getpid():
         return True
@@ -1576,6 +1578,7 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=expiry,
+                    lease_duration_seconds=self.lease_seconds,
                     now=now,
                     allow_expired_takeover=allow_takeover,
                     expected_lease_version=expected_version,
@@ -1667,6 +1670,7 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    lease_duration_seconds=self.lease_seconds,
                     expected_lease_version=int(current["lease_version"]),
                     prior_owner_liveness_proven_dead=prior_dead,
                     now=now,
@@ -2245,6 +2249,7 @@ class MutationGate:
                         expected_lease_version=version,
                         heartbeat_at=now,
                         lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                        lease_duration_seconds=self.lease_seconds,
                     )
                     result = _lease_public_result(result)
                 except Exception:

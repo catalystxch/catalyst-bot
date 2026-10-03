@@ -1,0 +1,430 @@
+# Secondary-PC combined integration acceptance — 2026-09-27
+
+## Candidate identity
+
+- Repository: `catalystxch/catalyst-bot`
+- Branch fetched: `codex/coin-prep-fee-approval`
+- Exact production candidate: `9bbf972a9e8b0b6459e67f483080dc487993a7ca`
+- The candidate was checked out detached in a new worktree. `git rev-parse HEAD`
+  and the fetched remote branch both resolved to the exact SHA above before any
+  build or test.
+- This checkpoint changes evidence only. It does not change production source,
+  merge main, or create a release.
+
+## Independent regression and suite results
+
+- Four focused red-first regressions covering retired sniper inputs and standard
+  Coin Prep restart rehydration: **4 passed**.
+- Complete affected economics, fee-wallet-snapshot and Coin Prep endpoint group:
+  **165 passed in 33.12 seconds**.
+- Complete serial backend suite: **7,047 passed, 165 skipped, 422 subtests
+  passed**, one pre-existing pytest deprecation warning, in **1,441.15 seconds**.
+- Complete real-Chromium E2E suite: **164 passed in 107.57 seconds**.
+- `ruff check src tests`: passed.
+- `git diff --check 0bd46052fa67f7ad5bbef356cadf289f51c25e97..HEAD`:
+  passed.
+- Full-suite interpreter provenance: Python 3.12 project venv supplied
+  `chia_rs`, Flask, requests, Playwright and pytest; the installed Sage
+  site-packages directory was appended after venv initialization to supply the
+  pure `chia` package. Module origins were printed and verified before the
+  authoritative run.
+- Two earlier collection-only attempts were invalid harness attempts and are not
+  product failures: the lightweight venv lacked `chia`, while the machine Sage
+  Python lacked the project dependencies. A path-order attempt then selected a
+  Python 3.14 `chia_rs` binary ahead of the Python 3.12 venv. No tests ran in
+  those attempts. The corrected runtime produced the complete green result
+  above.
+- An affected-group attempt ended after **164 passes and one setup error** with
+  `sqlite3.OperationalError: database or disk is full`. The exact errored test
+  passed alone, and the complete affected group then passed 165/165. This was a
+  transient machine-capacity event, not an assertion failure.
+
+## Windows build and package
+
+- Fresh `build.py --no-clean` PyInstaller build: passed, including bundled HTML
+  and certifi CA checks.
+- Built executable:
+  `dist/Catalyst/Catalyst.exe`
+- Secondary executable SHA-256:
+  `3210144F8DB7E6D85D13193D2B0CB5B59EF4F5089F581CD602534F20C13C8649`
+- Secondary ZIP:
+  `acceptance-artifacts/9bbf972/CATalyst-9bbf972-secondary-integration.zip`
+- ZIP SHA-256:
+  `0DD2CF7D0631C6F4E595314E7F0ABF6E77094B851E32E3A474D705DF4BFFDB4C`
+- The ZIP was extracted into a new directory. The extracted executable hash was
+  exactly the source build hash above.
+- Packaged API smoke: passed for both the build directory and independently
+  extracted ZIP.
+- Packaged mock Sage RPC worker smoke: passed.
+- Packaged interrupted-publication upgrade/recovery smoke: passed.
+- Native isolated-profile clean launch: passed, v1.4.0 health endpoint ready.
+- Duplicate launch: passed; second PID exited normally with code 0 and did not
+  bind a second server or replace the original process.
+- Authenticated graceful shutdown: passed; zero `Catalyst` processes remained.
+- Persisted-profile relaunch: passed; the immutable completed Coin Prep state
+  survived the process boundary.
+- The independently built bytes differ from the primary PC's executable hash.
+  Both builds are tied to the same exact source SHA; PyInstaller output is not
+  treated as reproducible across the two Windows build environments.
+
+## Live Sage read-only recovery
+
+No economic wallet mutation or fee spend was made during this combined-candidate
+verification.
+
+- Network: Chia mainnet.
+- Sage version: 0.13.0, minimum requirement 0.12.9, supported and healthy.
+- Wallet label: `Harvestr test wallet`.
+- Fingerprint: `3702373391`.
+- CAT wallet ID: 2.
+- Pair/ticker: MZ/XCH, `MZ_XCH`.
+- Asset: Monkeyzoo Token (MZ).
+- Asset ID:
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- Refreshed balances: `240.800786441412 XCH` and `3,381,521.720 MZ`.
+- Offers: zero buy and zero sell.
+- Locks: zero XCH and zero CAT.
+- Runtime errors: zero; runtime safety allowed; zero blocking operations,
+  reservations, prepared creations, publication claims or submitted cancels.
+- Recovered Coin Prep: `complete=true`, `previously_complete=true`, phase
+  `complete`, 258/56 XCH coins and 129/6 CAT coins.
+- Approval:
+  `989a638875baf1a9c6d39e34a063e44ce5173a192f1dd1a55ca1965059b1a121`.
+- Approval state: `complete`; `session_completed=true`; zero held, committed and
+  spent fee mojos; zero unresolved operations.
+- Manual configured fee remained `0.0000130791 XCH`. Read-only fee status also
+  returned a fresh Coinset suggestion of `0.000007473753 XCH` for the 120-second
+  target; no approval or spend was created from that estimate.
+- Persisted relaunch repeated the exact completed-state recovery with zero
+  offers, locks, fee holds, unresolved operations or runtime errors.
+
+## Safety and external blockers
+
+- Market confidence remained RED and correctly prohibited creation, exposure
+  increase and requote. The loaded snapshot included
+  `out_of_range_depth_excluded`, `insufficient_ask_depth`,
+  `single_provider_dependency`, `confidence_snapshot_expired` and
+  `market_evidence_expired`. No confidence gate was bypassed.
+- Live offer create/requote/remake was therefore not repeated on the integrated
+  candidate. Earlier authorized live acceptance already exercised Coin Prep,
+  bot start/stop and Cancel All; this combined pass was deliberately read-only.
+- Windows computer-control initialization failed twice before any UI action with
+  `failed to write kernel assets: The system cannot find the path specified.
+  (os error 3)`. Browser E2E, packaged API and native process smokes continued.
+  This is recorded as an external automation-tool blocker, not a CATalyst
+  product failure.
+
+## Verdict
+
+The integrated production candidate at exact SHA `9bbf972a9e8b0b6459e67f483080dc487993a7ca`
+passes the independently repeatable backend, Chromium, static, Windows build,
+package, duplicate-launch, persisted-restart and live Sage read-only recovery
+gates. Remaining live publication work is legitimately blocked by RED market
+confidence. No new CATalyst defect was found in this combined verification.
+
+## Lifecycle coverage audit checkpoint
+
+The feature branch was fetched again and verified at exact remote HEAD
+`e2a9c8fe03677abcf1d0c3cbee49e4115839ffb3`, with exact parent
+`b15cf8d8b26d53e70f6433c66db5b46fc9a5daf6`. The parent-to-head diff changes
+only `evidence/2026-09-24-live-test7-acceptance.md`; `git diff --check` passed.
+The complete range after production source `9bbf972a9e8b0b6459e67f483080dc487993a7ca`
+contains evidence files only.
+
+The smallest focused lifecycle slice expanded to **47 tests**, all passing in
+**20.87 seconds** under the complete Python 3.12 acceptance environment. Exact
+requirement-to-test coverage was:
+
+- Create and publication acknowledgement:
+  `test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence`,
+  `test_offer_manager_crash_boundaries_never_resubmit_ambiguous_intent`,
+  `test_offer_manager_concurrent_creation_has_exactly_one_effect_winner`,
+  `test_success_requires_current_claim_version_and_digest_binds_acknowledgement`,
+  `test_actual_transport_binds_request_header_bytes_and_provider_acknowledgement`,
+  and `test_crash_after_remote_success_reclaims_stale_claim_with_same_identity`.
+- Within-cap requote and remake:
+  `test_lineage_recovery_is_safe_at_each_durable_crash_boundary`,
+  `test_requote_resumes_visible_lineage_before_tier_and_budget_filtering`,
+  `test_replacement_runs_two_visible_child_before_parent_cancel_waves`, and
+  `test_amber_never_authorizes_create_child_first_requotes`.
+- Protected cancellation:
+  `test_coin_prep_cancel_uses_approved_sealed_bundle_and_exact_fee`,
+  `test_cancel_reservation_replay_cannot_authorize_second_dispatch`,
+  `test_protected_cancel_hold_cannot_release_before_authoritative_outcome`, and
+  `test_authoritative_confirmation_charges_hold_and_restart_scan_is_idempotent`.
+- Cancel retry and restart:
+  `test_retry_failed_cancel_advances_durable_attempt_after_restart`,
+  `test_retry_failed_cancel_settles_any_terminal_result_before_next_mutation`,
+  `test_retry_failed_cancel_pauses_when_submitted_result_is_not_proven`,
+  `test_retry_failed_cancel_race_has_one_new_wallet_effect`,
+  `test_startup_recovers_settled_protected_cancellation_fee_outcome`, and
+  `test_restart_resumes_unresolved_cancellation_without_replacement_creation`.
+- Atomic fee ledger:
+  `test_cancellation_can_use_protected_allowance_but_not_exceed_total`,
+  `test_concurrent_reservations_cannot_each_spend_same_remainder`,
+  `test_reservation_survives_connection_restart`,
+  `test_reservation_replay_is_not_a_new_dispatch_permission`, and
+  `test_new_approval_cannot_reduce_protected_cancellation_allowance`.
+- Bypass resistance:
+  `test_offer_creation_continuation_rejects_forgery_without_effect`,
+  `test_production_cancellation_callers_route_or_deny_before_adapter`,
+  `test_startup_repost_is_blocked_when_market_publication_gate_is_closed`, and
+  `test_amber_never_authorizes_create_child_first_requotes`.
+
+No production defect or genuine automated safety-coverage gap was proven. The
+remaining boundary is live acceptance only: RED market confidence prevented a
+real Sage offer, Dexie acknowledgement/discovery, fee-consuming cancellation,
+requote and remake cycle. Mock evidence is not treated as live acceptance. No
+wallet mutation or fee was incurred during this audit.
+
+## Integrated-head read-only live refresh
+
+The primary feature branch was fetched at exact HEAD
+`464ef56213618b7e525dc4ab811ae1b1b425e8cb`, with exact parent
+`e2a9c8fe03677abcf1d0c3cbee49e4115839ffb3`. Its parent diff is exactly the
+55-line addition to this evidence file from the lifecycle coverage checkpoint;
+`git diff --check` passed.
+
+At approximately 27 September 2026 13:28 BST, the locally built integrated
+package was launched in Flask-only mode against the established isolated live
+profile for one read-only refresh. Live Sage identity matched the authorized
+secondary wallet exactly: mainnet, Sage, label `Harvestr test wallet`,
+fingerprint `3702373391`, CAT wallet ID `2`, ticker `MZ_XCH`, and MZ asset ID
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+Sage RPC was listening and authenticated.
+
+CATalyst remained stopped with zero open buy/sell offers, zero XCH/CAT locks,
+zero pending cancellations and zero unresolved operation, reservation,
+publication or prepared-creation blockers. Runtime safety was allowed. Market
+Intel refreshed Dexie's public book successfully: nine buys, 29 sells, best
+bid `0.00004`, best ask `0.00011`, 0.3-second reported book age, one refresh
+and zero order-book errors. The visible 100 XCH bid was external, not ours.
+Splash remained unavailable/empty and Spacescan had no token context.
+
+The supported read-only Smart Settings calculation returned HTTP 409 with
+`market_confidence=RED`, `market_data_valid=false`, stage `INVALID`, provider
+redundancy 1 and follow capacity 0. Exact current reason codes were
+`out_of_range_depth_excluded`, `insufficient_ask_depth` and
+`single_provider_dependency`; Bootstrap was only suggested, with insufficient
+ask depth and single-provider dependency still blocking it. Therefore no fee
+budget proposal was generated or approved and no wallet effect was attempted.
+The exact supervised package process was then stopped; zero CATalyst processes
+and no port-5000 listener remained.
+
+## Splash provider diagnostic checkpoint
+
+The feature branch was fetched and verified at exact remote HEAD
+`4a32108c4f212ac62e8879917c888daf0ffc2339`. This diagnostic was read-only:
+the bot remained stopped, no offer was submitted or fabricated, no confidence
+gate was bypassed, and no wallet action or fee was incurred.
+During final verification the remote advanced to evidence-only successor
+`3a4f7c456a373cc4f63b41d5fb01188e914ac73c`; its sole delta from the assigned
+head is a 22-line addition to `evidence/2026-09-24-live-test7-acceptance.md`, so
+the tested product source is unchanged and this checkpoint remains scoped to
+the assigned exact head.
+
+The isolated live profile contained `splash.exe` version `Splash! 0.2.0`, size
+13,702,144 bytes, with SHA-256
+`52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8`.
+Its documented options include the exact submission, P2P, metrics and webhook
+arguments used by CATalyst. With the locally built CATalyst package running in
+Flask-only mode, the Splash binary was launched with CATalyst's exact supervised
+command:
+
+```text
+splash.exe --listen-offer-submission 127.0.0.1:4000 --listen-address /ip4/0.0.0.0/tcp/11511 --listen-metrics 127.0.0.1:4001 --offer-hook http://127.0.0.1:5000/api/splash/incoming
+```
+
+The daemon started normally, bound TCP ports 4000, 4001 and 11511, returned the
+expected HTTP 405 from the submission-only root endpoint, and served valid JSON
+from `/metrics`. It discovered mainnet peers without manual peers: the observed
+count progressed from one to three and settled at two after one disconnect.
+The final metrics snapshot was `peers=2`, `offers_received=0`,
+`offers_broadcasted=0`, `total_connections=0`. No MZ or other offer arrived at
+the CATalyst webhook during the bounded observation.
+
+CATalyst's Flask-only diagnostics correctly did not attribute this separately
+launched process to its in-process supervisor: the externally reachable submit
+endpoint was healthy, while managed-process and managed-metrics fields remained
+false and the bot-owned receive worker remained inactive. Source and regression
+contracts confirm that CATalyst starts and owns Splash with the bot, requires
+actual normalized webhook offers for confidence, treats an empty exact offer
+set as degraded, and never fabricates provider redundancy from peer connectivity
+alone. Splash's `total_connections=0` counter did not affect CATalyst health,
+which uses the live `peers` count.
+
+Focused provider, runtime, confidence-retention and UI-copy verification passed
+13 tests in 1.02 seconds on the final run. The real Chromium supervisor-restart
+test passed separately in 9.03 seconds with `--e2e`. A first selector-only command collected
+no tests because three UI function names had changed; the corrected exact
+selectors produced the reported pass result.
+
+Classification: **external empty/sparse Splash gossip state**, not a CATalyst
+packaging, configuration or environment failure and not a proven CATalyst
+defect. The executable, command line, listeners, submission API, metrics API,
+DNS/peer discovery and multiple peer connections all worked, but the peer
+network supplied zero offers. CATalyst therefore correctly retained RED
+single-provider protection. Both diagnostic processes were stopped afterward;
+no `Catalyst.exe` or `splash.exe` remained and ports 4000, 4001, 5000 and 11511
+were clear.
+
+## Final-head Bootstrap and fee-safety non-wallet audit
+
+The final feature branch was fetched at exact HEAD
+`892ceb7f2f6edbe00c454e7ffdbaea7223aee2df`, with exact parent
+`45cac635e60aa085480d50bbe33b1327fe0d23b2`. The parent delta is exactly six
+added lines in `evidence/2026-09-24-live-test7-acceptance.md`. Production source
+`9bbf972a9e8b0b6459e67f483080dc487993a7ca` remains an ancestor, and the full
+post-production range changes only the 24 September and 27 September evidence
+files. Product source was therefore unchanged throughout this audit.
+
+The secondary PC did not launch CATalyst, read the live Sage wallet, approve a
+fee or perform any wallet action. All tests used isolated temporary databases,
+mock wallet contracts and local Chromium route stubs while the primary PC owned
+the live-wallet lane.
+
+The focused backend command covered Bootstrap preview/start gating, Smart
+Settings, mutation gates, durable campaign state, cancellation fee budgeting,
+stopped-campaign fee renewal, recovery stop sequencing and invariants, Coin Prep
+fee confirmation/API/cancellation/Bootstrap integration, approval-ledger and
+approval-recovery rules, consent validation, preview persistence and session
+ownership. Result: **220 passed in 99.57 seconds**.
+
+The focused Chromium command ran the complete files
+`test_coin_prep_fee_approval.py`, `test_campaign_cancel_fee_recovery.py`,
+`test_campaign_cancel_recovery_confirmation.py` and `test_start_safety.py` with
+`--e2e`. It exercised displayed quote aging, unavailable/stale quote blocking,
+explicit confirmation, cap rejection, duplicate/restart behavior, durable
+pending accounting, cancellation-only renewal, cancel approval forwarding,
+recovery choices, Bootstrap legacy-plan separation and force-start bypass
+resistance. Result: **56 passed in 38.08 seconds**.
+
+Direct source audit confirmed the tested safety boundaries:
+
+- Bootstrap preview is pure and reports `financial_action_started=false`.
+  Start recomputes the preview, requires the exact asset warning and matching
+  digest, persists the campaign before Coin Prep, and still starts no financial
+  action.
+- Fee confirmation binds the immutable scope and economic-plan hashes, the
+  latest approval version, fresh available quote, funding and protected
+  cancellation reserve. Duplicate consent is idempotent and never grants a new
+  dispatch.
+- Fee reservations use an immediate SQLite transaction, reject stale approval,
+  scope/plan mismatch, conflicting operation replay and spending that consumes
+  the protected cancellation reserve. Returned records explicitly carry
+  `dispatch_authorized=false`.
+- Coin Prep cancellation derives its operation identity from the durable cohort,
+  requires the exact manifest and prepared journal, verifies wallet identity,
+  current provider quote and fee coin, rejects replay, and also returns no
+  dispatch authority.
+- Restart tests preserved campaign revision, cooldown, fee/loss state, approval
+  accounting and cancellation-only recovery without duplicate wallet effects.
+
+No CATalyst defect was reproduced, so no fix branch or package rebuild was
+created. This checkpoint is evidence-only and does not expand the live result:
+the primary PC remains the sole owner of the concurrent live Bootstrap review.
+
+## Live Bootstrap recovery evidence review and invariant audit
+
+The primary live-checkpoint commit was fetched and verified at exact feature
+HEAD `9b780830ebc21b83b131c7f06bbdd2269e558bde`, with exact parent
+`15332ca371654f6487a5aa2c2a838a6981b2c3bc`. The sole parent delta is 43 added
+lines in `evidence/2026-09-24-live-test7-acceptance.md`; `git diff --check`
+passed. The checkpoint records campaign
+`aaf64855aef9e1919d7cdfd4b15c1f589e7acf9321d71787b0b8122df9e16405`
+at revision 0, the exact TEST 7 MZ identity, a bounded 3-buy/3-sell first stage,
+exact Coin Prep fee closure, 0/6 through 6/6 authoritative cancellation, and a
+clean 3-buy/3-sell remake on the same campaign revision.
+
+The secondary PC remained strictly non-wallet and tested those recorded
+invariants with isolated temporary databases and mocked wallet/provider
+boundaries. No CATalyst process was launched against the live profile and no
+wallet read, fee approval, signing or spend occurred.
+
+The focused backend/integration command ran the complete Bootstrap live
+lifecycle, campaign persistence, Bootstrap end-to-end, Coin Prep fee-session
+completion, Bootstrap fee integration, protected cancellation and legacy-fee
+commitment files. Result: **102 passed in 55.96 seconds**. This covers:
+
+- every offer carrying the campaign and budget revision, with the active
+  revision rechecked at the journal boundary;
+- completion requiring exact current targets and zero unresolved holds, with
+  durable accounting surviving restart and confirmed cancellation moving the
+  hold to spend exactly once;
+- partial terminal cohorts remaining committed, restart surfacing the real hold,
+  and unresolved cancellation preventing replacement creation;
+- the full mocked confirmation → Coin Prep → bounded offer creation → cancel →
+  restart/remake cycle, including creation of only missing levels and fencing
+  superseded revisions.
+
+The focused Chromium recovery command exercised 11 GUI paths and passed all 11
+in 8.46 seconds. It verified that Cancel All explicitly covers the authoritative
+Sage offer set, Coin Prep waits while terminal proof propagates, unverified
+success cannot resume work, the async operation remains latched, reload restores
+its progress, completion clears stale recovery UI, and stale operation
+generations cannot unlock a newer cancellation.
+
+No discrepancy or CATalyst defect was reproduced. The live evidence is
+internally consistent with the independently tested durable state-machine and
+fee-ledger contracts, including restart blocking until all six cancellations
+are authoritative and a clean same-revision six-offer remake afterward.
+
+## Bootstrap reload readiness defect and secondary fix verification
+
+The feature branch was fetched and checked out at exact delegated candidate
+`d7b7624272a2493de002a0a6425c8f72cbacd983`. No CATalyst process was launched
+against Sage and no live wallet read, approval, signature, fee, offer or spend
+was performed; the primary PC retained sole control of the live campaign.
+
+A real fail-open readiness defect was reproduced. After an earlier Coin Prep
+completion, the browser trusted historical `/api/coin-prep/status` data and
+could display "Prepared coin sizes look ready" and enable Start even when the
+current active Bootstrap revision required re-preparation. This was not only a
+display defect: the active Bootstrap backend start path bypassed the legacy
+Smart Settings tier-drift check without replacing it with exact campaign-bound
+Coin Prep verification.
+
+Two regressions failed before the fix at the intended boundaries:
+
+- Chromium reload regression: **1 failed** because historical completion
+  restored readiness instead of calling the exact current-campaign verifier.
+- Backend mutation-boundary regression: **1 failed** because `/api/bot/start`
+  returned 200 instead of failing closed when exact Bootstrap prep was not
+  ready.
+
+The smallest fix reuses the existing read-only Coin Prep verifier with the
+exact durable campaign ID and revision in both places. The browser re-verifies
+before restoring its ready flag. The backend independently repeats the same
+verification immediately before Start and rejects unavailable, ambiguous,
+mismatched or insufficient results. The production fix is commit
+`1a5cccadc99135cc63502dbf01b1084dc86a7917` on branch
+`codex/secondary-bootstrap-reload-readiness`.
+
+Verification results:
+
+- Focused Chromium Coin Prep/start-safety group: **56 passed in 32.42s**.
+- Relevant backend, endpoint and Bootstrap integration group: **112 passed in
+  12.47s**.
+- Complete serial suite: **7,048 passed, 166 skipped, 422 subtests passed in
+  1,229.36s**, with one pre-existing pytest deprecation warning.
+- Repository-wide `python -m ruff check .`: **passed**.
+- `git diff --check`: **passed**.
+
+The first complete-suite attempt became invalid at 90% when pytest reported
+`OSError: [Errno 28] No space left on device`; its late failures/errors are not
+product results. The disposable `pytest-of-M920q` tree was removed. The
+supposedly lean isolated profile was also found to contain a 2.45 GB nested
+historical `backups` copy. That redundant nested copy was removed as required
+by the acceptance handoff, while the separate authoritative backup at
+`acceptance-data/0bd4605/authoritative-backups-20260926-1541` was verified
+present and preserved. The identical complete-suite rerun then produced the
+green result above and crossed the prior failure point with 3.53 GB free.
+
+A fresh clean `python build.py` build passed under Python 3.12.10 and
+PyInstaller 6.22.3, including bundled HTML and certifi CA checks. The exact
+executable is `dist/Catalyst/Catalyst.exe`, SHA-256
+`09F547D7DD5D81B5D0465F43DF93DEEF756D2797947CEDA4DF942A0BE4A177EA`.
+Against those bytes, packaged API smoke passed all nine endpoints, synthetic
+Sage mTLS worker smoke passed, interrupted-publication upgrade/recovery smoke
+passed, and the native desktop smoke passed clean launch, duplicate handoff,
+persisted-profile relaunch and native safety launch.

@@ -108,6 +108,32 @@ def test_running_session_reload_never_shows_risk_disclosure(flask_server, page):
     assert page.evaluate("window.__riskDisclosureEverVisible") is False
 
 
+def test_startup_skips_change_address_prompt_when_saved_setting_is_enabled(
+    flask_server, page
+):
+    """The startup prompt must honor the canonical uppercase config key."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"SAGE_SET_CHANGE_ADDRESS": True}),
+        ),
+    )
+    page.goto(flask_server, wait_until="domcontentloaded")
+    prompted = page.evaluate(
+        """async () => {
+            _startupWalletType = 'sage';
+            _startupChangeAddressPromptShown = false;
+            localStorage.removeItem('sage_change_address_declined');
+            return await startupMaybeShowChangeAddressPrompt();
+        }"""
+    )
+
+    assert prompted is False
+    expect(page.locator("#startupChangeAddressSection")).to_be_hidden()
+
+
 def test_dismissing_disclaimer_reveals_wallet_gate(app_page):
     """Continuing past the disclaimer should land on a Sage startup gate."""
     assert dismiss_disclaimer(app_page) is True
@@ -397,17 +423,23 @@ def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
     )
 
 
-def test_market_intel_explains_tibetswap_retirement(page):
-    """Market Intel must explain that TibetSwap is historical-only in v1.4."""
+def test_current_operator_ui_omits_retired_tibetswap_brand(page):
+    """Current Market Intel, About, and Help surfaces omit the retired venue."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
-    expect(page.locator("#intelTibetContext")).to_have_text(
-        "TibetSwap shut down; historical TibetSwap data is retained as read-only "
-        "history and never drives a live decision."
-    )
+    page.evaluate("window.v4SwitchView('intel')")
+    expect(page.locator("#v4View-intel")).not_to_contain_text("TibetSwap")
+    assert page.locator("#intelTibetContext").count() == 0
     expect(page.locator("#intelSlippage")).to_be_hidden()
     expect(page.locator("#intelPoolRatio")).to_be_hidden()
+
+    page.evaluate("window.openAboutModal()")
+    expect(page.locator("#aboutModal")).not_to_contain_text("TibetSwap")
+    page.evaluate("window.closeAboutModal()")
+
+    page.evaluate("window.openHelpModal(); window.switchHelpTab('sniper')")
+    expect(page.locator("#help_sniper")).not_to_contain_text("TibetSwap")
 
 
 def test_dashboard_confidence_does_not_invent_tradable_depth(page):
@@ -660,7 +692,7 @@ def test_dashboard_fiat_label_uses_cat_ticker_not_pair_id(page, has_price):
 def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
     page,
 ):
-    """RED blocks Follow exposure without claiming Bootstrap was withdrawn."""
+    """RED blocks Follow without claiming an empty Bootstrap book has offers."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -670,6 +702,7 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
                 campaign_id: 'campaign-1',
                 revision: 4,
                 stage: 'bootstrap',
+                open_offer_count: 0,
             };
             window.renderMarketConfidence({
                 confidence: {
@@ -698,8 +731,203 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
         "Bounded Bootstrap active — Follow mode is blocked by RED confidence"
     )
     expect(page.locator("#marketConfidenceCountdown")).to_have_text(
-        "Follow exposure withdrawn; bounded Bootstrap offers remain active"
+        "Follow exposure withdrawn; bounded Bootstrap campaign remains authorized"
     )
+
+
+def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(page):
+    """A restored live book must not claim readiness after its campaign expires."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'mz', name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH',
+            };
+            _resumeSessionSummary = {
+                pair_name: 'Monkeyzoo Token',
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+            };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            bot_state = {
+                running: false,
+                offers: { buy: [{ trade_id: 'buy-1' }], sell: [{ trade_id: 'sell-1' }] },
+            };
+            updateDashboardStartupLayout(bot_state);
+            return {
+                guide: document.getElementById('startupGuideTitle').textContent,
+                summary: document.getElementById('startupResumeTitle').textContent,
+                detail: document.getElementById('startupResumeCopy').textContent,
+                resumeDisabled: document.getElementById('startupResumeContinueBtn').disabled,
+                resumeText: document.getElementById('startupResumeContinueBtn').textContent,
+            };
+        }"""
+    )
+
+    assert result["resumeDisabled"] is True
+    for label in (result["guide"], result["summary"], result["detail"]):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+    assert "resume" not in result["resumeText"].lower()
+    assert "cancel" in result["resumeText"].lower()
+
+
+def test_expired_bootstrap_market_health_calls_for_cancellation(page):
+    """An expired campaign with live offers cannot be labelled active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    for label in (
+        page.locator("#ccHealthMsg").inner_text(),
+        page.locator("#marketConfidenceCountdown").inner_text(),
+    ):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+
+
+def test_expired_bootstrap_recovery_modal_does_not_offer_start(page):
+    """Restoring an expired campaign must lead to cancellation, not Start Bot."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                decimals: 3,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            currentCAT = { ...cat };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            setResumeSessionSummary({
+                can_resume: true,
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+                active_cat: cat,
+            });
+            document.getElementById('startupOverlay').style.display = 'none';
+            document.getElementById('resumeSessionModal').classList.add('active');
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            checkSettingsReviewed = () => {};
+            fetchStatus = async () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => new Response(JSON.stringify(
+                String(path).includes('/check-resume')
+                    ? { can_resume: true, buy_count: 3, sell_count: 3,
+                        offer_count: 6, active_cat: cat }
+                    : { success: true }
+            ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+            const restored = await resumeSession();
+            if (!restored) throw new Error('Test session did not restore');
+            const modal = document.querySelector('#resumeSessionModal > div');
+            return {
+                text: modal.innerText,
+                startButtons: modal.querySelectorAll('button[onclick="resumeStartNow()"]')
+                    .length,
+                closeButtons: modal.querySelectorAll('button[onclick="closeResumeAfterLoad()"]')
+                    .length,
+            };
+        }"""
+    )
+
+    assert "expired" in result["text"].lower()
+    assert "cancel" in result["text"].lower()
+    assert result["startButtons"] == 0
+    assert result["closeButtons"] == 1
+    page.locator('#resumeSessionModal button[onclick="closeResumeAfterLoad()"]').click()
+    assert "active" not in page.locator("#resumeSessionModal").get_attribute("class")
+
+
+def test_resume_start_sends_explicit_existing_offer_authority_request(page):
+    """Only the recovered-book CTA may request the exact live-offer start path."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            settingsReviewed = true;
+            currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            coinPrepStatus = 'skipped-safe';
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkForResume = async () => false;
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            window.__capturedStartRequest = null;
+            apiFetch = async (path, options = {}) => {
+                if (String(path).includes('/bot/start')) {
+                    window.__capturedStartRequest = {
+                        path: String(path),
+                        method: options.method,
+                        contentType: options.headers?.['Content-Type'],
+                        body: options.body,
+                    };
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await resumeStartNow();
+            return window.__capturedStartRequest;
+        }"""
+    )
+
+    assert result["path"].endswith("/bot/start")
+    assert result["method"] == "POST"
+    assert result["contentType"] == "application/json"
+    assert result["body"] == '{"resume_existing_offers":true}'
 
 
 def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
@@ -739,6 +967,86 @@ def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     expect(page.locator("#heroMidPriceTooltip")).to_contain_text(
         "approved campaign anchor"
     )
+
+
+def test_follow_price_provenance_tracks_confidence_and_status_updates(page):
+    """An indicative poll must never overwrite a trusted price or gain its label."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null,
+            reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+    expect(page.locator("#heroMidPriceTooltip")).to_contain_text("display only")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00007500")
+
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'RED', data_valid: false, trusted_midpoint: '0.00008'
+    }})""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+
+
+def test_bootstrap_price_provenance_uses_canonical_trusted_midpoint(page):
+    """The actual trusted_midpoint API field takes precedence over an anchor."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        _bootstrapActiveCampaign = {anchor_price: '0.0001'};
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Bootstrap Anchor Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00010000")
+
+
+def test_empty_offers_explains_running_follow_block_and_clears_on_recovery(page):
+    """Running RED Follow explains the blocker; recovery removes that message."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = true;
+        updateUI(bot_state);
+        renderMarketConfidence({confidence: {
+            state: 'RED', reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    empty = page.locator("#offersEmptyState")
+    expect(empty).to_contain_text("insufficient ask depth")
+    expect(empty).not_to_contain_text("Start the bot")
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+    }})""")
+    expect(empty).not_to_contain_text("insufficient ask depth")
+    expect(empty).to_contain_text("Bot is running")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        updateUI(bot_state);
+    }""")
+    expect(empty).to_contain_text("Start the bot")
 
 
 def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
@@ -802,6 +1110,130 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert result["globalStatus"].startswith("Bootstrap active")
     assert "corridor 0.00005–0.0002 XCH/MZ" in result["dashboardStatus"]
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
+
+
+def test_bootstrap_banner_shows_minutes_near_expiry(page):
+    """A campaign with minutes left must not look like it has an hour left."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    label = page.evaluate(
+        """() => {
+            const now = Date.parse('2030-01-01T12:00:00Z');
+            const originalNow = Date.now;
+            Date.now = () => now;
+            try {
+                currentCAT = { ticker_id: 'MZ_XCH' };
+                bot_state = {};
+                _bootstrapRenderStatus({
+                    active: true,
+                    identity: { ticker: 'MZ_XCH' },
+                    campaign: {
+                        campaign_id: 'near-expiry',
+                        asset_id: 'b8'.repeat(32),
+                        stage: 'bootstrap',
+                        deployment_fraction: '0.1',
+                        expires_at: '2030-01-01T12:14:00Z',
+                        revision: 0,
+                        minimum_price: '0.0000375',
+                        maximum_price: '0.00015',
+                        xch_budget: '0.9',
+                        cat_budget: '12000',
+                        fee_budget_xch: '0.001',
+                    },
+                });
+                return document.getElementById('bootstrapGlobalStatus').textContent;
+            } finally {
+                Date.now = originalNow;
+            }
+        }"""
+    )
+
+    assert "14m remaining" in label
+    assert "1h remaining" not in label
+
+
+def test_expired_bootstrap_banner_blocks_start_and_surfaces_cancel_action(page):
+    """Expired active Bootstrap authority must be visibly fail-closed."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'b8'.repeat(32);
+            const observed = new Date().toISOString();
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `<option value="${assetId}" data-ticker="MZ_XCH" data-name="Monkeyzoo Token">MZ</option>`;
+            selector.value = assetId;
+            _pairSelectedByUser = true;
+            currentCAT = {
+                asset_id: assetId,
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'done';
+            bot_state = {
+                running: false,
+                runtime_safety: {
+                    allowed: true,
+                    reason_code: '',
+                    lease: {active: true, owned_by_this_run: true},
+                    recovery: {
+                        freshness: {
+                            valid: true,
+                            age_seconds: 0,
+                            max_age_seconds: SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS,
+                            provenance: 'live_gate_and_durable_snapshot',
+                            observed_at_utc: observed,
+                        },
+                    },
+                },
+            };
+            _bootstrapRenderStatus({
+                success: true,
+                active: true,
+                needs_attention: true,
+                identity: { ticker: 'MZ_XCH' },
+                campaign: {
+                    campaign_id: 'expired-campaign',
+                    asset_id: assetId,
+                    stage: 'bootstrap',
+                    deployment_fraction: '0.1',
+                    expires_at: '2000-01-01T00:00:00Z',
+                    revision: 4,
+                    minimum_price: '0.0000375',
+                    maximum_price: '0.00015',
+                    xch_budget: '0.9',
+                    cat_budget: '12000',
+                    fee_budget_xch: '0.01',
+                    expired: true,
+                    cancel_required: true,
+                    cancel_reason: 'bootstrap_expired',
+                    manual_restart_required: true,
+                    open_offer_count: 6,
+                    active_authority_retained: true,
+                },
+            });
+            checkSettingsReviewed();
+            return {
+                globalStatus: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboardStatus: document.getElementById('bootstrapDashboardStatus').textContent,
+                canStart: canAttemptBotStart(),
+                safety: getStartSafetyState(),
+                startDisabled: document.getElementById('startBtn').disabled,
+            };
+        }"""
+    )
+
+    assert result["startDisabled"] is True
+    assert result["canStart"] is False
+    assert result["safety"]["allowed"] is False
+    assert "expired" in result["globalStatus"].lower()
+    assert "cancel" in result["globalStatus"].lower()
+    assert "6" in result["globalStatus"]
+    assert "requires cancellation" in result["dashboardStatus"].lower()
 
 
 def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
@@ -1131,7 +1563,20 @@ def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: false, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 if (!String(path).includes('/coin-prep/trigger')) {
                     throw new Error(`Unexpected test request: ${path}`);
                 }
@@ -1185,7 +1630,21 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
                 action: 'proceed',
                 resets: { pnl: true, offers: false, counters: false },
             });
-            apiFetch = async () => new Response(JSON.stringify({
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify({
                 success: false,
                 error: 'coin_prep_requires_offer_cancellation',
                 reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
@@ -1198,7 +1657,8 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
             }), {
                 status: 409,
                 headers: { 'Content-Type': 'application/json' },
-            });
+                });
+            };
             await startCoinPrepFromModal();
         }"""
     )
@@ -1223,8 +1683,21 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: true, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             window.__submittedPrepPayload = null;
             apiFetch = async (_path, options) => {
+                if (String(_path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 window.__submittedPrepPayload = JSON.parse(options.body);
                 return new Response(JSON.stringify({
                     success: false,
@@ -1291,9 +1764,24 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
             askPrepHistoryChoice = async () => ({
                 action: 'proceed', resets: { pnl: false, offers: true, counters: true },
             });
-            apiFetch = async () => new Response(JSON.stringify(failure), {
-                status: 423, headers: { 'Content-Type': 'application/json' },
-            });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify(failure), {
+                    status: 423, headers: { 'Content-Type': 'application/json' },
+                });
+            };
             await startCoinPrepFromModal();
         }""",
         failure,
@@ -1599,6 +2087,7 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,
@@ -1807,6 +2296,7 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,

@@ -259,6 +259,8 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
 class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
     """After a crash, the trigger endpoint must reset state cleanly."""
 
+    _FEE_APPROVAL_ID = "a" * 64
+
     def setUp(self):
         import database
 
@@ -304,6 +306,10 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
                 "_reconcile_authoritative_open_offers_before_prep",
                 return_value=None,
             ),
+            patch(
+                "coin_prep_fee_dispatch.price_approved_prep_batch",
+                return_value={"available": True},
+            ),
         ]
         for patcher in self._gate_patchers:
             patcher.start()
@@ -332,7 +338,7 @@ class TestCoinPrepTriggerAfterCrash(unittest.TestCase):
             mock_threading.Thread.return_value = mock_thread
             resp = self.client.post(
                 "/api/coin-prep/trigger",
-                json={},
+                json={"fee_approval_id": self._FEE_APPROVAL_ID},
                 headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
             )

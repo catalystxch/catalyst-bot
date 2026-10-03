@@ -26,6 +26,7 @@ import threading
 import subprocess
 import json
 import os
+import re
 import hashlib
 import sys
 import uuid
@@ -715,12 +716,16 @@ class FeeCoinPool:
         reservations (coins that were successfully spent are gone from
         the inventory; coins that weren't are re-added automatically).
       • ``reserve()`` hands out one coin ID per call.
-      • No explicit ``release()`` needed — the next ``refresh()`` resets.
+      • Protected cancellation releases a ticket only if planning or
+        authority fails before wallet dispatch. Other reservations reset on
+        the next ``refresh()``.
     """
 
     def __init__(self):
         self._available: list = []  # [(coin_id, amount_mojos), ...]
         self._reserved: set = set()  # coin IDs handed out this cycle
+        self._reservation_tickets: dict[str, int] = {}
+        self._next_reservation_ticket = 0
         self._lock = threading.Lock()
 
     # ---- pool management ----
@@ -730,6 +735,7 @@ class FeeCoinPool:
         with self._lock:
             self._available = []
             self._reserved = set()
+            self._reservation_tickets = {}
             for rec in fee_coin_records:
                 cid = _coin_id_from_record(rec)
                 if cid:
@@ -755,6 +761,47 @@ class FeeCoinPool:
                     self._reserved.add(cid)
                     return cid
         return None
+
+    def reserve_largest(self) -> tuple[str, int] | None:
+        """Reserve the largest available fee coin and return its exact value."""
+
+        with self._lock:
+            candidates = [
+                (amount, coin_id)
+                for coin_id, amount in self._available
+                if coin_id not in self._reserved
+            ]
+            if not candidates:
+                return None
+            amount, coin_id = max(candidates)
+            self._reserved.add(coin_id)
+            return coin_id, amount
+
+    def reserve_largest_with_ticket(self) -> tuple[str, int, int] | None:
+        """Reserve a fee coin with a token for safe pre-dispatch release."""
+        with self._lock:
+            candidates = [
+                (amount, coin_id)
+                for coin_id, amount in self._available
+                if coin_id not in self._reserved
+            ]
+            if not candidates:
+                return None
+            amount, coin_id = max(candidates)
+            self._next_reservation_ticket += 1
+            ticket = self._next_reservation_ticket
+            self._reserved.add(coin_id)
+            self._reservation_tickets[coin_id] = ticket
+            return coin_id, amount, ticket
+
+    def release_ticket(self, coin_id: str, ticket: int) -> bool:
+        """Release only the same in-memory reservation, never a newer one."""
+        with self._lock:
+            if self._reservation_tickets.get(coin_id) != ticket:
+                return False
+            del self._reservation_tickets[coin_id]
+            self._reserved.discard(coin_id)
+            return True
 
     # ---- introspection ----
 
@@ -12058,8 +12105,36 @@ class CoinManager:
     # Full coin prep (subprocess)
     # -------------------------------------------------------------------
 
-    def start_coin_prep(self) -> bool:
+    def start_coin_prep(self, *, fee_approval_id: str | None = None) -> bool:
         """Launch the full coin_prep_worker as a subprocess."""
+        if (
+            type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_required",
+                "Coin Prep remains blocked until its fee budget is approved",
+            )
+            return False
+        try:
+            from coin_prep_fee_dispatch import price_approved_prep_batch
+
+            approved_dispatch = price_approved_prep_batch(fee_approval_id)
+        except Exception:
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_unavailable",
+                "Coin Prep fee approval could not be validated; no worker was changed",
+            )
+            return False
+        if approved_dispatch.get("available") is not True:
+            log_event(
+                "warning",
+                "coin_prep_fee_approval_stale",
+                "Coin Prep fee approval is no longer current; no worker was changed",
+            )
+            return False
         # Kill any existing worker before starting a new one.
         # Two workers on the same wallet causes coin conflicts.
         if self._prep_process and self._prep_process.poll() is None:
@@ -12275,6 +12350,7 @@ class CoinManager:
 
             cmd.extend(["--cat-wallet", str(cat_wallet_id)])
             cmd.extend(["--run-id", prep_run_id])
+            cmd.extend(["--fee-approval-id", fee_approval_id])
 
             # Pass the bot's current weighted mid to the worker so CAT sizing
             # reflects what the bot is actually quoting, not Dexie's last_price

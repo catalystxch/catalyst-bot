@@ -71,7 +71,7 @@ from amount_utils import (
     format_cat_display_amount,
     round_cat_display_amount_up_to_mojo,
 )
-from ladder_sizing import TIER_ORDER, summarize_sell_ladder_cat
+from ladder_sizing import TIER_ORDER
 
 # Load environment
 from dotenv import load_dotenv
@@ -96,6 +96,22 @@ _WORKER_DELEGATION_ENV_NAMES = (
     mutation_gate.DELEGATION_PARENT_EPOCH_ENV,
 )
 _worker_delegation_environment = None
+
+
+def get_coins_by_ids(coin_ids: list[str], **kwargs) -> dict | None:
+    """Read exact historical records when the selected wallet exposes them."""
+
+    try:
+        import wallet as wallet_facade
+
+        callback = getattr(wallet_facade, "get_coins_by_ids", None)
+        if callable(callback):
+            result = callback(coin_ids, **kwargs)
+            if type(result) is dict:
+                return result
+    except Exception:
+        pass
+    return None
 
 
 def get_transaction_relay_outcome(transaction_id: str) -> dict:
@@ -677,6 +693,7 @@ class CoinPrepStatus:
     error: Optional[str] = None
     timestamp: float = 0.0
     run_id: Optional[str] = None
+    fee_approval_id: Optional[str] = None
     execution_mode: Optional[str] = None
     reused: int = 0
     missing: int = 0
@@ -868,6 +885,9 @@ class CoinPrepWorker:
         tier_counts_cat_str = os.getenv(
             "_CLI_TIER_COUNTS_CAT"
         )  # per-side CAT (sell ladder)
+        live_tier_counts_cat_str = os.getenv(
+            "_CLI_LIVE_TIER_COUNTS_CAT"
+        )  # live CAT offer slots only (excludes prep spares)
 
         def _parse_sizes(spec):
             out = {}
@@ -968,6 +988,11 @@ class CoinPrepWorker:
                 if tier_counts_cat_str
                 else dict(legacy_counts)
             )
+            self.cat_live_tier_counts = (
+                _parse_counts(live_tier_counts_cat_str)
+                if live_tier_counts_cat_str is not None
+                else None
+            )
 
             # Build a unified `tier_counts` for legacy code paths that still
             # consume a single dict. Use max() so per-amount partition logic
@@ -1033,6 +1058,7 @@ class CoinPrepWorker:
             self.tier_counts = {}
             self.xch_tier_counts = {}
             self.cat_tier_counts = {}
+            self.cat_live_tier_counts = None
             self.tier_cat_sizes = {}
             self.tier_order = []
 
@@ -1895,6 +1921,19 @@ class CoinPrepWorker:
         """Build exact per-amount tier expectations for the current prep mode."""
         plan = {}
         if not self.tier_enabled:
+            from coin_prep_economics import PREP_TIERS
+
+            for target in getattr(self, "_approved_targets", ()):
+                if target.asset != wallet_type:
+                    continue
+                tier_name = PREP_TIERS[target.tier_rank]
+                specs = plan.setdefault(target.amount_mojos, [])
+                for index, (name, count) in enumerate(specs):
+                    if name == tier_name:
+                        specs[index] = (name, count + 1)
+                        break
+                else:
+                    specs.append((tier_name, 1))
             return plan
 
         for tier_name in self.tier_order:
@@ -2165,6 +2204,25 @@ class CoinPrepWorker:
         except Exception as _e:
             self.log(f"   DB: deposit-advisory backfill skipped: {_e}")
 
+    def _complete_approved_fee_session(self) -> dict:
+        """Close the approved standalone scope before reporting prep success."""
+
+        approval_id = getattr(self, "fee_approval_id", None)
+        if (
+            type(approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
+        ):
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        from coin_prep_fee_approval import complete_coin_prep_fee_scope
+
+        result = complete_coin_prep_fee_scope(approval_id)
+        self.log(
+            "✅ Coin Prep fee scope closed from authoritative target and "
+            f"journal evidence ({result['target_count']} targets, "
+            f"{result['operation_count']} operations)"
+        )
+        return result
+
     def _complete_existing_tier_preparation(self) -> bool:
         """Finish a prep run when current selectable tier coins are already valid."""
         self.update_status(
@@ -2175,6 +2233,7 @@ class CoinPrepWorker:
         xch_final, cat_final = self.verify_coins()
         self._designate_final_sweep()
         self._record_prep_reserve_advisory_baseline()
+        self._complete_approved_fee_session()
         self.update_status(
             PrepPhase.COMPLETE,
             1.0,
@@ -2187,37 +2246,16 @@ class CoinPrepWorker:
     def _direct_batch_targets(self):
         """Return the exact final-output plan for the current tier settings."""
 
-        from coin_prep_batch_plan import TargetOutput
+        from coin_prep_targets import build_prep_targets
 
-        targets = []
-        for asset in ("xch", "cat"):
-            counts = self.xch_tier_counts if asset == "xch" else self.cat_tier_counts
-            sizes = self.tier_xch_sizes if asset == "xch" else self.tier_cat_sizes
-            ordinal = 0
-            for tier_rank, tier_name in enumerate(self.tier_order):
-                count = int(counts.get(tier_name, 0) or 0)
-                if asset == "xch":
-                    amount = int(
-                        Decimal(str(sizes.get(tier_name, 0))) * Decimal("1000000000000")
-                    )
-                else:
-                    amount = cat_display_amount_to_mojos_ceil(
-                        Decimal(str(sizes.get(tier_name, 0))), self.cat_decimals
-                    )
-                if count < 0 or (count and amount <= 0):
-                    raise ValueError("direct batch tier target is invalid")
-                for _index in range(count):
-                    targets.append(
-                        TargetOutput(
-                            asset=asset,
-                            purpose=self._purpose_for_tier(tier_name),
-                            tier_rank=tier_rank,
-                            amount_mojos=amount,
-                            ordinal=ordinal,
-                        )
-                    )
-                    ordinal += 1
-        return tuple(targets)
+        return build_prep_targets(
+            tier_order=self.tier_order,
+            xch_counts=self.xch_tier_counts,
+            cat_counts=self.cat_tier_counts,
+            xch_sizes=self.tier_xch_sizes,
+            cat_sizes=self.tier_cat_sizes,
+            cat_decimals=self.cat_decimals,
+        )
 
     def _direct_batch_snapshot(self, targets):
         """Read strict selectable coins and assign only exact reusable targets."""
@@ -2305,63 +2343,16 @@ class CoinPrepWorker:
     def _direct_batch_target_contract(self, plan, address: str) -> dict:
         """Build a version-2 durable target from one deterministic plan."""
 
-        outputs = []
-        for index, output in enumerate(plan.outputs):
-            purpose = {
-                "change": "top_up",
-                "fee_change": "fee_reserve",
-            }.get(output.purpose, output.purpose)
-            outputs.append(
-                {
-                    "output_index": index,
-                    "asset": output.asset,
-                    "address": address,
-                    "amount_mojos": output.amount_mojos,
-                    "purpose": purpose,
-                    "ordinal": output.ordinal,
-                }
-            )
-        target = {
-            "contract_version": 2,
-            "wallet_type": plan.asset,
-            "cat_asset_id": (
-                str(os.getenv("CAT_ASSET_ID", "")).strip()
-                if plan.asset == "cat"
-                else None
-            ),
-            "fee_mojos": plan.fee_mojos,
-            "outputs": outputs,
-        }
-        if plan.fee_source_id:
-            target["external_fee"] = {
-                "fee_mojos": plan.fee_mojos,
-                "coin_ids": [plan.fee_source_id],
-            }
-        return target
+        from coin_prep_unsigned import batch_target_contract
+
+        return batch_target_contract(
+            plan, address, str(os.getenv("CAT_ASSET_ID", "")).strip()
+        )
 
     def _direct_batch_actions(self, target: dict) -> list[dict]:
-        actions = []
-        for output in target["outputs"]:
-            action_id = (
-                {"type": "xch"}
-                if output["asset"] == "xch"
-                else {
-                    "type": "existing",
-                    "asset_id": target["cat_asset_id"],
-                }
-            )
-            actions.append(
-                {
-                    "type": "send",
-                    "id": action_id,
-                    "address": output["address"],
-                    "amount": str(output["amount_mojos"]),
-                    "memos": [],
-                }
-            )
-        if target["fee_mojos"]:
-            actions.append({"type": "fee", "amount": str(target["fee_mojos"])})
-        return actions
+        from coin_prep_unsigned import batch_actions
+
+        return batch_actions(target)
 
     def _direct_batch_relay_safe_fee_mojos(self, plan) -> int:
         """Scale an enabled Sage batch fee to its conservative CLVM cost.
@@ -2413,13 +2404,41 @@ class CoinPrepWorker:
             )
         return max(plan.fee_mojos, exact_cost * 6)
 
-    def _submit_direct_batch_plan(self, plan, address: str) -> bool:
-        """Journal, validate, sign and reconcile one exact Sage batch."""
+    def _submit_direct_batch_plan(
+        self, plan, address: str, *, priced_batch=None
+    ) -> bool:
+        """Hold the approved exact fee before the existing Sage dispatch fence."""
 
+        from coin_prep_fee_dispatch import (
+            price_approved_prep_batch,
+            recheck_approved_prep_dispatch,
+            reserve_approved_prep_dispatch,
+        )
+        from coin_prep_unsigned import batch_target_contract
         from replacement_capacity import canonical_coin_prep_contract
 
+        approval_id = getattr(self, "fee_approval_id", None)
+        if type(approval_id) is not str or not re.fullmatch(
+            r"[0-9a-f]{64}", approval_id
+        ):
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        if priced_batch is None:
+            priced_batch = price_approved_prep_batch(approval_id)
+        if priced_batch.get("available") is not True:
+            raise ValueError(priced_batch["reason"])
+        pricing = priced_batch["pricing"]
+        if (
+            pricing.get("transaction_required") is not True
+            or pricing["plan"] != plan
+            or priced_batch["receive_address"] != address
+        ):
+            raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
         fee_coin_ids = [plan.fee_source_id] if plan.fee_source_id else []
-        target = self._direct_batch_target_contract(plan, address)
+        # Neither the worker's independently sized tiers nor a CLI/env asset
+        # override may replace the canonical economic contract confirmed in UI.
+        target = batch_target_contract(
+            plan, address, priced_batch["identity"]["asset_id"]
+        )
         canonical = canonical_coin_prep_contract(
             operation_kind="split",
             purpose="replacement",
@@ -2459,60 +2478,25 @@ class CoinPrepWorker:
             )
             self.log(f"Direct batch PREPARED journal write failed: {exc}")
             return False
-        selected_ids = [*plan.source_coin_ids, *fee_coin_ids]
-        actions = self._direct_batch_actions(target)
-        unsigned = build_transaction_rpc(selected_ids, actions)
-        validation_contract = {
-            "source_asset": plan.asset,
-            "source_coin_ids": list(plan.source_coin_ids),
-            "fee_coin_ids": fee_coin_ids,
-            "cat_asset_id": target.get("cat_asset_id"),
-            "fee_mojos": plan.fee_mojos,
-            "outputs": [
-                {
-                    "asset": output["asset"],
-                    "address": output["address"],
-                    "amount_mojos": output["amount_mojos"],
-                    "purpose": output["purpose"],
-                    "ordinal": output["ordinal"],
-                }
-                for output in target["outputs"]
-            ],
-        }
-        validated = validate_unsigned_transaction_effect(unsigned, validation_contract)
-        validation_ok = (
-            type(validated) is dict
-            and validated.get("_catalyst_validated_unsigned") is True
-        )
-        compatibility_reason = None
-        if validation_ok:
-            try:
-                prepared = bind_coin_prep_constructed_outputs(
-                    prepared["operation_id"],
-                    plan_hash=target["plan_hash"],
-                    constructed_outputs=validated["constructed_outputs"],
-                )["operation"]
-            except Exception as exc:
-                retain_wallet_effect_claim_for_reconciliation(
-                    claim["claim_token"],
-                    claim["generation"],
-                    reason_code="DIRECT_BATCH_OUTPUT_BINDING_FAILED",
-                )
-                self.log(f"Direct batch output binding failed: {exc}")
-                raise CoinPrepAuthorityUnresolved(
-                    "direct batch output binding could not be persisted"
-                ) from exc
-        else:
-            validation_reason = (
-                validated.get("reason") if isinstance(validated, dict) else "unknown"
+        try:
+            hold = reserve_approved_prep_dispatch(
+                approval_id=approval_id,
+                operation_id=canonical["operation_id"],
+                priced_batch=priced_batch,
             )
-            if validation_reason == "UNSIGNED_EFFECT_NOT_INSPECTABLE":
-                compatibility_reason = validation_reason
-            self.log(
-                "Direct batch unsigned validation failed before signing: "
-                f"{validation_reason}"
+            validated = hold["validated_unsigned"]
+            recheck_approved_prep_dispatch(
+                approval_id=approval_id,
+                operation_id=canonical["operation_id"],
+                priced_batch=priced_batch,
             )
-
+        except Exception:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED",
+            )
+            raise
         if not wallet_effect_claim_is_current(
             claim["claim_token"],
             claim["generation"],
@@ -2528,13 +2512,25 @@ class CoinPrepWorker:
             raise CoinPrepAuthorityUnresolved(
                 "direct batch authority changed before wallet dispatch"
             )
-        dispatch = begin_wallet_effect_dispatch(
-            claim["claim_token"],
-            claim["generation"],
-            operation_id=canonical["operation_id"],
-            source_coin_ids=list(plan.source_coin_ids),
-            fee_coin_ids=fee_coin_ids,
-        )
+        try:
+            dispatch = begin_wallet_effect_dispatch(
+                claim["claim_token"],
+                claim["generation"],
+                operation_id=canonical["operation_id"],
+                source_coin_ids=list(plan.source_coin_ids),
+                fee_coin_ids=fee_coin_ids,
+                prep_fee_context={
+                    "approval_id": approval_id,
+                    "quote": pricing["quote"],
+                },
+            )
+        except Exception:
+            retain_wallet_effect_claim_for_reconciliation(
+                claim["claim_token"],
+                claim["generation"],
+                reason_code="DIRECT_BATCH_FEE_DISPATCH_DENIED",
+            )
+            raise
         if dispatch is None:
             retain_wallet_effect_claim_for_reconciliation(
                 claim["claim_token"],
@@ -2546,6 +2542,12 @@ class CoinPrepWorker:
             )
         try:
             with wallet_effect_adapter_dispatch_authority(dispatch):
+                recheck_approved_prep_dispatch(
+                    approval_id=approval_id,
+                    operation_id=canonical["operation_id"],
+                    priced_batch=priced_batch,
+                    dispatch_capability=dispatch,
+                )
                 if self._is_subprocess:
                     result = _guarded_wallet_mutation(
                         "coin_prep.create_final_batch",
@@ -2569,10 +2571,10 @@ class CoinPrepWorker:
             reason_code=f"DIRECT_BATCH_{dispatch_outcome}_UNRECONCILED",
         )
         if dispatch_outcome == "RELEASED_NO_EFFECT":
-            if compatibility_reason:
-                with self.status_lock:
-                    self.status.compatibility_reason = compatibility_reason
             return False
+        from database import get_coin_prep_operation_for_observation
+
+        prepared = get_coin_prep_operation_for_observation(canonical["operation_id"])
         transaction_id = None
         if type(result) is dict:
             transaction_id = result.get("transaction_id") or result.get("tx_id")
@@ -2620,6 +2622,9 @@ class CoinPrepWorker:
                     ),
                 },
             )
+            from database import settle_terminal_coin_prep_fee_reservations
+
+            settle_terminal_coin_prep_fee_reservations()
             self.log(
                 "Sage relay rejection was reconciled with an authoritative "
                 f"no-effect wallet view ({reason})"
@@ -2649,38 +2654,18 @@ class CoinPrepWorker:
         )
 
     def _run_direct_batch_prep(self) -> bool | None:
-        """Prepare exact final Sage tier outputs in at most two transactions."""
+        """Consume frozen approved targets; never fall back to unpriced signing."""
 
-        if not self.is_sage or not self.tier_enabled or not DB_AVAILABLE:
-            return None
-        from coin_prep_batch_plan import (
-            BatchConstraints,
-            BatchPlan,
-            BatchRefusal,
-            plan_batch,
-        )
-        from wallet import get_next_address
+        approval_id = getattr(self, "fee_approval_id", None)
+        if type(approval_id) is not str or not re.fullmatch(
+            r"[0-9a-f]{64}", approval_id
+        ):
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        if not self.is_sage or not DB_AVAILABLE:
+            raise ValueError("FEE_DISPATCH_UNSUPPORTED")
+        from coin_prep_fee_dispatch import price_approved_prep_batch
+        from coin_prep_fee_pricing import MAX_PREP_BATCHES
 
-        address_result = get_next_address(self.xch_wallet_id, new_address=False)
-        address = (
-            address_result.get("address") if type(address_result) is dict else None
-        )
-        if type(address) is not str or not address:
-            self.status.compatibility_reason = "DIRECT_BATCH_ADDRESS_UNAVAILABLE"
-            return False
-        targets = self._direct_batch_targets()
-        xch_reserve = int(
-            Decimal(str(os.getenv("XCH_RESERVE", "0") or "0"))
-            * Decimal("1000000000000")
-        )
-        cat_reserve = cat_display_amount_to_mojos_ceil(
-            self.cat_reserve, self.cat_decimals
-        )
-        constraints = BatchConstraints(
-            reserve_floors={"xch": xch_reserve, "cat": cat_reserve},
-            fee_mojos=self._tx_fee_mojos(),
-            allow_bounded_prerequisite=True,
-        )
         with self.status_lock:
             self.status.execution_mode = "direct_final_batch_v2"
             self.status.compatibility_reason = None
@@ -2688,82 +2673,15 @@ class CoinPrepWorker:
             self.status.paid_fee_mojos = 0
             self.status.batch_current = 0
             self.status.batch_confirmed = 0
-        effects_confirmed = 0
-        # Compact wallets finish in one batch per asset. Fragmented XCH can
-        # require one or more bounded 50-input prerequisites first; keep this
-        # finite so malformed or non-progressing snapshots fail closed.
-        for batch_number in range(1, 9):
-            snapshot = self._direct_batch_snapshot(targets)
-            if snapshot is None:
-                if effects_confirmed:
-                    raise CoinPrepAuthorityUnresolved(
-                        "direct batch snapshot became unavailable after a confirmed batch"
-                    )
-                self.status.compatibility_reason = "DIRECT_BATCH_SNAPSHOT_UNAVAILABLE"
-                return False
-            plan = plan_batch(snapshot, targets, constraints)
-            # Replan against the same authoritative snapshot when the
-            # transaction's actual input/output shape requires more than the
-            # configured standard-transaction fee.  Increasing monotonically
-            # avoids oscillation if the larger fee changes the selected source
-            # or removes a change output.
-            fee_converged = False
-            for _fee_pass in range(4):
-                if not isinstance(plan, BatchPlan) or not plan.transaction_required:
-                    fee_converged = True
-                    break
-                relay_safe_fee = max(
-                    plan.fee_mojos,
-                    self._direct_batch_relay_safe_fee_mojos(plan),
-                    self._direct_batch_exact_relay_safe_fee_mojos(plan, address),
-                )
-                if relay_safe_fee == plan.fee_mojos:
-                    fee_converged = True
-                    break
-                self.log(
-                    "Direct Sage batch fee scaled for relay safety: "
-                    f"{plan.fee_mojos:,} -> {relay_safe_fee:,} mojos "
-                    f"({len(plan.source_coin_ids)} asset inputs, "
-                    f"{1 if plan.fee_source_id else 0} fee inputs, "
-                    f"{len(plan.outputs)} outputs)"
-                )
-                scaled_constraints = BatchConstraints(
-                    reserve_floors=constraints.reserve_floors,
-                    fee_mojos=relay_safe_fee,
-                    max_asset_inputs=constraints.max_asset_inputs,
-                    max_outputs=constraints.max_outputs,
-                    allow_bounded_prerequisite=(constraints.allow_bounded_prerequisite),
-                )
-                plan = plan_batch(snapshot, targets, scaled_constraints)
-            if (
-                not fee_converged
-                and isinstance(plan, BatchPlan)
-                and plan.transaction_required
-            ):
-                raise CoinPrepAuthorityUnresolved(
-                    "direct batch fee did not converge before the bounded signing gate"
-                )
-            if isinstance(plan, BatchRefusal):
-                if effects_confirmed:
-                    raise CoinPrepAuthorityUnresolved(
-                        "direct batch replanning was refused after a confirmed batch: "
-                        f"{plan.code}"
-                    )
-                self.status.compatibility_reason = plan.code
-                if not plan.prerequisite_allowed:
-                    self.log(
-                        "Direct final-output Coin Prep refused an unsafe plan: "
-                        f"{plan.code}"
-                    )
-                    return False
-                self.log(
-                    "Direct final-output Coin Prep cannot safely use this wallet "
-                    f"shape ({plan.code}); using compatibility path before any effect"
-                )
-                return None
-            if not isinstance(plan, BatchPlan):
-                self.status.compatibility_reason = "DIRECT_BATCH_PLAN_INVALID"
-                return False
+        # Keep progress bounded. Every pass refreshes remaining durable budget
+        # and live inventory but never resizes the approved outputs.
+        for batch_number in range(1, MAX_PREP_BATCHES + 1):
+            priced = price_approved_prep_batch(approval_id)
+            if priced["available"] is not True:
+                raise ValueError(priced["reason"])
+            plan = priced["pricing"]["plan"]
+            targets = priced["recipe"]["targets"]
+            self._approved_targets = targets
             with self.status_lock:
                 self.status.reused = len(plan.reused_coin_ids)
                 self.status.missing = len(targets) - len(plan.reused_coin_ids)
@@ -2785,31 +2703,17 @@ class CoinPrepWorker:
                     else f"Building direct final-output batch {batch_number}..."
                 ),
             )
-            if not self._submit_direct_batch_plan(plan, address):
-                if (
-                    self.status.compatibility_reason
-                    == "UNSIGNED_EFFECT_NOT_INSPECTABLE"
-                ):
-                    if effects_confirmed:
-                        raise CoinPrepAuthorityUnresolved(
-                            "direct batch became incompatible after a confirmed batch"
-                        )
-                    self.log(
-                        "Sage cannot expose an inspectable unsigned final batch; "
-                        "using the compatibility Coin Prep path after proven no effect"
-                    )
-                    return None
+            if not self._submit_direct_batch_plan(
+                plan, priced["receive_address"], priced_batch=priced
+            ):
                 return False
             with self.status_lock:
                 self.status.batch_confirmed = batch_number
                 self.status.paid_fee_mojos += plan.fee_mojos
-            effects_confirmed += 1
-
-        snapshot = self._direct_batch_snapshot(targets)
-        final_plan = plan_batch(snapshot, targets, constraints) if snapshot else None
-        return bool(
-            isinstance(final_plan, BatchPlan) and not final_plan.transaction_required
-        )
+        final = price_approved_prep_batch(approval_id)
+        if final["available"] is not True:
+            raise ValueError(final["reason"])
+        return final["pricing"]["transaction_required"] is False
 
     def _merge_xch_fee_change_into_reserve(self) -> bool:
         """Merge leftover XCH fee-funding change back into reserve before final DB sweep.
@@ -3328,10 +3232,22 @@ class CoinPrepWorker:
                 )
                 for tier_name in TIER_ORDER
             }
-            if any(cli_sell_tier_counts.values()):
+            explicit_live_counts = getattr(self, "cat_live_tier_counts", None)
+            if explicit_live_counts is not None:
+                # GUI prep output counts include spares.  Its separate live
+                # count contract is the authoritative ladder shape used for
+                # pricing; standalone/legacy callers continue to use their
+                # CLI output counts below.
+                sell_tier_counts = {
+                    tier_name: max(0, int(explicit_live_counts.get(tier_name, 0) or 0))
+                    for tier_name in TIER_ORDER
+                }
+                max_sell_offers = sum(sell_tier_counts.values())
+            elif any(cli_sell_tier_counts.values()):
                 sell_tier_counts = cli_sell_tier_counts
                 max_sell_offers = sum(cli_sell_tier_counts.values())
             else:
+                # Legacy in-process callers may not provide CLI counts.
                 sell_tier_counts = {
                     tier_name: _env_int(f"SELL_{tier_name.upper()}_TIER_COUNT", 0)
                     for tier_name in TIER_ORDER
@@ -3345,28 +3261,18 @@ class CoinPrepWorker:
                     max_sell_offers = sum(sell_tier_counts.values())
             spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
             min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
-            ladder_summary = summarize_sell_ladder_cat(
-                mid_price=price,
-                spread_fraction=spread_fraction,
+            from coin_prep_economics import prepared_cat_sizes
+
+            result = prepared_cat_sizes(
+                live_sizes=live_sizes,
+                price=price,
+                headroom_multiplier=self.coin_prep_headroom_multiplier,
+                cat_decimals=self.cat_decimals,
+                sell_counts=sell_tier_counts,
                 max_offers=max_sell_offers,
-                tier_counts=sell_tier_counts,
-                tier_sizes_xch=live_sizes,
+                spread_bps=spread_fraction * Decimal("10000"),
                 min_edge_bps=min_edge_bps,
             )
-            for tier_name, xch_size in live_sizes.items():
-                if tier_name == get_fee_tier_name():
-                    result[tier_name] = Decimal("0")
-                    continue
-                cat_per_offer = ladder_summary.max_cat_per_tier.get(
-                    tier_name, Decimal("0")
-                )
-                if cat_per_offer <= 0:
-                    cat_per_offer = xch_size / price
-                cat_coin_size = round_cat_display_amount_up_to_mojo(
-                    cat_per_offer * self.coin_prep_headroom_multiplier,
-                    self.cat_decimals,
-                )
-                result[tier_name] = cat_coin_size
             self.log(
                 f"   Tier CAT sizes derived from generated SELL ladder prices "
                 f"at mid {price} with +{self.coin_prep_headroom_pct}% headroom"
@@ -3392,9 +3298,9 @@ class CoinPrepWorker:
         a stage budget) a few thousand mojos smaller than the exact offer
         spend, so Sage correctly refused to select them.
         """
-        return (live_size_xch * self.coin_prep_headroom_multiplier).quantize(
-            Decimal("0.000000000001")
-        )
+        from coin_prep_economics import prepared_xch_size
+
+        return prepared_xch_size(live_size_xch, self.coin_prep_headroom_multiplier)
 
     def _get_fingerprint(self) -> str:
         """Get wallet fingerprint — tries RPC first (fast), then CLI (slow fallback)."""
@@ -9578,6 +9484,10 @@ class CoinPrepWorker:
                 outcome=outcome,
                 evidence_json=evidence,
             )
+            if decision.confirmed:
+                from database import settle_terminal_coin_prep_fee_reservations
+
+                settle_terminal_coin_prep_fee_reservations()
         except Exception as exc:
             self.log(f"Coin prep authoritative outcome could not be persisted: {exc}")
             return False
@@ -9995,6 +9905,8 @@ class CoinPrepWorker:
                 ):
                     return None
                 expected_outputs = []
+                owned_outputs_match = True
+                owned_output_ids = set()
                 for output in constructed:
                     if type(output) is not dict:
                         return None
@@ -10008,9 +9920,12 @@ class CoinPrepWorker:
                         or type(amount) is not int
                         or amount <= 0
                         or type(purpose) is not str
-                        or asset_view.get(coin_id) != amount
                     ):
                         return None
+                    if asset_view.get(coin_id) != amount:
+                        owned_outputs_match = False
+                    else:
+                        owned_output_ids.add(coin_id)
                     expected_outputs.append(
                         {
                             "coin_id": coin_id,
@@ -10018,6 +9933,71 @@ class CoinPrepWorker:
                             "purpose": purpose,
                         }
                     )
+                if len(expected_outputs) != len(constructed):
+                    return None
+                if not owned_outputs_match:
+                    cat_asset_id = str(target.get("cat_asset_id") or "").lower()
+                    if cat_asset_id.startswith("0x"):
+                        cat_asset_id = cat_asset_id[2:]
+                    historical_ids = []
+                    expected_assets = {}
+                    for output in constructed:
+                        coin_id = self._canonical_coin_id(output.get("coin_id"))
+                        asset = output.get("asset")
+                        if asset == "xch":
+                            asset_id = "xch"
+                        elif asset == "cat" and re.fullmatch(
+                            r"[0-9a-f]{64}", cat_asset_id
+                        ):
+                            asset_id = cat_asset_id
+                        else:
+                            return None
+                        historical_ids.append(coin_id)
+                        expected_assets[coin_id] = asset_id
+                    historical = get_coins_by_ids(historical_ids)
+                    if type(historical) is not dict:
+                        return None
+                    historical_by_id = {}
+                    for raw_coin_id, record in historical.items():
+                        coin_id = self._canonical_coin_id(raw_coin_id)
+                        if type(record) is not dict or coin_id in historical_by_id:
+                            return None
+                        historical_by_id[coin_id] = record
+                    if set(historical_by_id) != set(historical_ids):
+                        return None
+                    expected_by_id = {
+                        output["coin_id"]: output for output in expected_outputs
+                    }
+                    for output in constructed:
+                        coin_id = self._canonical_coin_id(output.get("coin_id"))
+                        record = historical_by_id[coin_id]
+                        created_height = record.get("created_height")
+                        spent_height = record.get("spent_height")
+                        explicit_asset_id = record.get("asset_id")
+                        if (
+                            type(created_height) is not int
+                            or created_height <= 0
+                            or (
+                                spent_height is not None
+                                and (
+                                    type(spent_height) is not int
+                                    or spent_height < created_height
+                                )
+                            )
+                            or record.get("amount") != output.get("amount_mojos")
+                            or (
+                                explicit_asset_id is not None
+                                and explicit_asset_id != expected_assets[coin_id]
+                            )
+                        ):
+                            return None
+                        if coin_id in owned_output_ids:
+                            if spent_height is not None:
+                                return None
+                        else:
+                            if spent_height is None:
+                                return None
+                            expected_by_id[coin_id]["spent_height"] = spent_height
                 observed_text = identity_decision["observed_at_utc"]
                 observed_at = datetime.fromisoformat(observed_text[:-1] + "+00:00")
                 expires_text = (
@@ -10223,23 +10203,6 @@ class CoinPrepWorker:
             # Detailed coin snapshot at start — shows every coin ID and amount
             self._log_coin_snapshot(self.xch_wallet_id, "XCH", "INITIAL")
             self._log_coin_snapshot(self.cat_wallet_id, "CAT", "INITIAL")
-
-            # Clean stale DB rows: mark ALL existing coins as 'gone' before we start.
-            # Consolidation destroys every coin. The final sweep will re-insert
-            # only the coins that actually exist after prep, keeping the DB clean.
-            if self._db_ready:
-                try:
-                    from database import (
-                        mark_unreserved_free_coins_gone_for_preparation,
-                    )
-
-                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
-                    if stale_count > 0:
-                        self.log(
-                            f"   DB: marked {stale_count} stale coins as 'gone' (fresh start)"
-                        )
-                except Exception as e:
-                    self.log(f"   DB: stale cleanup failed: {e}")
 
             self._set_status_coin_counts(xch_total=xch_coins, cat_total=cat_coins)
             self.update_status(
@@ -10492,6 +10455,23 @@ class CoinPrepWorker:
                     error="DIRECT_BATCH_FAILED",
                 )
                 return False
+
+            # Only the legacy consolidation flow consumes every free input.
+            # Direct batches above preserve reusable, still-owned coins and
+            # journal the exact inputs they actually spend.
+            if self._db_ready:
+                try:
+                    from database import (
+                        mark_unreserved_free_coins_gone_for_preparation,
+                    )
+
+                    stale_count = mark_unreserved_free_coins_gone_for_preparation()
+                    if stale_count > 0:
+                        self.log(
+                            f"   DB: marked {stale_count} stale coins as 'gone' (legacy rebuild)"
+                        )
+                except Exception as e:
+                    self.log(f"   DB: stale cleanup failed: {e}")
 
             self.log(f"\n{'=' * 60}")
             self.log("⚡ PARALLEL CONSOLIDATION")
@@ -11138,6 +11118,12 @@ class CoinPrepWorker:
                     self.log(f"Post-prep drift status update failed: {status_err}")
                 return False
 
+            # A green worker exit is also the durable accounting boundary. The
+            # completion service re-reads the verified wallet and refuses to
+            # rotate this fee scope until every frozen target exists and every
+            # fee hold has an authoritative terminal outcome.
+            self._complete_approved_fee_session()
+
             self.log(f"\n{'=' * 60}")
             self.log("🎉 COIN PREPARATION COMPLETE!")
             self.log(f"{'=' * 60}")
@@ -11361,6 +11347,12 @@ def parse_arguments():
         help="Per-side CAT tier counts (sell ladder): inner=4,mid=16,outer=16,extreme=14",
     )
     parser.add_argument(
+        "--live-tier-counts-cat",
+        type=str,
+        default=None,
+        help="Live CAT sell-offer slot counts, excluding prepared spare outputs",
+    )
+    parser.add_argument(
         "--prep-headroom-pct",
         type=float,
         default=None,
@@ -11379,6 +11371,12 @@ def parse_arguments():
         type=str,
         default=None,
         help="Unique run ID for status file tracking (prevents stale status reads)",
+    )
+    parser.add_argument(
+        "--fee-approval-id",
+        type=str,
+        default=None,
+        help="Server-issued Coin Prep fee approval bound to this execution",
     )
     parser.add_argument(
         "--sage-rpc-smoke",
@@ -11732,6 +11730,18 @@ def main():
     if args.sage_rpc_smoke:
         sys.exit(_run_sage_rpc_smoke())
 
+    if (
+        type(args.fee_approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", args.fee_approval_id) is None
+    ):
+        slog(
+            "SAFETY",
+            "Coin prep worker blocked without a valid fee approval",
+            {"reason_code": "FEE_APPROVAL_REQUIRED"},
+            level="critical",
+        )
+        sys.exit(2)
+
     try:
         _validate_coin_prep_worker_delegation(args)
     except mutation_gate.MutationBlocked as exc:
@@ -11791,6 +11801,9 @@ def main():
     if args.tier_counts_cat is not None:
         os.environ["_CLI_TIER_COUNTS_CAT"] = args.tier_counts_cat
         overrides.append(f"TIER_COUNTS_CAT={args.tier_counts_cat}")
+    if args.live_tier_counts_cat is not None:
+        os.environ["_CLI_LIVE_TIER_COUNTS_CAT"] = args.live_tier_counts_cat
+        overrides.append(f"LIVE_TIER_COUNTS_CAT={args.live_tier_counts_cat}")
     if args.prep_headroom_pct is not None:
         os.environ["_CLI_PREP_HEADROOM_PCT"] = str(args.prep_headroom_pct)
         overrides.append(f"PREP_HEADROOM={args.prep_headroom_pct}%")
@@ -11806,6 +11819,8 @@ def main():
 
     # Initialize worker — __init__ derives settings from GUI config
     worker = CoinPrepWorker()
+    worker.fee_approval_id = args.fee_approval_id
+    worker.status.fee_approval_id = args.fee_approval_id
 
     # Pass run_id to worker so status file includes it (prevents stale reads)
     if args.run_id:

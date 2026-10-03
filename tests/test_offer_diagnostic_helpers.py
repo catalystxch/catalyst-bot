@@ -25,13 +25,22 @@ def test_offer_diagnostic_separates_pending_and_terminal_wallet_rows():
                 "status": "cancelled",
                 "lifecycle_state": "cancelled",
             },
+            {
+                "trade_id": "cancelled-buy-stale-lifecycle",
+                "side": "buy",
+                "status": "cancelled",
+                "lifecycle_state": "cancel_requested",
+            },
         ],
         wallet_ids={"pending-sell", "cancelled-sell", "unknown-wallet"},
     )
 
     assert result["active_db_ids"] == {"live-buy"}
     assert result["pending_cancel_ids"] == {"pending-sell"}
-    assert result["terminal_db_ids"] == {"cancelled-sell"}
+    assert result["terminal_db_ids"] == {
+        "cancelled-buy-stale-lifecycle",
+        "cancelled-sell",
+    }
     assert result["stale_in_db"] == ["live-buy"]
     assert result["wallet_only"] == ["unknown-wallet"]
     assert result["wallet_cancel_pending"] == ["pending-sell"]

@@ -18,16 +18,22 @@ NOW = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
 ASSET_ID = "ef" * 32
 
 
-def _campaign(*, subsidy=Decimal("0")):
+def _campaign(
+    *,
+    subsidy=Decimal("0"),
+    anchor=Decimal("0.01"),
+    xch_budget=Decimal("1"),
+    cat_budget=Decimal("0"),
+):
     return BootstrapCampaign(
         network="mainnet",
         wallet_type="sage",
         wallet_fingerprint=736588221,
         wallet_id=2,
         asset_id=ASSET_ID,
-        anchor_price=Decimal("0.01"),
-        xch_budget=Decimal("1"),
-        cat_budget=Decimal("0"),
+        anchor_price=anchor,
+        xch_budget=xch_budget,
+        cat_budget=cat_budget,
         fee_budget_xch=Decimal("0.02"),
         subsidy_budget_xch=subsidy,
         created_at=NOW,
@@ -141,3 +147,52 @@ def test_offer_specs_preserve_exact_bootstrap_level_purpose_and_amounts():
         level["xch_amount"] for level in plan["sides"]["buy"]["levels"]
     ]
     assert sum(spec["subsidy_xch"] for spec in specs) == plan["subsidy_used_xch"]
+
+
+def test_trusted_bounds_shift_each_bootstrap_ladder_without_collapsing_tiers():
+    campaign = _campaign(
+        anchor=Decimal("0.000075"),
+        xch_budget=Decimal("1"),
+        cat_budget=Decimal("150000"),
+    )
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            cat_available=Decimal("150000"),
+            minimum_profit_xch=Decimal("0"),
+            trusted_bid=Decimal("0.00004"),
+            trusted_ask=Decimal("0.00011"),
+        ),
+    )
+
+    buy_prices = [level["price"] for level in plan["sides"]["buy"]["levels"]]
+    sell_prices = [level["price"] for level in plan["sides"]["sell"]["levels"]]
+
+    assert plan["authorized"] is True
+    assert buy_prices[0] == Decimal("0.00004")
+    assert sell_prices[0] == Decimal("0.00011")
+    assert buy_prices[0] > buy_prices[1] > buy_prices[2]
+    assert sell_prices[0] < sell_prices[1] < sell_prices[2]
+    assert all(campaign.minimum_price <= price for price in buy_prices)
+    assert all(price <= campaign.maximum_price for price in sell_prices)
+
+
+def test_trusted_boundary_with_no_room_for_three_levels_pauses_that_side():
+    campaign = _campaign(
+        anchor=Decimal("0.000075"),
+        xch_budget=Decimal("0"),
+        cat_budget=Decimal("150000"),
+    )
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            cat_available=Decimal("150000"),
+            minimum_profit_xch=Decimal("0"),
+            trusted_ask=campaign.maximum_price,
+        ),
+    )
+
+    assert plan["sides"]["sell"] == {"paused": True, "levels": []}
+    assert "sell_trusted_range_insufficient_corridor" in plan["reason_codes"]

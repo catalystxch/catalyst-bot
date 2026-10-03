@@ -4742,6 +4742,7 @@
             font-size: 0.95em;
             color: var(--text-secondary);
             line-height: 1.6;
+            white-space: pre-line;
             margin-bottom: 25px;
         }
         .confirm-modal-buttons {
@@ -7029,6 +7030,47 @@
             text-align: left;
         }
 
+        .coin-prep-fee-panel {
+            display: none;
+            padding: 14px;
+            border: 1px solid rgba(96, 165, 250, 0.3);
+            border-radius: 10px;
+            background: rgba(15, 23, 42, 0.72);
+            color: var(--slate-300);
+            font-size: 0.88em;
+            line-height: 1.45;
+        }
+
+        .coin-prep-fee-panel h4 {
+            margin: 0 0 8px;
+            color: var(--slate-100);
+            font-size: 1.02em;
+        }
+
+        .coin-prep-fee-grid {
+            display: grid;
+            grid-template-columns: minmax(125px, auto) 1fr;
+            gap: 5px 12px;
+        }
+
+        .coin-prep-fee-grid .label { color: var(--slate-400); }
+        .coin-prep-fee-grid .value { color: var(--slate-100); overflow-wrap: anywhere; }
+        .coin-prep-fee-cap { margin-top: 10px; }
+        .coin-prep-fee-cap label { display: block; color: var(--slate-300); margin-bottom: 4px; }
+        .coin-prep-fee-cap input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px 10px;
+            border: 1px solid rgba(148, 163, 184, 0.4);
+            border-radius: 7px;
+            background: rgba(2, 6, 23, 0.7);
+            color: var(--slate-100);
+            font: inherit;
+        }
+
+        .coin-prep-fee-note { margin-top: 8px; color: var(--slate-400); }
+        .coin-prep-fee-error { margin-top: 7px; color: var(--sell-color); }
+
         .coin-prep-confirm-aside .coin-prep-guidance {
             margin-top: 0;
             grid-template-columns: 1fr;
@@ -8269,7 +8311,7 @@
     </div>
 
 <!-- ========== Sage Startup Modal ========== -->
-    <div class="startup-overlay" id="startupOverlay">
+    <div class="startup-overlay" id="startupOverlay" role="dialog" aria-modal="true" aria-labelledby="startupTitle" tabindex="-1">
         <div class="startup-shell">
         <div class="startup-header">
             <div class="startup-header-app"><img src="/favicon.ico" alt="CATalyst logo"></div>
@@ -9220,7 +9262,7 @@
                     <!-- ===== HERO STRIP: Key numbers at a glance ===== -->
                     <div class="v4-hero-strip" id="heroStrip">
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label" id="heroMidPriceLabel">Trusted Mid Price <span class="cc-help">?<span class="cc-tooltip" id="heroMidPriceTooltip">Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.</span></span></div>
+                            <div class="v4-hero-label" id="heroMidPriceLabel">Indicative Mid Price <span class="cc-help">?<span class="cc-tooltip" id="heroMidPriceTooltip">Observed or remembered midpoint for display only. No trusted market price is currently available.</span></span></div>
                             <div class="v4-hero-value data-pending" id="heroMidPrice">—</div>
                             <div class="v4-hero-sub data-pending" id="heroSpread">spread —</div>
                             <a href="javascript:void(0)" onclick="v4SwitchView('intel')" style="font-size: 10px; color: var(--text-tertiary); text-decoration: none; opacity: 0.6; display: inline-block; margin-top: 6px;" onmouseover="this.style.opacity='1'; this.style.color='var(--accent-primary)'" onmouseout="this.style.opacity='0.6'; this.style.color='var(--text-tertiary)'" title="Open Market Intel for full price history">Full chart →</a>
@@ -9768,7 +9810,7 @@
                     </div>
                     <div class="lc-manual-actions">
                         <div id="lcGapDisplay" style="font-size:0.85em; color: var(--text-secondary); margin-bottom: 8px;">Current arb gap: <strong id="lcGapValue">—</strong></div>
-                        <button class="btn" id="boostBtn" hidden onclick="toggleGapCloser()" style="width: 100%;">Retired</button>
+                        <button class="btn" id="boostBtn" hidden style="width: 100%;">Retired</button>
                     </div>
                 </div>
             </div>
@@ -9869,7 +9911,7 @@
                 <div id="offersEmptyState" style="display:none; text-align:center; padding: 48px 24px; color: var(--text-tertiary);">
                     <div style="font-size: 2em; margin-bottom: 12px; opacity: 0.3;">📋</div>
                     <div style="font-size: 1em; font-weight: 600; margin-bottom: 6px; color: var(--text-secondary);">No open offers</div>
-                    <div style="font-size: 0.85em;">Start the bot to begin market making, or wait for the next loop cycle.</div>
+                    <div id="offersEmptyStateMessage" style="font-size: 0.85em;">Start the bot to begin market making.</div>
                 </div>
                 <!-- Buy Offers -->
                 <div class="offers-section" id="buyOffersSection">
@@ -10140,7 +10182,7 @@
                         <div style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: var(--space-3);">Sniper Stats <span class="cc-help">?<span class="cc-tooltip">All sniper probe activity — automatic arb snipes plus manual Close the Gap probes. Both use the sniper pool to probe price levels.</span></span></div>
                         <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--space-2); margin-bottom: var(--space-3);">
                             <div>
-                                <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Arb Snipes <span class="cc-help">?<span class="cc-tooltip">Automatic arb snipes executed this session. Triggered when gap between Dexie and TibetSwap exceeds threshold.</span></span></div>
+                                <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">Arb Snipes <span class="cc-help">?<span class="cc-tooltip">Historical automatic probe activity retained for prior sessions.</span></span></div>
                                 <div id="sniperTotal" style="font-size: var(--text-lg); font-weight: 700; font-family: var(--font-mono); color: var(--status-warning);">0</div>
                             </div>
                             <div>
@@ -10155,7 +10197,7 @@
 
                         <!-- Close the Gap floor discovery summary -->
                         <div style="border-top: 1px solid var(--border-subtle); padding-top: var(--space-3);">
-                            <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: var(--space-2); text-transform: uppercase; letter-spacing: 0.5px;">Close the Gap — last completed run <span class="cc-help">?<span class="cc-tooltip">Most recent inverted-probe floor discovery results. Shows the depth at which arbers fired on each side. The cascade plants tight inner ladder offers (immune to TibetSwap arb) after the floors are proven.</span></span></div>
+                            <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: var(--space-2); text-transform: uppercase; letter-spacing: 0.5px;">Close the Gap — last completed run <span class="cc-help">?<span class="cc-tooltip">Historical inverted-probe floor discovery results retained for prior sessions.</span></span></div>
                             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: var(--space-2);">
                                 <div>
                                     <div style="color: var(--text-tertiary); font-size: var(--text-xs); margin-bottom: 2px;">BUY Floor</div>
@@ -10337,7 +10379,6 @@
                             <div style="color: rgba(255,255,255,0.3); font-size: 10px;">Rapid add/remove score</div>
                         </div>
                     </div>
-                    <div id="intelTibetContext" style="margin-top: 10px; color: rgba(255,255,255,0.58); font-size: 11px;">TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives a live decision.</div>
                     <div id="intelPoolRatio" style="display:none;">—</div>
                     <div id="intelSlippage" style="display:none;">—</div>
                 </div>
@@ -10725,6 +10766,7 @@
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapPreviewBtn" onclick="bootstrapPreviewCampaign()">Preview</button>
                                 <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapRetryStoppedBtn" onclick="bootstrapStopCampaign('pending')" style="display:none;" disabled>Retry Stopped Campaign Cancellation</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapManifestExportBtn" onclick="bootstrapExportManifest()" disabled>Export / Sign Manifest</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapParticipationExportBtn" onclick="exportBootstrapParticipationProof()" disabled>Export / Sign Participation Proof</button>
                                 <button type="button" class="btn btn-config btn-secondary" onclick="document.getElementById('bootstrapManifestImportInput').click()">Import Signed Manifest</button>
@@ -10743,7 +10785,7 @@
                             Liquidity Mode
                             <span class="cc-help">?<span class="cc-tooltip" style="min-width:320px; text-align:left;">
                                 Pick the shape of your market presence before anything else. Two-sided runs a full market maker quoting both buy and sell. One-sided modes place only buy OR only sell orders — useful for accumulation (buy at ladder prices) or distribution (sell at ladder prices) without needing inventory on both sides.<br><br>
-                                Changing the mode requires stopping the bot. Existing offers on the opposite side will be cancelled when the new mode takes effect.
+                                Changing the mode requires stopping the bot. Existing opposite-side offers remain live until you use protected Cancel All and they are confirmed terminal. Start is blocked while any remain open.
                             </span></span>
                         </div>
                         <div class="v4-settings-hint" style="margin-bottom: 12px;">
@@ -10770,7 +10812,7 @@
                             </label>
                         </div>
                         <div id="liquidityModeLockedHint" style="display:none; margin-top: 10px; padding: 8px 12px; background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.3); border-radius: 6px; font-size: 0.82em; color: var(--warning-300); line-height: 1.5;">
-                            🔒 Stop the bot to change the liquidity mode. Existing offers on the opposite side will be cancelled when the new mode starts.
+                            🔒 Stop the bot to change the liquidity mode. Existing opposite-side offers stay live; use protected Cancel All before starting the new mode.
                         </div>
                         <!-- Wallet-balance suggestion: appears when the wallet is
                              clearly lopsided (lots of XCH and ~no CAT, or vice
@@ -11487,13 +11529,13 @@
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="display: flex; align-items: center; gap: 10px;">
                                 <input type="checkbox" id="configTransactionFeeEnabled" style="width: auto; margin: 0;" onchange="updateFeeSettingsUi(); updateCoinPrepPreview();">
-                                <span>Transaction Fees <span class="cc-help">?<span class="cc-tooltip">Adds a fee to on-chain wallet transactions only: coin prep, top-ups, combines, splits, and secure cancels. Offer creation itself still stays fee-free.</span></span></span>
+                                <span>Manual Transaction Fee <span class="cc-help">?<span class="cc-tooltip">Manual fee for wallet transactions outside the approved Coin Prep workflow. Coin Prep and its protected cancellations use fresh cost-based estimates within a separately approved budget; this switch cannot disable that approval or make prep free. Offer creation itself stays fee-free.</span></span></span>
                             </label>
                         </div>
                         <div id="transactionFeeManualWrap" style="display: none;">
                             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Fee Amount (XCH per transaction) <span class="cc-help">?<span class="cc-tooltip">Fee you want to use for each transaction.</span></span></label>
+                                    <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
                                     <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
                                 </div>
                                 <div class="form-group" style="margin-bottom: 0;">
@@ -11755,8 +11797,35 @@
                 </div>
 
                 <div class="coin-prep-confirm-aside">
+                <div class="coin-prep-fee-panel" id="cpFeePanel" aria-live="polite">
+                    <h4>Network fee approval</h4>
+                    <div id="cpFeeStatus">Requesting a current network estimate…</div>
+                    <div class="coin-prep-fee-grid" id="cpFeeDetails" style="display:none;">
+                        <span class="label">Wallet and pair</span><span class="value" id="cpFeeWalletPair">--</span>
+                        <span class="label">Preparation count</span><span class="value" id="cpFeeTxCount">--</span>
+                        <span class="label">Current estimate</span><span class="value" id="cpFeeEstimate">--</span>
+                        <span class="label">Protected cancellation</span><span class="value" id="cpFeeCancellation">--</span>
+                        <span class="label">Existing fee commitments</span><span class="value" id="cpFeePriorAccounting">--</span>
+                        <span class="label">Fee-coin principal</span><span class="value" id="cpFeePrincipal">--</span>
+                        <span class="label">Fee funding available</span><span class="value" id="cpFeeFunding">--</span>
+                        <span class="label">Estimate source</span><span class="value" id="cpFeeSource">--</span>
+                        <span class="label">Evidence</span><span class="value" id="cpFeeEvidence">--</span>
+                    </div>
+                    <div class="coin-prep-fee-note" id="cpFeeStages"></div>
+                    <div class="coin-prep-fee-note" id="cpFeeNetwork"></div>
+                    <div class="coin-prep-fee-cap" id="cpFeeCapRow" style="display:none;">
+                        <label for="cpFeeMaximumInput">Maximum total fee (XCH)</label>
+                        <input id="cpFeeMaximumInput" inputmode="decimal" autocomplete="off"
+                               oninput="validateCoinPrepFeeMaximum()" aria-describedby="cpFeeCapHelp cpFeeInputError">
+                        <div class="coin-prep-fee-note" id="cpFeeCapHelp">This cap includes a protected allowance for cancellation transactions.</div>
+                        <div class="coin-prep-fee-error" id="cpFeeInputError" role="alert"></div>
+                    </div>
+                    <div class="coin-prep-fee-note" id="cpFeeDisclaimer">A target is not a guarantee of confirmation time. Exact unsigned costs are re-priced before every transaction and CATalyst pauses if the approved cap cannot cover them.</div>
+                    <button class="btn btn-config btn-secondary" id="cpFeeRefreshBtn" type="button"
+                            onclick="refreshCoinPrepFeePreview()" style="margin-top:10px; padding:7px 12px;">Refresh fee estimate</button>
+                </div>
                 <div class="coin-prep-message">
-                    This will take around five minutes to complete. You can monitor progress below.
+                    The default fee estimate targets inclusion within 300 seconds per transaction, not total preparation time. Block inclusion and completion times are not guaranteed.
                 </div>
 
                 <div class="coin-prep-guidance">
@@ -11780,7 +11849,7 @@
             
             <!-- PROGRESS VIEW (while coin prep is running) -->
             <div id="coinPrepProgressView" style="display: none;">
-                <div class="coin-prep-title">Preparing Coins</div>
+                <div class="coin-prep-title" id="cpProgressTitle">Preparing Coins</div>
                 <div class="coin-prep-phase" id="cpProgressPhase">Starting...</div>
                 
                 <!-- Progress bar with percentage overlay -->
@@ -11791,6 +11860,17 @@
                 
                 <div class="coin-prep-message" id="cpProgressMessage">
                     Initialising coin preparation...
+                </div>
+
+                <div id="cpProgressFeeAccounting" aria-live="polite" style="display:none; margin-top:14px; padding:14px; background:rgba(59,130,246,0.08); border:1px solid rgba(59,130,246,0.28); border-radius:10px;">
+                    <div id="cpProgressFeeState" style="font-size:0.9em; line-height:1.5; color:var(--text-primary); margin-bottom:10px;"></div>
+                    <div style="display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 14px; font-size:0.82em;">
+                        <span style="color:var(--text-tertiary);">Maximum approved</span><span id="cpProgressFeeMaximum" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Currently held</span><span id="cpProgressFeeHeld" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Confirmed spent</span><span id="cpProgressFeeSpent" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Remaining total</span><span id="cpProgressFeeRemaining" style="font-variant-numeric:tabular-nums;">--</span>
+                        <span style="color:var(--text-tertiary);">Protected for cancellation</span><span id="cpProgressFeeProtected" style="font-variant-numeric:tabular-nums;">--</span>
+                    </div>
                 </div>
                 
                 <div class="coin-prep-details">
@@ -11805,7 +11885,7 @@
                 </div>
                 
                 <div style="margin-top: 20px; padding: 10px 14px; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; font-size: 0.85em; color: rgba(255,255,255,0.6); line-height: 1.5; text-align: center;">
-                    ℹ️ This will take around five minutes to complete. Each split requires a blockchain transaction to confirm.
+                    ℹ️ Each split must confirm on-chain. The 300-second default target is per transaction; total preparation may take longer and is not guaranteed.
                 </div>
                 
                 <div style="margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px;">
@@ -11816,6 +11896,7 @@
                         <button id="coinPrepCancelBtn" onclick="cancelCoinPrepInProgress()" style="background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); color: var(--sell-color); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 0.85em; transition: all 0.2s;">
                             Cancel Coin Prep
                         </button>
+                        <button id="cpReviewFeeBudgetBtn" class="btn" style="display:none;" disabled>Review fee budget</button>
                     </div>
                     <div id="coinPrepLogBox" class="coin-prep-log-box">
                         Waiting for coin prep logs...
@@ -12275,7 +12356,7 @@
                 </ul>
             </div>
             <p style="opacity: 0.7; margin-bottom: 20px; font-size: 0.88em; color: var(--text-secondary);">
-                Coin prep only needs to run once and takes around five minutes.
+                Coin prep prepares coins for your current settings. The default fee estimate targets 300-second inclusion per transaction, not a guaranteed total preparation time.
             </p>
             <div class="v4-modal-actions v4-modal-actions--center">
                 <button class="btn btn-start btn-primary" onclick="closeSkipWarningAndGoBack()" style="flex: 1; max-width: 190px;">🪙 Run Coin Prep</button>
@@ -12423,7 +12504,7 @@
                     <div class="v4-modal-panel v4-modal-panel--info">
                         <div class="v4-modal-panel-title">What the app does</div>
                         <div class="v4-modal-panel-copy">
-                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, and updates confirmed PnL. Follow mode progressively withdraws exposure when attributable market evidence degrades; an explicitly approved, budget-bound Bootstrap campaign can remain active inside its signed corridor. TibetSwap shut down; historical TibetSwap data is retained as read-only history and never drives live trading.
+                            Connects to Sage Wallet, prepares offer-sized XCH and CAT coins, builds a tiered buy/sell ladder, publishes independently to Dexie and optional Splash P2P, tracks authoritative fills, and updates confirmed PnL. Follow mode progressively withdraws exposure when attributable market evidence degrades; an explicitly approved, budget-bound Bootstrap campaign can remain active inside its signed corridor.
                         </div>
                     </div>
                     <div class="v4-modal-panel">
@@ -12450,7 +12531,7 @@
                             <strong>Settings audit log</strong> — every config change is recorded with who/when/what so you can investigate after the fact.<br>
                             <strong>Light mode polish</strong> — every panel and modal now reads cleanly on a light background.<br>
                             <strong>PnL statistics</strong> — volume, avg fill size, avg trip time, avg profit per trip, open legs panel.<br>
-                            <strong>Token icons</strong> — live token logo throughout the app, sourced from Dexie CDN.
+                            <strong>Token identity</strong> — canonical ticker and asset identity are shown without loading remote token artwork into the wallet UI.
                         </div>
                     </div>
                     <div class="v4-modal-panel v4-modal-panel--warning">
@@ -12774,7 +12855,6 @@
                         <li><strong>Rate-limited</strong> — repeated undercutting cannot trigger an offer war</li>
                         <li><strong>Publication-proven</strong> — the exact offer must be rediscovered within 90 seconds</li>
                     </ul>
-                    <p>TibetSwap shut down. Its historical pool and sniper records remain read-only for continuity and never affect a live quote.</p>
                 </div>
 
                 <!-- CLOSE THE GAP -->
@@ -13282,12 +13362,11 @@
             const result = await showStyledConfirm({
                 icon: '↺',
                 title: 'Start Fresh To Change Settings',
-                message: 'This session is resuming <strong>existing live offers</strong>. Core settings are locked in resume mode so the live book stays consistent.<br><br>Use <strong>Live Controls</strong> for safe live quote changes, or choose <strong>View Settings</strong> to browse current settings (read-only), or <strong>Start Fresh</strong> to cancel all offers and rebuild from scratch.',
+                message: 'This session is resuming existing live offers. Core settings are locked in resume mode so the live book stays consistent.\n\nUse Live Controls for safe live quote changes, or choose View Settings to browse current settings (read-only), or Start Fresh to cancel all offers and rebuild from scratch.',
                 confirmText: 'Start Fresh',
                 cancelText: 'Back',
                 extraText: 'View Settings',
-                style: 'warning',
-                allowHtml: true
+                style: 'warning'
             });
 
             if (result === 'extra') {
@@ -14830,6 +14909,8 @@
                 }
             }
 
+            updateHeroPriceProvenance();
+
             // Spread — from command centre spread data if available
             const heroSpread = document.getElementById('heroSpread');
             if (heroSpread) {
@@ -15024,25 +15105,9 @@
             // (e.g. first status tick after a page reload where the pair is restored
             // from config but updateTokenIcons hasn't been called yet).
             const titleIcon = document.getElementById('tokenIconTitlebar');
-            if (titleIcon && currentCAT && currentCAT.asset_id) {
-                const aid = currentCAT.asset_id;
-                // icons.dexie.space serves .webp ONLY — .png returns a 1140-byte
-                // grey placeholder. Always use .webp.
-                const dexieFallback = `https://icons.dexie.space/${aid}.webp`;
-                const iconUrl = (typeof getTokenIconUrl === 'function')
-                    ? getTokenIconUrl(aid)
-                    : dexieFallback;
-                // Compare using getAttribute('src') not .src — browsers normalise
-                // .src to an absolute URL, so "" becomes the page origin and the
-                // !== check against an https://icons... URL always fails.
-                const currentSrc = titleIcon.getAttribute('src') || '';
-                if (iconUrl && currentSrc !== iconUrl) {
-                    titleIcon.setAttribute('src', iconUrl);
-                    titleIcon.dataset.fallbackSrc = (iconUrl !== dexieFallback) ? dexieFallback : '';
-                }
-                // Only make visible once we've given it a real src.
-                if (iconUrl) titleIcon.style.display = 'inline-block';
-            } else if (titleIcon && !currentCAT) {
+            if (titleIcon) {
+                // Pair identity is always shown as text.  Do not copy remote or
+                // DOM-derived token metadata into an image URL sink.
                 titleIcon.style.display = 'none';
             }
 
@@ -15273,6 +15338,8 @@
             if (m === 'GET'  && clean === 'coins')              return 'get_coins';
             if (m === 'POST' && clean === 'coins/topup')        return 'trigger_topup';
             if (m === 'GET'  && clean === 'coin-prep/status')   return 'get_coin_prep_status';
+            if (m === 'POST' && clean === 'coin-prep/fee-preview') return 'preview_coin_prep_fees';
+            if (m === 'POST' && clean === 'coin-prep/fee-approval') return 'approve_coin_prep_fees';
             if (m === 'POST' && clean === 'coin-prep/trigger')  return 'trigger_coin_prep';
             if (m === 'POST' && clean === 'coin-prep/reset')    return 'reset_coin_prep';
             if (m === 'GET'  && clean.startsWith('coin-prep/verify')) return 'verify_coin_prep';
@@ -15835,7 +15902,7 @@
             if (!anchor || !IS_DESKTOP) return;
 
             const rawHref = anchor.getAttribute('href') || '';
-            if (!rawHref || rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
+            if (!rawHref || rawHref.startsWith('#')) {
                 return;
             }
 
@@ -15976,15 +16043,14 @@
                         return await showStyledConfirm({
                             icon: '🎯',
                             title: 'Sniper has live probes',
-                            message: `You currently have <strong>${liveProbes}</strong> active sniper probe(s) ` +
+                            message: `You currently have ${liveProbes} active sniper probe(s) ` +
                                      `on the book. Turning sniper OFF stops new probe activity but does ` +
-                                     `<strong>NOT cancel</strong> these existing probes — they will stay ` +
+                                     `NOT cancel these existing probes — they will stay ` +
                                      `live until they fill, expire, or you manually cancel them. ` +
-                                     `<br><br>Continue?`,
+                                     `\n\nContinue?`,
                             confirmText: 'Yes, turn OFF',
                             cancelText: 'Keep ON',
-                            style: 'warning',
-                            allowHtml: true
+                            style: 'warning'
                         });
                     }
                 }
@@ -15999,15 +16065,14 @@
                         return await showStyledConfirm({
                             icon: '⚖️',
                             title: 'Position is non-zero',
-                            message: `Your net position is currently <strong>${netPos.toFixed(2)} CAT</strong> ` +
+                            message: `Your net position is currently ${netPos.toFixed(2)} CAT ` +
                                      `(${direction}). Turning Inventory Mgmt OFF means your spreads will ` +
-                                     `<strong>stop rebalancing</strong> back toward neutral — position drift ` +
+                                     `stop rebalancing back toward neutral — position drift ` +
                                      `will continue unchecked and could grow further. ` +
-                                     `<br><br>Continue?`,
+                                     `\n\nContinue?`,
                             confirmText: 'Yes, turn OFF',
                             cancelText: 'Keep ON',
-                            style: 'warning',
-                            allowHtml: true
+                            style: 'warning'
                         });
                     }
                 }
@@ -16017,16 +16082,15 @@
                     return await showStyledConfirm({
                         icon: '📐',
                         title: 'Switching to fixed spread',
-                        message: `Turning Dynamic Spreads OFF means the bot will use the <strong>fixed ` +
-                                 `Spread</strong> value from your settings (not the Base Spread slider above). ` +
-                                 `<br><br>Volatility and fill-rate scaling will <strong>stop</strong>. ` +
+                        message: `Turning Dynamic Spreads OFF means the bot will use the fixed ` +
+                                 `Spread value from your settings (not the Base Spread slider above). ` +
+                                 `\n\nVolatility and fill-rate scaling will stop. ` +
                                  `Offer-book confidence safeguards remain active. Existing offers stay ` +
                                  `live; eligible new requotes will use the fixed spread. ` +
-                                 `<br><br>Continue?`,
+                                 `\n\nContinue?`,
                         confirmText: 'Yes, turn OFF',
                         cancelText: 'Keep ON',
-                        style: 'warning',
-                        allowHtml: true
+                        style: 'warning'
                     });
                 }
             } catch (e) {
@@ -16734,42 +16798,12 @@
         let _saLastSuggestions = [];
         let _saLastActionKey = '';
         let _advisorActionItems = [];
-        const _SA_CLOSE_GAP_PROMOTE_BPS = 200;
-        const _SA_CLOSE_GAP_CLEAR_BPS = 120;
-        const _SA_CLOSE_GAP_CONFIRM_UPDATES = 3;
-        let _saCloseGapSignal = { key: '', hits: 0, misses: 0, confirmed: false };
-
-        function saCloseGapSignalReady(candidate, key, holdAllowed) {
-            const nextKey = String(key || 'default');
-            if (candidate) {
-                if (_saCloseGapSignal.key !== nextKey) {
-                    _saCloseGapSignal = { key: nextKey, hits: 0, misses: 0, confirmed: false };
-                }
-                _saCloseGapSignal.hits += 1;
-                _saCloseGapSignal.misses = 0;
-                if (_saCloseGapSignal.hits >= _SA_CLOSE_GAP_CONFIRM_UPDATES) {
-                    _saCloseGapSignal.confirmed = true;
-                }
-                return _saCloseGapSignal.confirmed;
-            }
-
-            if (_saCloseGapSignal.confirmed && holdAllowed && _saCloseGapSignal.misses < 2) {
-                _saCloseGapSignal.misses += 1;
-                return true;
-            }
-
-            _saCloseGapSignal = { key: '', hits: 0, misses: 0, confirmed: false };
-            return false;
-        }
-
         function getAdvisorActionTitle(actionType) {
             switch (String(actionType || '')) {
                 case 'enableInventory':
                     return 'Enable inventory protection';
                 case 'applySpread':
                     return 'Adjust live spread';
-                case 'activateGapCloser':
-                    return 'Probe for arb floor';
                 case 'openLiveControls':
                     return 'Open Live Controls';
                 case 'openSettings':
@@ -16855,6 +16889,15 @@
             const sc = dashboard.spacescan_context || dashboard.spacescan || {};
             const trading = s.trading || {};
             const safety = s.safety || {};
+            // Legacy market_health may remain green while Follow has withdrawn
+            // every offer. Only the attributable confidence snapshot can support
+            // price-based advice; a zero effective target is not a live ladder.
+            const confidence = (_lastMarketConfidence || {}).confidence || {};
+            const confidenceState = String(confidence.state || '').toUpperCase();
+            const trustedMid = Number(confidence.trusted_midpoint || 0);
+            const hasTrustedMarketContext = ['GREEN', 'AMBER'].includes(confidenceState)
+                && confidence.data_valid !== false
+                && Number.isFinite(trustedMid) && trustedMid > 0;
 
             // F62 (2026-04-10): suppress all advice until the bot has settled
             // after a restart. During the first few cycles, data is stale or
@@ -16934,7 +16977,6 @@
                 mhMetrics.market_intel_state ?? mh.market_intel_state ?? ''
             ).toLowerCase();
             const competitorCount = parseInt(mhMetrics.competitor_count ?? 0, 10) || 0;
-            const arbGapBps = parseFloat(mhMetrics.arb_gap_bps ?? 0) || 0;
             const minBps = parseFloat(spreads.min_spread_bps) || 100;
             const maxBps = parseFloat(spreads.max_spread_bps) || 1500;
             const inventoryMgmtEnabled = !!(s.features && s.features.inventory_mgmt);
@@ -17002,42 +17044,8 @@
             const walletReachable = (bot_state?.chia_health?.wallet_reachable ?? bot_state?.wallet_reachable) !== false;
             const uptimeSecs = parseInt(perf.uptime_secs ?? 0, 10) || 0;
             const totalFills = parseInt(perf.total_fills ?? 0, 10) || 0;
-            const sniperEnabled = !!(s.features && s.features.sniper);
             const isRunning = !!(bot_state && bot_state.running);
             const _spreadCooldownActive = Date.now() < _saSpreadActionCooldownUntil;
-            const _arbDataReliable = competitorBestBid > 0 && competitorBestAsk > 0;
-            const closeGapSafeRoom = baseBps - Math.max(arbGapBps + 20, 80);
-            const closeGapWideEnough = competitorBps > 0
-                ? baseBps >= Math.max(600, competitorBps * 1.75)
-                : baseBps >= 600;
-            const closeGapKey = [
-                currentCAT && currentCAT.asset_id ? currentCAT.asset_id : 'pair',
-                Math.round(baseBps / 50) * 50,
-                Math.round(competitorBps / 50) * 50
-            ].join(':');
-            const closeGapCandidate = isRunning
-                && !ladderStillBuilding
-                && liveOpenBuys > 0
-                && liveOpenSells > 0
-                && !_gapCloserActive
-                && baseBps > 400
-                && !_spreadCooldownActive
-                && arbGapBps >= _SA_CLOSE_GAP_PROMOTE_BPS
-                && closeGapSafeRoom > 150
-                && _arbDataReliable
-                && closeGapWideEnough
-                && uptimeSecs >= 900;
-            const closeGapHoldAllowed = isRunning
-                && !ladderStillBuilding
-                && !_gapCloserActive
-                && !_spreadCooldownActive
-                && arbGapBps >= _SA_CLOSE_GAP_CLEAR_BPS;
-            const closeGapReady = saCloseGapSignalReady(
-                closeGapCandidate,
-                closeGapKey,
-                closeGapHoldAllowed
-            );
-
             function pushSuggestion(item) {
                 if (!item) return;
                 // Errors always show; cap softer messages at 3 total
@@ -17078,6 +17086,7 @@
             const buyDynamicBps = parseFloat(mhMetrics.buy_spread_bps ?? 0) || 0;
             const sellDynamicBps = parseFloat(mhMetrics.sell_spread_bps ?? 0) || 0;
             const maxSpreadClampActive = isRunning
+                && hasTrustedMarketContext
                 && dynamicSpreadsEnabled
                 && maxBps > 0
                 && (buyDynamicBps >= maxBps - 0.5 || sellDynamicBps >= maxBps - 0.5);
@@ -17095,7 +17104,7 @@
 
             const hardMax = parseFloat(safety.hard_max_price) || 0;
             const hardMin = parseFloat(safety.hard_min_price) || 0;
-            const currentMid = parseFloat(bot_state?.pricing?.mid) || 0;
+            const currentMid = hasTrustedMarketContext ? trustedMid : 0;
             if (currentMid > 0 && hardMax > 0 && currentMid > hardMax) {
                 const pctOver = (((currentMid - hardMax) / hardMax) * 100).toFixed(1);
                 pushSuggestion({
@@ -17213,7 +17222,7 @@
             // is long enough that sparse fills are surprising.
             const _fillsVerySparse = totalFills === 0
                 || (fillsHr > 0 && fillsHr < 0.2 && totalFills < Math.max(3, uptimeSecs / 14400));
-            if (isRunning && uptimeSecs > 7200 && _fillsVerySparse && liveOpenBuys > 0 && liveOpenSells > 0) {
+            if (isRunning && hasTrustedMarketContext && uptimeSecs > 7200 && _fillsVerySparse && liveOpenBuys > 0 && liveOpenSells > 0) {
                 const _hoursUp = Math.round(uptimeSecs / 3600);
                 const _fillsCopy = totalFills === 0
                     ? 'zero fills'
@@ -17226,7 +17235,20 @@
                 });
             }
 
-            if (ladderStillBuilding && !isRecoveryGuidanceActive()) {
+            if (!hasTrustedMarketContext) {
+                const reasons = (Array.isArray(confidence.reason_codes) ? confidence.reason_codes : [])
+                    .map(code => String(code).replaceAll('_', ' ')).join(' · ');
+                pushSuggestion({
+                    type: 'info',
+                    icon: '...',
+                    msg: _bootstrapActiveCampaign
+                        ? 'No trusted external market price is available. Bootstrap uses its approved anchor and campaign limits; ordinary spread recommendations are paused.'
+                        : confidenceState === 'RED'
+                            ? 'Follow offers are paused by RED market confidence' + (reasons ? ': ' + reasons : '') + '. Tightening spreads cannot resolve missing trusted market evidence.'
+                            : 'Waiting for trusted market evidence before recommending spread changes.',
+                    action: null
+                });
+            } else if (ladderStillBuilding && !isRecoveryGuidanceActive()) {
                 pushSuggestion({
                     type: 'info',
                     icon: '...',
@@ -17250,63 +17272,17 @@
                     });
                 }
 
-                if (arbGapBps >= 100 && !closeGapReady) {
-                    const edgeMsg = bothSidesAtEdge
-                        ? ' Your live book is already sitting on the edge, so tightening now would mostly feed arb.'
-                        : '';
-                    const gapAdvice = arbGapBps >= _SA_CLOSE_GAP_PROMOTE_BPS
-                        ? ' Waiting for the gap to hold across multiple cycles before recommending Close the Gap.'
-                        : ' Let the gap settle before changing spreads aggressively.';
-                    pushSuggestion({
-                        type: 'info',
-                        icon: '<>',
-                        msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap.' + edgeMsg + gapAdvice,
-                        action: null
-                    });
-                }
-
-                // Smart action: adapts to market conditions.
-                //  • Arb gap present (≥50 bps) → "Close the Gap" (probe for arb floor)
-                //  • Arb gap calm, BASE wide, no fills → "Tighten Spread" (reduce BASE_SPREAD_BPS)
-                //
+                // When a quiet pair has no attributable competitor data, a
+                // wide configured base can be tightened without consulting
+                // retired AMM gap fields. Current advice is derived only from
+                // the live offer book and authoritative confidence snapshot.
                 // Gate and target derivation use `configBaseBps` (the actual
                 // BASE_SPREAD_BPS config) — NOT the adjusted `baseBps` which
                 // reflects competitor/pool widening. Anchoring on the adjusted
                 // spread produced targets wider than BASE and the "Tighten"
                 // button silently widened the user's config.
-                if (!_gapCloserActive && !maxSpreadClampActive && baseBps > 400 && !_spreadCooldownActive) {
-                    // Arb-gap reliability gate: the arb gap is computed
-                    // against Dexie's price, which falls back to a stale
-                    // 24h average for thin/illiquid pairs. Without legit
-                    // competitor offers on BOTH sides of Dexie's book the
-                    // gap doesn't reflect a real opportunity arbers would
-                    // act on, so probing is futile and the recommendation
-                    // becomes misleading. Require a real two-sided Dexie
-                    // market before suggesting Close the Gap.
-                    if (closeGapReady) {
-                        // Active arb gap WITH a real two-sided Dexie market — probe makes sense
-                        pushSuggestion({
-                            type: 'warning',
-                            icon: '📈',
-                            msg: 'Arb gap is ' + fmtPct(arbGapBps) + ' between Dexie and TibetSwap while your spread is ' + fmtPct(baseBps) + '. Close the Gap will probe for the arb floor with small offers, stepping tighter every 60s. When it finds the floor it plants an inner-tier offer at the proven safe price.',
-                            action: 'Close the Gap',
-                            actionType: 'activateGapCloser'
-                        });
-                    } else if (arbGapBps >= 50 && !_arbDataReliable) {
-                        // Arb gap looks tradeable on paper but Dexie's
-                        // book has no real competitors near market — the
-                        // gap is computed against historical price data,
-                        // not live opportunity. Probing won't catch real
-                        // arbers because there aren't any.
-                        pushSuggestion({
-                            type: 'info',
-                            icon: '...',
-                            msg: 'Arb gap reads ' + fmtPct(arbGapBps) + ' but Dexie has no live two-sided market for this pair — the gap is calculated against stale historical price data, not a real opportunity. Probing for the arb floor here would just expire offers without proving anything.',
-                            action: null
-                        });
-                    } else if (arbGapBps < 50 && fillsHr === 0 && closeGapSafeRoom > 100 && configBaseBps > 400) {
-                        // No arb gap, but BASE is wide with zero fills — tighten the actual config.
-                        //
+                if (!maxSpreadClampActive && baseBps > 400 && !_spreadCooldownActive
+                        && fillsHr === 0 && configBaseBps > 400) {
                         // Only fire this when we have NO competitor data. The
                         // "no fills + competitors visible" branch below makes
                         // a smarter call (tighten only if competitors are
@@ -17325,20 +17301,19 @@
                                 pushSuggestion({
                                     type: 'info',
                                     icon: '📐',
-                                    msg: 'No arb risk (' + fmtPct(arbGapBps) + ') and your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills. Tightening the base is more effective than probing with small offers in a quiet market.',
+                                    msg: 'Your base spread (' + fmtPct(configBaseBps) + ') is wide with zero fills and no attributable competitor book. Tightening the base may improve participation in this quiet market.',
                                     action: 'Tighten base to ' + fmtPct(targetBps),
                                     actionType: 'applySpread',
                                     actionValue: String(targetBps)
                                 });
                             }
                         }
-                    }
                 }
 
                 // Suppress the price-gap tip when the Spacescan cache is
                 // stale — the "explorer price" we'd compare against is no
                 // longer a reliable sanity check.
-                if (scHasData && !scStale && scPriceGapBps >= 1500 && arbGapBps < 100) {
+                if (scHasData && !scStale && scPriceGapBps >= 1500) {
                     pushSuggestion({
                         type: 'info',
                         icon: 'SC',
@@ -17410,7 +17385,7 @@
                 // and saying "competitors are tighter at 0.0%" is internally
                 // contradictory. Gate the entire branch on competitorBps > 0.
                 const spreadGapBps = baseBps - competitorBps;
-                if (fillsHr === 0 && !maxSpreadClampActive && competitorCount > 0 && competitorBps > 0 && arbGapBps < 60 && !bothSidesAtEdge && !_spreadCooldownActive) {
+                if (fillsHr === 0 && !maxSpreadClampActive && competitorCount > 0 && competitorBps > 0 && !bothSidesAtEdge && !_spreadCooldownActive) {
                     // The Spacescan "token still maturing" tip relies on
                     // holder/activity levels that may be stale (rate-limited
                     // 24h cache). If the cache is past the 12h freshness
@@ -17462,7 +17437,7 @@
                     }
                 }
 
-                if (competitorCount === 0 && arbGapBps < 40 && configBaseBps < 500 && !_spreadCooldownActive) {
+                if (competitorCount === 0 && configBaseBps < 500 && !_spreadCooldownActive) {
                     // Skip the "stay disciplined" Spacescan tip when the
                     // underlying holder/activity data is stale — the token
                     // regime may have shifted while the cache sat stale.
@@ -17759,16 +17734,8 @@
                     }, 300);
                     return;
                 }
-                case 'activateGapCloser': {
-                    // Directly open the gap closer confirmation modal
-                    const boostBtn = document.getElementById('boostBtn');
-                    if (boostBtn && !_gapCloserActive) {
-                        boostBtn.click();
-                    }
-                    return;
-                }
                 case 'openLiveControls': {
-                    // Scroll to and expand Live Controls, then highlight the gap-closer button
+                    // Scroll to and expand Live Controls.
                     // First switch to dashboard view if not already there
                     if (typeof v4SwitchView === 'function') v4SwitchView('dashboard');
                     else if (typeof switchView === 'function') switchView('dashboard');
@@ -17783,13 +17750,7 @@
                         const toggleBtn = document.querySelector('[onclick*="liveControlsBody"]');
                         if (toggleBtn) toggleBtn.classList.remove('collapsed');
                     }
-                    const boostBtn = document.getElementById('boostBtn');
-                    if (boostBtn) {
-                        boostBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        boostBtn.style.outline = '2px solid var(--warning-200)';
-                        boostBtn.style.outlineOffset = '3px';
-                        setTimeout(() => { boostBtn.style.outline = ''; boostBtn.style.outlineOffset = ''; }, 3000);
-                    }
+                    if (liveControlsEl) liveControlsEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
                     return;
                 }
                 default:
@@ -18134,33 +18095,14 @@
         ];
         let _tokenPreviewUrl = '';   // Set when Spacescan intel data arrives
 
-        function getTokenIconUrl(assetId) {
-            if (!assetId || assetId.toLowerCase() === 'xch') return '';
-            // Prefer the icon_url stored in currentCAT (populated from data-icon-url
-            // in the option element, which the server derives from Dexie's full 64-char
-            // base_id).  Sage wallet returns truncated 32-char IDs which icons.dexie.space
-            // doesn't recognise — using the Dexie base_id ensures the correct icon loads.
-            if (currentCAT && currentCAT.asset_id === assetId && currentCAT.icon_url) {
-                return currentCAT.icon_url;
-            }
-            // Only use the Spacescan CDN URL if it comes from a known-whitelisted host.
-            if (_tokenPreviewUrl) {
-                try {
-                    const host = new URL(_tokenPreviewUrl).hostname;
-                    if (_SPACESCAN_ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h))) {
-                        return _tokenPreviewUrl;
-                    }
-                } catch (_) { /* malformed URL — fall through */ }
-            }
-            // Last resort: construct from assetId directly (works when assetId is
-            // already the full 64-char Dexie base_id).
-            // IMPORTANT: icons.dexie.space serves .webp ONLY — .png returns a
-            // 1140-byte grey placeholder.
-            return `https://icons.dexie.space/${assetId}.webp`;
+        function getSafeTokenIconUrl(_assetId) {
+            // Remote token images are intentionally disabled.  The ticker text
+            // remains authoritative and avoids URL-bearing DOM sinks entirely.
+            return '';
         }
 
         function updateTokenIcons(assetId) {
-            const url = getTokenIconUrl(assetId);
+            const url = getSafeTokenIconUrl(assetId);
             // dexie.space is always in the CSP — guaranteed fallback if primary fails.
             // Must use .webp; .png returns the grey 404 placeholder.
             const dexieFallback = (assetId && assetId.toLowerCase() !== 'xch')
@@ -18171,7 +18113,7 @@
             // .src to a full absolute URL, which breaks !== comparisons.
             document.querySelectorAll('.cc-token-icon').forEach(img => {
                 if (url) {
-                    img.setAttribute('src', url);
+                    img.src = url;
                     img.dataset.fallbackSrc = (url !== dexieFallback) ? dexieFallback : '';
                     img.style.display = 'inline-block';
                 } else {
@@ -18188,7 +18130,7 @@
                 const iconEl = pill.querySelector('.cc-token-icon');
                 if (nameEl) nameEl.textContent = tokenName;
                 if (iconEl && url) {
-                    iconEl.src = url;
+                    iconEl.setAttribute('src', getSafeTokenIconUrl(assetId));
                     iconEl.style.display = 'inline-block';
                 } else if (iconEl) {
                     iconEl.style.display = 'none';
@@ -18834,13 +18776,64 @@
             // A browser/window reload resets this client-only flag to "none".
             // Rehydrate it from the wallet-verified backend result so a
             // successful Coin Prep does not strand Start Bot after restart.
-            if (coinPrepStatus !== 'none' || !settingsReviewed) return false;
+            if (coinPrepStatus !== 'none') return false;
             try {
                 const response = await apiFetch(`${API_URL}/coin-prep/status`, {
                     cache: 'no-store'
                 });
                 if (!response.ok) return false;
                 const status = await response.json();
+                const feeState = String(status.fee_approval?.state || '');
+                const feeStillBlocks = status.complete !== true
+                    && status.phase !== 'complete'
+                    && status.overlapping_coin_prep_blocked === true
+                    && !['complete', 'stale'].includes(feeState);
+                const activeBootstrap = _bootstrapActiveCampaign?.campaign_id
+                    ? _bootstrapActiveCampaign : null;
+                if (feeStillBlocks && activeBootstrap) {
+                    const feeCampaignId = String(status.fee_approval?.campaign_id
+                        || status.fee_approval?.request_options?.bootstrap_campaign_id || '');
+                    if (feeCampaignId !== String(activeBootstrap.campaign_id)) return false;
+                }
+                if (feeStillBlocks) {
+                    _coinPrepFeeRecoveryBlocking = true;
+                    setCoinPrepStatus('checking');
+                    renderCoinPrepFeeAccounting(status);
+                    updateCoinPrepRecoveryControls(status);
+                    showCoinPrepView('progress');
+                    const modal = document.getElementById('coinPrepConfirmOverlay');
+                    if (modal) {
+                        modal.classList.toggle('active',
+                            !(bot_state && bot_state.running)
+                            && !isProtectedCampaignCancellationReady(status));
+                    }
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = status.fee_resume_required
+                        ? 'Coin Prep Paused Safely'
+                        : 'Preparing Coins';
+                    const phase = document.getElementById('cpProgressPhase');
+                    if (phase) phase.textContent = coinPrepFeeStateMessage(feeState);
+                    const message = document.getElementById('cpProgressMessage');
+                    if (message) {
+                        message.style.display = '';
+                        message.textContent = status.fee_resume_required
+                            ? 'CATalyst recovered the approved fee budget after restart and has blocked any overlapping Coin Prep.'
+                            : (status.message || 'Coin Prep is using the approved fee budget.');
+                    }
+                    const cancel = document.getElementById('coinPrepCancelBtn');
+                    if (cancel) cancel.style.display = status.fee_resume_required ? 'none' : '';
+                    const progressRaw = Number(status.progress || 0);
+                    const progress = progressRaw <= 1 ? progressRaw * 100 : progressRaw;
+                    const bar = document.getElementById('cpProgressBar');
+                    if (bar) bar.style.width = Math.min(Math.max(progress, 0), 100) + '%';
+                    const pct = document.getElementById('cpProgressPct');
+                    if (pct) pct.textContent = Math.round(progress) + '%';
+                    if (!coinPrepPollInterval) {
+                        coinPrepPollInterval = setInterval(pollCoinPrepProgress, 1500);
+                    }
+                    return true;
+                }
+                if (!settingsReviewed) return false;
                 if (status.complete !== true
                     || status.needs_coin_prep === true
                     || status.needs_prep === true
@@ -18859,6 +18852,51 @@
                 ).trim().toLowerCase();
                 if (lastAssetId && (!activeAssetId || lastAssetId !== activeAssetId)) {
                     return false;
+                }
+
+                if (activeBootstrap && (
+                    String(status.bootstrap_campaign_id || '') !== String(activeBootstrap.campaign_id)
+                    || Number(status.bootstrap_campaign_revision) !== Number(activeBootstrap.revision)
+                )) {
+                    return false;
+                }
+                const offers = bot_state?.offers || {};
+                const activeOfferCount = Number(offers.buy_count || 0)
+                    + Number(offers.sell_count || 0)
+                    + (Array.isArray(offers.buy) ? offers.buy.length : 0)
+                    + (Array.isArray(offers.sell) ? offers.sell.length : 0);
+                if (bot_state?.running === true && activeOfferCount > 0) {
+                    // The current book already owns its prepared coins. A free-
+                    // coin verification would report those locks as missing and
+                    // incorrectly reopen fee approval over a running bot.
+                    setCoinPrepStatus('skipped-safe');
+                    return true;
+                }
+
+                // A completed worker/status record proves that its historical
+                // targets existed, not that the currently active Bootstrap
+                // revision is still ready.  Re-run the same exact, read-only
+                // verification used after saving settings before restoring the
+                // client-only ready flag.  The backend start route also checks
+                // this, but the browser must not advertise or enable a start
+                // that the authoritative preflight will reject.
+                if (activeBootstrap) {
+                    setCoinPrepStatus('checking');
+                    const configResponse = await apiFetch(`${API_URL}/config`, {
+                        cache: 'no-store'
+                    });
+                    if (!configResponse.ok) return false;
+                    const rawConfig = await configResponse.json();
+                    const getConfig = (key) => rawConfig[key]
+                        ?? rawConfig[key.toUpperCase()]
+                        ?? rawConfig[key.toLowerCase()]
+                        ?? null;
+                    await checkIfCoinPrepNeeded({
+                        liquidity_mode: 'two_sided',
+                        xch_reserve: getConfig('XCH_RESERVE') || 0,
+                        cat_reserve: getConfig('CAT_RESERVE') || 0,
+                    });
+                    return coinPrepStatus === 'done';
                 }
 
                 setCoinPrepStatus('done');
@@ -18978,6 +19016,7 @@
             const card = document.getElementById('startupResumeOverview');
             if (!card) return;
             const summary = _resumeSessionSummary;
+            const bootstrapBlock = getBootstrapCampaignStartBlock();
 
             // F52 (2026-04-09): prefer LIVE offer counts from bot_state over
             // the stale resume summary that was frozen at session-load time.
@@ -19024,8 +19063,12 @@
                 if (el) el.textContent = value;
             };
 
-            setText('startupResumeTitle', `${pairLabel} is ready to resume`);
-            setText('startupResumeCopy', 'Your previous live offers are still on the market. Review this quick reminder, then press Start Bot when you want the bot to resume managing them.');
+            setText('startupResumeTitle', bootstrapBlock
+                ? 'Bootstrap expired — cancel offers before restart'
+                : `${pairLabel} is ready to resume`);
+            setText('startupResumeCopy', bootstrapBlock
+                ? `Your previous live offers are still on the market. ${bootstrapBlock.message}`
+                : 'Your previous live offers are still on the market. Review this quick reminder, then press Start Bot when you want the bot to resume managing them.');
             setText('startupResumeAge', summary.last_active || 'Previous session');
             setText('startupResumePair', pairLabel);
             setText('startupResumeOffers', String(offerCount));
@@ -19038,7 +19081,9 @@
             const continueBtn = document.getElementById('startupResumeContinueBtn');
             if (continueBtn) {
                 continueBtn.disabled = !canAttemptBotStart() || !!(bot_state && bot_state.running);
-                continueBtn.textContent = pair?.selected ? '▶ Resume Bot Now' : 'Choose Pair to Resume';
+                continueBtn.textContent = bootstrapBlock
+                    ? 'Cancel Offers Before Restart'
+                    : (pair?.selected ? '▶ Resume Bot Now' : 'Choose Pair to Resume');
             }
         }
 
@@ -19052,7 +19097,29 @@
                 : 'Start blocked: waiting for a fresh runtime safety check. Review Safety Diagnostics if this persists.';
         }
 
+        function getBootstrapCampaignStartBlock() {
+            const campaign = (typeof _bootstrapActiveCampaign !== 'undefined')
+                ? _bootstrapActiveCampaign : null;
+            if (!campaign || !campaign.campaign_id) return null;
+            const expired = campaign.expired === true || campaign.cancel_required === true;
+            if (!expired) return null;
+            const rawCount = Number(campaign.open_offer_count || 0);
+            const openCount = Number.isFinite(rawCount) && rawCount > 0
+                ? Math.floor(rawCount) : 0;
+            const offerPhrase = openCount > 0
+                ? `${openCount} campaign-owned offer${openCount === 1 ? '' : 's'}`
+                : 'campaign-owned offers';
+            return {
+                reason: campaign.cancel_reason || 'bootstrap_expired',
+                message: `Bootstrap campaign expired — ${offerPhrase} require cancellation before restart or renewal.`,
+            };
+        }
+
         function getStartSafetyState(data = bot_state) {
+            const bootstrapBlock = getBootstrapCampaignStartBlock();
+            if (bootstrapBlock) {
+                return { allowed: false, message: bootstrapBlock.message, reason: bootstrapBlock.reason };
+            }
             const safety = data?.runtime_safety;
             const freshness = safety?.recovery?.freshness;
             const observedAt = Date.parse(freshness?.observed_at_utc);
@@ -19275,8 +19342,13 @@
                 if (subtitle) subtitle.textContent = 'Use the full dashboard below to watch pricing, market health, live controls, and activity for the current pair.';
             } else if (_resumeSessionSummary) {
                 if (kicker) kicker.textContent = 'Session Overview';
-                if (title) title.textContent = 'Previous session restored — review the overview, then resume the bot';
-                if (subtitle) subtitle.textContent = 'Your live offers are still on the market. Resume this session as-is, or start fresh if you want to change core settings.';
+                const bootstrapBlock = getBootstrapCampaignStartBlock();
+                if (title) title.textContent = bootstrapBlock
+                    ? 'Bootstrap expired — cancel offers before restart'
+                    : 'Previous session restored — review the overview, then resume the bot';
+                if (subtitle) subtitle.textContent = bootstrapBlock
+                    ? `Your live offers are still on the market. ${bootstrapBlock.message}`
+                    : 'Your live offers are still on the market. Resume this session as-is, or start fresh if you want to change core settings.';
             } else {
                 if (kicker) kicker.textContent = 'Quick Start';
                 if (title) title.textContent = 'Set up this trading pair before you start the bot';
@@ -19753,14 +19825,8 @@
                 _confirmResolve = resolve;
                 document.getElementById('confirmIcon').innerHTML = icon;
                 document.getElementById('confirmTitle').textContent = title;
-                // Default: textContent (XSS-safe). Callers passing trusted static
-                // HTML (no server data) may opt in with allowHtml: true.
                 const msgEl = document.getElementById('confirmMessage');
-                if (allowHtml) {
-                    msgEl.innerHTML = message;
-                } else {
-                    msgEl.textContent = String(message);
-                }
+                msgEl.textContent = String(message);
                 document.getElementById('confirmCancelBtn').textContent = cancelText;
                 const okBtn = document.getElementById('confirmOkBtn');
                 okBtn.textContent = confirmText;
@@ -19808,8 +19874,7 @@
                 document.getElementById('promptIcon').innerHTML = icon;
                 document.getElementById('promptTitle').textContent = title;
                 const msgEl = document.getElementById('promptMessage');
-                if (allowHtml) msgEl.innerHTML = message;
-                else msgEl.textContent = String(message);
+                msgEl.textContent = String(message);
                 const input = document.getElementById('promptInput');
                 input.value = initialValue;
                 input.placeholder = placeholder;
@@ -20041,12 +20106,11 @@
                         const choice = await showStyledConfirm({
                             icon: '🏆',
                             title: `${selectedCAT.name || 'Selected CAT'} earns ${rewardToken} rewards`,
-                            message: `Dexie pays ${rewardToken} on offers within <strong>${capPct}%</strong> of market price (estimated ${aprPct}% APR).<br><br>` +
+                            message: `Dexie pays ${rewardToken} on offers within ${capPct}% of market price (estimated ${aprPct}% APR).\n\n` +
                                      `Cap your spread at ${capPct}% so all tiers stay reward-eligible? Otherwise Smart Settings will use the calculated spread for this pair's volatility.`,
                             confirmText: `Maximize ${rewardToken} (cap at ${capPct}%)`,
                             cancelText: 'Use calculated spread',
                             style: 'success',
-                            allowHtml: true,
                         });
                         if (choice) {
                             params.set('dbx_cap', 'true');
@@ -20630,11 +20694,17 @@
                     const profileLabel = escapeHtml(appliedProfile.charAt(0).toUpperCase() + appliedProfile.slice(1));
                     const profileBadge = `<span style="background:${profileColour}22;color:${profileColour};border:1px solid ${profileColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${profileLabel}</span>`;
 
-                    resultTitle.innerHTML = `\u2713 Smart Settings applied &nbsp;${qBadge}&nbsp;${profileBadge}`;
-                    resultBody.innerHTML = `<div style="margin-bottom:8px;line-height:1.8;">${srcBadges}</div>
-                        <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:8px;display:flex;flex-direction:column;gap:8px;">
-                            ${marketRow}${capitalRow}${ladderRow}${spreadRow}${incentiveRow}${diffRow}
-                        </div>`;
+                    resultTitle.textContent = `\u2713 Smart Settings applied · ${qualityScore}% ${qualityLabel} · ${appliedProfile}`;
+                    resultBody.textContent = [
+                        `Market: ${priceStr}; ${regime}; ${mktActivity}; ${riskLabel || 'unknown'} risk`,
+                        cp.available_xch > 0
+                            ? `Capital: ${(cp.total_xch || cp.available_xch).toFixed(3)} XCH total; ${cp.n_final || 0} offers/side`
+                            : 'Capital: insufficient after reserve',
+                        spreadBps > 0
+                            ? `Spread: ${spreadPct}; requote ${requotePct}`
+                            : 'Spread: unavailable',
+                        _diffParts.length ? `Changed: ${_diffParts.join(' · ')}` : '',
+                    ].filter(Boolean).join('\n');
                     resultBox.style.display = 'block';
 
                     // Show quick-rerun strip and highlight active profile button
@@ -20908,7 +20978,7 @@
             const progressEl = document.getElementById('smartDefaultsProgress');
             if (resultBox) { resultBox.style.display = 'none'; }
             if (resultTitle) resultTitle.innerHTML = '';
-            if (resultBody) resultBody.innerHTML = '';
+                if (resultBody) resultBody.textContent = '';
             if (statusEl) statusEl.textContent = '';
             if (progressEl) progressEl.style.display = 'none';
 
@@ -20956,14 +21026,74 @@
         function formatCoinPrepXch(value) {
             const num = Number(value || 0);
             if (!Number.isFinite(num)) return '--';
-            const decimals = num >= 1 ? 4 : 6;
-            return num.toFixed(decimals).replace(/\.?0+$/, '');
+            return num.toFixed(12).replace(/\.?0+$/, '');
+        }
+
+        function coinPrepCatDecimals() {
+            const decimals = Number(currentCAT?.decimals ?? 3);
+            return Number.isInteger(decimals) && decimals >= 0 && decimals <= 18 ? decimals : 3;
+        }
+
+        function coinPrepDecimalFraction(value) {
+            const text = String(value);
+            if (text.length > 128) return null;
+            const match = /^(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(text);
+            if (!match) return null;
+            const places = (match[2] || '').length - Number(match[3] || 0);
+            if (!Number.isInteger(places) || Math.abs(places) > 128) return null;
+            const digits = BigInt(match[1] + (match[2] || ''));
+            return places >= 0 ? [digits, 10n ** BigInt(places)]
+                : [digits * 10n ** BigInt(-places), 1n];
+        }
+
+        function coinPrepCatCapacityFromFractions(size, price, headroom) {
+            // UI estimate only; the server still supplies the authoritative
+            // frozen outputs. Exact ratios avoid binary dust at mojo edges.
+            if (!size || !price || !headroom || price[0] <= 0n) return 0;
+            const scale = 10n ** BigInt(coinPrepCatDecimals());
+            const numerator = size[0] * headroom[0] * price[1] * scale;
+            const denominator = size[1] * headroom[1] * price[0];
+            const atomic = (numerator + denominator - 1n) / denominator;
+            return Number(atomic) / Number(scale);
+        }
+
+        function coinPrepHeadroomFraction(headroomPct) {
+            // Build 1 + percent/100 as a decimal ratio, not a binary sum:
+            // 14% must not become 1.1400000000000001 before mojo rounding.
+            const pct = coinPrepDecimalFraction(getCoinPrepHeadroomPct(headroomPct));
+            return pct ? [100n * pct[1] + pct[0], 100n * pct[1]] : null;
+        }
+
+        function uniformCoinPrepCatCapacity(tradeSize, midPrice, headroomPct) {
+            return coinPrepCatCapacityFromFractions(coinPrepDecimalFraction(tradeSize),
+                coinPrepDecimalFraction(midPrice), coinPrepHeadroomFraction(headroomPct));
+        }
+
+        function coinPrepSellPriceFraction(slot, midPrice, spreadBps, maxOffers, minEdgeBps) {
+            const mid = coinPrepDecimalFraction(midPrice);
+            const spread = coinPrepDecimalFraction(spreadBps);
+            const edge = coinPrepDecimalFraction(minEdgeBps);
+            if (!mid || !spread || !edge || !Number.isInteger(maxOffers) || maxOffers <= 0) return null;
+            let distanceNumerator, distanceDenominator;
+            if (edge[0] * spread[1] >= spread[0] * edge[1]) {
+                distanceNumerator = spread[0];
+                distanceDenominator = spread[1] * 10000n;
+            } else if (maxOffers === 1) {
+                distanceNumerator = edge[0];
+                distanceDenominator = edge[1] * 10000n;
+            } else {
+                const intervals = BigInt(maxOffers - 1);
+                distanceNumerator = edge[0] * spread[1] * intervals
+                    + (spread[0] * edge[1] - edge[0] * spread[1]) * BigInt(slot);
+                distanceDenominator = edge[1] * spread[1] * intervals * 10000n;
+            }
+            return [mid[0] * (distanceDenominator + distanceNumerator), mid[1] * distanceDenominator];
         }
 
         function formatCoinPrepCat(value) {
             const num = Number(value || 0);
             if (!Number.isFinite(num)) return '--';
-            return Math.round(num).toLocaleString();
+            return num.toLocaleString(undefined, {maximumFractionDigits: coinPrepCatDecimals()});
         }
 
         // Coin prep summary labels refer to COIN DENOMINATION (size of each coin
@@ -21098,6 +21228,13 @@
                     'Primary',
                     `${formatCoinPrepXch(plan.preparedXchSize)} prep`
                 ));
+                const feeCount = Number(plan.tierCounts?.fees || 0);
+                if (feeCount > 0) {
+                    rows.push(buildCoinPrepBreakdownRow(
+                        getCoinPrepTierLabel('fees'),
+                        `${feeCount} x ${formatCoinPrepXch(plan.preparedTierSizesXch.fees)} prep`
+                    ));
+                }
             } else if (asset === 'cat' && Number(plan.preparedCatPerCoin || 0) > 0) {
                 rows.push(buildCoinPrepBreakdownRow(
                     'Primary',
@@ -21158,29 +21295,18 @@
             if (!hint) return;
 
             const opts = getFeeOptionsFromInputs();
-            const env = feeStatusCache && feeStatusCache.environment ? feeStatusCache.environment : null;
-            const tierEnabled = document.getElementById('configTierEnabled')?.checked || false;
-            const manualOnly = env && env.supports_auto_estimate === false;
-
-            if (!opts.transactionFeeEnabled || opts.effectiveFeeXch <= 0) {
-                hint.innerHTML = 'Fees are <strong>OFF</strong>. Coin prep, top-ups, combines and secure cancels will be sent with zero fee, and no fee-tier coins will be prepared.';
-                return;
-            }
-
-            let poolText = 'No dedicated fee coin pool is configured yet.';
-            if (!tierEnabled && opts.feeCount > 0) {
-                poolText = 'Dedicated fee coins are only prepared during tiered coin prep. Flat prep still uses general XCH coins.';
-            } else if (opts.feeCount > 0 && opts.feeCoinSize > 0) {
-                poolText = `Fee pool planned: ${opts.feeCount} x ${opts.feeCoinSize.toFixed(8)} XCH.`;
-            }
-
-            const sourceText = manualOnly
-                ? 'Sage setup: this is a manual fee amount.'
-                : 'This fee amount is applied manually to wallet transactions.';
+            const manualText = opts.transactionFeeEnabled && opts.effectiveFeeXch > 0
+                ? `Manual transaction fee: <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong>, only for transactions using manual fee settings.`
+                : 'Manual transaction fees are <strong>OFF</strong>; this does not make Coin Prep free.';
+            const poolText = opts.feePoolEnabled
+                ? `Configured fee-coin pool: ${opts.feeCount} x ${formatTransactionFeeXch(opts.feeCoinSize)} XCH, retained in the wallet, not fees already spent. The Coin Prep review shows the actual required outputs.`
+                : 'No dedicated fee-coin pool is enabled by these settings.';
 
             hint.innerHTML = `
-                On-chain transactions will use <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong> each.<br>
-                ${sourceText} Offer creation stays fee-free. ${poolText}
+                ${manualText}<br>
+                <strong>Coin Prep</strong> requires fresh cost-based network estimates and a separately approved maximum fee budget, including a protected cancellation allowance, regardless of this setting.
+                Unavailable estimates or unsupported preparation paths pause without spending; this manual amount cannot bypass approval.<br>
+                ${poolText} Creating an offer itself stays fee-free.
             `;
         }
 
@@ -21349,12 +21475,14 @@
             minEdgeBps,
             maxSell,
             tierCounts,
-            sellTierSizes
+            sellTierSizes,
+            headroomPct = 0
         }) {
             const tiers = ['inner', 'mid', 'outer', 'extreme'];
             const dist = getCoinPrepTierDistribution(maxSell, tierCounts);
             const tierLiveCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
             const tierMaxCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
+            const tierPreparedCat = {inner: 0, mid: 0, outer: 0, extreme: 0};
             let liveCatTotal = 0;
             let slot = 0;
 
@@ -21369,13 +21497,18 @@
                         const cat = sizeXch / price;
                         tierLiveCat[tier] += cat;
                         tierMaxCat[tier] = Math.max(tierMaxCat[tier], cat);
+                        const prepared = coinPrepCatCapacityFromFractions(
+                            coinPrepDecimalFraction(sellTierSizes[tier]),
+                            coinPrepSellPriceFraction(slot, midPrice, spreadBps, maxSell, minEdgeBps),
+                            coinPrepHeadroomFraction(headroomPct));
+                        tierPreparedCat[tier] = Math.max(tierPreparedCat[tier], prepared);
                         liveCatTotal += cat;
                     }
                     slot += 1;
                 }
             }
 
-            return {tierLiveCat, tierMaxCat, liveCatTotal, tierCounts: dist};
+            return {tierLiveCat, tierMaxCat, tierPreparedCat, liveCatTotal, tierCounts: dist};
         }
 
         function clampCoinPrepMultiplier(value) {
@@ -22003,6 +22136,12 @@
             const modeState = getLiquidityModeState(liquidityMode);
             const buySideActive = modeState.buyActive;
             const sellSideActive = modeState.sellActive;
+            // Match frozen uniform economics: size the reusable cohort from
+            // both configured limits, then omit the inactive asset's outputs.
+            const countMultiplier = coinPrepDecimalFraction(coinPrepMultiplier ?? 1);
+            const uniformSlots = coinPrepDecimalFraction(maxBuy + maxSell);
+            const uniformCoinCount = countMultiplier && uniformSlots
+                ? Number(uniformSlots[0] * countMultiplier[0] / (uniformSlots[1] * countMultiplier[1])) : 0;
             if (!buySideActive) maxBuy = 0;
             if (!sellSideActive) maxSell = 0;
             const prepMult = getCoinPrepHeadroomMultiplier(headroomPct);
@@ -22017,12 +22156,29 @@
                 minXchForOffers: 0,
                 minCatForOffers: 0,
                 preparedXchSize: tradeSize * prepMult,
-                preparedCatPerCoin: midPrice > 0 ? Math.round((tradeSize / midPrice) * prepMult) : 0,
+                preparedCatPerCoin: uniformCoinPrepCatCapacity(tradeSize, midPrice, headroomPct),
                 offerTierSizesXch: {},
                 preparedTierSizesXch: {},
                 preparedTierSizesCat: {},
                 tierCounts: {},
                 tierSequence: []
+            };
+
+            // Frozen backend economics include fee-reserve outputs for both
+            // uniform and tiered prep. Add their principal before any tiered
+            // residual/topup calculation, without applying trading headroom.
+            const addFeePool = () => {
+                const parsedFeeSize = parseFloat(feeCoinSize) || 0;
+                const parsedFeeCount = parseInt(feeCount) || 0;
+                if (feePoolEnabled && parsedFeeSize > 0 && parsedFeeCount > 0) {
+                    plan.tierSequence.push('fees');
+                    plan.offerTierSizesXch.fees = parsedFeeSize;
+                    plan.preparedTierSizesXch.fees = parsedFeeSize;
+                    plan.preparedTierSizesCat.fees = 0;
+                    plan.tierCounts.fees = parsedFeeCount;
+                    plan.xchCoinsNeeded += parsedFeeCount;
+                    plan.totalXchForCoinPrep += parsedFeeCount * parsedFeeSize;
+                }
             };
 
             if (tierEnabled) {
@@ -22084,6 +22240,7 @@
                     maxSell,
                     tierCounts: configuredTierCountsSell,
                     sellTierSizes: plan.sellTierSizesXch,
+                    headroomPct,
                 }) : {
                     tierLiveCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
                     tierMaxCat: { inner: 0, mid: 0, outer: 0, extreme: 0 },
@@ -22150,11 +22307,8 @@
                 for (const tier of plan.tierSequence) {
                     plan.tierCounts[tier] = buySizeCounts[tier] || 0;
                     const _buySizeXch = _sizeOrientedBuy[tier] || 0;
-                    const _sellTierCat = sellLadderCatPlan.tierMaxCat[tier] || 0;
                     plan.preparedTierSizesXch[tier] = _buySizeXch * prepMult;
-                    plan.preparedTierSizesCat[tier] = midPrice > 0
-                        ? Math.round(_sellTierCat * prepMult)
-                        : 0;
+                    plan.preparedTierSizesCat[tier] = sellLadderCatPlan.tierPreparedCat?.[tier] || 0;
                     plan.xchCoinsNeeded += plan.tierCounts[tier];
                     plan.catCoinsNeeded += sellWeightedCounts[tier] || 0;
                     plan.totalXchForCoinPrep += plan.tierCounts[tier] * plan.preparedTierSizesXch[tier];
@@ -22190,17 +22344,7 @@
                     }
                 }
 
-                const parsedFeeSize = parseFloat(feeCoinSize) || 0;
-                const parsedFeeCount = parseInt(feeCount) || 0;
-                if (feePoolEnabled && parsedFeeSize > 0 && parsedFeeCount > 0) {
-                    plan.tierSequence.push('fees');
-                    plan.offerTierSizesXch.fees = parsedFeeSize;
-                    plan.preparedTierSizesXch.fees = parsedFeeSize;
-                    plan.preparedTierSizesCat.fees = 0;
-                    plan.tierCounts.fees = parsedFeeCount;
-                    plan.xchCoinsNeeded += parsedFeeCount;
-                    plan.totalXchForCoinPrep += parsedFeeCount * parsedFeeSize;
-                }
+                addFeePool();
 
                 // Topup coin: the working budget Smart Settings carves off
                 // for the topup worker to split when a tier runs short.
@@ -22325,12 +22469,13 @@
                     }
                 }
             } else {
-                plan.xchCoinsNeeded = buySideActive ? (maxBuy + (sellSideActive ? maxSell : 0)) : 0;
-                plan.catCoinsNeeded = sellSideActive ? (maxSell + (buySideActive ? maxBuy : 0)) : 0;
+                plan.xchCoinsNeeded = buySideActive ? uniformCoinCount : 0;
+                plan.catCoinsNeeded = sellSideActive ? uniformCoinCount : 0;
                 plan.totalXchForCoinPrep = plan.preparedXchSize * plan.xchCoinsNeeded;
                 plan.totalCatForCoinPrep = plan.preparedCatPerCoin * plan.catCoinsNeeded;
                 plan.minXchForOffers = plan.preparedXchSize * maxBuy;
                 plan.minCatForOffers = plan.preparedCatPerCoin * maxSell;
+                addFeePool();
             }
 
             return plan;
@@ -22418,7 +22563,7 @@
             },
             sell_only: {
                 title: 'Auto-Fill — Distribution Plan',
-                subtitle: 'Set your <strong>Token Reserve</strong> above first, then choose a risk profile, then click — the sell ladder is sized from the tokens left over. No buy ladder or sniper in this mode; XCH balance stays untouched.',
+                subtitle: 'Set your <strong>Token Reserve</strong> above first, then choose a risk profile, then click — the sell ladder is sized from the tokens left over. No buy ladder or sniper in this mode; XCH is reserved separately for fees.',
             },
         };
         function applySmartDefaultsLabels(mode) {
@@ -22844,6 +22989,19 @@
                     === String(settingsCAT?.asset_id || '').toLowerCase()
                 && renderBootstrapCoinPrepPreview(_bootstrapActiveCampaign, tokenName)
             ) {
+                return;
+            }
+
+            if (document.getElementById('bootstrapModeSelect')?.value === 'bootstrap') {
+                for (const id of ['prepXchCoins', 'prepXchSize', 'prepXchTotal',
+                    'prepCatCoins', 'prepCatSize', 'prepCatTotal']) {
+                    const field = document.getElementById(id);
+                    if (field) field.textContent = '--';
+                }
+                if (coinPrepWarn) {
+                    coinPrepWarn.style.display = 'block';
+                    coinPrepWarn.textContent = 'No active Bootstrap campaign for this trading pair. Preview and start a campaign before Coin Prep.';
+                }
                 return;
             }
 
@@ -24028,21 +24186,53 @@
                 .replace(/\.0+$/, '');
         }
 
-        function updateHeroPriceProvenance(confidence = {}) {
+        function updateHeroPriceProvenance(confidence = (_lastMarketConfidence || {}).confidence || {}) {
             const label = document.getElementById('heroMidPriceLabel');
             const tooltip = document.getElementById('heroMidPriceTooltip');
             if (!label || !tooltip) return;
-            const trustedMid = Number(confidence.trusted_mid || 0);
-            const trustedBid = Number(confidence.trusted_bid || 0);
-            const trustedAsk = Number(confidence.trusted_ask || 0);
-            const hasTrustedMarketPrice = trustedMid > 0 || (trustedBid > 0 && trustedAsk > 0);
-            const usesBootstrapAnchor = !!_bootstrapActiveCampaign && !hasTrustedMarketPrice;
+            const trustedMid = Number(confidence.trusted_midpoint || 0);
+            const state = String(confidence.state || 'RED').toUpperCase();
+            const hasTrustedMarketPrice = ['GREEN', 'AMBER'].includes(state)
+                && confidence.data_valid !== false
+                && Number.isFinite(trustedMid) && trustedMid > 0;
+            const anchor = Number(_bootstrapActiveCampaign?.anchor_price || 0);
+            const usesBootstrapAnchor = !!_bootstrapActiveCampaign && !hasTrustedMarketPrice
+                && Number.isFinite(anchor) && anchor > 0;
             label.firstChild.nodeValue = usesBootstrapAnchor
                 ? 'Bootstrap Anchor Price '
-                : 'Trusted Mid Price ';
+                : hasTrustedMarketPrice ? 'Trusted Mid Price ' : 'Indicative Mid Price ';
             tooltip.textContent = usesBootstrapAnchor
                 ? 'The approved campaign anchor used for bounded Bootstrap offers while no trusted external market price is available.'
-                : 'Current midpoint derived from fresh, attributable offer-book evidence. A remembered midpoint is display-only whenever confidence is red.';
+                : hasTrustedMarketPrice
+                    ? 'Current midpoint derived from fresh, attributable offer-book evidence.'
+                    : 'Observed or remembered midpoint for display only. No trusted market price is currently available.';
+            const price = document.getElementById('heroMidPrice');
+            if (price && currentCAT?.asset_id && (hasTrustedMarketPrice || usesBootstrapAnchor)) {
+                price.textContent = (hasTrustedMarketPrice ? trustedMid : anchor).toFixed(8);
+            }
+        }
+
+        function updateOffersEmptyState(data = bot_state) {
+            const empty = document.getElementById('offersEmptyState');
+            const message = document.getElementById('offersEmptyStateMessage');
+            if (!empty || !message) return;
+            const offers = data.offers || {};
+            const hasOffers = (offers.buy || []).length + (offers.sell || []).length > 0;
+            empty.style.display = hasOffers ? 'none' : 'block';
+            const confidence = (_lastMarketConfidence || {}).confidence || {};
+            const red = String(confidence.state || '').toUpperCase() === 'RED';
+            if (!data.running) {
+                message.textContent = 'Start the bot to begin market making.';
+            } else if (data.runtime_safety?.allowed === false) {
+                message.textContent = 'Bot is running, but runtime safety is blocking new offers. Check Safety & Limits for the recovery action.';
+            } else if (red && !_bootstrapActiveCampaign) {
+                const reasons = (Array.isArray(confidence.reason_codes) ? confidence.reason_codes : [])
+                    .map(code => String(code).replaceAll('_', ' ')).join(' · ');
+                message.textContent = 'Bot is running, but Follow offers are paused by RED market confidence'
+                    + (reasons ? ': ' + reasons : '') + '. Waiting for sufficient trusted market evidence.';
+            } else {
+                message.textContent = 'Bot is running. Waiting for the next eligible offer cycle; check Dashboard for readiness and safety status.';
+            }
         }
 
         function renderMarketConfidence(data = {}) {
@@ -24051,6 +24241,8 @@
             const metrics = data.metrics || {};
             const state = String(confidence.state || 'RED').toUpperCase();
             updateHeroPriceProvenance(confidence);
+            updateOffersEmptyState();
+            if (window._lastDashboard) saUpdateAdvisor(window._lastDashboard);
             const stateColor = state === 'GREEN'
                 ? 'var(--status-success)'
                 : state === 'AMBER'
@@ -24098,8 +24290,11 @@
                 const seconds = Math.max(0, Number(timeline.seconds_until_next_stage) || 0);
                 countdown = `${timeline.next_stage} in ${Math.floor(seconds / 60)}m ${seconds % 60}s`;
             } else if (timeline && timeline.current_stage === 'ALL') {
+                const bootstrapBlock = getBootstrapCampaignStartBlock();
                 countdown = _bootstrapActiveCampaign
-                    ? 'Follow exposure withdrawn; bounded Bootstrap offers remain active'
+                    ? (bootstrapBlock
+                        ? bootstrapBlock.message
+                        : 'Follow exposure withdrawn; bounded Bootstrap campaign remains authorized')
                     : 'All exposure withdrawn';
             }
             setText('marketConfidenceCountdown', countdown);
@@ -24275,6 +24470,7 @@
                         heroMid.style.fontSize = '';
                         heroMid.style.color = '';
                     }
+                    updateHeroPriceProvenance();
                 }
             } catch (err) {
                 debugWarn('[MARKET SUMMARY] Fetch failed:', err.message);
@@ -24934,11 +25130,7 @@
             updatePnlFlowDiagnostics(data);
 
             // Show/hide empty state for offers view
-            const offersEmptyState = document.getElementById('offersEmptyState');
-            if (offersEmptyState) {
-                const hasOffers = (data.offers.buy.length + data.offers.sell.length) > 0;
-                offersEmptyState.style.display = hasOffers ? 'none' : 'block';
-            }
+            updateOffersEmptyState(data);
 
             // Logs — system log is now purely SSE-driven (addLogEntry via allowlist).
             // Status poll no longer overwrites the log panel.
@@ -26166,7 +26358,6 @@
             // Context strings
             const contextIds = [
                 'intelSpacescanContext',
-                'intelTibetContext',
                 'intelDbxContext',
             ];
             contextIds.forEach(id => {
@@ -27093,15 +27284,10 @@
             // External links
             if (d.links) {
                 const dexieLink = el('ccDexieLink');
-                const tibetLink = el('ccTibetLink');
                 const spacescanLink = el('ccSpacescanLink');
                 if (d.links.dexie_orderbook && dexieLink) {
                     dexieLink.href = d.links.dexie_orderbook;
                     dexieLink.style.display = 'inline-flex';
-                }
-                if (d.links.tibetswap_pool && tibetLink) {
-                    tibetLink.href = d.links.tibetswap_pool;
-                    tibetLink.style.display = 'inline-flex';
                 }
                 if (d.links.spacescan_token && spacescanLink) {
                     spacescanLink.href = d.links.spacescan_token;
@@ -27548,7 +27734,8 @@
             const healthMessage = confidenceIsStricter
                 ? (confidenceState === 'red'
                     ? (_bootstrapActiveCampaign
-                        ? 'Bounded Bootstrap active — Follow mode is blocked by RED confidence'
+                        ? (getBootstrapCampaignStartBlock()?.message
+                            || 'Bounded Bootstrap active — Follow mode is blocked by RED confidence')
                         : 'Market blocked — offer-book confidence is RED')
                     : 'Market restricted — offer-book confidence is AMBER')
                 : (
@@ -28456,6 +28643,7 @@
                         heroMid.textContent = midStr;
                         heroMid.classList.remove('data-pending');
                     }
+                    updateHeroPriceProvenance();
                     const heroSpread = document.getElementById('heroSpread');
                     if (heroSpread) {
                         const ccSpread = document.getElementById('ccYourSpread');
@@ -28967,7 +29155,7 @@
             if (eventType === 'startup_wallet_sync')
                 return { icon: '🔗', msg: 'Syncing with wallet...', cls: 'la-info' };
 
-            // --- TibetSwap / AMM protection ---
+            // --- Legacy AMM protection history ---
             if (eventType === 'mempool_swap_detected' || eventType === 'mempool_imminent_wake') {
                 return { icon: '🔭', msg: 'Tibet swap spotted early — watching pool confirmation', cls: 'la-info' };
             }
@@ -29282,7 +29470,6 @@
             'applySpread',
             'openSettings',
             'openLiveControls',
-            'activateGapCloser',
             'reviewTopupPool',
             'reviewMaxSpread',
             'reserveFloor'
@@ -29680,7 +29867,6 @@
                 const ss = data.spacescan   || {};
                 const cs = data.coinset     || {};
                 const dx = data.dexie       || {};
-                const ts = data.tibetswap   || {};
                 const sp = data.splash      || {};
                 const cg = data.coingecko   || {};
                 const gh = data.github      || {};
@@ -29798,29 +29984,6 @@
                             </div>` : ''}
                           ${fmtEndpointFooter('Direct calls', dx.direct_calls_by_endpoint)}
                         ` : '<div style="color:var(--text-tertiary);">Dexie manager not running.</div>'}
-                    </div>
-                    <div class="v4-modal-panel">
-                        <div class="v4-modal-panel-title">TibetSwap · retired</div>
-                        ${ts.available ? `
-                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
-                            <div style="color:var(--text-secondary);">AMM price</div><div>${ts.amm_price ? Number(ts.amm_price).toFixed(8) : '—'}</div>
-                            <div style="color:var(--text-secondary);">Drift from quoted</div><div>${ts.drift_bps != null ? (ts.drift_bps / 100).toFixed(2) + '%' : '—'}</div>
-                            <div style="color:var(--text-secondary);">Arb pressure</div><div>${escapeHtml(ts.arb_pressure_label || '—')}</div>
-                            <div style="color:var(--text-secondary);">Total polls</div><div>${fmtN(ts.total_polls)}</div>
-                            <div style="color:var(--text-secondary);">Failed polls</div><div>${fmtN(ts.failed_polls)}</div>
-                            <div style="color:var(--text-secondary);">Consecutive failures</div><div>${fmtN(ts.consecutive_failures)}</div>
-                            <div style="color:var(--text-secondary);">Last success</div><div>${ts.last_success_ago_secs != null ? fmtN(Math.round(ts.last_success_ago_secs)) + 's ago' : '—'}</div>
-                            <div style="color:var(--text-secondary);">Price cache age</div><div>${ts.price_cache_age_secs != null ? fmtN(Math.round(ts.price_cache_age_secs)) + 's' : '—'}</div>
-                            ${ts.direct_calls ? `<div style="color:var(--text-secondary);">Direct calls (token discovery)</div><div>${fmtN(ts.direct_calls)}</div>` : ''}
-                          </div>
-                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
-                        ` : (ts.direct_calls ? `
-                          <div style="color:var(--text-tertiary); margin-bottom: 6px;">AMM monitor not running, but token-discovery calls have hit /pairs:</div>
-                          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:0.92em;">
-                            <div style="color:var(--text-secondary);">Direct calls</div><div>${fmtN(ts.direct_calls)}</div>
-                          </div>
-                          ${fmtEndpointFooter('Direct calls', ts.direct_calls_by_endpoint)}
-                        ` : '<div style="color:var(--text-tertiary);">TibetSwap is retired. Historical counters are read-only and no live AMM capability is used.</div>')}
                     </div>
                     <div class="v4-modal-panel">
                         <div class="v4-modal-panel-title">Splash ${sp.available ? (sp.healthy ? '✅' : '⚠️') : '❌'}</div>
@@ -31050,14 +31213,13 @@
             await showStyledConfirm({
                 icon: '🔄',
                 title: 'Restart Sage Manually',
-                message: 'Sage must be restarted outside the bot:<br><br>' +
-                    '<b>1.</b> Close the Sage application<br>' +
-                    '<b>2.</b> Reopen it and wait for sync<br>' +
-                    '<b>3.</b> The bot will reconnect automatically',
+                message: 'Sage must be restarted outside the bot:\n\n' +
+                    '1. Close the Sage application\n' +
+                    '2. Reopen it and wait for sync\n' +
+                    '3. The bot will reconnect automatically',
                 confirmText: 'Got it',
                 cancelText: '',
-                style: 'info',
-                allowHtml: true
+                style: 'info'
             });
         }
         const restartChia = restartSage;
@@ -31345,6 +31507,12 @@
                 const publication = offer.publication || {};
                 const publicationDisplay = ['dexie', 'splash'].map(provider => {
                     const state = String((publication[provider] || {}).state || 'not queued');
+                    if (provider === 'splash' && state === 'succeeded') {
+                        // Splash's HTTP 2xx only confirms receipt by the local
+                        // daemon. Peer broadcast can still fail (for example,
+                        // InsufficientPeers); exact discovery is shown below.
+                        return 'Splash local submit acknowledged; peer broadcast unverified';
+                    }
                     return provider.charAt(0).toUpperCase() + provider.slice(1) + ' ' + state.replace(/_/g, ' ');
                 }).join(' · ');
                 const discoveries = (offer.discovery && offer.discovery.providers) || {};
@@ -31938,13 +32106,14 @@
                 clearTimeout(_resumeSkipTimer);
                 const startBtn = document.getElementById('startBtn');
                 if (startBtn) {
-                    startBtn.disabled = false;
+                    startBtn.disabled = !canAttemptBotStart();
                     startBtn.innerHTML = '▶ Start Bot';
                 }
                 updateStartupChecklist(bot_state);
                 updateDashboardStartupLayout(bot_state);
                 updateResumeOverview();
 
+                const bootstrapBlock = getBootstrapCampaignStartBlock();
                 const _rs = _resumeSessionSummary || {};
                 const _rsCat = _rs.pair_name || currentCAT?.name || 'Previous pair';
                 const _rsTicker = _rs.active_cat?.ticker_id || currentCAT?.ticker_id || '';
@@ -31960,7 +32129,7 @@
                         <div style="display:flex; align-items:center; gap:14px; margin-bottom:22px;">
                             <div style="width:46px; height:46px; border-radius:13px; background:rgba(16,185,129,0.18); border:1px solid rgba(16,185,129,0.35); display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0;">✅</div>
                             <div>
-                                <div style="font-size:11px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--status-success); margin-bottom:4px;">Session Ready</div>
+                                <div style="font-size:11px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--status-success); margin-bottom:4px;">${bootstrapBlock ? 'Cancellation Required' : 'Session Ready'}</div>
                                 <div style="font-size:19px; font-weight:700; color:var(--slate-200); line-height:1.2;">Previous session loaded</div>
                             </div>
                         </div>
@@ -31994,9 +32163,11 @@
                             </div>
                         </div>
 
+                        ${bootstrapBlock ? `<div class="v4-modal-note" style="margin-bottom:16px;">${escapeHtml(bootstrapBlock.message)} The offers remain live until Sage confirms cancellation.</div>` : ''}
                         <div style="display:flex; gap:10px;">
-                            <button class="btn btn-config btn-secondary" onclick="dismissResumeAfterLoad()" style="flex:1; padding:12px 16px;">↺ Start Fresh</button>
-                            <button class="btn btn-start btn-primary" onclick="resumeStartNow()" style="flex:2; padding:12px 16px; font-size:1.02em; font-weight:700; letter-spacing:0.01em;">▶ Start Bot Now</button>
+                            ${bootstrapBlock
+                                ? '<button class="btn btn-config btn-primary" onclick="closeResumeAfterLoad()" style="flex:1; padding:12px 16px;">Review Offers and Cancel All</button>'
+                                : '<button class="btn btn-config btn-secondary" onclick="dismissResumeAfterLoad()" style="flex:1; padding:12px 16px;">↺ Start Fresh</button><button class="btn btn-start btn-primary" onclick="resumeStartNow()" style="flex:2; padding:12px 16px; font-size:1.02em; font-weight:700; letter-spacing:0.01em;">▶ Start Bot Now</button>'}
                         </div>
                     </div></div>
                 `;
@@ -32085,6 +32256,12 @@
             debugLog('[RESUME] User skipped loading — settingsReviewed:', settingsReviewed);
         }
 
+        // Leave the expired-campaign recovery prompt without changing the live book.
+        function closeResumeAfterLoad() {
+            document.getElementById('resumeSessionModal').classList.remove('active');
+            document.getElementById('cancelAllBtn')?.focus();
+        }
+
         // Called from the "Start Fresh for Changes" button in the post-load modal
         async function dismissResumeAfterLoad() {
             document.getElementById('resumeSessionModal').classList.remove('active');
@@ -32094,10 +32271,10 @@
         // Called from the "Start Bot Now" button in the post-load modal
         async function resumeStartNow() {
             document.getElementById('resumeSessionModal').classList.remove('active');
-            await startBot();
+            await startBot({ resumeExistingOffers: true });
         }
 
-        async function startBot() {
+        async function startBot(options = {}) {
             const safety = getStartSafetyState();
             if (!safety.allowed) {
                 updateStartupChecklist(bot_state);
@@ -32168,7 +32345,12 @@
                 }
 
                 // Start the bot directly
-                const response = await apiFetch(`${API_URL}/bot/start`, { method: 'POST' });
+                const startRequest = { method: 'POST' };
+                if (options.resumeExistingOffers === true) {
+                    startRequest.headers = { 'Content-Type': 'application/json' };
+                    startRequest.body = JSON.stringify({ resume_existing_offers: true });
+                }
+                const response = await apiFetch(`${API_URL}/bot/start`, startRequest);
                 const result = await response.json();
 
                 if (result.success) {
@@ -32582,7 +32764,19 @@
             if (sellCount > 0) addLogEntry('info', `   ${sellCount} sell offer${sellCount !== 1 ? 's' : ''}...`);
 
             try {
-                const response = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
+                const coinPrepApprovalId = cancelContext?.source === 'coin_prep'
+                    ? cancelContext?.prepPayload?.fee_approval_id
+                    : null;
+                if (cancelContext?.source === 'coin_prep' && !/^[0-9a-f]{64}$/.test(String(coinPrepApprovalId || ''))) {
+                    throw new Error('The Coin Prep fee approval is missing or invalid. Refresh the fee estimate; no cancellation was sent.');
+                }
+                const response = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(coinPrepApprovalId
+                        ? { source: 'coin_prep', fee_approval_id: coinPrepApprovalId }
+                        : {}),
+                });
                 const result = await response.json();
 
                 if (!result.success) {
@@ -32626,6 +32820,9 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
+                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                        await reviewCancelAllFeeBudgetFailure(st);
+                                    }
                                 }
                                 if (operationGeneration === _cancelAllOperationGeneration) {
                                     _cancelAllInProgress = false;
@@ -32689,6 +32886,40 @@
                     _cancelAllInProgress = false;
                 }
             }
+        }
+
+        async function reviewCancelAllFeeBudgetFailure(status) {
+            _coinPrepFeeReviewContract = null;
+            _coinPrepFeeRecoveryBlocking = true;
+            _coinPrepFeeRecoveryIntent = {
+                action: String(status?.recovery_action || 'cancel_all'),
+                total: Number(status?.total) || 0,
+                buy: Number(status?.buy_count) || 0,
+                sell: Number(status?.sell_count) || 0,
+                campaign_id: status?.campaign_id ? String(status.campaign_id) : null,
+                campaign_revision: Number.isInteger(Number(status?.campaign_revision))
+                    ? Number(status.campaign_revision) : null,
+            };
+            _coinPrepConfirmReadyText = 'Approve Fee & Continue Cancellation';
+            const modal = document.getElementById('coinPrepConfirmOverlay');
+            if (!modal) return false;
+            if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+            coinPrepPollInterval = null;
+            showCoinPrepView('confirm');
+            const summary = document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary');
+            if (summary) summary.style.display = 'none';
+            const banner = document.getElementById('cpReasonBanner');
+            if (banner) {
+                banner.style.display = '';
+                const reason = String(status?.reason_code || status?.code || '');
+                banner.textContent = ['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH'].includes(reason)
+                    ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                    : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
+                        ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                        : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
+            }
+            modal.classList.add('active');
+            return refreshCoinPrepFeePreview(buildCoinPrepFeePreviewOptions());
         }
 
         // Local helper: read cached cancel-all state from last poll
@@ -33021,7 +33252,7 @@
                         `<div style="color: var(--status-warning); text-align: center; padding: 10px;">` +
                         `⚠️ <strong>Waiting for market data...</strong><br>` +
                         `<span style="font-size: 0.85em;">The bot needs to complete at least one loop cycle ` +
-                        `to get pricing from TibetSwap and Dexie. Start the bot and wait a moment, then try again.</span>` +
+                        `to get current offer-book pricing. Start the bot and wait a moment, then try again.</span>` +
                         `</div>`;
                 }
                 const riskEl = document.getElementById('boostRiskInfo');
@@ -34536,11 +34767,10 @@
                 const proceed = await showStyledConfirm({
                     icon: '📉',
                     title: 'Low Spread Warning',
-                    message: 'A spread below 2% is risky. You may <strong>lose money</strong> on trades due to fees and slippage.',
+                    message: 'A spread below 2% is risky. You may lose money on trades due to fees and slippage.',
                     confirmText: 'Save Anyway',
                     cancelText: 'Go Back',
-                    style: 'warning',
-                    allowHtml: true
+                    style: 'warning'
                 });
                 if (!proceed) {
                     setSaveConfigButtonState(false);
@@ -34561,21 +34791,21 @@
                 const _hardMax = parseFloat(document.getElementById('configMaxMid')?.value) || 0;
                 if (_midPrice > 0 && _hardMax > 0 && _midPrice > _hardMax) {
                     _riskBlockers.push(
-                        `<strong>Max Price (${_hardMax.toFixed(8)})</strong> is BELOW the current ` +
+                        `Max Price (${_hardMax.toFixed(8)}) is BELOW the current ` +
                         `market price (${_midPrice.toFixed(8)}). The bot will refuse to trade and ` +
                         `cancel all offers next cycle.`
                     );
                 }
                 if (_midPrice > 0 && _hardMin > 0 && _midPrice < _hardMin) {
                     _riskBlockers.push(
-                        `<strong>Min Price (${_hardMin.toFixed(8)})</strong> is ABOVE the current ` +
+                        `Min Price (${_hardMin.toFixed(8)}) is ABOVE the current ` +
                         `market price (${_midPrice.toFixed(8)}). The bot will refuse to trade and ` +
                         `cancel all offers next cycle.`
                     );
                 }
                 if (_hardMin > 0 && _hardMax > 0 && _hardMin >= _hardMax) {
                     _riskBlockers.push(
-                        `<strong>Min Price ≥ Max Price</strong> — these rails are inverted. ` +
+                        `Min Price ≥ Max Price — these rails are inverted. ` +
                         `The bot will refuse every quote.`
                     );
                 }
@@ -34587,8 +34817,8 @@
                 const _maxSpread = parseFloat(document.getElementById('configMaxSpreadBps')?.value) || 0;
                 if (_minSpread > 0 && _maxSpread > 0 && _minSpread >= _maxSpread) {
                     _riskBlockers.push(
-                        `<strong>Min Spread (${_minSpread.toFixed(2)}%)</strong> ≥ <strong>Max Spread ` +
-                        `(${_maxSpread.toFixed(2)}%)</strong> — these bounds are inverted. The dynamic ` +
+                        `Min Spread (${_minSpread.toFixed(2)}%) ≥ Max Spread ` +
+                        `(${_maxSpread.toFixed(2)}%) — these bounds are inverted. The dynamic ` +
                         `spread engine will produce broken values.`
                     );
                 }
@@ -34603,14 +34833,14 @@
                     const _currentPosXch = Math.abs(_currentNet * _midPrice2);
                     if (_currentPosXch > _maxPos) {
                         _riskWarnings.push(
-                            `<strong>Max Position (${_maxPos.toFixed(2)} XCH)</strong> is below your ` +
+                            `Max Position (${_maxPos.toFixed(2)} XCH) is below your ` +
                             `current position (${_currentPosXch.toFixed(2)} XCH equivalent). The bot ` +
                             `will skew aggressively toward neutral on the next cycle.`
                         );
                     }
                 }
                 if (_maxPos < 0) {
-                    _riskBlockers.push(`<strong>Max Position cannot be negative.</strong>`);
+                    _riskBlockers.push(`Max Position cannot be negative.`);
                 }
             } catch (_e) {}
 
@@ -34619,12 +34849,12 @@
                 const _tradeSize = parseFloat(document.getElementById('configTradeXch')?.value) || 0;
                 if (_tradeSize > 0 && _tradeSize > 50) {
                     _riskWarnings.push(
-                        `<strong>Trade Size (${_tradeSize} XCH)</strong> is unusually large. ` +
+                        `Trade Size (${_tradeSize} XCH) is unusually large. ` +
                         `Most fills will require significant counterparty liquidity.`
                     );
                 }
                 if (_tradeSize < 0) {
-                    _riskBlockers.push(`<strong>Trade Size cannot be negative.</strong>`);
+                    _riskBlockers.push(`Trade Size cannot be negative.`);
                 }
             } catch (_e) {}
 
@@ -34651,11 +34881,11 @@
                         (_modeState.buyActive ? _buyTotalTier : 0) +
                         (_modeState.sellActive ? _sellTotalTier : 0);
                     if (_negTier) {
-                        _riskBlockers.push(`<strong>Tier counts cannot be negative.</strong>`);
+                        _riskBlockers.push(`Tier counts cannot be negative.`);
                     }
                     if (_activeTierTotal === 0) {
                         _riskBlockers.push(
-                            `<strong>All active-side tier counts are zero</strong> with TIER_ENABLED = ON. ` +
+                            `All active-side tier counts are zero with TIER_ENABLED = ON. ` +
                             `The bot will not create any offers.`
                         );
                     }
@@ -34664,17 +34894,16 @@
 
             // Show critical blockers first — these MUST be fixed
             if (_riskBlockers.length > 0) {
-                const _blockerHtml = _riskBlockers.map(m => '• ' + m).join('<br><br>');
+                const _blockerText = _riskBlockers.map(m => '• ' + m).join('\n\n');
                 await showStyledConfirm({
                     icon: '⛔',
                     title: 'Settings would break the bot',
                     message: 'These settings have critical issues that need to be fixed before saving:' +
-                             '<br><br>' + _blockerHtml +
-                             '<br><br>Fix them and try again.',
+                             '\n\n' + _blockerText +
+                             '\n\nFix them and try again.',
                     confirmText: 'OK',
                     cancelText: 'OK',
-                    style: 'danger',
-                    allowHtml: true
+                    style: 'danger'
                 });
                 setSaveConfigButtonState(false);
                 return;
@@ -34682,17 +34911,16 @@
 
             // Show non-blocking warnings — user can save anyway if they understand
             if (_riskWarnings.length > 0) {
-                const _warnHtml = _riskWarnings.map(m => '• ' + m).join('<br><br>');
+                const _warnText = _riskWarnings.map(m => '• ' + m).join('\n\n');
                 const _proceed = await showStyledConfirm({
                     icon: '⚠️',
                     title: 'Risky settings detected',
                     message: 'These settings will work but carry risk:' +
-                             '<br><br>' + _warnHtml +
-                             '<br><br>Save anyway?',
+                             '\n\n' + _warnText +
+                             '\n\nSave anyway?',
                     confirmText: 'Save Anyway',
                     cancelText: 'Go Back',
-                    style: 'warning',
-                    allowHtml: true
+                    style: 'warning'
                 });
                 if (!_proceed) {
                     setSaveConfigButtonState(false);
@@ -34760,8 +34988,6 @@
                 tibet_shock_cancel_trigger_pct: Math.max(0, parseFloat(document.getElementById('configTibetShockCancelPct')?.value || 0) || 0),
                 min_mid: document.getElementById('configMinMid').value || '',
                 max_mid: document.getElementById('configMaxMid').value || '',
-                // TibetSwap (with null checks)
-                // enable_tibetswap: REMOVED - TibetSwap always enabled
                 // price_strategy: NOT sent from GUI — managed via .env only to prevent accidental overwrite
                 arb_threshold_bps: _pct2bps(document.getElementById('configArbThreshold')?.value || '2.0'),
 
@@ -34863,7 +35089,7 @@
                 // coin_manager.py still reads COIN_PREP_MULTIPLIER for its
                 // own prep math, so we keep the field in the config payload.
                 coin_prep_multiplier: 1.0,
-                coin_prep_headroom_pct: parseFloat(document.getElementById('configCoinPrepHeadroomPct').value) || 10.0,
+                coin_prep_headroom_pct: getCoinPrepHeadroomPct(document.getElementById('configCoinPrepHeadroomPct').value),
 
                 // V2: Bot Operations
                 sniper_enabled: document.getElementById('configSniperEnabled').checked,
@@ -34966,16 +35192,15 @@
                     }
                     const warnItems = validationWarnings
                         .map(w => w.message || w)
-                        .map(msg => `• ${escapeHtml(msg)}`)
-                        .join('<br>');
+                        .map(msg => `• ${String(msg)}`)
+                        .join('\n');
                     const proceed = await showStyledConfirm({
                         icon: '⚠️',
                         title: 'Review Settings Warning',
-                        message: `${warnItems}<br><br>Save these settings anyway and continue to the next step?`,
+                        message: `${warnItems}\n\nSave these settings anyway and continue to the next step?`,
                         confirmText: 'Continue',
                         cancelText: 'Back to Settings',
-                        style: 'warning',
-                        allowHtml: true
+                        style: 'warning'
                     });
                     if (!proceed) {
                         setSaveConfigButtonState(false);
@@ -35097,6 +35322,7 @@ function closeCtgErrorModal() {
         // COIN PREP CONFIRMATION MODAL
         // ============================================================
         let coinPrepPollInterval = null;
+        let _coinPrepFeeRecoveryBlocking = false;
 
         // ─── F56 (2026-04-09): missing coin-prep modal helpers ──────────
         // These were referenced from saveConfig() and elsewhere but never
@@ -35309,17 +35535,18 @@ function closeCtgErrorModal() {
                     }
                     const configuredMaxSell = parseInt(config.max_active_sell || config.MAX_ACTIVE_SELL_OFFERS || 0)
                         || tiers.reduce((sum, t) => sum + (parseInt(sellTierCountsForVerify[t]) || 0), 0);
+                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     const sellLadderCatPlan = buildSellLadderCatPlan({
                         midPrice,
-                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
-                            || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
-                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
-                            || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                        spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS
+                            ?? ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100)),
+                        minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS
+                            ?? ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100)),
                         maxSell: configuredMaxSell,
                         tierCounts: sellTierCountsForVerify,
                         sellTierSizes: sellTierSizesForVerify,
+                        headroomPct: getCoinPrepHeadroomPct(config.coin_prep_headroom_pct),
                     });
-                    const prepFactor = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     const coinPrepMultiplier = clampCoinPrepMultiplier(config.coin_prep_multiplier);
                     const configuredBuyCounts = getConfiguredTierCountsFromConfigXch(config);
                     const configuredSellCounts = getConfiguredTierCountsFromConfig(config);
@@ -35349,9 +35576,7 @@ function closeCtgErrorModal() {
                         const preparedBuyXch = buyXch * prepFactor;
                         const buyCnt = preparedBuyCounts[t] || 0;
                         const sellCnt = preparedSellCounts[t] || 0;
-                        const sellCatSize = sellLadderCatPlan.tierMaxCat[t] || 0;
-                        const preparedSellCat = sellCatSize > 0
-                            ? Math.round(sellCatSize * prepFactor) : 0;
+                        const preparedSellCat = sellLadderCatPlan.tierPreparedCat[t] || 0;
                         if (liquidityMode === 'buy_only') {
                             if (preparedBuyXch > 0) params.set(`${t}_xch`, String(preparedBuyXch));
                             if (buyCnt > 0) params.set(`${t}_xch_count`, String(buyCnt));
@@ -35439,13 +35664,12 @@ function closeCtgErrorModal() {
                     const tradeSize = Number(config.default_trade_xch || 0);
                     const maxBuy = parseInt(config.max_active_buy || 0);
                     const maxSell = parseInt(config.max_active_sell || 0);
-                    const headroom = Math.max(1.0,
-                        1 + (parseFloat(config.coin_prep_headroom_pct || 10) / 100));
+                    const headroom = getCoinPrepHeadroomMultiplier(config.coin_prep_headroom_pct);
                     if (tradeSize > 0) params.set('trade_size', String(tradeSize));
                     if (tradeSize > 0) params.set('prepared_xch_size', String(tradeSize * headroom));
                     const midPrice = Number(bot_state?.pricing?.mid || 0);
                     if (tradeSize > 0 && midPrice > 0) {
-                        params.set('prepared_cat_size', String(Math.round((tradeSize / midPrice) * headroom)));
+                        params.set('prepared_cat_size', String(uniformCoinPrepCatCapacity(tradeSize, midPrice, config.coin_prep_headroom_pct)));
                     }
                     if (maxBuy > 0) params.set('max_buy', String(maxBuy));
                     if (maxSell > 0) params.set('max_sell', String(maxSell));
@@ -35557,7 +35781,431 @@ function closeCtgErrorModal() {
             return { buttonText: 'Yes, Prepare Exact Campaign Coins' };
         }
 
+        let _coinPrepFeePreview = null;
+        let _coinPrepFeePreviewOptions = null;
+        let _coinPrepFeeConfirmBusy = false;
+        let _coinPrepFeePlanBlocked = false;
+        let _coinPrepFeeRequestSequence = 0;
+        let _coinPrepConfirmReadyText = 'Yes, Prepare Coins';
+        let _coinPrepFeeAgeTimer = null;
+        let _coinPrepRecoveryStatus = null;
+        let _coinPrepFeeReviewContract = null;
+        let _coinPrepRecoveryReviewBusy = false;
+        let _coinPrepFeeRecoveryIntent = null;
+
+        function isProtectedCampaignCancellationReady(status) {
+            const campaign = _bootstrapActiveCampaign;
+            const accounting = status?.fee_approval;
+            if (!campaign?.campaign_id || !accounting || accounting.stale !== false) return false;
+            const approvalCampaignId = String(accounting.campaign_id
+                || accounting.request_options?.bootstrap_campaign_id || '');
+            if (approvalCampaignId !== String(campaign.campaign_id)) return false;
+            if (!['approved', 'paused_budget'].includes(String(accounting.state || ''))) return false;
+            if (Number(accounting.unresolved_operation_count) !== 0
+                    || String(accounting.held_fee_mojos ?? '') !== '0'
+                    || accounting.pending_operation) return false;
+            let cancellationReserve;
+            try {
+                cancellationReserve = BigInt(String(accounting.cancellation_reserve_mojos ?? ''));
+            } catch (_) {
+                return false;
+            }
+            if (cancellationReserve <= 0n) return false;
+            const offers = bot_state?.offers || {};
+            const buyCount = Array.isArray(offers.buy)
+                ? offers.buy.length : Number(offers.buy_count || 0);
+            const sellCount = Array.isArray(offers.sell)
+                ? offers.sell.length : Number(offers.sell_count || 0);
+            return buyCount + sellCount > 0;
+        }
+
+        function updateCoinPrepRecoveryControls(status) {
+            _coinPrepRecoveryStatus = status;
+            const accounting = status?.fee_approval;
+            const recovering = status?.complete !== true
+                && status?.phase !== 'complete'
+                && status?.running !== true
+                && status?.overlapping_coin_prep_blocked === true
+                && !['complete', 'stale'].includes(accounting?.state);
+            _coinPrepFeeRecoveryBlocking = recovering;
+            const options = accounting?.request_options;
+            const canReview = recovering && status.fee_resume_required === true
+                && ['approved', 'paused_budget'].includes(accounting?.state)
+                && accounting?.unresolved_operation_count === 0 && accounting?.stale === false
+                && options && typeof options === 'object' && !Array.isArray(options);
+            const button = document.getElementById('cpReviewFeeBudgetBtn');
+            if (button) {
+                button.style.display = recovering ? '' : 'none';
+                button.disabled = !canReview || _coinPrepRecoveryReviewBusy;
+            }
+            return {recovering, canReview: !!canReview};
+        }
+
+        async function reviewRecoveredCoinPrepFees() {
+            if (_coinPrepRecoveryReviewBusy) return;
+            const expectedId = _coinPrepRecoveryStatus?.fee_approval?.approval_id;
+            _coinPrepRecoveryReviewBusy = true;
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/status`, {cache: 'no-store'});
+                if (!response.ok) throw new Error('Current fee recovery status is unavailable.');
+                const status = await response.json();
+                renderCoinPrepFeeAccounting(status);
+                const controls = updateCoinPrepRecoveryControls(status);
+                const accounting = status.fee_approval;
+                if (!controls.canReview || accounting.approval_id !== expectedId) return;
+                _coinPrepFeeReviewContract = {
+                    scope_sha256: accounting.scope_sha256, plan_sha256: accounting.plan_sha256,
+                };
+                if (coinPrepPollInterval) clearInterval(coinPrepPollInterval);
+                coinPrepPollInterval = null;
+                showCoinPrepView('confirm');
+                // Do not show stale browser-derived denominations after restart.
+                document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary').style.display = 'none';
+                const banner = document.getElementById('cpReasonBanner');
+                banner.style.display = '';
+                banner.textContent = 'Reviewing fees for the existing approved coin plan. This does not resume preparation until you explicitly approve and continue. Changed plans must be reviewed through Settings.';
+                await refreshCoinPrepFeePreview(accounting.request_options);
+            } catch (error) {
+                setCoinPrepFeeText('cpProgressMessage', formatError(error));
+            } finally {
+                _coinPrepRecoveryReviewBusy = false;
+                if (_coinPrepRecoveryStatus) updateCoinPrepRecoveryControls(_coinPrepRecoveryStatus);
+            }
+        }
+
+        function canonicalCoinPrepMojos(value) {
+            const text = String(value ?? '');
+            if (!/^(0|[1-9][0-9]{0,18})$/.test(text)) {
+                throw new Error('Invalid atomic fee amount');
+            }
+            return BigInt(text);
+        }
+
+        function coinPrepFeeStateMessage(state) {
+            const messages = {
+                approved: 'Approved fee budget is ready to resume.',
+                held_before_submission: 'An exact fee is held before submission; recovery must prove whether it can safely continue.',
+                submitted_awaiting_confirmation: 'A submitted transaction is awaiting confirmation; its fee remains held until authoritative evidence arrives.',
+                paused_budget: 'Coin Prep is paused because the approved preparation allowance is exhausted.',
+                unavailable: 'Durable fee accounting is temporarily unavailable; Coin Prep remains blocked.',
+                complete: 'The approved Coin Prep fee session is complete.',
+                stale: 'This approval has been superseded by a newer fee budget.',
+            };
+            return messages[state] || 'Coin Prep fee accounting is being recovered.';
+        }
+
+        function renderCoinPrepFeeAccounting(status) {
+            const panel = document.getElementById('cpProgressFeeAccounting');
+            const accounting = status && status.fee_approval;
+            if (!panel || !accounting || typeof accounting !== 'object') {
+                if (panel) panel.style.display = 'none';
+                return false;
+            }
+            panel.style.display = 'block';
+            setCoinPrepFeeText('cpProgressFeeState', coinPrepFeeStateMessage(String(accounting.state || '')));
+            const values = [
+                ['cpProgressFeeMaximum', accounting.total_fee_mojos],
+                ['cpProgressFeeHeld', accounting.held_fee_mojos],
+                ['cpProgressFeeSpent', accounting.spent_fee_mojos],
+                ['cpProgressFeeRemaining', accounting.remaining_fee_mojos],
+                ['cpProgressFeeProtected', accounting.cancellation_reserve_mojos],
+            ];
+            for (const [id, raw] of values) {
+                let text = '--';
+                try {
+                    text = `${coinPrepMojosToXch(raw ?? '0')} XCH`;
+                } catch (_) {
+                    text = 'Unavailable';
+                }
+                setCoinPrepFeeText(id, text);
+            }
+            return true;
+        }
+
+        function coinPrepMojosToXch(value) {
+            const mojos = canonicalCoinPrepMojos(value);
+            const whole = mojos / 1000000000000n;
+            const fraction = (mojos % 1000000000000n).toString().padStart(12, '0').replace(/0+$/, '');
+            return fraction ? `${whole}.${fraction}` : String(whole);
+        }
+
+        function coinPrepXchToMojos(value) {
+            const text = String(value ?? '').trim();
+            if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{0,12})?$/.test(text)) {
+                throw new Error('Enter an exact XCH amount with no more than 12 decimal places.');
+            }
+            const [whole, rawFraction = ''] = text.split('.');
+            const atomic = BigInt(whole) * 1000000000000n
+                + BigInt((rawFraction + '000000000000').slice(0, 12));
+            if (atomic > 9223372036854775807n) {
+                throw new Error('The maximum fee is outside the supported range.');
+            }
+            return atomic.toString();
+        }
+
+        function buildCoinPrepFeePreviewOptions(config = null) {
+            const source = config || {};
+            const rawMultiplier = source.coin_prep_multiplier
+                ?? document.getElementById('configCoinPrepMultiplier')?.value
+                ?? '1';
+            const options = {
+                coin_multiplier: String(rawMultiplier),
+                target_seconds: 300,
+            };
+            const recoveryCampaign = _coinPrepFeeRecoveryIntent?.campaign_id
+                ? _coinPrepFeeRecoveryIntent : null;
+            const campaign = recoveryCampaign || _bootstrapActiveCampaign;
+            if (campaign?.campaign_id) {
+                options.bootstrap_campaign_id = String(campaign.campaign_id);
+                options.bootstrap_campaign_revision = Number(campaign.campaign_revision ?? campaign.revision);
+            }
+            const recoveryAction = String(_coinPrepFeeRecoveryIntent?.action || '');
+            if (campaign?.campaign_id && ['cancel_all', 'bootstrap_stop'].includes(recoveryAction)) {
+                options.cancellation_recovery_action = recoveryAction;
+            }
+            return options;
+        }
+
+        function setCoinPrepFeeText(id, value) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = String(value ?? '--');
+        }
+
+        function setCoinPrepFeeLaunchEnabled(enabled) {
+            const btn = document.getElementById('cpConfirmBtn');
+            if (!btn) return;
+            const allowed = !!enabled && !_coinPrepFeePlanBlocked && !_coinPrepFeeConfirmBusy;
+            btn.disabled = !allowed;
+            btn.style.opacity = allowed ? '' : '0.5';
+            btn.style.cursor = allowed ? '' : 'not-allowed';
+            if (allowed) btn.textContent = _coinPrepConfirmReadyText;
+        }
+
+        function updateCoinPrepFeeFreshness() {
+            const preview = _coinPrepFeePreview;
+            if (!preview) return false;
+            const now = Date.now() / 1000;
+            const observedAt = Number(preview.observed_at);
+            const expiresAt = Number(preview.expires_at);
+            const age = Number.isFinite(observedAt) && observedAt > 0
+                ? Math.max(0, Math.trunc(now - observedAt)) : null;
+            const expired = !Number.isFinite(expiresAt) || expiresAt <= 0 || now >= expiresAt;
+            const sources = [];
+            for (const stage of preview.stages || []) {
+                const raw = String(stage?.quote?.source || '').toLowerCase();
+                const label = raw === 'coinset' ? 'Coinset'
+                    : raw === 'full_node' ? 'Full node'
+                    : raw.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+                if (label && !sources.includes(label)) sources.push(label);
+            }
+            setCoinPrepFeeText('cpFeeSource',
+                `${sources.join(' + ') || 'Unavailable'} · ${age === null ? 'age unavailable' : `${age}s old`} · ${preview.target_seconds}s target${expired ? ' · expired — refresh required' : ''}`);
+            if (expired) {
+                setCoinPrepFeeText('cpFeeStatus', 'The fee estimate has expired. Refresh it and review the new maximum before approving Coin Prep.');
+                setCoinPrepFeeLaunchEnabled(false);
+            }
+            return !expired;
+        }
+
+        function validateCoinPrepFeeMaximum() {
+            const input = document.getElementById('cpFeeMaximumInput');
+            const error = document.getElementById('cpFeeInputError');
+            if (!_coinPrepFeePreview || !input) {
+                if (error) error.textContent = '';
+                setCoinPrepFeeLaunchEnabled(false);
+                return null;
+            }
+            if (!updateCoinPrepFeeFreshness()) {
+                if (error) error.textContent = 'The fee estimate has expired. Refresh it before approving Coin Prep.';
+                setCoinPrepFeeLaunchEnabled(false);
+                return null;
+            }
+            try {
+                const maximum = canonicalCoinPrepMojos(coinPrepXchToMojos(input.value));
+                const cancellation = canonicalCoinPrepMojos(
+                    _coinPrepFeePreview.minimum_cancellation_reserve_mojos
+                        ?? _coinPrepFeePreview.estimated_cancellation_fee_mojos
+                );
+                const estimatedTotal = canonicalCoinPrepMojos(
+                    _coinPrepFeePreview.minimum_cumulative_fee_mojos
+                        ?? _coinPrepFeePreview.estimated_total_fee_mojos
+                );
+                if (maximum < cancellation) {
+                    throw new Error(`The cap must retain at least ${coinPrepMojosToXch(cancellation)} XCH for protected cancellation.`);
+                }
+                if (maximum < estimatedTotal) {
+                    throw new Error(`The cumulative cap must cover at least ${coinPrepMojosToXch(estimatedTotal)} XCH, including existing commitments and cancellation protection.`);
+                }
+                if (error) error.textContent = '';
+                setCoinPrepFeeLaunchEnabled(_coinPrepFeePreview.funded === true);
+                return maximum.toString();
+            } catch (problem) {
+                if (error) error.textContent = problem.message || String(problem);
+                setCoinPrepFeeLaunchEnabled(false);
+                return null;
+            }
+        }
+
+        function renderCoinPrepFeePreview(preview) {
+            _coinPrepFeePreview = preview;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            const panel = document.getElementById('cpFeePanel');
+            const details = document.getElementById('cpFeeDetails');
+            const capRow = document.getElementById('cpFeeCapRow');
+            if (panel) panel.style.display = 'block';
+            if (details) details.style.display = 'grid';
+            if (capRow) capRow.style.display = 'block';
+
+            const wallet = preview.wallet || {};
+            const ticker = wallet.ticker || currentCAT?.symbol || currentCAT?.name || 'CAT';
+            const pair = /\/XCH$/i.test(ticker)
+                ? ticker : `${String(ticker).replace(/_XCH$/i, '')}/XCH`;
+            setCoinPrepFeeText(
+                'cpFeeWalletPair',
+                `Sage ${wallet.wallet_fingerprint} · wallet ${wallet.wallet_id} · ${pair} · ${wallet.network}`
+            );
+            const lower = Number(preview.preparation_transaction_count_min || 0);
+            const upper = Number(preview.preparation_transaction_count_max || 0);
+            setCoinPrepFeeText('cpFeeTxCount', `${lower === upper ? lower : `${lower}–${upper}`} preparation transactions`);
+            setCoinPrepFeeText('cpFeeEstimate', `${coinPrepMojosToXch(preview.estimated_total_fee_mojos)} XCH remaining plan estimate`);
+            const cancellation = preview.minimum_cancellation_reserve_mojos ?? preview.estimated_cancellation_fee_mojos;
+            setCoinPrepFeeText('cpFeeCancellation', `${coinPrepMojosToXch(cancellation)} XCH protected; current estimate ${coinPrepMojosToXch(preview.estimated_cancellation_fee_mojos)} XCH`);
+            const accounting = preview.fee_accounting || {};
+            setCoinPrepFeeText('cpFeePriorAccounting', `${coinPrepMojosToXch(accounting.spent_fee_mojos ?? '0')} XCH spent · ${coinPrepMojosToXch(accounting.held_fee_mojos ?? '0')} XCH held (included in the cumulative cap)`);
+            setCoinPrepFeeText('cpFeePrincipal', `${coinPrepMojosToXch(preview.fee_coin_principal_mojos)} XCH prepared as coin principal, not spent as fees`);
+            setCoinPrepFeeText('cpFeeFunding', `${coinPrepMojosToXch(preview.fee_funding_mojos)} XCH${preview.funded ? '' : ' — insufficient'}`);
+
+            let exact = 0;
+            let projected = 0;
+            const stageLines = [];
+            for (const stage of preview.stages || []) {
+                const raw = String(stage?.quote?.source || '').toLowerCase();
+                const label = raw === 'coinset' ? 'Coinset'
+                    : raw === 'full_node' ? 'Full node'
+                    : raw.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+                if (stage?.cost_kind === 'exact_unsigned') exact += 1;
+                if (stage?.cost_kind === 'projected') projected += 1;
+                const stageMin = Number(stage?.transaction_count_min || 0);
+                const stageMax = Number(stage?.transaction_count_max || 0);
+                const stageCount = stageMin === stageMax ? String(stageMin) : `${stageMin}–${stageMax}`;
+                const stageName = String(stage?.stage_id || 'stage').replace(/_/g, ' ');
+                const stageKind = stage?.cost_kind === 'exact_unsigned' ? 'exact unsigned' : 'projected';
+                const stageFee = coinPrepMojosToXch(stage?.quote?.fee_mojos ?? '0');
+                stageLines.push(`${stageName}: ${stageKind}, ${stageCount} transaction${stageMax === 1 ? '' : 's'}, ${stageFee} XCH each (${label || 'source unavailable'})`);
+            }
+            setCoinPrepFeeText('cpFeeEvidence', `${exact} exact · ${projected} projected`);
+            setCoinPrepFeeText('cpFeeStages', stageLines.join(' · '));
+            const networkLines = [];
+            for (const stage of preview.stages || []) {
+                const evidence = stage?.quote?.network_evidence || {};
+                const sync = evidence.full_node_synced === true
+                    ? 'provider synced' : 'provider sync unknown';
+                const metrics = [];
+                for (const [key, label, suffix] of [
+                    ['mempool_size', 'mempool transactions', ''],
+                    ['mempool_fees', 'mempool fees', ' mojos'],
+                    ['last_block_cost', 'last block cost', ''],
+                ]) {
+                    const value = evidence[key];
+                    metrics.push(value === null || value === undefined
+                        ? `${label} unavailable` : `${label} ${String(value)}${suffix}`);
+                }
+                const absent = ['mempool_size', 'mempool_fees', 'last_block_cost']
+                    .every(key => evidence[key] === null || evidence[key] === undefined);
+                networkLines.push(`${String(stage?.stage_id || 'stage').replace(/_/g, ' ')}: ${sync}; ${absent ? 'congestion data unavailable' : metrics.join(', ')}`);
+            }
+            setCoinPrepFeeText('cpFeeNetwork', networkLines.join(' · '));
+            setCoinPrepFeeText('cpFeeStatus', preview.funded
+                ? 'Review the current estimate and choose the cumulative maximum network fee you approve, including prior spent/held fees and protected cancellation.'
+                : 'The wallet does not have enough selectable XCH fee funding for this estimate.');
+
+            const input = document.getElementById('cpFeeMaximumInput');
+            if (input) input.value = coinPrepMojosToXch(preview.suggested_maximum_fee_mojos);
+            validateCoinPrepFeeMaximum();
+            _coinPrepFeeAgeTimer = setInterval(updateCoinPrepFeeFreshness, 1000);
+        }
+
+        function showCoinPrepFeeUnavailable(reason, providerFailures = []) {
+            _coinPrepFeePreview = null;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
+            const panel = document.getElementById('cpFeePanel');
+            const details = document.getElementById('cpFeeDetails');
+            const capRow = document.getElementById('cpFeeCapRow');
+            if (panel) panel.style.display = 'block';
+            if (details) details.style.display = 'none';
+            if (capRow) capRow.style.display = 'none';
+            const suffix = reason ? ` (${reason})` : '';
+            const labels = { full_node_rpc: 'Full node', coinset: 'Coinset' };
+            const reasons = {
+                fee_provider_unsynced: 'not synced', fee_provider_unavailable: 'unavailable',
+                fee_provider_disabled: 'disabled', fee_provider_not_configured: 'not configured',
+                fee_provider_rate_limited: 'rate limited', fee_provider_http_error: 'request rejected',
+                invalid_fee_response: 'invalid fee response', invalid_network_evidence: 'invalid network data',
+                stale_or_future_fee_quote: 'stale or invalid quote time',
+                invalid_fee_quote_request: 'invalid quote request',
+            };
+            const diagnostics = (Array.isArray(providerFailures) ? providerFailures.slice(0, 8) : [])
+                .filter(item => Object.prototype.hasOwnProperty.call(labels, item?.source))
+                .map(item => `${labels[item.source]}: ${Object.prototype.hasOwnProperty.call(reasons, item.reason) ? reasons[item.reason] : 'unavailable'}`);
+            const detail = diagnostics.length ? ` ${diagnostics.join('; ')}.` : '';
+            setCoinPrepFeeText('cpFeeStatus', `Fee estimate unavailable${suffix}.${detail} Coin Prep remains safely blocked; refresh when the wallet and fee provider are ready.`);
+            setCoinPrepFeeLaunchEnabled(false);
+        }
+
+        async function refreshCoinPrepFeePreview(options = null) {
+            const requestOptions = options || _coinPrepFeePreviewOptions || buildCoinPrepFeePreviewOptions();
+            _coinPrepFeePreviewOptions = { ...requestOptions };
+            _coinPrepFeePreview = null;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
+            const requestSequence = ++_coinPrepFeeRequestSequence;
+            const panel = document.getElementById('cpFeePanel');
+            const refresh = document.getElementById('cpFeeRefreshBtn');
+            if (panel) panel.style.display = 'block';
+            const details = document.getElementById('cpFeeDetails');
+            const capRow = document.getElementById('cpFeeCapRow');
+            if (details) details.style.display = 'none';
+            if (capRow) capRow.style.display = 'none';
+            if (refresh) refresh.disabled = true;
+            setCoinPrepFeeText('cpFeeStatus', 'Requesting a current network estimate…');
+            setCoinPrepFeeLaunchEnabled(false);
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/fee-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestOptions),
+                });
+                const data = await response.json();
+                if (requestSequence !== _coinPrepFeeRequestSequence) return false;
+                if (!response.ok || data.success !== true || data.available !== true || !data.preview_id) {
+                    showCoinPrepFeeUnavailable(data.reason || data.error || `HTTP ${response.status}`, data.provider_failures);
+                    return false;
+                }
+                _coinPrepFeePreview = data;
+                if (_coinPrepFeeReviewContract && ['scope_sha256', 'plan_sha256'].some(
+                    key => !/^[0-9a-f]{64}$/.test(String(_coinPrepFeeReviewContract[key] || ''))
+                        || data[key] !== _coinPrepFeeReviewContract[key])) {
+                    showCoinPrepFeeUnavailable('FEE_APPROVAL_STALE — review changed coin settings first');
+                    return false;
+                }
+                renderCoinPrepFeePreview(data);
+                return true;
+            } catch (error) {
+                if (requestSequence === _coinPrepFeeRequestSequence) {
+                    showCoinPrepFeeUnavailable(formatError(error));
+                }
+                return false;
+            } finally {
+                if (requestSequence === _coinPrepFeeRequestSequence && refresh) refresh.disabled = false;
+            }
+        }
+
         function showCoinPrepConfirm(config, reason, reasonMessage, verification = null) {
+            _coinPrepFeeRecoveryBlocking = false;
+            _coinPrepFeeReviewContract = null;
+            _coinPrepFeeRecoveryIntent = null;
+            document.querySelector('#coinPrepConfirmView .coin-prep-confirm-summary').style.display = '';
             config = normalizeConfigForLiquidityMode(config || {});
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (!modal) return;
@@ -35583,10 +36231,10 @@ function closeCtgErrorModal() {
                 coinPrepMultiplier: Math.max(0.5, Math.min(3.0, parseFloat(config.coin_prep_multiplier) || 1)),
                 tierEnabled,
                 midPrice,
-                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS ?? 0)
-                    || ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100),
-                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS ?? 0)
-                    || ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100),
+                spreadBps: parseFloat(config.spread_bps ?? config.SPREAD_BPS
+                    ?? ((parseFloat(document.getElementById('configSpreadBps')?.value) || 0) * 100)),
+                minEdgeBps: parseFloat(config.min_edge_bps ?? config.MIN_EDGE_BPS
+                    ?? ((parseFloat(document.getElementById('configMinEdgeBps')?.value) || 0) * 100)),
                 headroomPct: prepHeadroomPct,
                 innerSize: parseFloat(config.inner_size_xch) || tradeSize * 2,
                 midSize: parseFloat(config.mid_size_xch) || tradeSize,
@@ -35662,6 +36310,7 @@ function closeCtgErrorModal() {
             }
 
             const cpConfirmBtn = document.getElementById('cpConfirmBtn');
+            _coinPrepFeePlanBlocked = isError;
             if (cpConfirmBtn) {
                 if (isError) {
                     cpConfirmBtn.disabled = true;
@@ -35670,28 +36319,37 @@ function closeCtgErrorModal() {
                     cpConfirmBtn.title = 'Wallet balance too low for these settings';
                     cpConfirmBtn.textContent = 'Balance Too Low';
                 } else {
-                    cpConfirmBtn.disabled = false;
-                    cpConfirmBtn.style.opacity = '';
-                    cpConfirmBtn.style.cursor = '';
+                    cpConfirmBtn.disabled = true;
+                    cpConfirmBtn.style.opacity = '0.5';
+                    cpConfirmBtn.style.cursor = 'wait';
                     cpConfirmBtn.title = '';
-                    cpConfirmBtn.textContent = bootstrapRender
+                    _coinPrepConfirmReadyText = bootstrapRender
                         ? bootstrapRender.buttonText
                         : `Yes, Prepare Coins (+${prepHeadroomPct}% headroom)`;
+                    cpConfirmBtn.textContent = 'Estimating network fees…';
                 }
             }
 
             try { applyOneSidedUiState(config.liquidity_mode); } catch (_) {}
             showCoinPrepView('confirm');
             modal.classList.add('active');
+            if (!isError) {
+                void refreshCoinPrepFeePreview(buildCoinPrepFeePreviewOptions(config));
+            } else {
+                showCoinPrepFeeUnavailable('wallet balance is insufficient');
+            }
         }
 
         function closeCoinPrepConfirm() {
             const modal = document.getElementById('coinPrepConfirmOverlay');
             if (modal) modal.classList.remove('active');
+            _coinPrepFeeRecoveryIntent = null;
+            if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
+            _coinPrepFeeAgeTimer = null;
             
             // If user closes modal without completing prep, mark as skipped
             // (but don't overwrite 'done' if prep already completed)
-            if (coinPrepStatus === 'checking') {
+            if (coinPrepStatus === 'checking' && !_coinPrepFeeRecoveryBlocking) {
                 setCoinPrepStatus('skipped-unsafe');
             }
             
@@ -35896,6 +36554,18 @@ function closeCtgErrorModal() {
         }
 
         async function startCoinPrepFromModal() {
+            if (_coinPrepFeeConfirmBusy) return;
+            if (!_coinPrepFeePreview) {
+                showToast('Refresh the network fee estimate before starting Coin Prep.', 'warning');
+                setCoinPrepFeeLaunchEnabled(false);
+                return;
+            }
+            const maximumFeeMojos = validateCoinPrepFeeMaximum();
+            if (maximumFeeMojos === null) return;
+            const confirmedPreview = _coinPrepFeePreview;
+            const confirmedOptions = {..._coinPrepFeePreviewOptions};
+            const recoveryIntent = _coinPrepFeeRecoveryIntent;
+            _coinPrepFeeConfirmBusy = true;
             const btn = document.getElementById('cpConfirmBtn');
             if (btn) {
                 btn.disabled = true;
@@ -35906,22 +36576,72 @@ function closeCtgErrorModal() {
             // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
             // When there's no data worth preserving it short-circuits to
             // 'proceed' with all resets false so first-run UX is frictionless.
-            const historyChoice = await askPrepHistoryChoice();
+            const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
+                .includes(String(recoveryIntent?.action || ''));
+            const historyChoice = cancellationOnlyRecovery
+                ? {action: 'proceed', resets: {}}
+                : await askPrepHistoryChoice();
             if (!historyChoice || historyChoice.action === 'cancel') {
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = 'Yes, Prepare Coins';
-                }
+                _coinPrepFeeConfirmBusy = false;
+                validateCoinPrepFeeMaximum();
                 return;
             }
             const resets = historyChoice.resets || {};
             if (btn) btn.textContent = 'Starting...';
 
             try {
+                if (confirmedPreview !== _coinPrepFeePreview) {
+                    throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
+                }
+                if (validateCoinPrepFeeMaximum() !== maximumFeeMojos) {
+                    throw new Error('The fee estimate expired or the maximum changed while reviewing history. Refresh and review the estimate before approving Coin Prep.');
+                }
+                if (btn) btn.textContent = 'Recording fee approval…';
+                const approvalResponse = await apiFetch(`${API_URL}/coin-prep/fee-approval`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        preview_id: confirmedPreview.preview_id,
+                        maximum_fee_mojos: maximumFeeMojos,
+                        cancellation_reserve_mojos: String(confirmedPreview.minimum_cancellation_reserve_mojos
+                            ?? confirmedPreview.estimated_cancellation_fee_mojos),
+                    }),
+                });
+                const approval = await approvalResponse.json();
+                if (!approvalResponse.ok || approval.success !== true || !approval.approval_id) {
+                    const reason = approval.reason || approval.error || `HTTP ${approvalResponse.status}`;
+                    if (reason === 'FEE_APPROVAL_STALE') {
+                        await refreshCoinPrepFeePreview(_coinPrepFeePreviewOptions);
+                        throw new Error('The wallet or plan changed. A fresh fee estimate is ready for review; no transaction was sent.');
+                    }
+                    throw new Error(`Fee approval was not recorded (${reason}). No transaction was sent.`);
+                }
+                if (recoveryIntent?.action === 'cancel_all') {
+                    _coinPrepFeeRecoveryIntent = null;
+                    closeCoinPrepConfirm();
+                    await cancelAllOffers({
+                        source: 'coin_prep',
+                        prepPayload: {fee_approval_id: approval.approval_id},
+                        openOfferCount: recoveryIntent.total,
+                        openBuyCount: recoveryIntent.buy,
+                        openSellCount: recoveryIntent.sell,
+                        resumeAfterCancel: false,
+                    });
+                    return;
+                }
+                if (recoveryIntent?.action === 'bootstrap_stop') {
+                    _coinPrepFeeRecoveryIntent = null;
+                    closeCoinPrepConfirm();
+                    await resumeBootstrapStopAfterFeeApproval(
+                        recoveryIntent, approval.approval_id
+                    );
+                    return;
+                }
                 // Send the spare coin multiplier from the GUI to the API
-                const coinMultiplier = parseFloat(document.getElementById('configCoinPrepMultiplier')?.value) || 2;
+                const coinMultiplier = confirmedOptions.coin_multiplier;
                 const prepPayload = {
                     coin_multiplier: coinMultiplier,
+                    fee_approval_id: approval.approval_id,
                     reset_pnl: !!resets.pnl,
                     reset_offer_history: !!resets.offers,
                     reset_counters: !!resets.counters,
@@ -35969,7 +36689,11 @@ function closeCtgErrorModal() {
                     try {
                         await apiFetch(`${API_URL}/coin-prep/reset`, { method: 'POST' });
                         // Retry trigger
-                        const retry = await apiFetch(`${API_URL}/coin-prep/trigger`, { method: 'POST' });
+                        const retry = await apiFetch(`${API_URL}/coin-prep/trigger`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(prepPayload),
+                        });
                         const retryData = await retry.json();
                         if (retryData.success) {
                             showCoinPrepView('progress');
@@ -35998,9 +36722,12 @@ function closeCtgErrorModal() {
             } catch (error) {
                 debugError('Coin prep trigger error:', error);
                 showToast('Failed to start coin prep: ' + formatError(error), 'error');
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = 'Yes, Prepare Coins';
+                setCoinPrepFeeLaunchEnabled(!!_coinPrepFeePreview);
+            } finally {
+                _coinPrepFeeConfirmBusy = false;
+                const confirmView = document.getElementById('coinPrepConfirmView');
+                if (confirmView && confirmView.style.display !== 'none' && _coinPrepFeePreview) {
+                    validateCoinPrepFeeMaximum();
                 }
             }
         }
@@ -36009,6 +36736,36 @@ function closeCtgErrorModal() {
             try {
                 const response = await apiFetch(`${API_URL}/coin-prep/status`);
                 const status = await response.json();
+                renderCoinPrepFeeAccounting(status);
+                const recovery = updateCoinPrepRecoveryControls(status);
+                if (recovery.recovering) {
+                    const modal = document.getElementById('coinPrepConfirmOverlay');
+                    const botRunning = !!(bot_state && bot_state.running);
+                    const cancellationReady = isProtectedCampaignCancellationReady(status);
+                    if (modal) modal.classList.toggle('active', !botRunning && !cancellationReady);
+                    // A restored fee approval still blocks new Coin Prep, but it
+                    // must not cover an already-running trading session or the
+                    // protected Cancel All path for that campaign's live offers.
+                    // Keep polling so unresolved evidence remains fail-closed.
+                    if (botRunning || cancellationReady) return;
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = 'Coin Prep Paused Safely';
+                    setCoinPrepFeeText('cpProgressPhase', coinPrepFeeStateMessage(status.fee_approval?.state));
+                    setCoinPrepFeeText('cpProgressMessage', recovery.canReview
+                        ? 'Recovery is resolved. Review the current fee budget to continue; no work will restart automatically.'
+                        : 'Waiting for authoritative recovery evidence. Submitted transactions may still confirm; no overlapping preparation will start.');
+                    document.getElementById('coinPrepCancelBtn').style.display = 'none';
+                    document.getElementById('cpProgressDoneFallback').style.display = 'none';
+                    // Worker percentages/errors cannot declare journal-held effects complete.
+                    return;
+                }
+                if (status.fee_resume_required === true) {
+                    _coinPrepFeeRecoveryBlocking = true;
+                    const title = document.getElementById('cpProgressTitle');
+                    if (title) title.textContent = 'Coin Prep Paused Safely';
+                    const cancel = document.getElementById('coinPrepCancelBtn');
+                    if (cancel) cancel.style.display = 'none';
+                }
                 
                 // Update progress bar - worker reports 0.0-1.0, convert to 0-100
                 const progressRaw = status.progress || 0;
@@ -36170,6 +36927,7 @@ function closeCtgErrorModal() {
                     
                     // Show complete view
                     setCoinPrepStatus('done');
+                    _coinPrepFeeRecoveryBlocking = false;
                     showCoinPrepView('complete');
                 }
                 
@@ -36354,6 +37112,7 @@ function updateCtgCalculations() {
 
 // Event listeners for real-time updates
 document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('cpReviewFeeBudgetBtn')?.addEventListener('click', reviewRecoveredCoinPrepFees);
     // Live Controls moved from dashboard to Settings → Live sub-tab.
     // Relocate the existing DOM node so all the lc* handler ids stay valid.
     try { mountLiveControlsInSettings(); } catch (_) {}
@@ -36451,8 +37210,8 @@ function previewCtgOffers() {
 
 // Confirm and start Close the Gap
 
-// TibetSwap live polling was retired in v1.4. Market confidence is fetched
-// from /api/market/confidence as one coherent, durable offer-book snapshot.
+// Market confidence is fetched from /api/market/confidence as one coherent,
+// durable offer-book snapshot.
 document.addEventListener('DOMContentLoaded', () => {
     loadAlerts();
 });
@@ -36684,7 +37443,43 @@ function startupShowRiskDisclosure() {
     const section = document.getElementById('startupDisclaimerSection');
     if (section) section.style.display = 'block';
     startupSetDisclosureExtraInfoVisible(false);
+    // Focus the dialog without jumping past the disclosure on short windows.
+    const overlay = document.getElementById('startupOverlay');
+    if (overlay) {
+        overlay.scrollTop = 0;
+        overlay.focus({ preventScroll: true });
+    }
 }
+
+document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab') return;
+    const overlay = document.getElementById('startupOverlay');
+    if (!overlay || overlay.classList.contains('hidden')
+        || getComputedStyle(overlay).display === 'none') return;
+
+    // Startup has several phases. Trap only the controls visible in the
+    // current phase, including links shown for wallet setup and recovery.
+    const focusable = Array.from(overlay.querySelectorAll(
+        'button:not([disabled]), a[href], input:not([disabled]):not([type="hidden"]), '
+        + 'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter(element => element.getClientRects().length
+        && getComputedStyle(element).visibility !== 'hidden');
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!first) {
+        event.preventDefault();
+        overlay.focus({ preventScroll: true });
+    } else if (!focusable.includes(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+    }
+}, true);
 
 async function startupAcceptRiskDisclosure() {
     if (_startupRiskDisclosureBusy) return;
@@ -36969,7 +37764,10 @@ async function startupMaybeShowChangeAddressPrompt() {
             signal: AbortSignal.timeout(5000)
         });
         const data = await resp.json();
-        if (data && data.sage_set_change_address) {
+        const savedSetting = data
+            ? (data.SAGE_SET_CHANGE_ADDRESS ?? data.sage_set_change_address)
+            : false;
+        if (savedSetting === true || String(savedSetting).toLowerCase() === 'true') {
             return false;
         }
     } catch (err) {
@@ -37990,7 +38788,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 // Console + Sage Dashboard auto-open is now handled by startupDismiss()
     // (opens only after startup warnings/fingerprint selection are cleared)
 
-    // Start status polling (separate from TibetSwap polling)
+    // Start status polling.
     // Note: Sage wallet RPC is slow (~4s per balance call), so use longer interval
     // to avoid request pile-up. SSE provides real-time updates anyway.
     setInterval(async () => {
@@ -38813,6 +39611,8 @@ document.addEventListener('DOMContentLoaded', () => {
 let _bootstrapPreviewDigest = '';
 let _bootstrapPreviewBody = null;
 let _bootstrapActiveCampaign = null;
+let _bootstrapPendingStopRetry = null;
+let _bootstrapPendingStopUnresolved = null;
 
 function _bootstrapCanonicalDecimal(value, fallback = '') {
     let text = String(value == null || value === '' ? fallback : value).trim();
@@ -39021,26 +39821,96 @@ function _bootstrapRenderStatus(payload) {
     const globalStatus = document.getElementById('bootstrapGlobalStatus');
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
+    const stoppedRetry = document.getElementById('bootstrapRetryStoppedBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
+    const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const unresolvedCreationCount = Number(_bootstrapActiveCampaign?.unresolved_creation_count || 0);
+    const hasUnresolvedCreation = Number.isSafeInteger(unresolvedCreationCount)
+        && unresolvedCreationCount > 0;
+    const noActiveCampaignOffers = _bootstrapActiveCampaign?.open_offer_count != null
+        && Number(_bootstrapActiveCampaign.open_offer_count) === 0
+        && !hasUnresolvedCreation;
+    if (Object.prototype.hasOwnProperty.call(payload || {}, 'stopped_cancellation')) {
+        const stopped = payload.stopped_cancellation;
+        const exact = /^[0-9a-f]{64}$/.test(String(stopped?.campaign_id || ''))
+            && Number.isInteger(Number(stopped?.revision));
+        _bootstrapPendingStopRetry = exact && stopped.financial_action_started === false
+            ? {campaign_id: String(stopped.campaign_id), revision: Number(stopped.revision)}
+            : null;
+        _bootstrapPendingStopUnresolved = exact && stopped.financial_action_started !== false
+            ? stopped : null;
+    } else if (_bootstrapActiveCampaign) {
+        _bootstrapPendingStopRetry = null;
+        _bootstrapPendingStopUnresolved = null;
+    }
+    if (hadActiveCampaign && !_bootstrapActiveCampaign) {
+        _bootstrapPreviewDigest = '';
+        _bootstrapPreviewBody = null;
+        const exactConfirm = document.getElementById('bootstrapExactAssetConfirm');
+        if (exactConfirm) exactConfirm.checked = false;
+        _bootstrapText('bootstrapStatusPanel', 'No active Bootstrap campaign. Review exact local budgets and Preview before starting.');
+        updateCoinPrepPreview();
+    }
     updateHeroPriceProvenance((_lastMarketConfidence || {}).confidence || {});
+    updateOffersEmptyState();
     const bootstrapTicker = String(
         payload?.identity?.ticker || currentCAT?.ticker_id || currentCAT?.ticker || 'CAT'
     ).replace(/_XCH$/i, '').replace(/\/XCH$/i, '').trim() || 'CAT';
     if (_bootstrapActiveCampaign) syncBootstrapCampaignPairIntoSelectors(payload);
     hydrateBootstrapCampaignControls(_bootstrapActiveCampaign);
-    let summary = 'Follow mode · no active Bootstrap campaign';
+    if (_bootstrapPendingStopRetry || _bootstrapPendingStopUnresolved) {
+        const preview = document.getElementById('bootstrapPreviewBtn');
+        const start = document.getElementById('bootstrapStartBtn');
+        if (preview) preview.disabled = true;
+        if (start) start.disabled = true;
+    }
+    let summary = document.getElementById('bootstrapModeSelect')?.value === 'bootstrap'
+        ? 'Bootstrap selected · no active campaign'
+        : 'Follow mode · no active Bootstrap campaign';
+    if (!_bootstrapActiveCampaign && _bootstrapPendingStopRetry) {
+        summary = 'Bootstrap stopped · campaign cancellation retry required';
+    } else if (!_bootstrapActiveCampaign && _bootstrapPendingStopUnresolved) {
+        summary = 'Bootstrap stopped · cancellation outcome unresolved';
+    }
     if (_bootstrapActiveCampaign) {
         const campaign = _bootstrapActiveCampaign;
         const expiryMs = Date.parse(campaign.expires_at || '');
-        const remainingHours = Number.isFinite(expiryMs)
-            ? Math.max(0, Math.ceil((expiryMs - Date.now()) / 3600000))
-            : null;
+        const remainingMs = Number.isFinite(expiryMs) ? expiryMs - Date.now() : null;
+        const remainingTime = remainingMs == null
+            ? 'expiry unknown'
+            : remainingMs <= 0
+                ? 'expired'
+                : remainingMs < 3600000
+                    ? `${Math.ceil(remainingMs / 60000)}m remaining`
+                    : `${Math.ceil(remainingMs / 3600000)}h remaining`;
         const cooldowns = Array.isArray(campaign.adverse_fill_times)
             ? campaign.adverse_fill_times.length
             : 0;
-        summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingHours == null ? 'expiry unknown' : remainingHours + 'h remaining'} · revision ${campaign.revision}`;
+        const cancelRequired = campaign.cancel_required === true || campaign.expired === true;
+        if (hasUnresolvedCreation) {
+            summary = `Bootstrap unresolved offer creation — verify Sage before restart or renewal · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+        } else if (cancelRequired) {
+            const rawCount = Number(campaign.open_offer_count || 0);
+            const openCount = Number.isFinite(rawCount) && rawCount > 0
+                ? Math.floor(rawCount) : 0;
+            if (noActiveCampaignOffers) {
+                summary = `Bootstrap expired — stop campaign before renewal · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+            } else {
+                const offerPhrase = openCount > 0
+                    ? `${openCount} open offer${openCount === 1 ? '' : 's'}`
+                    : 'open offers';
+                summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+            }
+        } else {
+            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+        }
         campaign._uiCooldownCount = cooldowns;
+    }
+    if (_bootstrapActiveCampaign && (_bootstrapPendingStopRetry || _bootstrapPendingStopUnresolved)) {
+        summary += _bootstrapPendingStopRetry
+            ? ' · stopped campaign cancellation retry required'
+            : ' · stopped campaign cancellation outcome unresolved';
     }
     if (globalStatus) {
         globalStatus.style.display = 'block';
@@ -39049,10 +39919,31 @@ function _bootstrapRenderStatus(payload) {
     if (dashboardStatus) {
         dashboardStatus.style.display = 'block';
         dashboardStatus.textContent = _bootstrapActiveCampaign
-            ? summary + ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
-            : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
+            ? summary + (
+                hasUnresolvedCreation
+                    ? ` · unresolved offer creation; verify Sage before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
+                    : _bootstrapActiveCampaign.cancel_required === true || _bootstrapActiveCampaign.expired === true
+                    ? ` · ${noActiveCampaignOffers ? 'stop campaign' : 'requires cancellation'} before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
+                    : ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
+            )
+            : (_bootstrapPendingStopRetry || _bootstrapPendingStopUnresolved)
+                ? summary
+                : document.getElementById('bootstrapModeSelect')?.value === 'bootstrap'
+                    ? 'No active Bootstrap campaign. Preview and start a campaign before Coin Prep.'
+                    : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
     }
-    if (stop) stop.disabled = !_bootstrapActiveCampaign;
+    if (stop) {
+        stop.disabled = !_bootstrapActiveCampaign && !_bootstrapPendingStopRetry;
+        stop.textContent = !_bootstrapActiveCampaign && _bootstrapPendingStopRetry
+            ? 'Retry Campaign Cancellation'
+            : hasUnresolvedCreation ? 'Stop & Review Campaign'
+                : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
+    }
+    if (stoppedRetry) {
+        const separateRetry = !!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry;
+        stoppedRetry.style.display = separateRetry ? '' : 'none';
+        stoppedRetry.disabled = !separateRetry;
+    }
     if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
     const proofExporter = document.getElementById('bootstrapParticipationExportBtn');
     if (proofExporter) proofExporter.disabled = !_bootstrapActiveCampaign;
@@ -39112,9 +40003,10 @@ async function bootstrapPreviewCampaign() {
         const plan = payload.plan || {};
         const buyLevels = plan.sides?.buy?.levels?.length || 0;
         const sellLevels = plan.sides?.sell?.levels?.length || 0;
+        const mode = String(payload.liquidity_mode || 'unknown').replaceAll('_', ' ');
         _bootstrapText(
             'bootstrapStatusPanel',
-            `REVIEW ONLY — no wallet action. Asset ${campaign.asset_id}. Anchor ${campaign.anchor_price}; fixed corridor ${campaign.minimum_price}–${campaign.maximum_price}; first stage ${Number(plan.deployment_fraction || 0) * 100}%; ${buyLevels} buy / ${sellLevels} sell offers. Confirm the exact asset ID to enable Start Campaign.`
+            `REVIEW ONLY — no wallet action. Asset ${campaign.asset_id}. Liquidity mode ${mode}; effective market budgets ${campaign.xch_budget} XCH / ${campaign.cat_budget} CAT. Anchor ${campaign.anchor_price}; fixed corridor ${campaign.minimum_price}–${campaign.maximum_price}; first stage ${Number(plan.deployment_fraction || 0) * 100}%; ${buyLevels} buy / ${sellLevels} sell offers. Confirm the exact asset ID to enable Start Campaign.`
         );
         const start = document.getElementById('bootstrapStartBtn');
         if (start) start.disabled = !document.getElementById('bootstrapExactAssetConfirm')?.checked;
@@ -39156,15 +40048,42 @@ async function bootstrapStartCampaign() {
     }
 }
 
-async function bootstrapStopCampaign() {
-    const campaign = _bootstrapActiveCampaign;
+function bootstrapStopResultText(payload) {
+    const count = Number(payload?.cancel_targets || 0);
+    return count === 0
+        ? 'Campaign stopped. No campaign-owned offers needed cancellation.'
+        : `Campaign stopped. ${count} campaign-owned offer cancellation(s) submitted.`;
+}
+
+async function bootstrapStopCampaign(target = 'active') {
+    const retrying = target === 'pending'
+        || (!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry);
+    const campaign = retrying ? _bootstrapPendingStopRetry : _bootstrapActiveCampaign;
     if (!campaign) return;
+    const displayedCount = Number(campaign.open_offer_count);
+    const observedOpenOfferCount = !retrying && campaign.open_offer_count != null
+        && Number.isSafeInteger(displayedCount) && displayedCount >= 0
+        ? displayedCount : undefined;
+    const unresolvedCreationCount = Number(campaign.unresolved_creation_count || 0);
+    const hasUnresolvedCreation = !retrying
+        && Number.isSafeInteger(unresolvedCreationCount)
+        && unresolvedCreationCount > 0;
+    const noCampaignOffers = !retrying && campaign.open_offer_count != null
+        && Number(campaign.open_offer_count) === 0 && !hasUnresolvedCreation;
     try {
         const approved = await showStyledConfirm({
             icon: '⏹',
-            title: 'Stop Bootstrap campaign?',
-            message: 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
-            confirmText: 'Stop and cancel',
+            title: retrying ? 'Retry campaign cancellation?' : 'Stop Bootstrap campaign?',
+            message: retrying
+                ? 'The campaign is already stopped. Retry cancellation only for offers owned by this exact campaign after checking the wallet service is available.'
+                : hasUnresolvedCreation
+                    ? 'This stops the exact active campaign. At least one offer creation has an unknown wallet outcome. CATalyst will not submit cancellation until Sage and the operation journal are reconciled.'
+                : noCampaignOffers
+                    ? 'This stops the exact active campaign. There are no campaign-owned offers to cancel. History and unrelated offers remain untouched.'
+                : 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
+            confirmText: retrying ? 'Retry cancellation'
+                : hasUnresolvedCreation ? 'Stop and review'
+                    : noCampaignOffers ? 'Stop campaign' : 'Stop and cancel',
             cancelText: 'Keep running',
             style: 'warning'
         });
@@ -39172,17 +40091,89 @@ async function bootstrapStopCampaign() {
         const response = await apiFetch('/api/bootstrap/stop', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ campaign_id: campaign.campaign_id, revision: campaign.revision })
+            body: JSON.stringify({
+                campaign_id: campaign.campaign_id,
+                revision: campaign.revision,
+                observed_open_offer_count: observedOpenOfferCount,
+            })
         });
         const payload = await response.json();
+        const feeRecoveryReasons = [
+            'FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED',
+            'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH',
+            'FEE_BUDGET_APPROVAL_REQUIRED',
+            'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
+            'FEE_PREP_FUNDING_INSUFFICIENT',
+        ];
+        if (!payload?.success && payload?.stopped === true) {
+            _bootstrapPendingStopRetry = payload.financial_action_started === false
+                && !feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))
+                ? {campaign_id: String(payload.campaign_id), revision: Number(payload.campaign_revision)}
+                : null;
+            _bootstrapPendingStopUnresolved = payload.financial_action_started === false
+                ? null : payload;
+            await bootstrapRefreshStatus();
+        }
+        if (!payload?.success && payload?.stopped === true
+            && feeRecoveryReasons.includes(String(payload?.code || payload?.error || ''))) {
+            _bootstrapText('bootstrapStatusPanel', 'Campaign creation is stopped. Review and approve the fresh cancellation-only fee estimate to finish removing its offers.');
+            await reviewCancelAllFeeBudgetFailure({
+                ...payload,
+                reason_code: payload.code || payload.error,
+                recovery_action: 'bootstrap_stop',
+                total: Number(payload.cancel_targets || 0),
+            });
+            return;
+        }
+        if (!payload?.success && payload?.stopped === true) {
+            const message = payload.code === 'bootstrap_stop_targets_changed'
+                ? `Campaign stopped. The offer count changed to ${Number(payload.cancel_targets)} before cancellation; no wallet cancellation started. Review the offers and confirm a retry.`
+                : payload.financial_action_started === false
+                    ? 'Campaign creation is stopped. Cancellation did not start; review the offer state, then retry this campaign cancellation.'
+                    : 'Campaign creation is stopped. Cancellation outcome is unresolved; verify Sage and CATalyst before retrying.';
+            _bootstrapText('bootstrapStatusPanel', message);
+            showToast(message, 'warning');
+            return;
+        }
         if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap stop failed');
-        _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
+        _bootstrapPendingStopRetry = null;
+        _bootstrapPendingStopUnresolved = null;
+        _bootstrapText('bootstrapStatusPanel', bootstrapStopResultText(payload));
         showToast('Bootstrap campaign stopped', 'success');
         await bootstrapRefreshStatus();
     } catch (error) {
         _bootstrapText('bootstrapStatusPanel', error?.message || 'Bootstrap stop failed');
         showToast(error?.message || 'Bootstrap stop failed', 'error');
     }
+}
+
+async function resumeBootstrapStopAfterFeeApproval(intent, feeApprovalId) {
+    const response = await apiFetch('/api/bootstrap/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            campaign_id: intent.campaign_id,
+            revision: intent.campaign_revision,
+            fee_approval_id: feeApprovalId,
+        }),
+    });
+    const payload = await response.json();
+    if (!payload?.success) {
+        if (payload?.stopped === true) {
+            _bootstrapPendingStopRetry = payload.financial_action_started === false
+                ? {campaign_id: String(payload.campaign_id), revision: Number(payload.campaign_revision)}
+                : null;
+            _bootstrapPendingStopUnresolved = payload.financial_action_started === false
+                ? null : payload;
+            await bootstrapRefreshStatus();
+        }
+        throw new Error(payload?.code || payload?.error || 'Bootstrap cancellation retry failed');
+    }
+    _bootstrapPendingStopRetry = null;
+    _bootstrapPendingStopUnresolved = null;
+    _bootstrapText('bootstrapStatusPanel', bootstrapStopResultText(payload));
+    showToast('Bootstrap campaign cancellation resumed', 'success');
+    await bootstrapRefreshStatus();
 }
 
 function _bootstrapDownloadJson(value, filename) {

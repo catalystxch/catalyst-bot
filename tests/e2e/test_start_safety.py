@@ -272,6 +272,46 @@ def test_active_bootstrap_campaign_bypasses_legacy_reserve_warning_on_save(page)
     }
 
 
+def test_stopping_bootstrap_clears_active_coin_prep_preview(page):
+    _ready_setup(page, "allowed")
+    result = page.evaluate(
+        """() => {
+            _pairDataReadyAssetId = currentCAT.asset_id;
+            _catSwitchTargetAssetId = '';
+            bot_state.balances = mergeVerifiedWalletBalances({
+                xch: {total: 10, confirmed: 10, spendable: 10},
+                cat: {total: 10000, confirmed: 10000, spendable: 10000},
+            }, currentCAT.asset_id);
+            bot_state.pricing = {mid: 0.000075};
+            document.getElementById('bootstrapModeSelect').value = 'bootstrap';
+            _bootstrapActiveCampaign = {
+                campaign_id: 'campaign-stop-preview', revision: 0,
+                asset_id: currentCAT.asset_id, xch_budget: '0.9',
+                cat_budget: '12000', fee_budget_xch: '0.001',
+            };
+            updateCoinPrepPreview();
+            const before = document.getElementById('coinPrepWarning').textContent;
+            _bootstrapRenderStatus({success: true, active: false, campaign: null,
+                identity: {asset_id: currentCAT.asset_id}, stopped_cancellation: null});
+            return {
+                before,
+                after: document.getElementById('coinPrepWarning').textContent,
+                xch: document.getElementById('prepXchTotal').textContent,
+                banner: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboard: document.getElementById('bootstrapDashboardStatus').textContent,
+            };
+        }"""
+    )
+    assert "Bootstrap campaign active" in result["before"]
+    assert "No active Bootstrap campaign" in result["after"]
+    assert "Campaign-bound" not in result["xch"]
+    assert result["banner"] == "Bootstrap selected · no active campaign"
+    assert (
+        result["dashboard"]
+        == "No active Bootstrap campaign. Preview and start a campaign before Coin Prep."
+    )
+
+
 def test_coin_prep_pool_rejects_verified_zero_balance(page):
     """A verified zero balance is authoritative, not an unknown-balance sentinel."""
     _ready_setup(page, "allowed")
@@ -449,6 +489,21 @@ def test_coin_prep_verification_receives_reserve_and_topup_budget(page):
 
 def test_tier_verification_uses_effective_residual_topup_budget(page):
     """Verification must use the capped top-up coin shown in the prep plan."""
+    from coin_prep_economics import prepared_cat_sizes
+
+    # 1 XCH / 1.03 XCH per CAT * 1.1 headroom, rounded up to a CAT mojo.
+    # Two 1.068 CAT outputs leave 1000 - 100 reserve - 2.136 = 897.864 CAT.
+    backend = prepared_cat_sizes(
+        live_sizes={"inner": "1"},
+        price="1",
+        headroom_multiplier="1.1",
+        cat_decimals=3,
+        sell_counts={"inner": 1},
+        max_offers=1,
+        spread_bps="300",
+        min_edge_bps="300",
+    )
+    assert str(backend["inner"]) == "1.068"
     _ready_setup(page, "allowed")
     query = page.evaluate(
         """async () => {
@@ -477,6 +532,8 @@ def test_tier_verification_uses_effective_residual_topup_budget(page):
                 tier_enabled: true,
                 coin_prep_multiplier: 1,
                 coin_prep_headroom_pct: 10,
+                spread_bps: 300,
+                min_edge_bps: 300,
                 xch_reserve: 2,
                 cat_reserve: 100,
                 topup_pool_xch: 9,
@@ -493,7 +550,8 @@ def test_tier_verification_uses_effective_residual_topup_budget(page):
     )
 
     assert "topup_pool_xch=3.76" in query
-    assert "topup_pool_cat=898" in query
+    assert "inner_cat=1.068&" in query
+    assert "topup_pool_cat=897.864" in query
 
 
 def test_tier_verification_sends_separate_live_plus_spare_counts(page):

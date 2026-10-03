@@ -503,6 +503,21 @@ class TestFeeCoinPool(unittest.TestCase):
         )
         self.assertEqual(pool.largest_available_amount, 700_000_000)
 
+    def test_reserve_largest_returns_exact_coin_and_amount(self):
+        pool = FeeCoinPool()
+        pool.refresh(
+            [
+                self._rec("a" * 64, 700_000_000),
+                self._rec("b" * 64, 1_120_000_000),
+            ]
+        )
+
+        self.assertEqual(
+            pool.reserve_largest(),
+            ("0x" + "b" * 64, 1_120_000_000),
+        )
+        self.assertEqual(pool.largest_available_amount, 700_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

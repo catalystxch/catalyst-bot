@@ -73,7 +73,12 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
         )
 
     def test_get_all_offers_rejects_missing_or_malformed_offer_collection(self):
-        for response in ({"success": True}, {"success": True, "offers": {}}, [1, 2]):
+        for response in (
+            {"success": True},
+            {"success": True, "offers": {}},
+            {"success": False, "offers": []},
+            [1, 2],
+        ):
             with (
                 self.subTest(response=response),
                 patch.object(wallet_sage, "rpc", return_value=response),
@@ -96,6 +101,17 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             [row["trade_id"] for row in result],
             ["a" * 64, "b" * 64],
         )
+
+    def test_failed_sage_offer_response_cannot_prove_empty_book(self):
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": False, "offers": []}
+        ):
+            result = wallet_sage.get_authoritative_offer_history(
+                include_completed=False
+            )
+
+        self.assertEqual(result["success"], False)
+        self.assertEqual(result["end_of_history"], False)
 
     def test_reload_connection_settings_uses_canonical_cfg_values(self):
         old_cert = wallet_sage.CERT_PATH
