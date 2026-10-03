@@ -25,8 +25,12 @@ completed with zero matching detections.
 The affected Bootstrap API and offer-journal slice passed 122 tests; its
 new stopped-attention regression was red on 69a7071 and green on 00767dc.
 The bundled UI is byte-identical to the 69a7071 UI, whose complete Chromium
-suite passed 207 tests. The full local Windows Python suite and exact-source
-CI unit job were still running when this manifest was drafted.
+suite passed 207 tests. The complete local Windows Python suite passed
+**7,153 tests**, with **208 skipped** and **427 subtests passed**. All 11
+exact-source PR CI checks passed.
+
+Fresh HTTP downloads of the pinned ZIP and installer matched their SHA-256
+values above.
 
 Original-profile TEST 7 startup, live lifecycle, restart/recovery, full UI,
 both 24-hour windows, independent secondary acceptance and final review
