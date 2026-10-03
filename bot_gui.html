@@ -39812,6 +39812,8 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const noActiveCampaignOffers = _bootstrapActiveCampaign?.open_offer_count != null
+        && Number(_bootstrapActiveCampaign.open_offer_count) === 0;
     if (Object.prototype.hasOwnProperty.call(payload || {}, 'stopped_cancellation')) {
         const stopped = payload.stopped_cancellation;
         const exact = /^[0-9a-f]{64}$/.test(String(stopped?.campaign_id || ''))
@@ -39870,10 +39872,14 @@ function _bootstrapRenderStatus(payload) {
             const rawCount = Number(campaign.open_offer_count || 0);
             const openCount = Number.isFinite(rawCount) && rawCount > 0
                 ? Math.floor(rawCount) : 0;
-            const offerPhrase = openCount > 0
-                ? `${openCount} open offer${openCount === 1 ? '' : 's'}`
-                : 'open offers';
-            summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+            if (noActiveCampaignOffers) {
+                summary = `Bootstrap expired — stop campaign before renewal · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+            } else {
+                const offerPhrase = openCount > 0
+                    ? `${openCount} open offer${openCount === 1 ? '' : 's'}`
+                    : 'open offers';
+                summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
+            }
         } else {
             summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
         }
@@ -39893,7 +39899,7 @@ function _bootstrapRenderStatus(payload) {
         dashboardStatus.textContent = _bootstrapActiveCampaign
             ? summary + (
                 _bootstrapActiveCampaign.cancel_required === true || _bootstrapActiveCampaign.expired === true
-                    ? ` · requires cancellation before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
+                    ? ` · ${noActiveCampaignOffers ? 'stop campaign' : 'requires cancellation'} before restart or renewal · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker}`
                     : ` · corridor ${_bootstrapActiveCampaign.minimum_price}–${_bootstrapActiveCampaign.maximum_price} XCH/${bootstrapTicker} · budgets ${_bootstrapActiveCampaign.xch_budget} XCH / ${_bootstrapActiveCampaign.cat_budget} ${bootstrapTicker} · fee ${_bootstrapActiveCampaign.fee_budget_xch} XCH · cooldowns ${_bootstrapActiveCampaign._uiCooldownCount || 0} · stop state: armed at 5% loss`
             )
             : (_bootstrapPendingStopRetry || _bootstrapPendingStopUnresolved)
@@ -39903,7 +39909,8 @@ function _bootstrapRenderStatus(payload) {
     if (stop) {
         stop.disabled = !_bootstrapActiveCampaign && !_bootstrapPendingStopRetry;
         stop.textContent = !_bootstrapActiveCampaign && _bootstrapPendingStopRetry
-            ? 'Retry Campaign Cancellation' : 'Stop & Cancel Campaign Offers';
+            ? 'Retry Campaign Cancellation'
+            : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
     }
     if (stoppedRetry) {
         const separateRetry = !!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry;
@@ -40014,19 +40021,30 @@ async function bootstrapStartCampaign() {
     }
 }
 
+function bootstrapStopResultText(payload) {
+    const count = Number(payload?.cancel_targets || 0);
+    return count === 0
+        ? 'Campaign stopped. No campaign-owned offers needed cancellation.'
+        : `Campaign stopped. ${count} campaign-owned offer cancellation(s) submitted.`;
+}
+
 async function bootstrapStopCampaign(target = 'active') {
     const retrying = target === 'pending'
         || (!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry);
     const campaign = retrying ? _bootstrapPendingStopRetry : _bootstrapActiveCampaign;
     if (!campaign) return;
+    const noCampaignOffers = !retrying && campaign.open_offer_count != null
+        && Number(campaign.open_offer_count) === 0;
     try {
         const approved = await showStyledConfirm({
             icon: '⏹',
             title: retrying ? 'Retry campaign cancellation?' : 'Stop Bootstrap campaign?',
             message: retrying
                 ? 'The campaign is already stopped. Retry cancellation only for offers owned by this exact campaign after checking the wallet service is available.'
+                : noCampaignOffers
+                    ? 'This stops the exact active campaign. There are no campaign-owned offers to cancel. History and unrelated offers remain untouched.'
                 : 'This stops the exact active campaign and submits cancellation only for offers owned by it. It does not reset history or touch unrelated offers.',
-            confirmText: retrying ? 'Retry cancellation' : 'Stop and cancel',
+            confirmText: retrying ? 'Retry cancellation' : noCampaignOffers ? 'Stop campaign' : 'Stop and cancel',
             cancelText: 'Keep running',
             style: 'warning'
         });
@@ -40075,7 +40093,7 @@ async function bootstrapStopCampaign(target = 'active') {
         if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap stop failed');
         _bootstrapPendingStopRetry = null;
         _bootstrapPendingStopUnresolved = null;
-        _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
+        _bootstrapText('bootstrapStatusPanel', bootstrapStopResultText(payload));
         showToast('Bootstrap campaign stopped', 'success');
         await bootstrapRefreshStatus();
     } catch (error) {
@@ -40108,7 +40126,7 @@ async function resumeBootstrapStopAfterFeeApproval(intent, feeApprovalId) {
     }
     _bootstrapPendingStopRetry = null;
     _bootstrapPendingStopUnresolved = null;
-    _bootstrapText('bootstrapStatusPanel', `Campaign stopped. ${payload.cancel_targets || 0} campaign-owned offer cancellation(s) submitted.`);
+    _bootstrapText('bootstrapStatusPanel', bootstrapStopResultText(payload));
     showToast('Bootstrap campaign cancellation resumed', 'success');
     await bootstrapRefreshStatus();
 }

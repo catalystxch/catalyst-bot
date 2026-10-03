@@ -307,3 +307,68 @@ def test_active_stop_and_older_stopped_retry_remain_separately_available(page):
         {"campaign_id": active_id, "revision": 0},
         {"campaign_id": stopped_id, "revision": 1},
     ]
+
+
+def test_expired_zero_offer_campaign_describes_stop_without_cancellation(page):
+    _open_gui(page)
+    page.evaluate(
+        """() => {
+            _bootstrapRenderStatus({
+                success: true,
+                active: true,
+                campaign: {
+                    campaign_id: 'c'.repeat(64),
+                    revision: 0,
+                    status: 'active',
+                    stage: 'bootstrap',
+                    expired: true,
+                    cancel_required: true,
+                    open_offer_count: 0,
+                    asset_id: 'b8'.repeat(32),
+                    minimum_price: '0.0000375',
+                    maximum_price: '0.00015',
+                },
+            });
+            showStyledConfirm = async options => {
+                window.__zeroOfferStopConfirmation = options;
+                return false;
+            };
+        }"""
+    )
+
+    expect(page.locator("#bootstrapGlobalStatus")).to_contain_text(
+        "stop campaign before renewal"
+    )
+    expect(page.locator("#bootstrapGlobalStatus")).not_to_contain_text(
+        "cancellation required"
+    )
+    expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
+    expect(page.locator("#bootstrapStopBtn")).to_have_text("Stop Campaign")
+    page.evaluate("bootstrapStopCampaign()")
+    confirmation = page.evaluate("window.__zeroOfferStopConfirmation")
+    assert confirmation["confirmText"] == "Stop campaign"
+    assert "no campaign-owned offers to cancel" in confirmation["message"]
+
+    result = page.evaluate(
+        """async () => {
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {};
+            window.apiFetch = async (path, options) => {
+                if (path !== '/api/bootstrap/stop') throw new Error(String(path));
+                window.__zeroOfferStopBody = JSON.parse(options.body);
+                return new Response(JSON.stringify({
+                    success: true, stopped: true, cancel_targets: 0,
+                    cancel_results: {},
+                }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            };
+            await bootstrapStopCampaign();
+            return {
+                body: window.__zeroOfferStopBody,
+                message: document.getElementById('bootstrapStatusPanel').textContent,
+            };
+        }"""
+    )
+    assert result["body"] == {"campaign_id": "c" * 64, "revision": 0}
+    assert result["message"] == (
+        "Campaign stopped. No campaign-owned offers needed cancellation."
+    )
