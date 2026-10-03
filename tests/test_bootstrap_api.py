@@ -13,6 +13,20 @@ ASSET_ID = "b8" * 32
 OTHER_ASSET_ID = "cd" * 32
 
 
+@pytest.mark.parametrize("expires_at", ["not-a-time", "2026-09-12T12:00:00"])
+def test_unparseable_active_campaign_expiry_requires_attention(expires_at):
+    from blueprints import bootstrap
+
+    campaign = {
+        "campaign_id": "ab" * 32,
+        "status": "active",
+        "expires_at": expires_at,
+    }
+    now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+
+    assert bootstrap._campaign_expiry_has_elapsed(campaign, now) is True
+
+
 def test_bootstrap_identity_uses_configured_ticker_id_not_display_name(monkeypatch):
     from blueprints import bootstrap
     import wallet

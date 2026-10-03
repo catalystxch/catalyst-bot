@@ -832,6 +832,7 @@ class TestBotStart(_FlaskBase):
         campaign = {
             "campaign_id": campaign_id,
             "revision": 0,
+            "expires_at": "2099-01-01T00:00:00.000000Z",
             "asset_id": fake_cfg.CAT_ASSET_ID,
             "network": "mainnet",
             "wallet_fingerprint": 123456789,
@@ -1209,6 +1210,21 @@ class TestBotStart(_FlaskBase):
             data={"campaign_id": "cd" * 32, "revision": 3},
         )
         bot.start.assert_not_called()
+
+    def test_unparseable_active_bootstrap_campaign_expiry_blocks_start(self):
+        from blueprints import bot as bot_blueprint
+
+        for expires_at in ("not-a-time", "2026-09-12T12:00:00"):
+            with self.subTest(expires_at=expires_at):
+                campaign = {
+                    "campaign_id": "cd" * 32,
+                    "status": "active",
+                    "expires_at": expires_at,
+                    "revision": 3,
+                }
+                block = bot_blueprint._bootstrap_start_block(campaign)
+                self.assertIsNotNone(block)
+                self.assertEqual(block["reason"], "bootstrap_campaign_expired")
 
 
 # ---------------------------------------------------------------------------

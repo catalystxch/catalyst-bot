@@ -295,9 +295,10 @@ def _bootstrap_campaign_expired(campaign: dict[str, Any]) -> bool:
             str(campaign.get("expires_at") or "").replace("Z", "+00:00")
         )
     except (TypeError, ValueError):
-        return False
+        # An unreadable active-campaign deadline cannot grant start authority.
+        return True
     if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        return False
+        return True
     return datetime.now(timezone.utc) >= expires_at.astimezone(timezone.utc)
 
 

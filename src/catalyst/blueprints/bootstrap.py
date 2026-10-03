@@ -383,9 +383,10 @@ def _campaign_expiry_has_elapsed(campaign: dict[str, Any], now: datetime) -> boo
             str(campaign.get("expires_at") or "").replace("Z", "+00:00")
         )
     except (TypeError, ValueError):
-        return False
+        # Show a damaged active authority as requiring operator attention.
+        return True
     if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        return False
+        return True
     return now.astimezone(timezone.utc) >= expires_at.astimezone(timezone.utc)
 
 
