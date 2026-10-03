@@ -22992,6 +22992,19 @@
                 return;
             }
 
+            if (document.getElementById('bootstrapModeSelect')?.value === 'bootstrap') {
+                for (const id of ['prepXchCoins', 'prepXchSize', 'prepXchTotal',
+                    'prepCatCoins', 'prepCatSize', 'prepCatTotal']) {
+                    const field = document.getElementById(id);
+                    if (field) field.textContent = '--';
+                }
+                if (coinPrepWarn) {
+                    coinPrepWarn.style.display = 'block';
+                    coinPrepWarn.textContent = 'No active Bootstrap campaign for this trading pair. Preview and start a campaign before Coin Prep.';
+                }
+                return;
+            }
+
             if (tradeSize <= 0 || (maxBuy <= 0 && maxSell <= 0)) {
                 document.getElementById('prepXchCoins').textContent = '--';
                 document.getElementById('prepXchSize').textContent = '--';
@@ -39837,6 +39850,7 @@ function _bootstrapRenderStatus(payload) {
         const exactConfirm = document.getElementById('bootstrapExactAssetConfirm');
         if (exactConfirm) exactConfirm.checked = false;
         _bootstrapText('bootstrapStatusPanel', 'No active Bootstrap campaign. Review exact local budgets and Preview before starting.');
+        updateCoinPrepPreview();
     }
     updateHeroPriceProvenance((_lastMarketConfidence || {}).confidence || {});
     updateOffersEmptyState();
@@ -39851,7 +39865,9 @@ function _bootstrapRenderStatus(payload) {
         if (preview) preview.disabled = true;
         if (start) start.disabled = true;
     }
-    let summary = 'Follow mode · no active Bootstrap campaign';
+    let summary = document.getElementById('bootstrapModeSelect')?.value === 'bootstrap'
+        ? 'Bootstrap selected · no active campaign'
+        : 'Follow mode · no active Bootstrap campaign';
     if (!_bootstrapActiveCampaign && _bootstrapPendingStopRetry) {
         summary = 'Bootstrap stopped · campaign cancellation retry required';
     } else if (!_bootstrapActiveCampaign && _bootstrapPendingStopUnresolved) {
@@ -39912,7 +39928,9 @@ function _bootstrapRenderStatus(payload) {
             )
             : (_bootstrapPendingStopRetry || _bootstrapPendingStopUnresolved)
                 ? summary
-                : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
+                : document.getElementById('bootstrapModeSelect')?.value === 'bootstrap'
+                    ? 'No active Bootstrap campaign. Preview and start a campaign before Coin Prep.'
+                    : 'No active Bootstrap campaign. Follow mode uses the established attributable offer book.';
     }
     if (stop) {
         stop.disabled = !_bootstrapActiveCampaign && !_bootstrapPendingStopRetry;
