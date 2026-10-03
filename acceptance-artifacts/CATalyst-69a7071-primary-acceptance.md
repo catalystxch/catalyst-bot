@@ -23,11 +23,13 @@ directory were absent afterward. Defender custom scans of the bundle, ZIP,
 and unsigned installer completed with zero matching detections.
 
 Affected Bootstrap API and offer-journal tests: 122 passed. Complete Chromium
-suite: 207 passed. All 11 exact-source PR CI checks passed. The complete local
-Windows Python suite was still running when this manifest was drafted. No original TEST 7
+suite: 207 passed. The complete local Windows Python suite passed **7,153**
+tests with **208 skipped** and **427 subtests passed**. All 11 exact-source
+PR CI checks passed. No original TEST 7
 profile or wallet effect was used by these package checks.
 
-The prior approved MZ/XCH campaign expired. Exact-package original-profile
+Independent HTTP downloads of the pinned ZIP and installer matched the
+SHA-256 values above. The prior approved MZ/XCH campaign expired. Exact-package original-profile
 startup, Sage identity preflight, mainnet lifecycle, restart/recovery, full
 live UI, both 24-hour windows, independent secondary acceptance, and final
 review remain open. Keep PR #220 draft.
