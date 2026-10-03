@@ -89,6 +89,16 @@ clicking Save & Continue; after the status refresh the top banner read
 inactive preview and basic native restart checks. The short delay between
 selector change and banner refresh resolved without further interaction.
 
+The exact EXE was launched a second time while PID 139448 owned the native
+window. The duplicate process exited; PID 139448 remained the sole
+`Catalyst.exe` process and the sole port 5000 listener. The existing native
+window remained usable on its Offers history view. It showed zero active
+buy and sell offers and three historical, confirmed MZ buys from 18 days
+earlier. A follow-up read showed the bot stopped, unchanged balances, zero
+active offers, safety allowed, and no active or attention-required campaign.
+This passes the exact-package duplicate-owner safety check without a wallet
+effect. Foreground activation was not independently established.
+
 Live wallet lifecycle, both 24-hour windows, independent secondary acceptance,
 and final review remain open. A replacement campaign and fee scope have not
 been approved. PR #220 stays draft; there is no main merge, tag, release, or
