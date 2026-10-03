@@ -550,16 +550,20 @@ def test_status_export_and_scoped_stop_use_exact_active_campaign(
 
 
 @pytest.mark.parametrize(
-    "reason",
+    "reason, expected",
     [
-        "FEE_APPROVAL_STALE",
-        "FEE_APPROVAL_LEGACY_UNSCOPED",
-        "FEE_APPROVAL_RECOVERY_ONLY",
-        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+        ("FEE_APPROVAL_STALE", "FEE_APPROVAL_STALE"),
+        ("FEE_APPROVAL_LEGACY_UNSCOPED", "FEE_APPROVAL_LEGACY_UNSCOPED"),
+        ("FEE_APPROVAL_RECOVERY_ONLY", "FEE_APPROVAL_RECOVERY_ONLY"),
+        (
+            "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+            "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+        ),
+        ("fee_approval_stale", "FEE_APPROVAL_STALE"),
     ],
 )
 def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
-    isolated_db, bootstrap_api, monkeypatch, reason
+    isolated_db, bootstrap_api, monkeypatch, reason, expected
 ):
     bootstrap, client, _identity = bootstrap_api
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
@@ -591,8 +595,8 @@ def test_stop_fee_refusal_is_structured_and_leaves_campaign_in_recovery(
     assert response.status_code == 409, payload
     assert payload == {
         "success": False,
-        "code": reason,
-        "error": reason,
+        "code": expected,
+        "error": expected,
         "stopped": True,
         "campaign_id": campaign_id,
         "campaign_revision": 1,

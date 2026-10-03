@@ -706,12 +706,26 @@ def api_bootstrap_stop():
                 "BOOTSTRAP_CANCEL_MANAGER_UNAVAILABLE",
                 "BOOTSTRAP_CANCEL_JOURNAL_UNAVAILABLE",
             }
-            cause = str(exc).strip()
-            if (
-                isinstance(exc, (ValueError, BootstrapApiError))
-                and cause.upper() in no_effect_refusals
-            ):
-                reason = cause
+            # The exception message may contain internals; return only fixed
+            # public codes selected by equality with this allowlist.
+            known_no_effect_code = (
+                next(
+                    (
+                        code
+                        for code in no_effect_refusals
+                        if str(exc).strip().upper() == code
+                    ),
+                    None,
+                )
+                if isinstance(exc, (ValueError, BootstrapApiError))
+                else None
+            )
+            if known_no_effect_code is not None:
+                reason = (
+                    known_no_effect_code.lower()
+                    if known_no_effect_code.startswith("BOOTSTRAP_")
+                    else known_no_effect_code
+                )
                 financial_action_started = False
                 status = 409
             else:
