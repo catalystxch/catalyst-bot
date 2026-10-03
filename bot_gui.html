@@ -40033,6 +40033,10 @@ async function bootstrapStopCampaign(target = 'active') {
         || (!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry);
     const campaign = retrying ? _bootstrapPendingStopRetry : _bootstrapActiveCampaign;
     if (!campaign) return;
+    const displayedCount = Number(campaign.open_offer_count);
+    const observedOpenOfferCount = !retrying && campaign.open_offer_count != null
+        && Number.isSafeInteger(displayedCount) && displayedCount >= 0
+        ? displayedCount : undefined;
     const noCampaignOffers = !retrying && campaign.open_offer_count != null
         && Number(campaign.open_offer_count) === 0;
     try {
@@ -40052,7 +40056,11 @@ async function bootstrapStopCampaign(target = 'active') {
         const response = await apiFetch('/api/bootstrap/stop', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ campaign_id: campaign.campaign_id, revision: campaign.revision })
+            body: JSON.stringify({
+                campaign_id: campaign.campaign_id,
+                revision: campaign.revision,
+                observed_open_offer_count: observedOpenOfferCount,
+            })
         });
         const payload = await response.json();
         const feeRecoveryReasons = [
@@ -40083,9 +40091,11 @@ async function bootstrapStopCampaign(target = 'active') {
             return;
         }
         if (!payload?.success && payload?.stopped === true) {
-            const message = payload.financial_action_started === false
-                ? 'Campaign creation is stopped. Cancellation did not start; review the offer state, then retry this campaign cancellation.'
-                : 'Campaign creation is stopped. Cancellation outcome is unresolved; verify Sage and CATalyst before retrying.';
+            const message = payload.code === 'bootstrap_stop_targets_changed'
+                ? `Campaign stopped. The offer count changed to ${Number(payload.cancel_targets)} before cancellation; no wallet cancellation started. Review the offers and confirm a retry.`
+                : payload.financial_action_started === false
+                    ? 'Campaign creation is stopped. Cancellation did not start; review the offer state, then retry this campaign cancellation.'
+                    : 'Campaign creation is stopped. Cancellation outcome is unresolved; verify Sage and CATalyst before retrying.';
             _bootstrapText('bootstrapStatusPanel', message);
             showToast(message, 'warning');
             return;

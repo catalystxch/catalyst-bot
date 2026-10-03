@@ -2953,6 +2953,12 @@ class OfferManager:
                 spend_wallet_id=spend_wallet_id,
             )
 
+    def wait_for_offer_creation_quiescence(self) -> None:
+        """Wait until any already-authorized Sage creation has finished journaling."""
+
+        with self._sage_creation_authority_lock:
+            pass
+
     def _create_offer_from_journal_serialized(
         self,
         *,

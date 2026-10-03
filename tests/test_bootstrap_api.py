@@ -534,7 +534,11 @@ def test_expired_campaign_without_offers_stops_without_wallet_cancellation(
 
     stopped = client.post(
         "/api/bootstrap/stop",
-        json={"campaign_id": campaign_id, "revision": 0},
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "observed_open_offer_count": 1,
+        },
     )
 
     assert stopped.status_code == 200
@@ -549,6 +553,115 @@ def test_expired_campaign_without_offers_stops_without_wallet_cancellation(
     assert campaign["status"] == "stopped"
     assert campaign["revision"] == 1
     assert client.get("/api/bootstrap/status").get_json()["active"] is False
+
+
+def test_stop_collects_offers_after_in_flight_creation_finishes(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    creation_finished = False
+    cancellations = []
+
+    class Manager:
+        def wait_for_offer_creation_quiescence(self):
+            nonlocal creation_finished
+            assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+            creation_finished = True
+
+        def cancel_offers(self, trade_ids, **_kwargs):
+            cancellations.extend(trade_ids)
+            return {trade_id: {"outcome": "CANCEL_CONFIRMED"} for trade_id in trade_ids}
+
+    manager = Manager()
+    monkeypatch.setattr(bootstrap, "_campaign_cancel_manager", lambda: manager)
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: (
+            ["late-trade"] if exact_id == campaign_id and creation_finished else []
+        ),
+    )
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(offer_manager=manager)
+    )
+
+    stopped = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+
+    assert stopped.status_code == 200
+    assert creation_finished is True
+    assert stopped.get_json()["cancel_targets"] == 1
+    assert cancellations == ["late-trade"]
+
+
+def test_stop_requires_new_review_when_offer_count_changes_during_stop(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    creation_finished = False
+    cancelled = []
+
+    class Manager:
+        def wait_for_offer_creation_quiescence(self):
+            nonlocal creation_finished
+            creation_finished = True
+
+        def cancel_offers(self, trade_ids, **_kwargs):
+            cancelled.extend(trade_ids)
+            return {trade_id: {"outcome": "CANCEL_CONFIRMED"} for trade_id in trade_ids}
+
+    manager = Manager()
+    monkeypatch.setattr(bootstrap, "_campaign_cancel_manager", lambda: manager)
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_trade_ids",
+        lambda exact_id: (
+            ["late-trade"] if exact_id == campaign_id and creation_finished else []
+        ),
+    )
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(offer_manager=manager)
+    )
+
+    stopped = client.post(
+        "/api/bootstrap/stop",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "observed_open_offer_count": 0,
+        },
+    )
+
+    assert stopped.status_code == 409
+    assert stopped.get_json()["code"] == "bootstrap_stop_targets_changed"
+    assert stopped.get_json()["financial_action_started"] is False
+    assert stopped.get_json()["cancel_targets"] == 1
+    assert cancelled == []
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
 
 
 def test_status_export_and_scoped_stop_use_exact_active_campaign(

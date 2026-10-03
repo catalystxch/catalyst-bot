@@ -37,6 +37,30 @@ CREATION_CONTEXT = {
 }
 
 
+def test_campaign_stop_creation_fence_waits_for_in_flight_wallet_lane():
+    manager = object.__new__(offer_manager.OfferManager)
+    lane = threading.Lock()
+    lane.acquire()
+    manager._sage_creation_authority_lock = lane
+    started = threading.Event()
+    finished = threading.Event()
+
+    def wait_for_creation():
+        started.set()
+        manager.wait_for_offer_creation_quiescence()
+        finished.set()
+
+    worker = threading.Thread(target=wait_for_creation)
+    worker.start()
+    try:
+        assert started.wait(1)
+        assert not finished.wait(0.05)
+    finally:
+        lane.release()
+        worker.join(timeout=1)
+    assert finished.is_set()
+
+
 def _binding():
     return mutation_gate.WalletIdentityBinding(
         backend="sage",

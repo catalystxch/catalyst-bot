@@ -571,6 +571,18 @@ def _campaign_cancel_manager():
     return manager
 
 
+def _await_campaign_creation_quiescence() -> None:
+    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+    server = owner or sys.modules.get("api_server")
+    manager = getattr(getattr(server, "bot", None), "offer_manager", None)
+    if manager is None:
+        return
+    wait = getattr(manager, "wait_for_offer_creation_quiescence", None)
+    if not callable(wait):
+        raise BootstrapApiError("bootstrap_creation_fence_unavailable", 503)
+    wait()
+
+
 def _cancel_campaign_offers(
     trade_ids: list[str], *, fee_approval_id: str | None = None
 ) -> dict[str, Any]:
@@ -646,13 +658,17 @@ def api_bootstrap_stop():
         revision = body.get("revision")
         if type(revision) is not int or revision != campaign["revision"]:
             raise BootstrapApiError("bootstrap_revision_stale", 409)
+        observed_count = body.get("observed_open_offer_count")
+        if "observed_open_offer_count" in body and (
+            type(observed_count) is not int or observed_count < 0
+        ):
+            raise BootstrapApiError("invalid_observed_open_offer_count")
         fee_approval_id = body.get("fee_approval_id")
         if fee_approval_id is not None and (
             type(fee_approval_id) is not str
             or _ASSET_ID_RE.fullmatch(fee_approval_id) is None
         ):
             raise BootstrapApiError("invalid_fee_approval", 400)
-        trade_ids = _campaign_trade_ids(campaign_id)
         stopped_at = _utcnow()
         was_active = campaign.get("status") == "active"
         # Disable creation before any cancellation attempt. The cancellation
@@ -664,7 +680,19 @@ def api_bootstrap_stop():
         stopped_campaign = database.get_bootstrap_campaign(campaign_id)
         if type(stopped_campaign) is not dict:
             raise BootstrapApiError("bootstrap_stop_failed", 409)
+        trade_ids: list[str] = []
         try:
+            # A creation can pass its final campaign check immediately before
+            # this HTTP request stops the campaign. Wait for that serialized
+            # wallet call and its journal result before selecting cancel targets.
+            _await_campaign_creation_quiescence()
+            trade_ids = _campaign_trade_ids(campaign_id)
+            if (
+                trade_ids
+                and observed_count is not None
+                and observed_count != len(trade_ids)
+            ):
+                raise BootstrapApiError("bootstrap_stop_targets_changed", 409)
             if trade_ids and not _record_campaign_cancel_attempt(
                 campaign_id,
                 revision=stopped_campaign["revision"],
@@ -706,6 +734,7 @@ def api_bootstrap_stop():
                 "FEE_PREP_FUNDING_INSUFFICIENT",
                 "BOOTSTRAP_CANCEL_MANAGER_UNAVAILABLE",
                 "BOOTSTRAP_CANCEL_JOURNAL_UNAVAILABLE",
+                "BOOTSTRAP_STOP_TARGETS_CHANGED",
             }
             # The exception message may contain internals; return only fixed
             # public codes selected by equality with this allowlist.

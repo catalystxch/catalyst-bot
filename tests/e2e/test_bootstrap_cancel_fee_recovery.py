@@ -368,7 +368,46 @@ def test_expired_zero_offer_campaign_describes_stop_without_cancellation(page):
             };
         }"""
     )
-    assert result["body"] == {"campaign_id": "c" * 64, "revision": 0}
+    assert result["body"] == {
+        "campaign_id": "c" * 64,
+        "revision": 0,
+        "observed_open_offer_count": 0,
+    }
     assert result["message"] == (
         "Campaign stopped. No campaign-owned offers needed cancellation."
     )
+
+
+def test_stop_count_change_requests_new_operator_review_without_cancellation(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            _bootstrapActiveCampaign = {
+                campaign_id: 'c'.repeat(64), revision: 0,
+                status: 'active', open_offer_count: 0,
+            };
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {};
+            window.apiFetch = async (path, options) => {
+                if (path !== '/api/bootstrap/stop') throw new Error(String(path));
+                window.__stopCountBody = JSON.parse(options.body);
+                return new Response(JSON.stringify({
+                    success: false, stopped: true,
+                    code: 'bootstrap_stop_targets_changed',
+                    campaign_id: 'c'.repeat(64), campaign_revision: 1,
+                    cancel_targets: 1, financial_action_started: false,
+                }), {status: 409, headers: {'Content-Type': 'application/json'}});
+            };
+            await bootstrapStopCampaign();
+            return {
+                body: window.__stopCountBody,
+                message: document.getElementById('bootstrapStatusPanel').textContent,
+                retry: _bootstrapPendingStopRetry,
+            };
+        }"""
+    )
+    assert result["body"]["observed_open_offer_count"] == 0
+    assert result["retry"] == {"campaign_id": "c" * 64, "revision": 1}
+    assert "offer count changed to 1" in result["message"]
+    assert "no wallet cancellation started" in result["message"]
