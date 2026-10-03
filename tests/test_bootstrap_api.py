@@ -505,6 +505,52 @@ def test_status_flags_expired_active_campaign_as_cancel_required(
     assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
 
 
+def test_expired_campaign_without_offers_stops_without_wallet_cancellation(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    started = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()
+    campaign_id = started["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_utcnow",
+        lambda: datetime(2026, 9, 12, 12, 1, 1, tzinfo=timezone.utc),
+    )
+    assert bootstrap._campaign_trade_ids(campaign_id) == []
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_cancel_manager",
+        lambda: pytest.fail("zero-offer stop accessed the wallet cancel manager"),
+    )
+
+    stopped = client.post(
+        "/api/bootstrap/stop",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+
+    assert stopped.status_code == 200
+    assert stopped.get_json() == {
+        "success": True,
+        "campaign_id": campaign_id,
+        "stopped": True,
+        "cancel_targets": 0,
+        "cancel_results": {},
+    }
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    assert campaign["status"] == "stopped"
+    assert campaign["revision"] == 1
+    assert client.get("/api/bootstrap/status").get_json()["active"] is False
+
+
 def test_status_export_and_scoped_stop_use_exact_active_campaign(
     isolated_db, bootstrap_api, monkeypatch
 ):

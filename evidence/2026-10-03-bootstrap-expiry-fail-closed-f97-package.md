@@ -43,6 +43,19 @@ the installed EXE hash matched the expected source package. The restored
 left neither the QA directory nor its uninstall registry key. The sequence
 did not open the original profile or contact the live wallet.
 
+## Zero-offer campaign retirement regression
+
+The original TEST 7 database still has the expired `c275b953...` campaign
+marked active, but its MZ offer table has zero open offers and the latest
+offer-operation journal has zero mutation blockers. An isolated API regression
+now proves that stopping an expired campaign with no associated trade IDs
+commits its stopped revision and clears active status without calling the
+wallet cancellation manager or requiring a fee approval. All 34 Bootstrap API
+tests passed; Ruff, formatting and diff checks passed. This is test/evidence
+only, with no change to the packaged `f97efd7` runtime. The original profile
+was read-only during this check; its campaign remains active pending the
+operator's normal app flow.
+
 ## Open live gates
 
 The exact `f97efd7` EXE has not run against the original TEST 7 profile.
