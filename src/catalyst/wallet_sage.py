@@ -4894,7 +4894,7 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     if not isinstance(res, dict):
         get_all_offers._last_error = "get_offers response is not an object"
         return None
-    if res.get("success") is False and res.get("error"):
+    if res.get("success") is False:
         get_all_offers._last_error = str(res.get("error") or "wallet get_offers failed")
         _console(f"  ⚠️  [Sage] get_offers failed: {get_all_offers._last_error}")
         return None
