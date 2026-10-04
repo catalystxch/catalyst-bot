@@ -52,6 +52,76 @@ def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypat
     assert submit_calls == []
 
 
+def test_enabled_stopped_splash_skips_http_when_local_port_is_unreachable(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    socket_calls = []
+    http_calls = []
+
+    def unavailable_socket(address, timeout):
+        socket_calls.append((address, timeout))
+        raise TimeoutError("local Splash port is unreachable")
+
+    def unexpected_get(*args, **kwargs):
+        http_calls.append((args, kwargs))
+        raise AssertionError("unreachable Splash must not incur the HTTP timeout")
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
+    )
+    monkeypatch.setattr(splash_node.socket, "create_connection", unavailable_socket)
+    monkeypatch.setattr(splash_node.requests, "get", unexpected_get)
+
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    result = node.check_health()
+
+    assert result["process_running"] is False
+    assert result["api_reachable"] is False
+    assert socket_calls == [(("localhost", 4000), 0.25)]
+    assert http_calls == []
+
+
+def test_enabled_stopped_splash_detects_external_local_listener(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class FakeSocket:
+        def close(self):
+            pass
+
+    class FakeResponse:
+        status_code = 405
+
+    socket_calls = []
+    http_calls = []
+
+    def reachable_socket(address, timeout):
+        socket_calls.append((address, timeout))
+        return FakeSocket()
+
+    def reachable_get(url, timeout):
+        http_calls.append((url, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
+    )
+    monkeypatch.setattr(splash_node.socket, "create_connection", reachable_socket)
+    monkeypatch.setattr(splash_node.requests, "get", reachable_get)
+
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    result = node.check_health()
+
+    assert result["api_reachable"] is True
+    assert socket_calls == [(("localhost", 4000), 0.25)]
+    assert http_calls == [("http://localhost:4000", 2)]
+
+
 def test_stopped_splash_status_marks_cached_metrics_unreachable(monkeypatch):
     import splash_node
     from config import cfg

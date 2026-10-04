@@ -25,6 +25,7 @@ import socket
 import threading
 import subprocess
 import requests
+from urllib.parse import urlsplit
 from typing import Dict, Optional
 
 from config import cfg
@@ -757,6 +758,23 @@ class SplashNode:
         # manually-started managed process is actually running.
         if not getattr(cfg, "SPLASH_ENABLED", False) and not process_running:
             return result
+
+        # A configured but stopped local node may be unreachable. A full HTTP
+        # connect timeout can take several seconds on Windows and get_status()
+        # is called by every /api/status poll. Probe the loopback port briefly
+        # before making the HTTP request; still detect a node started outside
+        # this manager when the listener is present.
+        if not process_running:
+            try:
+                parsed = urlsplit(submit_url)
+                if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    probe = socket.create_connection(
+                        (parsed.hostname, port), timeout=0.25
+                    )
+                    probe.close()
+            except (OSError, ValueError):
+                return result
 
         # Quick connectivity check
         try:
