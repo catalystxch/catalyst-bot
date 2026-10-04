@@ -54,5 +54,35 @@ of both pinned files matched the hashes above.
 At the preflight check, the original TEST 7 process was still the earlier
 `b78ce49` EXE, PID `115676`, with the bot stopped. No new campaign, offer,
 fee approval, or wallet transaction was made by this package verification.
-Exact-candidate original-profile restart, live offer lifecycle, both 24-hour
-windows and final review remain open. PR #220 stays draft.
+The exact-candidate original-profile restart is recorded below. Live offer
+lifecycle, both 24-hour windows and final review remain open. PR #220 stays
+draft.
+
+## Original TEST 7 read-only restart
+
+The previous stopped `b78ce49` process was the sole CATalyst process and
+port 5000 owner before shutdown. Its UI showed no active Bootstrap campaign;
+the shutdown dialog's offer-cancellation checkbox stayed unchecked. It
+closed through the native Shutdown App action, after which CATalyst process
+and port 5000 listener counts both reached zero.
+
+The exact `00f2bfb` EXE was launched from the clean detached build. Its
+native Risk Disclosure was acknowledged under the operator's existing
+testing authorization. Sage detected an open wallet. The native picker
+displayed TEST 7 fingerprint `736588221`, which was selected. The stopped
+optional Splash node was skipped and the configured Spacescan key was used.
+The fresh Dashboard required explicit pair selection; the native UI selected
+Monkeyzoo Token `MZ_XCH`.
+
+The resulting sole PID was `144664`, with the exact EXE path and SHA-256 above
+and one port 5000 listener owned by the same PID. Read-only API checks showed
+Sage phase `ready`, fingerprint `736588221`, healthy synced wallet, mainnet,
+CAT wallet ID `2`, exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+138.470301476875 XCH and 780212.284 MZ, bot stopped, zero open offers,
+inactive Bootstrap, and runtime safety allowed with zero blockers. The
+previous package's balances were identical. No campaign, fee approval,
+offer, transaction, or other wallet financial effect was made by this
+restart. The injected config-reload failure path was verified in isolated
+tests, not induced on the original wallet profile. Live offer lifecycle,
+both 24-hour windows and final review remain open.
