@@ -457,7 +457,7 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         recipe = build_standard_prep_economics(
             configuration=config,
             fee_pool=fee_pool,
-            live_price=api_server._get_live_mid_price_str(),
+            live_price=api_server._get_readonly_mid_price_str(),
             coin_multiplier=options["coin_multiplier"],
             target_seconds=options["target_seconds"],
         )

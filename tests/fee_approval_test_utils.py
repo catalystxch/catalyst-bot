@@ -185,6 +185,7 @@ def economic_reads(live_reads, monkeypatch):
         return live_reads.get("live_price", "0.01")
 
     monkeypatch.setattr(api_server, "_get_live_mid_price_str", price)
+    monkeypatch.setattr(api_server, "_get_readonly_mid_price_str", price)
     return live_reads
 
 

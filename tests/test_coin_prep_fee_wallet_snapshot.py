@@ -275,6 +275,22 @@ def test_runtime_economics_are_derived_from_current_wallet_settings_without_effe
         )
 
 
+def test_fee_economic_preview_does_not_advance_trading_price_state(
+    economic_reads, monkeypatch
+):
+    import api_server
+
+    monkeypatch.setattr(
+        api_server,
+        "_get_live_mid_price_str",
+        lambda: pytest.fail("preview fetched a stateful trading price"),
+    )
+    monkeypatch.setattr(api_server, "_get_readonly_mid_price_str", lambda: "0.01")
+
+    result = _economic_collect(economic_reads)
+    assert result["recipe"]["targets"]
+
+
 def test_runtime_fee_snapshot_ignores_retired_sniper_pool_settings(economic_reads):
     economic_reads["config"].SNIPER_ENABLED = True
     economic_reads["config"].SNIPER_PREP_COUNT = 20

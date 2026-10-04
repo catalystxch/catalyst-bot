@@ -2,7 +2,7 @@
 
 Read-only aggregator routes that compose information from multiple
 bot subsystems for the GUI dashboard view. Depend heavily on helpers
-still living in api_server (_get_health_snapshot, _get_live_mid_price_str,
+still living in api_server (_get_health_snapshot, _get_readonly_mid_price_str,
 _get_live_local_offer_edges, _get_spacescan_market_context, etc.).
 """
 
