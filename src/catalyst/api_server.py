@@ -6396,7 +6396,6 @@ _validate_write_route_classification()
 from blueprints.market import _fetch_dbx_pair_status  # noqa: E402
 from blueprints.smart_defaults import (  # noqa: E402
     _calculate_smart_defaults,
-    _fetch_price_standalone,
     _fetch_dexie_orderbook_standalone,
 )
 from blueprints.offers import _build_fill_history_for_gui  # noqa: E402

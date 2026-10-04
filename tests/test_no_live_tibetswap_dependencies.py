@@ -14,7 +14,6 @@ from blueprints import bot as bot_routes
 from blueprints import boost as boost_routes
 from blueprints import market
 from boost_manager import BoostManager
-from blueprints.smart_defaults import _fetch_price_standalone
 from price_engine import PriceEngine
 
 
@@ -42,12 +41,15 @@ def test_price_engine_is_dexie_only_and_never_calls_retired_provider(monkeypatch
     assert result["arb_opportunity"] is None
 
 
-def test_smart_settings_and_market_collection_have_no_live_tibet_fetch_call():
-    standalone_source = inspect.getsource(_fetch_price_standalone)
+def test_public_price_and_market_collection_have_no_live_tibet_fetch_call():
+    public_price_source = inspect.getsource(market.api_price)
+    startup_price_source = inspect.getsource(market._get_startup_price_cached)
     collection_source = inspect.getsource(market_data_collector.collect_all_market_data)
 
-    assert "api.v2.tibetswap.io" not in standalone_source
-    assert '_record_api_call("tibetswap"' not in standalone_source
+    assert "api.v2.tibetswap.io" not in public_price_source + startup_price_source
+    assert (
+        '_record_api_call("tibetswap"' not in public_price_source + startup_price_source
+    )
     assert "_fetch_tibet_pool(" not in collection_source
     assert "_fetch_tibet_quote(" not in collection_source
     assert '"status": "retired"' in collection_source
