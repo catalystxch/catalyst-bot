@@ -87,6 +87,34 @@ Full native UI, both exact-candidate live wallet lifecycles, both 24-hour
 windows, and final review remain open. PR #220 stays draft; no main merge,
 tag, release, or public-readiness claim.
 
+## Original TEST 7 native desktop UI traversal
+
+The exact `b78ce49` process was rediscovered as PID `83412`; its executable
+path, SHA-256, and exclusive port 5000 ownership matched the package above
+before each native-window interaction. The app's own PyWebView window was
+used. Under the operator's existing testing authorization, the native Risk
+Disclosure was acknowledged. Native startup continued through Sage, skipped
+the optional stopped Splash node, and used the configured Spacescan key. It
+reached Dashboard with a stopped bot and no active Bootstrap campaign.
+
+Read-only native navigation rendered Dashboard, Offers, P&L & Inventory,
+Market Intelligence, Settings, Logs, Data Reset, Help, and About. Offers
+showed no active offers; P&L showed no current fills; Settings displayed
+fingerprint `736588221`; Logs showed Sage login and selection of Monkeyzoo
+Token, wallet `2`; Market Intelligence showed Dexie ready, Splash
+unavailable, Spacescan enabled, and Sage ready. Data Reset was viewed but no
+reset button was pressed. Help and About modals opened and closed. The
+native window was returned to Dashboard. This closes the exact-candidate
+native read-only UI traversal gate. No campaign, fee approval, offer, wallet
+transaction, or data reset was made.
+
+An independent read-only API check after traversal showed the exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+138.470301476875 XCH and 780212.284 MZ, stopped bot, zero open offers,
+inactive Bootstrap, ALLOWED safety, and zero blockers. The optional Splash
+node remained stopped. Live offer lifecycle, both 24-hour windows, and final
+review remain open.
+
 ## Exact-source opt-in Chromium rerun
 
 An additional opt-in Chromium run against source `b78ce49` initially found
