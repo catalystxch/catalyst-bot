@@ -115,6 +115,40 @@ inactive Bootstrap, ALLOWED safety, and zero blockers. The optional Splash
 node remained stopped. Live offer lifecycle, both 24-hour windows, and final
 review remain open.
 
+## Exact-package duplicate launch and same-build native restart
+
+With the original TEST 7 bot stopped, sole PID `83412`, exact EXE path/hash,
+one port 5000 owner, unchanged balances and zero open offers, the same EXE
+was launched a second time. The duplicate PID `48912` exited within the
+bounded wait. PID `83412` remained the only `Catalyst.exe` and port owner;
+the bot stayed stopped, TEST 7 fingerprint `736588221` and MZ wallet `2`
+remained selected, balances were unchanged, Bootstrap remained inactive,
+and runtime safety remained ALLOWED with zero blockers.
+
+The original app then shut down through its native Shutdown dialog with
+"Cancel all offers before shutdown" left unchecked. The port listener
+exited first and the process then exited; both counts reached zero. The
+same hash-verified EXE restarted as sole PID `115676` and sole port 5000
+owner. Its native startup showed Risk Disclosure, Sage wallet selection,
+optional stopped Splash, and configured Spacescan. Risk Disclosure was
+acknowledged under existing testing authorization. The native picker
+displayed TEST 7 fingerprint `736588221` and it was selected. Sage reached
+`ready` with that fingerprint; optional Splash was skipped; configured
+Spacescan continued to Dashboard.
+
+As designed for a stopped fresh session, the Dashboard initially required
+an explicit trading-pair choice. While it was unselected, `/api/status`
+withheld balances as zero despite retaining the configured MZ identity.
+The exact Monkeyzoo Token `MZ_XCH` option was selected in the native UI;
+the original 138.470301476875 XCH and 780212.284 MZ balances then
+returned. A read-only post-selection check found exact asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+wallet ID `2`, fingerprint `736588221`, stopped bot, zero open offers,
+inactive Bootstrap, and ALLOWED safety with zero blockers. No fee approval,
+offer, wallet transaction, or reset was made. This covers stopped-profile
+same-build restart and duplicate ownership; active-offer recovery remains
+unverified.
+
 ## Exact-source opt-in Chromium rerun
 
 An additional opt-in Chromium run against source `b78ce49` initially found
