@@ -41,3 +41,21 @@ target PID exits or after 25 hours. Its first two samples found successive
 lease versions `166526` and `166528`, safety allowed, zero open offers, synced
 Sage, and the backup still running. The trace must be reviewed before any
 24-hour stability claim; starting the sampler does not pass that gate.
+
+At 20:43 UTC the first sampler was stopped after 52 samples because the
+`/api/safety/status` read holds the mutation-gate lock while it reads SQLite;
+ten-second polling could add avoidable contention with lease heartbeats during
+backup load. Those 52 samples had no safety failure, and the maximum observed
+status latency was 1,566 ms. The trace ends with an explicit frequency-change
+record. No CATalyst process was stopped or restarted.
+
+A replacement sampler began at 20:43:23 UTC as hidden PowerShell PID `7880`,
+using one read-only status, health, offer-count and backup-state sample per
+minute. It writes
+`E:\catalyst-stability-monitor-13a842b\trace-60s.jsonl`; its revised script
+SHA-256 is
+`D4E042C7EA9BDAF1067BE3F6F89BEBE32D2003499183FDF04BC1380AEBA2B7FD`.
+The first new sample verified the same exact EXE hash, safety allowed, lease
+version `166581`, bot stopped, Sage synced, zero open offers and backup running.
+Review the complete one-minute trace at the 24-hour gate; the replacement
+monitor itself is not a stability pass.
