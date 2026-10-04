@@ -40,3 +40,10 @@ transactions, inactive campaign, and ALLOWED safety. Sage's 4,095 historical
 offers were all terminal. No wallet financial effect was made. Live wallet
 lifecycle, complete native UI, both 24-hour windows, independent secondary
 acceptance and final review remain open. PR #220 stays draft.
+
+The secondary PC reported independent matching ZIP, installer, EXE and UI
+hashes, 10 passed public-readiness browser tests, and an exact isolated-profile
+package launch with identity-unbound safety denial, clean duplicate exit and
+graceful shutdown. Its original Harvestr profile remained untouched and no
+wallet effect occurred. Secondary full native UI, original-profile live
+lifecycle and 24-hour acceptance remain open.
