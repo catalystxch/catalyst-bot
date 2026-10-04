@@ -123,3 +123,34 @@ allowed, Sage synced, bot stopped and zero open offers. The raw summary is
 `E:\catalyst-stability-monitor-b7eab4f\live-readonly-stress-2026-10-04.json`
 (SHA-256 `647A106E3931DB7530528BEC62C3A304ED2F10675575E166F130231382D663AC`).
 The live profile was not mutated by this read-only stress check.
+
+## Original-profile native read-only UI traversal
+
+The Windows native UI helper subsequently attached to the same exact-hash
+`b7eab4f` process without restarting it. In the visible native window, Sage
+fingerprint `736588221` was selected, optional Splash was skipped, the
+configured Spacescan key was continued, and Monkeyzoo Token (`MZ_XCH`) was
+selected with the native CAT selector. The Dashboard then showed Sage synced,
+the bot stopped, no active Bootstrap campaign, RED expired offer-book
+confidence, and the expected `138.4703` XCH and `780212.284` MZ balances.
+The Dashboard's Start path remained disabled pending setup review.
+
+Native Offers showed zero active buy/sell offers and three historical fills.
+PnL showed three confirmed historical buys, zero sells, three unmatched buy
+legs, and zero realized PnL. Market Intelligence showed Dexie ready, Splash
+unavailable, Sage ready, and RED confidence. Settings Setup displayed the
+selected fingerprint and exact MZ pair; its live safety panel was ALLOWED,
+with zero unresolved operations, reservations and publications and a renewing
+owned lease. Settings Live correctly said the bot must start before controls
+are enabled. Logs backfilled current Sage login, MZ selection and order-book
+events. Data Reset described its three separate confirmation-protected reset
+choices. Help and About opened and closed in the native shell. The app was
+left on Dashboard. No settings were saved, no reset or bot start was invoked,
+and no campaign, fee, offer, or wallet effect occurred.
+
+At the accompanying read-only process check the sole `Catalyst.exe` and port
+5000 owner was still PID `20784` from the clean exact-hash build. The monitor
+remained alive at sample 28 (`2026-10-04T21:33:45Z`): safety allowed, owned
+renewing lease, synced Sage, stopped bot and zero open offers while Windows
+Backup was running. The full 24-hour trace and live financial lifecycle remain
+open; this traversal closes only the native read-only view check.
