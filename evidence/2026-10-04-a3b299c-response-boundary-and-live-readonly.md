@@ -37,6 +37,14 @@ that gate to its footer in the 1000×700 window; the native Splash skip/start
 step and subsequent full interactive UI acceptance remain unverified on a3.
 No API call was used to dismiss the gate.
 
+An independent Chromium check of the exact served page at a 1000×700 viewport
+showed the Splash overlay's `overflow-y: auto`, `clientHeight=700` and
+`scrollHeight=929`. A normal browser wheel event moved `scrollTop` from 0 to
+its 229-pixel maximum and put the Skip button entirely in view. This narrows
+the native obstacle to the computer-control input or its window context; the
+browser rendering itself is scrollable. The separate browser was closed after
+this read-only check.
+
 Read-only live endpoints after Sage connection reported a healthy synced Sage
 wallet, stopped bot, zero consecutive wallet failures, mainnet fingerprint
 `736588221`, CAT wallet ID `2`, and MZ asset
