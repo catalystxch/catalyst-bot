@@ -228,6 +228,7 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
 
     bot = Bot()
     _patch_tier_price_inputs(monkeypatch, price_engine)
+    monkeypatch.setattr(coin_manager.cfg, "BUY_LADDER_REVERSED", False)
     monkeypatch.setattr(api_server, "bot", bot)
     start_cfg = SimpleNamespace(
         CAT_ASSET_ID="asset-id",
@@ -267,6 +268,10 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         "_enforce_post_tibet_start_migration",
         lambda _asset_id: {"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
     )
+
+    assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=False)
+    assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True)
+    price_engine.fresh_calls = 0
 
     client = api_server.app.test_client()
     response = client.post(
