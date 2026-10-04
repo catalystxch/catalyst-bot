@@ -55,6 +55,10 @@ class _BootstrapAuthorityAmbiguous(Exception):
     """More than one active campaign claims the selected asset."""
 
 
+class _BootstrapAuthorityMismatch(Exception):
+    """An active campaign belongs to a different wallet authority."""
+
+
 def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     """Prove legacy open-offer ownership before the first v1.4 bot start.
 
@@ -243,9 +247,8 @@ def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
     Bootstrap offer sizes are derived from the immutable campaign plan, not
     from the mutable legacy Smart Settings tier sizes.  The legacy drift gate
     is therefore inapplicable only after this exact authority check succeeds.
-    No active campaign or an identity mismatch falls back to the legacy gate.
-    Unreadable or ambiguous campaign authority blocks startup before ordinary
-    trading can begin.
+    Only an empty active campaign set falls back to the legacy gate. An
+    unreadable, ambiguous, or mismatched campaign blocks ordinary startup.
     """
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     wallet_id = getattr(cfg_obj, "CAT_WALLET_ID", 0)
@@ -264,17 +267,17 @@ def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
     identity = get_wallet_identity()
 
     if type(identity) is not dict or identity.get("success") is not True:
-        return None
+        raise _BootstrapAuthorityMismatch
     if str(identity.get("backend") or "").strip().lower() != "sage":
-        return None
+        raise _BootstrapAuthorityMismatch
     if identity.get("has_secrets") is not True:
-        return None
+        raise _BootstrapAuthorityMismatch
 
     network = str(identity.get("network_id") or "").strip().lower()
     if network.startswith("testnet"):
         network = "testnet"
     elif network != "mainnet":
-        return None
+        raise _BootstrapAuthorityMismatch
 
     if all(
         (
@@ -287,7 +290,7 @@ def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
         )
     ):
         return campaign
-    return None
+    raise _BootstrapAuthorityMismatch
 
 
 def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
@@ -773,6 +776,19 @@ def api_bot_start():
                 "success": False,
                 "status": "error",
                 "reason": "BOOTSTRAP_AUTHORITY_AMBIGUOUS",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 409
+    except _BootstrapAuthorityMismatch:
+        error = "Active Bootstrap campaign belongs to another wallet; bot start blocked"
+        log_event("error", "bootstrap_authority_mismatch", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_MISMATCH",
                 "error": error,
                 "errors": [error],
                 "warnings": warnings,

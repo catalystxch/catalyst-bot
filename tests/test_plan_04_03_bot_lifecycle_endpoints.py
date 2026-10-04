@@ -1033,6 +1033,38 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.get_json().get("reason"), "BOOTSTRAP_AUTHORITY_AMBIGUOUS")
         bot.start.assert_not_called()
 
+    def test_start_blocks_when_active_campaign_belongs_to_another_wallet(self):
+        """An active campaign for this asset cannot become ordinary Follow authority."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        bot = _make_bot(running=False)
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": 987654321,
+            "wallet_id": 2,
+            "status": "active",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "database.list_active_bootstrap_campaigns_for_asset",
+                return_value=[campaign],
+            ),
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "BOOTSTRAP_AUTHORITY_MISMATCH")
+        bot.start.assert_not_called()
+
     def test_resume_existing_bootstrap_offers_can_start_when_exact_book_is_proven(self):
         """Recovered live offers replace free-coin readiness only with exact proof."""
         fake_cfg = _fake_cfg()
@@ -1165,7 +1197,7 @@ class TestBotStart(_FlaskBase):
         resume_readiness.assert_not_called()
         bot.start.assert_not_called()
 
-    def test_mismatched_bootstrap_identity_keeps_legacy_tier_drift_gate(self):
+    def test_mismatched_bootstrap_identity_blocks_before_legacy_tier_drift(self):
         fake_cfg = _fake_cfg()
         fake_cfg.CAT_WALLET_ID = 2
         bot = _make_bot(running=False)
@@ -1205,11 +1237,9 @@ class TestBotStart(_FlaskBase):
         ):
             resp = self._post("/api/bot/start")
 
-        self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.get_json().get("reason"), "tier_size_drift")
-        drift_check.assert_called_once_with(
-            low_ratio=0.50, high_ratio=2.00, min_sample=2, strict=True
-        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "BOOTSTRAP_AUTHORITY_MISMATCH")
+        drift_check.assert_not_called()
         bot.start.assert_not_called()
 
     def test_failed_coin_prep_blocks_start(self):
