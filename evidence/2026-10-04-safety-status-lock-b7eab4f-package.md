@@ -110,3 +110,16 @@ The primary read-only 60-second monitor was still alive at sample 9 on
 2026-10-04T21:14:27Z: safety allowed, bot stopped, zero open offers, Sage
 synced, lease owned and renewing while Windows Backup remained running. This
 is an observation in progress, not a completed 24-hour stability window.
+
+## Original-profile concurrent read-only safety check
+
+While the exact original-profile process and Windows Backup were running,
+20 concurrent `GET /api/safety/status` calls all returned HTTP 200, safety
+allowed and the lease owned by this run. None failed; response times ranged
+from 992 to 1451 ms (mean 1185.5 ms). A subsequent safety read retained an
+active, owned lease at version `166811` and zero blockers. The monitor's next
+60-second sample at 2026-10-04T21:22:34Z recorded version `166814`, safety
+allowed, Sage synced, bot stopped and zero open offers. The raw summary is
+`E:\catalyst-stability-monitor-b7eab4f\live-readonly-stress-2026-10-04.json`
+(SHA-256 `647A106E3931DB7530528BEC62C3A304ED2F10675575E166F130231382D663AC`).
+The live profile was not mutated by this read-only stress check.
