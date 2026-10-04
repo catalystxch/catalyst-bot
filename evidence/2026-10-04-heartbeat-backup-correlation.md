@@ -16,10 +16,14 @@ The backup and snapshot overlap the lease interruption and Sage timeouts. They
 are a plausible shared load source, **not a proven cause**: no event or trace
 yet attributes the missed heartbeat to VSS, SQLite, Sage, or process scheduling.
 
-The current exact `13a842b` app remained safety-allowed at 20:26 UTC with a
-renewing 30-second lease (version 166477, expiry 20:26:25.939908 UTC), bot
-stopped, inactive Bootstrap, and zero open offers. Keep its original-profile
-24-hour observation running through the next scheduled backup; record lease
-version/expiry, safety state, process identity, wallet identity, offers, and
-Sage health around that time. A recurrence requires root-cause analysis before
-public readiness. No backup settings or wallet state were changed here.
+The current exact `13a842b` app remained safety-allowed at 20:28 UTC with a
+renewing 30-second lease (version 166494, expiry 20:29:16.126754 UTC), bot
+stopped, inactive Bootstrap, and zero open offers. Windows Task Scheduler still
+reported `AutomaticBackup` running at that time; its last start was 19:00
+local and its next scheduled start is **11 October at 19:00 local**. Thus the
+new process has stayed live during the ongoing backup, but its current 24-hour
+window will not include a second scheduled backup start. Continue the live
+stability observation and record lease version/expiry, safety state, process
+identity, wallet identity, offers, and Sage health. A recurrence requires
+root-cause analysis before public readiness. No backup settings or wallet
+state were changed here.
