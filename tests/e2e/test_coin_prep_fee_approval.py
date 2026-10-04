@@ -116,7 +116,8 @@ def test_zero_headroom_wallet_verification_uses_unpadded_coin_size(page):
         """async () => {
             let seen = null;
             window.apiFetch = async path => {
-                seen = String(path);
+                // Startup requests can interleave with this awaited probe.
+                if (String(path).includes('/coin-prep/verify?')) seen = String(path);
                 return new Response(JSON.stringify({all_sufficient: true, balance_sufficient: true}), {status: 200});
             };
             await checkIfCoinPrepNeeded({
@@ -783,11 +784,15 @@ def test_operator_cap_below_displayed_plan_fails_closed_before_approval(page):
         """async preview => {
             window.__feeCalls = [];
             window.apiFetch = async path => {
-                window.__feeCalls.push(String(path));
+                // Ignore unrelated background startup polling.
+                if (String(path).includes('/coin-prep/')) window.__feeCalls.push(String(path));
                 if (String(path).includes('/coin-prep/fee-preview')) {
                     return new Response(JSON.stringify(preview), {status: 200});
                 }
-                throw new Error(`Approval must remain blocked: ${path}`);
+                if (String(path).includes('/coin-prep/')) {
+                    throw new Error(`Approval must remain blocked: ${path}`);
+                }
+                return new Response(JSON.stringify({success: true}), {status: 200});
             };
             await refreshCoinPrepFeePreview({coin_multiplier: '1'});
             const input = document.getElementById('cpFeeMaximumInput');
