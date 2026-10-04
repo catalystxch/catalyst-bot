@@ -23,9 +23,18 @@ Sage RPC, and interrupted-publication recovery smokes. A unique-AppId
 current-user QA installer passed clean installation, installed EXE hash and
 API smoke, and uninstall. The QA directory and registry entry were absent
 afterward. Defender custom scans of the bundle, ZIP, and unsigned installer
-returned no matching detections.
+returned no matching detections. All 11 exact-source PR checks passed.
+Independent HTTP downloads of the pinned ZIP and installer matched the table
+hashes.
 
-At this package checkpoint, PR CI, independent HTTP download verification,
-original TEST 7 profile startup, secondary-PC acceptance, live offer lifecycle,
-complete native UI, both 24-hour windows, and final review remain open.
-PR #220 remains draft.
+The previous stopped `61a18d6` app shut down through its visible UI with
+offer cancellation unchecked. The exact `eb8df03` EXE started against the
+original TEST 7 profile as the sole process and port 5000 owner. Browser UI
+startup selected Sage fingerprint `736588221` and MZ/XCH. Read-only checks
+found mainnet, CAT wallet ID `2`, exact MZ asset, stopped bot, unchanged
+balances, zero open offers, ALLOWED safety and zero blockers. Doctor's API and
+visible Logs modal returned nine passes, one expected Splash warning, and the
+bounded message `Splash unreachable`. No wallet financial effect occurred.
+
+Secondary-PC acceptance, live offer lifecycle, complete native UI, both
+24-hour windows, and final review remain open. PR #220 remains draft.
