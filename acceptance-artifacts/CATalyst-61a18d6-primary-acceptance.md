@@ -17,8 +17,11 @@ the full Chromium suite passed 211 tests. The 192-entry ZIP passed CRC and
 extracted API. The bundle passed packaged API, synthetic Sage RPC,
 publication recovery, and native clean, duplicate, persisted and safety
 smokes. A unique-AppId current-user QA installer passed clean install,
-installed EXE hash/API/Sage, same-version reinstall and uninstall. Its QA
-directory and registration were absent afterward. Defender custom scans
+installed EXE hash/API/Sage, same-version reinstall and uninstall. A second
+unique-AppId QA install passed prior `a3b299c` install, in-place upgrade to
+`61a18d6`, rollback, restore and uninstall, with installed EXE hashes matched
+at every step. Both QA directories and registrations were absent afterward.
+The original TEST 7 process remained untouched. Defender custom scans
 reported no matching detections. Independent HTTP downloads of the pinned
 ZIP and installer matched the table hashes. All 11 exact-source PR checks
 passed, including `unit-tests`.
@@ -29,8 +32,8 @@ sole port 5000 owner; its process path and SHA-256 matched this package.
 Browser UI startup acknowledged Risk Disclosure under the operator's testing
 authorization, selected Sage fingerprint `736588221`, and completed optional
 Splash and Spacescan gates. The native window displayed Risk Disclosure, but
-computer-use clicks did not activate its Continue control, so full native UI
-acceptance remains open. The browser selected MZ/XCH and read-only checks
+computer-use clicks or Tab input did not activate its Continue control, so
+full native UI acceptance remains open. The browser selected MZ/XCH and read-only checks
 found mainnet, CAT wallet ID `2`, the exact MZ asset, synced wallet, stopped
 bot, XCH `138.470301476875`, MZ `780212.284`, zero open offers and pending
 transactions, inactive campaign, and ALLOWED safety. Sage's 4,095 historical
