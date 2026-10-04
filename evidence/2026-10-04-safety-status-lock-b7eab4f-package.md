@@ -74,3 +74,39 @@ Its script is `E:\catalyst-stability-monitor-b7eab4f\monitor.ps1`, SHA-256
 and its trace is `trace-60s.jsonl`. The initial sample passed. The complete
 24-hour trace, live wallet lifecycle, independent secondary acceptance and
 final review remain open. PR #220 stays draft; public readiness is not claimed.
+
+## Exact-package read-only UI and independent secondary check
+
+The exact `b7eab4f` process remained PID `20784`, the sole `127.0.0.1:5000`
+listener, with EXE SHA-256
+`9EB27A8DFCB15B026318F75B797B6FAD628A9D46AB44DFC49C9CE2F9AACF3C8A`.
+Its browser UI on the original TEST 7 profile rendered Dashboard, Offers,
+P&L, Market Intelligence, Settings Setup/Live, Logs, Data Reset, Help and
+About. The Dashboard showed a stopped bot and inactive Bootstrap. Offers
+showed zero active and three historical fills; P&L showed three confirmed
+historical buys, zero sells and zero realized P&L. After refresh, Market
+Intelligence showed three Dexie bids and 29 asks, matching the read-only API
+order book. No setting, reset, campaign, fee, offer or wallet mutation was
+made. Logs backfilled Sage login, MZ selection and order-book refresh. The
+on-demand Doctor passed nine checks with one expected warning for the stopped
+optional Splash daemon; Sage RPC, signing, sync, CAT identity, Dexie, database
+and Spacescan configuration passed. Native UI control remains separately open
+because the Windows UI helper lost activation of the window.
+
+The independent secondary PC checked the exact source and pinned ZIP,
+installer, EXE and UI hashes. Eight focused mutation-lock/heartbeat tests and
+26 safety API/diagnostic tests passed. In a new isolated profile its package
+started with one port owner; 20 concurrent safety-status calls all denied as
+expected with no failures (maximum 302 ms), a duplicate launch exited, and
+graceful shutdown left no process or listener. The isolated database had zero
+offers, campaigns, Coin Prep operations, approvals, journals and effect claims.
+Its original Harvestr profile was untouched and no wallet action occurred.
+The secondary report is
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\2026-10-04-pr220-secondary-b7eab4f.md`.
+This passes the delegated isolated secondary scope; a secondary original-profile
+live lifecycle has not been run.
+
+The primary read-only 60-second monitor was still alive at sample 9 on
+2026-10-04T21:14:27Z: safety allowed, bot stopped, zero open offers, Sage
+synced, lease owned and renewing while Windows Backup remained running. This
+is an observation in progress, not a completed 24-hour stability window.
