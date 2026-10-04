@@ -37453,15 +37453,18 @@ function startupShowRiskDisclosure() {
 
 document.addEventListener('keydown', (event) => {
     if (event.key !== 'Tab') return;
-    const overlay = document.getElementById('startupOverlay');
-    if (!overlay || overlay.classList.contains('hidden')
-        || getComputedStyle(overlay).display === 'none') return;
+    const overlay = ['startupOverlay', 'spacescanGateOverlay', 'splashGateOverlay']
+        .map(id => document.getElementById(id))
+        .find(element => element && !element.classList.contains('hidden')
+            && getComputedStyle(element).display !== 'none');
+    if (!overlay) return;
 
-    // Startup has several phases. Trap only the controls visible in the
-    // current phase, including links shown for wallet setup and recovery.
+    // Keep keyboard focus inside the visible startup or service setup gate.
+    // Startup has several phases, so include only currently visible controls.
     const focusable = Array.from(overlay.querySelectorAll(
         'button:not([disabled]), a[href], input:not([disabled]):not([type="hidden"]), '
-        + 'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        + 'select:not([disabled]), textarea:not([disabled]), summary, '
+        + '[tabindex]:not([tabindex="-1"])'
     )).filter(element => element.getClientRects().length
         && getComputedStyle(element).visibility !== 'hidden');
     const first = focusable[0];

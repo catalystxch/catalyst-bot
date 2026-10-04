@@ -253,3 +253,44 @@ def test_startup_wallet_choice_keeps_keyboard_focus_inside(page):
     first.focus()
     page.keyboard.press("Shift+Tab")
     assert last.evaluate("element => document.activeElement === element")
+
+    page.get_by_role("button", name="Dashboard").focus()
+    page.keyboard.press("Tab")
+    assert first.evaluate("element => document.activeElement === element")
+
+
+@pytest.mark.parametrize("gate_id", ["splashGateOverlay", "spacescanGateOverlay"])
+def test_service_gate_keeps_keyboard_focus_inside(page, gate_id):
+    """Setup gates must not let Tab reach controls behind the overlay."""
+    _open_gui(page)
+    page.evaluate(
+        """gateId => {
+            const startup = document.getElementById('startupOverlay');
+            startup.classList.add('hidden');
+            startup.style.display = 'none';
+            const gate = document.getElementById(gateId);
+            gate.style.display = 'flex';
+            gate.classList.add('active');
+            if (gateId === 'splashGateOverlay') {
+                document.getElementById('splashGateStartSection').style.display = 'block';
+            }
+        }""",
+        gate_id,
+    )
+    gate = page.locator(f"#{gate_id}")
+    controls = gate.locator(
+        "a[href]:visible, button:not([disabled]):visible, input:not([disabled]):visible"
+    )
+    first, last = controls.first, controls.last
+
+    last.focus()
+    page.keyboard.press("Tab")
+    assert first.evaluate("element => document.activeElement === element")
+
+    first.focus()
+    page.keyboard.press("Shift+Tab")
+    assert last.evaluate("element => document.activeElement === element")
+
+    page.get_by_role("button", name="Dashboard").focus()
+    page.keyboard.press("Tab")
+    assert first.evaluate("element => document.activeElement === element")
