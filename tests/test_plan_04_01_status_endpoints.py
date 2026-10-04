@@ -889,7 +889,12 @@ class TestStatusEndpointSmoke(_FlaskBase):
         )
         response = Mock(status_code=200)
         response.json.return_value = [
-            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+            {
+                "ticker_id": "MZ_XCH",
+                "base_id": "cold-start-cat",
+                "bid": "0.00007",
+                "ask": "0.00009",
+            }
         ]
         with (
             patch.object(api_server, "bot", stopped_bot),
@@ -925,7 +930,12 @@ class TestStatusEndpointSmoke(_FlaskBase):
         )
         response = Mock(status_code=200)
         response.json.return_value = [
-            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+            {
+                "ticker_id": "MZ_XCH",
+                "base_id": "stale-cat",
+                "bid": "0.00007",
+                "ask": "0.00009",
+            }
         ]
         with (
             patch.object(api_server, "bot", stopped_bot),

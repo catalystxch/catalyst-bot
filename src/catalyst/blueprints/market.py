@@ -127,7 +127,8 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                     row_asset = (
                         str(row.get("base_id") or "").strip().lower().removeprefix("0x")
                     )
-                    if row_asset and row_asset != asset:
+                    # A ticker symbol alone does not prove which CAT issued it.
+                    if row_asset != asset:
                         continue
                     bid = Decimal(str(row.get("bid") or row.get("best_bid") or 0))
                     ask = Decimal(str(row.get("ask") or row.get("best_ask") or 0))
