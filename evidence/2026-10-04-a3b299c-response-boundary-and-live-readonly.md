@@ -45,6 +45,21 @@ the native obstacle to the computer-control input or its window context; the
 browser rendering itself is scrollable. The separate browser was closed after
 this read-only check.
 
+A separate browser session connected to the same stopped exact a3 app and
+selected the already-bound MZ/XCH pair. The Dashboard showed TEST 7 fingerprint
+`736588221`, Sage synced, Follow mode, no active Bootstrap campaign, and a
+disabled Start Bot control pending setup review. The Offers view showed zero
+active buy/sell offers and zero pending cancels; its History view showed the
+three previously confirmed MZ buys. P&L rendered confirmed-evidence totals,
+and Market Intelligence rendered RED confidence with Splash unavailable. In
+Settings, Follow remained selected and the Coin Prep summary reflected Follow
+settings. No Save, Start, Stop, Cancel or campaign control was used. After the
+browser was closed, read-only app and Sage checks again showed unchanged
+balances, zero pending and fillable offers, inactive Bootstrap, stopped bot,
+synced wallet and ALLOWED safety with zero blockers. This passes browser-based
+live read-only traversal of the exact app; the native Splash and full native
+UI gates remain open.
+
 Read-only live endpoints after Sage connection reported a healthy synced Sage
 wallet, stopped bot, zero consecutive wallet failures, mainnet fingerprint
 `736588221`, CAT wallet ID `2`, and MZ asset
