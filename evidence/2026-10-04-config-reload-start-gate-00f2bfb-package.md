@@ -80,7 +80,9 @@ Sage phase `ready`, fingerprint `736588221`, healthy synced wallet, mainnet,
 CAT wallet ID `2`, exact MZ asset
 `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
 138.470301476875 XCH and 780212.284 MZ, bot stopped, zero open offers,
-inactive Bootstrap, and runtime safety allowed with zero blockers. The
+inactive Bootstrap, and runtime safety allowed with zero blockers. An
+independent read-only wallet facade call found zero pending Sage transactions
+and the same fingerprint. The
 previous package's balances were identical. No campaign, fee approval,
 offer, transaction, or other wallet financial effect was made by this
 restart. The injected config-reload failure path was verified in isolated
