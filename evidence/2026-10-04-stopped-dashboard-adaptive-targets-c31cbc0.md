@@ -137,7 +137,8 @@ downloads of the pinned ZIP and unsigned installer matched their hashes.
 
 Artifacts are pinned at `2fd758a877645487df905c62354266a9c7148829`.
 All 11 PR checks passed on exact source `6191cf4`, including unit tests. The
-full local Windows backend suite is still running at the time of this note.
+full local Windows backend suite exited zero with 7,166 passed, 210 skipped,
+and 427 subtests passed in 2,124.72 seconds.
 
 The prior app was shut down through its native UI with no offers to cancel.
 The exact `6191cf4` EXE became the sole `Catalyst.exe` process and port 5000
