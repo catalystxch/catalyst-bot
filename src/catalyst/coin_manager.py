@@ -1242,6 +1242,7 @@ def check_tier_size_drift_standalone(
     min_sample: int = 2,
     *,
     allow_fresh_price: bool = True,
+    strict: bool = False,
 ) -> List[Dict]:
     """Module-level mirror of CoinManager.check_tier_size_drift.
 
@@ -1258,6 +1259,9 @@ def check_tier_size_drift_standalone(
     ``allow_fresh_price=False`` keeps frequent status callers local. When no
     authoritative CAT price is already cached, CAT drift is omitted instead
     of performing network I/O or comparing against a fabricated price.
+
+    ``strict=True`` is for the bot-start gate: an unreadable tier target or
+    designation cannot be interpreted as a clean coin book.
     """
     from database import get_coins_by_designation
 
@@ -1274,8 +1278,12 @@ def check_tier_size_drift_standalone(
                     is_cat=is_cat, allow_fresh_price=False
                 )
         except Exception:
+            if strict:
+                raise RuntimeError("Tier target sizes unavailable") from None
             continue
         if not live_sizes:
+            if strict:
+                raise RuntimeError("Tier target sizes unavailable")
             continue
         for tier_name in ("inner", "mid", "outer", "extreme"):
             live_size = int(live_sizes.get(tier_name, 0) or 0)
@@ -1284,6 +1292,8 @@ def check_tier_size_drift_standalone(
             try:
                 coins = get_coins_by_designation(wallet_type, "tier_spare", tier_name)
             except Exception:
+                if strict:
+                    raise RuntimeError("Tier coin designations unavailable") from None
                 continue
             amounts = sorted(
                 int(c.get("amount_mojos") or 0)

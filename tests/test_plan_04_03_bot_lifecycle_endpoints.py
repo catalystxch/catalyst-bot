@@ -822,6 +822,54 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(body.get("tier_size_drift"), drift)
         bot.start.assert_not_called()
 
+    def test_tier_size_drift_check_error_blocks_start(self):
+        """Unreadable coin designations cannot be treated as drift-free."""
+        fake_cfg = _fake_cfg()
+        bot = _make_bot(running=False)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "coin_manager.check_tier_size_drift_standalone",
+                side_effect=RuntimeError("private-wallet-detail"),
+            ),
+            patch("blueprints.bot.log_event") as events,
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertTrue(body.get("needs_coin_prep"))
+        self.assertEqual(body.get("reason"), "tier_size_drift_check_failed")
+        self.assertNotIn("private-wallet-detail", str(body))
+        self.assertNotIn("private-wallet-detail", str(events.call_args_list))
+        bot.start.assert_not_called()
+
+    def test_coin_prep_state_check_error_blocks_start(self):
+        """An unreadable preparation state cannot authorize new offers."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.ENABLE_COIN_PREP = True
+        bot = _make_bot(running=False)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(api_server, "_coin_prep_state", object()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.get_json()
+        self.assertTrue(body.get("needs_coin_prep"))
+        self.assertEqual(body.get("reason"), "coin_prep_gate_check_failed")
+        bot.start.assert_not_called()
+
     def test_exact_active_bootstrap_prep_bypasses_legacy_tier_size_drift(self):
         """Bootstrap coins are campaign-bound, not Smart Settings tier-bound."""
         fake_cfg = _fake_cfg()
@@ -1110,7 +1158,7 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(resp.get_json().get("reason"), "tier_size_drift")
         drift_check.assert_called_once_with(
-            low_ratio=0.50, high_ratio=2.00, min_sample=2
+            low_ratio=0.50, high_ratio=2.00, min_sample=2, strict=True
         )
         bot.start.assert_not_called()
 

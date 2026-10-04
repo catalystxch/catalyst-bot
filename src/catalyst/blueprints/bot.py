@@ -821,7 +821,7 @@ def api_bot_start():
 
             _drift = (
                 check_tier_size_drift_standalone(
-                    low_ratio=0.50, high_ratio=2.00, min_sample=2
+                    low_ratio=0.50, high_ratio=2.00, min_sample=2, strict=True
                 )
                 or []
             )
@@ -838,13 +838,19 @@ def api_bot_start():
                     "re-run Coin Prep before starting. Drift: " + _summary
                 )
                 coin_prep_error = errors[-1]
-        except Exception as _drift_err:
-            log_event(
-                "warning",
-                "tier_drift_gate_failed",
-                f"Tier-drift gate skipped: {_drift_err}",
+        except Exception:
+            needs_coin_prep = True
+            coin_prep_reason = "tier_size_drift_check_failed"
+            coin_prep_error = (
+                "Coin tier sizes could not be verified — retry Coin Prep "
+                "before starting the bot"
             )
-            warnings.append("Tier-drift gate skipped - check logs before trading")
+            errors.append(coin_prep_error)
+            log_event(
+                "error",
+                "tier_drift_gate_failed",
+                "Coin tier-size verification failed; bot start blocked",
+            )
 
     if getattr(cfg, "ENABLE_COIN_PREP", False):
         try:
@@ -871,13 +877,18 @@ def api_bot_start():
                     "Coin Prep failed - rerun Coin Prep before starting the bot"
                 )
                 errors.append(coin_prep_error)
-        except Exception as _prep_gate_err:
-            log_event(
-                "warning",
-                "coin_prep_gate_check_failed",
-                f"Coin-prep gate check failed: {_prep_gate_err}",
+        except Exception:
+            needs_coin_prep = True
+            coin_prep_reason = "coin_prep_gate_check_failed"
+            coin_prep_error = (
+                "Coin Prep state could not be verified — retry before starting the bot"
             )
-            warnings.append("Coin-prep gate skipped - check logs before trading")
+            errors.append(coin_prep_error)
+            log_event(
+                "error",
+                "coin_prep_gate_check_failed",
+                "Coin Prep state verification failed; bot start blocked",
+            )
 
     # Give API/AppBridge callers an early, stable identity error after cheap
     # validation but before the bot starts orchestration. Every adapter effect
