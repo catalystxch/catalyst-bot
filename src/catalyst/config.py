@@ -193,9 +193,7 @@ def _safe_url(key: str, default: str) -> str:
     if val:
         parsed = urlparse(val)
         if parsed.scheme not in ("http", "https"):
-            print(
-                f"[CONFIG] WARNING: {key} has invalid scheme '{parsed.scheme}' — using default"
-            )
+            print(f"[CONFIG] WARNING: {key} has an invalid URL scheme — using default")
             return default
     return val
 

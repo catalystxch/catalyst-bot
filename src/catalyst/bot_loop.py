@@ -5810,12 +5810,16 @@ class BotLoop:
                     running=False, status="blocked", preflight=preflight.to_dict()
                 )
                 return False
-        except Exception as e:
-            # Preflight failure should not block startup — fall through
-            # to the legacy watch-only check below.
+        except Exception:
             log_event(
-                "warning", "preflight_error", f"Preflight could not run: {str(e)[:160]}"
+                "error", "preflight_error", "Preflight could not run; bot start blocked"
             )
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Preflight could not run",
+            )
+            return False
 
         # Legacy watch-only guard — kept as fallback in case preflight
         # import fails or is incomplete. The preflight system checks this
@@ -5845,12 +5849,18 @@ class BotLoop:
                     )
                     self._set_state(running=False, status="blocked")
                     return False
-        except Exception as e:
+        except Exception:
             log_event(
-                "warning",
+                "error",
                 "bot_start_signing_check_failed",
-                f"Could not verify Sage signing capability before start: {str(e)[:160]}",
+                "Could not verify Sage signing capability; bot start blocked",
             )
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Could not verify wallet signing capability",
+            )
+            return False
 
         self._watcher_stop_event.clear()
         self._running = True

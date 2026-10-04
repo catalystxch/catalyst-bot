@@ -13,6 +13,7 @@ from doctor import (
     _check_cat_config,
     _check_dexie_reachable,
     _check_splash_reachable,
+    _check_wallet_can_sign,
 )
 
 
@@ -196,6 +197,15 @@ class TestDoctorNetworkFailures(unittest.TestCase):
 
 
 class TestDoctorWalletOutage(unittest.TestCase):
+    @patch(
+        "wallet_sage._require_signing_capability",
+        side_effect=RuntimeError("key read failed"),
+    )
+    def test_signing_probe_error_blocks_start(self, _mock_signing):
+        check = _check_wallet_can_sign({"reachable": True, "_wallet_type": "sage"})
+        self.assertEqual(check.status, "fail")
+        self.assertFalse(DoctorReport(checks=[check]).can_start)
+
     def test_cat_mapping_is_skipped_when_wallet_is_unreachable(self):
         fallback_asset_id = "abc123"
         mock_get_wallets = MagicMock(return_value=[{"asset_id": fallback_asset_id}])

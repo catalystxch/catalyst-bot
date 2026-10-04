@@ -447,9 +447,9 @@ def _check_wallet_can_sign(sync_result: dict = None) -> DoctorCheck:
         return DoctorCheck(
             name="wallet_signing",
             category="wallet",
-            status="warn",
+            status="fail",
             message="Signing capability check failed",
-            severity="warning",
+            severity="error",
         )
 
 
