@@ -78,3 +78,26 @@ windows, and final review remain open. The secondary host independently
 checked this exact source and package in isolated mode; its original-profile
 and native UI gates remain open. Keep PR #220 draft; no main merge, tag,
 release, or public-readiness claim.
+
+## Additional live browser UI and Doctor check
+
+On 2026-10-04, a fresh Chromium session connected to the same exact a3
+process on `127.0.0.1:5000`. The Logs tab backfilled startup, wallet
+selection, CAT discovery, pair-selection, and Dexie refresh events. The live
+Doctor completed in 16.6 seconds with nine passing checks and one warning:
+the optional local Splash daemon was not running. The nine passing checks
+covered database, configuration, exact CAT identity, wallet reachability,
+wallet sync, signing ability, CAT wallet mapping, Dexie reachability, and
+Spacescan setup. TibetSwap was explicitly reported as retired.
+
+Data Reset, Help, and About rendered in the same session. Data Reset exposed
+three separate confirmation-gated actions; none was used. Help displayed the
+current Sage/Dexie/Splash authority and Bootstrap workflow. About reported
+CATalyst v1.4.0. No reset, configuration save, campaign, bot, offer, or wallet
+action was taken. The browser session was closed. An immediate read-only
+post-check still showed a stopped bot, healthy synced wallet, TEST 7
+fingerprint `736588221`, the exact MZ asset, spendable balances of
+138.470301476875 XCH and 780212.284 MZ, zero open offers, no active
+campaign, and runtime safety ALLOWED with zero blockers. This completes the
+read-only browser tab traversal on the exact live package, but does not
+substitute for native UI control or a live trading lifecycle.
