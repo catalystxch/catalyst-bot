@@ -254,6 +254,7 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
 
     with (
         api_mutations_permitted(api_server),
+        patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch.object(
             bot_routes,
             "_enforce_post_tibet_start_migration",
@@ -298,6 +299,7 @@ def test_bot_start_coin_prep_gate_hides_worker_exception_details(monkeypatch):
     }
     with (
         api_mutations_permitted(api_server),
+        patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch(
             "wallet.get_wallet_sync_status",
             return_value={"reachable": True, "sync_state": "synced"},
