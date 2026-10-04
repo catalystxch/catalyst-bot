@@ -77,3 +77,16 @@ The live wallet lifecycle, active-offer recovery, both 24-hour windows,
 secondary acceptance and final review remain open. A new campaign and fee
 scope are awaiting separate operator approval. PR #220 stays draft; this is
 not a public-readiness claim.
+
+At 19:16–19:18 UTC, the exact packaged native window was traversed without
+mutation across Dashboard, Offers, P&L, Market Intel, Settings, Logs, Data
+Reset, Help, and About. Offers showed zero active buy/sell rows and three
+historical confirmed buys. P&L showed those three verified fills and zero
+pending verification. Market Intel correctly showed RED confidence with no
+attributable tradable depth; Settings showed the selected fingerprint and
+runtime safety ALLOWED. Logs backfilled the current Sage startup, TEST 7
+selection, MZ pair switch, and later order-book refresh. Reset controls were
+only observed, not activated. A follow-up check still found a stopped bot,
+no active campaign, zero open offers, zero Sage pending transactions,
+unchanged balances, and safety ALLOWED. This covers read-only tab rendering
+and live log backfill; interactive wallet/offer flows remain open.
