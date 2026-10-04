@@ -780,6 +780,12 @@ def api_bootstrap_stop():
                 )
             ):
                 raise BootstrapApiError("bootstrap_cancel_result_unresolved", 503)
+            # The manager's result can include internal diagnostics. Only the
+            # cancellation outcome is needed by this public response.
+            public_cancel_results = {
+                trade_id: {"outcome": safe_cancel_results[trade_id]["outcome"]}
+                for trade_id in trade_ids
+            }
         except Exception as exc:
             no_effect_refusals = {
                 "FEE_APPROVAL_STALE",
@@ -918,7 +924,7 @@ def api_bootstrap_stop():
                 "campaign_id": campaign_id,
                 "stopped": True,
                 "cancel_targets": len(trade_ids),
-                "cancel_results": safe_cancel_results,
+                "cancel_results": public_cancel_results,
             }
         )
     except Exception as exc:
