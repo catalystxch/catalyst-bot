@@ -27,3 +27,17 @@ stability observation and record lease version/expiry, safety state, process
 identity, wallet identity, offers, and Sage health. A recurrence requires
 root-cause analysis before public readiness. No backup settings or wallet
 state were changed here.
+
+At 20:34 UTC a read-only 10-second stability sampler started as hidden
+PowerShell PID `148212`. It verified the exact Catalyst PID `147840` and EXE
+SHA-256 before writing to
+`E:\catalyst-stability-monitor-13a842b\trace.jsonl`. The sampler script is
+`E:\catalyst-stability-monitor-13a842b\monitor.ps1` (SHA-256
+`31036BBE7F4C3C4A622F90C2F59939BB9F755CCC2EF4985FFE390FE298F19BB0`).
+It reads only loopback safety status every 10 seconds and reads health,
+open-offer count, and Windows Backup task state every minute. It logs UTC
+timestamps, request latency, lease version/expiry and errors, and stops if the
+target PID exits or after 25 hours. Its first two samples found successive
+lease versions `166526` and `166528`, safety allowed, zero open offers, synced
+Sage, and the backup still running. The trace must be reviewed before any
+24-hour stability claim; starting the sampler does not pass that gate.
