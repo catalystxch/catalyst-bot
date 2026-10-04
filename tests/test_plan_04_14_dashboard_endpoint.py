@@ -113,6 +113,15 @@ class _FlaskBase(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestDashboard(_FlaskBase):
+    def test_stopped_live_read_guard_does_not_build_full_bot_state(self):
+        stopped_bot = types.SimpleNamespace(
+            is_running=lambda: False,
+            get_state=MagicMock(side_effect=AssertionError("full state is slow")),
+        )
+
+        self.assertFalse(dashboard_bp._live_wallet_reads_allowed(stopped_bot))
+        stopped_bot.get_state.assert_not_called()
+
     def test_returns_200(self):
         resp = self._get_dashboard()
         self.assertEqual(resp.status_code, 200)

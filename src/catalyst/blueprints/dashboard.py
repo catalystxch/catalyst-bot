@@ -26,18 +26,21 @@ def _live_wallet_reads_allowed(bot_obj=None) -> bool:
     """Dashboard live RPC is only allowed during an active bot run."""
     if bot_obj is None:
         return False
-    state_running = False
-    try:
-        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
-        state_running = bool((state or {}).get("running", False))
-    except Exception:
-        state_running = False
     try:
         method_running = (
             bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
         )
     except Exception:
         method_running = False
+    if not method_running:
+        # get_state() assembles a full diagnostics snapshot, including Splash
+        # connectivity checks. Stopped dashboard polling needs no such probe.
+        return False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
     return bool(state_running and method_running)
 
 
