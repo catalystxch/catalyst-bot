@@ -20,11 +20,20 @@ smokes. A unique-AppId current-user QA installer passed clean install,
 installed EXE hash/API/Sage, same-version reinstall and uninstall. Its QA
 directory and registration were absent afterward. Defender custom scans
 reported no matching detections. Independent HTTP downloads of the pinned
-ZIP and installer matched the table hashes. Exact-source PR CI was still
-running when this manifest was written.
+ZIP and installer matched the table hashes. All 11 exact-source PR checks
+passed, including `unit-tests`.
 
-The original TEST 7 app remains the older stopped `a3b299c` package. This
-new package has not run against the original live profile. No wallet effect
-was made. Live wallet lifecycle, complete native UI, both 24-hour windows,
-independent secondary acceptance and final review remain open. PR #220 stays
-draft.
+The stopped `a3b299c` process exited through the visible shutdown UI. The
+exact `61a18d6` EXE then started against the original TEST 7 profile as the
+sole port 5000 owner; its process path and SHA-256 matched this package.
+Browser UI startup acknowledged Risk Disclosure under the operator's testing
+authorization, selected Sage fingerprint `736588221`, and completed optional
+Splash and Spacescan gates. The native window displayed Risk Disclosure, but
+computer-use clicks did not activate its Continue control, so full native UI
+acceptance remains open. The browser selected MZ/XCH and read-only checks
+found mainnet, CAT wallet ID `2`, the exact MZ asset, synced wallet, stopped
+bot, XCH `138.470301476875`, MZ `780212.284`, zero open offers and pending
+transactions, inactive campaign, and ALLOWED safety. Sage's 4,095 historical
+offers were all terminal. No wallet financial effect was made. Live wallet
+lifecycle, complete native UI, both 24-hour windows, independent secondary
+acceptance and final review remain open. PR #220 stays draft.
