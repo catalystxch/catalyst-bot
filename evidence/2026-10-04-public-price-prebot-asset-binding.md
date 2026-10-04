@@ -80,7 +80,9 @@ the exact MZ asset row second; the prior code returned the unbound price `9`.
 The exact source now requires `base_id` to equal selected asset ID. A
 missing-asset-only response returns no quote. Focused tests passed 68 cases
 and four subtests. All 11 CI checks passed on `050fe19`. The full local
-Windows backend suite is running at this checkpoint.
+Windows backend suite then passed 7,171 tests, 210 skipped and 427 subtests
+in 2,501.46 seconds. All 11 checks also passed on the docs-only `b35d910`
+head.
 
 The clean detached `050fe19` EXE SHA-256 is
 `ADBA206BA661A2E4A50338A078FFBE9AE4BD174C1B74E516E5C4EC0CB6BFCB46`;
