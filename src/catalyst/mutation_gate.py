@@ -1819,24 +1819,29 @@ class MutationGate:
         Mutation boundaries continue to use :meth:`status`, which mirrors any
         durable stop into process memory and invokes the stop handler.  A GET
         diagnostics request must not create that state transition merely by
-        sampling a short-lived worker reconciliation latch.
+        sampling a short-lived worker reconciliation latch. Keep durable reads
+        outside the gate lock so a slow diagnostic cannot starve the heartbeat.
         """
 
-        with self._lock:
-            try:
+        try:
+            for attempt in range(2):
                 authorization = self._authorization_snapshot()
-                return self._status_from_rows(
+                current = self._status_from_rows(
                     authorization["latch"],
                     authorization["lease"],
                     authorization["unresolved"],
                     mirror_process_fence=False,
                 )
-            except Exception:
-                return GateStatus(
-                    allowed=False,
-                    reason_code="DURABLE_STATE_UNAVAILABLE",
-                    source="durable_read",
-                )
+                # A concurrent heartbeat may advance the version after the
+                # snapshot. Retry once instead of reporting a false lease loss.
+                if current.reason_code != "LEASE_LOST" or attempt:
+                    return current
+        except Exception:
+            return GateStatus(
+                allowed=False,
+                reason_code="DURABLE_STATE_UNAVAILABLE",
+                source="durable_read",
+            )
 
     def require_allowed(self, operation: str) -> GateStatus:
         current = self.status()

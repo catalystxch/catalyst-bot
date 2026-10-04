@@ -427,6 +427,76 @@ def test_read_only_status_does_not_install_a_transient_durable_latch_fence(
     assert gate.status().allowed is True
 
 
+def test_slow_diagnostic_snapshot_does_not_starve_lease_heartbeat(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    heartbeat_done = threading.Event()
+    observed = {}
+    real_snapshot = gate._authorization_snapshot
+
+    def slow_diagnostic_snapshot():
+        snapshot = real_snapshot()
+        snapshot_entered.set()
+        if not release_snapshot.wait(timeout=5):
+            raise TimeoutError("diagnostic snapshot was not released")
+        return snapshot
+
+    monkeypatch.setattr(gate, "_authorization_snapshot", slow_diagnostic_snapshot)
+
+    def read_diagnostics():
+        observed["diagnostic"] = gate.read_only_status()
+
+    def renew_lease():
+        observed["heartbeat"] = gate.heartbeat()
+        heartbeat_done.set()
+
+    diagnostic_thread = threading.Thread(target=read_diagnostics)
+    heartbeat_thread = threading.Thread(target=renew_lease)
+    diagnostic_thread.start()
+    try:
+        assert snapshot_entered.wait(timeout=1)
+        heartbeat_thread.start()
+        assert heartbeat_done.wait(timeout=2), (
+            "a slow read-only diagnostic must not hold the heartbeat lock"
+        )
+    finally:
+        release_snapshot.set()
+        diagnostic_thread.join(timeout=5)
+        if heartbeat_thread.ident is not None:
+            heartbeat_thread.join(timeout=5)
+
+    assert not diagnostic_thread.is_alive()
+    assert not heartbeat_thread.is_alive()
+    assert observed["heartbeat"]["heartbeat"] is True
+    assert observed["diagnostic"].allowed is True
+    assert gate.status().allowed is True
+
+
+def test_read_only_diagnostic_never_allows_persistently_stale_lease_snapshot(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    stale_snapshot = gate._authorization_snapshot()
+    clock.advance(10)
+    assert gate.heartbeat()["heartbeat"] is True
+    monkeypatch.setattr(gate, "_authorization_snapshot", lambda: stale_snapshot)
+
+    observed = gate.read_only_status()
+
+    assert observed.allowed is False
+    assert observed.reason_code == "LEASE_LOST"
+    assert gate._local_reason_code == ""
+
+
 def test_release_resolved_serializes_heartbeat_through_post_resolve_status(
     isolated_gate_database, monkeypatch
 ):
