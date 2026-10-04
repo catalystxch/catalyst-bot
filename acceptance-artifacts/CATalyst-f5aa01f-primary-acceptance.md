@@ -14,4 +14,8 @@ The 192-entry ZIP passed CRC, contained no `.env` or `bot.db`, and embedded an i
 
 The source keeps stopped-session P&L, dashboard, and standard Coin Prep fee previews from invoking the stateful trading price engine. It selects a quote for the configured CAT asset and ignores a stale prior-session midpoint while stopped. Red/green regressions and focused endpoint/fee tests passed; all 11 exact-source PR checks passed.
 
-The full local Windows backend run and original TEST 7 live read-only verification are pending. No campaign, fee approval, or wallet transaction has been made by this package. Live wallet lifecycle, both 24-hour windows, independent secondary acceptance, and final review remain open. Keep PR #220 draft.
+The exact full local Windows backend run passed 7,176 tests, with one skipped and 427 subtests passed. Independent HTTP downloads from pinned artifact commit `72e2b3767d6672281f74ec2ba4367d716910c064` matched both ZIP and installer hashes.
+
+The exact EXE was started against the original TEST 7 profile for read-only acceptance. Its sole process and port 5000 owner matched the EXE hash. Sage mainnet fingerprint `736588221`, CAT wallet ID `2`, exact MZ asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`, stopped bot, unchanged 138.470301476875 XCH and 780212.284 MZ spendable balances, zero active offers, inactive Bootstrap, and allowed runtime safety were verified. `GET /api/pnl`, `GET /api/dashboard`, and the native P&L view left `price_history` at `(count, max id) = (40907, 75945)`. No campaign, fee approval, offer, or wallet transaction was made.
+
+Live wallet lifecycle, both 24-hour windows, independent secondary acceptance, and final review remain open. Keep PR #220 draft.
