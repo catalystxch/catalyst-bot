@@ -46,7 +46,24 @@ Artifact commit `02c08185bf5691aaf4095cb726156de4253794dd`:
 - Installer: <https://raw.githubusercontent.com/catalystxch/catalyst-bot/02c08185bf5691aaf4095cb726156de4253794dd/acceptance-artifacts/Catalyst-Setup-13a842b-1.4.0.exe>
 
 The preceding `dfc53d9` exact app remained the sole original-profile process
-with bot stopped and no campaign or offer action during this build. Live
-verification of the new UI, both 24-hour windows, wallet lifecycle,
-independent secondary acceptance, and final review remain open. PR #220 stays
-draft; this is not a public-readiness claim.
+with bot stopped and no campaign or offer action during this build. At
+2026-10-04 20:11–20:17 UTC it shut down through its native UI with offer
+cancellation unchecked. The exact `13a842b` EXE was launched, and the testing
+Risk Disclosure was acknowledged under the operator's standing authorization.
+Sage TEST 7 fingerprint `736588221` and MZ/XCH were selected in the native
+startup flow. PID `147840` was the sole CATalyst process and port 5000 owner;
+its path and EXE SHA-256 matched the detached build.
+
+The live Dashboard displayed **`28/09/2026, 15:29:15`** for Evidence Time and
+dated Dexie/Splash observations, alongside RED confidence and the expired
+reason codes. Read-only API checks found the exact mainnet Sage fingerprint,
+CAT wallet ID `2`, MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+stopped bot, synced/healthy wallet, zero open
+offers, inactive Bootstrap with no attention, safety allowed with zero
+mutation blockers, and `can_create=false`. The native balances remained
+138.4703 XCH and 780212.284 MZ. No campaign, fee, trading, or offer action was
+taken. This is an initial live UI and restart check; the live stability window
+resets at this launch. Wallet lifecycle, both 24-hour windows, independent
+secondary acceptance, and final review remain open. PR #220 stays draft;
+this is not a public-readiness claim.
