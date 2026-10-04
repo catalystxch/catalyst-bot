@@ -665,12 +665,22 @@ def api_bot_start():
                 "config_reload",
                 "Config reloaded before bot start so pending Setup changes apply",
             )
-    except Exception as e:
+    except Exception:
+        error = "Pending Setup settings could not be loaded; bot start blocked"
         log_event(
-            "warning",
+            "error",
             "config_reload_failed",
-            f"Config reload before bot start failed: {e}",
+            error,
         )
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "CONFIG_RELOAD_FAILED",
+                "error": error,
+                "errors": [error],
+            }
+        ), 503
 
     # ---- Pre-start validation (V1 parity) ----
     warnings = []
