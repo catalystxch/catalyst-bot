@@ -166,6 +166,29 @@ class TestPnlGet(_FlaskBase):
         bot.price_engine.get_price.assert_not_called()
         quote.assert_called_once_with("a" * 64, "MZ_XCH", 3)
 
+    def test_stopped_pnl_ignores_midpoint_left_by_previous_session(self):
+        bot = _make_bot()
+        bot.is_running.return_value = False
+        bot._current_mid_price = Decimal("9")
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(
+                api_server,
+                "_active_cat",
+                {"asset_id": "a" * 64, "ticker_id": "MZ_XCH", "decimals": 3},
+            ),
+            patch("api_server.get_stats", return_value=_fake_stats()),
+            patch(
+                "blueprints.market._get_startup_price_cached",
+                return_value={"mid": "0.00008"},
+            ) as quote,
+        ):
+            response = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["pnl_mid_price_xch"], "0.00008")
+        quote.assert_called_once_with("a" * 64, "MZ_XCH", 3)
+
     def test_response_has_required_keys(self):
         with (
             patch.object(api_server, "bot", _make_bot()),

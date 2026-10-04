@@ -310,6 +310,10 @@ def api_dashboard():
             or getattr(cfg, "CAT_DECIMALS", 3)
             or 3
         )
+        try:
+            pricing_running = bool(bot and bot.is_running())
+        except Exception:
+            pricing_running = False
 
         # --- Market Health ---
         market_summary = {}
@@ -425,8 +429,12 @@ def api_dashboard():
                 try:
                     mid = Decimal(
                         str(
-                            live_state.get("mid_price")
-                            or getattr(bot, "_current_mid_price", None)
+                            (live_state.get("mid_price") if pricing_running else None)
+                            or (
+                                getattr(bot, "_current_mid_price", None)
+                                if pricing_running
+                                else None
+                            )
                             or api_server._get_readonly_mid_price_str()
                             or 0
                         )
@@ -444,11 +452,18 @@ def api_dashboard():
 
         executable_mid = Decimal("0")
         try:
-            if bot and getattr(bot, "price_engine", None):
+            if pricing_running and getattr(bot, "price_engine", None):
                 _lp = bot.price_engine.get_last_price()
                 executable_mid = Decimal(str(_lp)) if _lp else Decimal("0")
         except Exception:
             executable_mid = Decimal("0")
+        if executable_mid <= 0:
+            try:
+                executable_mid = Decimal(
+                    str(api_server._get_readonly_mid_price_str() or 0)
+                )
+            except (InvalidOperation, ValueError, TypeError):
+                executable_mid = Decimal("0")
         if executable_mid <= 0:
             try:
                 public_bid = Decimal(

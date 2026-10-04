@@ -177,7 +177,64 @@ class TestDashboard(_FlaskBase):
             "2500.00",
         )
         engine.get_price.assert_not_called()
-        quote.assert_called_once_with("a" * 64, "MZ_XCH", 3)
+        self.assertTrue(quote.called)
+        for recorded in quote.call_args_list:
+            self.assertEqual(recorded.args, ("a" * 64, "MZ_XCH", 3))
+
+    def test_stopped_spread_ignores_midpoint_left_by_previous_session(self):
+        bot = types.SimpleNamespace(
+            is_running=lambda: False,
+            _bot_state={"mid_price": "9"},
+            _current_mid_price=Decimal("9"),
+            _loop_count=0,
+            _start_time=0,
+            _probe_state={},
+            _last_live_offer_edges={
+                "our_best_bid": "0.00007",
+                "our_best_ask": "0.00009",
+            },
+            price_engine=None,
+            risk_manager=None,
+            market_intel=None,
+            offer_manager=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+        )
+        with (
+            patch("database.get_stats", return_value={}),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp, "_dashboard_wallet_reads_allowed", return_value=False
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(
+                api_server,
+                "_active_cat",
+                {"asset_id": "a" * 64, "ticker_id": "MZ_XCH", "decimals": 3},
+            ),
+            patch.object(api_server, "bot", bot),
+            patch(
+                "blueprints.market._get_startup_price_cached",
+                return_value={"mid": "0.00008"},
+            ) as quote,
+        ):
+            response = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["market_health"]["metrics"]["your_spread_bps"],
+            "2500.00",
+        )
+        self.assertTrue(quote.called)
+        for recorded in quote.call_args_list:
+            self.assertEqual(recorded.args, ("a" * 64, "MZ_XCH", 3))
 
     def test_stopped_live_read_guard_does_not_build_full_bot_state(self):
         stopped_bot = types.SimpleNamespace(

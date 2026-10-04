@@ -205,7 +205,13 @@ def _usd_string(amount, usd_price: Decimal | None) -> str:
 
 
 def _resolve_pnl_mid_price(bot, server) -> Decimal:
-    price = _decimal_or_none(getattr(bot, "_current_mid_price", None))
+    try:
+        running = bool(bot.is_running())
+    except Exception:
+        running = False
+    price = (
+        _decimal_or_none(getattr(bot, "_current_mid_price", None)) if running else None
+    )
     if price is None or price <= 0:
         try:
             price = _decimal_or_none(server._get_readonly_mid_price_str())
