@@ -86,3 +86,17 @@ offer, or wallet transaction was made.
 Full native UI, both exact-candidate live wallet lifecycles, both 24-hour
 windows, and final review remain open. PR #220 stays draft; no main merge,
 tag, release, or public-readiness claim.
+
+## Exact-source opt-in Chromium rerun
+
+An additional opt-in Chromium run against source `b78ce49` initially found
+two failures in Coin Prep fee-approval tests. The tests replaced the global
+`apiFetch` after `DOMContentLoaded` and then counted unrelated asynchronous
+startup polling as the last wallet-verification call or an attempted Coin
+Prep approval. No product call was implicated. Test-only child
+`eb1f1f5d9b9b8980cff4dcb9e637dbf07b447ee9` records and asserts only
+Coin Prep requests while providing a benign response to background polls.
+The focused Coin Prep browser file passed 41 tests; the complete opt-in
+Chromium suite passed **211 tests** on the exact `b78ce49` runtime source
+with that test-only child. Ruff check/format and diff checks passed. Package
+and live runtime identities above remain attributable to `b78ce49`.
