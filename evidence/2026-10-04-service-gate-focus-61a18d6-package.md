@@ -95,3 +95,28 @@ No campaign, fee approval, offer, or wallet transaction was created. The full
 native UI, live wallet lifecycle, both 24-hour windows, independent secondary
 acceptance and final review remain open. Keep PR #220 draft; no main merge,
 tag, release or public-readiness claim.
+
+## Secondary-PC read-only package gate
+
+The existing secondary Codex task reported a PASS for an independent
+read-only `61a18d6` gate on 2026-10-04. It fetched the PR evidence head
+`4dcb04e`, verified that only documentation and evidence differ from exact
+source `61a18d6`, and passed the enabled public-readiness Chromium module
+(10 tests in 12.37 seconds). Independent downloads matched the ZIP, installer,
+embedded EXE and bundled UI hashes in this report. The ZIP had 192 entries,
+passed inspection, and contained no `.env` or `bot.db`.
+
+The secondary launched the exact EXE with a new isolated `CMM_DATA_DIR`, not
+its original Harvestr profile. It observed one native window and one port 5000
+owner, HTTP 200, a stopped bot, and the expected fail-closed
+`WALLET_IDENTITY_SETUP_REQUIRED` / `WALLET_IDENTITY_BINDING_INVALID` first-run
+state. A duplicate exited cleanly while the owner remained; the owner then
+closed gracefully. The isolated DB contained zero offers, campaigns, Coin
+Prep operations, approvals, journals and wallet-effect claims. The original
+Harvestr profile was untouched and no wallet action occurred. The secondary
+computer-control kernel remained unavailable, so native Risk Disclosure
+traversal and installer interaction were not performed. Its local report is
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\2026-10-04-pr220-secondary-61a18d6.md`.
+
+This passes the secondary isolated read-only package gate only. Secondary
+original-profile live lifecycle, complete UI and 24-hour window remain open.
