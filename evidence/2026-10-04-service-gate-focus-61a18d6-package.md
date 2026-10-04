@@ -37,9 +37,24 @@ and native-safety desktop launches. A unique-AppId current-user QA installer
 used a separate `E:\catalyst-service-gate-61a-qa-install` directory. Clean
 install, installed EXE hash equality, installed API and synthetic Sage,
 same-version in-place reinstall, and uninstall passed. The isolated directory
-and both QA registry scopes were absent afterward. This was not a prior-build
-rollback/restore test. Defender custom scans of the bundle, ZIP and public
-installer returned no matching detections.
+and both QA registry scopes were absent afterward. Defender custom scans of
+the bundle, ZIP and public installer returned no matching detections.
+
+A separate unique-AppId `CATalyst Acceptance QA` sequence used AppId
+`{C51E254D-F8E9-4DA7-8347-41AC68A57B16}` and the explicitly verified
+`E:\catalyst-service-gate-61a-upgrade-qa-install` path. The prior `a3b299c`
+package installed with EXE hash
+`F9E02BF9111937E292A2FF12E92F4A38448CC3209F678F13806E6965B4F69617`.
+An in-place same-version upgrade changed the installed hash to the exact
+`61a18d6` value above; rollback restored the prior hash, and reinstall
+restored the exact new hash. All four installer runs exited zero. The QA
+uninstaller exited zero, and its directory and unique HKCU registration were
+absent afterward. The original TEST 7 process retained its exact source path
+and PID 33880 throughout. The first isolated QA install accidentally used
+the default current-user QA path because `/DIR` was not passed as a distinct
+argument; its unique registration and directory were verified and fully
+uninstalled before the corrected sequence. No production registration or
+original profile was changed by this QA sequence.
 
 The ZIP and unsigned installer are pinned at artifact commit `71c5ae9`.
 Independent HTTP downloads of both pinned files matched the local SHA-256
@@ -58,7 +73,8 @@ checkpoint, its sole `Catalyst.exe` process was PID 33880 and owned the sole
 package above. PID is observational and must be rediscovered for later work.
 
 The native desktop displayed Risk Disclosure, but the available computer-use
-clicks did not activate its Continue control. The same exact app was opened in
+clicks or Tab input did not activate its Continue control, even after explicit
+window activation. The same exact app was opened in
 a browser, where the operator-authorized disclosure was acknowledged through
 the visible UI. TEST 7 fingerprint `736588221` was selected in the visible
 Sage chooser, then the optional Splash and Spacescan gates were completed in
