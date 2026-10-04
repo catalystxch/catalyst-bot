@@ -52,8 +52,28 @@ Artifacts are committed at `codex/coin-prep-fee-approval-artifacts` head
 - ZIP: <https://raw.githubusercontent.com/catalystxch/catalyst-bot/a004e58fdc324ab32ee7408fa58eb5cd7f79b9aa/acceptance-artifacts/CATalyst-dfc53d9-primary-acceptance.zip>
 - Installer: <https://raw.githubusercontent.com/catalystxch/catalyst-bot/a004e58fdc324ab32ee7408fa58eb5cd7f79b9aa/acceptance-artifacts/Catalyst-Setup-dfc53d9-1.4.0.exe>
 
-The original TEST 7 profile continues to run the earlier exact `244da2e`
-package read-only. This source change has not been launched against that
-profile and made no wallet effect. The live wallet lifecycle, active-offer
-recovery, both 24-hour windows, secondary acceptance and final review remain
-open. PR #220 stays draft; this is not a public-readiness claim.
+At 2026-10-04 19:00–19:13 UTC, the original TEST 7 profile's prior `244da2e`
+app was shut down through its native UI with offer cancellation unchecked;
+its process and port listener exited. The exact `dfc53d9` clean EXE was
+launched through the native desktop, and testing Risk Disclosure was
+acknowledged under the operator's standing authorization. Sage TEST 7
+fingerprint `736588221` and MZ/XCH were selected. PID `144124` was the sole
+CATalyst process and owned the `127.0.0.1:5000` listener. Its executable
+path and SHA-256 matched the clean build above.
+
+Read-only live checks showed mainnet Sage, CAT wallet ID `2`, exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+synced wallet, stopped bot, 138.470301476875 spendable XCH and 780212.284
+spendable MZ, zero open buy/sell offers, and zero Sage pending transactions.
+Runtime safety was ALLOWED with no mutation blockers and a renewing 30-second
+lease. Bootstrap status had no active campaign or attention. The previous
+campaign `c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
+remained stopped with zero authoritative fee spend. The native dashboard
+showed TEST 7, MZ/XCH, bot stopped and RED market confidence; no trading or
+campaign action occurred. These are initial live restart observations, not
+the live wallet lifecycle or a 24-hour stability pass.
+
+The live wallet lifecycle, active-offer recovery, both 24-hour windows,
+secondary acceptance and final review remain open. A new campaign and fee
+scope are awaiting separate operator approval. PR #220 stays draft; this is
+not a public-readiness claim.
