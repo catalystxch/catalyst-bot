@@ -3702,6 +3702,21 @@ def _get_live_mid_price_str() -> Optional[str]:
         return None
 
 
+def _get_readonly_mid_price_str() -> Optional[str]:
+    """Return an asset-bound display quote without advancing trading state."""
+    try:
+        from blueprints.market import _get_startup_price_cached
+
+        asset_id = _active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        ticker_id = _active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
+        decimals = _active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
+        quote = _get_startup_price_cached(asset_id, ticker_id, decimals)
+        price = Decimal(str(quote.get("mid") or 0))
+        return format(price, "f") if price.is_finite() and price > 0 else None
+    except Exception:
+        return None
+
+
 def create_bot() -> BotLoop:
     """Create and return the bot loop instance."""
     global bot

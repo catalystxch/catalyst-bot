@@ -427,7 +427,7 @@ def api_dashboard():
                         str(
                             live_state.get("mid_price")
                             or getattr(bot, "_current_mid_price", None)
-                            or api_server._get_live_mid_price_str()
+                            or api_server._get_readonly_mid_price_str()
                             or 0
                         )
                     )
