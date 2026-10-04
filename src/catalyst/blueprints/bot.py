@@ -51,6 +51,10 @@ except Exception:
 bp = Blueprint("bot", __name__)
 
 
+class _BootstrapAuthorityAmbiguous(Exception):
+    """More than one active campaign claims the selected asset."""
+
+
 def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     """Prove legacy open-offer ownership before the first v1.4 bot start.
 
@@ -239,24 +243,25 @@ def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
     Bootstrap offer sizes are derived from the immutable campaign plan, not
     from the mutable legacy Smart Settings tier sizes.  The legacy drift gate
     is therefore inapplicable only after this exact authority check succeeds.
-    Any missing, ambiguous, or stale evidence falls back to the legacy gate.
+    No active campaign or an identity mismatch falls back to the legacy gate.
+    Unreadable or ambiguous campaign authority blocks startup before ordinary
+    trading can begin.
     """
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     wallet_id = getattr(cfg_obj, "CAT_WALLET_ID", 0)
     if len(asset_id) != 64 or type(wallet_id) is not int or wallet_id <= 0:
         return None
 
-    try:
-        from database import list_active_bootstrap_campaigns_for_asset
-        from wallet import get_wallet_identity
+    from database import list_active_bootstrap_campaigns_for_asset
+    from wallet import get_wallet_identity
 
-        campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
-        if len(campaigns) != 1:
-            return None
-        campaign = campaigns[0]
-        identity = get_wallet_identity()
-    except Exception:
+    campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+    if len(campaigns) > 1:
+        raise _BootstrapAuthorityAmbiguous
+    if len(campaigns) == 0:
         return None
+    campaign = campaigns[0]
+    identity = get_wallet_identity()
 
     if type(identity) is not dict or identity.get("success") is not True:
         return None
@@ -756,7 +761,36 @@ def api_bot_start():
     # split TX confirms. Coin prep's reclassify pass should have caught
     # this — if drift survives that, something's wrong and the bot
     # shouldn't trade until it's fixed.
-    bootstrap_campaign = _matching_active_bootstrap_campaign(cfg)
+    try:
+        bootstrap_campaign = _matching_active_bootstrap_campaign(cfg)
+    except _BootstrapAuthorityAmbiguous:
+        error = (
+            "Multiple active Bootstrap campaigns claim this asset; bot start blocked"
+        )
+        log_event("error", "bootstrap_authority_ambiguous", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_AMBIGUOUS",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 409
+    except Exception:
+        error = "Bootstrap campaign authority could not be verified; bot start blocked"
+        log_event("error", "bootstrap_authority_unavailable", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_UNAVAILABLE",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 503
     bootstrap_start_block = _bootstrap_start_block(bootstrap_campaign)
     if bootstrap_start_block is not None:
         error = bootstrap_start_block["error"]

@@ -983,6 +983,56 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(body.get("reason"), "bootstrap_coin_prep_required")
         bot.start.assert_not_called()
 
+    def test_start_blocks_when_active_campaign_authority_cannot_be_read(self):
+        """A failed campaign lookup must not become an ordinary Follow start."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        bot = _make_bot(running=False)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "database.list_active_bootstrap_campaigns_for_asset",
+                side_effect=RuntimeError("private-campaign-detail"),
+            ),
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+            patch("blueprints.bot.log_event") as events,
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 503)
+        body = resp.get_json()
+        self.assertEqual(body.get("reason"), "BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+        self.assertNotIn("private-campaign-detail", str(body))
+        self.assertNotIn("private-campaign-detail", str(events.call_args_list))
+        bot.start.assert_not_called()
+
+    def test_start_blocks_when_multiple_campaigns_claim_active_authority(self):
+        """Ambiguous active campaigns cannot authorize either startup mode."""
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        bot = _make_bot(running=False)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "database.list_active_bootstrap_campaigns_for_asset",
+                return_value=[{"campaign_id": "a"}, {"campaign_id": "b"}],
+            ),
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "BOOTSTRAP_AUTHORITY_AMBIGUOUS")
+        bot.start.assert_not_called()
+
     def test_resume_existing_bootstrap_offers_can_start_when_exact_book_is_proven(self):
         """Recovered live offers replace free-coin readiness only with exact proof."""
         fake_cfg = _fake_cfg()
