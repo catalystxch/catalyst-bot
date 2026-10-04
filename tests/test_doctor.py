@@ -11,6 +11,8 @@ from doctor import (
     _check_db_health,
     _check_config_sanity,
     _check_cat_config,
+    _check_dexie_reachable,
+    _check_splash_reachable,
 )
 
 
@@ -100,6 +102,14 @@ class TestDoctorCheck_DB(unittest.TestCase):
         check = _check_db_health()
         self.assertEqual(check.status, "fail")
 
+    @patch("database.get_connection", side_effect=RuntimeError("secret-db-path"))
+    def test_db_failure_report_does_not_expose_exception_details(self, _mock_conn_fn):
+        message = DoctorReport(checks=[_check_db_health()]).to_dict()["checks"][0][
+            "message"
+        ]
+        self.assertIn("Database", message)
+        self.assertNotIn("secret-db-path", message)
+
 
 class TestDoctorCheck_Config(unittest.TestCase):
     @patch("config_validator.validate_config")
@@ -138,6 +148,51 @@ class TestDoctorCheck_CAT(unittest.TestCase):
             mock_cfg.CAT_ASSET_ID = ""
             check = _check_cat_config()
             self.assertEqual(check.status, "fail")
+
+
+class TestDoctorNetworkFailures(unittest.TestCase):
+    def test_splash_report_does_not_expose_url_or_internal_exception(self):
+        from requests.exceptions import ConnectionError
+
+        secret_url = "https://alice:private-token@splash.example/submit?key=secret"
+        with (
+            patch("config.cfg") as mock_cfg,
+            patch(
+                "requests.head",
+                side_effect=ConnectionError(f"request to {secret_url} failed"),
+            ),
+        ):
+            mock_cfg.SPLASH_ENABLED = True
+            mock_cfg.SPLASH_SUBMIT_URL = secret_url
+            check = _check_splash_reachable()
+
+        message = DoctorReport(checks=[check]).to_dict()["checks"][0]["message"]
+        self.assertEqual(check.status, "warn")
+        self.assertIn("Splash", message)
+        self.assertNotIn("private-token", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("splash.example", message)
+
+    def test_dexie_report_does_not_expose_url_or_internal_exception(self):
+        from requests.exceptions import ConnectionError
+
+        with (
+            patch("config.cfg") as mock_cfg,
+            patch(
+                "requests.head",
+                side_effect=ConnectionError(
+                    "HTTPConnectionPool(host='private-host', token='secret')"
+                ),
+            ),
+        ):
+            mock_cfg.DEXIE_API_BASE = "https://private-host"
+            check = _check_dexie_reachable()
+
+        message = DoctorReport(checks=[check]).to_dict()["checks"][0]["message"]
+        self.assertEqual(check.status, "warn")
+        self.assertIn("Dexie", message)
+        self.assertNotIn("private-host", message)
+        self.assertNotIn("secret", message)
 
 
 class TestDoctorWalletOutage(unittest.TestCase):

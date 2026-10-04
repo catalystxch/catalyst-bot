@@ -222,6 +222,29 @@ class TestConfigValidator(unittest.TestCase):
         )
         self.assertFalse(report.is_valid)
 
+    def test_invalid_provider_urls_do_not_echo_configured_credentials(self):
+        secret_url = "private-token://internal-host/path?key=secret"
+        cases = (
+            ("sage", "SAGE_RPC_URL"),
+            ("chia", "CHIA_WALLET_RPC_URL"),
+            ("sage", "DEXIE_API_BASE"),
+            ("sage", "TIBET_API_BASE"),
+        )
+        for wallet_type, setting in cases:
+            with self.subTest(setting=setting):
+                report = validate_config(
+                    _make_cfg(WALLET_TYPE=wallet_type, **{setting: secret_url})
+                ).to_dict()
+                issue = next(
+                    item
+                    for item in report["errors"] + report["warnings"]
+                    if item["key"] == setting
+                )
+                self.assertIn("valid URL", issue["message"])
+                self.assertNotIn("private-token", issue["message"])
+                self.assertNotIn("secret", issue["message"])
+                self.assertNotIn("internal-host", issue["message"])
+
     def test_report_to_dict(self):
         report = validate_config(_make_cfg())
         d = report.to_dict()
