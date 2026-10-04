@@ -1,0 +1,7 @@
+# Public price GET stopped-state side effect
+
+The exact `6191cf4` primary live UI pass showed price-strategy and dynamic-limit initialization logs while the bot was stopped. Source review found `GET /api/price` called `PriceEngine.get_price()` whenever the `bot` object existed. That method advances the trading reference and calls `record_price()`, writing `price_history`. The nearby stopped `/api/status` path explicitly avoids the same method to prevent UI polling from writing the database or advancing trading risk state.
+
+Two new endpoint tests failed red on the prior source: both stopped and running GET requests called `PriceEngine.get_price()` and returned its synthetic value `9` rather than the selected pair's public quote `0.00008`. The route now uses the existing pair-bound, expiring Dexie setup-price cache. It retains the public response's `mid`, `mid_price`, `dexie_price`, strategy, retired TibetSwap fields and `success` shape, and does not call the PriceEngine method. This is a source correction; the currently running `6191cf4` EXE does not contain it.
+
+Focused verification: 87 backend tests and four subtests passed across the new route tests, setup pricing, retired TibetSwap checks, and status endpoints. Ruff check/format and Git whitespace checks passed. A clean detached package, exact-source full tests/CI, primary live retest, independent secondary acceptance, both 24-hour windows and final review remain required. No campaign, fee approval, offer or wallet transaction was created while investigating this issue. PR #220 remains draft.

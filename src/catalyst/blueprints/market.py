@@ -608,7 +608,7 @@ def api_coinset_stats():
 
 @bp.route("/api/price")
 def api_price():
-    """Get current price from all sources."""
+    """Read the current price without advancing trading state or writing history."""
     bot = api_server.bot
     cfg = api_server.cfg
     asset_id = api_server._active_cat.get("asset_id") or (
@@ -620,7 +620,23 @@ def api_price():
     )
 
     if bot:
-        price_data = bot.price_engine.get_price(asset_id, decimals, ticker)
+        # PriceEngine.get_price() records price history and advances its risk
+        # reference. A public GET must not perform either action.
+        # Use the pair-bound public quote for both stopped and running reads;
+        # a PriceEngine cache may belong to the previously selected CAT.
+        public_quote = _get_startup_price_cached(asset_id, ticker, decimals)
+        price_data = {}
+        if public_quote.get("mid"):
+            price_data = {
+                "mid_price": public_quote["mid"],
+                "dexie_price": public_quote["mid"],
+                "tibet_price": None,
+                "strategy_used": "dexie_offer_book",
+                "arb_opportunity": None,
+                "arb_gap_bps": "0",
+                "tibet_available": False,
+                "tibet_status": "retired",
+            }
         result = api_server._serialize_dict(price_data)
         # GUI expects "mid" key — price_engine returns "mid_price"
         if "mid" not in result and "mid_price" in result:
@@ -628,7 +644,10 @@ def api_price():
         # Ensure "success" key exists for GUI fallback check
         if "mid" not in result:
             result["mid"] = 0
-        result["success"] = float(result.get("mid", 0) or 0) > 0
+        try:
+            result["success"] = Decimal(str(result["mid"] or 0)) > 0
+        except (InvalidOperation, ValueError, TypeError):
+            result["success"] = False
         return jsonify(result)
 
     # Bot not running — lightweight price lookup via api_server helper
