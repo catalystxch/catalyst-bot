@@ -90,3 +90,22 @@ only observed, not activated. A follow-up check still found a stopped bot,
 no active campaign, zero open offers, zero Sage pending transactions,
 unchanged balances, and safety ALLOWED. This covers read-only tab rendering
 and live log backfill; interactive wallet/offer flows remain open.
+
+At 19:25–19:32 UTC, an isolated same-version installer upgrade was exercised
+on E: using the unchanged `installer.iss` and a dedicated QA AppId
+`6D7D5CB2-A8A9-4E57-8564-24B67C9243DD`. The QA install directory and
+uninstall registration were absent before the run. The prior `aa9b09f`
+payload installed with EXE SHA-256
+`51D871486C4F207574D01BEC9521FEEFB8AD1C14144468D1E6039D99B3DD69C8`.
+An in-place upgrade to the exact `dfc53d9` payload exited zero and replaced
+the EXE with SHA-256
+`B38EF8FE8CC232EBD56093A5442D84D8669E416BCE19B3E48F1A9075BD6F812D`.
+Rollback to `aa9b09f` and restore to `dfc53d9` each exited zero and yielded
+the corresponding exact EXE hash. After restore, all 192 installed payload
+files matched the detached source bundle by relative path and SHA-256; there
+were zero missing, changed, or extra payload files. The QA uninstaller exited
+zero and removed the verified E: install directory and its own HKCU registry
+entry. The original TEST 7 `dfc53d9` process remained the sole CATalyst
+process, with stopped bot, unchanged balances, zero open offers, and runtime
+safety ALLOWED. This validates the isolated installer upgrade/rollback path;
+it does not validate an in-app update on the original live profile.
