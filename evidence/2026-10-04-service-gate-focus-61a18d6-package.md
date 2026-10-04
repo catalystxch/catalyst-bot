@@ -91,6 +91,17 @@ blockers. Direct read-only Sage RPC returned no pending transactions and all
 The Sage `/get_offers` endpoint returned the complete history despite supplied
 page bounds; this check used one complete response, not repeated pagination.
 
+A fresh exact-package browser session selected MZ and traversed Dashboard,
+Offers, P&L, Market Intelligence, Settings Setup and Live, Logs, Data Reset,
+Help, and About. Offers showed zero active and three historical entries; Logs
+backfilled the current Sage startup and MZ pair-selection events. The Data
+Reset page was viewed without pressing any reset button. No setting was saved.
+After the browser closed, the app still reported the stopped bot, synced TEST
+7 fingerprint and exact asset, unchanged XCH/MZ balances, zero open offers,
+inactive campaign, and safety ALLOWED with zero blocking operations. This is
+browser UI coverage on the exact package, not native window input acceptance
+or live trading acceptance.
+
 No campaign, fee approval, offer, or wallet transaction was created. The full
 native UI, live wallet lifecycle, both 24-hour windows, independent secondary
 acceptance and final review remain open. Keep PR #220 draft; no main merge,
