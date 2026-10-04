@@ -68,6 +68,31 @@ because attributable market depth was insufficient; no trade was attempted.
 Balances and offer count matched the prior candidate. No campaign, fee
 approval, offer, or wallet transaction was created.
 
+## Stopped-profile heartbeat failure and fresh restart
+
+Later read-only monitoring of the same stopped process found runtime safety
+blocked with `HEARTBEAT_FAILED`, zero durable blockers, zero open offers, the
+same balances and inactive Bootstrap. Its last durable heartbeat was
+`2026-10-04T18:01:30.749034Z` and its stored expiry was
+`2026-10-04T18:02:00.749034Z`: the full intended 30-second lease had been
+stored, but no renewal succeeded before expiry. Sage logged three connection
+timeouts at 18:01:56 UTC. The proximity is evidence of a host or service
+interruption, not proof of its cause. The native UI correctly displayed
+"Start blocked by safety: Lease heartbeat failed". This **fails the live
+stability window** and is not counted as a safety pass beyond fail-closed
+containment.
+
+With the bot stopped and offer cancellation unchecked, the fenced app closed
+through its native UI. It left zero Catalyst processes and zero port 5000
+listeners. The same exact-hash EXE restarted as sole process PID `145356`.
+Native startup again acknowledged Risk Disclosure under the operator's
+existing testing authorization, selected TEST 7 fingerprint `736588221`,
+skipped stopped Splash, continued with the configured Spacescan key, and
+selected MZ/XCH. Fresh read-only checks found unchanged balances, zero open
+offers, inactive Bootstrap, stopped bot and ALLOWED safety with a renewing
+lease. This begins a new observation window; recurrence under ordinary load
+requires investigation before public readiness.
+
 The route failure cases were injected only in isolated tests, never into the
 original TEST 7 profile. Live offer lifecycle, active-offer recovery, both
 24-hour stability windows, independent secondary live acceptance, and final
