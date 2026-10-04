@@ -423,6 +423,32 @@ def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
     )
 
 
+def test_stale_market_confidence_shows_evidence_date_and_time(page):
+    """An old safety snapshot must not look current because only its clock is shown."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => window.renderMarketConfidence({
+            confidence: {state: 'RED', reason_codes: ['market_evidence_expired']},
+            evidence: {derived_at: '2026-09-28T14:29:15.775248Z', source_ids: []},
+            providers: {dexie: {
+                status: 'expired',
+                observed_at: '2026-09-28T14:29:15.775248Z',
+                reason_codes: ['provider_evidence_expired'],
+            }},
+            metrics: {},
+        })"""
+    )
+
+    evidence_time = page.locator("#marketConfidenceDerivedAt")
+    expect(evidence_time).to_contain_text("2026")
+    expect(evidence_time).to_contain_text(":")
+    provider_health = page.locator("#marketProviderHealth")
+    expect(provider_health).to_contain_text("2026")
+    expect(provider_health).to_contain_text(":")
+
+
 def test_current_operator_ui_omits_retired_tibetswap_brand(page):
     """Current Market Intel, About, and Help surfaces omit the retired venue."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

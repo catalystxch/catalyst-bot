@@ -24281,7 +24281,7 @@
             let derivedLabel = 'Not yet derived';
             if (derivedAt) {
                 const parsed = new Date(derivedAt);
-                derivedLabel = Number.isNaN(parsed.getTime()) ? derivedAt : parsed.toLocaleTimeString();
+                derivedLabel = Number.isNaN(parsed.getTime()) ? derivedAt : parsed.toLocaleString();
             }
             setText('marketConfidenceDerivedAt', derivedLabel);
             const timeline = (data.degraded && data.degraded.timeline) || null;
@@ -24312,7 +24312,7 @@
                     const provider = providers[name] || {};
                     const observed = provider.observed_at ? new Date(provider.observed_at) : null;
                     const timeLabel = observed && !Number.isNaN(observed.getTime())
-                        ? ` @ ${observed.toLocaleTimeString()}`
+                        ? ` @ ${observed.toLocaleString()}`
                         : '';
                     const providerReasons = Array.isArray(provider.reason_codes) && provider.reason_codes.length
                         ? ` (${provider.reason_codes.join(', ').replaceAll('_', ' ')})`
