@@ -816,11 +816,13 @@ def api_dashboard():
                 # same effective targets used by the bot so the dashboard does
                 # not falsely report a healthy confidence-capped book as still
                 # building toward the configured ceiling.
-                effective_targets = bot._get_effective_offer_targets(
-                    executable_mid,
-                    current_buy_count=live_open_buys,
-                    current_sell_count=live_open_sells,
-                )
+                effective_targets = {"buy": 0, "sell": 0}
+                if _live_wallet_reads_allowed(bot):
+                    effective_targets = bot._get_effective_offer_targets(
+                        executable_mid,
+                        current_buy_count=live_open_buys,
+                        current_sell_count=live_open_sells,
+                    )
                 metrics = market_health.setdefault("metrics", {})
                 metrics["effective_buy_target"] = max(
                     0, int(effective_targets.get("buy", 0) or 0)

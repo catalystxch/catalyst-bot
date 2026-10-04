@@ -775,6 +775,7 @@ class TestDashboard(_FlaskBase):
         stopped_bot = types.SimpleNamespace(
             get_state=lambda: {"running": False},
             is_running=lambda: False,
+            _get_effective_offer_targets=MagicMock(return_value={"buy": 3, "sell": 3}),
             offer_manager=types.SimpleNamespace(
                 get_wallet_sync_snapshot=lambda: {
                     "buy": [],
@@ -839,6 +840,10 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(performance["open_buys"], 0)
         self.assertEqual(performance["open_sells"], 0)
         self.assertEqual(performance["open_offers"], 0)
+        metrics = resp.get_json()["market_health"]["metrics"]
+        self.assertEqual(metrics["effective_buy_target"], 0)
+        self.assertEqual(metrics["effective_sell_target"], 0)
+        stopped_bot._get_effective_offer_targets.assert_not_called()
 
     def test_market_health_uses_live_offer_edges_for_inner_spread(self):
         risk_manager = MagicMock()
