@@ -2103,8 +2103,20 @@ def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
     assert "Sending cancel request to Sage..." not in confirm_source
 
 
-def test_shutdown_waits_for_stopped_state_and_retries_only_bot_stopping(page):
-    """Shutdown must prove stop completion before wallet-wide cancellation."""
+def test_shutdown_stop_step_reports_only_observed_bot_state(page):
+    """The client poll must not claim it proved every background worker stopped."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    html = gui.read_text(encoding="utf-8")
+
+    assert "Bot reports stop complete." in html
+    assert "Server shutdown will separately verify remaining cleanup." in html
+    assert "Bot loop and background workers stopped." not in html
+    assert "Bot stop completed authoritatively" not in html
+
+
+def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping(page):
+    """Shutdown must observe the reported stop state before cancellation."""
 
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")

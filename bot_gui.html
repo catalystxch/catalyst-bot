@@ -33720,7 +33720,7 @@
                 }
                 updateShutdownProgress(
                     'Stopping the bot...',
-                    'Bot stop is finishing; waiting for background workers and finalizers.'
+                    'Bot stop is finishing; waiting for the bot to report completion.'
                 );
                 await new Promise(resolve => setTimeout(resolve, pollMs));
             }
@@ -33859,10 +33859,10 @@
                 if (!stopResp.ok || stopResult.error) {
                     throw new Error(stopResult.error || 'Could not request bot stop.');
                 }
-                setShutdownStep('Stop', 'active', 'Stop requested. Waiting for background workers and finalizers.');
+                setShutdownStep('Stop', 'active', 'Stop requested. Waiting for the bot to report completion.');
                 await waitForShutdownBotStop();
-                setShutdownStep('Stop', 'done', 'Bot loop and background workers stopped.');
-                addLogEntry('success', '   Bot stop completed authoritatively');
+                setShutdownStep('Stop', 'done', 'Bot reports stop complete. Server shutdown will separately verify remaining cleanup.');
+                addLogEntry('success', '   Bot reports stop complete; server shutdown will verify remaining cleanup');
 
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {
