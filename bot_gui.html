@@ -4079,6 +4079,7 @@
         }
         .fp-card {
             display: flex;
+            width: 100%;
             align-items: center;
             gap: 16px;
             background: rgba(255,255,255,0.04);
@@ -4088,6 +4089,8 @@
             cursor: pointer;
             transition: all 0.2s;
             text-align: left;
+            color: inherit;
+            font: inherit;
         }
         .fp-card:hover {
             background: rgba(16,185,129,0.1);
@@ -4102,6 +4105,7 @@
             opacity: 0.4;
             pointer-events: none;
         }
+        .fp-card.selected:disabled { opacity: 1; }
         .fp-card-icon {
             width: 48px;
             height: 48px;
@@ -4119,6 +4123,7 @@
             color: var(--slate-200);
         }
         .fp-card-number {
+            display: block;
             font-size: 14px;
             color: var(--slate-500);
             font-family: var(--font-mono);
@@ -4128,6 +4133,7 @@
             color: var(--slate-500);
             font-size: 22px;
         }
+        .fp-card-label { display: block; }
 
         /* ========== Splash Gate Overlay (V3) ========== */
         .splash-gate-overlay {
@@ -33935,15 +33941,21 @@
 
                 // Render fingerprint cards
                 cards.innerHTML = data.fingerprints.map((fp, i) => `
-                    <div class="fp-card${currentFp === fp.fingerprint ? ' selected' : ''}" data-fingerprint="${escapeHtml(fp.fingerprint)}" onclick="walletPickerSelect(this.dataset.fingerprint, this)" tabindex="0" style="cursor: pointer;">
-                        <div class="fp-card-icon">🔑</div>
-                        <div>
-                            <div class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</div>
-                            <div class="fp-card-number">${escapeHtml(fp.fingerprint)}</div>
-                        </div>
-                        <div class="fp-card-arrow">${currentFp === fp.fingerprint ? '✓' : '→'}</div>
-                    </div>
+                    <button type="button" class="fp-card${currentFp === fp.fingerprint ? ' selected' : ''}" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
+                        <span class="fp-card-icon" aria-hidden="true">🔑</span>
+                        <span>
+                            <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>
+                            <span class="fp-card-number">${escapeHtml(fp.fingerprint)}</span>
+                        </span>
+                        <span class="fp-card-arrow" aria-hidden="true">${currentFp === fp.fingerprint ? '✓' : '→'}</span>
+                    </button>
                 `).join('');
+                cards.onclick = (event) => {
+                    const card = event.target.closest('.fp-card');
+                    if (card && cards.contains(card) && !card.disabled) {
+                        walletPickerSelect(card.dataset.fingerprint, card);
+                    }
+                };
 
             } catch (err) {
                 cards.innerHTML = '';
@@ -33969,7 +33981,7 @@
             // Disable all cards, highlight selected
             document.querySelectorAll('#walletPickerCards .fp-card').forEach(c => {
                 c.classList.add('disabled');
-                c.style.pointerEvents = 'none';
+                c.disabled = true;
             });
             if (cardEl) {
                 cardEl.classList.remove('disabled');
@@ -34021,7 +34033,7 @@
                         status.textContent = '⚠️ ' + (switched?.message || 'Wallet switch failed');
                         document.querySelectorAll('#walletPickerCards .fp-card').forEach(c => {
                             c.classList.remove('disabled');
-                            c.style.pointerEvents = '';
+                            c.disabled = false;
                         });
                         if (cardEl) cardEl.querySelector('.fp-card-arrow').textContent = '→';
                         showToast(`Could not switch to wallet ${fingerprint}`, 'error');
@@ -34035,7 +34047,7 @@
                     // Re-enable cards so user can try again
                     document.querySelectorAll('#walletPickerCards .fp-card').forEach(c => {
                         c.classList.remove('disabled');
-                        c.style.pointerEvents = '';
+                        c.disabled = false;
                     });
                     if (cardEl) cardEl.querySelector('.fp-card-arrow').textContent = '→';
                 }
@@ -34047,7 +34059,7 @@
                 status.innerHTML = 'Connection error: ' + escapeHtml(err.message);
                 document.querySelectorAll('#walletPickerCards .fp-card').forEach(c => {
                     c.classList.remove('disabled');
-                    c.style.pointerEvents = '';
+                    c.disabled = false;
                 });
             }
         }
@@ -38334,15 +38346,21 @@ async function startupShowFingerprints() {
 
         const container = document.getElementById('startupFpCards');
         container.innerHTML = data.fingerprints.map((fp, i) => `
-            <div class="fp-card" data-fingerprint="${escapeHtml(fp.fingerprint)}" onclick="startupSelectFingerprint(this.dataset.fingerprint, this)" tabindex="0">
-                <div class="fp-card-icon">🔑</div>
-                <div>
-                    <div class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</div>
-                    <div class="fp-card-number">${escapeHtml(fp.fingerprint)}</div>
-                </div>
-                <div class="fp-card-arrow">→</div>
-            </div>
+            <button type="button" class="fp-card" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
+                <span class="fp-card-icon" aria-hidden="true">🔑</span>
+                <span>
+                    <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>
+                    <span class="fp-card-number">${escapeHtml(fp.fingerprint)}</span>
+                </span>
+                <span class="fp-card-arrow" aria-hidden="true">→</span>
+            </button>
         `).join('');
+        container.onclick = (event) => {
+            const card = event.target.closest('.fp-card');
+            if (card && container.contains(card) && !card.disabled) {
+                startupSelectFingerprint(card.dataset.fingerprint, card);
+            }
+        };
 
         document.getElementById('startupStatusText').textContent =
             data.fingerprints.length + ' wallet' + (data.fingerprints.length === 1 ? '' : 's') + ' found — tap one to start';
@@ -38363,7 +38381,10 @@ async function startupSelectFingerprint(fingerprint, cardEl) {
     };
 
     // Highlight selected card, disable all
-    document.querySelectorAll('.fp-card').forEach(c => c.classList.add('disabled'));
+    document.querySelectorAll('#startupFpCards .fp-card').forEach(c => {
+        c.classList.add('disabled');
+        c.disabled = true;
+    });
     if (cardEl) {
         cardEl.classList.remove('disabled');
         cardEl.classList.add('selected');
