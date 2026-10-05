@@ -2150,7 +2150,8 @@ def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping
                     stateReads += 1;
                     return new Response(JSON.stringify({
                         status: stateReads < 2 ? 'stopping' : 'blocked',
-                        running: false
+                        running: false,
+                        error: stateReads < 2 ? null : 'Startup preflight was blocked.'
                     }), {status: 200});
                 }
                 if (path.endsWith('/offers/cancel_all')) {

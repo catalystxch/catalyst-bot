@@ -33704,7 +33704,9 @@
                 } catch (_) {
                     throw new Error('Bot stop status returned an invalid response.');
                 }
-                if (!stateResp.ok || state.error) {
+                // A stopped bot can retain a preflight error. Its HTTP status
+                // and settled running/status fields determine stop completion.
+                if (!stateResp.ok) {
                     throw new Error(state.error || 'Could not verify that the bot stopped.');
                 }
                 const status = String(state.status || '').trim().toLowerCase();
