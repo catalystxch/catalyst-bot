@@ -1,13 +1,114 @@
 """Cancel All must not race with the asynchronous bot stop finalizer."""
 
 import threading
+from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import api_server
 import pytest
 from api_test_support import api_mutations_permitted
 from bot_loop import BotLoop
+
+
+@pytest.mark.parametrize("running", [True, None])
+def test_bot_start_rejects_wallet_wide_cancel_in_progress(monkeypatch, running):
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    bot.start.return_value = True
+    api_server.app.testing = True
+    client = api_server.app.test_client()
+    monkeypatch.setattr(api_server, "bot", bot)
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": running})
+    with api_mutations_permitted(api_server):
+        response = client.post(
+            "/api/bot/start",
+            json={},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert response.status_code == 409
+    assert response.get_json()["reason"] == "CANCEL_ALL_IN_PROGRESS"
+    bot.start.assert_not_called()
+
+
+def test_bot_start_waits_for_cancel_all_stopped_book_check(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from flask import jsonify
+
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    bot.start.return_value = True
+    cfg = SimpleNamespace(
+        CAT_ASSET_ID="ab" * 32,
+        SPREAD_BPS=200,
+        HARD_MIN_PRICE_XCH=Decimal("1"),
+        HARD_MAX_PRICE_XCH=Decimal("2"),
+        MAX_ACTIVE_BUY_OFFERS=1,
+        MAX_ACTIVE_SELL_OFFERS=1,
+        LIQUIDITY_MODE="buy_only",
+    )
+    entered = threading.Event()
+    preflight_complete = threading.Event()
+    release = threading.Event()
+
+    def paused_cancel():
+        entered.set()
+        assert release.wait(5)
+        return jsonify({"success": True})
+
+    def completed_preflight(_cfg):
+        preflight_complete.set()
+        return None
+
+    def post(path):
+        return api_server.app.test_client().post(
+            path,
+            json={},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    api_server.app.testing = True
+    monkeypatch.setattr(api_server, "bot", bot)
+    monkeypatch.setattr(api_server, "cfg", cfg)
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    with (
+        api_mutations_permitted(api_server),
+        patch("blueprints.offers._api_cancel_all_locked", side_effect=paused_cancel),
+        patch(
+            "blueprints.bot._enforce_post_tibet_start_migration",
+            return_value={"can_start": True},
+        ),
+        patch(
+            "wallet.get_wallet_sync_status",
+            return_value={"reachable": True, "sync_state": "synced"},
+        ),
+        patch("wallet.preflight_wallet_identity", return_value={"success": True}),
+        patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),
+        patch(
+            "wallet.get_authoritative_offer_history",
+            return_value={"success": True, "offers": [], "end_of_history": True},
+        ),
+        patch("database.get_open_offers", return_value=[]),
+        patch(
+            "blueprints.bot._one_sided_open_offer_start_block",
+            side_effect=completed_preflight,
+        ),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        cancel_future = pool.submit(post, "/api/offers/cancel_all")
+        assert entered.wait(5)
+        start_future = pool.submit(post, "/api/bot/start")
+        assert preflight_complete.wait(5)
+        assert not start_future.done()
+        bot.start.assert_not_called()
+        release.set()
+        assert cancel_future.result(timeout=5).status_code == 200
+        assert start_future.result(timeout=5).status_code == 200
+        bot.start.assert_called_once()
 
 
 class _AliveThread:

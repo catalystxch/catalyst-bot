@@ -483,6 +483,13 @@ def api_open_offer_count():
 
 @bp.route("/api/offers/cancel_all", methods=["POST"])
 def api_cancel_all():
+    # A concurrent bot start must not pass while this request is checking the
+    # stopped book or reserving its background cancellation worker.
+    with api_server._bot_cancel_lifecycle_lock:
+        return _api_cancel_all_locked()
+
+
+def _api_cancel_all_locked():
     """Cancel all open offers when the bot is not actively managing the book."""
     bot = api_server.bot
     body = request.get_json(silent=True)
