@@ -12214,15 +12214,15 @@
                     </div>
                 </div>
                 <div class="v4-shutdown-note">
-                    <strong>Important:</strong> If you want a clean stop, cancel active offers before shutdown. If you leave them open, they can still be taken while the app is closed, but this bot will not be monitoring them.
+                    <strong>Important:</strong> If you want a clean stop, cancel all currently active offers in the connected Sage wallet before shutdown, including offers created manually or not tracked by CATalyst. If you leave them open, they can still be taken while the app is closed, but this bot will not be monitoring them.
                 </div>
                 <div class="v4-modal-panel v4-modal-panel--danger">
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                     <input type="checkbox" id="shutdownCancelOffers" style="accent-color: var(--sell-color); width: 16px; height: 16px;">
-                    <span>Cancel all offers before shutdown</span>
+                    <span>Cancel all currently active Sage wallet offers before shutdown</span>
                 </label>
                 <div id="shutdownCancelWarning" style="display: none; margin-top: 8px; padding: 8px 10px; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.4); border-radius: 6px; color: var(--danger-300); font-size: 0.85em; line-height: 1.4;">
-                    ⚠️ This will cancel <strong>all active offers</strong> on Dexie before shutting down. Are you sure?
+                    ⚠️ This will cancel <strong>all currently active offers in the connected Sage wallet</strong> before shutting down, including offers created manually or not tracked by CATalyst. Are you sure?
                     <div style="margin-top: 6px; display: flex; gap: 8px;">
                         <button onclick="document.getElementById('shutdownCancelConfirmed').value='yes'; this.parentElement.parentElement.innerHTML='✅ Offers will be cancelled before shutdown';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(239,68,68,0.5); background: rgba(220,38,38,0.3); color: var(--danger-200); cursor: pointer; font-size: 12px;">Yes, cancel them</button>
                         <button onclick="document.getElementById('shutdownCancelOffers').checked=false; document.getElementById('shutdownCancelWarning').style.display='none'; document.getElementById('shutdownCancelConfirmed').value='no';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(100,116,139,0.4); background: rgba(100,116,139,0.2); color: var(--slate-400); cursor: pointer; font-size: 12px;">No, leave them open</button>
@@ -33541,7 +33541,7 @@
             const confirmed = document.getElementById('shutdownCancelConfirmed');
             if (confirmed) confirmed.value = 'no';
             // Reset warning innerHTML in case it was replaced by confirmation text
-            if (warn) warn.innerHTML = '⚠️ This will cancel <strong>all active offers</strong> on Dexie before shutting down. Are you sure?<div style="margin-top: 6px; display: flex; gap: 8px;"><button onclick="document.getElementById(\'shutdownCancelConfirmed\').value=\'yes\'; this.parentElement.parentElement.innerHTML=\'✅ Offers will be cancelled before shutdown\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(239,68,68,0.5); background: rgba(220,38,38,0.3); color: var(--danger-200); cursor: pointer; font-size: 12px;">Yes, cancel them</button><button onclick="document.getElementById(\'shutdownCancelOffers\').checked=false; document.getElementById(\'shutdownCancelWarning\').style.display=\'none\'; document.getElementById(\'shutdownCancelConfirmed\').value=\'no\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(100,116,139,0.4); background: rgba(100,116,139,0.2); color: var(--slate-400); cursor: pointer; font-size: 12px;">No, leave them open</button></div>';
+            if (warn) warn.innerHTML = '⚠️ This will cancel <strong>all currently active offers in the connected Sage wallet</strong> before shutting down, including offers created manually or not tracked by CATalyst. Are you sure?<div style="margin-top: 6px; display: flex; gap: 8px;"><button onclick="document.getElementById(\'shutdownCancelConfirmed\').value=\'yes\'; this.parentElement.parentElement.innerHTML=\'✅ Offers will be cancelled before shutdown\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(239,68,68,0.5); background: rgba(220,38,38,0.3); color: var(--danger-200); cursor: pointer; font-size: 12px;">Yes, cancel them</button><button onclick="document.getElementById(\'shutdownCancelOffers\').checked=false; document.getElementById(\'shutdownCancelWarning\').style.display=\'none\'; document.getElementById(\'shutdownCancelConfirmed\').value=\'no\';" style="padding: 4px 10px; border-radius: 4px; border: 1px solid rgba(100,116,139,0.4); background: rgba(100,116,139,0.2); color: var(--slate-400); cursor: pointer; font-size: 12px;">No, leave them open</button></div>';
             document.getElementById('shutdownModal').classList.add('active');
         }
 
@@ -33583,7 +33583,7 @@
             if (copy) copy.textContent = 'Stopping trading, saving state, and closing the window cleanly.';
             if (stage) stage.textContent = 'Preparing shutdown...';
             if (detail) detail.textContent = cancelOffers
-                ? 'The bot will stop first, then cancel open offers before exit.'
+                ? 'The bot will stop first, then cancel all currently active offers in the connected Sage wallet before exit.'
                 : 'The bot will stop and leave current offers open before exit.';
             if (footer) footer.textContent = 'This usually takes a few seconds. The window will close automatically.';
             if (actions) actions.style.display = 'none';
@@ -33591,7 +33591,7 @@
 
             setShutdownStep('Stop', 'active', 'Stopping pricing, watchers, and active trading.');
             setShutdownStep('Offers', '', cancelOffers
-                ? 'Cancelling active offers before exit.'
+                ? 'Cancelling all currently active Sage wallet offers before exit.'
                 : 'Existing offers will be left open.');
             setShutdownStep('Server', '', 'Stop the server and close the window.');
 
@@ -33757,8 +33757,14 @@
                 && Number(cancelState?.failed) === 0;
             const count = hasTerminalProof ? 0 : buyCount + sellCount;
             return count === 0
-                ? { count, copy: 'No open offers were left behind.' }
-                : { count, copy: `${count} open offer${count === 1 ? '' : 's'} left active.` };
+                ? {
+                    count,
+                    copy: 'CATalyst shows no tracked open offers. Untracked Sage offers, if any, will remain active.'
+                  }
+                : {
+                    count,
+                    copy: `${count} CATalyst-tracked open offer${count === 1 ? '' : 's'} will remain active. Untracked Sage offers, if any, will also remain active.`
+                  };
         }
 
         async function confirmShutdown() {
@@ -33791,7 +33797,7 @@
 
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {
-                    setShutdownStep('Offers', 'active', 'Cancelling active offers before exit.');
+                    setShutdownStep('Offers', 'active', 'Cancelling all currently active Sage wallet offers before exit.');
                     updateShutdownProgress('Cancelling offers...', 'Sending cancel request to Sage...');
                     addLogEntry('info', '   Step 2: Cancelling all offers...');
                     try {

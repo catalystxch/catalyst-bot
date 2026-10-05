@@ -2076,6 +2076,27 @@ def test_generic_cancel_all_explicitly_covers_every_live_sage_offer(page):
     )
 
 
+def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
+    """Shutdown consent must describe the Sage-wide effect it will execute."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("showShutdownModal()")
+    page.locator("#shutdownCancelOffers").check()
+
+    checkbox_label = page.locator("label").filter(
+        has=page.locator("#shutdownCancelOffers")
+    )
+    expect(checkbox_label).to_contain_text("Sage wallet")
+    expect(page.locator("#shutdownCancelWarning")).to_contain_text(
+        "all currently active offers in the connected Sage wallet"
+    )
+    expect(page.locator("#shutdownCancelWarning")).to_contain_text(
+        "including offers created manually or not tracked by CATalyst"
+    )
+    expect(page.locator("#shutdownCancelWarning")).not_to_contain_text("on Dexie")
+
+
 def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     """Submitted cancels must be proven terminal before prep starts automatically."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

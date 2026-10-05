@@ -272,8 +272,8 @@ def test_cancel_all_gui_timeout_honours_backend_authoritative_deadline():
     assert "}, 300000);" not in confirm_source
 
 
-def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
-    """A clean empty wallet must be described as empty at shutdown."""
+def test_shutdown_offer_disposition_qualifies_catalyst_tracked_visibility():
+    """Tracked rows must not be presented as an authoritative Sage snapshot."""
 
     node = shutil.which("node")
     if node is None:
@@ -299,11 +299,20 @@ def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
     empty, active, terminal_after_stale_view = json.loads(completed.stdout)
 
     assert empty["count"] == 0
-    assert empty["copy"] == "No open offers were left behind."
+    assert empty["copy"] == (
+        "CATalyst shows no tracked open offers. "
+        "Untracked Sage offers, if any, will remain active."
+    )
     assert active["count"] == 3
-    assert active["copy"] == "3 open offers left active."
+    assert active["copy"] == (
+        "3 CATalyst-tracked open offers will remain active. "
+        "Untracked Sage offers, if any, will also remain active."
+    )
     assert terminal_after_stale_view["count"] == 0
-    assert terminal_after_stale_view["copy"] == "No open offers were left behind."
+    assert terminal_after_stale_view["copy"] == (
+        "CATalyst shows no tracked open offers. "
+        "Untracked Sage offers, if any, will remain active."
+    )
 
 
 # ---------------------------------------------------------------------------
