@@ -51,6 +51,22 @@ The immutable artifacts are pinned at commit
 - [Acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/1fb103cff9af58ccaf6fbfda556be276ff820fa2/acceptance-artifacts/CATalyst-6e4d61d-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/1fb103cff9af58ccaf6fbfda556be276ff820fa2/acceptance-artifacts/Catalyst-Setup-6e4d61d-1.4.0.exe)
 
+## Independent secondary check
+
+The secondary PC checked out exact source `6e4d61d` detached, passed the six
+focused wallet keyboard tests and all 218 Chromium tests, and built its own
+clean Windows package. Its bundled UI SHA-256 matched the primary source and
+bundle. A direct bundled-UI probe confirmed real-toolbar Enter activation,
+contained Tab/Shift+Tab focus with Escape returning to the opener, no card
+overflow at 390 and 1280 pixels with a 176-character unbroken label, and an
+accessible disabled-Start description. It recorded zero non-GET requests or
+page errors. Its isolated-profile packaged startup showed no Sage connection
+or wallet mutation and closed normally; original Harvestr profile hashes were
+unchanged. Its Python 3.14.3 EXE hash differs from the primary Python 3.12.6
+build, so it does not attest to the primary EXE bytes. The immutable
+[secondary evidence](https://github.com/catalystxch/catalyst-bot/commit/0b3b18f27954729e1b9ba6588e8a6312ce9358bd)
+records the bounded result.
+
 ## Live boundary
 
 The original TEST 7 profile is still running the previous exact `b7eab4f`
