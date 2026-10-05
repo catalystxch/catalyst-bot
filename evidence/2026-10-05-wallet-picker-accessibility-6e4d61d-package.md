@@ -94,6 +94,26 @@ includes screenshots and backup/ledger comparisons. This passes only the
 secondary read-only startup, identity, fail-closed, shutdown and restart
 scope. Secondary live trading and fee lifecycle remain open.
 
+## Independent synthetic active-offer recovery
+
+The secondary PC also exercised exact `6e4d61d` in fresh temporary
+mock-wallet profiles. Its deterministic full lifecycle passed 3 tests for
+offer creation, durable publication/discovery, GREEN-to-RED gating, verified
+fill evidence, replacement backoff, cancellation, and DB close/reopen
+recovery. A focused backend restart/authority group passed 58 tests, and
+three focused Chromium tests passed for explicit resume, wallet-wide Cancel
+All consent, and authoritative cancel completion before Coin Prep. Its exact
+compiled EXE passed interrupted-publication recovery with two active offer
+projections and a stale killed-owner lease: the undispatched claim became
+retryable while an ambiguous dispatched claim was suppressed. Native
+clean/duplicate/persisted/safety and authenticated synthetic Sage smokes
+also passed. Dexie posting and Splash were disabled; no live wallet or
+provider effect occurred. The original Harvestr profile hashes remained
+unchanged. The immutable
+[synthetic recovery report](https://github.com/catalystxch/catalyst-bot/commit/75bf9a6b4ec3bda96808220555cf008ae2c70804)
+records the exact scope and results. Real-wallet active-offer lifecycle and
+recovery remain unverified.
+
 ## Live boundary
 
 The original TEST 7 profile is still running the previous exact `b7eab4f`
