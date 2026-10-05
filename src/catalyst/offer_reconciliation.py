@@ -1520,6 +1520,32 @@ def _classify_terminal_evidence(
     offer_rows = evidence["offer_history"].get("records")
     raw_transactions = evidence["transaction_history"].get("records")
     raw_coins = evidence["coin_records"].get("records")
+    offer_scope = evidence["offer_history"].get("scope_trade_ids")
+    if offer_scope is not None and (
+        type(offer_scope) is not list
+        or not 0 < len(offer_scope) <= _MAX_CANCEL_MEMBERS
+        or any(
+            type(value) is not str or _hex_id(value) != value for value in offer_scope
+        )
+        or len(set(offer_scope)) != len(offer_scope)
+        or exact_intent["sage_trade_id"] not in offer_scope
+        or type(offer_rows) is not list
+        or len(offer_rows) != len(offer_scope)
+        or {
+            _hex_id(_first_present(row, "trade_id", "offer_id"))
+            for row in offer_rows
+            if type(row) is dict
+        }
+        != set(offer_scope)
+    ):
+        return _unknown("EVIDENCE_SCOPE_MISMATCH")
+    coin_scope = evidence["transaction_history"].get("scope_selected_coin_ids")
+    if coin_scope is not None and (
+        type(coin_scope) is not list
+        or len(coin_scope) != len(exact_intent["selected_coin_ids"])
+        or set(coin_scope) != set(exact_intent["selected_coin_ids"])
+    ):
+        return _unknown("EVIDENCE_SCOPE_MISMATCH")
     if (
         type(offer_rows) is list
         and len(offer_rows) > _MAX_HISTORY_RECORDS
@@ -1946,6 +1972,138 @@ def load_sage_offer_history(
     }
 
 
+def _sage_exact_offer_scope(intent: dict[str, Any]) -> tuple[str, ...] | None:
+    """Find every durable cancellation member needed to prove this intent."""
+
+    import database
+
+    try:
+        trade_id = intent["sage_trade_id"]
+        events = database.get_offer_operation_events(f"cancel:{trade_id}")
+        if type(events) is not list or len(events) > _MAX_HISTORY_RECORDS:
+            return None
+        offer_ids = {trade_id}
+        for raw_event in events:
+            event = database.validate_offer_operation_event(raw_event)
+            if event["phase"] != "PREPARED":
+                continue
+            details = json.loads(event["evidence_json"])
+            if type(details) is not dict:
+                return None
+            cohort_id = details.get("cohort_id")
+            cohort_size = details.get("cohort_size")
+            if cohort_id is None:
+                if cohort_size not in (None, 1):
+                    return None
+                continue
+            if type(cohort_id) is not str or not cohort_id:
+                return None
+            manifest = database.get_offer_cancel_cohort_manifest(cohort_id)
+            if manifest is None:
+                if cohort_size not in (None, 1):
+                    return None
+                continue
+            exact_manifest = database.validate_offer_cancel_cohort_manifest(manifest)
+            members = exact_manifest["members"]
+            if type(cohort_size) is not int or cohort_size != len(members):
+                return None
+            if type(members) is not list or not any(
+                type(member) is dict
+                and member.get("trade_id") == trade_id
+                and member.get("prepared_event_id") == event["event_id"]
+                for member in members
+            ):
+                return None
+            for member in members:
+                member_id = _hex_id(member.get("trade_id"))
+                if not member_id:
+                    return None
+                offer_ids.add(member_id)
+                if len(offer_ids) > 256:
+                    return None
+        return tuple(sorted(offer_ids))
+    except BaseException:
+        return None
+
+
+def _load_sage_exact_offer_set(
+    reader: Callable[[tuple[str, ...]], Any],
+    scope: tuple[str, ...] | None,
+    *,
+    clock: Callable[[], Any] | None,
+) -> dict[str, Any]:
+    """Normalize an exact, bounded Sage offer set as scoped source evidence."""
+
+    observed_at = _clock_utc(clock)
+    records: list[dict[str, Any]] = []
+    complete = False
+    read_error = "exact_offer_scope_incomplete"
+    if scope is not None:
+        try:
+            result = reader(scope)
+            observed_at = _clock_utc(clock)
+            rows = _offer_list(result.get("offers"), record_cap=len(scope))
+            if (
+                type(result) is dict
+                and result.get("complete") is True
+                and result.get("requested_ids") == list(scope)
+                and rows is not None
+                and len(rows) == len(scope)
+                and {_hex_id(row.get("trade_id")) for row in rows} == set(scope)
+            ):
+                records = rows
+                complete = True
+                read_error = None
+        except BaseException:
+            observed_at = _clock_utc(clock)
+            read_error = "exact_offer_reader_exception"
+    return {
+        "observed_at": observed_at,
+        "source_observed_at": None,
+        "source_observed_at_all": [],
+        "read_observed_at": [observed_at],
+        "provenance": "wallet.get_authoritative_offers_by_ids",
+        "complete": complete,
+        "read_error": read_error,
+        "records": records,
+        "scope_trade_ids": list(scope) if scope is not None else [],
+        "pagination": {
+            "pages_read": max(1, len(scope) if scope is not None else 1),
+            "page_size": 1,
+            "remote_bounds_honored": True,
+            "locally_normalized": True,
+            "authoritative_end": True,
+        },
+    }
+
+
+def _empty_sage_scoped_transaction_source(
+    clock: Callable[[], Any] | None,
+    selected_coin_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Start a transaction proof scoped to exact selected-coin spent heights."""
+
+    observed_at = _clock_utc(clock)
+    return {
+        "observed_at": observed_at,
+        "source_observed_at": None,
+        "source_observed_at_all": [],
+        "read_observed_at": [observed_at],
+        "provenance": "wallet.get_coins_by_ids+get_transaction_by_height",
+        "complete": True,
+        "read_error": None,
+        "records": [],
+        "scope_selected_coin_ids": list(selected_coin_ids),
+        "pagination": {
+            "pages_read": 1,
+            "page_size": 1,
+            "remote_bounds_honored": True,
+            "locally_normalized": True,
+            "authoritative_end": True,
+        },
+    }
+
+
 def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
     if type(entry) is not dict:
         return None
@@ -2268,6 +2426,7 @@ def load_authoritative_evidence(
     intent: Any,
     *,
     wallet_facade: Any = None,
+    offer_scope: str = "exact_intent",
     clock: Callable[[], Any] | None = None,
     wallet_ids: tuple[int, ...] = (1,),
     page_size: int = 50,
@@ -2279,6 +2438,8 @@ def load_authoritative_evidence(
     exact_intent = _exact_intent(intent)
     if exact_intent is None:
         raise ValueError("intent is not an exact registered offer")
+    if offer_scope not in {"exact_intent", "wallet_full"}:
+        raise ValueError("offer evidence scope is invalid")
     if (
         type(wallet_ids) is not tuple
         or not wallet_ids
@@ -2364,16 +2525,29 @@ def load_authoritative_evidence(
     def unavailable_offer_reader(**_kwargs):
         raise RuntimeError("offer reader unavailable")
 
-    offers = load_sage_offer_history(
-        get_all_offers=(
-            offer_reader if callable(offer_reader) else unavailable_offer_reader
-        ),
-        include_completed=True,
-        clock=clock,
-        page_size=page_size,
-        max_pages=max_pages,
-        max_records=max_records,
+    exact_offer_reader = getattr(wallet_facade, "get_authoritative_offers_by_ids", None)
+    scoped_sage = (
+        offer_scope == "exact_intent"
+        and wallet_backend == "sage"
+        and callable(exact_offer_reader)
     )
+    if scoped_sage:
+        offers = _load_sage_exact_offer_set(
+            exact_offer_reader,
+            _sage_exact_offer_scope(exact_intent),
+            clock=clock,
+        )
+    else:
+        offers = load_sage_offer_history(
+            get_all_offers=(
+                offer_reader if callable(offer_reader) else unavailable_offer_reader
+            ),
+            include_completed=True,
+            clock=clock,
+            page_size=page_size,
+            max_pages=max_pages,
+            max_records=max_records,
+        )
     try:
         transaction_reader = getattr(wallet_facade, "get_transactions_list")
     except BaseException:
@@ -2382,18 +2556,23 @@ def load_authoritative_evidence(
     def unavailable_transaction_reader(**_kwargs):
         raise RuntimeError("transaction reader unavailable")
 
-    transactions = _load_transactions(
-        (
-            transaction_reader
-            if callable(transaction_reader)
-            else unavailable_transaction_reader
-        ),
-        wallet_ids=wallet_ids,
-        clock=clock,
-        page_size=page_size,
-        max_pages=max_pages,
-        max_records=max_records,
-    )
+    if scoped_sage:
+        transactions = _empty_sage_scoped_transaction_source(
+            clock, exact_intent["selected_coin_ids"]
+        )
+    else:
+        transactions = _load_transactions(
+            (
+                transaction_reader
+                if callable(transaction_reader)
+                else unavailable_transaction_reader
+            ),
+            wallet_ids=wallet_ids,
+            clock=clock,
+            page_size=page_size,
+            max_pages=max_pages,
+            max_records=max_records,
+        )
     required_ids = set(exact_intent["selected_coin_ids"])
     authoritative_asset_hints = {
         coin_id: ("xch" if exact_intent["side"] == "buy" else exact_intent["asset_id"])
@@ -2464,7 +2643,7 @@ def load_authoritative_evidence(
             height_reader = None
         selected_ids = set(exact_intent["selected_coin_ids"])
         spent_heights = set()
-        if callable(height_reader) and len(raw_coins) <= _MAX_COIN_RECORDS:
+        if len(raw_coins) <= _MAX_COIN_RECORDS:
             try:
                 for raw_id, raw_record in raw_coins.items():
                     if type(raw_record) is not dict:
@@ -2488,8 +2667,14 @@ def load_authoritative_evidence(
             and bool(_hex_id(tx.get("transaction_id")))
         }
         heights_needing_exact_read = sorted(spent_heights - identified_heights)
+        if scoped_sage and heights_needing_exact_read and not callable(height_reader):
+            transactions["complete"] = False
+            transactions["read_error"] = "exact_height_reader_unavailable"
         if len(heights_needing_exact_read) > _MAX_HISTORY_PAGES:
             coin_cap_exceeded = True
+            if scoped_sage:
+                transactions["complete"] = False
+                transactions["read_error"] = "source_limit_exceeded"
             heights_needing_exact_read = []
         supplemental_transactions = []
         for height in heights_needing_exact_read:
@@ -2525,6 +2710,15 @@ def load_authoritative_evidence(
             ):
                 supplemental_transactions.append(normalized)
 
+        if (
+            scoped_sage
+            and {tx["confirmed_height"] for tx in supplemental_transactions}
+            != spent_heights
+            and transactions["read_error"] is None
+        ):
+            transactions["complete"] = False
+            transactions["read_error"] = "exact_height_read_incomplete"
+
         if supplemental_transactions:
             try:
                 supplemental_heights = {
@@ -2544,9 +2738,10 @@ def load_authoritative_evidence(
                 transactions["records"] = _dedupe_records(
                     combined_transactions, "transaction_id"
                 )
-                transactions["provenance"] = (
-                    "wallet.get_transactions_list+get_transaction_by_height"
-                )
+                if not scoped_sage:
+                    transactions["provenance"] = (
+                        "wallet.get_transactions_list+get_transaction_by_height"
+                    )
                 prior_required_ids = set(required_ids)
                 for tx in supplemental_transactions:
                     for flow_name in ("spent", "created"):

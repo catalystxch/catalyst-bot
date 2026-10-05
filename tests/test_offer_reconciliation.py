@@ -1885,6 +1885,480 @@ def test_authoritative_loader_uses_wallet_facade_readers_and_marks_coin_complete
     assert {kind for kind, _args in calls} == {"offers", "transactions", "coins"}
 
 
+def test_sage_exact_offer_scope_survives_unbounded_terminal_archive(monkeypatch):
+    import database
+
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    requested = []
+
+    def read_exact(ids):
+        requested.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        }
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=read_exact,
+        get_authoritative_offer_history=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded Sage history must not be requested")
+        ),
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [_transaction()],
+            "total": 1,
+        },
+        get_coins_by_ids=lambda _coin_ids: {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RECEIVE: _coin(
+                RECEIVE,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+
+    assert requested == [(TRADE,)]
+    assert evidence["offer_history"]["complete"] is True
+    assert [row["trade_id"] for row in evidence["offer_history"]["records"]] == [TRADE]
+
+
+def test_wallet_full_scope_keeps_complete_history_contract(monkeypatch):
+    import database
+
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    full_reads = []
+
+    def read_full(**kwargs):
+        full_reads.append(kwargs)
+        return {"offers": [_offer()], "total": 1, "end_of_history": True}
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda _ids: (_ for _ in ()).throw(
+            AssertionError("quarantine must not use a target-only offer read")
+        ),
+        get_authoritative_offer_history=read_full,
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda _ids: {COIN: _coin(COIN, asset_id="xch", amount=1000)},
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(),
+        wallet_facade=facade,
+        offer_scope="wallet_full",
+        clock=_clock_at(),
+        page_size=10,
+    )
+
+    assert full_reads[0]["include_completed"] is True
+    assert evidence["offer_history"]["provenance"] == "wallet.get_all_offers"
+    assert evidence["offer_history"]["complete"] is True
+
+
+def test_sage_exact_offer_scope_includes_every_durable_cohort_member(monkeypatch):
+    import database
+
+    sibling = "e" * 64
+    manifest = {
+        "cohort_id": "cohort-exact",
+        "manifest_sha256": "f" * 64,
+        "member_count": 2,
+        "members": [
+            {"trade_id": TRADE, "prepared_event_id": "prepared-exact"},
+            {"trade_id": sibling, "prepared_event_id": "prepared-sibling"},
+        ],
+    }
+    monkeypatch.setattr(
+        database,
+        "get_offer_operation_events",
+        lambda _id: [
+            {
+                "event_id": "prepared-exact",
+                "phase": "PREPARED",
+                "evidence_json": '{"cohort_id":"cohort-exact","cohort_size":2}',
+            }
+        ],
+    )
+    monkeypatch.setattr(database, "validate_offer_operation_event", lambda row: row)
+    monkeypatch.setattr(
+        database, "get_offer_cancel_cohort_manifest", lambda _id: manifest
+    )
+    monkeypatch.setattr(
+        database, "validate_offer_cancel_cohort_manifest", lambda row: row
+    )
+    requested = []
+
+    def read_exact(ids):
+        requested.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer(), _offer(trade_id=sibling)],
+        }
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=read_exact,
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [_transaction()],
+            "total": 1,
+        },
+        get_coins_by_ids=lambda _coin_ids: {
+            COIN: _coin(COIN, asset_id="xch", amount=1000),
+            RECEIVE: _coin(RECEIVE, asset_id=ASSET, amount=2000),
+        },
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+
+    assert requested == [(TRADE, sibling)]
+    assert evidence["offer_history"]["complete"] is True
+    assert len(evidence["offer_history"]["records"]) == 2
+    assert evidence["offer_history"]["scope_trade_ids"] == [TRADE, sibling]
+
+
+def test_sage_exact_offer_scope_rejects_partial_cohort_or_invalid_manifest(monkeypatch):
+    import database
+
+    sibling = "e" * 64
+    prepared = {
+        "event_id": "prepared-exact",
+        "phase": "PREPARED",
+        "evidence_json": '{"cohort_id":"cohort-exact","cohort_size":2}',
+    }
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [prepared])
+    monkeypatch.setattr(database, "validate_offer_operation_event", lambda row: row)
+    manifest = {
+        "cohort_id": "cohort-exact",
+        "manifest_sha256": "f" * 64,
+        "member_count": 2,
+        "members": [
+            {"trade_id": TRADE, "prepared_event_id": "prepared-exact"},
+            {"trade_id": sibling, "prepared_event_id": "prepared-sibling"},
+        ],
+    }
+    monkeypatch.setattr(
+        database, "get_offer_cancel_cohort_manifest", lambda _id: manifest
+    )
+    monkeypatch.setattr(
+        database, "validate_offer_cancel_cohort_manifest", lambda row: row
+    )
+    calls = []
+
+    def read_partial(ids):
+        calls.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        }
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=read_partial,
+        get_transactions_list=lambda **_kwargs: {
+            "success": True,
+            "transactions": [],
+            "total": 0,
+        },
+        get_coins_by_ids=lambda _ids: {COIN: _coin(COIN, asset_id="xch", amount=1000)},
+    )
+
+    partial = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert calls == [(TRADE, sibling)]
+    assert partial["offer_history"]["complete"] is False
+    assert partial["offer_history"]["records"] == []
+
+    monkeypatch.setattr(database, "get_offer_cancel_cohort_manifest", lambda _id: None)
+    invalid = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert calls == [(TRADE, sibling)]
+    assert invalid["offer_history"]["complete"] is False
+
+    monkeypatch.setattr(
+        database, "get_offer_cancel_cohort_manifest", lambda _id: manifest
+    )
+    monkeypatch.setattr(
+        database,
+        "get_offer_operation_events",
+        lambda _id: [
+            {
+                **prepared,
+                "evidence_json": '{"cohort_id":"cohort-exact","cohort_size":1}',
+            }
+        ],
+    )
+    mismatched = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert calls == [(TRADE, sibling)]
+    assert mismatched["offer_history"]["complete"] is False
+
+
+def test_sage_exact_coin_heights_prove_fill_after_transaction_archive_cap(
+    monkeypatch,
+):
+    import database
+
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    reads = []
+    coin_rows = {
+        COIN: _coin(
+            COIN,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=TRADE,
+        ),
+        RECEIVE: _coin(
+            RECEIVE,
+            asset_id=ASSET,
+            amount=2000,
+            created_height=42,
+            transaction_id=TX,
+        ),
+    }
+
+    def read_height(height):
+        reads.append(height)
+        return {"success": True, "transaction": _transaction()}
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transactions_list=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wallet-wide transaction archive must not be requested")
+        ),
+        get_transaction_by_height=read_height,
+        get_coins_by_ids=lambda ids: {coin_id: coin_rows[coin_id] for coin_id in ids},
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+
+    assert reads == [42]
+    assert evidence["transaction_history"]["complete"] is True
+    assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
+def test_sage_exact_coin_height_read_failure_is_not_complete(monkeypatch):
+    import database
+
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": None,
+        },
+        get_coins_by_ids=lambda _ids: {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            )
+        },
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert evidence["transaction_history"]["complete"] is False
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
+def test_sage_exact_coin_height_reader_absent_is_not_complete(monkeypatch):
+    import database
+
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_coins_by_ids=lambda _ids: {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            )
+        },
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert evidence["transaction_history"]["complete"] is False
+    assert evidence["transaction_history"]["read_error"] == (
+        "exact_height_reader_unavailable"
+    )
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
+def test_sage_scoped_height_and_offer_set_prove_full_group_cancel(monkeypatch):
+    import database
+
+    context, expected = _grouped_cancel_contradiction_case()
+    prepared_id = context["members"][0]["prepared_event_id"]
+    prepared = {
+        "event_id": prepared_id,
+        "phase": "PREPARED",
+        "evidence_json": json.dumps(
+            {"cohort_id": context["cohort_id"], "cohort_size": 2}
+        ),
+    }
+    manifest = {
+        "cohort_id": context["cohort_id"],
+        "manifest_sha256": context["manifest_sha256"],
+        "member_count": 2,
+        "members": context["members"],
+    }
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [prepared])
+    monkeypatch.setattr(database, "validate_offer_operation_event", lambda row: row)
+    monkeypatch.setattr(
+        database, "get_offer_cancel_cohort_manifest", lambda _id: manifest
+    )
+    monkeypatch.setattr(
+        database, "validate_offer_cancel_cohort_manifest", lambda row: row
+    )
+    exact_coins = expected["coin_records"]["records"]
+    requested_ids = []
+
+    def read_exact(ids):
+        requested_ids.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": expected["offer_history"]["records"],
+        }
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=read_exact,
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": expected["transaction_history"]["records"][0],
+        },
+        get_coins_by_ids=lambda ids: {coin_id: exact_coins[coin_id] for coin_id in ids},
+    )
+
+    collected = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+
+    assert requested_ids == [(TRADE, OTHER_TRADE)]
+    assert collected["offer_history"]["complete"] is True
+    assert collected["transaction_history"]["complete"] is True
+    assert collected["coin_records"]["complete"] is True
+    assert _classify(collected, cancel_context=context)["classification"] == (
+        CANCELLED_PROVEN
+    )
+
+
+def test_classifier_rejects_scoped_evidence_bound_to_another_offer_or_coin():
+    other = "e" * 64
+    wrong_offer_scope = _evidence()
+    wrong_offer_scope["offer_history"]["scope_trade_ids"] = [other]
+    wrong_coin_scope = _evidence()
+    wrong_coin_scope["transaction_history"]["scope_selected_coin_ids"] = [other]
+
+    assert _classify(wrong_offer_scope)["classification"] == UNKNOWN
+    assert _classify(wrong_coin_scope)["classification"] == UNKNOWN
+
+
 def test_sage_authoritative_loader_reuses_collected_asset_evidence_for_coin_read():
     received_hints = []
 

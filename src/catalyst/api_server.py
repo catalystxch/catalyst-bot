@@ -4282,7 +4282,9 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     history_provenance = "wallet.get_all_offers"
     identity_provenance = "wallet.get_wallet_identity"
     for offer in requirements.get("offers", []):
-        evidence = load_authoritative_evidence(offer["intent"])
+        evidence = load_authoritative_evidence(
+            offer["intent"], offer_scope="wallet_full"
+        )
         authoritative_read_performed = True
         if (
             type(evidence) is not dict
