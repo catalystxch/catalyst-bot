@@ -16,6 +16,18 @@ The backup and snapshot overlap the lease interruption and Sage timeouts. They
 are a plausible shared load source, **not a proven cause**: no event or trace
 yet attributes the missed heartbeat to VSS, SQLite, Sage, or process scheduling.
 
+The original `bot_superlog_20261004_182439.log` also shows latency across
+unrelated application threads during this interval. Two `get_adjusted_spread`
+requests completed at 18:00:39 UTC after 3.9 and 11.1 seconds. A
+`get_chia_health` request completed at 18:01:30 UTC after 24.9 seconds;
+another completed at 18:01:57 UTC after 11.9 seconds. Three Sage RPC calls
+reported 10.07–10.08-second connection timeouts at 18:01:56 UTC. The
+`mutation-lease-heartbeat` thread logged `HEARTBEAT_FAILED` at 18:02:07 UTC.
+These timings establish a multi-thread latency episode around the missed
+renewal. The existing log does not record when that heartbeat began waiting,
+whether it waited on the local lock or SQLite, or how long the host scheduler
+delayed it, so the root cause remains unresolved.
+
 The current exact `13a842b` app remained safety-allowed at 20:28 UTC with a
 renewing 30-second lease (version 166494, expiry 20:29:16.126754 UTC), bot
 stopped, inactive Bootstrap, and zero open offers. Windows Task Scheduler still
