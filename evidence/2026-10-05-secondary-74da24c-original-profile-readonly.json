@@ -1,0 +1,82 @@
+{
+  "accepted_runtime_commit": "74da24c34c0e107ff4c4bf9be7a719e8ae3777d0",
+  "scope": "secondary original-profile read-only startup/restart/package/gui",
+  "result": "PASS",
+  "wallet_effects": false,
+  "source_changes": false,
+  "packages": {
+    "secondary_build_exe_sha256": "569404987BFFD97938141682F5C59983416AEB996AC1A79EC182D6984AE7CA92",
+    "pinned_artifact_commit": "7b90d6dca999eec6a3e28083037b581484255b01",
+    "pinned_zip_bytes": 36476935,
+    "pinned_zip_sha256": "7120A8B1490D8EE551210F57372FF8BA65637A9CA1698796559758C0215334AB",
+    "pinned_exe_bytes": 11276460,
+    "pinned_exe_sha256": "C03A78147CDAA3532F6F103E46328DEA53F6FF3B41F51F3FEA1E8134709B4664",
+    "bot_gui_sha256": "2778E110E3E358D05E6E84E9EE8645AD71233FCDCB9D396BD219D62D4774D6F5"
+  },
+  "tests": {
+    "affected_backend_passed": 131,
+    "chromium_e2e_passed": 223,
+    "targeted_browser_passed": 2,
+    "stop_quiescence_race_passed": 20,
+    "stop_quiescence_race_attempts": 20,
+    "ruff": "PASS",
+    "packaged_smokes": "PASS"
+  },
+  "identity": {
+    "wallet_name": "Harvestr test wallet",
+    "fingerprint": 3702373391,
+    "network": "mainnet",
+    "wallet_id": 2,
+    "ticker": "MZ_XCH",
+    "asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+    "sage_version": "0.13.0"
+  },
+  "final_wallet_state": {
+    "xch": "240.800676512155",
+    "mz": "3381521.72",
+    "pending_transactions": 0,
+    "fillable_offers": 0,
+    "catalyst_buy_offers": 0,
+    "catalyst_sell_offers": 0,
+    "xch_locked_coins": 0,
+    "mz_locked_coins": 0,
+    "reservations": 0,
+    "fee_holds_mojos": "0",
+    "unresolved_fee_operations": 0,
+    "bot_running": false,
+    "coin_prep_running": false
+  },
+  "final_runtime_state": {
+    "lease_active": false,
+    "safety_latch": "resolved",
+    "catalyst_processes": 0,
+    "sage_processes": 0,
+    "port_5000_listeners": 0
+  },
+  "profile_hashes": {
+    "env_sha256": "A73F8C9D64EC1E07B864F18D7A91C110984C33B21FBBEBE28D2D399D1BCD68D5",
+    "bot_db_sha256": "B2AA80ECB8449CB30D66F85BD7DD944894713632539572F336505B0D3F1183FA",
+    "bot_db_wal_sha256": "8295B5F01A434D2E351279B3BE8AEA6315364C001E26C7D2D45A23BF7E424A48",
+    "bot_db_shm_sha256": "5C34304037FB1FB376EE8258204ABF35BDB48CFA0E3A6CF00769A35B8C1A8CD8"
+  },
+  "doctor": {
+    "passed": 8,
+    "warnings": [
+      "Splash unreachable",
+      "SPACESCAN_PRO_URL configured without SPACESCAN_API_KEY"
+    ]
+  },
+  "market_confidence": {
+    "state": "RED",
+    "can_create": false,
+    "can_requote": false,
+    "can_increase_exposure": false,
+    "reasons": [
+      "out_of_range_depth_excluded",
+      "single_provider_dependency",
+      "confidence_snapshot_expired",
+      "market_evidence_expired"
+    ]
+  },
+  "automation_limitation": "Native computer-use helper could not write kernel assets; Playwright Chromium exercised the exact localhost package process instead."
+}
