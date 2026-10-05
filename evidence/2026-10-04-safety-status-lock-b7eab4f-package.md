@@ -173,3 +173,28 @@ with zero authoritative fee spend and no Coin Prep approval.
 This is evidence that this particular stopped run survived the completed
 backup. It does not establish the cause of the earlier heartbeat failure or
 pass the still-running 24-hour window and live offer lifecycle.
+
+## Exact-candidate TEST 7 review-only Bootstrap preview
+
+On 2026-10-05 around 07:07 UTC the original-profile native window for exact
+`b7eab4f` PID `20784` generated a review-only Bootstrap preview. The process
+path, EXE SHA-256 `9EB27A8DFCB15B026318F75B797B6FAD628A9D46AB44DFC49C9CE2F9AACF3C8A`,
+and sole port 5000 owner matched the clean build. The locally entered terms
+were a one-day expiry, `0.000075` XCH/MZ anchor, `0.9` XCH and `12000` MZ
+market budgets, `0.001` XCH fee cap, and zero subsidy. The UI returned
+`REVIEW ONLY — no wallet action`, the exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+a fixed `0.0000375–0.00015` corridor, first stage 10%, and three buy plus
+three sell offers. The exact-asset checkbox remained unchecked and Start
+Campaign disabled. Follow authority was restored locally without saving;
+the window was left on Dashboard.
+
+Afterward, the bot remained stopped, Bootstrap inactive with no attention
+required, safety ALLOWED with an owned lease, and both local and Sage fillable
+offer counts zero. Sage pending transactions were zero. Balances remained
+`138.470301476875` XCH and `780212.284` MZ. No campaign, fee approval,
+settings save, offer, Coin Prep operation, or wallet transaction occurred.
+At monitor sample 594, all 594 one-minute samples remained clean. The
+evidence-only PR head `4b0b537b6658eb90974c4c85dcc122a27e9480d3`
+passed all 11 CI checks, including unit tests. This closes the exact-candidate
+review-only preview, not approval or the live financial lifecycle.
