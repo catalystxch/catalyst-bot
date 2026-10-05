@@ -4269,6 +4269,16 @@ def api_safety_quarantine_status(quarantine_id: str):
 def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
 
+    import wallet
+
+    try:
+        if wallet.get_wallet_backend_authority() == "sage" and callable(
+            getattr(wallet, "get_authoritative_offer_absence_by_ids", None)
+        ):
+            return _collect_sage_quarantine_absence_proof(requirements, wallet)
+    except Exception:
+        pass
+
     from offer_reconciliation import (
         load_authoritative_evidence,
         load_sage_offer_history,
@@ -4414,6 +4424,125 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         "identity_provenance": identity_provenance,
         "absent_offer_ids": sorted(absent_offer_ids),
         "coins": [coins_by_id[key] for key in sorted(coins_by_id)],
+    }
+
+
+def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) -> dict:
+    """Bind exact Sage MissingOffer reads to the quarantined IDs and coins."""
+
+    observed_at = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    offers = requirements.get("offers", [])
+    trade_ids = tuple(sorted(offer["trade_id"] for offer in offers))
+    # An empty quarantine still performs a real endpoint read. A normal Sage
+    # MissingOffer response for this sentinel verifies route availability.
+    query_ids = trade_ids or ("0" * 64,)
+    complete = False
+    read_performed = False
+    absent: list[str] = []
+    coins: list[dict] = []
+    try:
+        before = wallet_module.get_wallet_identity()
+        result = wallet_module.get_authoritative_offer_absence_by_ids(query_ids)
+        read_performed = True
+        after = wallet_module.get_wallet_identity()
+
+        def identity_hash(identity):
+            if type(identity) is not dict:
+                return None
+            value = identity.get("wallet_fingerprint_hash")
+            if value is None and type(identity.get("fingerprint")) is int:
+                value = hashlib.sha256(
+                    f"fingerprint:{identity['fingerprint']}".encode("utf-8")
+                ).hexdigest()
+            return value
+
+        def identity_ok(identity):
+            if type(identity) is not dict:
+                return False
+            network = identity.get("network_id")
+            if network is None:
+                network = identity.get("network")
+            return bool(
+                identity.get("success") is True
+                and identity.get("backend") == "sage"
+                and identity_hash(identity) == requirements["wallet_fingerprint_hash"]
+                and network == requirements["network"]
+                and type(identity.get("observed_at_utc")) is str
+                and identity["observed_at_utc"]
+            )
+
+        absence_ok = bool(
+            type(result) is dict
+            and result.get("complete") is True
+            and result.get("requested_ids") == list(query_ids)
+            and result.get("absent_offer_ids") == list(query_ids)
+        )
+        expected_coins = sorted(
+            {coin_id for offer in offers for coin_id in offer["selected_coin_ids"]}
+        )
+        raw_coins = (
+            wallet_module.get_coins_by_ids(expected_coins) if expected_coins else {}
+        )
+        normalized: dict[str, dict] = {}
+        if type(raw_coins) is dict and len(raw_coins) == len(expected_coins):
+            for raw_id, row in raw_coins.items():
+                coin_id = str(raw_id).lower().removeprefix("0x")
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", coin_id) is None
+                    or coin_id not in expected_coins
+                    or type(row) is not dict
+                    or (
+                        row.get("coin_id") is not None
+                        and str(row["coin_id"]).lower().removeprefix("0x") != coin_id
+                    )
+                ):
+                    break
+                normalized[coin_id] = {
+                    "coin_id": coin_id,
+                    "owned": row.get("owned", True) is True,
+                    "unlocked": (
+                        (
+                            row.get("spent_height") is None
+                            or (
+                                type(row.get("spent_height")) is int
+                                and row["spent_height"] == 0
+                            )
+                        )
+                        and row.get("locked", False) is False
+                        and not row.get("offer_id")
+                    ),
+                }
+        coins = [normalized[key] for key in sorted(normalized)]
+        complete = bool(
+            identity_ok(before)
+            and identity_ok(after)
+            and absence_ok
+            and set(normalized) == set(expected_coins)
+        )
+        if complete:
+            absent = list(trade_ids)
+    except Exception:
+        complete = False
+    return {
+        "version": 2,
+        "wallet_backend": "sage",
+        "quarantine_id": requirements["quarantine_id"],
+        "recovery_id": requirements["recovery_id"],
+        "latch_generation": requirements["latch_generation"],
+        "wallet_fingerprint_hash": requirements["wallet_fingerprint_hash"],
+        "network": requirements["network"],
+        "authority_digest": requirements["authority_digest"],
+        "observed_at": observed_at,
+        "history_complete": complete,
+        "authoritative_read_performed": read_performed,
+        "history_provenance": "wallet.get_authoritative_offer_absence_by_ids",
+        "identity_provenance": "wallet.get_wallet_identity",
+        "absent_offer_ids": absent,
+        "coins": coins,
     }
 
 

@@ -1537,6 +1537,16 @@ def _sage_post(
             )
         return parsed
 
+    if (
+        path.strip("/") == "get_offer"
+        and resp.status == 404
+        and type(payload.get("offer_id")) is str
+        and len(payload["offer_id"]) == 64
+        and all(char in "0123456789abcdef" for char in payload["offer_id"])
+        and data == f"Missing offer: {payload['offer_id']}"
+    ):
+        raise SageOperationalError(status=404, error_code="SAGE_OFFER_NOT_FOUND")
+
     try:
         parsed = _json.loads(data)
     except (TypeError, ValueError):
@@ -1590,6 +1600,7 @@ _SAGE_FIXED_MESSAGES = {
     "NO_SPENDABLE_COINS": "Sage reports that no spendable coins are available.",
     "SAGE_CONNECTION_ERROR": "The Sage RPC service could not be reached.",
     "SAGE_HTTP_ERROR": "The Sage RPC service returned an HTTP error.",
+    "SAGE_OFFER_NOT_FOUND": "Sage has no offer with that exact ID.",
     "SAGE_RPC_ERROR": "The Sage RPC request failed.",
     "UNKNOWN_UNSPENT": "Sage reports that an input coin is not unspent.",
 }
@@ -5102,15 +5113,7 @@ def get_authoritative_offer_history(
     }
 
 
-def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
-    """Read one exact Sage DB row per requested offer, without listing history.
-
-    Sage's ``get_offers`` ignores pagination and grows with the wallet's
-    lifetime. Its native ``get_offer`` endpoint instead indexes one offer ID.
-    A missing, mismatched, or malformed row invalidates the whole set; callers
-    cannot mistake a partial cohort for complete cancellation evidence.
-    """
-
+def _require_exact_offer_ids(offer_ids: tuple[str, ...]) -> None:
     valid = (
         type(offer_ids) is tuple
         and 0 < len(offer_ids) <= 256
@@ -5124,6 +5127,18 @@ def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
     )
     if not valid:
         raise ValueError("exact offer IDs must be distinct bounded hex IDs")
+
+
+def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
+    """Read one exact Sage DB row per requested offer, without listing history.
+
+    Sage's ``get_offers`` ignores pagination and grows with the wallet's
+    lifetime. Its native ``get_offer`` endpoint instead indexes one offer ID.
+    A missing, mismatched, or malformed row invalidates the whole set; callers
+    cannot mistake a partial cohort for complete cancellation evidence.
+    """
+
+    _require_exact_offer_ids(offer_ids)
 
     records = []
     for offer_id in offer_ids:
@@ -5169,6 +5184,43 @@ def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
         "complete": True,
         "requested_ids": list(offer_ids),
         "offers": records,
+        "read_error": None,
+    }
+
+
+def get_authoritative_offer_absence_by_ids(offer_ids: tuple[str, ...]) -> dict:
+    """Prove exact Sage DB absence only from its offer-specific 404 response.
+
+    A generic 404 can mean the RPC route is unavailable. The transport emits
+    ``SAGE_OFFER_NOT_FOUND`` only for the native MissingOffer text containing
+    the exact requested ID; every other response leaves this proof incomplete.
+    """
+
+    _require_exact_offer_ids(offer_ids)
+    absent: list[str] = []
+    for offer_id in offer_ids:
+        try:
+            result = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+        except Exception:
+            result = None
+        if not (
+            type(result) is dict
+            and result.get("success") is False
+            and result.get("error_code") == "SAGE_OFFER_NOT_FOUND"
+            and result.get("endpoint") == "get_offer"
+            and result.get("http_status") == 404
+        ):
+            return {
+                "complete": False,
+                "requested_ids": list(offer_ids),
+                "absent_offer_ids": [],
+                "read_error": "exact_offer_absence_incomplete",
+            }
+        absent.append(offer_id)
+    return {
+        "complete": True,
+        "requested_ids": list(offer_ids),
+        "absent_offer_ids": absent,
         "read_error": None,
     }
 

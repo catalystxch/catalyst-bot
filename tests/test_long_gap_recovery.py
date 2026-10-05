@@ -494,6 +494,75 @@ def test_quarantine_resolution_accepts_only_fresh_exact_complete_proof():
 
     assert decision["allowed"] is True
     assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
+
+
+def test_quarantine_accepts_exact_sage_absence_provenance_only_for_v2():
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    requirements = {
+        "quarantine_id": "quarantine:" + "a" * 64,
+        "recovery_id": "recovery:" + "b" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "c" * 64,
+        "offers": [
+            {
+                "intent_id": "intent-1",
+                "trade_id": "2" * 64,
+                "selected_coin_ids": ["1" * 64],
+            }
+        ],
+    }
+    proof = {
+        **{
+            key: requirements[key]
+            for key in (
+                "quarantine_id",
+                "recovery_id",
+                "latch_generation",
+                "wallet_fingerprint_hash",
+                "network",
+                "authority_digest",
+            )
+        },
+        "version": 2,
+        "wallet_backend": "sage",
+        "observed_at": "2026-08-21T12:02:00.000000Z",
+        "history_complete": True,
+        "authoritative_read_performed": True,
+        "history_provenance": "wallet.get_authoritative_offer_absence_by_ids",
+        "identity_provenance": "wallet.get_wallet_identity",
+        "absent_offer_ids": ["2" * 64],
+        "coins": [{"coin_id": "1" * 64, "owned": True, "unlocked": True}],
+    }
+
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert decision["allowed"] is True
+
+    proof["absent_offer_ids"] = []
+    denied = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert denied["reason_code"] == "QUARANTINED_OFFER_ABSENCE_INCOMPLETE"
+
+    proof["absent_offer_ids"] = ["2" * 64]
+    proof["history_provenance"] = "wallet.get_all_offers"
+    denied = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert denied["reason_code"] == "QUARANTINE_FULL_HISTORY_INCOMPLETE"
     assert len(decision["proof_sha256"]) == 64
 
 
@@ -1669,6 +1738,7 @@ def test_empty_quarantine_proof_requires_actual_authoritative_history_read(monke
     import wallet
     from runtime_recovery import validate_quarantine_resolution_proof
 
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "chia")
     calls = []
     monkeypatch.setattr(
         wallet,
@@ -1714,6 +1784,7 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
     import wallet
     from runtime_recovery import validate_quarantine_resolution_proof
 
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "chia")
     observed = datetime.now(timezone.utc)
     monkeypatch.setattr(
         wallet,
@@ -1748,6 +1819,210 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
 
     assert decision["allowed"] is True
     assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
+
+
+def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    trade_id = "2" * 64
+    coin_id = "1" * 64
+    requirements = {
+        "quarantine_id": "quarantine:" + "8" * 64,
+        "recovery_id": "recovery:" + "8" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "e" * 64,
+        "offers": [{"trade_id": trade_id, "selected_coin_ids": [coin_id]}],
+    }
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network_id": NETWORK,
+            "observed_at_utc": observed,
+        },
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded history is not an absence proof")
+        ),
+    )
+    calls = []
+
+    def absence(ids):
+        calls.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "absent_offer_ids": list(ids),
+        }
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", absence)
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+    assert calls == [(trade_id,)]
+    assert proof["version"] == 2
+    assert decision["allowed"] is True
+
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_absence_by_ids",
+        lambda ids: {
+            "complete": False,
+            "requested_ids": list(ids),
+            "absent_offer_ids": [],
+        },
+    )
+    denied = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            denied,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", absence)
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {
+            "0x" + ids[0]: {
+                "amount": 1000,
+                "spent_height": None,
+                "locked": "false",
+            }
+        },
+    )
+    malformed_coin = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            malformed_coin,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+
+    identities = iter(
+        [
+            {
+                "success": True,
+                "backend": "sage",
+                "wallet_fingerprint_hash": WALLET_HASH,
+                "network_id": NETWORK,
+                "observed_at_utc": observed,
+            },
+            {
+                "success": True,
+                "backend": "sage",
+                "wallet_fingerprint_hash": "0" * 64,
+                "network_id": NETWORK,
+                "observed_at_utc": observed,
+            },
+        ]
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: next(identities))
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+    drifted = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            drifted,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+
+
+def test_sage_empty_quarantine_uses_exact_missing_offer_probe(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    requirements = {
+        "quarantine_id": "quarantine:" + "9" * 64,
+        "recovery_id": "recovery:" + "9" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "f" * 64,
+        "offers": [],
+    }
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network_id": NETWORK,
+            "observed_at_utc": observed,
+        },
+    )
+    requested = []
+
+    def probe(ids):
+        requested.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "absent_offer_ids": list(ids),
+        }
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", probe)
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    assert requested == [("0" * 64,)]
+    assert proof["version"] == 2
+    assert proof["absent_offer_ids"] == []
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            proof,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is True
+    )
 
 
 def test_quarantine_api_rejects_oversized_body_before_json_allocation():
