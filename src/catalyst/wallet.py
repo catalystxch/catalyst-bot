@@ -203,6 +203,7 @@ else:
         cleanup_expired_offers,
         get_all_offers,
         get_authoritative_offer_history,
+        get_authoritative_offers_by_ids,
         get_offer_bech32,
         classify_offers_from_list,
         classify_open_offers_for_pair,

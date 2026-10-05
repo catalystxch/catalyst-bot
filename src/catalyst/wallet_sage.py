@@ -5102,6 +5102,77 @@ def get_authoritative_offer_history(
     }
 
 
+def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
+    """Read one exact Sage DB row per requested offer, without listing history.
+
+    Sage's ``get_offers`` ignores pagination and grows with the wallet's
+    lifetime. Its native ``get_offer`` endpoint instead indexes one offer ID.
+    A missing, mismatched, or malformed row invalidates the whole set; callers
+    cannot mistake a partial cohort for complete cancellation evidence.
+    """
+
+    valid = (
+        type(offer_ids) is tuple
+        and 0 < len(offer_ids) <= 256
+        and len(set(offer_ids)) == len(offer_ids)
+        and all(
+            type(offer_id) is str
+            and len(offer_id) == 64
+            and all(char in "0123456789abcdef" for char in offer_id)
+            for offer_id in offer_ids
+        )
+    )
+    if not valid:
+        raise ValueError("exact offer IDs must be distinct bounded hex IDs")
+
+    records = []
+    for offer_id in offer_ids:
+        try:
+            result = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+            if (
+                type(result) is not dict
+                or (
+                    result.get("success") is not None
+                    and result.get("success") is not True
+                )
+                or type(result.get("offer")) is not dict
+            ):
+                raise ValueError("exact offer read failed")
+            row = result["offer"]
+            if (
+                len(row) > 128
+                or row.get("offer_id") != offer_id
+                or row.get("trade_id", offer_id) != offer_id
+                or type(row.get("status")) not in (str, int)
+                or type(row.get("summary")) is not dict
+            ):
+                raise ValueError("exact offer identity or shape mismatch")
+            bounded_row = {
+                key: value
+                for key, value in row.items()
+                if key not in {"offer", "offer_bech32"}
+            }
+            bounded_row["trade_id"] = offer_id
+            summary = bounded_row["summary"]
+            if "maker" in summary or "taker" in summary:
+                bounded_row["summary"] = _normalize_sage_summary(summary)
+            records.append(bounded_row)
+        except Exception:
+            return {
+                "complete": False,
+                "requested_ids": list(offer_ids),
+                "offers": [],
+                "read_error": "exact_offer_read_incomplete",
+            }
+
+    return {
+        "complete": True,
+        "requested_ids": list(offer_ids),
+        "offers": records,
+        "read_error": None,
+    }
+
+
 def _normalize_sage_summary(sage_summary: dict) -> dict:
     """Convert Sage's maker/taker summary format to Chia's offered/requested.
 
