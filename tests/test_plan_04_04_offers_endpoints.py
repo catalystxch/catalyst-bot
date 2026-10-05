@@ -1247,7 +1247,7 @@ class TestCancelAllPost(_FlaskBase):
         assert "cancelResult.timeout_seconds" in shutdown_source
         assert "await waitForShutdownCancelAllCompletion" in shutdown_source
         cancel_response_window = shutdown_source.split(
-            "const cancelResult = await cancelResp.json();", 1
+            "const cancelResult = await requestShutdownCancelAllAfterStop();", 1
         )[1].split("const isAsyncCancel = cancelResult.async === true;", 1)[0]
         assert "stopShutdownCancelAllPoll();" not in cancel_response_window
         assert "cancelled + pending + failed !== count" in shutdown_source

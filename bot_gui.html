@@ -33694,6 +33694,70 @@
             throw new Error('Cancellation worker did not finish before the shutdown timeout.');
         }
 
+        async function waitForShutdownBotStop(timeoutMs = 60000, pollMs = 250) {
+            const startedAt = Date.now();
+            while (Date.now() - startedAt < timeoutMs) {
+                const stateResp = await apiFetch(`${API_URL}/bot/state`);
+                let state = {};
+                try {
+                    state = await stateResp.json();
+                } catch (_) {
+                    throw new Error('Bot stop status returned an invalid response.');
+                }
+                if (!stateResp.ok || state.error) {
+                    throw new Error(state.error || 'Could not verify that the bot stopped.');
+                }
+                const status = String(state.status || '').trim().toLowerCase();
+                const settledStatuses = new Set(['stopped', 'blocked', 'error']);
+                if (settledStatuses.has(status)) {
+                    if (state.running === false) {
+                        return state;
+                    }
+                    throw new Error(`Bot reported ${status} while its running flag was not false.`);
+                }
+                if (status !== 'stopping') {
+                    throw new Error(`Bot entered unexpected state while stopping: ${status || 'unknown'}.`);
+                }
+                updateShutdownProgress(
+                    'Stopping the bot...',
+                    'Bot stop is finishing; waiting for background workers and finalizers.'
+                );
+                await new Promise(resolve => setTimeout(resolve, pollMs));
+            }
+            throw new Error('Timed out waiting for the bot to finish stopping.');
+        }
+
+        async function requestShutdownCancelAllAfterStop(timeoutMs = 60000, initialBackoffMs = 250) {
+            const startedAt = Date.now();
+            let attempt = 0;
+            while (Date.now() - startedAt < timeoutMs) {
+                const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
+                let cancelResult = {};
+                try {
+                    cancelResult = await cancelResp.json();
+                } catch (_) {
+                    throw new Error('Cancel all returned an invalid response.');
+                }
+                if (cancelResp.ok && cancelResult.success === true) {
+                    return cancelResult;
+                }
+                const mayRetry = cancelResp.status === 409
+                    && cancelResult.reason === 'BOT_STOPPING'
+                    && cancelResult.retryable === true;
+                if (!mayRetry) {
+                    throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');
+                }
+                attempt += 1;
+                updateShutdownProgress(
+                    'Waiting for bot stop...',
+                    'Bot stop is still completing. Retrying wallet cancellation safely.'
+                );
+                const backoffMs = Math.min(2000, initialBackoffMs * Math.pow(2, Math.min(attempt - 1, 3)));
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+            }
+            throw new Error('Timed out waiting to start wallet cancellation after bot stop.');
+        }
+
         function finishShutdownProgress(success, detailText) {
             stopShutdownCancelAllPoll();
             const title = document.getElementById('shutdownProgressTitle');
@@ -33785,15 +33849,20 @@
                 // Step 1: Stop the bot loop
                 updateShutdownProgress('Stopping the bot...', 'Pausing pricing, watchers, and trading loops.');
                 addLogEntry('info', '   Step 1: Stopping bot loop...');
+                const stopResp = await apiFetch(`${API_URL}/bot/stop`, { method: 'POST' });
+                let stopResult = {};
                 try {
-                    const stopResp = await apiFetch(`${API_URL}/bot/stop`, { method: 'POST' });
-                    await stopResp.json();
-                    setShutdownStep('Stop', 'done', 'Bot loop and background watchers stopped.');
-                    addLogEntry('success', '   Bot loop stopped');
-                } catch(e) {
-                    setShutdownStep('Stop', 'done', 'Bot was already stopped before shutdown.');
-                    addLogEntry('warning', '   Bot loop was not running');
+                    stopResult = await stopResp.json();
+                } catch (_) {
+                    throw new Error('Bot stop returned an invalid response.');
                 }
+                if (!stopResp.ok || stopResult.error) {
+                    throw new Error(stopResult.error || 'Could not request bot stop.');
+                }
+                setShutdownStep('Stop', 'active', 'Stop requested. Waiting for background workers and finalizers.');
+                await waitForShutdownBotStop();
+                setShutdownStep('Stop', 'done', 'Bot loop and background workers stopped.');
+                addLogEntry('success', '   Bot stop completed authoritatively');
 
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {
@@ -33801,13 +33870,7 @@
                     updateShutdownProgress('Cancelling offers...', 'Sending cancel request to wallet...');
                     addLogEntry('info', '   Step 2: Cancelling all offers...');
                     try {
-                        startShutdownCancelAllPoll();
-                        const cancelResp = await apiFetch(`${API_URL}/offers/cancel_all`, { method: 'POST' });
-                        const cancelResult = await cancelResp.json();
-
-                        if (!cancelResult.success) {
-                            throw new Error(cancelResult.error || 'Cancel all returned an unexpected response.');
-                        }
+                        const cancelResult = await requestShutdownCancelAllAfterStop();
 
                         const isAsyncCancel = cancelResult.async === true;
                         const count = isAsyncCancel
@@ -33818,6 +33881,7 @@
                         }
 
                         if (isAsyncCancel) {
+                            startShutdownCancelAllPoll();
                             addLogEntry('info', `   Journaling cancellation requests for ${count} offers...`);
                             const serverTimeoutSeconds = Number(cancelResult.timeout_seconds);
                             const cancelTimeoutMs = Number.isFinite(serverTimeoutSeconds) && serverTimeoutSeconds > 0

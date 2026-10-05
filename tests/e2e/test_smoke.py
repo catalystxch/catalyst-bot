@@ -2103,6 +2103,187 @@ def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
     assert "Sending cancel request to Sage..." not in confirm_source
 
 
+def test_shutdown_waits_for_stopped_state_and_retries_only_bot_stopping(page):
+    """Shutdown must prove stop completion before wallet-wide cancellation."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const calls = [];
+            const steps = [];
+            const progress = [];
+            let stateReads = 0;
+            let cancelAttempts = 0;
+
+            document.getElementById('shutdownCancelOffers').checked = true;
+            document.getElementById('shutdownCancelConfirmed').value = 'yes';
+            setShutdownStep = (name, status, detail) => {
+                steps.push({name, status, detail, callCount: calls.length});
+            };
+            updateShutdownProgress = (title, detail) => progress.push({title, detail});
+            addLogEntry = () => {};
+            startShutdownCancelAllPoll = () => {};
+            stopShutdownCancelAllPoll = () => {};
+            startupWaitForBackendShutdown = async () => true;
+            closeDesktopWindowAfterShutdown = async () => true;
+
+            apiFetch = async (path) => {
+                calls.push(path);
+                if (path.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({status: 'stopping'}), {status: 202});
+                }
+                if (path.endsWith('/bot/state')) {
+                    stateReads += 1;
+                    return new Response(JSON.stringify({
+                        status: stateReads < 2 ? 'stopping' : 'blocked',
+                        running: false
+                    }), {status: 200});
+                }
+                if (path.endsWith('/offers/cancel_all')) {
+                    cancelAttempts += 1;
+                    if (cancelAttempts === 1) {
+                        return new Response(JSON.stringify({
+                            success: false,
+                            error: 'Bot stop is still completing; retry Cancel All after it finishes.',
+                            reason: 'BOT_STOPPING',
+                            retryable: true
+                        }), {status: 409});
+                    }
+                    return new Response(JSON.stringify({
+                        success: true,
+                        async: false,
+                        cancelled: 0
+                    }), {status: 200});
+                }
+                if (path.endsWith('/shutdown')) {
+                    return new Response(JSON.stringify({success: true}), {status: 200});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+
+            await confirmShutdown();
+            return {calls, steps, progress, stateReads, cancelAttempts};
+        }"""
+    )
+
+    shutdown_calls = [
+        path
+        for path in result["calls"]
+        if path
+        in {
+            "/api/bot/stop",
+            "/api/bot/state",
+            "/api/offers/cancel_all",
+            "/api/shutdown",
+        }
+    ]
+    assert shutdown_calls[:5] == [
+        "/api/bot/stop",
+        "/api/bot/state",
+        "/api/bot/state",
+        "/api/offers/cancel_all",
+        "/api/offers/cancel_all",
+    ]
+    assert result["stateReads"] == 2
+    assert result["cancelAttempts"] == 2
+    stop_done = next(
+        step
+        for step in result["steps"]
+        if step["name"] == "Stop" and step["status"] == "done"
+    )
+    assert stop_done["callCount"] >= 3
+    assert any(
+        "finishing" in str(item["detail"]).lower() for item in result["progress"]
+    )
+    assert any(
+        "retry" in str(item["detail"]).lower() for item in result["progress"]
+    )
+
+
+def test_shutdown_stop_poll_times_out_fail_closed(page):
+    """A stop that never becomes authoritative must not proceed to cancellation."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let calls = 0;
+            apiFetch = async () => {
+                calls += 1;
+                return new Response(JSON.stringify({
+                    status: 'stopping',
+                    running: false
+                }), {status: 200});
+            };
+            updateShutdownProgress = () => {};
+            try {
+                await waitForShutdownBotStop(15, 1);
+                return {resolved: true, calls};
+            } catch (error) {
+                return {resolved: false, calls, message: error.message};
+            }
+        }"""
+    )
+    assert result["resolved"] is False
+    assert result["calls"] >= 1
+    assert "timed out" in result["message"].lower()
+
+
+def test_shutdown_cancel_retry_is_bounded_and_rejects_other_errors(page):
+    """Only retryable BOT_STOPPING conflicts may retry, and never forever."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            updateShutdownProgress = () => {};
+            let mode = 'other';
+            let calls = 0;
+            apiFetch = async () => {
+                calls += 1;
+                if (mode === 'other') {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        error: 'Wallet unavailable',
+                        reason: 'WALLET_UNAVAILABLE',
+                        retryable: false
+                    }), {status: 503});
+                }
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'Bot stop is still completing; retry Cancel All after it finishes.',
+                    reason: 'BOT_STOPPING',
+                    retryable: true
+                }), {status: 409});
+            };
+
+            let otherMessage = '';
+            try {
+                await requestShutdownCancelAllAfterStop(15, 1);
+            } catch (error) {
+                otherMessage = error.message;
+            }
+            const otherCalls = calls;
+
+            mode = 'stopping';
+            calls = 0;
+            let timeoutMessage = '';
+            try {
+                await requestShutdownCancelAllAfterStop(15, 1);
+            } catch (error) {
+                timeoutMessage = error.message;
+            }
+            return {otherMessage, otherCalls, timeoutMessage, timeoutCalls: calls};
+        }"""
+    )
+    assert result["otherMessage"] == "Wallet unavailable"
+    assert result["otherCalls"] == 1
+    assert "timed out" in result["timeoutMessage"].lower()
+    assert result["timeoutCalls"] >= 1
+
+
 def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     """Submitted cancels must be proven terminal before prep starts automatically."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
