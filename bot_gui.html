@@ -4121,17 +4121,21 @@
             font-size: 16px;
             font-weight: 600;
             color: var(--slate-200);
+            overflow-wrap: anywhere;
         }
+        .fp-card-info { min-width: 0; flex: 1; }
         .fp-card-number {
             display: block;
             font-size: 14px;
             color: var(--slate-500);
             font-family: var(--font-mono);
+            overflow-wrap: anywhere;
         }
         .fp-card-arrow {
             margin-left: auto;
             color: var(--slate-500);
             font-size: 22px;
+            flex-shrink: 0;
         }
         .fp-card-label { display: block; }
 
@@ -9169,7 +9173,7 @@
                          is visible directly under the token pill) ===== -->
                     <div class="v4-toolbar v4-toolbar--primary">
                         <div class="v4-toolbar-left">
-                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot()" disabled>▶ Start</button>
+                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot()" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
                         <button class="btn btn-cancel btn-danger" id="cancelAllBtn" onclick="cancelAllOffers()">Cancel All (<span id="cancelAllCount">0</span>) <span class="cc-help">?<span class="cc-tooltip">Cancels every active buy and sell offer — use for a clean restart or wallet switch. Stop the bot first.</span></span></button>
@@ -9186,7 +9190,7 @@
                                 <span id="walletTypeIcon">⚡</span>
                                 <span id="walletTypeLabel">Sage</span>
                             </div>
-                            <div id="fingerprintDisplay" onclick="showWalletPickerModal()" style="display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 6px; font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 600; background: rgba(148,163,184,0.1); color: var(--text-tertiary); border: 1px solid rgba(148,163,184,0.2); cursor: pointer; transition: all 0.2s;" onmouseover="this.style.borderColor='rgba(245,158,11,0.5)'; this.style.background='rgba(245,158,11,0.08)'" onmouseout="this.style.borderColor='rgba(148,163,184,0.2)'; this.style.background='rgba(148,163,184,0.1)'">🔑 <span id="fingerprintValue">—</span> <span class="cc-help">?<span class="cc-tooltip">Click to change your active wallet or fingerprint</span></span></div>
+                            <button type="button" id="fingerprintDisplay" aria-label="Change wallet fingerprint" onclick="showWalletPickerModal()" style="display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 6px; font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 600; background: rgba(148,163,184,0.1); color: var(--text-tertiary); border: 1px solid rgba(148,163,184,0.2); cursor: pointer; transition: all 0.2s;" onmouseover="this.style.borderColor='rgba(245,158,11,0.5)'; this.style.background='rgba(245,158,11,0.08)'" onmouseout="this.style.borderColor='rgba(148,163,184,0.2)'; this.style.background='rgba(148,163,184,0.1)'">🔑 <span id="fingerprintValue">—</span> <span class="cc-help">?<span class="cc-tooltip">Click to change your active wallet or fingerprint</span></span></button>
                         </div>
                     </div>
 
@@ -18046,6 +18050,7 @@
             const valueEl = document.getElementById('fingerprintValue');
             const reason = walletSwitchLockedReason();
             const locked = !!reason;
+            display.disabled = locked;
             display.style.cursor = locked ? 'not-allowed' : 'pointer';
             display.style.opacity = locked ? '0.6' : '1';
             if (locked) {
@@ -25662,6 +25667,26 @@
                     e.preventDefault();
                 }
             }, true);  // capture phase so we catch it before view handlers
+
+            // Keep keyboard focus in the wallet picker until it closes.
+            document.addEventListener('keydown', function(e) {
+                if (e.key !== 'Tab') return;
+                const top = findTopmostVisibleModal();
+                if (!top || top.id !== 'walletPickerModal') return;
+                const focusable = Array.from(top.querySelectorAll(
+                    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+                )).filter(el => el.getClientRects().length > 0);
+                if (!focusable.length) return;
+                const first = focusable[0];
+                const last = focusable[focusable.length - 1];
+                if (!top.contains(document.activeElement) || (e.shiftKey && document.activeElement === first)) {
+                    last.focus();
+                    e.preventDefault();
+                } else if (!e.shiftKey && document.activeElement === last) {
+                    first.focus();
+                    e.preventDefault();
+                }
+            }, true);
 
             // Backdrop click: clicking the overlay element itself (but not
             // its children) dismisses the modal.
@@ -33943,7 +33968,7 @@
                 cards.innerHTML = data.fingerprints.map((fp, i) => `
                     <button type="button" class="fp-card${currentFp === fp.fingerprint ? ' selected' : ''}" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
                         <span class="fp-card-icon" aria-hidden="true">🔑</span>
-                        <span>
+                        <span class="fp-card-info">
                             <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>
                             <span class="fp-card-number">${escapeHtml(fp.fingerprint)}</span>
                         </span>
@@ -38348,7 +38373,7 @@ async function startupShowFingerprints() {
         container.innerHTML = data.fingerprints.map((fp, i) => `
             <button type="button" class="fp-card" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
                 <span class="fp-card-icon" aria-hidden="true">🔑</span>
-                <span>
+                <span class="fp-card-info">
                     <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>
                     <span class="fp-card-number">${escapeHtml(fp.fingerprint)}</span>
                 </span>
