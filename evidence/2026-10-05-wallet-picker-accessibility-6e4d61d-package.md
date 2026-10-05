@@ -67,6 +67,33 @@ build, so it does not attest to the primary EXE bytes. The immutable
 [secondary evidence](https://github.com/catalystxch/catalyst-bot/commit/0b3b18f27954729e1b9ba6588e8a6312ce9358bd)
 records the bounded result.
 
+## Secondary original-profile read-only acceptance
+
+The secondary PC then backed up and hash-checked its original Harvestr
+profile (23 files, zero mismatches) and ran its exact-source Python 3.14
+package against that profile twice. Direct Sage 0.13.0 RPC before and after
+proved Chia mainnet, fingerprint `3702373391`, CAT wallet ID `2`, the exact
+MZ asset, unchanged `240.800676512155` XCH and `3,381,521.720` MZ,
+zero pending transactions and zero active fillable offers. The first launch
+retired an expired owner lease and both launches acquired and released their
+own leases cleanly. Runtime safety had zero blockers, the bot remained
+stopped, and an expired prior Bootstrap campaign correctly required an
+explicit stop before renewal. Its campaign, offer, Coin Prep, reservation,
+publication and fee-approval database projections and `.env` were unchanged.
+The supported Sage picker showed the single correct Harvestr wallet; the
+wallet card was not selected because that would persist configuration. No
+wallet or offer effect occurred. CATalyst and Sage were closed afterward.
+
+The secondary profile has historical fee approvals and a nonzero prior
+campaign fee spend, distinct from the primary TEST 7 profile. Its public
+authoritative fee view reports the maximum of proven evidence and the stored
+campaign row; the secondary PC confirmed that this difference was already
+present before the test and was not a startup write. The immutable
+[original-profile report](https://github.com/catalystxch/catalyst-bot/commit/a9bd85ea77727bf1b35e83b398d2cf60ab97c569)
+includes screenshots and backup/ledger comparisons. This passes only the
+secondary read-only startup, identity, fail-closed, shutdown and restart
+scope. Secondary live trading and fee lifecycle remain open.
+
 ## Live boundary
 
 The original TEST 7 profile is still running the previous exact `b7eab4f`
@@ -76,5 +103,5 @@ ALLOWED safety, synced Sage, stopped bot, and zero open offers. This window
 began on 2026-10-04 21:06 UTC and cannot complete before 2026-10-05 21:06
 UTC. It does not certify `6e4d61d`. Original-profile live acceptance of the
 new package, active-offer lifecycle and recovery, both 24-hour windows and
-final review remain open. The prior campaign is stopped with zero fee spend;
+final review remain open. The primary prior campaign is stopped with zero fee spend;
 there is no new campaign or fee approval and no wallet effect from this fix.
