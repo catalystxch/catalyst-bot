@@ -1123,48 +1123,14 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
         "reverse": True,
     }
     res = rpc("get_all_offers", payload, timeout=8)
-    if not res or not res.get("success"):
+    if type(res) is not dict or res.get("success") is not True:
         return None
 
-    # Handle different response formats
-    offers_list = res.get("trades")
-    if offers_list is None:
-        offers_list = res.get("offers")
-    if offers_list is None:
-        offers_list = res.get("trade_records")
-    if offers_list is None:
-        maybe = res.get("data") or {}
-        offers_list = maybe.get("trades") or maybe.get("offers") or []
-
-    if offers_list is None:
-        offers_list = []
-
-    if not isinstance(offers_list, list):
-        return []
-
-    return offers_list
-
-
-def get_authoritative_offer_history(
-    include_completed: bool = True, start: int = 0, end: int = 50
-):
-    """Read a bounded Chia page without treating malformed data as empty."""
-
-    result = rpc(
-        "get_all_offers",
-        {
-            "include_completed": include_completed,
-            "start": start,
-            "end": end,
-            "reverse": True,
-        },
-        timeout=8,
-    )
-    if type(result) is not dict or result.get("success") is not True:
-        return None
-    containers = [result]
-    if type(result.get("data")) is dict:
-        containers.append(result["data"])
+    # A successful RPC without an explicit, well-formed collection is an
+    # unreadable wallet snapshot, not proof that the offer book is empty.
+    containers = [res]
+    if type(res.get("data")) is dict:
+        containers.append(res["data"])
     pages = [
         container[key]
         for container in containers
@@ -1176,6 +1142,14 @@ def get_authoritative_offer_history(
     if any(type(offer) is not dict for offer in pages[0]):
         return None
     return pages[0]
+
+
+def get_authoritative_offer_history(
+    include_completed: bool = True, start: int = 0, end: int = 50
+):
+    """Use the strict Chia page reader for authoritative reconciliation."""
+
+    return get_all_offers(include_completed=include_completed, start=start, end=end)
 
 
 def get_offer_bech32(trade_id: str) -> str:

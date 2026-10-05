@@ -43,3 +43,20 @@ def test_authoritative_chia_history_accepts_nested_data_page():
             "reverse": True,
         },
     )
+
+
+def test_general_chia_offer_reader_rejects_missing_collection():
+    with patch.object(wallet_chia, "rpc", return_value={"success": True}):
+        assert wallet_chia.get_all_offers(False, 0, 50) is None
+
+
+def test_general_chia_offer_reader_rejects_malformed_collection():
+    with patch.object(
+        wallet_chia, "rpc", return_value={"success": True, "trades": "bad"}
+    ):
+        assert wallet_chia.get_all_offers(False, 0, 50) is None
+
+
+def test_general_chia_offer_reader_accepts_explicit_empty_page():
+    with patch.object(wallet_chia, "rpc", return_value={"success": True, "trades": []}):
+        assert wallet_chia.get_all_offers(False, 0, 50) == []
