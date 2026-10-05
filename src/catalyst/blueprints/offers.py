@@ -525,12 +525,16 @@ def api_cancel_all():
     if isinstance(bot, api_server.BotLoop):
         try:
             with bot._state_lock:
-                stopped = bot._bot_state.get("status") == "stopped"
+                stop_settled = bot._bot_state.get("status") in {
+                    "stopped",
+                    "blocked",
+                    "error",
+                }
             # RuntimeMonitor is a read-only health watcher and intentionally
             # remains active after BotLoop.stop(); it cannot publish offers.
             monitor = getattr(bot, "runtime_monitor", None)
             read_only_monitor_thread = getattr(monitor, "_thread", None)
-            quiescent = stopped and all(
+            quiescent = stop_settled and all(
                 thread is read_only_monitor_thread or not thread.is_alive()
                 for thread in api_server._shutdown_thread_refs(bot)
             )

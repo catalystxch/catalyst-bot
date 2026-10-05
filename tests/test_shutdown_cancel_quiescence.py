@@ -71,11 +71,12 @@ def test_cancel_all_rejects_unfinished_stop_before_wallet_history(
     history.assert_not_called()
 
 
-def test_cancel_all_allows_stopped_bot_with_read_only_monitor(monkeypatch):
+@pytest.mark.parametrize("status", ["stopped", "blocked", "error"])
+def test_cancel_all_allows_quiescent_bot_with_read_only_monitor(monkeypatch, status):
     bot = BotLoop.__new__(BotLoop)
     bot._running = False
     bot._state_lock = threading.Lock()
-    bot._bot_state = {"running": False, "status": "stopped"}
+    bot._bot_state = {"running": False, "status": status}
     bot._stop_finalize_thread = _DeadThread()
     bot.runtime_monitor = SimpleNamespace(_thread=_AliveThread())
     api_server.app.testing = True
