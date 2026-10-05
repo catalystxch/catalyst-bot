@@ -154,3 +154,22 @@ remained alive at sample 28 (`2026-10-04T21:33:45Z`): safety allowed, owned
 renewing lease, synced Sage, stopped bot and zero open offers while Windows
 Backup was running. The full 24-hour trace and live financial lifecycle remain
 open; this traversal closes only the native read-only view check.
+
+## Windows Backup overlap completed
+
+The host's scheduled Windows Backup task returned to `Ready` at monitor
+sample 475 (`2026-10-05T05:07:34Z`); Task Scheduler reported
+`LastTaskResult=0`. Across the first 474 60-second samples while the task
+reported `Running`, the exact `b7eab4f` PID remained alive, safety allowed,
+lease owned and renewing, Sage synced, bot stopped, and open offers zero.
+At sample 505 (`05:37:59Z`), all 505 samples still met those conditions.
+The smallest observed lease time remaining at a sample was 20.066 seconds;
+the largest safety GET latency was 303 ms. The exact executable SHA-256 and
+sole port 5000 owner still matched the clean build. Read-only Sage and app
+checks showed unchanged balances, zero pending transactions and fillable
+offers, inactive Bootstrap, zero blockers, and the stopped prior campaign
+with zero authoritative fee spend and no Coin Prep approval.
+
+This is evidence that this particular stopped run survived the completed
+backup. It does not establish the cause of the earlier heartbeat failure or
+pass the still-running 24-hour window and live offer lifecycle.
