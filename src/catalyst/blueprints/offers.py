@@ -519,6 +519,29 @@ def api_cancel_all():
             }
         ), 409
 
+    # stop(wait=False) clears is_running before its finalizer has joined
+    # offer-producing threads.  Wallet-wide cancellation must wait for that
+    # durable stop boundary, including any thread whose state is unreadable.
+    if isinstance(bot, api_server.BotLoop):
+        try:
+            with bot._state_lock:
+                stopped = bot._bot_state.get("status") == "stopped"
+            quiescent = stopped and all(
+                not thread.is_alive()
+                for thread in api_server._shutdown_thread_refs(bot)
+            )
+        except Exception:
+            quiescent = False
+        if not quiescent:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "Bot stop is still completing; retry Cancel All after it finishes.",
+                    "reason": "BOT_STOPPING",
+                    "retryable": True,
+                }
+            ), 409
+
     gate_status = api_server.mutation_gate.read_only_status()
     if getattr(gate_status, "allowed", False) is not True:
         reason = str(getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED")
