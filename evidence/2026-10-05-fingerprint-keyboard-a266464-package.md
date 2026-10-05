@@ -49,6 +49,18 @@ The immutable artifacts are pinned to commit
 - [Acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/81108fc26602dcddeb28a0947283f3138f3cfe9f/acceptance-artifacts/CATalyst-a266464-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/81108fc26602dcddeb28a0947283f3138f3cfe9f/acceptance-artifacts/Catalyst-Setup-a266464-1.4.0.exe)
 
+## Independent secondary check
+
+The secondary PC verified detached exact source `a266464` and byte-identical
+locally bundled UI. Its regression passed 2 tests, and an independent Chromium
+probe against the bundled HTML verified native button names, one selection per
+Enter and Space key, a visible focus outline, no network mutation, and no
+overflow at 390 by 700. CATalyst and Sage remained stopped there; the
+original Harvestr profile hashes were unchanged. Its Python 3.14 build had a
+different EXE hash, so it was not treated as an exact verification of the
+primary EXE. The immutable [secondary evidence](https://github.com/catalystxch/catalyst-bot/commit/a67ace60c808c125af3dd2a3c2c540b442739934)
+records the bounded result.
+
 ## Live boundary
 
 The original TEST 7 profile is still running the previous exact `b7eab4f`
@@ -56,8 +68,8 @@ package. Its read-only stability monitor had 1,136 clean one-minute samples
 through 2026-10-05 16:19 UTC, with an owned lease, ALLOWED safety, a stopped
 bot, and zero open offers. That 24-hour window began at 2026-10-04 21:06 UTC
 and cannot complete before 2026-10-05 21:06 UTC. It does not certify the new
-`a266464` runtime. Independent secondary-PC verification of the keyboard fix
-and original-profile live acceptance of the new package remain open.
+`a266464` runtime. Original-profile live acceptance of the new package remains
+open, as does secondary original-profile live acceptance.
 
 The stopped prior campaign has zero authoritative fee spend. No new campaign
 or fee approval exists; the older `c665` approval is invalid for a new
