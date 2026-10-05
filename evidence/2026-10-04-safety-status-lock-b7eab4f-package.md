@@ -198,3 +198,35 @@ At monitor sample 594, all 594 one-minute samples remained clean. The
 evidence-only PR head `4b0b537b6658eb90974c4c85dcc122a27e9480d3`
 passed all 11 CI checks, including unit tests. This closes the exact-candidate
 review-only preview, not approval or the live financial lifecycle.
+
+## Completed stopped-profile 24-hour observation
+
+The original TEST 7 `b7eab4f` process remained the sole `127.0.0.1:5000`
+owner through the 24-hour boundary. Its executable path was
+`E:\catalyst-safety-readonly-b7eab4f-build\dist\catalyst\catalyst.exe` and
+SHA-256 remained
+`9EB27A8DFCB15B026318F75B797B6FAD628A9D46AB44DFC49C9CE2F9AACF3C8A`.
+The immutable first-24-hour trace snapshot is
+`E:\catalyst-stability-monitor-b7eab4f\trace-first-24h.jsonl`, SHA-256
+`2916F437E3C90515F0E11AAAD64C614C1FD2F5B1D589A530E5C381E2607BB6BE`.
+Its committed gzip copy is
+`evidence/2026-10-05-b7eab4f-stopped-profile-first-24h.jsonl.gz`, SHA-256
+`3EDFAEDCCECE78F2AE57D75A1B1FEC5C2B471C44422C66C1FA22ECA2FA2F57AC`;
+decompression reproduces the snapshot's hash exactly.
+It contains the start record and 1,419 read-only samples from
+2026-10-04T21:06:19.6939493Z through 2026-10-05T21:07:06.050923Z,
+spanning 24.012876937 hours. All samples had the exact PID alive, ALLOWED
+safety, an owned lease, synced Sage, a stopped bot, and zero open offers.
+There were zero failed or missing safety/health/offer reads, zero lease-version
+decreases, a minimum sampled lease remaining of 20.058 seconds, and a maximum
+sample gap of 84.685 seconds. Windows Backup reported Running in 474 samples.
+An end-state read confirmed unchanged `138.470301476875` XCH and
+`780212.284` MZ, fingerprint `736588221`, CAT wallet ID `2`, the exact MZ
+asset, zero open offers, and no safety blockers. No wallet mutation was made
+by this monitor.
+
+This completes the **stopped original-profile** stability observation for
+`b7eab4f`. It does not certify later source `74da24c`, a running bot, active
+offers, offer recovery, a secondary live campaign, or public readiness. The
+monitor continues toward its configured 25-hour end; its immutable 24-hour
+snapshot fixes the acceptance boundary independently of later samples.
