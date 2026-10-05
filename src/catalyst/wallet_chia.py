@@ -1148,13 +1148,34 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
 def get_authoritative_offer_history(
     include_completed: bool = True, start: int = 0, end: int = 50
 ):
-    """Use Chia's bounded offer page through the shared history-loader contract."""
+    """Read a bounded Chia page without treating malformed data as empty."""
 
-    return get_all_offers(
-        include_completed=include_completed,
-        start=start,
-        end=end,
+    result = rpc(
+        "get_all_offers",
+        {
+            "include_completed": include_completed,
+            "start": start,
+            "end": end,
+            "reverse": True,
+        },
+        timeout=8,
     )
+    if type(result) is not dict or result.get("success") is not True:
+        return None
+    containers = [result]
+    if type(result.get("data")) is dict:
+        containers.append(result["data"])
+    pages = [
+        container[key]
+        for container in containers
+        for key in ("trades", "offers", "trade_records")
+        if key in container
+    ]
+    if len(pages) != 1 or type(pages[0]) is not list:
+        return None
+    if any(type(offer) is not dict for offer in pages[0]):
+        return None
+    return pages[0]
 
 
 def get_offer_bech32(trade_id: str) -> str:
