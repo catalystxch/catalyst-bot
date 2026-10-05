@@ -15,4 +15,12 @@ Verification on Windows in `C:\catalyst\.superpowers\pr239-primary-integration`:
 - Focused exact Sage, cohort, transaction-height, scope and full-history contract cases: 9 passed.
 - Ruff check, Ruff format check and `git diff --check`: passed.
 
+At 2026-10-05T23:33Z, a read-only request to the configured primary Sage RPC
+returned 4,095 historical offers. An exact `get_offer` read for one ID from
+that set returned an `offer` object with the same `offer_id`, a string status
+and a dictionary summary. Only response shape and identity equality were
+printed; no offer content, credential or key was printed. This verifies the
+real Sage route used by the bounded reader, without a wallet effect or a
+live Task 9 resolution.
+
 The original TEST 7 profile still runs the prior `74da24c` executable in a stopped, read-only monitor. This source change has not been packaged or used for live wallet actions. Mainnet active-offer lifecycle/recovery, exact-candidate 24-hour windows, secondary live trading acceptance, quarantine history-growth recovery, and final review remain open. PR #220 stays draft.

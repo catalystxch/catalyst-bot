@@ -15,4 +15,15 @@ Windows verification:
 - Combined changed-area run: 113 passed and 342 subtests passed.
 - Ruff check, format and `git diff --check`: passed.
 
-The running original TEST 7 app is still the earlier `74da24c` package, stopped under a read-only monitor. This source has not yet been built, installed, or exercised against the live Sage 0.13.0 RPC. Real active-offer recovery, both exact-candidate 24-hour windows, live secondary lifecycle and final review remain open. PR #220 stays draft.
+## Original-profile read-only RPC shape
+
+At 2026-10-05T23:27Z, the source checkout made one read-only `get_offer` request
+for the fixed all-zero absent sentinel through the configured local Sage RPC
+and client certificate. The endpoint was `127.0.0.1:9257`; the response was
+HTTP 404 and the transport classified its exact body as
+`SAGE_OFFER_NOT_FOUND`. The script printed no certificate, token, private key,
+or offer payload. This checks the real missing-offer discriminator on the
+selected primary Sage installation; it does not exercise quarantine
+resolution or change the wallet.
+
+The running original TEST 7 app is still the earlier `74da24c` package, stopped under a read-only monitor. The new source has not yet run as the app against the original profile. Real quarantine resolution, active-offer recovery, both exact-candidate 24-hour windows, live secondary lifecycle and final review remain open. PR #220 stays draft.
