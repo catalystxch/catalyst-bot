@@ -6012,6 +6012,9 @@ _cancel_all_state = {
     "failed": 0,
 }
 _cancel_all_state_lock = threading.Lock()
+# Serialize the bot-start transition with Cancel All's stopped-book check and
+# worker reservation. The long-running worker is tracked by _cancel_all_state.
+_bot_cancel_lifecycle_lock = threading.Lock()
 
 
 # _set_cancel_all_state moved to blueprint

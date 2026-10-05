@@ -653,6 +653,34 @@ def api_bot_start():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
+    def cancel_all_in_progress():
+        try:
+            with server._cancel_all_state_lock:
+                if server._cancel_all_state.get("running") is not False:
+                    return True
+            cancel_thread = server._cancel_all_thread
+            return cancel_thread is not None and cancel_thread.is_alive()
+        except Exception:
+            return True
+
+    def cancel_all_start_block():
+        error = (
+            "Wallet-wide Cancel All is still in progress; "
+            "wait for its result before starting the bot."
+        )
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "CANCEL_ALL_IN_PROGRESS",
+                "error": error,
+                "errors": [error],
+            }
+        ), 409
+
+    if cancel_all_in_progress():
+        return cancel_all_start_block()
+
     if bot.is_running():
         return jsonify({"success": True, "status": "already_running"})
 
@@ -1062,10 +1090,14 @@ def api_bot_start():
             )
         return jsonify(payload), 400
 
-    server._reset_runtime_session_stats()
-
-    # Start with warnings
-    started = bot.start()
+    # Cancel All may have begun after the initial is_running() check while
+    # pre-start validation was reading Sage. Serialize this final transition
+    # with Cancel All's stopped-book check and worker reservation.
+    with server._bot_cancel_lifecycle_lock:
+        if cancel_all_in_progress():
+            return cancel_all_start_block()
+        server._reset_runtime_session_stats()
+        started = bot.start()
     if not started:
         state = {}
         try:
