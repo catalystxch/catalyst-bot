@@ -510,9 +510,12 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
             "open_sell_count": 0,
             "open_trade_ids": [],
         }
+    # This gate needs the complete live book, not terminal history. Sage may
+    # ignore its RPC filter, so the wallet adapter removes proven terminal
+    # rows only after reading the complete response.
     snapshot = offer_reconciliation.load_sage_offer_history(
         get_all_offers=reader,
-        include_completed=True,
+        include_completed=False,
         page_size=500,
         max_pages=9,
         max_records=4096,
