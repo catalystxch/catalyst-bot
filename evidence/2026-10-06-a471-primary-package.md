@@ -41,7 +41,10 @@ above.
 Read-only calls to the original-profile Sage RPC confirmed both the exact
 missing-offer 404 discriminator and one existing `get_offer` response shape
 from a 4,095-offer history, as recorded in the related Sage evidence files.
-The still-running original TEST 7 app is the earlier `74da24c` executable,
-stopped under its own monitor. No live wallet effect or quarantine resolution
-was performed with this package. Exact-candidate live lifecycle, secondary
-acceptance, both 24-hour windows and final review remain open.
+The earlier original-profile `74da24c` executable was later shut down with
+cancel-all unchecked. Exact `a471bd0` subsequently started against TEST 7
+and passed the initial read-only checks in
+`evidence/2026-10-06-a471-primary-live-readonly-startup.md`. No live wallet
+effect or quarantine resolution was performed with this package. Active-offer
+lifecycle, secondary exact-candidate acceptance, both 24-hour windows and
+final review remain open.
