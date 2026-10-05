@@ -580,6 +580,17 @@ class TestCancelOffer(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllPost(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        import wallet
+
+        history_patch = patch(
+            "wallet.get_authoritative_offer_history",
+            side_effect=lambda **kwargs: wallet.get_all_offers(**kwargs),
+        )
+        history_patch.start()
+        self.addCleanup(history_patch.stop)
+
     def test_coin_prep_cancel_requires_exact_approval_shape(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False
@@ -1252,14 +1263,15 @@ class TestCancelAllPost(_FlaskBase):
             target()
             return object()
 
+        def read_page(*, include_completed, start=0, end=50):
+            return [
+                {"trade_id": trade_id, "status": "ACTIVE"}
+                for trade_id in trade_ids[start:end]
+            ]
+
         with (
             patch.object(api_server, "bot", stopped),
-            patch(
-                "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
-            ),
+            patch("wallet.get_all_offers", side_effect=read_page),
             patch(
                 "database.get_authoritative_terminal_records",
                 side_effect=lambda candidates: {
@@ -1290,6 +1302,104 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["cancelled"], 500)
         self.assertEqual(status["pending"], 0)
         self.assertEqual(status["failed"], 0)
+
+    def test_stopped_cancel_all_finds_active_offer_after_full_terminal_page(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        active_id = "f" * 64
+        history = [
+            {"trade_id": f"{index:064x}", "status": "CANCELLED"}
+            for index in range(1, 501)
+        ] + [{"trade_id": active_id, "status": "ACTIVE"}]
+        stopped.offer_manager.cancel_offers.return_value = {
+            active_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED", "success": True}
+        }
+
+        def read_page(*, include_completed, start=0, end=50):
+            # A wallet may honor pagination while ignoring include_completed.
+            return history[start:end]
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_all_offers", side_effect=read_page),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    active_id: {
+                        "sage_trade_id": active_id,
+                        "outcome": "CANCELLED_PROVEN",
+                    }
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [active_id], reason="manual_cancel_all", force_storm=True
+        )
+
+    def test_stopped_cancel_all_rejects_failed_authoritative_history_read(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": False,
+                    "offers": [],
+                    "end_of_history": False,
+                },
+            ),
+            patch("wallet.get_all_offers", return_value=[]),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
+    def test_stopped_cancel_all_does_not_claim_empty_for_pending_cancel(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [{"trade_id": "a" * 64, "status": "PENDING_CANCEL"}],
+                    "end_of_history": True,
+                },
+            ),
+            patch("wallet.get_all_offers", return_value=[]),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
+    def test_stopped_cancel_all_rejects_repeated_unbounded_page(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        page = [
+            {"trade_id": f"{index:064x}", "status": "ACTIVE"} for index in range(1, 501)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", return_value=page),
+            patch("wallet.get_all_offers", return_value=page),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
 
     def test_stopped_cancel_all_sequences_balanced_fee_safe_sage_batches(self):
         stopped = _make_bot()

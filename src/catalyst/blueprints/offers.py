@@ -723,9 +723,41 @@ def api_cancel_all():
         # and the GUI can poll /api/offers/cancel_all/status for live progress
         # instead of hanging for 2-3 minutes with no feedback.
         try:
-            from wallet import get_all_offers
+            from offer_reconciliation import load_sage_offer_history
+            from wallet import get_authoritative_offer_history
 
-            all_offers = get_all_offers(include_completed=False, end=500)
+            def read_authoritative_page(**bounds):
+                page = get_authoritative_offer_history(**bounds)
+                if type(page) is dict and page.get("success") is False:
+                    return None
+                return page
+
+            # Cancel All is wallet-wide. A single bounded page can contain only
+            # terminal history while a still-live offer sits on a later page.
+            # Require a complete read before claiming that no offers remain or
+            # submitting a cancellation for only part of the wallet book.
+            offer_history = load_sage_offer_history(
+                get_all_offers=read_authoritative_page,
+                include_completed=False,
+                page_size=500,
+                max_pages=20,
+            )
+            if offer_history.get("complete") is not True or offer_history.get(
+                "read_error"
+            ):
+                error = (
+                    "Wallet offer history is incomplete; Cancel All was not started."
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=error,
+                    phase="error",
+                    message=error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify({"success": False, "error": error}), 503
+            all_offers = offer_history["records"]
             if not all_offers:
                 if bot and getattr(bot, "offer_manager", None):
                     bot.offer_manager.expect_empty_wallet_offer_book(
@@ -759,6 +791,7 @@ def api_cancel_all():
                 "1",
             }
             open_ids = []
+            unclassified_offer = False
             for o in all_offers if isinstance(all_offers, list) else []:
                 if not isinstance(o, dict):
                     continue
@@ -772,6 +805,28 @@ def api_cancel_all():
                     tid = o.get("trade_id", "") or o.get("offer_id", "")
                     if tid:
                         open_ids.append(tid)
+                    else:
+                        unclassified_offer = True
+                else:
+                    # The history loader removed proven terminal rows. A
+                    # remaining unknown or pending-cancel row may still be
+                    # fillable and cannot justify an empty-book claim.
+                    unclassified_offer = True
+
+            if unclassified_offer:
+                error = (
+                    "Wallet offer state needs authoritative reconciliation; "
+                    "Cancel All was not started."
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=error,
+                    phase="error",
+                    message=error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify({"success": False, "error": error}), 503
 
             if not open_ids:
                 if bot and getattr(bot, "offer_manager", None):
