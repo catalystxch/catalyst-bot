@@ -2077,7 +2077,7 @@ def test_generic_cancel_all_explicitly_covers_every_live_sage_offer(page):
 
 
 def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
-    """Shutdown consent must describe the Sage-wide effect it will execute."""
+    """Shutdown consent must describe wallet-wide scope without naming one backend."""
 
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
@@ -2087,14 +2087,20 @@ def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
     checkbox_label = page.locator("label").filter(
         has=page.locator("#shutdownCancelOffers")
     )
-    expect(checkbox_label).to_contain_text("Sage wallet")
+    expect(checkbox_label).to_contain_text("wallet offers")
+    expect(checkbox_label).not_to_contain_text("Sage")
     expect(page.locator("#shutdownCancelWarning")).to_contain_text(
-        "all currently active offers in the connected Sage wallet"
+        "all currently active offers in the connected wallet"
     )
     expect(page.locator("#shutdownCancelWarning")).to_contain_text(
         "including offers created manually or not tracked by CATalyst"
     )
     expect(page.locator("#shutdownCancelWarning")).not_to_contain_text("on Dexie")
+    expect(page.locator("#shutdownCancelWarning")).not_to_contain_text("Sage")
+
+    confirm_source = page.evaluate("confirmShutdown.toString()")
+    assert "Sending cancel request to wallet..." in confirm_source
+    assert "Sending cancel request to Sage..." not in confirm_source
 
 
 def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):

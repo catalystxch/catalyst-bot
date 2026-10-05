@@ -273,7 +273,7 @@ def test_cancel_all_gui_timeout_honours_backend_authoritative_deadline():
 
 
 def test_shutdown_offer_disposition_qualifies_catalyst_tracked_visibility():
-    """Tracked rows must not be presented as an authoritative Sage snapshot."""
+    """Tracked rows must not be presented as an authoritative wallet snapshot."""
 
     node = shutil.which("node")
     if node is None:
@@ -301,17 +301,17 @@ def test_shutdown_offer_disposition_qualifies_catalyst_tracked_visibility():
     assert empty["count"] == 0
     assert empty["copy"] == (
         "CATalyst shows no tracked open offers. "
-        "Untracked Sage offers, if any, will remain active."
+        "Untracked wallet offers, if any, will remain active."
     )
     assert active["count"] == 3
     assert active["copy"] == (
         "3 CATalyst-tracked open offers will remain active. "
-        "Untracked Sage offers, if any, will also remain active."
+        "Untracked wallet offers, if any, will also remain active."
     )
     assert terminal_after_stale_view["count"] == 0
     assert terminal_after_stale_view["copy"] == (
         "CATalyst shows no tracked open offers. "
-        "Untracked Sage offers, if any, will remain active."
+        "Untracked wallet offers, if any, will remain active."
     )
 
 
