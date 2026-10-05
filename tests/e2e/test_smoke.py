@@ -2210,9 +2210,7 @@ def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping
     assert any(
         "finishing" in str(item["detail"]).lower() for item in result["progress"]
     )
-    assert any(
-        "retry" in str(item["detail"]).lower() for item in result["progress"]
-    )
+    assert any("retry" in str(item["detail"]).lower() for item in result["progress"])
 
 
 def test_shutdown_stop_poll_times_out_fail_closed(page):
