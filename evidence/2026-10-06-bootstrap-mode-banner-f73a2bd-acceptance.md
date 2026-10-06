@@ -164,3 +164,29 @@ secondary exact-candidate 24-hour monitor began. The secondary report is
 `C9945E9901B9FFB3DE0C46AF40BE340C28F42C5978946B9EAB7867A2AA9BEDAE`,
 on the secondary PC. Its live trading lifecycle and full 24-hour result remain
 open; this report does not claim native mouse-driven acceptance on that host.
+
+## Secondary isolated package and update audit
+
+The secondary PC copied its independently built exact-f73 extracted bundle to
+an isolated test environment, renamed the audit EXE to avoid competing with
+the monitored original-profile `Catalyst.exe`, and verified the original,
+audit and restored EXEs all had SHA-256
+`9E2A80B35849550BA3C517E801F9D02D57C767B5D399AEB1CD59C34DD92E29AB`.
+Its packaged API/TLS mock-Sage smoke passed all nine endpoint contracts.
+Isolated native smokes passed clean first launch, duplicate-instance window
+restore and foreground handoff, persisted-profile relaunch, and a branded
+fail-closed window for malformed identity. Focused updater, installer,
+single-instance and packaged-smoke tests passed `57` tests in `5.79` seconds.
+
+The updater correctly reported no update for same-version `1.4.0` or older
+`1.3.9`, and an update for newer `1.4.1`. A same-version extracted-bundle
+overlay produced zero file or hash differences. Backup and interrupted-update
+restore preserved the exact EXE and an isolated profile sentinel; the restored
+bundle passed API/mock-Sage smoke again. This was extracted-bundle restore,
+not a signed Inno install/uninstall or registry-rollback exercise. Secondary
+native computer control remained unavailable, so repository Win32 native
+smoke supplied the window assertions. Its final isolation check found the
+original Harvestr app and exact-PID monitor live, one `Catalyst.exe`, no audit
+process, no port-5000 owner change, zero alerts and no wallet effect. The
+secondary report `2026-10-06-f73a2bd-package-update-audit.md` has SHA-256
+`70476D64B662485D2599FAB1CE9FF445B68E3CCDDC09F7B2285D1E6569357745`.
