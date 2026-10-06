@@ -48,8 +48,29 @@ downloads matched both published SHA-256 hashes:
 - [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/5dc28455dddc2e7a1aaf52f38c207fdb7353a42d/acceptance-artifacts/CATalyst-24ba013-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/5dc28455dddc2e7a1aaf52f38c207fdb7353a42d/acceptance-artifacts/Catalyst-Setup-24ba013-1.4.0.exe)
 
-The previous packaged `6876f0f` runtime remains running on original
-TEST 7 in stopped/read-only mode under its exact-PID/hash monitor. Its trace
-is historical for this new source. Exact-source live rollover, both 24-hour
-windows, active-offer lifecycle/recovery, secondary original-profile
-acceptance, and final review remain required. PR #220 stays draft.
+## Original TEST 7 read-only rollover
+
+The preceding `6876f0f` app shut down through its native UI with the
+cancel-offers checkbox unchecked after zero app and wallet offers were
+observed. It exited and released port 5000. The exact `24ba013` EXE then
+launched through the native UI and connected Sage mainnet TEST 7 fingerprint
+736588221. Testing Risk Disclosure was acknowledged under the operator's
+existing authorization; Splash was skipped and the existing Spacescan key
+retained. Monkeyzoo Token MZ/XCH was selected.
+
+The new app ran as sole PID 153748 and sole port 5000 listener from the
+expected path, with the EXE hash above. Read-only status showed CAT wallet 2,
+the expected asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+synced Sage, unchanged 138.470301476875 XCH and 780212.284 MZ balances,
+zero app and wallet open offers, stopped bot, inactive Bootstrap, and allowed
+safety with an owned renewing lease. No campaign or wallet action was started.
+
+An exact-PID/path/hash stopped-profile monitor began at
+`2026-10-06T10:19:23Z` in
+`E:\catalyst-stability-monitor-24ba013\trace-60s.jsonl`; its first sample
+showed a matching hash, synced wallet, stopped bot, zero offers, allowed
+safety, and owned lease. The preceding trace is historical. The 24-hour gate
+cannot pass before `2026-10-07T10:19:23Z` plus full trace and end-state
+review. Both final-candidate 24-hour windows, active-offer lifecycle/recovery,
+secondary original-profile acceptance, and final review remain required.
+PR #220 stays draft.
