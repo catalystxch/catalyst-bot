@@ -129,3 +129,38 @@ an owned lease. `/api/bootstrap/status` still identified Sage mainnet,
 fingerprint `736588221`, CAT wallet ID `2` and the exact MZ asset. No Save,
 Reset, bot, campaign, or wallet action was taken. This advances packaged
 browser-screen acceptance but does not replace live lifecycle or 24-hour gates.
+
+## Minimum-window keyboard and modal check, 01:00 UTC
+
+A separate read-only Chromium session used the packaged app at the native main
+window's declared minimum `1000×700` (`desktop_app.py` sets
+`WINDOW_MIN_WIDTH=1000`, `WINDOW_MIN_HEIGHT=700`). The Dashboard startup card,
+pair selector, status banner and sidebar remained readable without clipped
+text in the captured viewport. Sequential Tab navigation gave the Dashboard,
+Offers, P&L, Market Intel, Settings and Logs buttons accessible names and a
+visible solid focus outline. Opening Help moved focus to its Close help button
+inside an `aria-modal` dialog; Escape closed it and returned focus to Help.
+Chromium reported zero console errors or warnings. A `500×600` browser-only
+viewport clipped Quick Start text horizontally; it is below the native
+window's supported minimum and is not counted as native desktop acceptance.
+No settings, campaign, wallet or reset action was taken.
+
+## Independent secondary original-profile read-only check
+
+The secondary PC independently built exact source `f73a2bd` into an EXE with
+SHA-256 `9E2A80B35849550BA3C517E801F9D02D57C767B5D399AEB1CD59C34DD92E29AB`.
+It selected Sage mainnet Harvestr fingerprint `3702373391`, CAT wallet ID `2`
+and the exact MZ asset through rendered Chromium startup controls after the
+testing Risk Disclosure; native computer control was unavailable on that host.
+The original-profile read-only UI traversal covered Dashboard, Offers, P&L,
+Market Intel, Settings Live and Setup, Logs, Doctor, Data Reset confirmation
+gates (all cancelled), Help and About. It observed zero console errors or
+warnings, page errors or failed requests. Doctor passed its preflight with
+eight passes and two external configuration warnings: Splash unreachable and
+Spacescan API key empty. The bot remained stopped, offers and pending effects
+remained zero, safety stayed allowed with an owned renewing lease, and the
+secondary exact-candidate 24-hour monitor began. The secondary report is
+`2026-10-06-f73a2bd-original-profile-readonly.md`, SHA-256
+`C9945E9901B9FFB3DE0C46AF40BE340C28F42C5978946B9EAB7867A2AA9BEDAE`,
+on the secondary PC. Its live trading lifecycle and full 24-hour result remain
+open; this report does not claim native mouse-driven acceptance on that host.
