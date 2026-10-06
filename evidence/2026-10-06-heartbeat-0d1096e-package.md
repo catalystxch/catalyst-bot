@@ -102,6 +102,8 @@ An independent read-only audit script at
 `23BE8C7ADA53B365CCB123FBBD63596F9B62E4CE2CF7E198ACC6B9E81A2B7043`)
 checks every sample's identity, safety, lease, wallet sync, stopped bot, offer
 count and observation gap, plus the current executable hash and port owner.
+The [auditor is pinned for independent review](https://raw.githubusercontent.com/catalystxch/catalyst-bot/d20acaa4990c291a88215cf5b45739bd09e99a2f/acceptance-artifacts/heartbeat-trace-audit-0d1096e.ps1);
+an independent HTTP download matched that hash.
 With the duration threshold set to zero solely for verifier testing, a
 synthetic clean row returned pass (`0`); an otherwise identical row with
 safety blocked returned failure (`1`). The live trace correctly returned
