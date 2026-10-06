@@ -29,10 +29,11 @@ initialization.
   `0BC6A450C08D48BA77C2700A4F7DF8EEE54215A83259462CB07CF0CC47C6D574`;
   bytes are unchanged from the prior candidate whose complete 231-test
   Chromium suite passed.
-- Draft PR #220 CI on the integrated source is pending at this checkpoint.
-  Its preceding docs-only head had 10 successful checks and a CodeQL code
-  quality Python SARIF upload failure. Do not count the gate until all 11
-  exact-source checks pass.
+- All **11 PR #220 checks passed** on the exact source and its evidence-only
+  child `7f97cae2695431bd5d1fd87b9023af8d913e517b`, including unit tests,
+  both Python CodeQL analyses, security scans, and lint. The earlier
+  docs-only head's CodeQL code-quality Python SARIF upload failure did not
+  recur.
 
 ## Detached Windows package
 
@@ -57,12 +58,33 @@ not use the original TEST 7 profile.
 
 ## Live state and open gates
 
-At this checkpoint the original TEST 7 profile still runs the prior
-`bbf94f0` EXE in a stopped, read-only monitor. It has zero open offers and
-no new campaign or fee approval. The exact `673c259` package has not yet
-run against that profile. Its old monitor trace is historical after a
-candidate rollover; a new exact-PID/path/hash trace must begin for this
-candidate. Active-offer lifecycle and recovery, secondary original-profile
-acceptance, both final-candidate 24-hour windows, CI, and final review
-remain open. Keep PR #220 draft; do not merge, tag, release, or claim public
-readiness.
+The prior `bbf94f0` original-profile process shut down normally through the
+native UI with the offer-cancellation checkbox unchecked, while the bot was
+already stopped and there were zero active offers. Its 61 clean stopped
+samples from `2026-10-06T19:40:41Z` through the intentional shutdown are
+historical.
+
+The exact `673c259` EXE is now the sole original TEST 7 process, PID
+`150260`, and port 5000 owner. Its process hash matched the packaged EXE.
+The native UI acknowledged the testing Risk Disclosure, connected Sage,
+selected fingerprint `736588221` and Monkeyzoo Token (MZ/XCH), continued
+without optional Splash, and retained the configured Spacescan setting.
+Read-only Dashboard, Offers, P&L, Market Intelligence, Settings Setup/Live,
+Logs, Data Reset, Help, and About traversal passed without a wallet effect
+or settings save. Post-traversal API checks showed Sage mainnet, CAT wallet
+ID `2`, exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+synced wallet, unchanged `138.470301476875` XCH and `780212.284` MZ,
+zero open offers, bot stopped, inactive Bootstrap, and safety ALLOWED with
+an owned lease. The legacy original-profile database has its new
+`bot.db.initialized` marker.
+
+A new exact-PID/path/hash stopped-profile monitor began at
+`2026-10-06T20:48:11Z` in
+`E:\catalyst-stability-monitor-673c259\trace-60s.jsonl`. Its first three
+samples were clean. The 24-hour gate cannot pass before
+`2026-10-07T20:48:11Z` plus a complete trace and end-state review.
+Active-offer lifecycle and recovery, secondary original-profile acceptance,
+the stopped and active final-candidate 24-hour windows, and final review
+remain open. No new campaign or fee approval exists. Keep PR #220 draft;
+do not merge, tag, release, or claim public readiness.
