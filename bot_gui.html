@@ -1895,7 +1895,7 @@
         }
         @media (max-width: 980px) {
             .dashboard-startup-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: minmax(0, 1fr);
             }
         }
         .dashboard-pair-card,
@@ -3418,6 +3418,8 @@
 
         /* Centred settings container — narrower than dashboard for form readability */
         #v4View-settings .container {
+            width: 100%;
+            min-width: 0;
             max-width: 900px;
             margin: 0 auto;
             padding-bottom: 10px;

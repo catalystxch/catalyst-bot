@@ -13,6 +13,49 @@ def _open_gui(page):
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+@pytest.mark.parametrize("width", [390, 480])
+def test_dashboard_quick_start_remains_visible_in_small_window(page, width):
+    """The pair selector and Refresh control must not be clipped by the guide."""
+    page.set_viewport_size({"width": width, "height": 640})
+    _open_gui(page)
+    page.evaluate(
+        """() => {
+            const overlay = document.getElementById('startupOverlay');
+            overlay.classList.add('hidden');
+            overlay.style.display = 'none';
+            const selector = document.getElementById('catSelector');
+            selector.add(new Option('Monkeyzoo Token (MZ_XCH) │ 0 XCH/day', 'mz'));
+        }"""
+    )
+
+    viewport_width = page.evaluate("window.innerWidth")
+    for selector in (
+        "#startupGuideTitle",
+        ".dashboard-pair-card",
+        ".dashboard-pair-row button",
+    ):
+        box = page.locator(selector).bounding_box()
+        assert box is not None
+        assert box["x"] + box["width"] <= viewport_width, selector
+
+
+def test_settings_setup_remains_visible_in_small_window(page):
+    """Settings cards and the Setup tab must fit beside the compact sidebar."""
+    page.set_viewport_size({"width": 390, "height": 640})
+    _open_gui(page)
+    page.evaluate("window.v4SwitchView('settings')")
+
+    viewport_width = page.evaluate("window.innerWidth")
+    for selector in (
+        "#v4View-settings .container",
+        "#settingsSubtabSetup",
+        "#settingsWalletSessionSection",
+    ):
+        box = page.locator(selector).bounding_box()
+        assert box is not None
+        assert box["x"] + box["width"] <= viewport_width, selector
+
+
 def test_doctor_report_escapes_duration_from_api(page):
     _open_gui(page)
     malicious_duration = '<img src=x onerror="window.__doctorDurationInjected=true">'
