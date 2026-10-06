@@ -6584,6 +6584,9 @@ class BotLoop:
         # Startup: sync state from wallet
         # Background threads wait for this to finish before writing to DB.
         startup_state = self._startup_sync() or {}
+        if not self._running:
+            self._startup_complete.set()  # Wake workers so they can exit.
+            return
         if "open_buys" in startup_state and "open_sells" in startup_state:
             self._set_state(
                 open_buys=int(startup_state["open_buys"]),
@@ -8345,7 +8348,19 @@ class BotLoop:
             log_event(
                 "info", "startup_wallet_sync", "Fetching offers from wallet RPC..."
             )
-            open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
+            startup_offers, startup_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                type(startup_offers) is not tuple
+                or len(startup_offers) != 3
+                or any(type(rows) is not list for rows in startup_offers)
+                or type(startup_meta) is not dict
+                or startup_meta.get("fresh") is not True
+                or startup_meta.get("using_cache") is not False
+            ):
+                raise RuntimeError("Wallet offer book is stale during startup sync")
+            open_buys, open_sells, closed = startup_offers
             log_event(
                 "info",
                 "startup_wallet_result",

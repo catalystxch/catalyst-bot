@@ -2974,12 +2974,15 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
             events.append("startup_gate")
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
-    loop._running = False
+    loop._running = True
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: events.append("startup_recovery")
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
     loop._background_publication_snapshot_ready = lambda: True
-    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._flush_public_offer_queues = lambda: (
+        events.append("drain_outbox"),
+        setattr(loop, "_running", False),
+    )
     loop._set_state = lambda **kwargs: None
 
     loop._run_loop()
@@ -2990,6 +2993,25 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
         "startup_gate",
         "drain_outbox",
     ]
+
+
+def test_failed_startup_does_not_enable_workers_or_publish_offers():
+    events = []
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._startup_sync = lambda: (setattr(loop, "_running", False), None)[1]
+    loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
+    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._startup_complete = type(
+        "Gate", (), {"set": lambda self: events.append("gate")}
+    )()
+    loop._set_state = lambda **kwargs: events.append(kwargs.get("status"))
+
+    loop._run_loop()
+
+    assert events == ["gate"]
 
 
 def test_startup_defers_durable_publication_drain_until_fresh_cycle():
@@ -3068,14 +3090,18 @@ def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():
             events.append("startup_gate")
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
-    loop._running = False
+    loop._running = True
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: {
         "open_buys": 36,
         "open_sells": 36,
     }
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
-    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
+    loop._flush_public_offer_queues = lambda: (
+        events.append("drain_outbox"),
+        setattr(loop, "_running", False),
+    )
 
     def record_state(**updates):
         if "open_buys" in updates or "open_sells" in updates:

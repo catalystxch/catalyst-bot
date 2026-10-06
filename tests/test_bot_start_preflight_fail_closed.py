@@ -128,3 +128,48 @@ def test_stale_wallet_cycle_does_not_run_fill_detection():
     result = bot_loop.BotLoop._detect_fills_for_wallet_cycle(loop, {"fresh-buy"}, set())
     assert result["buy_fills"][0]["trade_id"] == "false-fill"
     assert calls == [({"fresh-buy"}, set(), {})]
+
+
+def test_second_startup_offer_read_must_be_fresh_before_recovery(monkeypatch):
+    import cat_resolver
+    import database
+    import reservation_manager
+    import wallet
+
+    baselines = []
+    states = []
+    cached = ([{"trade_id": "cached-buy"}], [], [])
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._run_startup_self_test = lambda: None
+    loop._set_state = lambda **state: states.append(state)
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: cached,
+        sync_from_wallet_with_meta=lambda: (
+            cached,
+            {"fresh": False, "using_cache": True},
+        ),
+    )
+    loop.fill_tracker = SimpleNamespace(
+        set_baseline=lambda *args: baselines.append(args)
+    )
+    monkeypatch.setattr(
+        bot_loop.cfg, "validate", lambda: {"warnings": [], "errors": []}
+    )
+    monkeypatch.setattr(
+        reservation_manager.ReservationManager, "expire_all", lambda self: 0
+    )
+    monkeypatch.setattr(wallet, "get_wallet_type", lambda: "chia")
+    monkeypatch.setattr(wallet, "get_next_address", lambda **kwargs: {"success": False})
+    monkeypatch.setattr(
+        cat_resolver,
+        "resolve_and_apply",
+        lambda cfg: {"ticker_id": "MZ_XCH", "name": "MZ"},
+    )
+    monkeypatch.setattr(database, "get_open_offers", lambda **kwargs: [])
+
+    bot_loop.BotLoop._startup_sync(loop)
+
+    assert loop._running is False
+    assert baselines == []
+    assert states[-1]["status"] == "error"
