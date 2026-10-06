@@ -95,3 +95,15 @@ stopped-profile gate cannot be counted before `2026-10-07T13:49:13Z` plus
 complete trace and end-state review. The prior candidate's traces are
 historical. Active-offer lifecycle/recovery, secondary original-profile
 acceptance, the active-profile 24-hour window, and final review remain open.
+
+The same native exact-build session traversed Dashboard, Offers, P&L, Market
+Intel, Settings Setup and Live, Logs, Data Reset, Help, and About. The Offers
+view showed zero active buys, sells, and pending cancels. Market Intel showed
+RED confidence and unavailable Splash without presenting an authorized
+tradable range. The Live settings controls remained disabled while the bot
+was stopped; the Data Reset view described its confirmations, and no reset
+action was selected. Help and About modals opened and closed. After returning
+to Dashboard, the API still reported the same fingerprint, wallet ID, exact
+asset, XCH/MZ balances, zero open offers, stopped bot, inactive Bootstrap,
+synced Sage, and allowed safety with an owned lease. No UI error or wallet
+effect was observed in this traversal. Active-state UI acceptance remains open.
