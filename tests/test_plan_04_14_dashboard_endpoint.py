@@ -1103,23 +1103,18 @@ class TestDashboard(_FlaskBase):
                 "cnt": 1,
             }
         ]
-        sync_from_wallet = MagicMock(
-            return_value=(
-                [{"trade_id": "cached-buy"}],
-                [],
-                [],
-            )
-        )
         running_bot = types.SimpleNamespace(
             get_state=lambda: {"running": True},
             is_running=lambda: True,
             offer_manager=types.SimpleNamespace(
-                sync_from_wallet=sync_from_wallet,
-                get_wallet_sync_meta=lambda: {
-                    "fresh": False,
-                    "using_cache": True,
-                    "last_error": "Sage get_offers unavailable",
-                },
+                sync_from_wallet_with_meta=lambda: (
+                    ([{"trade_id": "cached-buy"}], [], []),
+                    {
+                        "fresh": False,
+                        "using_cache": True,
+                        "last_error": "Sage get_offers unavailable",
+                    },
+                ),
             ),
         )
 
@@ -1129,11 +1124,38 @@ class TestDashboard(_FlaskBase):
         ):
             result = api_server._get_live_local_offer_edges("aa" * 32)
 
-        sync_from_wallet.assert_called_once_with()
         self.assertEqual(result["source"], "wallet_unavailable")
         self.assertEqual(result["our_open_buys"], 0)
         self.assertEqual(result["our_best_bid"], api_server.Decimal("0"))
         stale_conn.execute.assert_not_called()
+
+    def test_live_offer_edges_keeps_offers_with_their_own_freshness(self):
+        """Another sync's fresh metadata cannot bless this read's cached offers."""
+        conn = MagicMock()
+        manager = types.SimpleNamespace(
+            sync_from_wallet=lambda: ([{"trade_id": "cached-buy"}], [], []),
+            get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+            sync_from_wallet_with_meta=lambda: (
+                ([{"trade_id": "cached-buy"}], [], []),
+                {"fresh": False, "using_cache": True},
+            ),
+        )
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=manager,
+        )
+
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_unavailable")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_best_bid"], Decimal("0"))
+        conn.execute.assert_not_called()
 
     def test_live_offer_edges_uses_fresh_running_wallet_book(self):
         conn = MagicMock()
@@ -1149,11 +1171,10 @@ class TestDashboard(_FlaskBase):
             get_state=lambda: {"running": True},
             is_running=lambda: True,
             offer_manager=types.SimpleNamespace(
-                sync_from_wallet=lambda: ([{"trade_id": "live-buy"}], [], []),
-                get_wallet_sync_meta=lambda: {
-                    "fresh": True,
-                    "using_cache": False,
-                },
+                sync_from_wallet_with_meta=lambda: (
+                    ([{"trade_id": "live-buy"}], [], []),
+                    {"fresh": True, "using_cache": False},
+                ),
             ),
         )
         with (

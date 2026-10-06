@@ -1443,9 +1443,9 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     offer_manager = getattr(bot, "offer_manager", None)
     if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
-            wallet_open_buys, wallet_open_sells, _ = offer_manager.sync_from_wallet()
-            meta_getter = getattr(offer_manager, "get_wallet_sync_meta", None)
-            wallet_meta = meta_getter() if callable(meta_getter) else {}
+            (wallet_open_buys, wallet_open_sells, _), wallet_meta = (
+                offer_manager.sync_from_wallet_with_meta()
+            )
             if (
                 wallet_meta.get("fresh") is True
                 and wallet_meta.get("using_cache") is not True

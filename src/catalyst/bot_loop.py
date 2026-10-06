@@ -12021,9 +12021,23 @@ class BotLoop:
             self._graceful_in_progress = False
             return
 
+        if (
+            current_buy_ids is not None
+            and current_sell_ids is not None
+            and self._wallet_sync_stale_cycle
+        ):
+            return
+
         if current_buy_ids is None or current_sell_ids is None:
             try:
-                open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
+                (open_buys, open_sells, _), sync_meta = (
+                    self.offer_manager.sync_from_wallet_with_meta()
+                )
+                if (
+                    sync_meta.get("fresh") is not True
+                    or sync_meta.get("using_cache") is not False
+                ):
+                    return
                 current_buy_ids = {
                     o.get("trade_id") for o in open_buys if o.get("trade_id")
                 }
@@ -17108,7 +17122,14 @@ class BotLoop:
             )
 
             # ── Step 2: Sync current offers ──
-            open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
+            (open_buys, open_sells, _), sync_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is not False
+            ):
+                raise RuntimeError("Wallet offer sync is stale; migration not planned")
             total = len(open_buys) + len(open_sells)
 
             if total == 0:
