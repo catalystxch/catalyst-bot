@@ -65,7 +65,12 @@ unchanged `138.470301476875` XCH and `780212.284` MZ, bot stopped, no open
 wallet or DB offers, Bootstrap inactive, synced Sage, and safety allowed with
 an owned lease. The offer diagnostic used a fresh wallet read and reported
 wallet/DB agreement with zero open offers. No campaign, offer, or fee approval
-was made.
+was made. The native Offers view showed zero active buys and sells and three
+historical fills. Settings showed fingerprint `736588221`, mainnet binding,
+zero unresolved operations/reservations/publications, and the owned renewing
+lease. Market Intelligence rendered the selected MZ/XCH pair with Sage ready,
+zero attributable live depth, RED confidence, and optional Splash unavailable.
+No settings were saved.
 
 The exact-PID/path/hash 60-second stopped-profile monitor is
 `E:\catalyst-stability-monitor-b69061b\monitor.ps1`. Its trace began
