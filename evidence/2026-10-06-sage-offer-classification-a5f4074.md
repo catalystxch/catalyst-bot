@@ -74,3 +74,21 @@ samples were clean. The 24-hour gate cannot pass before
 campaign or wallet effect was initiated. Active-offer lifecycle and recovery,
 secondary original-profile acceptance, both final-candidate 24-hour windows,
 and final review remain open. PR #220 stays draft.
+
+## Exact-source Chromium acceptance
+
+The complete opt-in Chromium suite ran from the detached `a5f4074` checkout at
+`E:\catalyst-unknown-offers-a5f4074-build` with
+`python -m pytest tests/e2e --e2e -q -ra`. It passed **226 tests in 169.08
+seconds** with exit code 0. The browser fixture used its isolated test profile
+and port 5099; the original TEST 7 app remained the sole port 5000 owner.
+The exact source and frontend test tree were byte-identical to the previously
+tested `82a715d` frontend, and this run supplies direct exact-candidate
+browser evidence after the Sage offer-classification change.
+
+At `2026-10-06T11:38:46Z`, the new original-profile stopped safety trace had
+16 samples with zero failed checks, while its port-owner sidecar had 30 samples
+with zero failed checks. The exact PID 143728 and EXE hash still matched,
+Sage remained synced, the bot stopped, the lease owned, safety allowed, and
+open offers zero. This is an in-progress stability checkpoint, not the
+24-hour acceptance result.
