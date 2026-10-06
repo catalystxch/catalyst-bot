@@ -1,0 +1,10 @@
+CATalyst Windows acceptance checkpoint — 673c259
+
+Exact source/runtime: 673c259720e94dcee304e98710c5f23891ee1e2b
+Feature PR: #220 (draft); safety sub-PR: #250 (draft)
+
+An established profile whose bot.db is missing now blocks startup when durable prior-profile evidence exists. Successful database initialization persists a stable identity in SQLite and a paired external marker, so a healthy but unrelated replacement database also blocks. A preconfigured genuine first launch remains possible.
+
+The exact clean detached Windows EXE, synthetic Sage worker, packaged API, native clean/duplicate/persisted/safety launches, isolated missing-file/legacy-backup/valid-replacement safety launches, ZIP CRC/contents/extracted API, and isolated unique-AppId installer clean install/installed API and Sage/uninstall passed. Defender scans of bundle, ZIP, and unsigned installer added zero detections. Full serial backend and PR CI are pending; this checkpoint does not claim completion of those gates.
+
+This is an unsigned test installer. The original TEST 7 profile still runs the prior bbf94f0 candidate in stopped, read-only safety monitoring. Exact 673c259 live acceptance, active-offer recovery, both final-candidate 24-hour windows, secondary original-profile acceptance, final review, and release authorization remain open. No new campaign or fee approval exists. Do not merge main, tag, release, or claim public readiness from this checkpoint.
