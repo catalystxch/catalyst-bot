@@ -1138,6 +1138,44 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
 
 
+def test_bootstrap_mode_change_refreshes_inactive_authority_banner(page):
+    """The global mode banner follows the local selector without a page change."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const mode = document.getElementById('bootstrapModeSelect');
+            const banner = document.getElementById('bootstrapGlobalStatus');
+            const status = {
+                success: true, active: false, campaign: null,
+                identity: { ticker: 'MZ_XCH' }, stopped_cancellation: null,
+            };
+            let statusRequests = 0;
+            apiFetch = async (path) => {
+                if (path === '/api/bootstrap/status') statusRequests += 1;
+                return new Response(JSON.stringify(status), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            mode.value = 'follow';
+            _bootstrapRenderStatus(status);
+            const initial = banner.textContent;
+            mode.value = 'bootstrap';
+            await bootstrapModeChanged();
+            const selected = banner.textContent;
+            mode.value = 'follow';
+            await bootstrapModeChanged();
+            return {initial, selected, restored: banner.textContent, statusRequests};
+        }"""
+    )
+
+    assert result["initial"].startswith("Follow mode")
+    assert result["selected"].startswith("Bootstrap selected")
+    assert result["restored"].startswith("Follow mode")
+    assert result["statusRequests"] == 2
+
+
 def test_bootstrap_banner_shows_minutes_near_expiry(page):
     """A campaign with minutes left must not look like it has an hour left."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
