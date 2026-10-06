@@ -76,3 +76,19 @@ allowed renewing lease. Its exact PID/hash one-minute monitor is
 `E:\catalyst-stability-monitor-cfa42f3\trace-60s.jsonl`; the first
 sample passed. This run is intended to identify the blocked heartbeat
 boundary if the failure recurs, not to support public readiness.
+
+## Postmortem logging correction
+
+The failed candidate emitted its safety stop through `slog(...,
+level="critical")`, but `super_log.LEVELS` did not recognize `critical` and
+silently ranked it as `info`. This explains why the old safety stop did not
+flush the in-memory debug context. It does **not** explain the missed lease
+renewal. Commit `e694dab2a02801f5f0337c389888e5f5b9eb665e` recognizes
+`critical` above `error`, so future critical safety stops persist even at an
+error file threshold and dump preceding debug context. The two focused
+regressions failed before the correction and passed afterward. The combined
+super-log, mutation-gate, stability-schema and startup-recovery suite passed
+**449 tests**; Ruff and `git diff --check` passed. The already-running
+diagnostic EXE remains source `cfa42f3`; its explicit heartbeat failure
+timing event uses `error` and is available independently of this subsequent
+logger fix. The current PR source has not yet been packaged or accepted live.
