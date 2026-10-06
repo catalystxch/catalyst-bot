@@ -5,10 +5,12 @@ LEVELS dict, set_file_level/set_terminal_level, start_cycle/cycle_count/
 cycle_note/end_cycle, log_db_write/log_db_lock, and get_log_stats keys.
 """
 
+import io
 import sys
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 try:
     import super_log as _sl
@@ -41,8 +43,8 @@ def _call_slog(*args, **kwargs):
 
 @unittest.skipIf(_SKIP is not None, f"super_log unavailable: {_SKIP}")
 class TestLevels(unittest.TestCase):
-    def test_all_five_levels_present(self):
-        for lvl in ("trace", "debug", "info", "warn", "error"):
+    def test_all_six_levels_present(self):
+        for lvl in ("trace", "debug", "info", "warn", "error", "critical"):
             self.assertIn(lvl, _sl.LEVELS)
 
     def test_levels_ordered_correctly(self):
@@ -50,6 +52,9 @@ class TestLevels(unittest.TestCase):
         self.assertLess(_sl.LEVELS["debug"], _sl.LEVELS["info"])
         self.assertLess(_sl.LEVELS["info"], _sl.LEVELS["warn"])
         self.assertLess(_sl.LEVELS["warn"], _sl.LEVELS["error"])
+
+    def test_critical_is_at_least_as_severe_as_error(self):
+        self.assertGreaterEqual(_sl.LEVELS["critical"], _sl.LEVELS["error"])
 
 
 # ===========================================================================
@@ -101,6 +106,25 @@ class TestSlogRingBuffer(unittest.TestCase):
     def test_slog_level_unknown_defaults_to_info(self):
         # Should not raise
         _call_slog("TEST", "msg", level="nonexistent_level")
+
+    def test_critical_safety_stop_persists_and_dumps_debug_context(self):
+        log_file = io.StringIO()
+        with patch.multiple(
+            _sl,
+            _initialized=True,
+            _log_file=log_file,
+            _file_level=_sl.LEVELS["error"],
+            _terminal_level=100,
+            _error_dump_count=0,
+            _error_dump_seen_categories=set(),
+            _bytes_written=0,
+        ):
+            _sl.slog("SAFETY", "lease attempt detail", level="debug")
+            _sl.slog("SAFETY", "Mutation safety stop", level="critical")
+            output = log_file.getvalue()
+        self.assertIn("Mutation safety stop", output)
+        self.assertIn("ERROR CONTEXT DUMP", output)
+        self.assertIn("lease attempt detail", output)
 
     def test_slog_makes_each_file_line_visible_without_waiting_for_close(self):
         class DelayedVisibilityFile:
