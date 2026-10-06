@@ -59,6 +59,11 @@ healthy synced Sage, unchanged 138.470301476875 XCH and 780212.284 MZ,
 zero app open offers, stopped bot, inactive Bootstrap, and allowed safety with
 an owned lease. A separate read-only Sage query returned zero pending
 transactions and zero fillable offers from the full 4,095-offer history.
+Read-only UI traversal covered Dashboard, Offers, P&L, Market Intel, Settings,
+Logs, Data Reset, Help, and About, then returned to Dashboard. Offers showed
+zero buy and sell offers; Data Reset controls were not used. Market confidence
+was RED on expired or insufficient external depth evidence, with exposure
+withdrawn; the bot remained stopped.
 
 An exact-PID/path/hash stopped-profile safety monitor began
 `2026-10-06T11:22:57Z` in
