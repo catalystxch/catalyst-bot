@@ -1647,5 +1647,60 @@ def test_offer_diagnostic_does_not_invent_dexie_staleness_from_local_agreement()
     assert "cannot determine" in result["diagnosis"]
 
 
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_offer_diagnostic_rejects_cached_wallet_book_after_sage_read_failure():
+    bot = _make_bot()
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": False,
+        "using_cache": True,
+        "last_error": "sage_get_offers_unavailable",
+    }
+
+    with (
+        patch.object(api_server, "bot", bot),
+        patch("database.get_connection", return_value=conn),
+    ):
+        result = api_server.app.test_client().get(
+            "/api/offers/diagnostic",
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert result.status_code == 200
+    body = result.get_json()
+    assert body["success"] is True
+    assert body["local_book_consistent"] is False
+    assert body["wallet_error"] == "sage_get_offers_unavailable"
+    assert "unavailable" in body["diagnosis"].lower()
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_offer_diagnostic_accepts_fresh_empty_wallet_book():
+    bot = _make_bot()
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+        "last_error": "",
+    }
+
+    with (
+        patch.object(api_server, "bot", bot),
+        patch("database.get_connection", return_value=conn),
+    ):
+        result = api_server.app.test_client().get(
+            "/api/offers/diagnostic",
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert result.status_code == 200
+    body = result.get_json()
+    assert body["success"] is True
+    assert body["local_book_consistent"] is True
+    assert body["wallet_error"] is None
+
+
 if __name__ == "__main__":
     unittest.main()

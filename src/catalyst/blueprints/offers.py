@@ -1841,7 +1841,12 @@ def _offer_diagnostic_assessment(
         and (len(wallet_cancel_pending) > 0 or len(wallet_cancelled_still_visible) > 0)
     )
 
-    if local_book_consistent:
+    if wallet_error is not None:
+        diagnosis = (
+            "Wallet offer read unavailable. A cached offer book cannot prove "
+            "agreement with the DB; retry after Sage recovers."
+        )
+    elif local_book_consistent:
         diagnosis = (
             "Wallet and DB agree on the open book, and each live offer has a "
             "unique non-reserve coin. This endpoint did not evaluate any Dexie "
@@ -1958,6 +1963,16 @@ def api_offers_diagnostic():
                 wallet_open_buys, wallet_open_sells, _ = (
                     bot.offer_manager.sync_from_wallet()
                 )
+                sync_meta = bot.offer_manager.get_wallet_sync_meta()
+                if type(sync_meta) is not dict or sync_meta.get("fresh") is not True:
+                    wallet_error = (
+                        str(
+                            sync_meta.get("last_error")
+                            or "wallet_offer_query_not_fresh"
+                        )
+                        if type(sync_meta) is dict
+                        else "wallet_offer_query_not_fresh"
+                    )
             else:
                 from wallet import get_all_offers, classify_offers_from_list
 
