@@ -2007,6 +2007,10 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
         ),
         get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
     )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     events = []
@@ -2099,6 +2103,10 @@ def test_startup_repost_does_not_publish_cached_wallet_offers(monkeypatch):
             "last_error": "Sage get_offers unavailable",
         },
     )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
     loop.dexie_manager = SimpleNamespace(
         queue_post=lambda *_args, **_kwargs: queued.append(_args),
         flush_queue=lambda *_args, **_kwargs: flushed.append(_args),
@@ -2124,6 +2132,10 @@ def test_startup_repost_does_not_publish_db_only_offer(monkeypatch):
     loop.offer_manager = SimpleNamespace(
         sync_from_wallet=lambda: ([], [], []),
         get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
     )
     loop.dexie_manager = SimpleNamespace(
         queue_post=lambda *_args, **_kwargs: queued.append(_args),
@@ -2164,6 +2176,10 @@ def test_startup_repost_includes_wallet_offer_missing_from_partial_db(monkeypatc
             [],
         ),
         get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
     )
     loop.dexie_manager = SimpleNamespace(
         queue_post=lambda offer, trade_id, force=False: queued.append(
@@ -2254,6 +2270,10 @@ def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch
     loop.offer_manager = SimpleNamespace(
         sync_from_wallet=lambda: ([{"trade_id": "slow-trade"}], [], []),
         get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
     )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()

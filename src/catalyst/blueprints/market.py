@@ -220,8 +220,9 @@ def api_dexie_repost():
     bot = api_server.bot
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
-    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
-    sync_meta = bot.offer_manager.get_wallet_sync_meta()
+    (open_buys, open_sells, _), sync_meta = (
+        bot.offer_manager.sync_from_wallet_with_meta()
+    )
     if (
         type(sync_meta) is not dict
         or sync_meta.get("fresh") is not True

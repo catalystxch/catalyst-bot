@@ -95,6 +95,10 @@ def test_direct_bot_start_requires_fresh_wallet_offer_metadata():
         sync_from_wallet=lambda: ([{"trade_id": "cached"}], [], []),
         get_wallet_sync_meta=lambda: {"fresh": False, "using_cache": True},
     )
+    manager.sync_from_wallet_with_meta = lambda: (
+        manager.sync_from_wallet(),
+        manager.get_wallet_sync_meta(),
+    )
     loop = SimpleNamespace(offer_manager=manager)
     assert bot_loop.BotLoop._fresh_wallet_offer_book_for_start(loop) is False
     manager.get_wallet_sync_meta = lambda: {"fresh": True, "using_cache": False}

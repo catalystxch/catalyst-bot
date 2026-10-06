@@ -5692,8 +5692,7 @@ class BotLoop:
     def _fresh_wallet_offer_book_for_start(self) -> bool:
         """Reject a cached or failed Sage offer read before spawning workers."""
         try:
-            offers = self.offer_manager.sync_from_wallet()
-            meta = self.offer_manager.get_wallet_sync_meta()
+            offers, meta = self.offer_manager.sync_from_wallet_with_meta()
         except Exception:
             return False
         return (
@@ -9900,8 +9899,9 @@ class BotLoop:
         self._set_cycle_step("step3_wallet_sync")
         print("   [3] Syncing offers from wallet...", end="", flush=True)
         # step3_sync log removed — console print covers this
-        open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
-        wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
+        (open_buys, open_sells, closed), wallet_sync_meta = (
+            self.offer_manager.sync_from_wallet_with_meta()
+        )
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
         # Local expiry is display/planning context only. The wallet book stays
         # intact until authoritative reconciliation proves terminal state.
@@ -15959,8 +15959,9 @@ class BotLoop:
         try:
             from database import PublicationSuppressedError, get_offers_for_repost
 
-            open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
-            sync_meta = self.offer_manager.get_wallet_sync_meta()
+            (open_buys, open_sells, _), sync_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
             if (
                 type(sync_meta) is not dict
                 or sync_meta.get("fresh") is not True

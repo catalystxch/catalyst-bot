@@ -951,6 +951,7 @@ class OfferManager:
         # When Sage get_offers times out, we must not treat that as an empty
         # book. Keep the last successful classified view so callers can fail
         # closed and avoid rebuilding on top of still-live offers.
+        self._wallet_sync_lock = threading.RLock()
         self._wallet_sync_cache: Dict[str, List[Dict]] = {
             "buy": [],
             "sell": [],
@@ -9976,6 +9977,19 @@ class OfferManager:
         )
 
     def sync_from_wallet(self) -> Tuple[List, List, List]:
+        """Synchronize the offer book under the shared wallet-sync lock."""
+        with self._wallet_sync_lock:
+            return self._sync_from_wallet_unlocked()
+
+    def sync_from_wallet_with_meta(
+        self,
+    ) -> Tuple[Tuple[List, List, List], Dict[str, Any]]:
+        """Return one offer read and the freshness metadata belonging to it."""
+        with self._wallet_sync_lock:
+            offers = self._sync_from_wallet_unlocked()
+            return offers, dict(self._wallet_sync_meta)
+
+    def _sync_from_wallet_unlocked(self) -> Tuple[List, List, List]:
         """Sync offer state from the Chia wallet RPC.
 
         Fetches all offers from the wallet and classifies them.

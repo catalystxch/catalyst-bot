@@ -204,6 +204,10 @@ class TestCheckResume(_FlaskBase):
         bot._loop_count = 46
         bot.is_running.return_value = False
         bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
 
         with (
             patch("chia_node.is_startup_authorised", return_value=True),
@@ -237,6 +241,10 @@ class TestCheckResume(_FlaskBase):
         bot = MagicMock()
         bot.is_running.return_value = False
         bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
         with (
             patch("chia_node.is_startup_authorised", return_value=True),
             patch.object(api_server, "bot", bot),
@@ -308,6 +316,10 @@ class TestCheckResume(_FlaskBase):
         bot._loop_count = 0
         bot.is_running.return_value = False
         bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
 
         with (
             patch("chia_node.is_startup_authorised", return_value=True),

@@ -1145,13 +1145,12 @@ def api_check_resume():
             cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
         )
         offer_manager = getattr(bot, "offer_manager", None) if bot else None
-        sync_from_wallet = getattr(offer_manager, "sync_from_wallet", None)
-        if callable(sync_from_wallet):
+        sync_with_meta = getattr(offer_manager, "sync_from_wallet_with_meta", None)
+        if callable(sync_with_meta):
             # Share this explicit live read with /api/status so the stopped
             # dashboard cannot overwrite the verified resume count with stale
             # database rows on its next poll.
-            open_buy, open_sell, _ = sync_from_wallet()
-            sync_meta = offer_manager.get_wallet_sync_meta()
+            (open_buy, open_sell, _), sync_meta = sync_with_meta()
             if (
                 type(sync_meta) is not dict
                 or sync_meta.get("fresh") is not True

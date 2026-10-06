@@ -32,6 +32,10 @@ except (ModuleNotFoundError, ImportError) as exc:
 
 def _make_bot():
     bot = MagicMock()
+    bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        bot.offer_manager.sync_from_wallet(),
+        bot.offer_manager.get_wallet_sync_meta(),
+    )
     bot.is_running.return_value = True
     bot.market_intel.refresh_orderbook.return_value = None
     bot.market_intel.get_market_summary.return_value = {

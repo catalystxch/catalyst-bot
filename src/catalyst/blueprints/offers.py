@@ -1960,10 +1960,9 @@ def api_offers_diagnostic():
         wallet_open_sells = []
         try:
             if bot and getattr(bot, "offer_manager", None):
-                wallet_open_buys, wallet_open_sells, _ = (
-                    bot.offer_manager.sync_from_wallet()
+                (wallet_open_buys, wallet_open_sells, _), sync_meta = (
+                    bot.offer_manager.sync_from_wallet_with_meta()
                 )
-                sync_meta = bot.offer_manager.get_wallet_sync_meta()
                 if type(sync_meta) is not dict or sync_meta.get("fresh") is not True:
                     wallet_error = (
                         str(

@@ -62,13 +62,11 @@ class _BootstrapAuthorityMismatch(Exception):
 def _fresh_start_wallet_offer_book(bot) -> bool:
     """Require a new Sage offer read before accepting any bot-start caller."""
     manager = getattr(bot, "offer_manager", None)
-    sync = getattr(manager, "sync_from_wallet", None)
-    get_meta = getattr(manager, "get_wallet_sync_meta", None)
-    if not callable(sync) or not callable(get_meta):
+    sync_with_meta = getattr(manager, "sync_from_wallet_with_meta", None)
+    if not callable(sync_with_meta):
         return False
     try:
-        offers = sync()
-        meta = get_meta()
+        offers, meta = sync_with_meta()
     except Exception:
         return False
     return (
