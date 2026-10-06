@@ -74,7 +74,16 @@ modal successfully: nine passed, one warning (Splash unreachable), and the
 duration rendered as `4579.5ms`. The preceding independent Sage read-only
 preflight found zero pending and fillable offers across the complete 4,095
 record offer history, and the prior campaign stopped with zero authoritative
-fee spend. No bot, campaign, Coin Prep, offer, or wallet action was started.
+fee spend. A second independent read-only Sage check after this exact build's
+startup confirmed TEST 7 mainnet fingerprint `736588221`, zero pending
+transactions, and zero fillable offers after classifying the complete 4,095
+record offer table. XCH selectable and owned balance both remained
+`138470301476875` mojos. Direct exact-asset Sage `get_coins` reads found 60
+selectable and 60 owned MZ coins, each set totaling `780212284` atomic units.
+Read-only database functions confirmed the prior campaign remains `stopped`,
+its authoritative fee spend is zero mojos, and there is no active MZ/mainnet
+campaign for this fingerprint. No bot, campaign, Coin Prep, offer, or wallet
+action was started.
 
 Fresh exact-PID/path/hash read-only monitors began on
 `2026-10-06T13:49:13Z` in
