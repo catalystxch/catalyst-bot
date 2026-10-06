@@ -153,3 +153,21 @@ zero alerts; six initial samples are frozen in the evidence tree. The complete
 24-hour trace and end-state
 review remain pending. This secondary read-only pass does not establish an
 active-offer lifecycle or live trading stability window.
+
+## Exact-candidate primary campaign preview without wallet effect
+
+At `2026-10-06T02:56Z`, the sole primary PID `149044` still matched EXE
+SHA-256 `DBC3D205070D58E6C443FDC2C4BE28CE4B106359BAE285C31A87C70FBDA0AE26`.
+In its native Settings UI, Bootstrap was selected locally and a review-only
+preview was generated for the already discussed TEST 7 MZ/XCH limits:
+`0.000075` XCH/MZ anchor, one-day expiry, `0.9` XCH and `12,000` MZ market
+budgets, `0.001` XCH fee budget, and zero optional subsidy. The preview showed
+the exact asset ID
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+fixed corridor `0.0000375–0.00015`, first stage `10%`, and three buy plus
+three sell offers. Its exact-asset acknowledgement remained unchecked and
+Start Campaign disabled. Follow mode was then restored locally without Save.
+Read-only API rechecks showed bot stopped, Bootstrap inactive, no campaign,
+zero open offers, safety allowed, and unchanged `138.470301476875` XCH and
+`780212.284` MZ balances. No fee approval, offer, or wallet mutation occurred.
+This preview is not authorization to start a new campaign or incur network fees.
