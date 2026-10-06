@@ -11,11 +11,13 @@ the real warning function and failed before the fix. The fix escapes both
 counts at the HTML sink. No campaign or wallet action is involved.
 
 The targeted Chromium regression passed after the fix. The complete opt-in
-Chromium suite passed **227 tests in 177.92 seconds**. Ruff check and format
-of the modified test passed. The runtime Python source is unchanged from
-`a5f4074`, whose complete serial Windows backend passed 7,277 tests, with
-227 skipped and 433 subtests. All eleven exact-source PR checks passed on
-`2028c84`; the docs-only evidence child must be checked separately.
+Chromium suite passed **227 tests in 177.92 seconds**. The exact detached
+`2028c84` checkout passed the complete serial Windows backend:
+**7,277 passed, 228 skipped, 433 subtests passed in 1282.82 seconds**. The
+additional skip is the new opt-in browser regression. Ruff check and format
+of the modified test passed. All eleven exact-source PR checks passed on
+`2028c84`. All eleven checks also passed on docs/evidence-only head
+`5a2845ec5d62caca31017e7721fc1fd572c38924`.
 
 The detached checkout `E:\catalyst-skip-xss-2028c84-build` built the clean
 Windows bundle successfully with PyInstaller 6.21.0 and release version 1.4.0.
@@ -48,8 +50,10 @@ exited 0 and removed the QA EXE and registration; the original TEST 7 process
 and port owner remained unchanged. The QA installer has a deliberately
 different AppId and hash from the pinned distributable.
 
-Synthetic Sage and publication-recovery package smokes remain open for this
-exact bundle. Live original-profile API and Sage reads are recorded below.
+The exact packaged worker passed the isolated synthetic Sage mTLS RPC smoke,
+including certificate loading and fingerprint 123456789 against the mock
+endpoint. Packaged publication-recovery smoke remains open for this exact
+bundle. Live original-profile API and Sage reads are recorded below.
 
 ## Original TEST 7 read-only rollover
 
@@ -81,7 +85,22 @@ startup covered Dashboard, Offers, P&L, Market Intel, Settings, Logs, Data
 Reset, Help and About. Each navigation selection became current, both info
 modals opened, and there were no page errors. Post-traversal app state still
 showed the stopped bot, zero open offers, unchanged balances, inactive
-Bootstrap and allowed safety. Full native interactive UI acceptance,
+Bootstrap and allowed safety.
+
+The exact native desktop window was then exercised on the same PID. Its testing
+Risk Disclosure was acknowledged under the operator's prior authorization,
+Sage connected, the existing Spacescan configuration was retained, and
+`MZ_XCH` selected. The native Dashboard showed the selected pair and stopped
+bot. Offers showed zero active bids and asks; P&L showed prior confirmed
+history; Market Intel showed RED confidence and Splash unavailable; Settings
+showed fingerprint `736588221` and both Setup and idle Live views; Logs
+backfilled current-session CAT discovery and pair-selection events. Data Reset
+was inspected without pressing a reset action. Help and About opened and
+closed, and the window returned to Dashboard. No start, settings save, Coin
+Prep, campaign, offer, or wallet action was taken. A post-traversal read-only
+API check showed the same EXE hash, correct mainnet/MZ identity, unchanged
+balances, zero open offers, inactive Bootstrap, and ALLOWED safety with an
+owned lease. This completes the inactive native UI traversal; active-state UI,
 active-offer lifecycle/recovery, secondary original-profile acceptance, both
 final-candidate 24-hour windows, and final review remain open. PR #220 stays
 draft.
