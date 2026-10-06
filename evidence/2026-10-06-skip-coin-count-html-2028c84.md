@@ -76,7 +76,12 @@ Exact-PID/path/hash stopped-profile safety and port-owner monitors began at
 `2026-10-06T12:27:21Z` and `12:27:19Z` under
 `E:\catalyst-stability-monitor-2028c84`; their first samples passed. The
 24-hour stopped-profile gate cannot pass before `2026-10-07T12:27:21Z` plus
-complete trace and end-state review. Full native interactive UI acceptance,
+complete trace and end-state review. A read-only live Chromium traversal after
+startup covered Dashboard, Offers, P&L, Market Intel, Settings, Logs, Data
+Reset, Help and About. Each navigation selection became current, both info
+modals opened, and there were no page errors. Post-traversal app state still
+showed the stopped bot, zero open offers, unchanged balances, inactive
+Bootstrap and allowed safety. Full native interactive UI acceptance,
 active-offer lifecycle/recovery, secondary original-profile acceptance, both
 final-candidate 24-hour windows, and final review remain open. PR #220 stays
 draft.
