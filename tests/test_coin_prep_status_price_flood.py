@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import api_server
 import coin_manager
@@ -215,6 +216,12 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         def __init__(self):
             self.price_engine = price_engine
             self.started = False
+            self.offer_manager = MagicMock()
+            self.offer_manager.sync_from_wallet.return_value = ([], [], [])
+            self.offer_manager.get_wallet_sync_meta.return_value = {
+                "fresh": True,
+                "using_cache": False,
+            }
 
         def is_running(self):
             return False

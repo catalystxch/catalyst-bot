@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import api_server
 from api_test_support import api_mutations_permitted
@@ -229,6 +229,12 @@ def test_sage_cert_pair_rejects_unknown_custom_root(tmp_path):
 class _StartableBot:
     def __init__(self):
         self.started = False
+        self.offer_manager = MagicMock()
+        self.offer_manager.sync_from_wallet.return_value = ([], [], [])
+        self.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
 
     def is_running(self):
         return False

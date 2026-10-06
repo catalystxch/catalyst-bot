@@ -284,6 +284,11 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     api_server._rate_limit_log.clear()
 
     fake_bot = MagicMock()
+    fake_bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+    fake_bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+    }
     fake_bot.is_running.return_value = False
     fake_bot.start.return_value = True
 

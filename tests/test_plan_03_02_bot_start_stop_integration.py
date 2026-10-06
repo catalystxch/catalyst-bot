@@ -116,6 +116,11 @@ class _TempDB(unittest.TestCase):
 
     def _make_bot(self, running=False):
         bot = MagicMock()
+        bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+        bot.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
         bot.is_running.return_value = running
         bot.start.return_value = True
         bot.get_state.return_value = {"status": "running"}
