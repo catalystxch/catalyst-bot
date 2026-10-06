@@ -1095,6 +1095,52 @@ def test_failed_heartbeat_records_bounded_timing_without_exception_details(
     assert "private diagnostic detail" not in repr(data)
 
 
+def test_background_heartbeat_exception_fences_and_stops_immediately(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    stopped = threading.Event()
+    reasons = []
+    gate.register_stop_handler(lambda reason: (reasons.append(reason), stopped.set()))
+
+    def unexpected_heartbeat_failure():
+        raise RuntimeError("private heartbeat diagnostic detail")
+
+    monkeypatch.setattr(gate, "heartbeat", unexpected_heartbeat_failure)
+    assert gate.start_heartbeat(interval_seconds=0.01) is True
+    try:
+        assert stopped.wait(timeout=1), "heartbeat worker exited without fencing"
+        assert gate.status().reason_code == "HEARTBEAT_FAILED"
+        assert reasons == ["HEARTBEAT_FAILED"]
+    finally:
+        gate.stop_heartbeat()
+
+
+def test_heartbeat_rechecks_expiry_after_delayed_database_return(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    durable_heartbeat = database.heartbeat_runtime_mutation_lease
+
+    def delayed_return(**kwargs):
+        result = durable_heartbeat(**kwargs)
+        assert result["heartbeat"] is True
+        clock.advance(50)
+        return result
+
+    monkeypatch.setattr(database, "heartbeat_runtime_mutation_lease", delayed_return)
+    renewed = gate.heartbeat()
+
+    assert renewed["heartbeat"] is False
+    assert renewed["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
 def test_heartbeat_timing_separates_local_gate_lock_wait(
     isolated_gate_database, monkeypatch
 ):

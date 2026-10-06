@@ -2266,6 +2266,16 @@ class MutationGate:
                             lease_duration_seconds=self.lease_seconds,
                         )
                         result = _lease_public_result(result)
+                        if (
+                            result.get("heartbeat")
+                            and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                        ):
+                            # The process may have been suspended after the
+                            # durable commit but before this thread resumed.
+                            result = result | {
+                                "heartbeat": False,
+                                "reason": "lease_expired",
+                            }
                         attempts.append(
                             {
                                 "elapsed_ms": round(
@@ -2343,7 +2353,24 @@ class MutationGate:
 
             def run() -> None:
                 while not self._heartbeat_stop.wait(interval):
-                    if not self.heartbeat().get("heartbeat"):
+                    try:
+                        renewed = self.heartbeat().get("heartbeat")
+                    except BaseException as exc:
+                        # An unexpected worker exception must not leave an
+                        # apparently authorized process with no renewer.
+                        self._set_local_block("HEARTBEAT_FAILED")
+                        self._flush_stop_handler()
+                        try:
+                            slog(
+                                "SAFETY",
+                                "Mutation lease heartbeat worker failed",
+                                {"exception_type": type(exc).__name__},
+                                level="error",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if not renewed:
                         return
 
             self._heartbeat_thread = threading.Thread(

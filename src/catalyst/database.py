@@ -32685,7 +32685,20 @@ def heartbeat_runtime_mutation_lease(
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
+        if effective_expiry <= _stability_wall_clock():
+            conn.rollback()
+            return {
+                "heartbeat": False,
+                "reason": "lease_expired",
+                "lease": current,
+            }
         conn.commit()
+        if effective_expiry <= _stability_wall_clock():
+            return {
+                "heartbeat": False,
+                "reason": "lease_expired",
+                "lease": dict(row),
+            }
         return {
             "heartbeat": cursor.rowcount == 1,
             "reason": "heartbeat" if cursor.rowcount == 1 else "compare_and_set_failed",
