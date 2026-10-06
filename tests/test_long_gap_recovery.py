@@ -1821,6 +1821,66 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
     assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
 
 
+@pytest.mark.parametrize("reader_unavailable", ["missing", "raising"])
+def test_sage_quarantine_does_not_fall_back_to_full_history_when_exact_reader_unavailable(
+    monkeypatch, reader_unavailable
+):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = datetime.now(timezone.utc)
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+
+    def raising_reader(_ids):
+        raise RuntimeError("exact Sage offer endpoint unavailable")
+
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_absence_by_ids",
+        None if reader_unavailable == "missing" else raising_reader,
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": NETWORK,
+            "observed_at_utc": observed.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        },
+    )
+    history_calls = []
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_kwargs: history_calls.append(True) or [],
+    )
+    requirements = {
+        "quarantine_id": "quarantine:" + "9" * 64,
+        "recovery_id": "recovery:" + "9" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "f" * 64,
+        "offers": [],
+    }
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+
+    assert decision["allowed"] is False
+    assert proof["version"] == 2
+    assert history_calls == []
+
+
 def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypatch):
     import api_server
     import wallet

@@ -176,7 +176,10 @@ _SPACESCAN_PUBLIC_PLANS = {
 intercept_log_event()
 
 from bot_loop import BotLoop
-from wallet import get_wallet_adapter_authority, get_wallet_type
+import wallet
+
+get_wallet_adapter_authority = wallet.get_wallet_adapter_authority
+get_wallet_type = wallet.get_wallet_type
 
 # ---- Super Log: hook ALL module methods for complete visibility ----
 try:
@@ -4269,15 +4272,13 @@ def api_safety_quarantine_status(quarantine_id: str):
 def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
 
-    import wallet
-
-    try:
-        if wallet.get_wallet_backend_authority() == "sage" and callable(
-            getattr(wallet, "get_authoritative_offer_absence_by_ids", None)
-        ):
-            return _collect_sage_quarantine_absence_proof(requirements, wallet)
-    except Exception:
-        pass
+    backend = wallet.get_wallet_backend_authority()
+    if backend == "sage":
+        # An unavailable exact reader must not downgrade Sage to the older
+        # full-history proof. The Sage collector returns an incomplete proof.
+        return _collect_sage_quarantine_absence_proof(requirements, wallet)
+    if backend != "chia":
+        raise RuntimeError("wallet backend authority unavailable")
 
     from offer_reconciliation import (
         load_authoritative_evidence,
@@ -4359,8 +4360,6 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         ):
             observed_at = candidate_observed
     if not requirements.get("offers"):
-        import wallet
-
         try:
             identity = wallet.get_wallet_identity()
         except Exception:
