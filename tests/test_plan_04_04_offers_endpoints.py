@@ -69,6 +69,14 @@ def _make_bot(offers=([], [], [])):
     bot = MagicMock()
     bot.is_running.return_value = True
     bot.offer_manager.sync_from_wallet.return_value = offers
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+    }
+    bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        bot.offer_manager.sync_from_wallet(),
+        bot.offer_manager.get_wallet_sync_meta(),
+    )
     bot.offer_manager.cancel_all.return_value = {"cancelled": [], "failed": []}
     bot.offer_manager.cancel_offers.return_value = {"success": True}
     bot.coin_manager.is_busy.return_value = False

@@ -121,6 +121,10 @@ class _TempDB(unittest.TestCase):
             "fresh": True,
             "using_cache": False,
         }
+        bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            bot.offer_manager.sync_from_wallet(),
+            bot.offer_manager.get_wallet_sync_meta(),
+        )
         bot.is_running.return_value = running
         bot.start.return_value = True
         bot.get_state.return_value = {"status": "running"}

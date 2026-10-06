@@ -289,6 +289,10 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
         "fresh": True,
         "using_cache": False,
     }
+    fake_bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        fake_bot.offer_manager.sync_from_wallet(),
+        fake_bot.offer_manager.get_wallet_sync_meta(),
+    )
     fake_bot.is_running.return_value = False
     fake_bot.start.return_value = True
 

@@ -235,6 +235,10 @@ class _StartableBot:
             "fresh": True,
             "using_cache": False,
         }
+        self.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            self.offer_manager.sync_from_wallet(),
+            self.offer_manager.get_wallet_sync_meta(),
+        )
 
     def is_running(self):
         return False

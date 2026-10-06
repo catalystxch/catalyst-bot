@@ -44,6 +44,10 @@ def test_bot_start_waits_for_cancel_all_stopped_book_check(monkeypatch):
         "fresh": True,
         "using_cache": False,
     }
+    bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        bot.offer_manager.sync_from_wallet(),
+        bot.offer_manager.get_wallet_sync_meta(),
+    )
     bot.is_running.return_value = False
     bot.start.return_value = True
     cfg = SimpleNamespace(
