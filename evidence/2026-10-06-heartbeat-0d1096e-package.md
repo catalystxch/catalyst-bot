@@ -97,6 +97,16 @@ The clean exact-PID/hash stopped-profile monitor is
 `trace-60s-clean.jsonl`. It began at `2026-10-06T22:27:32Z`; its first sample
 had an owned lease, synced wallet, stopped bot, zero offers and safety
 allowed. This is the start of observation, not a completed 24-hour gate.
+An independent read-only audit script at
+`E:\catalyst-stability-monitor-0d1096e-clean\audit.ps1` (SHA-256
+`23BE8C7ADA53B365CCB123FBBD63596F9B62E4CE2CF7E198ACC6B9E81A2B7043`)
+checks every sample's identity, safety, lease, wallet sync, stopped bot, offer
+count and observation gap, plus the current executable hash and port owner.
+With the duration threshold set to zero solely for verifier testing, a
+synthetic clean row returned pass (`0`); an otherwise identical row with
+safety blocked returned failure (`1`). The live trace correctly returned
+incomplete (`2`), with no sample errors at that checkpoint. This verifier
+does not shorten the required 24-hour observation.
 
 The exact native UI's read-only Dashboard, Offers, P&L, Market Intelligence,
 Settings, Logs, Data Reset, Help and About traversal passed with MZ selected.
