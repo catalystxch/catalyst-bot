@@ -9862,12 +9862,13 @@ class OfferManager:
 
     def get_wallet_sync_snapshot(self) -> Dict[str, Any]:
         """Return a defensive copy of the last wallet-authoritative offer book."""
-        return {
-            "buy": [dict(o) for o in self._wallet_sync_cache.get("buy", [])],
-            "sell": [dict(o) for o in self._wallet_sync_cache.get("sell", [])],
-            "closed": [dict(o) for o in self._wallet_sync_cache.get("closed", [])],
-            "meta": dict(self._wallet_sync_meta),
-        }
+        with self._wallet_sync_lock:
+            return {
+                "buy": [dict(o) for o in self._wallet_sync_cache.get("buy", [])],
+                "sell": [dict(o) for o in self._wallet_sync_cache.get("sell", [])],
+                "closed": [dict(o) for o in self._wallet_sync_cache.get("closed", [])],
+                "meta": dict(self._wallet_sync_meta),
+            }
 
     def expect_empty_wallet_offer_book(
         self, reason: str, ttl_seconds: int = 180

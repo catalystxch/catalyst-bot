@@ -253,6 +253,45 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertEqual(results[1][0][0][0]["trade_id"], "fresh")
         self.assertIs(results[1][1]["fresh"], True)
 
+    def test_stopped_dashboard_snapshot_never_exposes_partial_wallet_sync(self):
+        manager = self.offer_manager.OfferManager()
+        manager._wallet_sync_cache = {
+            "buy": [{"trade_id": "old-buy"}],
+            "sell": [{"trade_id": "old-sell"}],
+            "closed": [],
+        }
+        manager._wallet_sync_meta.update({"fresh": True, "last_success_at": 1})
+        reader_entered = threading.Event()
+        reader_done = threading.Event()
+        snapshots = []
+
+        def read_snapshot():
+            reader_entered.set()
+            snapshots.append(manager.get_wallet_sync_snapshot())
+            reader_done.set()
+
+        with manager._wallet_sync_lock:
+            # Model the writer's real buy/sell/meta updates while its sync lock
+            # protects a partially replaced offer book.
+            manager._wallet_sync_cache["buy"] = [{"trade_id": "new-buy"}]
+            reader = threading.Thread(target=read_snapshot)
+            reader.start()
+            self.assertTrue(reader_entered.wait(timeout=2))
+            self.assertFalse(reader_done.wait(timeout=0.25))
+            manager._wallet_sync_cache["sell"] = [{"trade_id": "new-sell"}]
+            manager._wallet_sync_meta["last_success_at"] = 2
+
+        reader.join(timeout=2)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [offer["trade_id"] for offer in snapshots[0]["buy"]], ["new-buy"]
+        )
+        self.assertEqual(
+            [offer["trade_id"] for offer in snapshots[0]["sell"]], ["new-sell"]
+        )
+        self.assertEqual(snapshots[0]["meta"]["last_success_at"], 2)
+
     def test_expected_empty_wallet_book_after_cancel_all_bypasses_cache(self):
         manager = self.offer_manager.OfferManager()
 
