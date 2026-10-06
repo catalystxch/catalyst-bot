@@ -66,6 +66,14 @@ synced wallet, unchanged 138.470301476875 XCH and 780212.284 MZ balances,
 bot stopped, zero open offers, inactive Bootstrap, and safety ALLOWED with
 an owned renewing lease. No campaign or wallet action was taken.
 
+The exact native window also passed a read-only traversal of Dashboard,
+Offers (zero active, three historical fills), P&L (three confirmed historical
+buy fills), Market Intelligence (RED confidence and zero attributed depth),
+Settings (TEST 7 fingerprint and MZ pair), Logs (Sage startup and pair-selection
+events backfilled), Data Reset, Help, and About. Data Reset actions and bot
+Start were not invoked. The pair's market confidence was RED during this
+traversal, so this is an inactive-profile UI result, not a live ladder result.
+
 An exact-PID/hash 60-second stopped-profile monitor started at
 `2026-10-06T18:45:21Z` in
 `E:\catalyst-stability-monitor-19ded88\trace-60s.jsonl`. Its first sample
