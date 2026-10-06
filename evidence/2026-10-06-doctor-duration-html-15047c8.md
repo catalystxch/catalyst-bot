@@ -53,3 +53,36 @@ All eleven exact-source PR checks passed. At packaging, PR #220 remains draft. E
 active-offer lifecycle and recovery, secondary original-profile acceptance,
 both final-candidate 24-hour windows, and final review remain open. No new
 campaign or wallet effect was started.
+
+## Original TEST 7 read-only rollover
+
+The prior stopped `2028c84` app was closed through its native shutdown flow
+with offer cancellation unchecked. The exact clean `15047c8` EXE then launched
+as the sole CATalyst process, PID `100576`, from the E: build path above. Its
+on-disk SHA-256 matched `D2C9AD43F4F7D47E9FCFED4A1C13DE7D22BE92CE45CF086E366530A4EFC6D6C8`,
+and the sole `127.0.0.1:5000` listener belonged to that PID. The native UI
+acknowledged the testing Risk Disclosure under existing operator authorization,
+connected Sage mainnet fingerprint `736588221`, and selected Monkeyzoo Token
+`MZ_XCH`. The bot remained stopped.
+
+The live API reported CAT wallet ID `2`, exact asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+138.470301476875 XCH and 780212.284 MZ, a healthy synced Sage wallet, zero
+open offers, inactive Bootstrap, and safety allowed with zero blockers and an
+owned lease. The native Logs > Run Doctor flow displayed its Doctor Report
+modal successfully: nine passed, one warning (Splash unreachable), and the
+duration rendered as `4579.5ms`. The preceding independent Sage read-only
+preflight found zero pending and fillable offers across the complete 4,095
+record offer history, and the prior campaign stopped with zero authoritative
+fee spend. No bot, campaign, Coin Prep, offer, or wallet action was started.
+
+Fresh exact-PID/path/hash read-only monitors began on
+`2026-10-06T13:49:13Z` in
+`E:\catalyst-stability-monitor-15047c8` (60-second safety/health/offer trace)
+and at `2026-10-06T13:49:10Z` (30-second port-owner trace). Their first samples
+showed the same process/hash, one owned listener, allowed safety, an owned
+renewing lease, synced Sage, stopped bot, and zero open offers. The 24-hour
+stopped-profile gate cannot be counted before `2026-10-07T13:49:13Z` plus
+complete trace and end-state review. The prior candidate's traces are
+historical. Active-offer lifecycle/recovery, secondary original-profile
+acceptance, the active-profile 24-hour window, and final review remain open.
