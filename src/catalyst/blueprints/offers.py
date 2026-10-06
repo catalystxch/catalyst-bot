@@ -442,7 +442,14 @@ def api_offers():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
+    (open_buys, open_sells, _), wallet_meta = (
+        bot.offer_manager.sync_from_wallet_with_meta()
+    )
+    if (
+        wallet_meta.get("fresh") is not True
+        or wallet_meta.get("using_cache") is not False
+    ):
+        return jsonify({"success": False, "error": "wallet_offer_sync_stale"}), 503
 
     return jsonify(
         {

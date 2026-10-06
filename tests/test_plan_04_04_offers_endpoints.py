@@ -356,6 +356,17 @@ class TestOffersGet(_FlaskBase):
         self.assertEqual(body["buy_count"], 0)
         self.assertEqual(body["sell_count"], 0)
 
+    def test_cached_empty_wallet_book_is_not_reported_as_current(self):
+        bot = _make_bot(offers=([], [], []))
+        bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            ([], [], []),
+            {"fresh": False, "using_cache": False},
+        )
+        with patch.object(api_server, "bot", bot):
+            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "wallet_offer_sync_stale")
+
 
 # ---------------------------------------------------------------------------
 # 2. GET /api/offers/cancel_all/status

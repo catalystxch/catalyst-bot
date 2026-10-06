@@ -668,7 +668,12 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
         "bot",
         SimpleNamespace(
             offer_manager=SimpleNamespace(
-                sync_from_wallet=Mock(return_value=([wallet_offer], [], None))
+                sync_from_wallet_with_meta=Mock(
+                    return_value=(
+                        ([wallet_offer], [], []),
+                        {"fresh": True, "using_cache": False},
+                    )
+                )
             )
         ),
     )
