@@ -137,10 +137,19 @@ port ownership were independently checked. Sixteen screenshots and the full
 report are at the secondary PC's
 `evidence/acceptance-cbd7d08-20261006T0320BST/REPORT.md` (SHA-256
 `F5F0BEF39DF99CA07FFAD7CFA7DE2D06D4A848A22C5AD9264524EEEB96CF4165`).
+The 38-file [immutable secondary evidence tree](https://github.com/catalystxch/catalyst-bot/tree/c3149267d939783aa16ca22d9118464a2945196e/evidence/secondary-cbd7d08-original-profile)
+is pinned at commit `c3149267d939783aa16ca22d9118464a2945196e`.
+An independent HTTP fetch of its
+[report](https://github.com/catalystxch/catalyst-bot/blob/c3149267d939783aa16ca22d9118464a2945196e/evidence/secondary-cbd7d08-original-profile/README.md)
+returned HTTP 200 and matched that SHA-256; the remote branch resolved to
+the same commit. The secondary manifest SHA-256 is
+`19D3E8080A512A2C98057C82F12A5BABCD833B8C101D226A11E5FE0BA7C71BF5`.
 
 Its exact-PID/hash stopped-profile monitor began at about `02:40Z`; the
 monitor script SHA-256 is
 `0398BEC86B13FA5D7FCF4D5A921C6CB8BEA68087E498AEB70E7833FC3B1E88DC`.
-The first two samples were clean. The complete 24-hour trace and end-state
+The first ten live samples through `2026-10-06T02:48:07Z` were clean, with
+zero alerts; six initial samples are frozen in the evidence tree. The complete
+24-hour trace and end-state
 review remain pending. This secondary read-only pass does not establish an
 active-offer lifecycle or live trading stability window.
