@@ -1000,18 +1000,9 @@ def _sqlite_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
 # when installed to a read-only location (e.g. C:\Program Files).
 # user_paths.py handles first-launch migration of legacy dev-layout DBs.
 # ---------------------------------------------------------------------------
-try:
-    from user_paths import database_file as _db_file
+from user_paths import database_file as _db_file
 
-    DB_PATH = _db_file()
-except Exception as _e:
-    # Fallback for unusual dev setups.  In a packaged build this should
-    # never execute because user_paths.py is bundled alongside database.py.
-    print(
-        f"[database] user_paths unavailable ({_e}); falling back to install dir",
-        flush=True,
-    )
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+DB_PATH = _db_file()
 
 
 # ---------------------------------------------------------------------------

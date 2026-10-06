@@ -72,45 +72,36 @@ def _restrict_env_file_permissions(path: str) -> None:
 # first-launch migration from the legacy install-dir location, so
 # existing dev installs keep working transparently.
 # ---------------------------------------------------------------------------
-try:
-    from user_paths import env_file as _env_file, install_dir as _install_dir
+from user_paths import env_file as _env_file, install_dir as _install_dir
 
-    _ENV_PATH = _env_file()
-    # If the user data .env doesn't exist yet but a template does in the
-    # install dir, seed the data-dir .env from .env.example so first-run
-    # users start with sensible defaults.
-    if not os.path.exists(_ENV_PATH):
-        _example = _find_env_example_path(_install_dir())
-        if _example:
+_ENV_PATH = _env_file()
+# If the user data .env doesn't exist yet but a template does in the
+# install dir, seed the data-dir .env from .env.example so first-run
+# users start with sensible defaults.
+if not os.path.exists(_ENV_PATH):
+    _example = _find_env_example_path(_install_dir())
+    if _example:
+        try:
+            import shutil as _shutil
+
+            _tmp_env = f"{_ENV_PATH}.{os.getpid()}.tmp"
+            _shutil.copy2(_example, _tmp_env)
             try:
-                import shutil as _shutil
-
-                _tmp_env = f"{_ENV_PATH}.{os.getpid()}.tmp"
-                _shutil.copy2(_example, _tmp_env)
+                os.replace(_tmp_env, _ENV_PATH)
+            except OSError:
+                # Another process may have won the first-run seed race.
+                if not os.path.exists(_ENV_PATH):
+                    raise
                 try:
-                    os.replace(_tmp_env, _ENV_PATH)
+                    os.unlink(_tmp_env)
                 except OSError:
-                    # Another process may have won the first-run seed race.
-                    if not os.path.exists(_ENV_PATH):
-                        raise
-                    try:
-                        os.unlink(_tmp_env)
-                    except OSError:
-                        pass
-            except Exception as _copy_err:
-                print(
-                    f"[config] Could not seed .env from .env.example: {_copy_err}",
-                    flush=True,
-                )
-    _restrict_env_file_permissions(_ENV_PATH)
-except Exception as _e:
-    # Fallback: legacy behaviour if user_paths import fails during an
-    # unusual dev setup.  Should never happen in a packaged build.
-    print(
-        f"[config] user_paths unavailable ({_e}); falling back to install dir",
-        flush=True,
-    )
-    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                    pass
+        except Exception as _copy_err:
+            print(
+                f"[config] Could not seed .env from .env.example: {_copy_err}",
+                flush=True,
+            )
+_restrict_env_file_permissions(_ENV_PATH)
 
 load_dotenv(_ENV_PATH)
 

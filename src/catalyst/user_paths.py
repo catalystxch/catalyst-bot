@@ -64,16 +64,8 @@ def data_dir() -> str:
     """Return the user-writable data directory (creating it if needed)."""
     try:
         os.makedirs(_DATA_DIR, exist_ok=True)
-    except Exception as e:
-        # If we can't create the canonical dir, fall back to the install
-        # dir.  This preserves legacy behaviour for dev runs and at least
-        # fails visibly rather than silently dropping writes.
-        print(
-            f"[user_paths] WARNING: could not create data dir {_DATA_DIR}: {e}. "
-            f"Falling back to install dir {_INSTALL_DIR}",
-            flush=True,
-        )
-        return _INSTALL_DIR
+    except OSError as e:
+        raise OSError(f"CATalyst data directory is unavailable: {_DATA_DIR}") from e
     return _DATA_DIR
 
 
@@ -249,8 +241,8 @@ def migrate_legacy_files() -> None:
 
 
 # Best-effort: run migration at import time so it happens before any
-# module reads these files.  If migration fails we still return usable
-# paths, we just might have legacy copies sitting in the install dir.
+# module reads these files. A migration failure leaves legacy copies in
+# the install dir; callers still resolve only the canonical data dir.
 try:
     migrate_legacy_files()
 except Exception as _e:
