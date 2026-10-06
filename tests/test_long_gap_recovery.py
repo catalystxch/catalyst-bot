@@ -1880,9 +1880,7 @@ def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypat
     monkeypatch.setattr(
         wallet,
         "get_owned_coins_detailed",
-        lambda wallet_id: (
-            {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {}
-        ),
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
     )
 
     proof = api_server._collect_quarantine_resolution_proof(requirements)
@@ -1895,6 +1893,52 @@ def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypat
     assert calls == [(trade_id,)]
     assert proof["version"] == 2
     assert decision["allowed"] is True
+
+    # The later owned-only view includes offer-locked coins. A later lock
+    # contradicts the earlier exact coin read and must block release.
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000, "offer_id": trade_id}}
+            if wallet_id == 1
+            else {}
+        ),
+    )
+    later_locked = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            later_locked,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000, "spent_height": 123}}
+            if wallet_id == 1
+            else {}
+        ),
+    )
+    later_spent = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            later_spent,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
+    )
 
     monkeypatch.setattr(
         wallet,
@@ -1939,9 +1983,7 @@ def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypat
     monkeypatch.setattr(
         wallet,
         "get_owned_coins_detailed",
-        lambda wallet_id: (
-            {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {}
-        ),
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
     )
 
     monkeypatch.setattr(

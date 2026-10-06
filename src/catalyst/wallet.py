@@ -161,6 +161,7 @@ else:
     from wallet_sage import (  # noqa: F401
         # Constants
         WALLET_ID_XCH,
+        SAGE_ACTIVE_CAT_WALLET_ID,
         WALLET_URL,
         CERT_PATH,
         KEY_PATH,

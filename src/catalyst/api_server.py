@@ -4489,19 +4489,34 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
         # Sage's exact coin response may omit `owned`. In that case require
         # positive membership in the wallet's owned-only XCH or CAT view;
         # absence of an ownership field is not affirmative proof.
-        owned_ids: set[str] = set()
+        owned_rows: dict[str, dict | None] = {}
         if type(raw_coins) is dict and any(
             type(row) is dict and "owned" not in row for row in raw_coins.values()
         ):
-            for wallet_id in (1, 2):
-                try:
-                    owned_view = wallet_module.get_owned_coins_detailed(wallet_id)
-                except Exception:
-                    owned_view = None
-                if type(owned_view) is dict:
-                    owned_ids.update(
-                        str(raw_id).lower().removeprefix("0x") for raw_id in owned_view
-                    )
+            xch_id = getattr(wallet_module, "WALLET_ID_XCH", None)
+            cat_id = getattr(wallet_module, "SAGE_ACTIVE_CAT_WALLET_ID", None)
+            if (
+                type(xch_id) is int
+                and type(cat_id) is int
+                and xch_id > 0
+                and cat_id > 0
+                and xch_id != cat_id
+            ):
+                for wallet_id in (xch_id, cat_id):
+                    try:
+                        owned_view = wallet_module.get_owned_coins_detailed(wallet_id)
+                    except Exception:
+                        owned_view = None
+                    if type(owned_view) is dict:
+                        for raw_id, owned_row in owned_view.items():
+                            if type(raw_id) is not str:
+                                continue
+                            owned_id = raw_id.lower().removeprefix("0x")
+                            if owned_id in expected_coins:
+                                # A coin cannot appear in both asset views.
+                                owned_rows[owned_id] = (
+                                    owned_row if owned_id not in owned_rows else None
+                                )
         after = wallet_module.get_wallet_identity()
         normalized: dict[str, dict] = {}
         if type(raw_coins) is dict and len(raw_coins) == len(expected_coins):
@@ -4517,10 +4532,29 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
                     )
                 ):
                     break
+                owned_row = owned_rows.get(coin_id)
+                owned_view_ok = bool(
+                    type(owned_row) is dict
+                    and type(owned_row.get("amount")) is int
+                    and owned_row["amount"] > 0
+                    and owned_row["amount"] == row.get("amount")
+                )
+                owned_view_unlocked = bool(
+                    owned_view_ok
+                    and (
+                        owned_row.get("spent_height") is None
+                        or (
+                            type(owned_row.get("spent_height")) is int
+                            and owned_row["spent_height"] == 0
+                        )
+                    )
+                    and owned_row.get("offer_id") in (None, "")
+                    and owned_row.get("locked", False) is False
+                )
                 normalized[coin_id] = {
                     "coin_id": coin_id,
                     "owned": (
-                        row["owned"] is True if "owned" in row else coin_id in owned_ids
+                        row["owned"] is True if "owned" in row else owned_view_ok
                     ),
                     "unlocked": (
                         (
@@ -4532,6 +4566,7 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
                         )
                         and row.get("locked", False) is False
                         and not row.get("offer_id")
+                        and ("owned" in row or owned_view_unlocked)
                     ),
                 }
         coins = [normalized[key] for key in sorted(normalized)]
