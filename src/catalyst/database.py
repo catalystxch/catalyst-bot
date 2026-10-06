@@ -31757,6 +31757,14 @@ def adopt_runtime_recovery_epoch(
                 authority, current, require_unexpired_at=adopted_at
             )
             conn.commit()
+            if current["expires_at"] <= _stability_wall_clock():
+                return {
+                    "adopted": False,
+                    "reason": "lease_expired",
+                    "record": authority,
+                    "lease": current,
+                    "idempotent": True,
+                }
             return {
                 "adopted": True,
                 "reason": "already_adopted",
@@ -31861,6 +31869,15 @@ def adopt_runtime_recovery_epoch(
                 "AND state='active'",
                 (adopted_at, adopted_at, predecessor["owner_run_id"]),
             )
+        if effective_expiry <= _stability_wall_clock():
+            conn.rollback()
+            return {
+                "adopted": False,
+                "reason": "lease_expired",
+                "record": None,
+                "lease": current,
+                "idempotent": False,
+            }
         record = dict(
             conn.execute(
                 "SELECT * FROM runtime_recovery_takeovers WHERE takeover_id=?",
@@ -31868,6 +31885,14 @@ def adopt_runtime_recovery_epoch(
             ).fetchone()
         )
         conn.commit()
+        if effective_expiry <= _stability_wall_clock():
+            return {
+                "adopted": False,
+                "reason": "lease_expired",
+                "record": record,
+                "lease": successor,
+                "idempotent": False,
+            }
         return {
             "adopted": True,
             "reason": "recovery_epoch_adopted",
@@ -32608,10 +32633,23 @@ def acquire_runtime_mutation_lease(
                 """,
                 (safety_at, safety_at, prior_parent),
             )
+        if effective_expiry <= _stability_wall_clock():
+            conn.rollback()
+            return {
+                "acquired": False,
+                "reason": "lease_expired",
+                "lease": current,
+            }
         result = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
         conn.commit()
+        if effective_expiry <= _stability_wall_clock():
+            return {
+                "acquired": False,
+                "reason": "lease_expired",
+                "lease": dict(result),
+            }
         return {"acquired": True, "reason": reason, "lease": dict(result)}
     except Exception:
         conn.rollback()

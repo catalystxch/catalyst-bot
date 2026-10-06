@@ -1141,6 +1141,27 @@ def test_heartbeat_rechecks_expiry_after_delayed_database_return(
     assert gate.status().reason_code == "HEARTBEAT_FAILED"
 
 
+def test_acquire_does_not_report_success_after_delayed_database_return(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    durable_acquire = database.acquire_runtime_mutation_lease
+
+    def delayed_return(**kwargs):
+        result = durable_acquire(**kwargs)
+        assert result["acquired"] is True
+        clock.advance(50)
+        return result
+
+    monkeypatch.setattr(database, "acquire_runtime_mutation_lease", delayed_return)
+    acquired = gate.acquire()
+
+    assert acquired["acquired"] is False
+    assert acquired["reason"] == "lease_expired"
+    assert gate.status().reason_code == "LEASE_EXPIRED"
+
+
 def test_heartbeat_timing_separates_local_gate_lock_wait(
     isolated_gate_database, monkeypatch
 ):

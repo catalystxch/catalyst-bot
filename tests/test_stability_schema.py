@@ -3051,6 +3051,72 @@ def test_heartbeat_cannot_report_success_if_commit_returns_after_expiry(
     assert database.get_runtime_mutation_lease()["lease_version"] == 2
 
 
+def test_acquire_cannot_report_success_if_commit_returns_after_expiry(
+    isolated_database, monkeypatch
+):
+    database.init_database()
+    late_clock = "2026-08-15T12:00:50.000000Z"
+    open_connection = database._stability_connection
+
+    class PausedCommit:
+        def __init__(self):
+            self.connection = open_connection()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def commit(self):
+            self.connection.commit()
+            monkeypatch.setattr(database, "_stability_wall_clock", lambda: late_clock)
+
+    monkeypatch.setattr(database, "_stability_connection", PausedCommit)
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:00:30.000000Z",
+        now=AT,
+        lease_duration_seconds=30,
+    )
+
+    assert acquired["acquired"] is False
+    assert acquired["reason"] == "lease_expired"
+    assert database.get_runtime_mutation_lease()["lease_version"] == 1
+
+
+def test_acquire_rolls_back_if_transaction_outlives_lease(
+    isolated_database, monkeypatch
+):
+    database.init_database()
+    late_clock = "2026-08-15T12:00:50.000000Z"
+    original_expiry = database._post_lock_lease_expiry
+
+    def pause_after_expiry_calculation(*args, **kwargs):
+        result = original_expiry(*args, **kwargs)
+        monkeypatch.setattr(database, "_stability_wall_clock", lambda: late_clock)
+        return result
+
+    monkeypatch.setattr(
+        database, "_post_lock_lease_expiry", pause_after_expiry_calculation
+    )
+    acquired = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=100,
+        owner_host="host-a",
+        wallet_fingerprint_hash=_sha("wallet-a"),
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:00:30.000000Z",
+        now=AT,
+        lease_duration_seconds=30,
+    )
+
+    assert acquired["acquired"] is False
+    assert acquired["reason"] == "lease_expired"
+    assert database.get_runtime_mutation_lease()["lease_version"] == 0
+
+
 @pytest.mark.parametrize("operation", ["renew", "heartbeat"])
 def test_lease_waiter_uses_post_lock_wall_clock_and_cannot_cross_expiry(
     isolated_database, monkeypatch, operation

@@ -1584,6 +1584,15 @@ class MutationGate:
                     expected_lease_version=expected_version,
                 )
                 result = _lease_public_result(result)
+                if (
+                    result.get("acquired")
+                    and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                ):
+                    result = result | {
+                        "acquired": False,
+                        "reason": "lease_expired",
+                    }
+                    self._set_local_block("LEASE_EXPIRED")
                 if result.get("acquired"):
                     lease = result["lease"]
                     self._lease_version = int(lease["lease_version"])
@@ -1681,6 +1690,13 @@ class MutationGate:
                     "lease": adopted.get("lease"),
                     "recovery_takeover": adopted.get("record"),
                 }
+                if (
+                    result["acquired"]
+                    and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                ):
+                    result["acquired"] = False
+                    result["reason"] = "lease_expired"
+                    self._set_local_block("LEASE_EXPIRED")
                 if result["acquired"]:
                     lease = result["lease"]
                     self._lease_version = int(lease["lease_version"])

@@ -1358,6 +1358,215 @@ def test_recovery_successor_keeps_full_lease_after_database_lock_wait(
     assert expires_at - acquired_at == timedelta(seconds=30)
 
 
+def test_recovery_successor_does_not_report_adoption_after_commit_expiry(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "f" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-commit"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    open_connection = db._stability_connection
+
+    class PausedCommit:
+        def __init__(self):
+            self.connection = open_connection()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def commit(self):
+            self.connection.commit()
+            monkeypatch.setattr(
+                db,
+                "_stability_wall_clock",
+                lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            )
+
+    monkeypatch.setattr(db, "_stability_connection", PausedCommit)
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is False
+    assert adopted["reason"] == "lease_expired"
+
+
+def test_recovery_successor_rolls_back_if_transaction_outlives_lease(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "0" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-transaction"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    original_snapshot = db._runtime_recovery_lease_snapshot
+
+    def delayed_snapshot(successor):
+        result = original_snapshot(successor)
+        monkeypatch.setattr(
+            db,
+            "_stability_wall_clock",
+            lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        )
+        return result
+
+    monkeypatch.setattr(db, "_runtime_recovery_lease_snapshot", delayed_snapshot)
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is False
+    assert adopted["reason"] == "lease_expired"
+    assert (
+        db.get_runtime_mutation_lease()["lease_version"]
+        == released["lease"]["lease_version"]
+    )
+    assert (
+        db.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM runtime_recovery_takeovers WHERE recovery_id=?",
+            (epoch["recovery_id"],),
+        )
+        .fetchone()[0]
+        == 0
+    )
+
+
+def test_idempotent_recovery_adoption_rechecks_expiry_after_commit(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "2" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-idempotent-commit"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    successor = dict(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_duration_seconds=30,
+        prior_owner_liveness_proven_dead=False,
+    )
+    first = db.adopt_runtime_recovery_epoch(
+        **successor,
+        lease_expires_at=requested + timedelta(seconds=30),
+        expected_lease_version=released["lease"]["lease_version"],
+        now=requested,
+    )
+    assert first["adopted"] is True
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: (
+            (requested + timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        ),
+    )
+    open_connection = db._stability_connection
+
+    class PausedCommit:
+        def __init__(self):
+            self.connection = open_connection()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def commit(self):
+            self.connection.commit()
+            monkeypatch.setattr(
+                db,
+                "_stability_wall_clock",
+                lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            )
+
+    monkeypatch.setattr(db, "_stability_connection", PausedCommit)
+    repeated = db.adopt_runtime_recovery_epoch(
+        **successor,
+        lease_expires_at=requested + timedelta(seconds=31),
+        expected_lease_version=first["lease"]["lease_version"],
+        now=requested + timedelta(seconds=1),
+    )
+
+    assert repeated["adopted"] is False
+    assert repeated["reason"] == "lease_expired"
+
+
 def test_active_expired_recovery_epoch_requires_dead_owner_proof_for_adoption(
     isolated_database, monkeypatch
 ):
@@ -1448,6 +1657,50 @@ def test_mutation_gate_acquires_exact_recovery_successor_authority(
     assert result["reason"] == "recovery_epoch_adopted"
     assert gate.last_acquire_result["lease"]["owner_run_id"] == "run-successor"
     assert gate.status().reason_code == "RUNTIME_DISCONTINUITY"
+
+
+def test_mutation_gate_rejects_recovery_adoption_returned_after_lease_expiry(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "1" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-return"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    observed = [requested]
+    gate = mutation_gate.MutationGate(
+        run_id="run-successor",
+        owner_pid=4343,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_seconds=30,
+        clock=lambda: observed[0],
+    )
+    durable_adopt = db.adopt_runtime_recovery_epoch
+
+    def delayed_return(**kwargs):
+        result = durable_adopt(**kwargs)
+        assert result["adopted"] is True
+        observed[0] = requested + timedelta(seconds=50)
+        return result
+
+    monkeypatch.setattr(db, "adopt_runtime_recovery_epoch", delayed_return)
+    result = gate.acquire_recovery_successor(epoch)
+
+    assert result["acquired"] is False
+    assert result["reason"] == "lease_expired"
 
 
 def test_ordered_startup_resumes_released_frozen_recovery_epoch(
