@@ -86,6 +86,41 @@ class _FlaskBase(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestMarketIntel(_FlaskBase):
+    def test_dexie_repost_rejects_cached_wallet_offers(self):
+        """A failed Sage read must not republish cached offers as active."""
+        bot = _make_bot()
+        bot.offer_manager.sync_from_wallet.return_value = (
+            [{"trade_id": "cached-buy", "offer_bech32": "offer1stale"}],
+            [],
+            [],
+        )
+        bot.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": False,
+            "using_cache": True,
+            "last_error": "Sage get_offers unavailable",
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/dexie/repost")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "wallet_offer_query_not_fresh")
+        bot.dexie_manager.repost_active_offers.assert_not_called()
+
+    def test_dexie_repost_queues_fresh_wallet_offers(self):
+        bot = _make_bot()
+        active = {"trade_id": "active-buy", "offer_bech32": "offer1live"}
+        bot.offer_manager.sync_from_wallet.return_value = ([active], [], [])
+        bot.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/dexie/repost")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["count"], 1)
+        bot.dexie_manager.repost_active_offers.assert_called_once_with([active])
+
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
             resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)

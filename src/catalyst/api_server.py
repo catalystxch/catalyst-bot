@@ -1426,8 +1426,8 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     """Get our current best live bid/ask from wallet-open offers.
 
     Uses wallet-open trade IDs when possible so stale DB rows do not distort the
-    Market Intel "best live" display. Falls back to DB-open rows only if wallet
-    sync is unavailable.
+    Market Intel "best live" display. A failed running-wallet read cannot prove
+    that cached wallet or DB rows remain live.
     """
     result = {
         "our_best_bid": Decimal("0"),
@@ -1444,16 +1444,26 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
             wallet_open_buys, wallet_open_sells, _ = offer_manager.sync_from_wallet()
-            trade_ids = [
-                o.get("trade_id", "")
-                for o in (wallet_open_buys + wallet_open_sells)
-                if o.get("trade_id")
-            ]
-            result["our_open_buys"] = len(wallet_open_buys)
-            result["our_open_sells"] = len(wallet_open_sells)
-            result["source"] = "wallet_sync"
+            meta_getter = getattr(offer_manager, "get_wallet_sync_meta", None)
+            wallet_meta = meta_getter() if callable(meta_getter) else {}
+            if (
+                wallet_meta.get("fresh") is True
+                and wallet_meta.get("using_cache") is not True
+            ):
+                trade_ids = [
+                    o.get("trade_id", "")
+                    for o in (wallet_open_buys + wallet_open_sells)
+                    if o.get("trade_id")
+                ]
+                result["our_open_buys"] = len(wallet_open_buys)
+                result["our_open_sells"] = len(wallet_open_sells)
+                result["source"] = "wallet_sync"
+            else:
+                result["source"] = "wallet_unavailable"
+                return result
         except Exception:
-            trade_ids = None
+            result["source"] = "wallet_unavailable"
+            return result
     elif offer_manager:
         try:
             snapshot_getter = getattr(offer_manager, "get_wallet_sync_snapshot", None)

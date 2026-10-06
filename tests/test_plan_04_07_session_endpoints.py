@@ -196,6 +196,10 @@ class TestCheckResume(_FlaskBase):
         }
         offer_manager = MagicMock()
         offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
         bot = MagicMock()
         bot._loop_count = 46
         bot.is_running.return_value = False
@@ -216,6 +220,34 @@ class TestCheckResume(_FlaskBase):
         self.assertEqual(body["buy_count"], 1)
         self.assertEqual(body["sell_count"], 1)
         offer_manager.sync_from_wallet.assert_called_once_with()
+
+    def test_cached_wallet_offers_do_not_authorize_resume_prompt(self):
+        """A failed Sage read must not present cached offers as live."""
+        offer_manager = MagicMock()
+        offer_manager.sync_from_wallet.return_value = (
+            [{"trade_id": "cached-buy", "status": "active", "side": "buy"}],
+            [],
+            [],
+        )
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": False,
+            "using_cache": True,
+            "last_error": "Sage get_offers unavailable",
+        }
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.offer_manager = offer_manager
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "_fresh_start_is_set", return_value=False),
+        ):
+            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertFalse(body["can_resume"])
+        self.assertEqual(body["buy_count"], 0)
+        self.assertEqual(body["reason"], "wallet_offer_query_not_fresh")
 
     def test_fresh_start_set_returns_cannot_resume(self):
         with (
@@ -268,6 +300,10 @@ class TestCheckResume(_FlaskBase):
         }
         offer_manager = MagicMock()
         offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
         bot = MagicMock()
         bot._loop_count = 0
         bot.is_running.return_value = False

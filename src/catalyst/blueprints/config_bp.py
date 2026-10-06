@@ -1151,6 +1151,21 @@ def api_check_resume():
             # dashboard cannot overwrite the verified resume count with stale
             # database rows on its next poll.
             open_buy, open_sell, _ = sync_from_wallet()
+            sync_meta = offer_manager.get_wallet_sync_meta()
+            if (
+                type(sync_meta) is not dict
+                or sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is True
+            ):
+                return jsonify(
+                    {
+                        "can_resume": False,
+                        "has_session": False,
+                        "buy_count": 0,
+                        "sell_count": 0,
+                        "reason": "wallet_offer_query_not_fresh",
+                    }
+                )
         else:
             from wallet import get_all_offers, classify_offers_from_list
 

@@ -1092,6 +1092,80 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(result["our_open_buys"], 0)
         self.assertEqual(result["our_open_sells"], 0)
 
+    def test_live_offer_edges_does_not_label_cached_wallet_book_as_live(self):
+        """A failed Sage read must not make cached offers appear live."""
+        stale_conn = MagicMock()
+        stale_conn.execute.return_value.fetchall.return_value = [
+            {
+                "side": "buy",
+                "min_price": Decimal("0.000064"),
+                "max_price": Decimal("0.000065"),
+                "cnt": 1,
+            }
+        ]
+        sync_from_wallet = MagicMock(
+            return_value=(
+                [{"trade_id": "cached-buy"}],
+                [],
+                [],
+            )
+        )
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=types.SimpleNamespace(
+                sync_from_wallet=sync_from_wallet,
+                get_wallet_sync_meta=lambda: {
+                    "fresh": False,
+                    "using_cache": True,
+                    "last_error": "Sage get_offers unavailable",
+                },
+            ),
+        )
+
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=stale_conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        sync_from_wallet.assert_called_once_with()
+        self.assertEqual(result["source"], "wallet_unavailable")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_best_bid"], api_server.Decimal("0"))
+        stale_conn.execute.assert_not_called()
+
+    def test_live_offer_edges_uses_fresh_running_wallet_book(self):
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = [
+            {
+                "side": "buy",
+                "min_price": Decimal("0.000064"),
+                "max_price": Decimal("0.000065"),
+                "cnt": 1,
+            }
+        ]
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=types.SimpleNamespace(
+                sync_from_wallet=lambda: ([{"trade_id": "live-buy"}], [], []),
+                get_wallet_sync_meta=lambda: {
+                    "fresh": True,
+                    "using_cache": False,
+                },
+            ),
+        )
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_sync")
+        self.assertEqual(result["our_open_buys"], 1)
+        self.assertEqual(result["our_best_bid"], api_server.Decimal("0.000065"))
+
     def test_live_offer_edges_prefers_fresh_stopped_wallet_snapshot_over_stale_db(self):
         """A stopped app must not present stale DB rows as live offers."""
         stale_conn = MagicMock()

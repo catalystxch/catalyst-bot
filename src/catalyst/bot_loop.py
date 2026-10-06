@@ -15928,14 +15928,36 @@ class BotLoop:
         try:
             from database import PublicationSuppressedError, get_offers_for_repost
 
+            open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
+            sync_meta = self.offer_manager.get_wallet_sync_meta()
+            if (
+                type(sync_meta) is not dict
+                or sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is True
+            ):
+                log_event(
+                    "warning",
+                    "dexie_repost_wallet_unavailable",
+                    "Skipped repost because the wallet offer book is not fresh",
+                )
+                return False
+            all_open = open_buys + open_sells
+            wallet_open_ids = {
+                str(offer.get("trade_id") or offer.get("offer_id"))
+                for offer in all_open
+                if offer.get("trade_id") or offer.get("offer_id")
+            }
+
             # Get open offers with their stored bech32 strings from DB
             cat_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
-            db_offers = get_offers_for_repost(cat_asset_id=cat_id)
+            db_offers = [
+                offer
+                for offer in get_offers_for_repost(cat_asset_id=cat_id)
+                if str(offer.get("trade_id") or "") in wallet_open_ids
+            ]
 
             if not db_offers:
-                # Fallback: sync from wallet (first run or empty DB)
-                open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
-                all_open = open_buys + open_sells
+                # Fallback for wallet-open offers missing from the DB.
                 if not all_open:
                     return
                 # Use legacy path for offers without DB bech32

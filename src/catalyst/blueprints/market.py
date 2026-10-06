@@ -221,6 +221,13 @@ def api_dexie_repost():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
     open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
+    sync_meta = bot.offer_manager.get_wallet_sync_meta()
+    if (
+        type(sync_meta) is not dict
+        or sync_meta.get("fresh") is not True
+        or sync_meta.get("using_cache") is True
+    ):
+        return jsonify({"error": "wallet_offer_query_not_fresh"}), 503
     all_offers = open_buys + open_sells
     bot.dexie_manager.repost_active_offers(all_offers)
     return jsonify({"status": "queued", "count": len(all_offers)})

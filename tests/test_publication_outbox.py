@@ -1999,6 +1999,14 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
     loop = object.__new__(bot_loop.BotLoop)
     loop._running = True
     loop._enter_runtime_effect_phase = lambda phase: phase == "publication"
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [{"trade_id": "suppressed-trade"}],
+            [{"trade_id": "ordinary-trade"}],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     events = []
@@ -2064,6 +2072,83 @@ def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkey
     assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
 
 
+def test_startup_repost_does_not_publish_cached_wallet_offers(monkeypatch):
+    """An empty DB and failed Sage read cannot justify public reposting."""
+    import wallet
+
+    queued = []
+    flushed = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [
+                {
+                    "trade_id": "cached-buy",
+                    "side": "buy",
+                    "offer_bech32": "offer1stale",
+                }
+            ],
+            [],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {
+            "fresh": False,
+            "using_cache": True,
+            "last_error": "Sage get_offers unavailable",
+        },
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: queued.append(_args),
+        flush_queue=lambda *_args, **_kwargs: flushed.append(_args),
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(database, "get_offers_for_repost", lambda **_kwargs: [])
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda _trade_id: "offer1stale")
+
+    result = loop._repost_active_offers_to_dexie(reason="startup_resume")
+    assert queued == []
+    assert flushed == []
+    assert result is False
+
+
+def test_startup_repost_does_not_publish_db_only_offer(monkeypatch):
+    """An open DB row is not proof that its offer remains live in Sage."""
+    queued = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: ([], [], []),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: queued.append(_args),
+        flush_queue=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "db-only-buy",
+                "side": "buy",
+                "offer_bech32": "offer1stale",
+                "dexie_id": None,
+            }
+        ],
+    )
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+    assert queued == []
+
+
 def test_background_startup_repost_defers_stale_confidence_without_global_failure(
     monkeypatch,
 ):
@@ -2116,6 +2201,10 @@ def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch
     loop._running = True
     gate_results = iter((True, False))
     loop._enter_runtime_effect_phase = lambda phase: next(gate_results)
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: ([{"trade_id": "slow-trade"}], [], []),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
