@@ -1173,21 +1173,22 @@ def check_db_integrity() -> Dict[str, object]:
 
 
 def attempt_db_recovery() -> Dict[str, object]:
-    """If ``bot.db`` is corrupt, salvage what's readable and swap in a clean
-    file. Mirrors ``scripts/recover_db.py`` for use during desktop_app
-    startup so users don't have to run a separate script.
+    """Check integrity and prepare a salvage candidate without auto-swapping.
+
+    A clean dump cannot prove that an integrity-failed authority retained all
+    offer, fee, and mutation rows. Operator reconciliation is required before
+    a recovered database can replace the live file.
 
     Returns a result dict with::
 
-        {"action": "ok" | "recovered" | "failed",
+        {"action": "ok" | "failed",
          "result": <integrity message>,
-         "skipped_statements": int,           # only if recovered
-         "corrupt_backup": "<filename>",      # only if recovered
+         "skipped_statements": int,           # if salvage was attempted
+         "corrupt_backup": "<filename>",      # if backup was created
          "error": "<reason>"}                 # only if failed
 
     SAFETY — caller must guarantee no SQLite connection is open against
-    ``bot.db`` when this is invoked (the swap rename will fail on Windows
-    if any handle is alive). The right place to call this is from the
+    ``bot.db`` when this is invoked. The right place to call this is from the
     desktop_app entrypoint, after the singleton lock is acquired and
     before ``init_database()`` is called.
     """
@@ -1232,12 +1233,9 @@ def attempt_db_recovery() -> Dict[str, object]:
             "error": f"backup_failed: {e}",
         }
 
-    # Step 2: dump readable rows into a fresh DB. Try iterdump() first —
-    # it preserves data when corruption is mild. If iterdump itself
-    # explodes (the page that holds the schema is the corrupt one), fall
-    # back to renaming the corrupt file aside and letting init_database()
-    # create a fresh one. Better to lose some history than to leave the
-    # user unable to start the app.
+    # Step 2: dump readable rows into a separate candidate. A new empty or
+    # partially recovered database would lose authority while Sage could
+    # still hold live effects.
     skipped = 0
     iterdump_ok = False
     try:
@@ -1255,9 +1253,9 @@ def attempt_db_recovery() -> Dict[str, object]:
             src.close()
             dst.close()
     except Exception:
-        # iterdump itself failed (severe corruption). Drop the partial
-        # recovered file so the fresh-start fallback below gets a clean
-        # path to swap into.
+        # iterdump itself failed (severe corruption). Keep the original live
+        # file for operator-assisted recovery instead of creating an empty
+        # trading authority.
         iterdump_ok = False
         try:
             recovered.unlink()
@@ -1265,34 +1263,27 @@ def attempt_db_recovery() -> Dict[str, object]:
             pass
 
     if not iterdump_ok:
-        # Fresh-start fallback. The corrupt original is already saved as
-        # corrupt_backup, so no data is lost — it just isn't auto-merged.
-        # Remove the live files so init_database can build a clean DB.
-        try:
-            if db.exists():
-                db.unlink()
-            for suffix in ("-wal", "-shm"):
-                side = db.with_suffix(db.suffix + suffix)
-                if side.exists():
-                    try:
-                        side.unlink()
-                    except Exception:
-                        pass
-        except Exception as e:
-            return {
-                "action": "failed",
-                "result": str(check.get("result")),
-                "error": f"fresh_start_unlink_failed: {e}",
-            }
         return {
-            "action": "recovered",
+            "action": "failed",
             "result": str(check.get("result")),
-            "skipped_statements": -1,  # signals fresh-start, no rows kept
+            "error": "lossless_recovery_unavailable",
             "corrupt_backup": corrupt_backup.name,
-            "fallback": "fresh_start",
         }
 
-    # Step 3: verify the recovered file passes integrity_check before swap
+    if skipped:
+        try:
+            recovered.unlink()
+        except OSError:
+            pass
+        return {
+            "action": "failed",
+            "result": str(check.get("result")),
+            "error": "statement_salvage_incomplete",
+            "skipped_statements": int(skipped),
+            "corrupt_backup": corrupt_backup.name,
+        }
+
+    # Step 3: verify the candidate for operator-assisted recovery.
     try:
         v = _sqlite_connect(str(recovered), timeout=5)
         try:
@@ -1321,30 +1312,12 @@ def attempt_db_recovery() -> Dict[str, object]:
             "error": f"recovered_db_still_fails: {'; '.join(msgs[:3])}",
         }
 
-    # Step 4: atomically swap. Remove the WAL/SHM that belong to the old
-    # main DB so the recovered file owns its own WAL on first open.
-    try:
-        db.unlink()
-        for suffix in ("-wal", "-shm"):
-            side = db.with_suffix(db.suffix + suffix)
-            if side.exists():
-                try:
-                    side.unlink()
-                except Exception:
-                    pass
-        recovered.rename(db)
-    except Exception as e:
-        return {
-            "action": "failed",
-            "result": str(check.get("result")),
-            "error": f"swap_failed: {e}",
-        }
-
     return {
-        "action": "recovered",
+        "action": "failed",
         "result": str(check.get("result")),
-        "skipped_statements": int(skipped),
+        "error": "manual_reconciliation_required",
         "corrupt_backup": corrupt_backup.name,
+        "recovered_candidate": recovered.name,
     }
 
 

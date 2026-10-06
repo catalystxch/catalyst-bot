@@ -1,4 +1,4 @@
-"""One-shot SQLite recovery for ``bot.db``.
+"""Prepare an operator-reviewed SQLite salvage candidate for ``bot.db``.
 
 Use when the bot logs ``database disk image is malformed`` and the DB
 needs to be salvaged. The script:
@@ -8,7 +8,7 @@ needs to be salvaged. The script:
 3. Reads what it can from the corrupt file via ``.iterdump()`` and
    writes a fresh ``bot.db.recovered``.
 4. Verifies the recovered file passes ``PRAGMA integrity_check``.
-5. Atomically swaps the recovered file into place.
+5. Leaves the original live database untouched for authority reconciliation.
 
 Usage::
 
@@ -136,6 +136,18 @@ def main() -> int:
         src.close()
         dst.close()
 
+    if skipped:
+        try:
+            recovered.unlink()
+        except OSError:
+            pass
+        print(
+            "[recover] Incomplete salvage. Original is unchanged; "
+            "manual reconciliation is required. Discard the incomplete candidate.",
+            flush=True,
+        )
+        return 3
+
     # Step 3: verify the recovered DB
     ok, status = _integrity(recovered)
     print(f"[recover] recovered integrity_check: {status}", flush=True)
@@ -147,18 +159,15 @@ def main() -> int:
         )
         return 3
 
-    # Step 4: swap. WAL/SHM must be removed so the new main DB owns its
-    # own WAL on first open.
-    print("[recover] swapping recovered -> bot.db", flush=True)
-    db.unlink()
-    for suffix in ("-wal", "-shm"):
-        side = db.with_suffix(db.suffix + suffix)
-        if side.exists():
-            side.unlink()
-    recovered.rename(db)
-
-    print("[recover] done. Restart the desktop app.", flush=True)
-    return 0
+    # A readable dump is not evidence that every offer, fee, and mutation
+    # row survived the corruption. The candidate needs operator review and
+    # wallet reconciliation before any separate replacement action.
+    print(
+        f"[recover] Candidate ready at {recovered}; original is unchanged. "
+        "Reconcile authority with the wallet before replacement.",
+        flush=True,
+    )
+    return 3
 
 
 if __name__ == "__main__":

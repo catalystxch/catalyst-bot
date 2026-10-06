@@ -7012,7 +7012,7 @@ def test_authorized_desktop_startup_exception_runs_central_lease_cleanup(
     monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
     monkeypatch.setattr(desktop_app, "_CONSOLE_HIDDEN", True)
     monkeypatch.setattr(desktop_app, "_show_fatal_error_dialog", lambda _msg: None)
-    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
 
     assert desktop_app.main(["--show-console"]) == 1
     assert events == ["cleanup"]
@@ -7177,7 +7177,7 @@ def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
         read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
     )
     monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
-    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
     monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
     monkeypatch.setattr(
         api_server,
@@ -7894,7 +7894,7 @@ def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
         "run_flask_mode",
         lambda: events.append(("run", arbiter.released)),
     )
-    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
 
     assert desktop_app.main(["--flask", "--show-console"]) == 0
     assert events == [

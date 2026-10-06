@@ -178,6 +178,74 @@ def test_startup_initialization_exception_is_not_reported_as_lease_unavailable(
     }
 
 
+def test_unreadable_database_preserves_original_and_blocks_startup(
+    monkeypatch, tmp_path
+):
+    import database
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    db_path = tmp_path / "bot.db"
+    original = b"not a SQLite database"
+    db_path.write_bytes(original)
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    events = []
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: events.append("initialized") or {"allowed": True},
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert db_path.read_bytes() == original
+    assert events == ["arbiter_release"]
+    assert desktop_app._startup_diagnostics_status == {
+        "allowed": False,
+        "reason_code": "DATABASE_RECOVERY_REQUIRED",
+        "source": "database_integrity",
+        "recovery": {
+            "failed_check": "database_integrity",
+            "blocker_counts": {},
+        },
+    }
+
+
+def test_main_does_not_repeat_database_recovery_after_authorization(monkeypatch):
+    import database
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    events = []
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: True)
+    monkeypatch.setattr(desktop_app, "_enable_pythonw_startup_log", lambda: None)
+    monkeypatch.setattr(desktop_app, "_attach_to_kill_on_close_job", lambda: None)
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: None)
+    monkeypatch.setattr(
+        database,
+        "attempt_db_recovery",
+        lambda: events.append("late_recovery") or {"action": "ok"},
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_desktop_mode",
+        lambda **_kwargs: events.append("run"),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == ["run"]
+
+
 def test_bootstrap_candidate_requires_unconfigured_identity_and_clean_durable_state(
     monkeypatch,
 ):
