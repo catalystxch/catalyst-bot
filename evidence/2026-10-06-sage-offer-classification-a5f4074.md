@@ -92,3 +92,30 @@ with zero failed checks. The exact PID 143728 and EXE hash still matched,
 Sage remained synced, the bot stopped, the lease owned, safety allowed, and
 open offers zero. This is an in-progress stability checkpoint, not the
 24-hour acceptance result.
+
+## Isolated same-version upgrade and rollback
+
+An additional Inno Setup QA run used the unique AppId
+`{C8A8C93D-7F9B-414C-9D3B-1D73EAD2B541}` and the separate
+`E:\catalyst-a5-upgrade-qa-installed` directory. Both QA installers were
+compiled from the respective clean detached bundles with the same QA AppId,
+name and uninstall key. The `82a715d` predecessor QA installer SHA-256 was
+`25415F3412F048668598B2244A463D08AE181B840729C89DDF4F5333AE66E6E2`;
+the `a5f4074` QA installer SHA-256 was
+`F84FC4EAF42524CAB7F9A3A35AD66A57FD1B978ECC7E8506A28795820F57F916`.
+These QA installer hashes differ from the published a5 installer because the
+AppId and app name are deliberately isolated; the installed EXE hash matched
+the published exact a5 binary.
+
+The silent current-user sequence completed with exit code 0 at every step:
+install `82a715d` (installed EXE
+`9BF6193C74C1CCDF43B2C98986266973EB7CFB3FFCF347BB227674CE03A85FE3`),
+upgrade in place to `a5f4074`
+(`A71C4FBB820C432D9AF8EA0089990FBD73179A3D1649E4CCBD339EDAB4B0F13B`),
+roll back to `82a715d`, restore `a5f4074`,
+then uninstall. The upgraded install reported version 1.4.0, the expected QA
+install path and key, and passed packaged API and synthetic Sage RPC smokes.
+After uninstall, its EXE and QA uninstall registration were absent; the
+original TEST 7 PID 143728 remained running from the separate exact build.
+The five Inno logs are in `E:\catalyst-a5-upgrade-qa-build`. No installed
+QA app was connected to the original wallet or used for a wallet action.
