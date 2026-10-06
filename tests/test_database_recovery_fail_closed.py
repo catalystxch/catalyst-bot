@@ -1,6 +1,7 @@
 """An incomplete SQLite salvage must not replace durable trading authority."""
 
 import sqlite3
+import shutil
 
 import database
 import pytest
@@ -89,6 +90,55 @@ def test_initialized_unbound_profile_fails_closed_if_database_disappears(
 
         assert result["action"] == "failed"
         assert result["error"] == "missing_database_existing_profile"
+    finally:
+        database.close_connection()
+
+
+def test_initialized_profile_rejects_valid_replacement_database(monkeypatch, tmp_path):
+    original = tmp_path / "original" / "bot.db"
+    original.parent.mkdir()
+    replacement = tmp_path / "replacement" / "bot.db"
+    replacement.parent.mkdir()
+    database.close_connection()
+    try:
+        monkeypatch.setattr(database, "DB_PATH", str(original))
+        database.init_database()
+        database.close_connection()
+        monkeypatch.setattr(database, "DB_PATH", str(replacement))
+        database.init_database()
+        database.close_connection()
+        shutil.copyfile(replacement, original)
+        monkeypatch.setattr(database, "DB_PATH", str(original))
+
+        result = database.attempt_db_recovery()
+
+        assert result["action"] == "failed"
+        assert result["error"] == "database_identity_mismatch"
+    finally:
+        database.close_connection()
+
+
+def test_initialized_profile_rejects_valid_database_without_authority_tables(
+    monkeypatch, tmp_path
+):
+    db_path = tmp_path / "bot.db"
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    database.close_connection()
+    try:
+        database.init_database()
+        database.close_connection()
+        db_path.unlink()
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("CREATE TABLE unrelated (id INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = database.attempt_db_recovery()
+
+        assert result["action"] == "failed"
+        assert result["error"] == "database_identity_mismatch"
     finally:
         database.close_connection()
 

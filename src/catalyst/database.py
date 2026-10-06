@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -1017,6 +1018,7 @@ _local = threading.local()
 # file bypass the guard automatically because the path differs.
 _db_initialized_path: str = ""
 _db_init_lock = threading.Lock()
+_DB_IDENTITY_SETTING_KEY = "_database_identity"
 
 
 def _missing_splash_table(exc: Exception) -> bool:
@@ -1198,6 +1200,24 @@ def _missing_database_has_prior_profile_evidence(db: Path) -> bool:
     return False
 
 
+def _database_identity_marker(db: Path) -> Path:
+    return db.with_name(db.name + ".initialized")
+
+
+def _stored_database_identity(db: Path) -> str | None:
+    """Read an identity without creating or migrating the candidate database."""
+
+    uri = f"file:{db.resolve().as_posix()}?mode=ro"
+    conn = _sqlite_connect(uri, uri=True, timeout=10)
+    try:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key=?", (_DB_IDENTITY_SETTING_KEY,)
+        ).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        conn.close()
+
+
 def attempt_db_recovery() -> Dict[str, object]:
     """Check integrity and prepare a salvage candidate without auto-swapping.
 
@@ -1237,6 +1257,23 @@ def attempt_db_recovery() -> Dict[str, object]:
 
     check = check_db_integrity()
     if check.get("ok"):
+        marker = _database_identity_marker(db)
+        if marker.exists():
+            try:
+                expected = marker.read_text(encoding="ascii").strip()
+                actual = _stored_database_identity(db)
+            except (OSError, UnicodeError, sqlite3.Error):
+                expected = actual = None
+            if (
+                expected is None
+                or not re.fullmatch(r"[0-9a-f]{32}", expected)
+                or actual != expected
+            ):
+                return {
+                    "action": "failed",
+                    "result": "integrity_ok_identity_mismatch",
+                    "error": "database_identity_mismatch",
+                }
         return {"action": "ok", "result": "ok"}
 
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -7568,10 +7605,22 @@ def init_database():
             return
         with _database_migration_guard():
             _init_database_impl()
-            # This marker survives deletion of bot.db and distinguishes later
-            # missing-file recovery from a new profile with template .env.
-            marker = Path(DB_PATH).with_name(Path(DB_PATH).name + ".initialized")
-            marker.write_text("Database initialized.\n", encoding="ascii")
+            # Pair an on-disk marker with a stable identity stored in SQLite.
+            # A fresh or replaced database may pass integrity_check while
+            # silently losing offer and fee authority; the pair detects it.
+            identity = get_setting(_DB_IDENTITY_SETTING_KEY)
+            if identity is None:
+                identity = secrets.token_hex(16)
+                if not set_setting(_DB_IDENTITY_SETTING_KEY, identity):
+                    raise RuntimeError("database identity could not be persisted")
+            if not re.fullmatch(r"[0-9a-f]{32}", identity):
+                raise RuntimeError("database identity is invalid")
+            marker = _database_identity_marker(Path(DB_PATH))
+            if marker.exists():
+                if marker.read_text(encoding="ascii").strip() != identity:
+                    raise RuntimeError("database identity marker does not match")
+            else:
+                marker.write_text(identity + "\n", encoding="ascii")
             # Publish initialization only after every migration and integrity
             # setup step has returned. Concurrent callers block on both the
             # process lock and this database-adjacent OS lock.
