@@ -1,0 +1,27 @@
+{
+  "views": [
+    "Dashboard",
+    "Offers",
+    "Profit and loss",
+    "Market intelligence",
+    "Settings",
+    "Logs",
+    "Data reset"
+  ],
+  "page_errors": [],
+  "console_errors": [],
+  "api_failures": [],
+  "destructive_confirmation_opened": true,
+  "destructive_action_confirmed": false,
+  "health": {
+    "version": "1.4.0",
+    "wallet_type": "sage",
+    "bot_running": false
+  },
+  "http_status": 200,
+  "title": "CATalyst",
+  "risk_disclosure_visible": true,
+  "help_opened": true,
+  "about_opened": true,
+  "body_has_traceback": false
+}
