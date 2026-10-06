@@ -19,3 +19,11 @@ The binaries and checksum manifest are pinned at artifact commit 1288e23408dfc48
 - Installer: https://raw.githubusercontent.com/catalystxch/catalyst-bot/1288e23408dfc48fa596a97aca878f954830296e/acceptance-artifacts/Catalyst-Setup-6760282-1.4.0.exe
 
 At this package checkpoint the previous 15047c8 EXE still owns the original TEST 7 profile and port 5000. The new EXE has not run against that profile. No new campaign, fee approval, or wallet action occurred. Exact-source CI, original-profile rollover, active-offer lifecycle/recovery, secondary original-profile acceptance, both final-candidate 24-hour windows, and final review remain open. PR #220 stays draft.
+
+## Original TEST 7 read-only rollover
+
+The prior stopped 15047c8 app closed through its native shutdown flow with offer cancellation unchecked. The exact 6760282 clean EXE then became the sole CATalyst process and port 5000 owner, PID 109092. Its on-disk SHA-256 matched the clean-build hash above. The native startup acknowledged the testing Risk Disclosure under existing operator authorization, selected Sage mainnet TEST 7 fingerprint 736588221, and selected Monkeyzoo Token MZ_XCH. Splash was skipped because it was not running; the existing Spacescan key configuration was retained without entering or saving a key. The bot remained stopped.
+
+Read-only live API showed CAT wallet ID 2, exact asset b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105, 138.470301476875 XCH and 780212.284 MZ spendable and total, zero buy/sell offers, wallet sync state synced, and safety allowed with an owned lease and zero blockers. No campaign, Coin Prep, offer, settings save, or wallet action was started.
+
+Fresh exact-PID/path/hash monitors began at 2026-10-06T15:00:43Z for 60-second safety/health/offer samples and 15:00:40Z for 30-second sole port ownership. Both first samples passed. The stopped-profile 24-hour gate requires the complete traces and end-state review no earlier than 2026-10-07T15:00:43Z. Prior candidate traces are historical. Active-offer lifecycle/recovery, secondary original-profile acceptance, the active-profile 24-hour window, and final review remain open; PR #220 stays draft.
