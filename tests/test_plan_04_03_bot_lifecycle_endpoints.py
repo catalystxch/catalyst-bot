@@ -113,6 +113,11 @@ def _make_bot(running=False, start_returns=True):
         "status": "running" if running else "idle",
         "loop_count": 0,
     }
+    bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+    }
     return bot
 
 
@@ -134,6 +139,32 @@ def _fake_cfg(cat_asset_id="ab" * 32, spread_bps=200):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStart(_FlaskBase):
+    def test_start_rejects_stale_wallet_offer_book_before_bot_start(self):
+        """A direct API caller cannot bypass the GUI's fresh-offer check."""
+        bot = _make_bot(running=False)
+        bot.offer_manager.sync_from_wallet.return_value = (
+            [{"trade_id": "cached-buy"}],
+            [],
+            [],
+        )
+        bot.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": False,
+            "using_cache": True,
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json().get("reason"), "WALLET_OFFER_QUERY_NOT_FRESH")
+        bot.start.assert_not_called()
+
     def test_bootstrap_resume_readiness_requires_exact_intent_db_wallet_set(self):
         from blueprints import bot as bot_blueprint
 

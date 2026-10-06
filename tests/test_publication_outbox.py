@@ -2149,6 +2149,56 @@ def test_startup_repost_does_not_publish_db_only_offer(monkeypatch):
     assert queued == []
 
 
+def test_startup_repost_includes_wallet_offer_missing_from_partial_db(monkeypatch):
+    """A DB hit for one offer must not hide another live wallet offer."""
+    import wallet
+
+    queued = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [{"trade_id": "wallet-a", "side": "buy"}],
+            [{"trade_id": "wallet-b", "side": "sell"}],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda offer, trade_id, force=False: queued.append(
+            (trade_id, offer, force)
+        ),
+        flush_queue=lambda **_kwargs: None,
+    )
+    loop.splash_manager = object()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(bot_loop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "wallet-a",
+                "offer_bech32": "offer1a",
+                "dexie_id": None,
+                "side": "buy",
+            }
+        ],
+    )
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda trade_id: "offer1b")
+    monkeypatch.setattr(database, "update_offer_bech32", lambda *_args: None)
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+
+    assert queued == [
+        ("wallet-a", "offer1a", True),
+        ("wallet-b", "offer1b", True),
+    ]
+
+
 def test_background_startup_repost_defers_stale_confidence_without_global_failure(
     monkeypatch,
 ):

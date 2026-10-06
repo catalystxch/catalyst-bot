@@ -59,6 +59,28 @@ class _BootstrapAuthorityMismatch(Exception):
     """An active campaign belongs to a different wallet authority."""
 
 
+def _fresh_start_wallet_offer_book(bot) -> bool:
+    """Require a new Sage offer read before accepting any bot-start caller."""
+    manager = getattr(bot, "offer_manager", None)
+    sync = getattr(manager, "sync_from_wallet", None)
+    get_meta = getattr(manager, "get_wallet_sync_meta", None)
+    if not callable(sync) or not callable(get_meta):
+        return False
+    try:
+        offers = sync()
+        meta = get_meta()
+    except Exception:
+        return False
+    return (
+        type(offers) is tuple
+        and len(offers) == 3
+        and all(type(rows) is list for rows in offers)
+        and type(meta) is dict
+        and meta.get("fresh") is True
+        and meta.get("using_cache") is False
+    )
+
+
 def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     """Prove legacy open-offer ownership before the first v1.4 bot start.
 
@@ -1045,6 +1067,20 @@ def api_bot_start():
                     "migration": migration,
                 }
             ), 400
+
+    if not errors:
+        if not _fresh_start_wallet_offer_book(bot):
+            error = "Live wallet offers could not be verified; retry bot start"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "WALLET_OFFER_QUERY_NOT_FRESH",
+                    "error": error,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 503
 
     if not errors:
         mode_block = _one_sided_open_offer_start_block(cfg)

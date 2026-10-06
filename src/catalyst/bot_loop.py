@@ -5689,6 +5689,22 @@ class BotLoop:
         self._startup_complete.clear()
         log_event("debug", "runtime_state_reset", "Runtime state reset for new session")
 
+    def _fresh_wallet_offer_book_for_start(self) -> bool:
+        """Reject a cached or failed Sage offer read before spawning workers."""
+        try:
+            offers = self.offer_manager.sync_from_wallet()
+            meta = self.offer_manager.get_wallet_sync_meta()
+        except Exception:
+            return False
+        return (
+            type(offers) is tuple
+            and len(offers) == 3
+            and all(type(rows) is list for rows in offers)
+            and type(meta) is dict
+            and meta.get("fresh") is True
+            and meta.get("using_cache") is False
+        )
+
     def start(self) -> bool:
         """Start the bot loop in a background thread.
 
@@ -5859,6 +5875,21 @@ class BotLoop:
                 running=False,
                 status="blocked",
                 error="Could not verify wallet signing capability",
+            )
+            return False
+
+        # The API checked this earlier, but Sage can fail between that check
+        # and the final worker start. Keep direct BotLoop callers fail-closed.
+        if not self._fresh_wallet_offer_book_for_start():
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Live wallet offers could not be verified",
+            )
+            log_event(
+                "error",
+                "bot_start_wallet_offers_not_fresh",
+                "Bot start blocked because the live wallet offer book is not fresh",
             )
             return False
 
@@ -15956,20 +15987,25 @@ class BotLoop:
                 if str(offer.get("trade_id") or "") in wallet_open_ids
             ]
 
-            if not db_offers:
-                # Fallback for wallet-open offers missing from the DB.
-                if not all_open:
-                    return
-                # Use legacy path for offers without DB bech32
-                db_offers = [
+            # The DB may cover only part of the fresh wallet-open book. Add
+            # every missing wallet offer to the RPC slow path, even when some
+            # other offers have stored bech32 strings in the DB.
+            db_offer_ids = {str(o.get("trade_id") or "") for o in db_offers}
+            for wallet_offer in all_open:
+                trade_id = str(
+                    wallet_offer.get("trade_id") or wallet_offer.get("offer_id") or ""
+                )
+                if not trade_id or trade_id in db_offer_ids:
+                    continue
+                db_offers.append(
                     {
-                        "trade_id": o.get("trade_id", ""),
+                        "trade_id": trade_id,
                         "offer_bech32": None,
                         "dexie_id": None,
-                        "side": o.get("side", ""),
+                        "side": wallet_offer.get("side", ""),
                     }
-                    for o in all_open
-                ]
+                )
+                db_offer_ids.add(trade_id)
 
             # Split into: already posted (skip), have bech32 (fast), need RPC (slow)
             skip_count = 0
