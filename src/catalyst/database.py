@@ -1172,6 +1172,32 @@ def check_db_integrity() -> Dict[str, object]:
     }
 
 
+def _missing_database_has_prior_profile_evidence(db: Path) -> bool:
+    """Find durable evidence of a previous database without blocking setup."""
+
+    profile = db.parent
+    adjacent = (
+        db.with_name(f"{db.name}.initialized"),
+        db.with_name(f"{db.name}-wal"),
+        db.with_name(f"{db.name}-shm"),
+        db.with_name(f"{db.name}.recovered"),
+        profile / "coin_prep_last.json",
+        profile / "coin_prep_status.json",
+        profile / "protected_offers.json",
+        profile / "worker_cancelled_ids.json",
+        profile / ".window_state.json",
+        profile / "crash.log",
+        profile / "superlog_archive.jsonl",
+    )
+    if any(path.exists() for path in adjacent):
+        return True
+    if any(profile.glob(f"{db.name}.corrupt_*")):
+        return True
+    if any((profile / "backups").glob("bot_backup_*.db")):
+        return True
+    return False
+
+
 def attempt_db_recovery() -> Dict[str, object]:
     """Check integrity and prepare a salvage candidate without auto-swapping.
 
@@ -1198,7 +1224,15 @@ def attempt_db_recovery() -> Dict[str, object]:
 
     db = _P(DB_PATH)
     if not db.exists():
-        # Nothing to check. init_database() will create a fresh file.
+        # A missing file is safe to create only if this could be a first run.
+        # Existing database/profile evidence can still represent live Sage
+        # effects whose offer, fee, and mutation authority was in this DB.
+        if _missing_database_has_prior_profile_evidence(db):
+            return {
+                "action": "failed",
+                "result": "no_db_file",
+                "error": "missing_database_existing_profile",
+            }
         return {"action": "ok", "result": "no_db_file"}
 
     check = check_db_integrity()
@@ -7534,6 +7568,10 @@ def init_database():
             return
         with _database_migration_guard():
             _init_database_impl()
+            # This marker survives deletion of bot.db and distinguishes later
+            # missing-file recovery from a new profile with template .env.
+            marker = Path(DB_PATH).with_name(Path(DB_PATH).name + ".initialized")
+            marker.write_text("Database initialized.\n", encoding="ascii")
             # Publish initialization only after every migration and integrity
             # setup step has returned. Concurrent callers block on both the
             # process lock and this database-adjacent OS lock.

@@ -222,6 +222,46 @@ def test_unreadable_database_preserves_original_and_blocks_startup(
     }
 
 
+def test_missing_database_for_prior_profile_blocks_before_startup_ownership(
+    monkeypatch, tmp_path
+):
+    import database
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    db_path = tmp_path / "bot.db"
+    (tmp_path / ".env").write_text(
+        "WALLET_TYPE=sage\nSAGE_FINGERPRINT='736588221'\n", encoding="utf-8"
+    )
+    (tmp_path / ".window_state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    events = []
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: events.append("initialized") or {"allowed": True},
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert events == ["arbiter_release"]
+    assert not db_path.exists()
+    assert desktop_app._startup_diagnostics_status["reason_code"] == (
+        "DATABASE_RECOVERY_REQUIRED"
+    )
+
+
 def test_main_does_not_repeat_database_recovery_after_authorization(monkeypatch):
     import database
 
