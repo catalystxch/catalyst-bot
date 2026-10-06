@@ -38,8 +38,18 @@ of the pinned ZIP and installer matched the hashes below:
 | `CATalyst-2028c84-primary-acceptance.zip` | `96E49DEA9289FA91C414A244A0FA4535BFE648186BE515A4DF04B003F8A13B83` |
 | Unsigned `Catalyst-Setup-1.4.0.exe` | `11A3343075DE3BD705896327E5EF525A04400DF2EC4B717C4A5146851AAF3E15` |
 
-Packaged API/Sage/recovery and isolated installer execution remain open for
-this exact bundle.
+The exact bundle's separate QA installer used AppId
+`{0F49699E-DC74-4F8E-8A31-B123B51790E7}` and the E: QA install directory.
+It compiled with Inno Setup 6.7.3 (QA installer SHA-256
+`BB42C00A062FBC7FF2EF8B1C5F36D905EF1F7EE423370DC82595B53D56DDF204`).
+A silent current-user clean install exited 0, registered version 1.4.0 in the
+QA key, and installed an EXE matching the clean-build hash. A silent uninstall
+exited 0 and removed the QA EXE and registration; the original TEST 7 process
+and port owner remained unchanged. The QA installer has a deliberately
+different AppId and hash from the pinned distributable.
+
+Synthetic Sage and publication-recovery package smokes remain open for this
+exact bundle. Live original-profile API and Sage reads are recorded below.
 
 ## Original TEST 7 read-only rollover
 
