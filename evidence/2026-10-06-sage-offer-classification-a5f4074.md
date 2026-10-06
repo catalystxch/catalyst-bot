@@ -40,8 +40,32 @@ entries, and contained an EXE matching the clean-build hash:
 - [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/187b27fa5665c0c056fba50e3b20d4146d43c564/acceptance-artifacts/CATalyst-a5f4074-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/187b27fa5665c0c056fba50e3b20d4146d43c564/acceptance-artifacts/Catalyst-Setup-a5f4074-1.4.0.exe)
 
-The existing original TEST 7 process remains the preceding `24ba013`
-candidate. No new wallet effect or campaign was initiated for `a5f4074`.
-Exact live rollover, active-offer lifecycle and recovery, secondary
-original-profile acceptance, both final-candidate 24-hour windows, and final
-review remain open. PR #220 stays draft.
+## Original TEST 7 read-only rollover
+
+The preceding `24ba013` process was verified as the sole PID and port 5000
+owner with its expected path and hash. The bot was stopped, Bootstrap inactive,
+app open offers zero, safety allowed with an owned lease, and Sage identity and
+balances matched the original TEST 7 profile. The native window closed
+cleanly, leaving no process or port listener. No cancellation was requested.
+
+The exact `a5f4074` EXE then started as sole PID 143728 and sole port 5000
+owner with the hash above. Its startup UI acknowledged the testing Risk
+Disclosure under the operator's existing authorization, selected Sage
+mainnet TEST 7 fingerprint 736588221, skipped Splash, retained the configured
+Spacescan key, and selected Monkeyzoo Token MZ/XCH. The app reported CAT
+wallet 2, exact asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+healthy synced Sage, unchanged 138.470301476875 XCH and 780212.284 MZ,
+zero app open offers, stopped bot, inactive Bootstrap, and allowed safety with
+an owned lease. A separate read-only Sage query returned zero pending
+transactions and zero fillable offers from the full 4,095-offer history.
+
+An exact-PID/path/hash stopped-profile safety monitor began
+`2026-10-06T11:22:57Z` in
+`E:\catalyst-stability-monitor-a5f4074\trace-60s.jsonl`. A companion port
+owner monitor began `2026-10-06T11:22:55Z` in the same directory. Their first
+samples were clean. The 24-hour gate cannot pass before
+`2026-10-07T11:22:57Z` plus complete trace and end-state review. No new
+campaign or wallet effect was initiated. Active-offer lifecycle and recovery,
+secondary original-profile acceptance, both final-candidate 24-hour windows,
+and final review remain open. PR #220 stays draft.
