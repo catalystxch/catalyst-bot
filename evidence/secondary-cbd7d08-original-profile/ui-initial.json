@@ -1,0 +1,1284 @@
+{
+  "http_status": 200,
+  "url": "http://127.0.0.1:5000/",
+  "title": "CATalyst",
+  "body_text": "CATALYST\nCREATED BY MONKEYZOO\nRisk Disclosure\nReview the live trading risks before connecting your wallet\nRISK DISCLOSURE\nRead this before connecting your wallet\nThis app creates, cancels, and broadcasts real offers using your Sage wallet. It automates pricing, coin prep, requoting, and fill handling, but cannot remove the risks of live trading.\nTrading risks\nPrice shocks, stale data, wallet lag, and failed cancels can leave you with unexpected exposure or losses.\nOperator responsibility\nReview settings, monitor live trading, and stop the bot if wallet or market behavior looks wrong.\nThird-party dependency risk\nSage, Dexie, Splash, Coinset, and Spacescan are external. CATalyst degrades safely when attributable evidence becomes incomplete.\nNo guarantee\nThis is an operator tool, not financial advice. Use at your own risk and start small until you trust the behavior.\nBy continuing, you acknowledge these risks and accept responsibility for using this software with your wallet and funds.\nContinue to wallet connection\nClose app\nCATALYST\nAPP V1.4.0\nIDLE\nBootstrap expired — stop campaign before renewal · b8edcc6a7cf3… · revision 1\nOVERVIEW\nDashboard\n\nYour live command centre for startup, wallet state, activity, risk, and market behaviour.\n\nBootstrap expired — stop campaign before renewal · b8edcc6a7cf3… · revision 1 · stop campaign before restart or renewal · corridor 0.0000375–0.00015 XCH/MZ\nQUICK START\nSet up this trading pair before you start the bot\n\nChoose the CAT pair, review your settings, and confirm coin prep. The dashboard below stays focused until the bot is live.\n\nTRADING PAIR\n-- Choose a Trading Pair --\nMZ (MZ) [resumed]\nRefresh\nReview Settings\nCurrent pair: MZ (MZ). Balances, market data, and settings now follow this selection.\nWallet\nWaiting for Sage wallet connection.\nTrading Pair\nMZ (MZ) selected.\nSettings\nUse Review Settings and save your setup for this run.\nCoin Prep\nSave settings to verify coin sizes for this pair.\nStart\nBootstrap campaign expired — campaign-owned offers require cancellation before restart or renewal.\n▶ Start\n⏹ Stop\nNo Offers To Cancel\n● STOPPED\nDisconnected\n⚡\nSage\n🔑\nConnect ▸\n?\nOFFER-BOOK MARKET CONFIDENCE\nSOURCES · DEXIE / SPLASH / SAGE / CHAIN\nGathering attributable offer-book evidence\nVOLUME & TOKEN INFO\nSOURCE · DEXIE\nSelect a trading pair to load volume data\nACTIVE SETTINGS\n?\nTRADING\nBuy / Sell\n?\nChoose pair\nLoop\n?\n—\nMax Offers\n?\n—\nSPREADS\nMode\n?\nChoose pair\nBase\n?\n—\nRange\n?\n—\nMin Edge\n?\n—\nINVENTORY\nSkew\n?\nPENDING\nMax Position\n?\n—\nTIERS\nEnabled\n?\nPENDING\nSizes\n?\n—\nSAFETY\nReserves\n?\nChoose pair\nPrice Limits\n?\n—\nCircuit Breaker\n?\nPENDING\nMARKET HEALTH\n?\n...\nChoose a trading pair to load balances and market data.\nSelect a CAT pair above, then open Settings to prepare that token for this run.\nINNER SPREAD ?\nloading\nMARKET SPREAD ?\nloading\nCOMPETITORS ?\nloading\nCONFIDENCE STATE ?\nloading\nREQUIRED INDEPENDENT DEPTH ?\nloading\nFILL RATE ?\npending\nVOLATILITY ?\npending\nPOSITION ?\npending\nTRADING PACE ?\npending\nWITHDRAWAL STAGE ?\npending\nCB BLOCKED ?\npending\nTOXICITY ?\npending\nACTIVITY LEVEL ?\npending\nON-CHAIN RISK ?\npending\nHOLDERS ?\npending\nDexie Orderbook\nSpacescan\nWALLET & PERFORMANCE\n?\nRefresh\nSAGE WALLET\nXCH Spendable\n?\n0.0000\nXCH Total\n?\n0.0000\nSelect a pair to see token balances\nRESERVES ?\nXCH\nChoose pair\nCAT\nChoose pair\nPERFORMANCE\nUptime\n?\n00:00:00\nLoops\n?\n0\nLast Loop\n?\n0.00s\nTotal Fills\n?\n0\nFill Rate\n?\n0.0/hr\nPnL\n?\n+0.000 XCH\nErrors\n?\n0",
+  "buttons": [
+    {
+      "id": "",
+      "text": "⏻",
+      "aria": "Shut down application",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "?",
+      "aria": "Help",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "─",
+      "aria": "Minimize window",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "v4MaximizeBtn",
+      "text": "□",
+      "aria": "Maximize window",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "✕",
+      "aria": "Close window",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupDisclaimerContinueBtn",
+      "text": "Continue to wallet connection",
+      "aria": null,
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "startupDisclaimerCloseBtn",
+      "text": "Close app",
+      "aria": null,
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "Launch Sage for me",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "I'll open it myself",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Connect to Sage",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Retry Connection",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Retry After Updating Sage",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupCertBrowseBtn",
+      "text": "Browse",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Auto-Detect",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Save & Continue",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupRpcRescanBtn",
+      "text": "Rescan",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupChangeAddressYesBtn",
+      "text": "Yes - auto-apply it",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupChangeAddressNoBtn",
+      "text": "No - keep wallet unchanged",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Retry",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "splashGateInstallBtn",
+      "text": "Install Splash Node",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "splashGateStartBtn",
+      "text": "Start Splash Node",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Retry",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Skip — continue without Splash",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Continue with Configured Key",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "spacescanSaveBtn",
+      "text": "Save & Verify",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Use Free Tier",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Dashboard",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Offers",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Profit and loss",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Market intelligence",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Settings",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "v4-nav-logs",
+      "text": "",
+      "aria": "Logs",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Data reset",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "themeToggleBtn",
+      "text": "",
+      "aria": "Toggle light or dark theme",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Help",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "About this app",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Shut down application",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "v4UpdateBadge",
+      "text": "UpdateReady",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Refresh",
+      "aria": null,
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "startupReviewSettingsBtn",
+      "text": "Review Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "startupReadyCtaBtn",
+      "text": "▶ Start Bot Now",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "startupResumeContinueBtn",
+      "text": "▶ Resume Bot Now",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startupResumeSettingsBtn",
+      "text": "↺ Start Fresh for Changes",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "startBtn",
+      "text": "▶ Start",
+      "aria": null,
+      "disabled": true,
+      "visible": true
+    },
+    {
+      "id": "stopBtn",
+      "text": "⏹ Stop",
+      "aria": null,
+      "disabled": true,
+      "visible": true
+    },
+    {
+      "id": "cancelAllBtn",
+      "text": "No Offers To Cancel",
+      "aria": null,
+      "disabled": true,
+      "visible": true
+    },
+    {
+      "id": "fingerprintDisplay",
+      "text": "🔑\nConnect ▸\n?",
+      "aria": "Change wallet fingerprint",
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "Open Guard Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Review Smart Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Refresh",
+      "aria": null,
+      "disabled": false,
+      "visible": true
+    },
+    {
+      "id": "",
+      "text": "Active 0",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "History 0",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Export Fills",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "All",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Buy",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Sell",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "buySortBtn",
+      "text": "↕ Newest",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "buyCollapseBtn",
+      "text": "Collapse All",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "sellSortBtn",
+      "text": "↕ Newest",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "sellCollapseBtn",
+      "text": "Collapse All",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "btnPnlResetPosition",
+      "text": "Reset Position",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "btnPnlResetAllStats",
+      "text": "⚠ Reset All Stats",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "20m",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "1h",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "6h",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "24h",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "intelDbxClaimBtn",
+      "text": "Manual Claim",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "splashCollapseBtn",
+      "text": "▲ Collapse",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "splashListenToggle",
+      "text": "Listening Enabled",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "splashSetupBtn",
+      "text": "Install Splash Node",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "settingsSubtabLive",
+      "text": "Live\n                                \n                                    \n                                    Idle",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "settingsSubtabSetup",
+      "text": "Setup\n                                \n                                    \n                                    Configure",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Stop Bot",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "lcSpreadApplyBtn",
+      "text": "Apply",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "lcSpreadCancelBtn",
+      "text": "Cancel Move",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "lcSkewApplyBtn",
+      "text": "Apply",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "lcSkewCancelBtn",
+      "text": "Cancel Move",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "boostBtn",
+      "text": "Retired",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "settingsWalletChangeBtn",
+      "text": "Change Wallet",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "settingsSageCertBrowseBtn",
+      "text": "Browse",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Auto-Detect",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Save Certificate",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "💾 Save current as preset…",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "settingsPairChangeBtn",
+      "text": "Change Trading Pair",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "bootstrapPreviewBtn",
+      "text": "Preview",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "bootstrapStartBtn",
+      "text": "Start Campaign",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "bootstrapStopBtn",
+      "text": "Stop Campaign",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "bootstrapRetryStoppedBtn",
+      "text": "Retry Stopped Campaign Cancellation",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "bootstrapManifestExportBtn",
+      "text": "Export / Sign Manifest",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "bootstrapParticipationExportBtn",
+      "text": "Export / Sign Participation Proof",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Import Signed Manifest",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "liquidityModeApplySuggestionBtn",
+      "text": "Apply suggestion",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "5%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "10%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "25%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "50%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "5%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "10%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "25%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "50%",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "smartDefaultsBtn",
+      "text": "Smart Settings",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "rerunBtn_conservative",
+      "text": "Conservative",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "rerunBtn_balanced",
+      "text": "Balanced",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "rerunBtn_aggressive",
+      "text": "Aggressive",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Re-run Smart Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "safetyDiagnosticsRefresh",
+      "text": "Refresh",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Auto From Offer Limits",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Recommended",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "exportEnvBtn",
+      "text": "↓ Export .env",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "saveConfigBtn",
+      "text": "Save & Continue",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "logsRunDoctorBtn",
+      "text": "Run Doctor ?Runs the same preflight Doctor checks used before starting the bot and opens the Doctor Report modal.",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "API Stats ?Live counters for Spacescan / Coinset / Dexie usage — calls today, hit rates, queue depth, and rate-limit cooldowns.",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Debug Bundle ?Downloads a redacted zip of recent logs and state snapshots. Wallet addresses and Sage fingerprints are redacted; the Spacescan API key, TLS paths, .env, database files, and wallet secret files are not included.",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Clear",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "btnResetPnl",
+      "text": "Reset P&L",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "btnResetOfferHistory",
+      "text": "Clear History",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "btnResetFull",
+      "text": "Full Reset",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "confirmCancelBtn",
+      "text": "Cancel",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "confirmExtraBtn",
+      "text": "View",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "confirmOkBtn",
+      "text": "Confirm",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "promptCancelBtn",
+      "text": "Cancel",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "promptOkBtn",
+      "text": "Save",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cpFeeRefreshBtn",
+      "text": "Refresh fee estimate",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "⚙️ Back to Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cpSkipBtn",
+      "text": "Skip Coin Prep",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cpConfirmBtn",
+      "text": "✅ Yes, Prepare Coins",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "coinPrepConsoleBtn",
+      "text": "📜 Open Logs",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "coinPrepCancelBtn",
+      "text": "Cancel Coin Prep",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cpReviewFeeBudgetBtn",
+      "text": "Review fee budget",
+      "aria": null,
+      "disabled": true,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Done",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Done",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Close",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "🔄 Try Again",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "prepHistoryContinueBtn",
+      "text": "Continue — keep everything",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "prepHistoryCancelBtn",
+      "text": "Cancel",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "depositAdvisorApplyBtn",
+      "text": "Apply allocation",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "depositAdvisorCancelBtn",
+      "text": "Decide later",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Keep Offers",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cancelAllConfirmBtn",
+      "text": "Cancel All",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "cancelProgressCloseBtn",
+      "text": "Hide",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Cancel",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "confirmBoostBtn",
+      "text": "📈 Start",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Yes, cancel them",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "No, leave them open",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Go Back",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "confirmShutdownBtn",
+      "text": "Shutdown App",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Close This Message",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Close",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "🪙 Run Coin Prep",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Skip Anyway",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "⚙️ Open Settings",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Start Anyway",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "⚙️ Start Fresh",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "✅ Load Previous Session",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "×",
+      "aria": "Cancel signing",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Copy pairing URI",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Cancel and disconnect",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "×",
+      "aria": "Close about",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Close",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "×",
+      "aria": "Close update",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "Later",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "View Release",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "appUpdateUpgradeBtn",
+      "text": "Upgrade",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "×",
+      "aria": "Close help",
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_overview",
+      "text": "Overview",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_getting-started",
+      "text": "Getting Started",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_dashboard",
+      "text": "Dashboard",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_offers",
+      "text": "Offers & Fills",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_spreads",
+      "text": "Spreads & Pricing",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_inventory",
+      "text": "Inventory & PnL",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_coins",
+      "text": "Coin Management",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_intel",
+      "text": "Market Intel",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_sniper",
+      "text": "Book Opportunities",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_gap-closer",
+      "text": "Confidence Recovery",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_wallet",
+      "text": "Sage Wallet",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_config",
+      "text": "Config Guide",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "helpTab_troubleshooting",
+      "text": "Troubleshooting",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "📄 View last crash report",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "📁 Open data folder",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "📋 Copy",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    },
+    {
+      "id": "",
+      "text": "✕ Hide",
+      "aria": null,
+      "disabled": false,
+      "visible": false
+    }
+  ],
+  "console": [],
+  "page_errors": []
+}

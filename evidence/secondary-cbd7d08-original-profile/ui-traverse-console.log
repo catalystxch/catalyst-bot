@@ -1,0 +1,18 @@
+{
+  "pair_value": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+  "view_names": [
+    "Dashboard",
+    "Offers",
+    "Profit and loss",
+    "Market intelligence",
+    "Settings",
+    "Logs",
+    "Doctor Report",
+    "Data reset",
+    "Help",
+    "About"
+  ],
+  "console_error_count": 0,
+  "page_errors": [],
+  "api_failures": []
+}

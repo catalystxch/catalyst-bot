@@ -1,0 +1,647 @@
+{
+  "utc": "2026-10-06T02:35:47.6636570Z",
+  "health": {
+    "bot_running": false,
+    "chia_health": {
+      "consecutive_failures": 0,
+      "healthy": true,
+      "node_reachable": false,
+      "node_synced": false,
+      "peer_count": 20,
+      "status": "healthy",
+      "wallet_reachable": true,
+      "wallet_sync_state": "synced",
+      "wallet_synced": true,
+      "wallet_syncing": false
+    },
+    "sse_clients": 2,
+    "status": "ok",
+    "timestamp": 1791254145,
+    "version": "1.4.0",
+    "wallet_type": "sage"
+  },
+  "status": {
+    "arb_gap_bps": "0",
+    "balances": {
+      "cat": {
+        "spendable": 3381521.72,
+        "total": 3381521.72
+      },
+      "xch": {
+        "spendable": 240.800676512155,
+        "total": 240.800676512155
+      }
+    },
+    "chia_health": {
+      "consecutive_failures": 0,
+      "last_check": 1791254146.5979962,
+      "node_reachable": false,
+      "node_synced": false,
+      "status": "healthy",
+      "wallet_reachable": true,
+      "wallet_sync_state": "synced",
+      "wallet_synced": true,
+      "wallet_syncing": false
+    },
+    "coin_tracking": {
+      "cat_free": 140,
+      "cat_locked": 0,
+      "cat_locked_amount": "0.00",
+      "cat_spendable": 140,
+      "cat_topup_pool_amount": "0.00",
+      "cat_total": 140,
+      "xch_free": 216,
+      "xch_locked": 0,
+      "xch_locked_amount": "0.0000",
+      "xch_spendable": 216,
+      "xch_topup_pool_amount": "0.0000",
+      "xch_total": 216
+    },
+    "current_cat": {
+      "asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+      "decimals": 3,
+      "name": "Monkeyzoo Token",
+      "ticker_id": "MZ_XCH",
+      "wallet_id": 2
+    },
+    "diagnostics": {
+      "active_conditions": [],
+      "enabled": true,
+      "note": "Waiting for bot start",
+      "poll_interval_secs": 20,
+      "recent_actions": [],
+      "recent_findings": [],
+      "status": "idle",
+      "updated_at": "2026-10-06T03:29:30.973735+01:00"
+    },
+    "liquidity": {
+      "active_side": "sell",
+      "mode": "sell_only",
+      "parked": false,
+      "parked_message": null,
+      "parked_reason": null
+    },
+    "logs": [
+      {
+        "full_ts": "2026-10-06 02:33:59",
+        "level": "success",
+        "message": "Sage wallet fully started and logged in",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:59"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:59",
+        "level": "success",
+        "message": "Logged in to fingerprint 3702373391",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:59"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:57",
+        "level": "info",
+        "message": "This Sage version does not expose the optional initialize endpoint; continuing.",
+        "source": "sage_initialize_not_required",
+        "timestamp": "2026-10-06 02:33:57"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:57",
+        "level": "info",
+        "message": "Fingerprint 3702373391 selected — starting...",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:57"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:57",
+        "level": "info",
+        "message": "Logging in to selected fingerprint 3702373391...",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:57"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:00",
+        "level": "info",
+        "message": "Waiting for wallet selection in GUI...",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:00"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:00",
+        "level": "info",
+        "message": "Auto-detected cert: C:\\Users\\M920q\\AppData\\Roaming\\com.rigidnetwork.sage\\ssl\\wallet.crt",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:00"
+      },
+      {
+        "full_ts": "2026-10-06 02:33:00",
+        "level": "info",
+        "message": "Starting Sage wallet startup sequence...",
+        "source": "sage_startup",
+        "timestamp": "2026-10-06 02:33:00"
+      },
+      {
+        "full_ts": "2026-10-06 02:29:31",
+        "level": "info",
+        "message": "CAT metadata resolved from Dexie — applied: [none] | kept .env: [CAT_TICKER_ID (already: MZ_XCH), CAT_NAME (already: Monkeyzoo Token)]",
+        "source": "cat_resolver_applied",
+        "timestamp": "2026-10-06 02:29:31"
+      }
+    ],
+    "offer_lifecycle": {
+      "by_lifecycle": {
+        "cancel_requested": 3,
+        "cancelled": 2942,
+        "expired": 803,
+        "filled": 35,
+        "mempool_observed": 8,
+        "phantom_rejected": 130
+      },
+      "by_side": {
+        "buy": {
+          "cancelled": 1532,
+          "expired": 399,
+          "filled": 24,
+          "open": 0
+        },
+        "sell": {
+          "cancelled": 1551,
+          "expired": 404,
+          "filled": 11,
+          "open": 0
+        }
+      },
+      "by_status": {
+        "cancelled": 3083,
+        "expired": 803,
+        "filled": 35,
+        "open": 0
+      },
+      "pending_cancel": 0,
+      "total": 3921
+    },
+    "offers": {
+      "buy": [],
+      "history": [],
+      "sell": []
+    },
+    "pricing": {
+      "ask": 7.038505939125E-05,
+      "bid": 6.464622960875001E-05,
+      "mid": 6.75156445E-05,
+      "source": "dexie_bid_ask",
+      "tibet_available": false,
+      "tibet_status": "retired"
+    },
+    "requote_diagnostics": {
+      "batch_size": 3,
+      "cancel_retry_total": 0,
+      "cooldown_secs": 75,
+      "exhausted_cancel_failures": 0,
+      "mid_price": "0",
+      "pending_cancel_retries": 0,
+      "pending_cancel_total": 0,
+      "sides": {
+        "buy": {
+          "backoff_secs": 0.0,
+          "baseline": "0",
+          "forced": false,
+          "move_bps": "0.0",
+          "pending_cancel": 0
+        },
+        "sell": {
+          "backoff_secs": 0.0,
+          "baseline": "0",
+          "forced": false,
+          "move_bps": "0.0",
+          "pending_cancel": 0
+        }
+      },
+      "thresholds": {
+        "emergency_bps": "500.0",
+        "full_bps": "200.0",
+        "inner_bps": "30.0",
+        "mid_bps": "80.0"
+      }
+    },
+    "risk": {
+      "circuit_breaker_active": false,
+      "circuit_breaker_reason": "",
+      "competitor_aware": true,
+      "inventory_enabled": false,
+      "market_toxicity": {
+        "buy_score": 0,
+        "buy_spread_multiplier": "1.0",
+        "enabled": true,
+        "level": "normal",
+        "reasons": [],
+        "score": 0,
+        "sell_score": 0,
+        "sell_spread_multiplier": "1.0",
+        "suggested_action": "No toxicity action needed.",
+        "throttle_until": {},
+        "throttled_sides": []
+      },
+      "max_position_xch": "120.6",
+      "net_position_cat": "0",
+      "pool_depth_ratio": "0",
+      "skew_intensity": "0.5"
+    },
+    "running": false,
+    "runtime_safety": {
+      "allowed": true,
+      "blocker_counts": {
+        "contradictory_history": 0,
+        "operations": 0,
+        "prepared_creations": 0,
+        "publication_claims": 0,
+        "reservations": 0,
+        "submitted_cancels": 0
+      },
+      "blocking_operation_count": 0,
+      "identity": {
+        "lease_owner": "this_run",
+        "network": "mainnet",
+        "wallet_fingerprint": "sha256:c19030c1d31a…"
+      },
+      "lease": {
+        "active": true,
+        "expires_at": "2026-10-06T02:36:10.525003Z",
+        "owned_by_this_run": true,
+        "owner": "this_run",
+        "version": 148343
+      },
+      "reason_code": "",
+      "recommended_action": "NONE",
+      "recovery": {
+        "checks": [
+          {
+            "name": "lease",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": 64
+          },
+          {
+            "name": "wallet_identity_freshness",
+            "ok": true,
+            "reason_code": "",
+            "source": "configured_binding",
+            "source_age_seconds": null
+          },
+          {
+            "name": "unresolved_operations",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": null
+          },
+          {
+            "name": "reservations",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": null
+          },
+          {
+            "name": "publication_claims",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": 313596
+          },
+          {
+            "name": "authority_revalidation",
+            "ok": true,
+            "reason_code": "",
+            "source": "configured_binding",
+            "source_age_seconds": null
+          }
+        ],
+        "durable_counts": {
+          "lineage": 0,
+          "publication": 2131,
+          "registry": 1083,
+          "reserve": 854
+        },
+        "failed_check": null,
+        "freshness": {
+          "age_seconds": 0,
+          "max_age_seconds": 30,
+          "observed_at_utc": "2026-10-06T02:35:46.582949Z",
+          "provenance": "live_gate_and_durable_snapshot",
+          "valid": true
+        }
+      },
+      "source": "lease",
+      "source_ages_seconds": {
+        "authority_revalidation": null,
+        "lease": 64,
+        "publication_claims": 313596,
+        "reservations": null,
+        "unresolved_operations": null,
+        "wallet_identity_freshness": null
+      }
+    },
+    "sniper": {
+      "active_snipes": 0,
+      "cooldown_secs": 30,
+      "last_snipe_time": 0,
+      "max_active_snipes": 2,
+      "recent_snipes": [],
+      "size_xch": "0.33",
+      "total_skipped": 0,
+      "total_snipes": 0
+    },
+    "spread_bps": "850",
+    "stats": {
+      "errors": 0,
+      "last_loop_time": 0,
+      "loop_count": 0,
+      "total_fills": 0,
+      "uptime_seconds": 0
+    },
+    "wallet_type": "sage"
+  },
+  "fingerprint": {
+    "fingerprint": "3702373391",
+    "success": true
+  },
+  "offers": {
+    "buy_count": 0,
+    "buys": [],
+    "sell_count": 0,
+    "sells": []
+  },
+  "bootstrap": {
+    "active": true,
+    "campaign": {
+      "active_authority_retained": true,
+      "adverse_fill_times": [],
+      "anchor_price": "0.000075",
+      "asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+      "campaign_id": "d61791de6807761e4a81c2a3ce58fb7b2ebad2dd012593ba0a37a122198694d5",
+      "cancel_reason": "bootstrap_expired",
+      "cancel_required": true,
+      "cat_budget": "150000",
+      "confirmed_fills": 0,
+      "created_at": "2026-10-02T10:10:57.150098Z",
+      "current_anchor_price": "0.000075",
+      "deployment_fraction": "0.1",
+      "expired": true,
+      "expires_at": "2026-10-03T10:10:57.150098Z",
+      "fee_budget_xch": "0.1",
+      "fee_spent_xch": "0.000082338193",
+      "independent_depth_sides": [
+        "buy",
+        "sell"
+      ],
+      "manual_restart_required": true,
+      "marked_inventory_loss_xch": "0",
+      "maximum_price": "0.00015",
+      "minimum_price": "0.0000375",
+      "network": "mainnet",
+      "open_offer_count": 0,
+      "realized_loss_xch": "0",
+      "revision": 1,
+      "settlement_clusters": 0,
+      "stable_since": "2026-10-02T10:35:05.471557Z",
+      "stage": "bootstrap",
+      "status": "active",
+      "stop_reason": null,
+      "stopped_at": null,
+      "subsidy_budget_xch": "0",
+      "suspected_linked_activity": false,
+      "unresolved_creation_count": 0,
+      "updated_at": "2026-10-02T10:35:05.471557Z",
+      "wallet_fingerprint": 3702373391,
+      "wallet_id": 2,
+      "wallet_type": "sage",
+      "xch_budget": "0"
+    },
+    "identity": {
+      "asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+      "has_secrets": true,
+      "network": "mainnet",
+      "ticker": "MZ",
+      "wallet_fingerprint": 3702373391,
+      "wallet_id": 2,
+      "wallet_type": "sage"
+    },
+    "needs_attention": true,
+    "stopped_cancellation": null,
+    "success": true
+  },
+  "coin_prep": {
+    "bootstrap_campaign_id": "d61791de6807761e4a81c2a3ce58fb7b2ebad2dd012593ba0a37a122198694d5",
+    "bootstrap_campaign_revision": 1,
+    "cat_coins": 140,
+    "cat_free_coins": 140,
+    "cat_needed": 0,
+    "cat_target": 30,
+    "coin_prep_mode": "bootstrap_exact",
+    "complete": true,
+    "error": null,
+    "fee_approval": {
+      "approval_id": "1b8f1d017baa03ce2b83b3cfb877d9e93f7de4fa20c5db7534af589b6e7c588f",
+      "campaign_id": "d61791de6807761e4a81c2a3ce58fb7b2ebad2dd012593ba0a37a122198694d5",
+      "cancellation_reserve_mojos": "61386840",
+      "committed_fee_mojos": "82338193",
+      "confirmed_operation_count": 3,
+      "dispatch_authorized": false,
+      "held_fee_mojos": "0",
+      "noncancellation_committed_fee_mojos": "37339821",
+      "pending_operation": null,
+      "plan_sha256": "e20a47c19e267d027248a12ff994e467d984090bcede4d47d6e80581bb3c49f5",
+      "released_operation_count": 0,
+      "remaining_fee_mojos": "99917661807",
+      "remaining_preparation_fee_mojos": "99901273339",
+      "request_options": {
+        "bootstrap_campaign_id": "d61791de6807761e4a81c2a3ce58fb7b2ebad2dd012593ba0a37a122198694d5",
+        "bootstrap_campaign_revision": 1,
+        "coin_multiplier": "1",
+        "target_seconds": 300
+      },
+      "reservation_count": 3,
+      "scope_sha256": "736d321cb2be6704945b25a03206fc676beb498bee756d3d83f578d6b70f9307",
+      "session_completed": false,
+      "session_generation": null,
+      "session_id": null,
+      "spent_fee_mojos": "82338193",
+      "stale": false,
+      "state": "approved",
+      "total_fee_mojos": "100000000000",
+      "unresolved_operation_count": 0,
+      "version": 2
+    },
+    "fee_approval_id": "1b8f1d017baa03ce2b83b3cfb877d9e93f7de4fa20c5db7534af589b6e7c588f",
+    "fee_resume_required": true,
+    "last_prep_settings": {
+      "cat_asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+      "cat_coins_total": 151,
+      "cat_target": 30,
+      "designations_written": true,
+      "max_buy": 15,
+      "max_sell": 15,
+      "offer_tier_sizes_xch": {
+        "fees": 0.001
+      },
+      "prep_headroom_pct": 0.0,
+      "prepared_trade_size_xch": 2.6909,
+      "tier_counts": {
+        "fees": 3,
+        "inner": 10,
+        "mid": 10,
+        "outer": 10
+      },
+      "tier_counts_cat": {
+        "inner": 10,
+        "mid": 10,
+        "outer": 10
+      },
+      "tier_counts_xch": {
+        "fees": 3
+      },
+      "tier_enabled": true,
+      "tier_sizes_cat": {
+        "inner": 5000.0,
+        "mid": 5000.0,
+        "outer": 5000.0
+      },
+      "tier_sizes_xch": {
+        "fees": 0.001
+      },
+      "timestamp": 1790937112.5744007,
+      "trade_size": 2.6909,
+      "xch_coins_total": 217,
+      "xch_target": 3
+    },
+    "log_lines": [],
+    "overlapping_coin_prep_blocked": true,
+    "phase": "complete",
+    "previously_complete": true,
+    "running": false,
+    "started_at": null,
+    "success": true,
+    "tier_size_drift": [],
+    "xch_coins": 216,
+    "xch_free_coins": 216,
+    "xch_needed": 0,
+    "xch_target": 3
+  },
+  "reservations": {
+    "active": [],
+    "totals": {
+      "cat_mojos": 0,
+      "count": 0,
+      "xch_mojos": 0
+    }
+  },
+  "safety": {
+    "safety": {
+      "allowed": true,
+      "blocker_counts": {
+        "contradictory_history": 0,
+        "operations": 0,
+        "prepared_creations": 0,
+        "publication_claims": 0,
+        "reservations": 0,
+        "submitted_cancels": 0
+      },
+      "blocking_operation_count": 0,
+      "identity": {
+        "lease_owner": "this_run",
+        "network": "mainnet",
+        "wallet_fingerprint": "sha256:c19030c1d31a…"
+      },
+      "lease": {
+        "active": true,
+        "expires_at": "2026-10-06T02:36:10.525003Z",
+        "owned_by_this_run": true,
+        "owner": "this_run",
+        "version": 148343
+      },
+      "reason_code": "",
+      "recommended_action": "NONE",
+      "recovery": {
+        "checks": [
+          {
+            "name": "lease",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": 64
+          },
+          {
+            "name": "wallet_identity_freshness",
+            "ok": true,
+            "reason_code": "",
+            "source": "configured_binding",
+            "source_age_seconds": null
+          },
+          {
+            "name": "unresolved_operations",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": null
+          },
+          {
+            "name": "reservations",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": null
+          },
+          {
+            "name": "publication_claims",
+            "ok": true,
+            "reason_code": "",
+            "source": "durable_snapshot",
+            "source_age_seconds": 313596
+          },
+          {
+            "name": "authority_revalidation",
+            "ok": true,
+            "reason_code": "",
+            "source": "configured_binding",
+            "source_age_seconds": null
+          }
+        ],
+        "durable_counts": {
+          "lineage": 0,
+          "publication": 2131,
+          "registry": 1083,
+          "reserve": 854
+        },
+        "failed_check": null,
+        "freshness": {
+          "age_seconds": 0,
+          "max_age_seconds": 30,
+          "observed_at_utc": "2026-10-06T02:35:47.626204Z",
+          "provenance": "live_gate_and_durable_snapshot",
+          "valid": true
+        }
+      },
+      "source": "lease",
+      "source_ages_seconds": {
+        "authority_revalidation": null,
+        "lease": 64,
+        "publication_claims": 313596,
+        "reservations": null,
+        "unresolved_operations": null,
+        "wallet_identity_freshness": null
+      }
+    },
+    "success": true
+  },
+  "startup": {
+    "fingerprint": "3702373391",
+    "message": "Wallet is healthy",
+    "node_status": "healthy",
+    "phase": "ready",
+    "preload_running": true,
+    "sage_min_required_version": "0.12.9",
+    "sage_version": "0.13.0",
+    "sage_version_supported": true,
+    "wallet_type": "sage"
+  }
+}

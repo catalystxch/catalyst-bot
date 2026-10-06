@@ -1,0 +1,212 @@
+{
+  "url": "http://127.0.0.1:5000/",
+  "title": "CATalyst",
+  "body_text": "CATALYST\nCREATED BY MONKEYZOO\nConnect Wallet\nSage wallet is already open\nWALLET DETECTED\nSage is already open\nSage wallet is running and ready. Click below to connect this app to your wallet.\nConnect to Sage\nCATALYST\nAPP V1.4.0\nIDLE\nBootstrap expired — stop campaign before renewal · b8edcc6a7cf3… · revision 1\nOVERVIEW\nDashboard\n\nYour live command centre for startup, wallet state, activity, risk, and market behaviour.\n\nBootstrap expired — stop campaign before renewal · b8edcc6a7cf3… · revision 1 · stop campaign before restart or renewal · corridor 0.0000375–0.00015 XCH/MZ\nQUICK START\nSet up this trading pair before you start the bot\n\nChoose the CAT pair, review your settings, and confirm coin prep. The dashboard below stays focused until the bot is live.\n\nTRADING PAIR\n-- Choose a Trading Pair --\nMZ (MZ) [resumed]\nRefresh\nReview Settings\nCurrent pair: MZ (MZ). Balances, market data, and settings now follow this selection.\nWallet\nSage is connected and ready.\nTrading Pair\nMZ (MZ) selected.\nSettings\nUse Review Settings and save your setup for this run.\nCoin Prep\nSave settings to verify coin sizes for this pair.\nStart\nBootstrap campaign expired — campaign-owned offers require cancellation before restart or renewal.\n▶ Start\n⏹ Stop\nNo Offers To Cancel\n● STOPPED\nSynced\n⚡\nSage\n🔑\n3702373391\n?\nOFFER-BOOK MARKET CONFIDENCE\nSOURCES · DEXIE / SPLASH / SAGE / CHAIN\nGathering attributable offer-book evidence\nVOLUME & TOKEN INFO\nSOURCE · DEXIE\nSelect a trading pair to load volume data\nACTIVE SETTINGS\n?\nTRADING\nBuy / Sell\n?\nChoose pair\nLoop\n?\n—\nMax Offers\n?\n—\nSPREADS\nMode\n?\nChoose pair\nBase\n?\n—\nRange\n?\n—\nMin Edge\n?\n—\nINVENTORY\nSkew\n?\nPENDING\nMax Position\n?\n—\nTIERS\nEnabled\n?\nPENDING\nSizes\n?\n—\nSAFETY\nReserves\n?\nChoose pair\nPrice Limits\n?\n—\nCircuit Breaker\n?\nPENDING\nMARKET HEALTH\n?\n...\nChoose a trading pair to load balances and market data.\nSelect a CAT pair above, then open Settings to prepare that token for this run.\nINNER SPREAD ?\nloading\nMARKET SPREAD ?\nloading\nCOMPETITORS ?\nloading\nCONFIDENCE STATE ?\nloading\nREQUIRED INDEPENDENT DEPTH ?\nloading\nFILL RATE ?\npending\nVOLATILITY ?\npending\nPOSITION ?\npending\nTRADING PACE ?\npending\nWITHDRAWAL STAGE ?\npending\nCB BLOCKED ?\npending\nTOXICITY ?\npending\nACTIVITY LEVEL ?\npending\nON-CHAIN RISK ?\npending\nHOLDERS ?\npending\nDexie Orderbook\nSpacescan\nWALLET & PERFORMANCE\n?\nRefresh\nSAGE WALLET\nXCH Spendable\n?\n0.0000\nXCH Total\n?\n0.0000\nSelect a pair to see token balances\nRESERVES ?\nXCH\nChoose pair\nCAT\nChoose pair\nPERFORMANCE\nUptime\n?\n00:00:00\nLoops\n?\n0\nLast Loop\n?\n0.00s\nTotal Fills\n?\n0\nFill Rate\n?\n0.0/hr\nPnL\n?\n+0.000 XCH\nErrors\n?\n0",
+  "visible_buttons": [
+    {
+      "id": "",
+      "text": "Connect to Sage",
+      "aria": null,
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Dashboard",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Offers",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Profit and loss",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Market intelligence",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Settings",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "v4-nav-logs",
+      "text": "",
+      "aria": "Logs",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Data reset",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "themeToggleBtn",
+      "text": "",
+      "aria": "Toggle light or dark theme",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Help",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "About this app",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "",
+      "aria": "Shut down application",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "Refresh",
+      "aria": null,
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "startupReviewSettingsBtn",
+      "text": "Review Settings",
+      "aria": null,
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "startBtn",
+      "text": "▶ Start",
+      "aria": null,
+      "disabled": true,
+      "fingerprint": null
+    },
+    {
+      "id": "stopBtn",
+      "text": "⏹ Stop",
+      "aria": null,
+      "disabled": true,
+      "fingerprint": null
+    },
+    {
+      "id": "cancelAllBtn",
+      "text": "No Offers To Cancel",
+      "aria": null,
+      "disabled": true,
+      "fingerprint": null
+    },
+    {
+      "id": "fingerprintDisplay",
+      "text": "🔑\n3702373391\n?",
+      "aria": "Change wallet fingerprint",
+      "disabled": false,
+      "fingerprint": null
+    },
+    {
+      "id": "",
+      "text": "Refresh",
+      "aria": null,
+      "disabled": false,
+      "fingerprint": null
+    }
+  ],
+  "events": [
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/alerts",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/status",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/sage/startup-status",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/bootstrap/partial-capability",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/console/status",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/logs?limit=2000",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/bootstrap/status",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/fingerprint",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/fingerprint",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/sage/cert-candidates",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/health",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/check-update",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/events",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:5000/api/wallet/sage-running",
+      "status": 200
+    }
+  ]
+}
