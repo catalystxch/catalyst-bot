@@ -104,3 +104,12 @@ owned lease. This completes the inactive native UI traversal; active-state UI,
 active-offer lifecycle/recovery, secondary original-profile acceptance, both
 final-candidate 24-hour windows, and final review remain open. PR #220 stays
 draft.
+
+A separate post-traversal read-only Sage facade query reconfirmed mainnet,
+fingerprint `736588221`, no pending transactions, XCH spendable
+`138470301476875` mojos, CAT wallet 2 spendable `780212284` atomic units, and
+the complete 4,095-offer local history (3,326 cancelled, 231 expired, 538
+completed; no active status). Database read APIs returned no open MZ offers,
+no unresolved offer-operation blockers, no active Bootstrap campaign, and the
+stopped prior campaign with zero authoritative fee spend. These observations
+were made without a wallet mutation.
