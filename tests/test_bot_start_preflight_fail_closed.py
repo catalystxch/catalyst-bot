@@ -103,3 +103,28 @@ def test_direct_bot_start_requires_fresh_wallet_offer_metadata():
     assert bot_loop.BotLoop._fresh_wallet_offer_book_for_start(loop) is False
     manager.get_wallet_sync_meta = lambda: {"fresh": True, "using_cache": False}
     assert bot_loop.BotLoop._fresh_wallet_offer_book_for_start(loop) is True
+
+
+def test_stale_wallet_cycle_does_not_run_fill_detection():
+    calls = []
+    loop = SimpleNamespace(
+        _wallet_sync_stale_cycle=True,
+        offer_manager=SimpleNamespace(_offer_details_cache={}),
+        fill_tracker=SimpleNamespace(
+            detect_fills=lambda *args: (
+                calls.append(args)
+                or {"buy_fills": [{"trade_id": "false-fill"}], "sell_fills": []}
+            )
+        ),
+    )
+
+    result = bot_loop.BotLoop._detect_fills_for_wallet_cycle(
+        loop, {"cached-buy"}, set()
+    )
+    assert result == {"buy_fills": [], "sell_fills": []}
+    assert calls == []
+
+    loop._wallet_sync_stale_cycle = False
+    result = bot_loop.BotLoop._detect_fills_for_wallet_cycle(loop, {"fresh-buy"}, set())
+    assert result["buy_fills"][0]["trade_id"] == "false-fill"
+    assert calls == [({"fresh-buy"}, set(), {})]

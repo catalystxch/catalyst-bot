@@ -5704,6 +5704,16 @@ class BotLoop:
             and meta.get("using_cache") is False
         )
 
+    def _detect_fills_for_wallet_cycle(self, current_buy_ids, current_sell_ids):
+        """Only a fresh offer book can advance fill detection state."""
+        if self._wallet_sync_stale_cycle:
+            return {"buy_fills": [], "sell_fills": []}
+        return self.fill_tracker.detect_fills(
+            current_buy_ids,
+            current_sell_ids,
+            self.offer_manager._offer_details_cache,
+        )
+
     def start(self) -> bool:
         """Start the bot loop in a background thread.
 
@@ -10225,8 +10235,8 @@ class BotLoop:
             arb_gap,
         )
         print("   [4] Checking fills...", end="", flush=True)
-        fill_result = self.fill_tracker.detect_fills(
-            current_buy_ids, current_sell_ids, self.offer_manager._offer_details_cache
+        fill_result = self._detect_fills_for_wallet_cycle(
+            current_buy_ids, current_sell_ids
         )
 
         buy_fills = fill_result.get("buy_fills", [])
