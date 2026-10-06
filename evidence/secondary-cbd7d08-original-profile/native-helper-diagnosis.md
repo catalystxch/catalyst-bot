@@ -1,8 +1,8 @@
-# Native-control helper diagnosis
+# CATalyst cbd7d08 native-control helper diagnosis
 
 Date: 2026-10-06 (Europe/London)
 
-## Result
+## Scope and result
 
 The requested read-only native Windows traversal could not be performed through a supported automation path. CATalyst and its read-only monitor were not restarted or modified. No wallet, campaign, offer, fee, balance, or configuration action was taken.
 
@@ -38,7 +38,7 @@ Two independent limitations prevent a supported native traversal:
 
 The runtime itself is present, including `node.exe`, `node_repl.exe`, `@oai/cua-repl`, and `@oai/sky`. `%TEMP%`, `%TMP%`, `C:\Users\M920q\.codex\tmp`, and the configured native named pipe all exist. The normal computer-use UI config is present. `CODEX_WINDOWS_REGISTERED_CORE` is not supplied to this task.
 
-The cached plugin manifest inspected was:
+The cached plugin manifest path inspected was:
 
 ```text
 C:\Users\M920q\.codex\plugins\cache\openai-bundled\unified-computer-use\26.930.31730\.mcp.json

@@ -41,8 +41,13 @@
   },
   {
     "path": "SNAPSHOT.md",
-    "bytes": 1148,
-    "sha256": "66F62BC1CE2D03D7D22BC72FBD95A9866DCA3D1A027D978390F6F9DF6B75BC9D"
+    "bytes": 1252,
+    "sha256": "43C03FBB43162583AE5161024FCDF8EE78F05963B0CF9E5EA7D5BDCA633E4ACA"
+  },
+  {
+    "path": "native-helper-diagnosis.md",
+    "bytes": 3275,
+    "sha256": "A1A7472219E77AC714AE78FD7699844214979DC677117BC7F72C04B05E92DE4E"
   },
   {
     "path": "ui_connect_probe.py",
