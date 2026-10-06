@@ -93,3 +93,18 @@ No new campaign or fee approval exists. Live offer lifecycle and recovery,
 primary and secondary full 24-hour windows, original-profile secondary live
 acceptance, and final review remain open. PR #220 remains draft; no merge, tag,
 release or public-readiness claim is supported.
+
+## Exact-package read-only diagnostics, 00:45 UTC
+
+The sole port-5000 owner was still PID `160304`, with the exact executable SHA-256
+above. A read-only `/api/doctor` request reported `can_start=true`: nine checks
+passed, TibetSwap was skipped as a retired provider, and Splash was unreachable.
+The passes covered database, config, CAT identity and wallet mapping, Sage RPC,
+Sage sync and signing, Dexie, and Spacescan configuration. The read-only
+`/api/health/runtime` request reported `healthy=true`, zero repairs, and zero
+pending cancellation journals, orphan coin locks, stale Dexie posts, ladder
+overbuild, top-up budget drift, funds-floor issues, or unallocated deposits.
+Its two warnings were the unavailable Splash metrics endpoint and a missing or
+expired Spacescan cache for this asset. Neither request started the bot or
+changed offers. These warnings remain observable diagnostics; the 24-hour
+monitor and live trading gates are still pending.
