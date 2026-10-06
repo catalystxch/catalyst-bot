@@ -31840,6 +31840,10 @@
 
             try {
                 const hasOffers = await checkForResume();
+                if (hasOffers === null) {
+                    showToast('Update complete, but live wallet offers could not be verified. Check Sage and retry Start Bot.', 'warning');
+                    return false;
+                }
                 if (!hasOffers) {
                     showToast('Update complete, but no previous live offers were found to resume.', 'warning');
                     return false;
@@ -31868,7 +31872,13 @@
             
             try {
                 const response = await apiFetch(`${API_URL}/check-resume`);
+                if (!response.ok) throw new Error('Wallet offer check failed');
                 const data = await response.json();
+
+                if (data.reason === 'wallet_offer_query_not_fresh') {
+                    showToast('Live wallet offers could not be verified. Check Sage and retry.', 'warning');
+                    return null;
+                }
                 
                 if (!data.can_resume) {
                     // Don't touch session state when the bot is already mid-run
@@ -31947,7 +31957,8 @@
                 
             } catch (error) {
                 debugError('[RESUME] Check failed:', error);
-                return false;
+                showToast('Live wallet offers could not be verified. Check Sage and retry.', 'warning');
+                return null;
             }
         }
         
@@ -32352,6 +32363,14 @@
             try {
                 // Check for resume (existing offers)
                 const needsResume = await checkForResume();
+                if (needsResume === null) {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    return;
+                }
                 if (needsResume) {
                     debugLog('[START] Resume modal shown, waiting for user choice...');
                     _botStarting = false;

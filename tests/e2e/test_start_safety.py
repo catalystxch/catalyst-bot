@@ -83,6 +83,30 @@ def test_start_safety_failure_explains_reason_and_does_not_dispatch(page):
     )
 
 
+@pytest.mark.parametrize("failure", ["nonfresh", "network"])
+def test_unavailable_wallet_offer_book_does_not_start_as_empty_book(page, failure):
+    _ready_setup(page, "allowed")
+    result = page.evaluate(
+        """async failure => {
+            const calls = [];
+            apiFetch = async (url) => {
+                calls.push(url);
+                if (url.endsWith('/check-resume')) {
+                    if (failure === 'network') throw new Error('Sage unavailable');
+                    return new Response(JSON.stringify({can_resume: false,
+                        reason: 'wallet_offer_query_not_fresh'}));
+                }
+                return new Response(JSON.stringify({success: true}));
+            };
+            const resume = await checkForResume();
+            await startBot();
+            return {resume, started: calls.some(url => url.endsWith('/bot/start'))};
+        }""",
+        failure,
+    )
+    assert result == {"resume": None, "started": False}
+
+
 def test_start_safety_error_uses_allowlisted_reason_not_untrusted_detail(page):
     _ready_setup(page)
     message = page.evaluate(
