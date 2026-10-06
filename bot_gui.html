@@ -29857,7 +29857,7 @@
                     icon: passed ? '\ud83e\ude7a' : '\u26a0\ufe0f',
                     kicker: 'Preflight',
                     title: 'Doctor Report',
-                    copy: `${escapeHtml(report.summary || '')} (${report.duration_ms || 0}ms)`,
+                    copy: `${escapeHtml(report.summary || '')} (${escapeHtml(report.duration_ms || 0)}ms)`,
                     bodyHtml: `
                         <div class="v4-modal-panel">
                             <div class="v4-modal-panel-title">${headerText}</div>

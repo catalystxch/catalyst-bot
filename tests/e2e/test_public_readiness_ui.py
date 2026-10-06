@@ -13,6 +13,31 @@ def _open_gui(page):
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+def test_doctor_report_escapes_duration_from_api(page):
+    _open_gui(page)
+    malicious_duration = '<img src=x onerror="window.__doctorDurationInjected=true">'
+    page.evaluate(
+        """async duration => {
+            window.__doctorDurationInjected = false;
+            window.apiFetch = async path => {
+                if (path !== '/api/doctor?force=true') throw new Error('Unexpected request');
+                return new Response(JSON.stringify({
+                    can_start: true,
+                    summary: 'Ready',
+                    duration_ms: duration,
+                    checks: [],
+                }), {status: 200});
+            };
+            await showDoctorReport();
+        }""",
+        malicious_duration,
+    )
+    modal = page.locator(".v4-modal-shell").last
+    assert malicious_duration in modal.locator(".v4-modal-copy").inner_text()
+    assert modal.locator("img").count() == 0
+    assert page.evaluate("window.__doctorDurationInjected") is False
+
+
 @pytest.mark.parametrize(
     ("mode", "xch_budget", "cat_budget", "buy_count", "sell_count"),
     [
