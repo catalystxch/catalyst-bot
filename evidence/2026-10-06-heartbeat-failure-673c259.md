@@ -18,15 +18,24 @@ full 30 seconds, but was not renewed before expiry. Samples 14–16 remained
 failed. The monitor's 24-hour acceptance window is **failed**, regardless
 of later samples.
 
+Windows Application Event Log event `VSS/8231` records a snapshot start at
+`20:59:48.0171434Z` by `taskhostw.exe -RegisterDevice -Periodic`. Windows
+Backup's task state was `Ready` when the minute monitor later sampled it;
+that state does not exclude this VSS activity. A Windows time-service sync
+adjusted the clock backwards about 1.2 seconds at `21:00:01Z`; that small
+adjustment alone does not explain the roughly 19-second missed-renewal gap.
+The VSS event is a second correlation with the earlier failed candidate,
+not proof that VSS blocked SQLite or Python.
+
 The application superlog
 `%APPDATA%\Catalyst\bot_superlog_20261006_214454.log` reported several
 Sage RPC connection errors at `21:00:38Z`. Concurrent `get_chia_health`
 calls took about 27.7, 33.8, and 40.4 seconds. The
 `mutation-lease-heartbeat` thread logged its terminal read-only safety stop
 at `21:00:48.445Z`. Windows Backup was `Ready` in the failing monitor
-sample, so an active backup is not established as the cause. The existing
-log does not show when the heartbeat began waiting, whether it waited on
-the gate lock or SQLite, or the database result/exception. Root cause is
+sample. The existing log does not show when the heartbeat began waiting,
+whether it waited on the gate lock or SQLite, or the database
+result/exception. Root cause is
 still open; a longer lease alone would be an unproven workaround.
 
 After failure, read-only `/api/safety/status` showed the terminal
@@ -43,3 +52,16 @@ Do not merge PR #220 or claim public readiness. Keep the failed process
 read-only while gathering diagnostics. Determine why the heartbeat missed
 renewal, verify a correction on an exact packaged candidate, and restart
 the required 24-hour acceptance window from that candidate.
+
+## Follow-up diagnostic work
+
+The source branch now records a bounded timing event for each heartbeat in
+the normal in-memory debug ring. A slow heartbeat writes a warning; a
+failed one writes an error after dispatching the stop callback. The event
+separates local gate-lock wait from each SQLite attempt and records the
+result, exception type, and numeric SQLite error code. Exception messages
+are omitted. This instrumentation is for a future recurrence; it cannot
+retroactively identify this failure's blocked boundary and is not a fix.
+The mutation-gate, stability-schema, and startup-recovery suites passed
+**414 tests** with the diagnostic change. The original failed process
+continues to run its earlier `673c259` binary in read-only mode.

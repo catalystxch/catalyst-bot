@@ -1042,6 +1042,106 @@ def test_database_write_lock_during_heartbeat_fails_closed(
     assert exc_info.value.reason_code == "HEARTBEAT_FAILED"
 
 
+def test_failed_heartbeat_records_bounded_timing_without_exception_details(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    records = []
+    events = []
+    gate.register_stop_handler(lambda _reason: events.append("stop"))
+
+    def capture_log(category, message, data=None, level="info"):
+        events.append("log")
+        records.append((category, message, data, level))
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        capture_log,
+    )
+
+    def blocked_heartbeat(**_kwargs):
+        failure = sqlite3.OperationalError("database locked; private diagnostic detail")
+        failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise failure
+
+    monkeypatch.setattr(database, "heartbeat_runtime_mutation_lease", blocked_heartbeat)
+    assert gate.heartbeat() == {
+        "heartbeat": False,
+        "reason": "durable_state_unavailable",
+    }
+
+    diagnostics = [
+        item for item in records if item[1] == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostics) == 1
+    assert events == ["stop", "log"]
+    category, _message, data, level = diagnostics[0]
+    assert category == "SAFETY"
+    assert level == "error"
+    assert data["outcome"] == "durable_state_unavailable"
+    assert data["lock_wait_ms"] >= 0
+    assert data["elapsed_ms"] >= data["lock_wait_ms"]
+    assert len(data["attempts"]) == 4
+    assert all(
+        attempt["exception_type"] == "OperationalError" for attempt in data["attempts"]
+    )
+    assert all(
+        attempt["sqlite_errorcode"] == sqlite3.SQLITE_BUSY
+        for attempt in data["attempts"]
+    )
+    assert "private diagnostic detail" not in repr(data)
+
+
+def test_heartbeat_timing_separates_local_gate_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    records = []
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data, level)
+        ),
+    )
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_gate_lock():
+        with gate._lock:
+            holding.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_gate_lock)
+    holder.start()
+    assert holding.wait(timeout=5)
+    timer = threading.Timer(0.08, release.set)
+    timer.start()
+    try:
+        assert gate.heartbeat()["heartbeat"] is True
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        timer.join(timeout=5)
+
+    diagnostic = [
+        item for item in records if item[0] == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostic) == 1
+    data = diagnostic[0][1]
+    assert diagnostic[0][2] == "debug"
+    assert data["outcome"] == "heartbeat"
+    assert data["lock_wait_ms"] >= 20
+    assert data["elapsed_ms"] >= data["lock_wait_ms"]
+    assert len(data["attempts"]) == 1
+
+
 def test_transient_durable_heartbeat_failure_retries_before_process_fence(
     isolated_gate_database, monkeypatch
 ):

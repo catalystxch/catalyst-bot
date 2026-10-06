@@ -2240,36 +2240,93 @@ class MutationGate:
 
     @_stop_callback_boundary
     def heartbeat(self) -> dict[str, Any]:
-        with self._lock:
-            version = self._lease_version
-            if version is None:
+        started = time.monotonic()
+        lock_acquired = started
+        attempts: list[dict[str, Any]] = []
+        outcome = "unexpected_exception"
+        try:
+            with self._lock:
+                lock_acquired = time.monotonic()
+                version = self._lease_version
+                if version is None:
+                    self._set_local_block("HEARTBEAT_FAILED")
+                    outcome = "not_owned"
+                    return {"heartbeat": False, "reason": outcome}
+                result = {"heartbeat": False, "reason": "durable_state_unavailable"}
+                for attempt in range(_HEARTBEAT_MAX_ATTEMPTS):
+                    now = self._now()
+                    attempt_started = time.monotonic()
+                    try:
+                        result = database.heartbeat_runtime_mutation_lease(
+                            owner_run_id=self.run_id,
+                            expected_lease_version=version,
+                            heartbeat_at=now,
+                            lease_expires_at=now
+                            + timedelta(seconds=self.lease_seconds),
+                            lease_duration_seconds=self.lease_seconds,
+                        )
+                        result = _lease_public_result(result)
+                        attempts.append(
+                            {
+                                "elapsed_ms": round(
+                                    (time.monotonic() - attempt_started) * 1000, 1
+                                ),
+                                "outcome": str(result.get("reason") or "unknown"),
+                            }
+                        )
+                    except Exception as exc:
+                        failure = {
+                            "elapsed_ms": round(
+                                (time.monotonic() - attempt_started) * 1000, 1
+                            ),
+                            "exception_type": type(exc).__name__,
+                        }
+                        sqlite_errorcode = getattr(exc, "sqlite_errorcode", None)
+                        if type(sqlite_errorcode) is int:
+                            failure["sqlite_errorcode"] = sqlite_errorcode
+                        attempts.append(failure)
+                        if attempt + 1 < _HEARTBEAT_MAX_ATTEMPTS:
+                            continue
+                        result = {
+                            "heartbeat": False,
+                            "reason": "durable_state_unavailable",
+                        }
+                    if result.get("heartbeat"):
+                        self._lease_version = int(result["lease"]["lease_version"])
+                        outcome = "heartbeat"
+                        return result
+                    break
                 self._set_local_block("HEARTBEAT_FAILED")
-                return {"heartbeat": False, "reason": "not_owned"}
-            result = {"heartbeat": False, "reason": "durable_state_unavailable"}
-            for attempt in range(_HEARTBEAT_MAX_ATTEMPTS):
-                now = self._now()
-                try:
-                    result = database.heartbeat_runtime_mutation_lease(
-                        owner_run_id=self.run_id,
-                        expected_lease_version=version,
-                        heartbeat_at=now,
-                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
-                        lease_duration_seconds=self.lease_seconds,
-                    )
-                    result = _lease_public_result(result)
-                except Exception:
-                    if attempt + 1 < _HEARTBEAT_MAX_ATTEMPTS:
-                        continue
-                    result = {
-                        "heartbeat": False,
-                        "reason": "durable_state_unavailable",
-                    }
-                if result.get("heartbeat"):
-                    self._lease_version = int(result["lease"]["lease_version"])
-                    return result
-                break
-            self._set_local_block("HEARTBEAT_FAILED")
-            return result
+                outcome = str(result.get("reason") or "unknown")
+                return result
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            if outcome != "heartbeat":
+                # A slow logging sink must not delay the emergency stop.
+                # The boundary wrapper's later flush is harmlessly empty.
+                self._flush_stop_handler()
+            # The failure log must distinguish a delayed thread, local lock
+            # contention, and a slow/failed SQLite attempt. Keep exception
+            # messages out of durable logs because they can contain paths.
+            level = (
+                "error"
+                if outcome != "heartbeat"
+                else ("warn" if elapsed_ms >= 5000 else "debug")
+            )
+            try:
+                slog(
+                    "SAFETY",
+                    "Mutation lease heartbeat timing",
+                    {
+                        "outcome": outcome,
+                        "lock_wait_ms": round((lock_acquired - started) * 1000, 1),
+                        "elapsed_ms": elapsed_ms,
+                        "attempts": attempts,
+                    },
+                    level=level,
+                )
+            except Exception:
+                pass  # Diagnostics must not change the fail-closed result.
 
     def start_heartbeat(self, interval_seconds: Optional[float] = None) -> bool:
         with self._lock:
