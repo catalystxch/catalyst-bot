@@ -28,6 +28,20 @@ campaign, safety `ALLOWED`, an owned lease, and zero blocker counts. The
 balances match the pre-rollover values. No campaign or fee approval was
 created, and no wallet mutation was requested.
 
+The connected native UI was traversed without Save, Start, Cancel, or Reset.
+Dashboard showed TEST 7/MZ and Follow mode with the bot stopped. Offers showed
+zero active buy/sell offers and three historical fills. P&L showed the three
+historical confirmed buy fills and zero pending verification. Market Intel
+reported RED attributable offer-book confidence, no tradable range, and
+Splash unavailable as expected after skipping it. Settings showed fingerprint
+`736588221`, the MZ pair, and safety `ALLOWED` with an owned lease. Current
+session Logs backfilled Sage login and MZ selection. The native Doctor report
+passed nine checks and showed one expected Splash-unreachable warning; wallet
+RPC, sync, signing, CAT mapping, Dexie, database, configuration, and
+Spacescan checks passed. The TibetSwap check was explicitly skipped as a
+retired dependency. This is read-only UI and diagnostic evidence, not an
+active-offer or trading lifecycle result.
+
 A fresh exact-PID/hash monitor, PID `115476`, began at
 `2026-10-06T03:50:36Z` using
 `E:\catalyst-stability-monitor-61be438\monitor.ps1` and
