@@ -14,8 +14,8 @@ The targeted Chromium regression passed after the fix. The complete opt-in
 Chromium suite passed **227 tests in 177.92 seconds**. Ruff check and format
 of the modified test passed. The runtime Python source is unchanged from
 `a5f4074`, whose complete serial Windows backend passed 7,277 tests, with
-227 skipped and 433 subtests. At evidence publication, ten of the eleven
-exact-source PR checks had passed; `unit-tests` was still running.
+227 skipped and 433 subtests. All eleven exact-source PR checks passed on
+`2028c84`; the docs-only evidence child must be checked separately.
 
 The detached checkout `E:\catalyst-skip-xss-2028c84-build` built the clean
 Windows bundle successfully with PyInstaller 6.21.0 and release version 1.4.0.
@@ -39,9 +39,34 @@ of the pinned ZIP and installer matched the hashes below:
 | Unsigned `Catalyst-Setup-1.4.0.exe` | `11A3343075DE3BD705896327E5EF525A04400DF2EC4B717C4A5146851AAF3E15` |
 
 Packaged API/Sage/recovery and isolated installer execution remain open for
-this exact bundle. The preceding `a5f4074` app still owns the original TEST 7
-profile and port 5000 with the bot stopped, zero offers, and a clean ongoing
-monitor; its trace is historical for a future final-candidate 24-hour gate.
-Original-profile rollover, active-offer lifecycle/recovery, secondary
-original-profile acceptance, both final-candidate 24-hour windows, and final
-review remain open. PR #220 stays draft.
+this exact bundle.
+
+## Original TEST 7 read-only rollover
+
+The preceding `a5f4074` process was the sole expected PID and port 5000
+owner, with synced Sage, stopped bot, zero offers, and allowed safety. It
+closed through its desktop window with no port listener remaining. Its monitor
+ended at `2026-10-06T12:22:09Z`; that trace is historical for this new
+runtime candidate.
+
+The exact `2028c84` EXE started as sole PID 108228 and sole port 5000 owner.
+Browser startup acknowledged the testing Risk Disclosure under the operator's
+existing authorization and selected Sage mainnet TEST 7 fingerprint
+736588221. A fresh dashboard read populated the pre-bot balance cache. The
+read-only app state then showed CAT wallet 2 and exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+synced wallet, stopped bot, unchanged 138.470301476875 XCH and 780212.284
+MZ, zero open offers, inactive Bootstrap, and allowed safety with an owned
+lease. Independent read-only Sage checks found zero pending transactions and
+zero fillable offers in the complete 4,095-offer history. The prior campaign
+remains stopped with zero authoritative fee spend. No new campaign or wallet
+effect was initiated.
+
+Exact-PID/path/hash stopped-profile safety and port-owner monitors began at
+`2026-10-06T12:27:21Z` and `12:27:19Z` under
+`E:\catalyst-stability-monitor-2028c84`; their first samples passed. The
+24-hour stopped-profile gate cannot pass before `2026-10-07T12:27:21Z` plus
+complete trace and end-state review. Full native interactive UI acceptance,
+active-offer lifecycle/recovery, secondary original-profile acceptance, both
+final-candidate 24-hour windows, and final review remain open. PR #220 stays
+draft.
