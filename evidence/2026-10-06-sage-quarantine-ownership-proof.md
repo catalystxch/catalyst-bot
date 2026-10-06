@@ -70,10 +70,44 @@ Artifact commit `7b11d624d4c21ab49f49c4529b59785202b9c100`:
 - [Acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/7b11d624d4c21ab49f49c4529b59785202b9c100/acceptance-artifacts/CATalyst-cbd7d08-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/7b11d624d4c21ab49f49c4529b59785202b9c100/acceptance-artifacts/Catalyst-Setup-cbd7d08-1.4.0.exe)
 
+## Initial original TEST 7 read-only acceptance
+
+The predecessor `f73a2bd` remained stopped with zero open offers and correct
+Sage TEST 7 identity. Its GUI-equivalent shutdown route was called with
+`cancel_offers:false`; process PID `160304` and port 5000 exited. Its monitor
+recorded 109 clean stopped-profile samples, then a process-exit and end record.
+No cancellation or wallet mutation was requested.
+
+The exact `cbd7d08` EXE started as sole PID `149044`, SHA-256 matched the clean
+build, and it alone owned `127.0.0.1:5000`. The native window showed Risk
+Disclosure, which was acknowledged under the operator's standing testing
+authorization. The native startup flow selected Sage mainnet TEST 7 fingerprint
+`736588221`, skipped unavailable Splash, retained the existing Spacescan key,
+and selected MZ/XCH. The selected CAT wallet ID was `2`, asset ID
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+The wallet was synced; balances remained `138.470301476875` XCH and
+`780212.284` MZ. The bot was stopped, Bootstrap inactive, DB open-offer count
+zero, and runtime safety ALLOWED with an owned renewing lease.
+
+Native read-only traversal loaded Dashboard, Offers, P&L, Market Intelligence,
+Settings Setup and Live tabs, Logs, Help, About and Data Reset. Offers showed
+zero active and three historical fills; Market Intelligence showed Dexie and
+Sage ready, Splash unavailable, Spacescan enabled, and RED attributable-book
+confidence. No Save, Reset, Start, campaign, fee approval, offer, or transaction
+action was taken. The UI was left on the stopped Dashboard.
+
+The new exact-PID/hash stopped-profile monitor is
+`E:\catalyst-stability-monitor-cbd7d08\monitor.ps1` (SHA-256
+`CEE1A37583D3B3AA855BF447E2DB985C6766CA9E128AE026DB1C2F656F8120E2`).
+Its first clean sample was `2026-10-06T02:25:58.5283494Z`. The 24-hour gate
+cannot finish before `2026-10-07T02:25:58Z` and requires the full trace and
+end-state review. Four initial samples through `02:29:01Z` were clean; this is
+only a stopped-profile window, not a live trading window. The secondary PC
+was assigned an independent original-profile exact-candidate pass and monitor.
+
 No wallet effect was initiated for this finding.
 
-The previous exact `f73a2bd` stopped-profile monitors remain live while the
-new package is prepared for original-profile acceptance. Their results cannot
-count as a completed 24-hour window for this later runtime candidate. PR #220
-remains draft; active-offer lifecycle, both exact-candidate 24-hour windows and
-final review remain open.
+The previous exact `f73a2bd` traces are historical and cannot count as a
+completed 24-hour window for this later runtime candidate. PR #220 remains
+draft; active-offer lifecycle, both exact-candidate 24-hour windows and final
+review remain open.
