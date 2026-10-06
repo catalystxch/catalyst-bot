@@ -1306,9 +1306,7 @@ def _get_sage_signing_block_reason():
         return None
 
     try:
-        from wallet import get_wallet_identity
-
-        identity = get_wallet_identity()
+        identity = wallet.get_wallet_identity()
         if type(identity) is not dict or identity.get("success") is not True:
             return None
         if identity.get("has_secrets") is not True:
@@ -2326,10 +2324,8 @@ def _complete_runtime_recovery_epoch(
     wallet_hash, network = _configured_mutation_binding()
     binding = runtime.wallet_identity_binding
     try:
-        from wallet import get_wallet_identity
-
         first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
-            get_wallet_identity
+            wallet.get_wallet_identity
         )
     except Exception:
         first_identity = None
@@ -5233,10 +5229,9 @@ _walletconnect_signing_project_id = None
 def _read_walletconnect_identity():
     """Read the current Sage identity and receive address without mutation."""
 
-    from wallet import get_next_address, get_wallet_identity
     from walletconnect_signing import SigningError, WalletIdentity
 
-    snapshot = get_wallet_identity()
+    snapshot = wallet.get_wallet_identity()
     if type(snapshot) is not dict or snapshot.get("success") is not True:
         raise SigningError("wallet_identity_unavailable")
     if str(snapshot.get("backend") or "").strip().lower() != "sage":
@@ -5253,7 +5248,7 @@ def _read_walletconnect_identity():
         network = "testnet"
     else:
         raise SigningError("invalid_wallet_network")
-    address_result = get_next_address(
+    address_result = wallet.get_next_address(
         int(getattr(cfg, "WALLET_ID_XCH", 1)), new_address=False
     )
     if type(address_result) is not dict or address_result.get("success") is not True:
@@ -5682,17 +5677,15 @@ def _get_health_snapshot() -> dict:
     if not chia_node.is_startup_authorised():
         return {"status": "not_started", "consecutive_failures": 0}
     try:
-        from wallet import get_chia_health
-
-        h = get_chia_health()
-        wallet = h.get("wallet", {}) or {}
+        h = wallet.get_chia_health()
+        wallet_status = h.get("wallet", {}) or {}
         node = h.get("node", {}) or {}
         return {
             "status": h.get("status", "unknown"),
-            "wallet_reachable": wallet.get("reachable", False),
-            "wallet_synced": wallet.get("synced", False),
-            "wallet_syncing": wallet.get("syncing", False),
-            "wallet_sync_state": wallet.get("sync_state", "unknown"),
+            "wallet_reachable": wallet_status.get("reachable", False),
+            "wallet_synced": wallet_status.get("synced", False),
+            "wallet_syncing": wallet_status.get("syncing", False),
+            "wallet_sync_state": wallet_status.get("sync_state", "unknown"),
             "node_reachable": node.get("reachable", False),
             "node_synced": node.get("synced", False),
             "consecutive_failures": _health_consecutive_failures(h),
