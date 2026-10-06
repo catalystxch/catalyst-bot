@@ -1,0 +1,10 @@
+CATalyst Windows acceptance checkpoint — bbf94f0
+
+Exact source/runtime: bbf94f0f379fe7965ad079009b68e9cdfec380d7
+Feature PR: #220 (draft); safety sub-PR: #249
+
+This candidate fails closed on a damaged bot.db and leaves the original authority for operator reconciliation. The standalone recovery command prepares a separate candidate without swapping the live file.
+
+Local Windows: 7,287 backend tests passed, 232 skipped, 433 subtests passed. Repository-wide Ruff check and format passed. Bundled frontend is byte-identical to the preceding 231-test Chromium candidate. Clean detached EXE, ZIP CRC/contents/extracted API, synthetic Sage, publication recovery, native safety, isolated installer clean install/installed API and Sage/uninstall, and Defender scans passed. An isolated packaged corrupt-profile launch entered read-only diagnostics and preserved the original DB byte-for-byte.
+
+This is an unsigned test installer. Original TEST 7 live-profile acceptance, active-offer recovery, both exact-candidate 24-hour windows, final review, and release authorization remain open. Do not merge main, tag, release, or claim public readiness from this checkpoint.
