@@ -64,4 +64,15 @@ are omitted. This instrumentation is for a future recurrence; it cannot
 retroactively identify this failure's blocked boundary and is not a fix.
 The mutation-gate, stability-schema, and startup-recovery suites passed
 **414 tests** with the diagnostic change. The original failed process
-continues to run its earlier `673c259` binary in read-only mode.
+was shut down cleanly from the local UI with offer cancellation off. Its
+monitor trace was retained. The clean detached diagnostic build is source
+`cfa42f376c1e53f69280e0cf5ce983a1e39d2acb` with EXE SHA-256
+`7891AFDCF91F66A0323FFD88A023824FD4D17FD6FA929297B7395E4F1BF6164B`.
+At `21:18:42Z` the exact diagnostic EXE ran as sole PID `137816` and port
+5000 owner on the original TEST 7 profile. Read-only checks verified
+mainnet fingerprint `736588221`, CAT wallet ID `2`, the exact MZ asset,
+synced Sage, stopped bot, inactive Bootstrap, zero open offers and an
+allowed renewing lease. Its exact PID/hash one-minute monitor is
+`E:\catalyst-stability-monitor-cfa42f3\trace-60s.jsonl`; the first
+sample passed. This run is intended to identify the blocked heartbeat
+boundary if the failure recurs, not to support public readiness.
