@@ -48,6 +48,9 @@ downloads matched both published SHA-256 hashes:
 - [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/5dc28455dddc2e7a1aaf52f38c207fdb7353a42d/acceptance-artifacts/CATalyst-24ba013-primary-acceptance.zip)
 - [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/5dc28455dddc2e7a1aaf52f38c207fdb7353a42d/acceptance-artifacts/Catalyst-Setup-24ba013-1.4.0.exe)
 
+The independently downloaded ZIP extracted to the exact EXE hash above;
+the extracted app passed the packaged API smoke in an isolated profile.
+
 ## Original TEST 7 read-only rollover
 
 The preceding `6876f0f` app shut down through its native UI with the
@@ -64,6 +67,10 @@ the expected asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbe
 synced Sage, unchanged 138.470301476875 XCH and 780212.284 MZ balances,
 zero app and wallet open offers, stopped bot, inactive Bootstrap, and allowed
 safety with an owned renewing lease. No campaign or wallet action was started.
+
+Read-only native traversal passed Dashboard, Offers, P&L, Market Intel,
+Settings, Logs, Data Reset, Help, and About. Offers showed no open offers.
+No reset or wallet control was used; the UI returned to Dashboard.
 
 An exact-PID/path/hash stopped-profile monitor began at
 `2026-10-06T10:19:23Z` in
