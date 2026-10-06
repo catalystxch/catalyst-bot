@@ -137,6 +137,16 @@ port ownership were independently checked. Sixteen screenshots and the full
 report are at the secondary PC's
 `evidence/acceptance-cbd7d08-20261006T0320BST/REPORT.md` (SHA-256
 `F5F0BEF39DF99CA07FFAD7CFA7DE2D06D4A848A22C5AD9264524EEEB96CF4165`).
+The [native-helper diagnosis](https://github.com/catalystxch/catalyst-bot/blob/6cfd7e006b013f1d9b614ee8ec7e9dbc8acd1be2/evidence/secondary-cbd7d08-original-profile/native-helper-diagnosis.md)
+(published SHA-256
+`A1A7472219E77AC714AE78FD7699844214979DC677117BC7F72C04B05E92DE4E`)
+records that the secondary task's active computer-use surface was browser-only
+and its REPL failed before native control could initialize. The published
+38-entry [manifest](https://github.com/catalystxch/catalyst-bot/blob/6cfd7e006b013f1d9b614ee8ec7e9dbc8acd1be2/evidence/secondary-cbd7d08-original-profile/SHA256SUMS.json)
+includes that exact report hash and byte count. Its immutable Git/HTTP bytes
+have SHA-256 `F1BD92D7CC7C9011D4271EBF99D7C70031E393D2C66D9261EDB97799969A32C3`;
+the secondary Windows checkout has CRLF line endings and a different local
+manifest-file hash.
 The 38-file [immutable secondary evidence tree](https://github.com/catalystxch/catalyst-bot/tree/c3149267d939783aa16ca22d9118464a2945196e/evidence/secondary-cbd7d08-original-profile)
 is pinned at commit `c3149267d939783aa16ca22d9118464a2945196e`.
 An independent HTTP fetch of its
