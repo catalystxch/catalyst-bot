@@ -17,6 +17,26 @@ def _open_gui(page) -> None:
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+def test_skip_coin_prep_escapes_status_coin_counts(page):
+    _open_gui(page)
+    malicious_count = '<img src=x onerror="window.__coinCountInjected=true">'
+    page.evaluate(
+        """async count => {
+            window.__coinCountInjected = false;
+            window.apiFetch = async path => {
+                if (!String(path).endsWith('/coin-prep/status')) throw new Error('Unexpected request');
+                return new Response(JSON.stringify({xch_coins: count, cat_coins: count}), {status: 200});
+            };
+            await handleSkipCoinPrep();
+        }""",
+        malicious_count,
+    )
+    needed = page.locator("#skipCoinNeeded")
+    expect(needed).to_contain_text(malicious_count)
+    assert needed.locator("img").count() == 0
+    assert page.evaluate("window.__coinCountInjected") is False
+
+
 def _preview(*, available: bool = True) -> dict:
     if not available:
         return {

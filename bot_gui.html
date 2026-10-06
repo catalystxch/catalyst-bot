@@ -36535,7 +36535,7 @@ function closeCtgErrorModal() {
                 
                 const neededEl = document.getElementById('skipCoinNeeded');
                 if (neededEl) {
-                    neededEl.innerHTML = `Your settings need <strong>${neededXch} XCH coins</strong> and <strong>${neededCat} ${escapeHtml(tokenName)} coins</strong> — you currently have <strong>${xchCoins}</strong> and <strong>${catCoins}</strong>`;
+                    neededEl.innerHTML = `Your settings need <strong>${neededXch} XCH coins</strong> and <strong>${neededCat} ${escapeHtml(tokenName)} coins</strong> — you currently have <strong>${escapeHtml(xchCoins)}</strong> and <strong>${escapeHtml(catCoins)}</strong>`;
                 }
             } catch (e) {
                 document.getElementById('skipXchCoinCount').textContent = '?';
