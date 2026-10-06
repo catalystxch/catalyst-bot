@@ -108,3 +108,24 @@ Its two warnings were the unavailable Splash metrics endpoint and a missing or
 expired Spacescan cache for this asset. Neither request started the bot or
 changed offers. These warnings remain observable diagnostics; the 24-hour
 monitor and live trading gates are still pending.
+
+## Packaged live browser traversal, 00:47–00:50 UTC
+
+A separate Chromium session opened the packaged app served by the exact f73
+process at `127.0.0.1:5000`. Read-only navigation loaded Dashboard, Offers
+(active and history), P&L, Market Intel, Settings (Setup and Live tabs), Logs,
+Data Reset, Help, and About. The Offers screen showed zero active offers and
+three historical confirmed fills; Market Intel showed Dexie and Sage ready,
+Splash unavailable, and Spacescan enabled. Data Reset displayed its three
+confirmation-gated controls; none was activated. Help and About opened and
+closed. Chromium reported zero console errors and zero warnings. The separate
+browser session did not select a CAT pair locally, so its pair-specific setup
+panels are not evidence of the native window's already selected MZ state.
+
+The browser session was closed. A subsequent exact PID/path/hash check found
+the same sole app; `/api/health` still reported a stopped, synced wallet,
+`/api/offers/open_count` was zero, Bootstrap inactive, and safety allowed with
+an owned lease. `/api/bootstrap/status` still identified Sage mainnet,
+fingerprint `736588221`, CAT wallet ID `2` and the exact MZ asset. No Save,
+Reset, bot, campaign, or wallet action was taken. This advances packaged
+browser-screen acceptance but does not replace live lifecycle or 24-hour gates.
