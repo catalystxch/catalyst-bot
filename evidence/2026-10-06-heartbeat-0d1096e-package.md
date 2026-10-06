@@ -13,8 +13,10 @@ subsequent attempt failed closed. `0d1096e` checks expiry before and after
 durable commit and again when the gate receives the result; an unexpected
 heartbeat-worker exception now fences the process. The affected suites passed
 482 tests, with focused regressions demonstrated red before and green after
-the changes. The exact-source full serial Windows backend suite and final
-PR unit-test check are still running at this checkpoint.
+the changes. The exact-source full serial Windows backend suite passed
+**7,305 tests**, with **232 skipped** and **433 subtests passed** in
+30m 48s. All 11 PR checks passed on evidence-only head
+`8fdb310aa7d7ca8ba35a9bfb76a5961e1f9e4269`, including `unit-tests`.
 
 The correction does not keep a 30-second lease alive through the observed
 42–45-second Windows Update snapshot stalls. Those diagnostic runs failed the
@@ -35,6 +37,17 @@ build worktree.
 | `E:\CATalyst-0d1096e-primary-acceptance.zip` | `7BD3A1B14F72B822D48F33967B3D38570D6F2C094D22953B18C6F75EEF692AB6` |
 | Unsigned `Output/Catalyst-Setup-1.4.0.exe` | `01BDBFBFD6498CF835EFD4596FC3223FE38CED05A248F398B5ADCCB6DC8EE949` |
 
+The ZIP, unsigned installer and `SHA256SUMS-0d1096e.txt` are pinned at
+artifact commit `68cbbb332c0b11dbc40d34c450bb37ae639d54e5`:
+
+- [Exact-source Windows acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/68cbbb332c0b11dbc40d34c450bb37ae639d54e5/acceptance-artifacts/CATalyst-0d1096e-primary-acceptance.zip)
+- [Unsigned acceptance installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/68cbbb332c0b11dbc40d34c450bb37ae639d54e5/acceptance-artifacts/Catalyst-Setup-0d1096e-1.4.0.exe)
+- [SHA-256 manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/68cbbb332c0b11dbc40d34c450bb37ae639d54e5/acceptance-artifacts/SHA256SUMS-0d1096e.txt)
+
+Independent HTTP downloads of the pinned ZIP and installer matched the
+table's hashes. These are acceptance artifacts for the draft PR, not a public
+release.
+
 The 206-entry ZIP passed full CRC readback; it contains one exact EXE and no
 `.env`, `bot.db`, WAL/SHM, or crash-log file. Its extracted EXE matched the
 build hash and passed packaged API smoke. The original bundle passed packaged
@@ -52,9 +65,44 @@ Microsoft Defender engine `1.1.26080.3`, signatures `1.459.576.0`, scanned
 the bundle, ZIP, and production installer. The threat-detection count remained
 six before and after, with no new detection attributable to this package.
 
-The earlier `cfa42f3` process remains in terminal read-only safety after its
-failed diagnostic run. This exact `0d1096e` package has not yet replaced it
-on original TEST 7. No wallet effect, new campaign, or fee approval occurred
-in these isolated checks. Active-offer lifecycle and recovery, secondary
-original-profile acceptance, both final-candidate 24-hour windows, final
-review, and release authorization remain open. Keep PR #220 draft.
+## Original TEST 7 read-only rollover
+
+The prior `cfa42f3` process shut down through the local UI control plane with
+cancel-all unchecked, while the bot was stopped and no offers were open. The
+exact clean `0d1096e` executable then started as the sole `Catalyst.exe` and
+port 5000 owner. At the initial checkpoint its PID was `118100`, path was
+`E:\catalyst-heartbeat-0d1096e-build\dist\Catalyst\Catalyst.exe`, and the
+on-disk SHA-256 matched the package table above.
+
+The operator-authorized native startup acknowledged the testing Risk
+Disclosure, connected Sage, selected TEST 7 fingerprint `736588221`, skipped
+optional Splash, used the previously configured Spacescan key, and selected
+Monkeyzoo Token. It did not start the bot or a Bootstrap campaign. Read-only
+API checks reported mainnet, Sage fingerprint `736588221`, CAT wallet ID `2`,
+exact MZ asset
+`b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`,
+synced Sage, XCH `138.470301476875`, MZ `780212.284`, bot stopped, inactive
+Bootstrap, zero wallet and DB open offers, and safety `ALLOWED` with an owned
+renewing lease and zero blockers. An independent read-only Sage RPC returned
+zero pending transactions and `get_key` returned the expected fingerprint.
+The original database still held prior campaign
+`c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
+as stopped with zero authoritative fee spend. No new campaign was active.
+
+The clean exact-PID/hash stopped-profile monitor is
+`E:\catalyst-stability-monitor-0d1096e-clean\monitor.ps1` (SHA-256
+`DFFC1AF5977F2461828669B09EEB52AF8BEC945982974A57FA0E2484F7B58795`), writing
+`trace-60s-clean.jsonl`. It began at `2026-10-06T22:27:32Z`; its first sample
+had an owned lease, synced wallet, stopped bot, zero offers and safety
+allowed. This is the start of observation, not a completed 24-hour gate.
+
+The exact native UI's read-only Dashboard, Offers, P&L, Market Intelligence,
+Settings, Logs, Data Reset, Help and About traversal passed with MZ selected.
+Offers showed zero active buy/sell offers; the historic P&L page showed three
+previously verified buy fills, and the market page showed RED confidence with
+no tradable depth. No settings were saved and no reset action was used.
+
+No wallet effect, new campaign, or fee approval occurred. Active-offer
+lifecycle and recovery, secondary original-profile acceptance, both
+final-candidate 24-hour windows, final review, and release authorization
+remain open. Keep PR #220 draft.
