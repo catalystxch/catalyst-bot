@@ -4448,7 +4448,6 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
         before = wallet_module.get_wallet_identity()
         result = wallet_module.get_authoritative_offer_absence_by_ids(query_ids)
         read_performed = True
-        after = wallet_module.get_wallet_identity()
 
         def identity_hash(identity):
             if type(identity) is not dict:
@@ -4487,6 +4486,23 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
         raw_coins = (
             wallet_module.get_coins_by_ids(expected_coins) if expected_coins else {}
         )
+        # Sage's exact coin response may omit `owned`. In that case require
+        # positive membership in the wallet's owned-only XCH or CAT view;
+        # absence of an ownership field is not affirmative proof.
+        owned_ids: set[str] = set()
+        if type(raw_coins) is dict and any(
+            type(row) is dict and "owned" not in row for row in raw_coins.values()
+        ):
+            for wallet_id in (1, 2):
+                try:
+                    owned_view = wallet_module.get_owned_coins_detailed(wallet_id)
+                except Exception:
+                    owned_view = None
+                if type(owned_view) is dict:
+                    owned_ids.update(
+                        str(raw_id).lower().removeprefix("0x") for raw_id in owned_view
+                    )
+        after = wallet_module.get_wallet_identity()
         normalized: dict[str, dict] = {}
         if type(raw_coins) is dict and len(raw_coins) == len(expected_coins):
             for raw_id, row in raw_coins.items():
@@ -4503,7 +4519,9 @@ def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) ->
                     break
                 normalized[coin_id] = {
                     "coin_id": coin_id,
-                    "owned": row.get("owned", True) is True,
+                    "owned": (
+                        row["owned"] is True if "owned" in row else coin_id in owned_ids
+                    ),
                     "unlocked": (
                         (
                             row.get("spent_height") is None

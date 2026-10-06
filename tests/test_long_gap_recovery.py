@@ -1877,6 +1877,13 @@ def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypat
         "get_coins_by_ids",
         lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
     )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {}
+        ),
+    )
 
     proof = api_server._collect_quarantine_resolution_proof(requirements)
     decision = validate_quarantine_resolution_proof(
@@ -1888,6 +1895,54 @@ def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypat
     assert calls == [(trade_id,)]
     assert proof["version"] == 2
     assert decision["allowed"] is True
+
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {
+            "0x" + ids[0]: {
+                "amount": 1000,
+                "spent_height": None,
+                "owned": False,
+            }
+        },
+    )
+    explicitly_unowned = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            explicitly_unowned,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_NOT_OWNED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+
+    # The exact coin endpoint may omit `owned`. A missing owned-wallet view
+    # cannot be converted into affirmative ownership proof.
+    monkeypatch.setattr(wallet, "get_owned_coins_detailed", lambda _wallet_id: None)
+    missing_ownership = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            missing_ownership,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {}
+        ),
+    )
 
     monkeypatch.setattr(
         wallet,
