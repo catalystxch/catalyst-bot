@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import ast
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,6 +102,72 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             [row["trade_id"] for row in result],
             ["a" * 64, "b" * 64],
         )
+
+    def test_matching_offer_with_unknown_status_cannot_prove_closed_book(self):
+        asset_id = "a" * 64
+        row = {
+            "trade_id": "b" * 64,
+            "status": "SAGE_FUTURE_ACTIVE",
+            "summary": {
+                "offered": {"xch": 1000},
+                "requested": {asset_id: 1},
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown offer status"):
+            wallet_sage.classify_offers_from_list([row], asset_id)
+
+    def test_open_offer_without_pair_summary_cannot_prove_empty_book(self):
+        row = {"trade_id": "b" * 64, "status": "OPEN", "summary": {}}
+
+        with self.assertRaisesRegex(ValueError, "unclassifiable open offer"):
+            wallet_sage.classify_offers_from_list([row], "a" * 64)
+
+    def test_unknown_status_without_pair_summary_cannot_prove_empty_book(self):
+        row = {
+            "trade_id": "b" * 64,
+            "status": "SAGE_FUTURE_ACTIVE",
+            "summary": {},
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown offer status"):
+            wallet_sage.classify_offers_from_list([row], "a" * 64)
+
+    def test_pending_cancel_remains_wallet_open_exposure_until_confirmed(self):
+        asset_id = "a" * 64
+        for status in (2, "PENDING_CANCEL"):
+            with self.subTest(status=status):
+                row = {
+                    "trade_id": "b" * 64,
+                    "status": status,
+                    "summary": {
+                        "offered": {"xch": 1000},
+                        "requested": {asset_id: 1},
+                    },
+                }
+
+                buys, sells, closed = wallet_sage.classify_offers_from_list(
+                    [row], asset_id
+                )
+                self.assertEqual(buys, [row])
+                self.assertEqual(sells, [])
+                self.assertEqual(closed, [])
+
+    def test_expired_pending_cancel_is_not_fillable_wallet_exposure(self):
+        asset_id = "a" * 64
+        row = {
+            "trade_id": "b" * 64,
+            "status": "PENDING_CANCEL",
+            "valid_times": {"max_time": int(time.time()) - 3600},
+            "summary": {
+                "offered": {"xch": 1000},
+                "requested": {asset_id: 1},
+            },
+        }
+
+        buys, sells, closed = wallet_sage.classify_offers_from_list([row], asset_id)
+        self.assertEqual((buys, sells), ([], []))
+        self.assertEqual(closed, [row])
 
     def test_failed_sage_offer_response_cannot_prove_empty_book(self):
         with patch.object(

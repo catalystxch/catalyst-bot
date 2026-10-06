@@ -173,6 +173,41 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertIs(fresh_meta["fresh"], True)
         self.assertIs(failed_meta["fresh"], False)
 
+    def test_unclassifiable_offer_book_marks_wallet_sync_stale(self):
+        manager = self.offer_manager.OfferManager()
+        with (
+            patch.object(
+                self.offer_manager,
+                "get_all_offers",
+                return_value=[{"trade_id": "unknown-status"}],
+            ),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                side_effect=ValueError("unknown offer status"),
+            ),
+        ):
+            offers, meta = manager.sync_from_wallet_with_meta()
+
+        self.assertEqual(offers, ([], [], []))
+        self.assertIs(meta["fresh"], False)
+        self.assertIs(meta["using_cache"], False)
+        self.assertIn("unknown offer status", meta["last_error"])
+
+    def test_malformed_sage_offer_response_marks_wallet_sync_stale(self):
+        manager = self.offer_manager.OfferManager()
+        with patch.object(
+            self.offer_manager,
+            "get_all_offers",
+            side_effect=ValueError("malformed Sage summary"),
+        ):
+            offers, meta = manager.sync_from_wallet_with_meta()
+
+        self.assertEqual(offers, ([], [], []))
+        self.assertIs(meta["fresh"], False)
+        self.assertIs(meta["using_cache"], False)
+        self.assertIn("wallet offer read failed", meta["last_error"])
+
     def test_concurrent_wallet_syncs_do_not_mix_offer_results_and_freshness(self):
         manager = self.offer_manager.OfferManager()
         first_entered = threading.Event()

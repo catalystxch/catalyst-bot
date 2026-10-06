@@ -5367,7 +5367,7 @@ def _is_still_fillable(status_val, offer_record=None) -> bool:
     return status in FILLABLE
 
 
-def _is_open_status(status_val, offer_record=None) -> bool:
+def _is_open_status(status_val, offer_record=None, *, strict_unknown=False) -> bool:
     """Determine if an offer status represents an open/active offer.
 
     Chia TradeStatus integer enum:
@@ -5382,10 +5382,18 @@ def _is_open_status(status_val, offer_record=None) -> bool:
         return False
 
     if status_val is None:
+        if strict_unknown:
+            raise ValueError("unknown offer status")
         return False
-    if isinstance(status_val, int):
+    if type(status_val) is int:
         # Only 0 (PENDING_ACCEPT) and 1 (PENDING_CONFIRM) are truly open
-        return status_val <= 1
+        if status_val in (0, 1):
+            return True
+        if status_val in (2, 3, 4, 5):
+            return False
+        if strict_unknown:
+            raise ValueError("unknown offer status")
+        return False
 
     status = str(status_val).upper()
     OPEN_STATUSES = {
@@ -5405,12 +5413,17 @@ def _is_open_status(status_val, offer_record=None) -> bool:
         "EXPIRED",
         "COMPLETED",
         "SUCCESS",
+        "TAKEN",
+        "FILLED",
     }
 
     if status in CLOSED_STATUSES:
         return False
     if status in OPEN_STATUSES:
         return True
+
+    if strict_unknown:
+        raise ValueError("unknown offer status")
 
     # Unknown status — log it once so we can add it to the right set
     if not hasattr(_is_open_status, "_unknown_logged"):
@@ -5463,10 +5476,24 @@ def classify_offers_from_list(offers_list: list, asset_id_mz: str):
         offered = summary.get("offered") or {}
         requested = summary.get("requested") or {}
 
-        is_open = _is_open_status(status_val, offer_record=tr)
-
         is_buy = "xch" in offered and asset_id_mz in requested
         is_sell = asset_id_mz in offered and "xch" in requested
+        is_open = _is_open_status(
+            status_val,
+            offer_record=tr,
+            strict_unknown=is_buy or is_sell or not offered or not requested,
+        )
+        if not is_open and (
+            (type(status_val) is int and status_val == 2)
+            or (
+                type(status_val) is str
+                and status_val.strip().upper() == "PENDING_CANCEL"
+            )
+        ):
+            # Sage keeps this state fillable until the cancellation confirms.
+            is_open = _is_still_fillable(status_val, offer_record=tr)
+        if is_open and not (is_buy or is_sell) and (not offered or not requested):
+            raise ValueError("unclassifiable open offer")
 
         # Debug: log first few offers on first call only
         if _first_classify and i < 3:

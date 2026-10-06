@@ -10002,10 +10002,26 @@ class OfferManager:
         of 50. By excluding completed, we only get what matters.
         """
         # Only fetch non-completed offers — avoids truncation by old cancelled offers
-        all_offers = get_all_offers(include_completed=False, start=0, end=500)
+        sync_error = ""
+        sync_stage = "read"
+        try:
+            all_offers = get_all_offers(include_completed=False, start=0, end=500)
+            if all_offers is not None:
+                sync_stage = "classification"
+                open_buy, open_sell, closed = classify_offers_from_list(
+                    all_offers, cfg.CAT_ASSET_ID
+                )
+        except Exception as exc:
+            sync_error = (
+                f"wallet offer {sync_stage} failed: {exc}"
+                if isinstance(exc, ValueError)
+                else f"wallet offer {sync_stage} failed: {type(exc).__name__}"
+            )
+            all_offers = None
         if all_offers is None:
             err = str(
-                getattr(get_all_offers, "_last_error", "")
+                sync_error
+                or getattr(get_all_offers, "_last_error", "")
                 or "wallet get_offers unavailable"
             )
             self._wallet_sync_meta["fresh"] = False
@@ -10042,10 +10058,6 @@ class OfferManager:
                 [dict(o) for o in self._wallet_sync_cache["sell"]],
                 [dict(o) for o in self._wallet_sync_cache["closed"]],
             )
-
-        open_buy, open_sell, closed = classify_offers_from_list(
-            all_offers, cfg.CAT_ASSET_ID
-        )
 
         # Suspicious-empty guard: Sage's get_offers occasionally returns a
         # valid-but-empty response during a sync hiccup — same RPC blip
