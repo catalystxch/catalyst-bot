@@ -85,6 +85,8 @@ synced Sage, XCH `138.470301476875`, MZ `780212.284`, bot stopped, inactive
 Bootstrap, zero wallet and DB open offers, and safety `ALLOWED` with an owned
 renewing lease and zero blockers. An independent read-only Sage RPC returned
 zero pending transactions and `get_key` returned the expected fingerprint.
+An independent complete Sage `get_offers` read returned 4,095 terminal
+records: 3,326 cancelled, 231 expired and 538 completed; none was fillable.
 The original database still held prior campaign
 `c275b95327bd42fede7bca1b731a76ebbfebe13b84a0b083f51d25ab5cda7220`
 as stopped with zero authoritative fee spend. No new campaign was active.
