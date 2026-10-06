@@ -111,3 +111,36 @@ The previous exact `f73a2bd` traces are historical and cannot count as a
 completed 24-hour window for this later runtime candidate. PR #220 remains
 draft; active-offer lifecycle, both exact-candidate 24-hour windows and final
 review remain open.
+
+## Independent secondary original-profile read-only acceptance
+
+The secondary PC independently verified the pinned `cbd7d08` ZIP and its
+extracted EXE hashes, stopped its predecessor after a clean final sample,
+and launched the exact candidate as the sole CATalyst process and port-5000
+owner against its original Harvestr profile. Through the packaged UI it
+acknowledged Risk Disclosure under the operator's testing authorization,
+connected Sage mainnet, selected fingerprint `3702373391`, and selected the
+same exact MZ asset ID. Sage and CATalyst agreed on CAT wallet ID `2`,
+unchanged balances of `240.800676512155` XCH and `3381521.72` MZ, zero
+pending and fillable offers, zero CATalyst offers/locks/fee holds/reservations/
+unresolved operations, a stopped bot, allowed safety, and an owned lease.
+The old campaign remains active but expired with `cancel_required=true`; no
+new campaign or wallet-effect action occurred.
+
+The secondary read-only UI traversal covered Dashboard, Offers, P&L, Market
+Intel, Settings, Logs, Doctor, Data Reset, Help and About with zero console,
+page, or failed-API errors. The native-control test helper lacked its runtime
+assets on that PC, so the interactive traversal used Chromium against the
+exact packaged executable's loopback server; this limits the claim to packaged
+frontend behavior, while the native executable launch, hash, process, and
+port ownership were independently checked. Sixteen screenshots and the full
+report are at the secondary PC's
+`evidence/acceptance-cbd7d08-20261006T0320BST/REPORT.md` (SHA-256
+`F5F0BEF39DF99CA07FFAD7CFA7DE2D06D4A848A22C5AD9264524EEEB96CF4165`).
+
+Its exact-PID/hash stopped-profile monitor began at about `02:40Z`; the
+monitor script SHA-256 is
+`0398BEC86B13FA5D7FCF4D5A921C6CB8BEA68087E498AEB70E7833FC3B1E88DC`.
+The first two samples were clean. The complete 24-hour trace and end-state
+review remain pending. This secondary read-only pass does not establish an
+active-offer lifecycle or live trading stability window.
