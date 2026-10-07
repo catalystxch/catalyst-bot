@@ -116,14 +116,15 @@ def test_spendable_rpc_includes_later_page_for_coin_watcher(monkeypatch):
 
 def test_spendable_rpc_rejects_later_page_error(monkeypatch):
     monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: False)
+    failure = {"success": False, "error": "SAGE_TIMEOUT"}
 
     def fake_rpc(endpoint, payload, timeout):
         if payload["offset"] == 0:
             return {"coins": [_coin(index) for index in range(500)]}
-        return {"success": False, "error": "SAGE_TIMEOUT"}
+        return failure
 
     monkeypatch.setattr(wallet_sage, "rpc", fake_rpc)
-    assert wallet_sage.get_spendable_coins_rpc(1) is None
+    assert wallet_sage.get_spendable_coins_rpc(1) is failure
 
 
 def test_spendable_amount_filter_sees_coin_after_first_page(monkeypatch):

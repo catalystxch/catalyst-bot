@@ -2419,7 +2419,12 @@ def _query_coin_records(
         filter_mode,
         sort_mode="coin_id",
         ascending=True,
+        preserve_error=True,
     )
+    if isinstance(coins, dict):
+        # Keep Sage's structured failure for callers that surface its code.
+        # A later-page failure is still never treated as a partial success.
+        return coins
     if coins is None:
         return None
 
@@ -2708,9 +2713,15 @@ def count_suitable_coins(
 
 
 def _get_complete_sage_coin_rows(
-    asset_id, filter_mode, *, sort_mode=None, ascending=None, timeout=15
-) -> Optional[List[Dict]]:
-    """Read an entire Sage coin view or return unknown on any incomplete page."""
+    asset_id,
+    filter_mode,
+    *,
+    sort_mode=None,
+    ascending=None,
+    timeout=15,
+    preserve_error=False,
+) -> Optional[List[Dict] | Dict]:
+    """Read a whole Sage coin view, optionally preserving structured RPC errors."""
     page_size = 500
     rows = []
     seen_ids = set()
@@ -2729,6 +2740,8 @@ def _get_complete_sage_coin_rows(
             payload["ascending"] = ascending
         result = rpc("get_coins", payload, timeout=timeout)
         if not _rpc_succeeded(result):
+            if preserve_error and isinstance(result, dict):
+                return result
             return None
         coins = next(
             (result[key] for key in ("coins", "records", "data") if key in result),
