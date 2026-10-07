@@ -41,7 +41,7 @@ def test_splash_passes_bootstrap_credential_to_local_server(page, tmp_path):
         splash.write_text(
             source.replace("127.0.0.1:5000", f"127.0.0.1:{port}"), encoding="utf-8"
         )
-        page.goto(f"{splash.as_uri()}?bootstrap=example-token")
+        page.goto(f"{splash.as_uri()}#bootstrap=example-token")
         page.wait_for_url(f"http://127.0.0.1:{port}/", timeout=7000)
 
         expect(page.locator("p")).to_have_text("ready")

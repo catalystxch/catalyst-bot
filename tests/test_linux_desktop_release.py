@@ -183,7 +183,7 @@ def test_windows_splash_url_carries_local_bootstrap(monkeypatch):
 
     assert desktop_app._initial_desktop_url() == (
         (ROOT / "splash.html").as_uri()
-        + "?bootstrap="
+        + "#bootstrap="
         + api_server._LOCAL_API_BOOTSTRAP_TOKEN
     )
 

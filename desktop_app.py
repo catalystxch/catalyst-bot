@@ -173,7 +173,9 @@ def _initial_desktop_url() -> str:
         import pathlib
 
         token = quote(flask_url.split("bootstrap=", 1)[1], safe="")
-        return f"{pathlib.Path(splash_path).as_uri()}?bootstrap={token}"
+        # Edge WebView2 treats a query on file:// as part of the filename.
+        # A fragment survives native file navigation and remains local.
+        return f"{pathlib.Path(splash_path).as_uri()}#bootstrap={token}"
     return flask_url
 
 

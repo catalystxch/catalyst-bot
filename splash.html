@@ -119,7 +119,7 @@
         // splash to be visible and not feel jarring) is all we need.
         // The desktop process supplies a per-run credential in this file URL.
         // Flask consumes it and redirects to a clean URL before rendering UI.
-        const bootstrap = new URLSearchParams(window.location.search).get("bootstrap");
+        const bootstrap = new URLSearchParams(window.location.hash.slice(1)).get("bootstrap");
         const FLASK_URL = bootstrap
             ? `http://127.0.0.1:5000/?bootstrap=${encodeURIComponent(bootstrap)}`
             : "http://127.0.0.1:5000/";
