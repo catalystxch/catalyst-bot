@@ -300,6 +300,24 @@ def test_startup_risk_dialog_opens_at_top_on_small_window(page):
     )
 
 
+def test_startup_wallet_choice_starts_at_top_after_scrolled_disclosure(page):
+    """A shorter next step must not inherit the prior step's scroll position."""
+    page.set_viewport_size({"width": 600, "height": 400})
+    _open_gui(page)
+    page.evaluate(
+        """() => {
+            startupShowRiskDisclosure();
+            const overlay = document.getElementById('startupOverlay');
+            overlay.scrollTop = overlay.scrollHeight;
+            document.getElementById('startupDisclaimerSection').style.display = 'none';
+            document.getElementById('startupSageConnectSection').style.display = 'block';
+            startupSetPhase('wallet_choice', 'Connect Wallet', 'Sage is already open', '');
+        }"""
+    )
+
+    assert page.locator("#startupOverlay").evaluate("element => element.scrollTop") == 0
+
+
 def test_startup_wallet_choice_keeps_keyboard_focus_inside(page):
     """Later startup steps must not leak focus to background navigation."""
     _open_gui(page)

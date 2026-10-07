@@ -37379,6 +37379,7 @@ let _startupChangeAddressChoiceBusy = false;
 let _startupRiskDisclosureBusy = false;
 
 function startupSetPhase(phase, title, subtitle, statusText) {
+    const phaseChanged = _startupPhase !== phase;
     _startupPhase = phase;
     const el = (id) => document.getElementById(id);
 
@@ -37395,6 +37396,10 @@ function startupSetPhase(phase, title, subtitle, statusText) {
         if (titleEl) titleEl.style.display = '';
         if (subtitleEl) subtitleEl.style.display = '';
         if (statusEl) statusEl.style.display = '';
+    }
+    if (phaseChanged) {
+        const overlay = el('startupOverlay');
+        if (overlay) overlay.scrollTop = 0;
     }
 }
 
