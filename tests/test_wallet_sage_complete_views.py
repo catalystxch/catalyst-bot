@@ -1,5 +1,7 @@
 """Wallet balance and strict selectable views require all Sage coin pages."""
 
+import pytest
+
 import wallet_sage
 
 
@@ -156,3 +158,58 @@ def test_spendable_rpc_preserves_descending_amount_order(monkeypatch):
     monkeypatch.setattr(wallet_sage, "rpc", fake_rpc)
     result = wallet_sage.get_spendable_coins_rpc(1)
     assert [record["coin"]["amount"] for record in result["records"]] == [300, 200, 100]
+
+
+@pytest.mark.parametrize("invalid_amount", [True, 1.5, -1])
+def test_spendable_rpc_rejects_nonintegral_or_negative_coin_amount(
+    monkeypatch, invalid_amount
+):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: False)
+    malformed = {**_coin(1), "amount": invalid_amount}
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda _endpoint, _payload, timeout: {
+            "success": True,
+            "coins": [malformed],
+            "total": 1,
+        },
+    )
+
+    assert wallet_sage.get_spendable_coins_rpc(1) is None
+
+
+def test_cat_balance_rejects_boolean_coin_amount(monkeypatch):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: True)
+    monkeypatch.setattr(wallet_sage, "_resolve_asset_id", lambda _wid: "ab" * 32)
+    malformed = {**_coin(1), "amount": True}
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda _endpoint, _payload, timeout: {
+            "success": True,
+            "coins": [malformed],
+            "total": 1,
+        },
+    )
+
+    assert wallet_sage.get_wallet_balance(2)["success"] is False
+
+
+def test_cat_balance_uses_exact_alias_amount(monkeypatch):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: True)
+    monkeypatch.setattr(wallet_sage, "_resolve_asset_id", lambda _wid: "ab" * 32)
+    coin = {"coin_id": f"{1:064x}", "amt": "125"}
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda _endpoint, _payload, timeout: {
+            "success": True,
+            "coins": [coin],
+            "total": 1,
+        },
+    )
+
+    balance = wallet_sage.get_wallet_balance(2)
+    assert balance["wallet_balance"]["confirmed_wallet_balance"] == 125
+    assert balance["wallet_balance"]["spendable_balance"] == 125

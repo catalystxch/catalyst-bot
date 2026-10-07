@@ -2782,11 +2782,10 @@ def _get_complete_sage_coin_rows(
             raw_amount = coin.get("amount")
             if raw_amount is None:
                 raw_amount = coin.get("amt", coin.get("value"))
-            try:
-                int(raw_amount)
-            except (TypeError, ValueError):
+            amount = _exact_positive_atomic_amount(raw_amount)
+            if amount is None:
                 return None
-            rows.append(coin)
+            rows.append({**coin, "amount": amount})
         if len(coins) < page_size:
             if expected_total is not None and len(rows) != expected_total:
                 return None
@@ -6449,9 +6448,8 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
                 cid = "0x" + cid
             if cid in coin_map:
                 return None
-            try:
-                amount = int(c["amount"])
-            except (KeyError, TypeError, ValueError):
+            amount = _exact_positive_atomic_amount(c.get("amount"))
+            if amount is None:
                 return None
             # Extract offer_id — this is the offer_hash from Sage's DB.
             offer_id = c.get("offer_id") or c.get("offer_hash") or None
@@ -6880,10 +6878,10 @@ def get_selectable_coins_map(wallet_id: int) -> Optional[Dict]:
                 cid = "0x" + cid
             if cid in coin_map:
                 return None
-            try:
-                coin_map[cid] = int(c["amount"])
-            except (KeyError, TypeError, ValueError):
+            amount = _exact_positive_atomic_amount(c.get("amount"))
+            if amount is None:
                 return None
+            coin_map[cid] = amount
         if len(coins) < page_size:
             if expected_total is not None and len(coin_map) != expected_total:
                 return None

@@ -101,6 +101,32 @@ def test_detailed_owned_coins_rejects_malformed_coin(monkeypatch):
     assert wallet_sage.get_owned_coins_detailed(1) is None
 
 
+def test_detailed_owned_coins_rejects_boolean_amount(monkeypatch):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wallet_id: False)
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda *_args, **_kwargs: {
+            "coins": [{**_coin(1), "amount": True}],
+            "total": 1,
+        },
+    )
+    assert wallet_sage.get_owned_coins_detailed(1) is None
+
+
+def test_selectable_coins_rejects_fractional_amount(monkeypatch):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wallet_id: False)
+    monkeypatch.setattr(
+        wallet_sage,
+        "rpc",
+        lambda *_args, **_kwargs: {
+            "coins": [{**_coin(1), "amount": 1.5}],
+            "total": 1,
+        },
+    )
+    assert wallet_sage.get_selectable_coins_map(1) is None
+
+
 def test_detailed_owned_coins_rejects_repeated_page(monkeypatch):
     monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wallet_id: False)
 
