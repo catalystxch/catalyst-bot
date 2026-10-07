@@ -37688,6 +37688,8 @@ async function startupAcceptRiskDisclosure() {
             startupSetPhase('wallet_choice', 'Connect Wallet', "Sage wallet isn't running", '');
             document.getElementById('startupSageLaunchSection').style.display = 'block';
         }
+        const overlay = document.getElementById('startupOverlay');
+        if (overlay) overlay.focus({ preventScroll: true });
     } catch (e) {
         startupShowError('Could not check wallet status. Is the bot server running?');
     } finally {

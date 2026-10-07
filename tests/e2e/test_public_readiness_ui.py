@@ -318,6 +318,19 @@ def test_startup_wallet_choice_starts_at_top_after_scrolled_disclosure(page):
     assert page.locator("#startupOverlay").evaluate("element => element.scrollTop") == 0
 
 
+def test_startup_wallet_choice_keeps_dialog_focus_after_disclosure(app_page):
+    """Advancing the dialog must not leave keyboard focus on the background."""
+    app_page.set_viewport_size({"width": 600, "height": 400})
+    app_page.locator("#startupDisclaimerContinueBtn").click()
+    app_page.locator(
+        "#startupSageConnectSection:visible, #startupSageLaunchSection:visible"
+    ).wait_for(state="visible")
+
+    assert app_page.locator("#startupOverlay").evaluate(
+        "element => element.contains(document.activeElement)"
+    )
+
+
 def test_startup_wallet_choice_keeps_keyboard_focus_inside(page):
     """Later startup steps must not leak focus to background navigation."""
     _open_gui(page)
