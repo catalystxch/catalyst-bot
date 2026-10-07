@@ -64,12 +64,18 @@ The clean detached checkout at `b693a4e` produced:
 The 192-entry ZIP passed CRC and embedded-EXE hash checks. Its safely
 extracted EXE matched the bundle hash and passed API and synthetic Sage smokes.
 Packaged API, synthetic Sage RPC, and publication-recovery smokes passed.
-Defender real-time
-protection was enabled; custom scans of the bundle, ZIP, and installer produced
+Defender real-time protection was enabled; custom scans of the bundle, ZIP, and installer produced
 no recent detection. A unique-AppId isolated installer clean-installed on E:,
 produced the exact EXE hash, passed installed API and synthetic Sage smokes,
 then uninstalled with no remaining EXE or QA registry key. This QA install did
 not use the original TEST 7 profile or overwrite its installer registration.
+
+The [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/cdb1d1100f7571783eeb728fd4fff884cb6b1c1d/acceptance-artifacts/CATalyst-b693a4e-primary-acceptance.zip),
+[installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/cdb1d1100f7571783eeb728fd4fff884cb6b1c1d/acceptance-artifacts/Catalyst-Setup-b693a4e-1.4.0.exe),
+and SHA-256 manifest are pinned at artifact commit
+`cdb1d1100f7571783eeb728fd4fff884cb6b1c1d`. Independent HTTP downloads
+of both binaries matched the SHA-256 values above. These are acceptance
+artifacts, not a release.
 
 ## Live and release gates
 
