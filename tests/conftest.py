@@ -48,6 +48,53 @@ if not os.environ.get("CMM_DATA_DIR"):
 
     _atexit.register(_cleanup_test_data_dir)
 
+# The ordinary test suite must never discover the operator's Sage TLS keys or
+# connect to the default live wallet RPC. Config reloads read the data-dir .env
+# with override=True, so seed that isolated file with the same safe values.
+_TEST_SAGE_HOME = os.path.join(os.environ["CMM_DATA_DIR"], "sage-empty-home")
+os.environ["SAGE_HOME"] = _TEST_SAGE_HOME
+os.environ["SAGE_ALLOWED_CERT_ROOTS"] = _TEST_SAGE_HOME
+os.environ["SAGE_RPC_URL"] = "https://127.0.0.1:1"
+os.environ["SAGE_CERT_PATH"] = os.path.join(_TEST_SAGE_HOME, "ssl", "wallet.crt")
+os.environ["SAGE_KEY_PATH"] = os.path.join(_TEST_SAGE_HOME, "ssl", "wallet.key")
+os.environ.pop("_CATALYST_PRESERVE_PROCESS_ENV", None)
+_SAFE_SAGE_CONFIG = {
+    key: os.environ[key] for key in ("SAGE_RPC_URL", "SAGE_CERT_PATH", "SAGE_KEY_PATH")
+}
+_TEST_ENV_PATH = os.path.join(os.environ["CMM_DATA_DIR"], ".env")
+os.makedirs(os.environ["CMM_DATA_DIR"], exist_ok=True)
+if not os.path.exists(_TEST_ENV_PATH):
+    _template_path = os.path.join(os.path.dirname(__file__), "..", ".env.example")
+    with open(_template_path, encoding="utf-8") as _template_file:
+        _template_lines = _template_file.read().splitlines()
+    _found_keys = set()
+    for _index, _line in enumerate(_template_lines):
+        _key = _line.partition("=")[0]
+        if _key in _SAFE_SAGE_CONFIG:
+            _template_lines[_index] = f"{_key}={_SAFE_SAGE_CONFIG[_key]}"
+            _found_keys.add(_key)
+    _template_lines.extend(
+        f"{_key}={_value}"
+        for _key, _value in _SAFE_SAGE_CONFIG.items()
+        if _key not in _found_keys
+    )
+    with open(_TEST_ENV_PATH, "w", encoding="utf-8") as _test_env_file:
+        _test_env_file.write("\n".join(_template_lines) + "\n")
+else:
+    # A caller-supplied data dir may contain real settings. Fail before test
+    # collection rather than silently loading that wallet configuration.
+    with open(_TEST_ENV_PATH, encoding="utf-8") as _test_env_file:
+        _existing_values = dict(
+            _line.split("=", 1)
+            for _line in _test_env_file.read().splitlines()
+            if "=" in _line and not _line.lstrip().startswith("#")
+        )
+    if any(
+        _existing_values.get(_key, _value) != _value
+        for _key, _value in _SAFE_SAGE_CONFIG.items()
+    ):
+        raise RuntimeError("pytest data directory has non-isolated Sage settings")
+
 # ---------------------------------------------------------------------------
 # Src-layout bootstrap: add src/catalyst/ to sys.path so tests can use
 # flat imports (`from database import X`) against the reorganised source
@@ -220,3 +267,22 @@ def _restore_isolation_guarded_modules(request):
         _restore_guarded_modules(collected)
     yield
     _restore_guarded_modules(saved)
+    for key, value in _SAFE_SAGE_CONFIG.items():
+        os.environ[key] = value
+    os.environ["SAGE_HOME"] = _TEST_SAGE_HOME
+    os.environ["SAGE_ALLOWED_CERT_ROOTS"] = _TEST_SAGE_HOME
+
+
+@pytest.fixture(autouse=True)
+def _restore_sage_process_defaults():
+    """Keep a test's synthetic Sage overrides out of the next test."""
+
+    for key, value in _SAFE_SAGE_CONFIG.items():
+        os.environ[key] = value
+    os.environ["SAGE_HOME"] = _TEST_SAGE_HOME
+    os.environ["SAGE_ALLOWED_CERT_ROOTS"] = _TEST_SAGE_HOME
+    yield
+    for key, value in _SAFE_SAGE_CONFIG.items():
+        os.environ[key] = value
+    os.environ["SAGE_HOME"] = _TEST_SAGE_HOME
+    os.environ["SAGE_ALLOWED_CERT_ROOTS"] = _TEST_SAGE_HOME
