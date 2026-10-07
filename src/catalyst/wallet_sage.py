@@ -2729,6 +2729,80 @@ def count_suitable_coins(
     return len(records)
 
 
+def _get_complete_sage_coin_rows(
+    asset_id, filter_mode, *, sort_mode=None, ascending=None, timeout=15
+) -> Optional[List[Dict]]:
+    """Read an entire Sage coin view or return unknown on any incomplete page."""
+    page_size = 500
+    rows = []
+    seen_ids = set()
+    expected_total = None
+    for page in range(40):
+        offset = page * page_size
+        payload = {
+            "asset_id": asset_id,
+            "offset": offset,
+            "limit": page_size,
+            "filter_mode": filter_mode,
+        }
+        if sort_mode is not None:
+            payload["sort_mode"] = sort_mode
+        if ascending is not None:
+            payload["ascending"] = ascending
+        result = rpc("get_coins", payload, timeout=timeout)
+        if not _rpc_succeeded(result):
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
+                return None
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
+        for coin in coins:
+            if not isinstance(coin, dict):
+                return None
+            coin_id = (
+                coin.get("coin_id")
+                or coin.get("id")
+                or coin.get("coinId")
+                or coin.get("name")
+            )
+            if not isinstance(coin_id, str) or not coin_id:
+                return None
+            normalized_id = coin_id.lower().removeprefix("0x")
+            if normalized_id in seen_ids:
+                return None
+            seen_ids.add(normalized_id)
+            raw_amount = coin.get("amount")
+            if raw_amount is None:
+                raw_amount = coin.get("amt", coin.get("value"))
+            try:
+                int(raw_amount)
+            except (TypeError, ValueError):
+                return None
+            rows.append(coin)
+        if len(coins) < page_size:
+            if expected_total is not None and len(rows) != expected_total:
+                return None
+            return rows
+    return None
+
+
 def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
     """Get ONLY selectable (on-chain confirmed) coins — NO workaround.
 
@@ -2746,36 +2820,18 @@ def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
     else:
         asset_id = None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "sort_mode": "amount",
-            "filter_mode": "selectable",
-            "ascending": False,
-        },
-        timeout=15,
+    found = _get_complete_sage_coin_rows(
+        asset_id,
+        "selectable",
+        sort_mode="coin_id",
+        ascending=True,
     )
-
-    if not result or not isinstance(result, dict):
+    if found is None:
         return None
-
-    # Extract coins from response
-    found = result.get("coins") or result.get("records") or result.get("data") or []
-    if not found:
-        for k in result.keys():
-            v = result.get(k)
-            if isinstance(v, list) and len(v) > 0:
-                found = v
-                break
 
     # Convert to Chia-compatible format
     records = []
     for coin in found:
-        if not isinstance(coin, dict):
-            continue
         raw_amount = coin.get("amount") or coin.get("amt") or coin.get("value") or "0"
         amount = int(raw_amount)
         parent = (
@@ -2809,6 +2865,10 @@ def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
                 "coin_id": coin_id,
             }
         )
+
+    # Stable coin-id pagination avoids duplicate/missing rows among equal-sized
+    # tier coins; restore the descending amount order expected by callers.
+    records.sort(key=lambda record: record["coin"]["amount"], reverse=True)
 
     return {
         "success": True,
@@ -3920,52 +3980,21 @@ def get_wallet_balance(wallet_id: int):
 
         # CAT balance: "selectable" = spendable, "owned" = total (free + locked)
         # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
-        # "all" includes spent coins and hits 500-limit. "owned" = currently held only.
-        # IMPORTANT: reject structured error results — don't silently turn them into zero balance.
-        sel_result = rpc(
-            "get_coins",
-            {
-                "asset_id": asset_id,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "selectable",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(sel_result):
+        # "all" includes spent coins. Both current views must be complete.
+        sel_coins = _get_complete_sage_coin_rows(asset_id, "selectable", timeout=10)
+        if sel_coins is None:
             return {
                 "success": False,
-                "error": f"CAT selectable balance query failed for wallet {wallet_id}: {sel_result}",
+                "error": f"CAT selectable balance view incomplete for wallet {wallet_id}",
             }
-        sel_coins = (
-            sel_result.get("coins")
-            or sel_result.get("records")
-            or sel_result.get("data")
-            or []
-        )
         spendable = sum(int(c.get("amount", "0")) for c in sel_coins)
 
-        owned_result = rpc(
-            "get_coins",
-            {
-                "asset_id": asset_id,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "owned",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(owned_result):
+        owned_coins = _get_complete_sage_coin_rows(asset_id, "owned", timeout=10)
+        if owned_coins is None:
             return {
                 "success": False,
-                "error": f"CAT owned balance query failed for wallet {wallet_id}: {owned_result}",
+                "error": f"CAT owned balance view incomplete for wallet {wallet_id}",
             }
-        owned_coins = (
-            owned_result.get("coins")
-            or owned_result.get("records")
-            or owned_result.get("data")
-            or []
-        )
         total = sum(int(c.get("amount", "0")) for c in owned_coins)
 
         if not hasattr(get_wallet_balance, "_cat_diag_logged"):
@@ -4006,27 +4035,12 @@ def get_wallet_balance(wallet_id: int):
                 spendable = int(sel_val)
 
         # Step 2: get ALL owned XCH coins (free + offer-locked) for total
-        owned_result = rpc(
-            "get_coins",
-            {
-                "asset_id": None,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "owned",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(owned_result):
+        owned_coins = _get_complete_sage_coin_rows(None, "owned", timeout=10)
+        if owned_coins is None:
             return {
                 "success": False,
-                "error": f"XCH owned balance query failed: {owned_result}",
+                "error": "XCH owned balance view incomplete",
             }
-        owned_coins = (
-            owned_result.get("coins")
-            or owned_result.get("records")
-            or owned_result.get("data")
-            or []
-        )
         total = sum(int(c.get("amount", "0")) for c in owned_coins)
 
         if not hasattr(get_wallet_balance, "_xch_diag_logged"):
