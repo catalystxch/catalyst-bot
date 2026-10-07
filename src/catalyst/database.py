@@ -32666,6 +32666,9 @@ def heartbeat_runtime_mutation_lease(
     heartbeat_at: Any = None,
     lease_duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
+    def elapsed_ms(start_ns: int, end_ns: int) -> int:
+        return min(3_600_000, max(0, round((end_ns - start_ns) / 1_000_000)))
+
     database_ms = {"connection": 0, "begin": 0, "read": 0, "finish": 0, "close": 0}
     owner = _required_stability_text(owner_run_id, "owner_run_id")
     version = _exact_integer(expected_lease_version, "expected_lease_version")
@@ -32676,23 +32679,21 @@ def heartbeat_runtime_mutation_lease(
     started_ns = time.perf_counter_ns()
     conn = _stability_connection()
     connected_ns = time.perf_counter_ns()
-    database_ms["connection"] = max(0, round((connected_ns - started_ns) / 1_000_000))
+    database_ms["connection"] = elapsed_ms(started_ns, connected_ns)
     try:
         conn.execute("BEGIN IMMEDIATE")
         begun_ns = time.perf_counter_ns()
-        database_ms["begin"] = max(0, round((begun_ns - connected_ns) / 1_000_000))
+        database_ms["begin"] = elapsed_ms(connected_ns, begun_ns)
         locked_at = _stability_wall_clock()
         safety_at = max(at, locked_at)
         current_row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
         read_ns = time.perf_counter_ns()
-        database_ms["read"] = max(0, round((read_ns - begun_ns) / 1_000_000))
+        database_ms["read"] = elapsed_ms(begun_ns, read_ns)
 
         def with_timing(result: Dict[str, Any]) -> Dict[str, Any]:
-            database_ms["finish"] = max(
-                0, round((time.perf_counter_ns() - read_ns) / 1_000_000)
-            )
+            database_ms["finish"] = elapsed_ms(read_ns, time.perf_counter_ns())
             result["database_ms"] = database_ms
             return result
 
@@ -32778,9 +32779,7 @@ def heartbeat_runtime_mutation_lease(
     finally:
         closing_ns = time.perf_counter_ns()
         conn.close()
-        database_ms["close"] = max(
-            0, round((time.perf_counter_ns() - closing_ns) / 1_000_000)
-        )
+        database_ms["close"] = elapsed_ms(closing_ns, time.perf_counter_ns())
 
 
 def release_runtime_mutation_lease(
