@@ -928,7 +928,7 @@ def test_sage_rpc_does_not_retry_send_after_reconnect_outlives_lease(monkeypatch
     )
 
     with pytest.raises(mutation_gate.MutationBlocked) as blocked:
-        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+        wallet_sage.rpc("get_sync_status", {}, _identity_recheck=require_live_lease)
 
     assert blocked.value.reason_code == "LEASE_EXPIRED"
     assert retry_sent == []
@@ -982,7 +982,7 @@ def test_sage_rpc_does_not_retry_send_after_tls_handshake_outlives_lease(
     )
 
     with pytest.raises(mutation_gate.MutationBlocked) as blocked:
-        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+        wallet_sage.rpc("get_sync_status", {}, _identity_recheck=require_live_lease)
 
     assert blocked.value.reason_code == "LEASE_EXPIRED"
     assert retry_sent == []
@@ -1262,7 +1262,7 @@ def test_sage_split_bulk_rechecks_after_nested_signing_read(monkeypatch):
     monkeypatch.setattr(
         wallet_sage,
         "rpc",
-        lambda endpoint, payload, timeout=10: (
+        lambda endpoint, payload, timeout=10, _identity_recheck=None: (
             events.append(f"effect:{endpoint}") or {"success": True}
         ),
     )
@@ -1372,7 +1372,7 @@ def test_sage_create_transaction_rechecks_create_sign_and_submit(monkeypatch):
     monkeypatch.setattr(
         wallet_sage,
         "rpc",
-        lambda endpoint, payload, timeout=10: (
+        lambda endpoint, payload, timeout=10, _identity_recheck=None: (
             events.append(endpoint) or {"coin_spends": [{"coin": "safe"}]}
         ),
     )
@@ -1479,7 +1479,7 @@ def test_sage_login_rechecks_before_each_wallet_state_change(monkeypatch):
 
     events = []
 
-    def rpc(endpoint, payload, timeout=10):
+    def rpc(endpoint, payload, timeout=10, _identity_recheck=None):
         events.append(endpoint)
         if endpoint == "get_version":
             return {"success": True, "version": "1.2.3"}

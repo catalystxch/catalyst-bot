@@ -1377,7 +1377,12 @@ def ensure_initialized(force_retry: bool = False, *, _identity_recheck=None) -> 
         if _identity_recheck is not None:
             _identity_recheck("sage_initialize")
         try:
-            result = rpc("initialize", {}, timeout=_INIT_RPC_TIMEOUT)
+            result = rpc(
+                "initialize",
+                {},
+                timeout=_INIT_RPC_TIMEOUT,
+                _identity_recheck=_identity_recheck,
+            )
             if _rpc_succeeded(result):
                 _console("  [Sage] initialize OK")
             elif isinstance(result, dict) and result.get("http_status") == 404:
@@ -1393,6 +1398,8 @@ def ensure_initialized(force_retry: bool = False, *, _identity_recheck=None) -> 
                 return False
             _init_ok = True
             return True
+        except mutation_gate.MutationBlocked:
+            raise
         except Exception as e:
             _console(f"  [Sage] INIT FAILED: initialize error: {e}")
             _init_last_attempt = _time.time()
@@ -1468,12 +1475,38 @@ def _raise_sage_response_failure(
     raise SageHTTPError(**failure_args)
 
 
+# A response can disappear after Sage has accepted a POST. Only endpoints
+# whose replay cannot create a wallet effect may retry an ambiguous transport
+# failure. Unknown endpoints fail closed until they are classified.
+_RETRYABLE_SAGE_READ_ENDPOINTS = frozenset(
+    {
+        "get_are_coins_spendable",
+        "get_cats",
+        "get_coins",
+        "get_coins_by_ids",
+        "get_derivations",
+        "get_key",
+        "get_keys",
+        "get_offer",
+        "get_offers",
+        "get_peers",
+        "get_pending_transactions",
+        "get_spendable_coin_count",
+        "get_sync_status",
+        "get_transaction",
+        "get_transactions",
+        "get_version",
+        "view_offer",
+    }
+)
+
+
 def _sage_post(
     path: str,
     payload: dict,
     timeout: int = 10,
     *,
-    retry_transport_error: bool = True,
+    retry_transport_error: Optional[bool] = None,
     _identity_recheck=None,
 ):
     """Low-level HTTPS POST to Sage, bypassing requests library entirely.
@@ -1484,6 +1517,8 @@ def _sage_post(
     """
     body = _json.dumps(payload).encode("utf-8")
     headers_dict = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    if retry_transport_error is None:
+        retry_transport_error = path.strip("/") in _RETRYABLE_SAGE_READ_ENDPOINTS
 
     try:
         conn = _get_sage_connection(timeout)
@@ -2041,7 +2076,12 @@ def sage_login(
     if force_resync:
         if _identity_recheck is not None:
             _identity_recheck("sage_login:resync")
-        result = rpc("resync", {"fingerprint": fingerprint}, timeout=30)
+        result = rpc(
+            "resync",
+            {"fingerprint": fingerprint},
+            timeout=30,
+            _identity_recheck=_identity_recheck,
+        )
         if not _rpc_succeeded(result):
             _console(f"  [Sage] resync failed: {result}")
             return False
@@ -2052,7 +2092,12 @@ def sage_login(
     # Step 3: login — activates the key
     if _identity_recheck is not None:
         _identity_recheck("sage_login:login")
-    result = rpc("login", {"fingerprint": fingerprint}, timeout=30)
+    result = rpc(
+        "login",
+        {"fingerprint": fingerprint},
+        timeout=30,
+        _identity_recheck=_identity_recheck,
+    )
     if not _rpc_succeeded(result):
         _console(f"  [Sage] login failed: {result}")
         return False
@@ -2937,7 +2982,7 @@ def split_coins_rpc(
     )
     if _identity_recheck is not None:
         _identity_recheck("split_coins_rpc")
-    result = rpc("split", payload, timeout=60)
+    result = rpc("split", payload, timeout=60, _identity_recheck=_identity_recheck)
     if WALLET_DEBUG:
         _console(f"  [Sage] split result: {result}")
     return result
@@ -2964,7 +3009,12 @@ def build_transaction_rpc(
     )
     if _identity_recheck is not None:
         _identity_recheck("create_transaction")
-    result = rpc("create_transaction", payload, timeout=60)
+    result = rpc(
+        "create_transaction",
+        payload,
+        timeout=60,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] create_transaction result: {result}")
     return result
@@ -3644,7 +3694,7 @@ def combine_coins(
     _console(f"   [Sage] Combining {len(bare_ids)} coins via /combine")
     if _identity_recheck is not None:
         _identity_recheck("combine")
-    result = rpc("combine", payload, timeout=120)
+    result = rpc("combine", payload, timeout=120, _identity_recheck=_identity_recheck)
     if WALLET_DEBUG:
         _console(f"  [Sage] combine result: {result}")
     return _submit_coin_spends_if_needed(
@@ -4319,7 +4369,10 @@ def sign_message_by_address(
                 "message": message,
             },
             timeout=15,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as e:
         return {"success": False, "error": f"rpc_exception: {e}"}
 
@@ -4368,6 +4421,7 @@ def set_change_address(
                 "change_address": address,
             },
             timeout=10,
+            _identity_recheck=_identity_recheck,
         )
         # Sage v0.12.10 documents this mutation as EmptyResponse, serialized
         # as exactly {}.  Retain the exact legacy success object as well, but
@@ -4382,6 +4436,8 @@ def set_change_address(
             return {"success": False, "error": "set_change_address_failed"}
 
         return {"success": True, "fingerprint": fingerprint, "address": address}
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception:
         return {"success": False, "error": "set_change_address_failed"}
 
@@ -4428,7 +4484,7 @@ def send_transaction(
             payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
         if _identity_recheck is not None:
             _identity_recheck("send_transaction:send_cat")
-        return rpc("send_cat", payload, timeout=30)
+        return rpc("send_cat", payload, timeout=30, _identity_recheck=_identity_recheck)
     else:
         payload = {
             "address": str(address),
@@ -4440,7 +4496,7 @@ def send_transaction(
             payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
         if _identity_recheck is not None:
             _identity_recheck("send_transaction:send_xch")
-        return rpc("send_xch", payload, timeout=30)
+        return rpc("send_xch", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 def send_transaction_multi(
@@ -4471,7 +4527,7 @@ def send_transaction_multi(
     }
     if _identity_recheck is not None:
         _identity_recheck("send_transaction_multi:submit")
-    return rpc("multi_send", payload, timeout=30)
+    return rpc("multi_send", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 def send_cat_multi(payments: list, fee_mojos: int = 0, *, _identity_recheck=None):
@@ -4515,7 +4571,7 @@ def send_cat_multi(payments: list, fee_mojos: int = 0, *, _identity_recheck=None
     }
     if _identity_recheck is not None:
         _identity_recheck("send_cat_multi")
-    return rpc("multi_send", payload, timeout=30)
+    return rpc("multi_send", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 # ============================================================================
@@ -4672,7 +4728,7 @@ def create_offer(
 
     if _identity_recheck is not None:
         _identity_recheck("create_offer")
-    result = rpc("make_offer", payload, timeout=15)
+    result = rpc("make_offer", payload, timeout=15, _identity_recheck=_identity_recheck)
 
     if result and isinstance(result, dict):
         # ALWAYS log response keys so we can debug format issues
@@ -6826,7 +6882,12 @@ def auto_combine_xch(
     }
     if _identity_recheck is not None:
         _identity_recheck("auto_combine_xch")
-    result = rpc("auto_combine_xch", payload, timeout=120)
+    result = rpc(
+        "auto_combine_xch",
+        payload,
+        timeout=120,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] auto_combine_xch result: {result}")
     return result
@@ -6862,7 +6923,12 @@ def auto_combine_cat(
     }
     if _identity_recheck is not None:
         _identity_recheck("auto_combine_cat")
-    result = rpc("auto_combine_cat", payload, timeout=120)
+    result = rpc(
+        "auto_combine_cat",
+        payload,
+        timeout=120,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] auto_combine_cat result: {result}")
     return result
