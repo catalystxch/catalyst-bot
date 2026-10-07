@@ -1133,6 +1133,68 @@ def test_slow_heartbeat_connection_reports_database_stage_without_wallet_data(
     assert "wallet" not in repr(stages).lower()
 
 
+@pytest.mark.parametrize("delayed_stage", ["begin", "read", "finish", "close"])
+def test_slow_heartbeat_database_stage_is_attributed(
+    isolated_gate_database, monkeypatch, delayed_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    class DelayedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if delayed_stage == "begin" and sql == "BEGIN IMMEDIATE":
+                time.sleep(0.02)
+            elif (
+                delayed_stage == "read"
+                and sql == "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                time.sleep(0.02)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if delayed_stage == "finish":
+                time.sleep(0.02)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            if delayed_stage == "close":
+                time.sleep(0.02)
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: DelayedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    stages = timing["attempts"][0]["database_ms"]
+    assert stages[delayed_stage] >= 15
+    assert set(stages) == {"connection", "begin", "read", "finish", "close"}
+
+
 def test_expired_heartbeat_logs_where_delayed_connection_spent_time(
     isolated_gate_database, monkeypatch
 ):

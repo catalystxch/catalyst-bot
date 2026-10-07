@@ -9,3 +9,11 @@ The clean detached Windows EXE is `E:\catalyst-heartbeat-stage-clean-build\dist\
 The ZIP, installer and [manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/SHA256SUMS-221399a.txt) are pinned at artifact commit `896c7e8dd9f452550414f582c4e6c1856fb49d34`. Independent HTTP downloads matched both binary hashes. [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/CATalyst-221399a-primary-acceptance.zip) and [unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/Catalyst-Setup-221399a-1.4.0.exe) are acceptance artifacts, not a release.
 
 PR #220 remains draft. Exact-candidate original-profile rollover, Veeam-overlap reliability diagnosis, active-offer lifecycle/recovery, secondary original-profile acceptance, both 24-hour windows, and final review remain open. No new campaign or wallet effect was authorized or started.
+
+The later test-only diagnostic check injected isolated 20 ms delays into the
+lease transaction's begin, read, commit and close stages. All four appeared
+in their corresponding bounded `database_ms` fields. The complete
+`tests/test_mutation_gate.py` file passed **269 tests**; Ruff check, format
+and `git diff --check` passed. This verifies attribution when those
+database stages return; it does not identify the instruction delayed in the
+historical Veeam snapshot or make the failed 24-hour window pass.
