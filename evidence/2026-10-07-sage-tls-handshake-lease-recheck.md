@@ -25,7 +25,30 @@ final check or the socket write may block. Sage-side fencing would be needed
 for an absolute guarantee. This change does not explain the Veeam-associated
 heartbeat stall or turn the failed original TEST 7 24-hour trace into a pass.
 
-Exact-source CI, clean package, installer, original-profile acceptance, both
-final-candidate 24-hour windows, and final review remain pending at this
-checkpoint. The `b5725c3` package is historical and does not include this
-correction. PR #220 stays draft.
+The exact runtime/source is `eadb82aef284fd6ef4ec80f163e067d104d3ad46`.
+Its clean detached Windows `Catalyst.exe` has SHA-256
+`8E8EFDD7A175FE50D5BF168AF0EB4D6A4E7FB557BC8C6B68B2111C834356EF02`;
+the bundled UI is byte-identical to the prior package at
+`A696815D885412C94E1B9B460D2976ED80288819A6E023C0DE60FC4AD0A32609`.
+Packaged API, synthetic Sage mTLS, interrupted-publication recovery, and
+isolated native clean/duplicate/persisted/safety smokes passed. The 192-entry
+ZIP passed CRC and embedded-EXE checks; its extracted EXE passed API and
+synthetic Sage smokes. A unique-AppId QA installer clean-installed to E:,
+matched the EXE hash, passed installed API and Sage smokes, and silently
+uninstalled without leaving its EXE or QA registry key. Defender real-time
+protection was enabled and custom EXE/ZIP/installer scans found no attributable
+detection.
+
+The [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/e851d452f6af8877e94a9bb7c20e08df9c9c3028/acceptance-artifacts/CATalyst-eadb82a-primary-acceptance.zip)
+has SHA-256 `72C5F9C66666DA84AAB403AC955CBB01A8B06FF0396AECB5A329B667FD8B7F5B`.
+The [unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/e851d452f6af8877e94a9bb7c20e08df9c9c3028/acceptance-artifacts/Catalyst-Setup-eadb82a-1.4.0.exe)
+has SHA-256 `567EF072A4BFE4C941F59BDF6F5D571F35051BFBC4561D26D3C4BD947DEA73EB`.
+Both files and the [manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/e851d452f6af8877e94a9bb7c20e08df9c9c3028/acceptance-artifacts/SHA256SUMS-eadb82a.txt)
+are pinned at artifact commit `e851d452f6af8877e94a9bb7c20e08df9c9c3028`;
+independent HTTP downloads matched both binary hashes. These are acceptance
+artifacts, not a release.
+
+Exact-source CI was running at this checkpoint. Original-profile acceptance,
+both final-candidate 24-hour windows, and final review remain pending. The
+`b5725c3` package is historical and does not include this correction. PR #220
+stays draft.
