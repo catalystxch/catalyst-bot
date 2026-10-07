@@ -177,6 +177,25 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(self.calls["upserts"], [])
 
+    def test_update_coin_counts_does_not_persist_partial_sage_view(self):
+        """A selectable page cannot stand in for a failed owned-coin view."""
+        selectable = [{"coin_id": "0x" + "11" * 32, "coin": {"amount": 111}}]
+        with (
+            patch.object(
+                self.coin_manager, "get_owned_coins_detailed", return_value=None
+            ),
+            patch.object(self.coin_manager, "get_owned_coins", return_value=None),
+            patch.object(
+                self.manager,
+                "_get_coins_fast",
+                return_value={"confirmed_records": selectable},
+            ),
+        ):
+            self.manager.update_coin_counts()
+
+        self.assertEqual(self.calls["batches"], [])
+        self.assertEqual(self.calls["upserts"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

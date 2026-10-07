@@ -130,6 +130,34 @@ def test_stale_wallet_cycle_does_not_run_fill_detection():
     assert calls == [({"fresh-buy"}, set(), {})]
 
 
+def test_incomplete_startup_coin_view_never_reconciles():
+    calls = []
+
+    def reconcile(**kwargs):
+        calls.append(kwargs)
+        return {"added": 0}
+
+    with pytest.raises(RuntimeError, match="Incomplete.*startup coin view"):
+        bot_loop._reconcile_startup_coin_views({}, None, {}, {}, reconcile)
+
+    assert calls == []
+
+
+def test_complete_startup_coin_views_reconcile_both_assets():
+    calls = []
+
+    def reconcile(**kwargs):
+        calls.append(kwargs)
+        return {"added": 0}
+
+    stats = bot_loop._reconcile_startup_coin_views(
+        {"xch": 1}, {"xch": 1}, {"cat": 2}, {}, reconcile
+    )
+
+    assert stats == ({"added": 0}, {"added": 0})
+    assert [call["wallet_type"] for call in calls] == ["xch", "cat"]
+
+
 def test_second_startup_offer_read_must_be_fresh_before_recovery(monkeypatch):
     import cat_resolver
     import database

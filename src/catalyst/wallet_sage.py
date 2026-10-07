@@ -6359,40 +6359,10 @@ def get_owned_coins(wallet_id: int) -> Optional[Dict]:
 
     Returns dict: {normalized_coin_id: amount_mojos}
     """
-    if _is_cat_wallet(wallet_id):
-        asset_id = _get_cat_asset_id()
-        if not asset_id:
-            return None
-    else:
-        asset_id = None
-
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "filter_mode": "owned",
-        },
-        timeout=15,
-    )
-
-    if not result:
+    detailed = get_owned_coins_detailed(wallet_id)
+    if detailed is None:
         return None
-
-    coins = result.get("coins") or result.get("records") or result.get("data") or []
-    # Return {coin_id: amount_mojos} with normalized IDs (0x prefix)
-    coin_map = {}
-    for c in coins:
-        cid = c.get("coin_id", "")
-        if cid:
-            # Normalize: add 0x prefix if missing
-            if not cid.startswith("0x"):
-                cid = "0x" + cid.lower()
-            else:
-                cid = cid.lower()
-            coin_map[cid] = int(c.get("amount", "0"))
-    return coin_map
+    return {coin_id: info["amount"] for coin_id, info in detailed.items()}
 
 
 def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
@@ -6428,6 +6398,7 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
     page_size = 500
     max_pages = 40  # 20k coins ceiling
     coin_map: Dict[str, Dict] = {}
+    expected_total = None
     for page in range(max_pages):
         offset = page * page_size
         result = rpc(
@@ -6440,35 +6411,60 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
             },
             timeout=15,
         )
-        if not result:
-            if page == 0:
+        if not _rpc_succeeded(result):
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
                 return None
-            break
-        coins = result.get("coins") or result.get("records") or result.get("data") or []
-        if not coins:
-            break
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
         for c in coins:
-            cid = c.get("coin_id", "")
-            if cid:
-                if not cid.startswith("0x"):
-                    cid = "0x" + cid.lower()
-                else:
-                    cid = cid.lower()
-                # Extract offer_id — this is the offer_hash from Sage's DB
-                # If set, this coin is locked by an offer
-                offer_id = c.get("offer_id") or c.get("offer_hash") or None
-                if offer_id and isinstance(offer_id, str):
-                    offer_id = offer_id.lower()
-                coin_map[cid] = {
-                    "amount": int(c.get("amount", "0")),
-                    "offer_id": offer_id,
-                    "created_height": c.get("created_height"),
-                    "spent_height": c.get("spent_height"),
-                    "transaction_id": c.get("transaction_id"),
-                }
+            if not isinstance(c, dict) or not isinstance(c.get("coin_id"), str):
+                return None
+            cid = c["coin_id"].lower()
+            if not cid:
+                return None
+            if not cid.startswith("0x"):
+                cid = "0x" + cid
+            if cid in coin_map:
+                return None
+            try:
+                amount = int(c["amount"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            # Extract offer_id — this is the offer_hash from Sage's DB.
+            offer_id = c.get("offer_id") or c.get("offer_hash") or None
+            if offer_id and isinstance(offer_id, str):
+                offer_id = offer_id.lower()
+            coin_map[cid] = {
+                "amount": amount,
+                "offer_id": offer_id,
+                "created_height": c.get("created_height"),
+                "spent_height": c.get("spent_height"),
+                "transaction_id": c.get("transaction_id"),
+            }
         if len(coins) < page_size:
-            break
-    return coin_map
+            if expected_total is not None and len(coin_map) != expected_total:
+                return None
+            return coin_map
+    # A full final page cannot prove that there is no next page.
+    return None
 
 
 _MAX_EXACT_ATOMIC_DIGITS = 128
@@ -6831,31 +6827,63 @@ def get_selectable_coins_map(wallet_id: int) -> Optional[Dict]:
     else:
         asset_id = None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "filter_mode": "selectable",
-        },
-        timeout=15,
-    )
-
-    if not result:
-        return None
-
-    coins = result.get("coins") or result.get("records") or result.get("data") or []
     coin_map = {}
-    for c in coins:
-        cid = c.get("coin_id", "")
-        if cid:
+    page_size = 500
+    expected_total = None
+    for page in range(40):
+        offset = page * page_size
+        result = rpc(
+            "get_coins",
+            {
+                "asset_id": asset_id,
+                "offset": offset,
+                "limit": page_size,
+                "filter_mode": "selectable",
+            },
+            timeout=15,
+        )
+        if not _rpc_succeeded(result):
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
+                return None
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
+        for c in coins:
+            if not isinstance(c, dict) or not isinstance(c.get("coin_id"), str):
+                return None
+            cid = c["coin_id"].lower()
+            if not cid:
+                return None
             if not cid.startswith("0x"):
-                cid = "0x" + cid.lower()
-            else:
-                cid = cid.lower()
-            coin_map[cid] = int(c.get("amount", "0"))
-    return coin_map
+                cid = "0x" + cid
+            if cid in coin_map:
+                return None
+            try:
+                coin_map[cid] = int(c["amount"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        if len(coins) < page_size:
+            if expected_total is not None and len(coin_map) != expected_total:
+                return None
+            return coin_map
+    return None
 
 
 # ============================================================================

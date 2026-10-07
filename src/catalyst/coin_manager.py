@@ -4288,22 +4288,30 @@ class CoinManager:
 
             # For Sage wallet: Also fetch "owned" coins to distinguish between
             # truly gone coins vs Sage-hidden receive-side coins in offers
-            xch_owned_ids = set()
-            cat_owned_ids = set()
+            xch_owned_ids = None if wallet_type == "sage" else set()
+            cat_owned_ids = None if wallet_type == "sage" else set()
             if wallet_type == "sage":
                 if xch_owned_snapshot is not None:
                     xch_owned_ids = set(xch_owned_snapshot["owned_ids"])
                 else:
                     xch_owned = get_owned_coins(cfg.WALLET_ID_XCH)
-                    if xch_owned:
+                    if xch_owned is not None:
                         xch_owned_ids = set(xch_owned.keys())
 
                 if cat_owned_snapshot is not None:
                     cat_owned_ids = set(cat_owned_snapshot["owned_ids"])
                 else:
                     cat_owned = get_owned_coins(cfg.CAT_WALLET_ID)
-                    if cat_owned:
+                    if cat_owned is not None:
                         cat_owned_ids = set(cat_owned.keys())
+
+                if xch_owned_ids is None or cat_owned_ids is None:
+                    log_event(
+                        "warning",
+                        "coin_count_skip_incomplete_owned_view",
+                        "Sage owned-coin view is incomplete; skipping coin persistence",
+                    )
+                    return (self._xch_coins, self._cat_coins)
 
             self._persist_coins_to_db(xch_records, "xch", {}, xch_owned_ids)
             self._persist_coins_to_db(cat_records, "cat", {}, cat_owned_ids)

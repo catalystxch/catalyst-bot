@@ -110,6 +110,33 @@ DEXIE_STATUS_CANCELLED = 3
 DEXIE_STATUS_COMPLETED = 4
 DEXIE_STATUS_EXPIRED = 6
 
+
+class _IncompleteStartupCoinView(RuntimeError):
+    """The wallet did not provide a complete startup reconciliation view."""
+
+
+def _reconcile_startup_coin_views(
+    xch_owned, xch_selectable, cat_owned, cat_selectable, reconcile
+):
+    """Reconcile only after both wallet assets have complete coin views."""
+    if any(
+        not isinstance(view, dict)
+        for view in (xch_owned, xch_selectable, cat_owned, cat_selectable)
+    ):
+        raise _IncompleteStartupCoinView("Incomplete Sage startup coin view")
+    xch_stats = reconcile(
+        wallet_selectable=xch_selectable,
+        wallet_owned=xch_owned,
+        wallet_type="xch",
+    )
+    cat_stats = reconcile(
+        wallet_selectable=cat_selectable,
+        wallet_owned=cat_owned,
+        wallet_type="cat",
+    )
+    return xch_stats, cat_stats
+
+
 # One-release compatibility keeps the old BoostManager available for
 # authoritative cancellation of recovered offers, never for creation or
 # repricing. Conservative opportunity orders now run through OfferManager.
@@ -8778,22 +8805,17 @@ class BotLoop:
                     )
 
                 if not _startup_detailed:
-                    xch_owned = get_owned_coins(xch_wid) or {}
-                    xch_selectable = get_selectable_coins_map(xch_wid) or {}
-                    cat_owned = get_owned_coins(cat_wid) or {}
-                    cat_selectable = get_selectable_coins_map(cat_wid) or {}
+                    xch_owned = get_owned_coins(xch_wid)
+                    xch_selectable = get_selectable_coins_map(xch_wid)
+                    cat_owned = get_owned_coins(cat_wid)
+                    cat_selectable = get_selectable_coins_map(cat_wid)
 
-                # Reconcile XCH coins
-                xch_stats = reconcile_coins_with_wallet(
-                    wallet_selectable=xch_selectable,
-                    wallet_owned=xch_owned,
-                    wallet_type="xch",
-                )
-                # Reconcile CAT coins
-                cat_stats = reconcile_coins_with_wallet(
-                    wallet_selectable=cat_selectable,
-                    wallet_owned=cat_owned,
-                    wallet_type="cat",
+                xch_stats, cat_stats = _reconcile_startup_coin_views(
+                    xch_owned,
+                    xch_selectable,
+                    cat_owned,
+                    cat_selectable,
+                    reconcile_coins_with_wallet,
                 )
                 log_event(
                     "info",
@@ -8810,6 +8832,11 @@ class BotLoop:
                     "info", "startup_offer_linking", f"Offer-coin linking: {link_stats}"
                 )
 
+            except _IncompleteStartupCoinView as e:
+                log_event("error", "startup_coin_view_incomplete", str(e))
+                self._running = False
+                self._set_state(status="error", error=str(e))
+                return
             except Exception as e:
                 log_event(
                     "warning",
