@@ -33,6 +33,14 @@ subtests. The complete serial Windows backend rerun on that child passed
 **7,376 tests, 246 skipped, 447 subtests** in 20 minutes 33 seconds. Ruff
 check, format check, `git diff --check`, and all 11 PR checks passed.
 
+Test-only descendant `9ab681a5adc34793b294bb6e7644d3de5bb156ad`
+adds a regression for an uncertain Coin Prep split dispatch: the source coin
+remains claimed against both the original operation and a different retry
+operation ID. The selected replacement/split suites passed 97 tests. Its
+complete serial Windows backend run passed **7,377 tests, 246 skipped, 447
+subtests** in 27 minutes 17 seconds (exit code 0), and all 11 PR checks passed
+on that exact head. No runtime or packaged file changed after `f4ff7c5`.
+
 ## Clean Windows package
 
 Built from a clean detached worktree at the runtime commit:
