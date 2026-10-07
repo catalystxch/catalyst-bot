@@ -591,6 +591,44 @@ def test_batch_constructed_outputs_bind_once_before_dispatch(
         )
 
 
+def test_uncertain_split_submission_keeps_source_claimed_against_retry(
+    isolated_database, monkeypatch
+):
+    """An unknown dispatch keeps its source reserved against split retries."""
+    database.init_database()
+    _activate_wallet_authority(monkeypatch, run_id="split-response-lost")
+    source = hashlib.sha256(b"split-response-lost-source").hexdigest()
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+
+    first = database.claim_wallet_effect(
+        operation_id="coin-prep-split-first",
+        source_coin_ids=[source],
+    )
+    assert first is not None
+    dispatch = database.begin_wallet_effect_dispatch(
+        first["claim_token"],
+        first["generation"],
+        operation_id="coin-prep-split-first",
+        source_coin_ids=[source],
+    )
+    assert dispatch is not None
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch, exception=ConnectionError("response lost after Sage accepted")
+        )
+        == "UNKNOWN"
+    )
+
+    for operation_id in ("coin-prep-split-first", "coin-prep-split-retry"):
+        assert (
+            database.claim_wallet_effect(
+                operation_id=operation_id,
+                source_coin_ids=[source],
+            )
+            is None
+        )
+
+
 @pytest.mark.parametrize("protected_history", [False, True])
 def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
     isolated_database, monkeypatch, protected_history
