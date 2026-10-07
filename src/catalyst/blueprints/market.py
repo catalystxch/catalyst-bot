@@ -1304,7 +1304,11 @@ def api_debug_pricing():
     result["ticker_id"] = ticker_id
 
     try:
-        resp = _req.get("http://127.0.0.1:5000/api/status", timeout=15)
+        resp = _req.get(
+            "http://127.0.0.1:5000/api/status",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            timeout=15,
+        )
         status_data = resp.json()
         result["status_pricing"] = status_data.get("pricing", "MISSING")
         result["status_current_cat"] = status_data.get("current_cat", "MISSING")

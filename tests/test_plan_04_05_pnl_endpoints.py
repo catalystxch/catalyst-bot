@@ -645,7 +645,9 @@ class TestFillsExport(_FlaskBase):
                 api_server, "_build_fill_history_for_gui", return_value=[]
             ):
                 response = self.client.get(
-                    "/api/fills/export", environ_base=self._LOOPBACK
+                    "/api/fills/export",
+                    headers=self.auth,
+                    environ_base=self._LOOPBACK,
                 )
         finally:
             api_server._active_cat.clear()

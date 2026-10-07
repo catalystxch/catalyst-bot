@@ -66,6 +66,10 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self._LOOPBACK,
+        )
         api_server._rate_limit_log.clear()
         self._fiat_price_patcher = patch(
             "market_data_collector.get_cached_xch_usd_price",

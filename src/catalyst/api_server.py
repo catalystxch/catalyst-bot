@@ -214,6 +214,25 @@ _TOKEN_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
 }
 
+# Logs, crash reports, exported settings and trade history may contain private
+# local data even though they are GET requests. Do not hand them to another
+# loopback process merely because it can connect to this TCP port.
+_PRIVATE_READ_ROUTES = frozenset(
+    {
+        "/api/status",
+        "/api/dashboard",
+        "/api/logs",
+        "/api/logs/download",
+        "/api/superlog/stats",
+        "/api/superlog/archive",
+        "/api/superlog/download",
+        "/api/crash-log",
+        "/api/config/history",
+        "/api/config/export-env",
+        "/api/fills/export",
+    }
+)
+
 # Generic control-plane throttling is too aggressive for local webhook bursts.
 # Those machine routes stay loopback-only and must implement their own validation.
 _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
@@ -717,6 +736,7 @@ _LOCAL_API_COOKIE = "catalyst_local_session"
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN") or secrets.token_urlsafe(32)
 os.environ["BOT_LOCAL_WRITE_TOKEN"] = _LOCAL_API_TOKEN
 _LOCAL_API_COOKIE_VALUE = secrets.token_urlsafe(32)
+_LOCAL_API_BOOTSTRAP_TOKEN = secrets.token_urlsafe(32)
 
 # ---------------------------------------------------------------------------
 # Security helpers
@@ -1321,25 +1341,32 @@ def _get_sage_signing_block_reason():
     return None
 
 
+def _bind_local_browser_cookie(response):
+    """Bind an already authorized browser to this local runtime."""
+    response.set_cookie(
+        _LOCAL_API_COOKIE,
+        _LOCAL_API_COOKIE_VALUE,
+        httponly=True,
+        # The native splash starts from file://, so Chromium withholds a
+        # Strict cookie on its first redirected top-level navigation.
+        # Explicit Lax still excludes cross-site POSTs; the Origin guard
+        # independently rejects foreign browser writes.
+        samesite="Lax",
+        secure=False,
+        path="/",
+    )
+    return response
+
+
 def _serve_bootstrapped_html(filename: str):
-    """Serve HTML and bind the local runtime token to an HttpOnly cookie."""
+    """Serve HTML to an already authorized local browser."""
     gui_dir = _APP_ROOT
     path = os.path.join(gui_dir, filename)
     with open(path, "r", encoding="utf-8") as f:
         html_doc = f.read()
 
     response = Response(html_doc, mimetype="text/html")
-    response.set_cookie(
-        _LOCAL_API_COOKIE,
-        # Per-process loopback browser session nonce. The worker/header token
-        # stays out of browser storage.
-        _LOCAL_API_COOKIE_VALUE,
-        httponly=True,
-        samesite="Strict",
-        secure=False,
-        path="/",
-    )
-    return response
+    return _bind_local_browser_cookie(response)
 
 
 class _QuietRequestFilter(logging.Filter):
@@ -1347,6 +1374,10 @@ class _QuietRequestFilter(logging.Filter):
 
     def filter(self, record):
         msg = record.getMessage()
+        # The first browser navigation carries a secret that must not enter
+        # access logs or exported diagnostics.
+        if "GET /?bootstrap=" in msg:
+            return False
         # Werkzeug log format: '127.0.0.1 - - [date] "GET /api/status HTTP/1.1" 200 -'
         for endpoint in _QUIET_ENDPOINTS:
             if endpoint in msg:
@@ -3908,6 +3939,13 @@ def enforce_local_runtime_guard():
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
+    if (
+        request.method == "GET"
+        and path in _PRIVATE_READ_ROUTES
+        and not _has_valid_local_token()
+    ):
+        return jsonify({"error": "unauthorized"}), 401
+
     if request.method in {
         "POST",
         "PUT",
@@ -3977,6 +4015,15 @@ def release_local_runtime_guard(_error=None):
 @app.route("/")
 def serve_gui():
     """Serve the bot GUI HTML file."""
+    bootstrap = request.args.get("bootstrap", "")
+    if bootstrap and secrets.compare_digest(bootstrap, _LOCAL_API_BOOTSTRAP_TOKEN):
+        response = Response(status=302)
+        response.headers["Location"] = "/"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return _bind_local_browser_cookie(response)
+    if not _has_valid_local_token():
+        return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
 
 

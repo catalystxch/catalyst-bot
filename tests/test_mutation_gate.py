@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 from pathlib import Path
@@ -7090,7 +7091,27 @@ def test_authorized_desktop_mode_uses_alternate_reserved_port_for_server_and_win
         desktop_app.run_desktop_mode()
 
     assert events[:3] == ["reserve", "services", ("serve", reservation)]
-    assert ("window", f"http://127.0.0.1:{selected_port}/") in events
+    window_urls = [
+        event[1]
+        for event in events
+        if isinstance(event, tuple) and event[0] == "window"
+    ]
+    assert len(window_urls) == 1
+    window_url = urlsplit(window_urls[0])
+    assert (
+        window_url.scheme,
+        window_url.hostname,
+        window_url.port,
+        window_url.path,
+    ) == (
+        "http",
+        "127.0.0.1",
+        selected_port,
+        "/",
+    )
+    assert parse_qs(window_url.query).get("bootstrap") == [
+        desktop_app._browser_bootstrap_url().split("bootstrap=", 1)[1]
+    ]
 
 
 def test_desktop_thread_construction_failure_releases_port_and_lease(monkeypatch):

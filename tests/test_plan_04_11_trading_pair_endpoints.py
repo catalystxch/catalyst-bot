@@ -339,7 +339,9 @@ class TestBalanceRefresh(_FlaskBase):
             ):
                 refresh_resp = self._post("/api/balances/refresh")
                 status_resp = self.client.get(
-                    "/api/status", environ_base=self._LOOPBACK
+                    "/api/status",
+                    headers=self.auth,
+                    environ_base=self._LOOPBACK,
                 )
 
             self.assertEqual(refresh_resp.status_code, 200)

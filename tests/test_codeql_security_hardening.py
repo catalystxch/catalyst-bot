@@ -108,7 +108,10 @@ def test_open_data_folder_error_does_not_expose_exception_details():
     api_server.app.testing = True
     client = api_server.app.test_client()
     loopback = {"REMOTE_ADDR": "127.0.0.1"}
-    client.get("/", environ_base=loopback)
+    client.get(
+        f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+        environ_base=loopback,
+    )
 
     with patch(
         "user_paths.data_dir", side_effect=RuntimeError("secret local path leaked")
@@ -514,7 +517,11 @@ def test_status_prebot_response_hides_traceback_shaped_cached_values(monkeypatch
         patch("wallet.get_spendable_coin_count", return_value=0),
         patch("chia_node.is_startup_authorised", return_value=False),
     ):
-        resp = client.get("/api/status", environ_base=loopback)
+        resp = client.get(
+            "/api/status",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base=loopback,
+        )
 
     body = resp.get_data(as_text=True).lower()
     assert resp.status_code == 200

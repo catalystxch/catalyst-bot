@@ -109,6 +109,10 @@ class _TempDB(unittest.TestCase):
 
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=_LOOPBACK,
+        )
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._fresh_start_clear()

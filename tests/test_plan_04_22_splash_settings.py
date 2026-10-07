@@ -80,7 +80,7 @@ class _FlaskBase(unittest.TestCase):
         api_server._SPLASH_BACKLOG_CACHE["new_count"] = 0
 
     def _get(self, path):
-        return self.client.get(path, environ_base=_LOOPBACK)
+        return self.client.get(path, headers=self.auth, environ_base=_LOOPBACK)
 
     def _post(self, path, body=None, auth=True):
         headers = dict(self.auth) if auth else {}

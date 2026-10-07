@@ -27,6 +27,7 @@ import argparse
 import subprocess
 import importlib.util
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -153,9 +154,17 @@ def _configure_linux_webengine_env() -> None:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = existing
 
 
+def _browser_bootstrap_url() -> str:
+    """Return the private first-navigation URL for this process's browser."""
+    import api_server
+
+    token = quote(api_server._LOCAL_API_BOOTSTRAP_TOKEN, safe="")
+    return f"http://{FLASK_HOST}:{FLASK_PORT}/?bootstrap={token}"
+
+
 def _initial_desktop_url() -> str:
     """Return the first URL shown in the native desktop window."""
-    flask_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+    flask_url = _browser_bootstrap_url()
     if sys.platform.startswith("linux") or FLASK_PORT != 5000:
         return flask_url
 
@@ -163,7 +172,8 @@ def _initial_desktop_url() -> str:
     if os.path.exists(splash_path):
         import pathlib
 
-        return pathlib.Path(splash_path).as_uri()
+        token = quote(flask_url.split("bootstrap=", 1)[1], safe="")
+        return f"{pathlib.Path(splash_path).as_uri()}?bootstrap={token}"
     return flask_url
 
 
@@ -1146,7 +1156,7 @@ def run_desktop_mode(dev_mode: bool = False):
 
     print("\n  Launching desktop window...")
     if dev_mode:
-        print(f"  Dev mode: also accessible at http://{FLASK_HOST}:{FLASK_PORT}/")
+        print(f"  Dev mode browser URL: {_browser_bootstrap_url()}")
 
     # Create JS bridge for window.pywebview.api calls
     try:
@@ -1170,7 +1180,7 @@ def run_desktop_mode(dev_mode: bool = False):
         _win_y = None
 
     _initial_url = _initial_desktop_url()
-    print(f"  Desktop window URL: {_initial_url}", flush=True)
+    print(f"  Desktop window URL: {_initial_url.split('?', 1)[0]}", flush=True)
 
     _create_window_kwargs = dict(
         title=APP_NAME,
@@ -1329,7 +1339,7 @@ def run_flask_mode():
 
     print(f"\n  {APP_NAME} v{APP_VERSION} - Flask Mode")
     print(f"  {'=' * 40}")
-    print(f"  Open http://{FLASK_HOST}:{FLASK_PORT}/ in your browser")
+    print(f"  Open {_browser_bootstrap_url()} in your browser")
     print("  Press Ctrl+C to stop\n")
 
     # Register signal handlers — must call sys.exit() so Werkzeug's
@@ -1557,7 +1567,10 @@ def _poll_tray_status(tray, interval: float = 3.0):
         try:
             req = urllib.request.Request(
                 f"http://{FLASK_HOST}:{FLASK_PORT}/api/status",
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "X-Bot-Local-Token": os.environ.get("BOT_LOCAL_WRITE_TOKEN", ""),
+                },
             )
             with urllib.request.urlopen(req, timeout=4) as resp:
                 data = _json.loads(resp.read().decode())

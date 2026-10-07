@@ -91,6 +91,10 @@ def flask_server(tmp_path_factory):
     a read-only Flask shell (no PyWebView window) on a non-default port.
     """
     data_dir = tmp_path_factory.mktemp("catalyst-e2e")
+    # The isolated child generates its own per-process browser credential.
+    # Pass it back through this private test directory instead of exposing it
+    # on stdout or assuming the dashboard accepts unauthenticated navigation.
+    bootstrap_path = data_dir / ".browser_bootstrap"
     (data_dir / ".migration_complete").write_text(
         "E2E isolation: do not import legacy runtime state.\n",
         encoding="utf-8",
@@ -111,6 +115,7 @@ def flask_server(tmp_path_factory):
         f"sys.path.insert(0, {str(_REPO_ROOT / 'src' / 'catalyst')!r});"
         "from types import SimpleNamespace;"
         "import api_server;"
+        f"from pathlib import Path;Path({str(bootstrap_path)!r}).write_text(api_server._LOCAL_API_BOOTSTRAP_TOKEN,encoding='utf-8');"
         "from database import init_database;"
         "init_database();"
         "_boost=SimpleNamespace(get_state=lambda:{'active':False});"
@@ -141,7 +146,8 @@ def flask_server(tmp_path_factory):
             proc.terminate()
             pytest.skip(f"Flask server failed to start on port {_E2E_PORT} within 30s")
         else:
-            base_url = f"http://127.0.0.1:{_E2E_PORT}"
+            bootstrap_token = bootstrap_path.read_text(encoding="utf-8")
+            base_url = f"http://127.0.0.1:{_E2E_PORT}/?bootstrap={bootstrap_token}"
         yield base_url
     finally:
         proc.terminate()

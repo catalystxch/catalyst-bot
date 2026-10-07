@@ -125,6 +125,10 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self._LOOPBACK,
+        )
         api_server._rate_limit_log.clear()
         # Contract tests must not inherit the machine's network availability.
         # Individual startup-price tests install their own nested requests.get
@@ -960,15 +964,21 @@ class TestStatusEndpointWriteGuards(_FlaskBase):
     and returns 401 — before Flask can return 405 for a GET-only route."""
 
     def test_bot_state_post_no_token_returns_401(self):
-        resp = self.client.post("/api/bot/state", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/bot/state", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_bot_price_post_no_token_returns_401(self):
-        resp = self.client.post("/api/bot/price", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/bot/price", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_status_post_no_token_returns_401(self):
-        resp = self.client.post("/api/status", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/status", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_bot_state_post_with_token_returns_405(self):
