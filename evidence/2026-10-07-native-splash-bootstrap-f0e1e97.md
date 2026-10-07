@@ -10,6 +10,8 @@ A regression was first changed to require fragment transport and failed before t
 
 ## Exact-source verification
 
+- A later complete serial Windows backend run on exact `f0e1e97` passed **7,350 tests, 244 skipped, 447 subtests passed** in 1,630.36 seconds. It used isolated `CMM_DATA_DIR=E:\catalyst-f0e1e97-full-windows-tests-data`; stderr was empty. The stdout receipt is `E:\catalyst-f0e1e97-full-windows-tests\pytest.stdout.log` (SHA-256 `87F16D64072DBF0101462E43D38C82DFAF389F214A3CC58EBCAC6FE05B41D9D9`).
+- A later complete exact-`f0e1e97` Chromium run passed **243 tests** in 169.81 seconds using its own isolated data directory and port 5099. The stdout receipt is `E:\catalyst-f0e1e97-chromium-tests\pytest.stdout.log` (SHA-256 `6026EEA96B63A7653ECA9615769199C5F6B3630E4463ADF2897DD528A0D3835E`).
 - Focused Windows URL and log-redaction regressions: **2 passed** on `f0e1e97`.
 - Full Chromium suite: **243 passed** on direct parent `45f835a`; `f0e1e97` changes only the Python startup log and its unit test. The isolated Chromium splash regression passed red/green after fragment transport.
 - Ruff check/format and `git diff --check` passed. A concurrent optional local backend run on `45f835a` was interrupted at 38% to remove resource contention during native acceptance; it is **not** counted as a full-suite pass. All 11 PR checks, including exact-source unit tests, passed on evidence-only head `7e185cdac55e8a006f11f9f8a7194f5d952accfe`.
