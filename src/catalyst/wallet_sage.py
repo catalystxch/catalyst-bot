@@ -6498,17 +6498,32 @@ def _exact_authoritative_offer_asset_ids(offer_ids: set[str]) -> Dict[str, str]:
         return {}
 
     matches: Dict[str, list] = {offer_id: [] for offer_id in offer_ids}
+    ambiguous_ids: set[str] = set()
     for offer in history["offers"]:
         if type(offer) is not dict:
             return {}
-        raw_offer_id = offer.get("trade_id") or offer.get("offer_id")
-        normalized_offer_id = _normalize_offer_lock_id(raw_offer_id)
-        if normalized_offer_id in matches:
-            matches[normalized_offer_id].append(offer)
+        wire_ids = [
+            _normalize_offer_lock_id(offer[key])
+            for key in ("trade_id", "offer_id")
+            if key in offer
+        ]
+        targeted_ids = {offer_id for offer_id in wire_ids if offer_id in matches}
+        if not targeted_ids:
+            continue
+        if (
+            any(
+                offer_id is None or re.fullmatch(r"[0-9a-f]{64}", offer_id) is None
+                for offer_id in wire_ids
+            )
+            or len(set(wire_ids)) != 1
+        ):
+            ambiguous_ids.update(targeted_ids)
+            continue
+        matches[wire_ids[0]].append(offer)
 
     resolved: Dict[str, str] = {}
     for offer_id, rows in matches.items():
-        if len(rows) != 1:
+        if offer_id in ambiguous_ids or len(rows) != 1:
             continue
         summary = rows[0].get("summary")
         offered = summary.get("offered") if type(summary) is dict else None

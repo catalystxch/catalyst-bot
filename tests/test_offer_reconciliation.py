@@ -2977,6 +2977,124 @@ def test_sage_coin_adapter_does_not_infer_ambiguous_offer_asset(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("trade_id", "offer_id"),
+    [
+        (TRADE, OTHER_TRADE),
+        (OTHER_TRADE, TRADE),
+        (TRADE, "not-a-hex-offer-id"),
+    ],
+    ids=["matching-trade-id", "matching-offer-id", "malformed-alias"],
+)
+def test_sage_coin_adapter_does_not_infer_asset_from_conflicting_offer_ids(
+    monkeypatch, trade_id, offer_id
+):
+    import wallet_sage
+
+    def sage_rpc(method, *_args, **_kwargs):
+        if method == "get_coins_by_ids":
+            return {
+                "coins": [
+                    {
+                        "coin_id": COIN,
+                        "amount": "33887186",
+                        "owned": True,
+                        "offer_id": TRADE,
+                        "spent_height": None,
+                    }
+                ]
+            }
+        if method == "get_offers":
+            return {
+                "offers": [
+                    {
+                        "trade_id": trade_id,
+                        "offer_id": offer_id,
+                        "status": 1,
+                        "summary": {
+                            "offered": {ASSET: 28804800},
+                            "requested": {"xch": 1000},
+                        },
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected Sage RPC: {method}")
+
+    monkeypatch.setattr(wallet_sage, "rpc", sage_rpc)
+
+    records = wallet_sage.get_coins_by_ids([COIN])
+
+    assert "asset_id" not in records["0x" + COIN]
+
+
+def test_sage_coin_adapter_accepts_equivalent_offer_id_encodings(monkeypatch):
+    import wallet_sage
+
+    def sage_rpc(method, *_args, **_kwargs):
+        if method == "get_coins_by_ids":
+            return {
+                "coins": [
+                    {
+                        "coin_id": COIN,
+                        "amount": "33887186",
+                        "owned": True,
+                        "offer_id": TRADE,
+                        "spent_height": None,
+                    }
+                ]
+            }
+        if method == "get_offers":
+            return {
+                "offers": [
+                    {
+                        "trade_id": "0x" + TRADE.upper(),
+                        "offer_id": TRADE,
+                        "status": 1,
+                        "summary": {
+                            "offered": {ASSET: 28804800},
+                            "requested": {"xch": 1000},
+                        },
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected Sage RPC: {method}")
+
+    monkeypatch.setattr(wallet_sage, "rpc", sage_rpc)
+
+    records = wallet_sage.get_coins_by_ids([COIN])
+
+    assert records["0x" + COIN]["asset_id"] == ASSET
+
+
+def test_sage_coin_asset_inference_rejects_conflicting_duplicate_history_row(
+    monkeypatch,
+):
+    import wallet_sage
+
+    valid = {
+        "trade_id": TRADE,
+        "offer_id": TRADE,
+        "summary": {"offered": {ASSET: 28804800}},
+    }
+    conflicting = {
+        "trade_id": TRADE,
+        "offer_id": OTHER_TRADE,
+        "summary": {"offered": {ASSET: 28804800}},
+    }
+    monkeypatch.setattr(
+        wallet_sage,
+        "get_authoritative_offer_history",
+        lambda **_kwargs: {
+            "success": True,
+            "end_of_history": True,
+            "total": 2,
+            "offers": [valid, conflicting],
+        },
+    )
+
+    assert wallet_sage._exact_authoritative_offer_asset_ids({TRADE}) == {}
+
+
+@pytest.mark.parametrize(
     ("raw_amount", "offered"),
     [(1000.9, "1000"), (True, "1"), ("9" * 5000, "1000")],
     ids=["fractional-float", "boolean", "over-cap-digits"],
