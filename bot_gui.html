@@ -13323,9 +13323,6 @@
         }
 
         async function clearResumeModeForFreshSetup({ openSettings = false } = {}) {
-            clearResumeSessionSummary();
-            _resumeHandled = true;
-
             try {
                 const response = await apiFetch(`${API_URL}/session/fresh-start`, {
                     method: 'POST',
@@ -13339,8 +13336,11 @@
             } catch (err) {
                 debugWarn('[RESUME] Fresh-start reset failed from settings flow:', err);
                 showToast('Start Fresh reset failed: ' + formatError(err), 'warning');
+                return false;
             }
 
+            clearResumeSessionSummary();
+            _resumeHandled = true;
             resetPairSelectionState('Choose a CAT pair for this wallet.');
             clearPairScopedDashboardState('selected pair');
             setFreshStartTemplateState(true);
@@ -13361,6 +13361,7 @@
             if (openSettings) {
                 v4SwitchView('settings', { bypassResumeSettingsLock: true });
             }
+            return true;
         }
 
         async function handleResumeSettingsChangeRequest({ openSettings = true } = {}) {
@@ -13387,8 +13388,7 @@
                 return false;
             }
             if (!result) return false;
-            await clearResumeModeForFreshSetup({ openSettings });
-            return true;
+            return await clearResumeModeForFreshSetup({ openSettings });
         }
 
         async function v4SwitchView(viewName, options = {}) {

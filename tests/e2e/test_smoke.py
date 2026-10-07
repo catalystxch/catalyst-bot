@@ -1130,6 +1130,115 @@ def test_successful_fresh_start_choice_closes_recovery_prompt(page):
     assert result == {"outcome": True, "modalActive": False, "startDisabled": True}
 
 
+@pytest.mark.parametrize(
+    "trigger", ["clearResumeModeForFreshSetup", "handleResumeSettingsChangeRequest"]
+)
+def test_failed_settings_fresh_start_preserves_resumed_book(page, trigger):
+    """A rejected durable choice must not discard resume authority or open editable setup."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            let resetCalled = false;
+            let dashboardCalled = false;
+            let settingsOpened = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            const originalSwitch = v4SwitchView;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => { dashboardCalled = true; };
+            v4SwitchView = () => { settingsOpened = true; };
+            showStyledConfirm = async () => true;
+            const toasts = [];
+            showToast = message => { toasts.push(message); };
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, error: 'profile is read-only'
+            }), {status: 500, headers: {'Content-Type': 'application/json'}});
+            try {
+                const outcome = await window[trigger]({openSettings: true});
+                return {
+                    outcome,
+                    resumedBook: hasResumedLiveBook(),
+                    startDisabled: startButton.disabled,
+                    resetCalled,
+                    dashboardCalled,
+                    settingsOpened,
+                    successToast: toasts.some(text => text.includes('Resume mode cleared')),
+                };
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+                v4SwitchView = originalSwitch;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": False,
+        "resumedBook": True,
+        "startDisabled": True,
+        "resetCalled": False,
+        "dashboardCalled": False,
+        "settingsOpened": False,
+        "successToast": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "trigger", ["clearResumeModeForFreshSetup", "handleResumeSettingsChangeRequest"]
+)
+def test_successful_settings_fresh_start_opens_setup(page, trigger):
+    """The settings route still advances after a durable fresh-start choice."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
+            let resetCalled = false;
+            let settingsOpened = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            const originalSwitch = v4SwitchView;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => {};
+            v4SwitchView = () => { settingsOpened = true; };
+            showStyledConfirm = async () => true;
+            showToast = () => {};
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {
+                status: 200, headers: {'Content-Type': 'application/json'}
+            });
+            try {
+                const outcome = await window[trigger]({openSettings: true});
+                return {outcome, resumedBook: hasResumedLiveBook(), resetCalled, settingsOpened};
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+                v4SwitchView = originalSwitch;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": True,
+        "resumedBook": False,
+        "resetCalled": True,
+        "settingsOpened": True,
+    }
+
+
 def test_resume_start_sends_explicit_existing_offer_authority_request(page):
     """Only the recovered-book CTA may request the exact live-offer start path."""
 
