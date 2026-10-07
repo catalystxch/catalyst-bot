@@ -1195,6 +1195,75 @@ def test_slow_heartbeat_database_stage_is_attributed(
     assert set(stages) == {"connection", "begin", "read", "finish", "close"}
 
 
+@pytest.mark.parametrize("paused_stage", ["begin", "read", "finish", "close"])
+def test_expired_heartbeat_after_database_stage_pause_is_fenced_and_attributed(
+    isolated_gate_database, monkeypatch, paused_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def pause():
+        time.sleep(0.02)
+        clock.advance(35)
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "begin" and sql == "BEGIN IMMEDIATE":
+                pause()
+            elif (
+                paused_stage == "read"
+                and sql == "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                pause()
+            elif paused_stage == "finish" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                pause()
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            if paused_stage == "close":
+                pause()
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    result = gate.heartbeat()
+    assert result["heartbeat"] is False
+    assert result["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    assert timing["attempts"][0]["database_ms"][paused_stage] >= 15
+
+
 def test_expired_heartbeat_logs_where_delayed_connection_spent_time(
     isolated_gate_database, monkeypatch
 ):

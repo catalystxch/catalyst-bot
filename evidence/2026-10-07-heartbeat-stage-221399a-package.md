@@ -17,3 +17,12 @@ in their corresponding bounded `database_ms` fields. The complete
 and `git diff --check` passed. This verifies attribution when those
 database stages return; it does not identify the instruction delayed in the
 historical Veeam snapshot or make the failed 24-hour window pass.
+
+A subsequent isolated test-only check advanced the clock beyond the 30-second
+lease during each of the begin, read, update and close stages. Each heartbeat
+failed closed with `HEARTBEAT_FAILED`, and the timing record attributed the
+delayed stage. The focused four cases and complete mutation-gate file passed
+**273 tests**; Ruff check and format passed. This exercises the return paths
+around a host pause without performing a wallet effect. The historical Veeam
+stall remains unexplained; the exact `221399a` package still has not run on
+the original profile.
