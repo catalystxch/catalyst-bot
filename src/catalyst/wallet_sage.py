@@ -2414,39 +2414,14 @@ def _query_coin_records(
     if not supported:
         return None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "sort_mode": "amount",
-            "filter_mode": filter_mode,
-            "ascending": False,
-        },
-        timeout=15,
+    coins = _get_complete_sage_coin_rows(
+        asset_id,
+        filter_mode,
+        sort_mode="coin_id",
+        ascending=True,
     )
-
-    if not result or not isinstance(result, dict):
+    if coins is None:
         return None
-    if not _rpc_succeeded(result):
-        # Preserve the structured Sage failure so coin watchers and other
-        # callers fail closed instead of diffing an invented empty wallet.
-        # This remains independent of external market-provider degradation,
-        # including the current TibetSwap outage.
-        return result
-
-    coins = _extract_sage_coin_list(result)
-    if not coins:
-        result_keys = [k for k in result.keys() if k not in ("success", "error")]
-        if result_keys:
-            total = result.get("total")
-            total_suffix = f", total={total}" if total is not None else ""
-            _console(
-                f"⚠️  [Sage] get_coins({filter_mode}) returned 0 coins "
-                f"(keys: {result_keys}{total_suffix})",
-                flush=True,
-            )
 
     if WALLET_DEBUG and coins:
         _console(
@@ -2459,6 +2434,9 @@ def _query_coin_records(
         min_amount_mojos=min_amount_mojos,
         max_amount_mojos=max_amount_mojos,
     )
+    # The previous Sage query sorted by amount. Keep that caller contract
+    # after coin-ID pagination proves the full selectable view.
+    records.sort(key=lambda record: record["coin"]["amount"], reverse=True)
     return {
         "success": True,
         "records": records,
