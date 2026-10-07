@@ -1489,6 +1489,11 @@ def _sage_post(
         conn = _get_sage_connection(timeout)
         try:
             if _identity_recheck is not None:
+                # HTTPConnection.request() connects lazily. Finish the TLS
+                # handshake before the final lease check and request send.
+                connect = getattr(conn, "connect", None)
+                if getattr(conn, "sock", None) is None and callable(connect):
+                    connect()
                 _identity_recheck(f"rpc:{path}:send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
@@ -1510,6 +1515,9 @@ def _sage_post(
             )
             _conn_local.conn = conn
             if _identity_recheck is not None:
+                connect = getattr(conn, "connect", None)
+                if getattr(conn, "sock", None) is None and callable(connect):
+                    connect()
                 _identity_recheck(f"rpc:{path}:retry_send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict

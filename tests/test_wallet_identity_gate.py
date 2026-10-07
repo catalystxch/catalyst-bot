@@ -854,6 +854,43 @@ def test_sage_rpc_does_not_send_after_connection_setup_outlives_lease(monkeypatc
     assert sent == []
 
 
+def test_sage_rpc_does_not_send_after_tls_handshake_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeConnection:
+        sock = None
+
+        def connect(self):
+            nonlocal now_seconds
+            now_seconds = 35
+            self.sock = object()
+
+        def request(self, method, path, *, body, headers):
+            if self.sock is None:
+                self.connect()
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:submit")
+
+    monkeypatch.setattr(
+        wallet_sage, "_get_sage_connection", lambda _timeout: FakeConnection()
+    )
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
 def test_sage_rpc_does_not_retry_send_after_reconnect_outlives_lease(monkeypatch):
     import wallet_sage
 
@@ -884,6 +921,60 @@ def test_sage_rpc_does_not_retry_send_after_reconnect_outlives_lease(monkeypatch
         wallet_sage, "_get_sage_connection", lambda _timeout: StaleConnection()
     )
     monkeypatch.setattr(wallet_sage.http.client, "HTTPSConnection", delayed_reconnect)
+    monkeypatch.setattr(
+        wallet_sage.ssl,
+        "_create_unverified_context",
+        lambda: SimpleNamespace(load_cert_chain=lambda *_args: None),
+    )
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert retry_sent == []
+
+
+def test_sage_rpc_does_not_retry_send_after_tls_handshake_outlives_lease(
+    monkeypatch,
+):
+    import wallet_sage
+
+    now_seconds = 0
+    retry_sent = []
+
+    class StaleConnection:
+        sock = object()
+
+        def request(self, *_args, **_kwargs):
+            raise ConnectionError("stale connection")
+
+    class RetryConnection:
+        sock = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            nonlocal now_seconds
+            now_seconds = 35
+            self.sock = object()
+
+        def request(self, method, path, *, body, headers):
+            if self.sock is None:
+                self.connect()
+            retry_sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:submit")
+
+    monkeypatch.setattr(
+        wallet_sage, "_get_sage_connection", lambda _timeout: StaleConnection()
+    )
+    monkeypatch.setattr(wallet_sage.http.client, "HTTPSConnection", RetryConnection)
     monkeypatch.setattr(
         wallet_sage.ssl,
         "_create_unverified_context",
