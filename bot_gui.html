@@ -32266,9 +32266,6 @@
         }
 
         async function dismissResumeFresh() {
-            _resumeHandled = true;
-            clearResumeSessionSummary();
-
             try {
                 const response = await apiFetch(`${API_URL}/session/fresh-start`, {
                     method: 'POST',
@@ -32285,6 +32282,8 @@
                 return false;
             }
 
+            _resumeHandled = true;
+            clearResumeSessionSummary();
             resetPairSelectionState('Choose a CAT pair for this wallet.');
             clearPairScopedDashboardState('selected pair');
             setFreshStartTemplateState(true);

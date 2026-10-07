@@ -1061,6 +1061,10 @@ def test_failed_fresh_start_choice_keeps_recovery_prompt_open(page, trigger):
 
     result = page.evaluate(
         """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
             document.getElementById('resumeSessionModal').classList.add('active');
             const startButton = document.getElementById('startBtn');
             startButton.disabled = true;
@@ -1081,6 +1085,8 @@ def test_failed_fresh_start_choice_keeps_recovery_prompt_open(page, trigger):
                     outcome,
                     modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
                     startDisabled: startButton.disabled,
+                    resumedBook: hasResumedLiveBook(),
+                    resumeHandled: _resumeHandled,
                     resetCalled,
                     dashboardCalled,
                     successToast: toasts.some(text => text.includes('Fresh run started')),
@@ -1097,6 +1103,8 @@ def test_failed_fresh_start_choice_keeps_recovery_prompt_open(page, trigger):
         "outcome": False,
         "modalActive": True,
         "startDisabled": True,
+        "resumedBook": True,
+        "resumeHandled": False,
         "resetCalled": False,
         "dashboardCalled": False,
         "successToast": False,
