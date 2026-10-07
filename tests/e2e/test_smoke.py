@@ -1053,6 +1053,83 @@ def test_verified_resume_enables_start_after_live_book_check(page):
     }
 
 
+@pytest.mark.parametrize("trigger", ["dismissResumeFresh", "dismissResumeAfterLoad"])
+def test_failed_fresh_start_choice_keeps_recovery_prompt_open(page, trigger):
+    """A rejected durable choice must not claim that a fresh run began."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            let resetCalled = false;
+            let dashboardCalled = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => { dashboardCalled = true; };
+            const toasts = [];
+            showToast = (message) => { toasts.push(message); };
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, error: 'profile is read-only'
+            }), {status: 500, headers: {'Content-Type': 'application/json'}});
+            try {
+                const outcome = await window[trigger]();
+                return {
+                    outcome,
+                    modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                    startDisabled: startButton.disabled,
+                    resetCalled,
+                    dashboardCalled,
+                    successToast: toasts.some(text => text.includes('Fresh run started')),
+                };
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": False,
+        "modalActive": True,
+        "startDisabled": True,
+        "resetCalled": False,
+        "dashboardCalled": False,
+        "successToast": False,
+    }
+
+
+def test_successful_fresh_start_choice_closes_recovery_prompt(page):
+    """The post-load Start Fresh action still advances after server success."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {
+                status: 200, headers: {'Content-Type': 'application/json'}
+            });
+            fetchDashboard = () => {};
+            showToast = () => {};
+            const outcome = await dismissResumeAfterLoad();
+            return {
+                outcome,
+                modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                startDisabled: startButton.disabled,
+            };
+        }"""
+    )
+
+    assert result == {"outcome": True, "modalActive": False, "startDisabled": True}
+
+
 def test_resume_start_sends_explicit_existing_offer_authority_request(page):
     """Only the recovered-book CTA may request the exact live-offer start path."""
 

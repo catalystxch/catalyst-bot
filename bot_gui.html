@@ -32282,6 +32282,7 @@
             } catch (err) {
                 debugWarn('[RESUME] Fresh-start reset failed:', err);
                 showToast('Start Fresh reset failed: ' + formatError(err), 'warning');
+                return false;
             }
 
             resetPairSelectionState('Choose a CAT pair for this wallet.');
@@ -32297,6 +32298,7 @@
             fetchDashboard();
             debugLog('[RESUME] User chose Start Fresh \u2014 settingsReviewed:', settingsReviewed);
             showToast('Fresh run started \u2014 review settings and run coin prep for the new setup.', 'info');
+            return true;
         }
 
         function resumeSkip() {
@@ -32324,8 +32326,7 @@
 
         // Called from the "Start Fresh for Changes" button in the post-load modal
         async function dismissResumeAfterLoad() {
-            document.getElementById('resumeSessionModal').classList.remove('active');
-            await dismissResumeFresh();
+            return await dismissResumeFresh();
         }
 
         // Called from the "Start Bot Now" button in the post-load modal
