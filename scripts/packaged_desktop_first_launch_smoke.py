@@ -7,10 +7,12 @@ import argparse
 import ctypes
 import json
 import os
+import secrets
 import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -42,6 +44,7 @@ def _clean_first_launch_env(data_dir: Path, port: int) -> dict[str, str]:
         {
             "CMM_DATA_DIR": str(data_dir),
             "CATALYST_FLASK_PORT": str(port),
+            "BOT_LOCAL_WRITE_TOKEN": secrets.token_urlsafe(32),
             "PYTHONIOENCODING": "utf-8",
         }
     )
@@ -150,7 +153,9 @@ def _window_is_restored_and_foreground(process_id: int, handle: int) -> bool:
     )
 
 
-def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
+def _wait_for_first_launch(
+    port: int, process: subprocess.Popen, local_token: str
+) -> None:
     deadline = time.monotonic() + 45
     root_url = f"http://127.0.0.1:{port}/"
     safety_url = f"http://127.0.0.1:{port}/api/safety/status"
@@ -161,8 +166,21 @@ def _wait_for_first_launch(port: int, process: subprocess.Popen) -> None:
                 f"desktop process exited before first-run UI was ready: {process.returncode}"
             )
         try:
-            # Both URLs are constructed above from a fixed loopback HTTP origin.
-            with urllib.request.urlopen(root_url, timeout=2) as response:  # nosec B310
+            # A second local process must not obtain a browser write session
+            # by requesting the dashboard without its private credential.
+            try:
+                with urllib.request.urlopen(root_url, timeout=2):  # nosec B310
+                    raise SmokeFailure("uncredentialed root exposed the dashboard")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    raise SmokeFailure(
+                        f"uncredentialed root returned HTTP {exc.code}, not 401"
+                    ) from exc
+
+            request = urllib.request.Request(
+                root_url, headers={"X-Bot-Local-Token": local_token}
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:  # nosec B310
                 content_type = response.headers.get("content-type", "").lower()
                 body = response.read().decode("utf-8", errors="replace")
             if "text/html" not in content_type:
@@ -316,7 +334,9 @@ def main() -> int:
             environment = _clean_first_launch_env(data_dir, port)
             process = _launch(executable, environment, log_file)
             try:
-                _wait_for_first_launch(port, process)
+                _wait_for_first_launch(
+                    port, process, environment["BOT_LOCAL_WRITE_TOKEN"]
+                )
                 owner_window_handle = _minimize_catalyst_window(process.pid)
                 duplicate = _launch(executable, environment, log_file)
                 try:
@@ -344,7 +364,9 @@ def main() -> int:
 
             persisted = _launch(executable, environment, log_file)
             try:
-                _wait_for_first_launch(port, persisted)
+                _wait_for_first_launch(
+                    port, persisted, environment["BOT_LOCAL_WRITE_TOKEN"]
+                )
             except Exception:
                 log_file.flush()
                 details = log_path.read_text(encoding="utf-8", errors="replace")
