@@ -163,6 +163,7 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
             },
             timeout=60,
             retry_transport_error=False,
+            _identity_recheck=None,
         )
         for result in results.values():
             self.assertEqual(result["outcome"], CANCEL_FAILED)
@@ -196,6 +197,7 @@ class SageTypedBatchCancelCompatibilityTests(unittest.TestCase):
             },
             timeout=60,
             retry_transport_error=False,
+            _identity_recheck=None,
         )
         self.assertEqual(set(results), set(trade_ids))
         for result in results.values():

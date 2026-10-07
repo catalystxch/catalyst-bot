@@ -817,6 +817,275 @@ def test_compound_wallet_export_rechecks_identity_inside_adapter(monkeypatch):
     ]
 
 
+def test_sage_rpc_does_not_send_after_connection_setup_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return b'{"success": true}'
+
+    class FakeConnection:
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return FakeResponse()
+
+    def delayed_connection(_timeout):
+        nonlocal now_seconds
+        now_seconds = 35
+        return FakeConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:submit")
+
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
+def test_sage_rpc_does_not_retry_send_after_reconnect_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    retry_sent = []
+
+    class StaleConnection:
+        def request(self, *_args, **_kwargs):
+            raise ConnectionError("stale connection")
+
+    class RetryConnection:
+        def request(self, method, path, *, body, headers):
+            retry_sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def delayed_reconnect(*_args, **_kwargs):
+        nonlocal now_seconds
+        now_seconds = 35
+        return RetryConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:submit")
+
+    monkeypatch.setattr(
+        wallet_sage, "_get_sage_connection", lambda _timeout: StaleConnection()
+    )
+    monkeypatch.setattr(wallet_sage.http.client, "HTTPSConnection", delayed_reconnect)
+    monkeypatch.setattr(
+        wallet_sage.ssl,
+        "_create_unverified_context",
+        lambda: SimpleNamespace(load_cert_chain=lambda *_args: None),
+    )
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.rpc("submit_transaction", {}, _identity_recheck=require_live_lease)
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert retry_sent == []
+
+
+def test_sage_direct_cancel_does_not_send_after_connection_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeConnection:
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(
+                status=200, read=lambda: b'{"success": false, "error": "rejected"}'
+            )
+
+    def delayed_connection(_timeout):
+        nonlocal now_seconds
+        now_seconds = 35
+        return FakeConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:cancel")
+
+    monkeypatch.setattr(wallet_sage, "_require_signing_capability", lambda: True)
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.cancel_offer(
+            "a" * 64, secure=False, _identity_recheck=require_live_lease
+        )
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
+def test_sage_direct_sign_does_not_send_after_connection_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeConnection:
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def delayed_connection(_timeout):
+        nonlocal now_seconds
+        now_seconds = 35
+        return FakeConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:sign")
+
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage._submit_coin_spends_if_needed(
+            {"success": True, "coin_spends": [{"coin": "fake"}]},
+            "cancel_offer",
+            _identity_recheck=require_live_lease,
+        )
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
+def test_sage_direct_submit_does_not_send_after_connection_outlives_lease(monkeypatch):
+    import json
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+    connections = 0
+
+    class FakeConnection:
+        def __init__(self, response):
+            self.response = response
+
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(
+                status=200, read=lambda: json.dumps(self.response).encode()
+            )
+
+    def delayed_second_connection(_timeout):
+        nonlocal now_seconds, connections
+        connections += 1
+        if connections == 2:
+            now_seconds = 35
+            return FakeConnection({"success": True})
+        return FakeConnection(
+            {"success": True, "spend_bundle": {"aggregated_signature": "aa"}}
+        )
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:submit")
+
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_second_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage._submit_coin_spends_if_needed(
+            {"success": True, "coin_spends": [{"coin": "fake"}]},
+            "cancel_offer",
+            _identity_recheck=require_live_lease,
+        )
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == [("POST", "/sign_coin_spends")]
+
+
+def test_sage_bulk_cancel_build_does_not_send_after_connection_outlives_lease(
+    monkeypatch,
+):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeConnection:
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def delayed_connection(_timeout):
+        nonlocal now_seconds
+        now_seconds = 35
+        return FakeConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:bulk_cancel")
+
+    monkeypatch.setattr(wallet_sage, "_require_signing_capability", lambda: True)
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.build_cancel_offers_batch_unsigned(
+            ["a" * 64],
+            fee_mojos=0,
+            source_coin_ids=["b" * 64],
+            fee_coin_id="c" * 64,
+            _identity_recheck=require_live_lease,
+        )
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
+def test_sage_delete_offer_does_not_send_after_connection_outlives_lease(monkeypatch):
+    import wallet_sage
+
+    now_seconds = 0
+    sent = []
+
+    class FakeConnection:
+        def request(self, method, path, *, body, headers):
+            sent.append((method, path))
+
+        def getresponse(self):
+            return SimpleNamespace(status=200, read=lambda: b'{"success": true}')
+
+    def delayed_connection(_timeout):
+        nonlocal now_seconds
+        now_seconds = 35
+        return FakeConnection()
+
+    def require_live_lease(_step):
+        if now_seconds >= 30:
+            raise mutation_gate.MutationBlocked("LEASE_EXPIRED", "wallet:delete")
+
+    monkeypatch.setattr(wallet_sage, "_get_sage_connection", delayed_connection)
+
+    with pytest.raises(mutation_gate.MutationBlocked) as blocked:
+        wallet_sage.delete_offer("a" * 64, _identity_recheck=require_live_lease)
+
+    assert blocked.value.reason_code == "LEASE_EXPIRED"
+    assert sent == []
+
+
 @pytest.mark.parametrize(
     ("adapter_name", "caller_name", "callee_name"),
     [
@@ -1017,7 +1286,9 @@ def test_sage_create_transaction_rechecks_create_sign_and_submit(monkeypatch):
         ),
     )
 
-    def sage_post(endpoint, payload, timeout=10):
+    def sage_post(endpoint, payload, timeout=10, *, _identity_recheck=None):
+        if _identity_recheck is not None:
+            _identity_recheck(f"rpc:{endpoint}:send")
         events.append(endpoint)
         if endpoint == "sign_coin_spends":
             return {"spend_bundle": {"aggregated_signature": "signature"}}
@@ -1036,8 +1307,10 @@ def test_sage_create_transaction_rechecks_create_sign_and_submit(monkeypatch):
         "check:create_transaction",
         "create_transaction",
         "check:create_transaction:sign",
+        "check:rpc:sign_coin_spends:send",
         "sign_coin_spends",
         "check:create_transaction:submit",
+        "check:rpc:submit_transaction:send",
         "submit_transaction",
     ]
 

@@ -1474,6 +1474,7 @@ def _sage_post(
     timeout: int = 10,
     *,
     retry_transport_error: bool = True,
+    _identity_recheck=None,
 ):
     """Low-level HTTPS POST to Sage, bypassing requests library entirely.
 
@@ -1487,11 +1488,15 @@ def _sage_post(
     try:
         conn = _get_sage_connection(timeout)
         try:
+            if _identity_recheck is not None:
+                _identity_recheck(f"rpc:{path}:send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
             )
             resp = conn.getresponse()
             data = resp.read().decode("utf-8")
+        except mutation_gate.MutationBlocked:
+            raise
         except Exception:
             # Connection was stale — recreate and retry once.
             _conn_local.conn = None
@@ -1504,11 +1509,15 @@ def _sage_post(
                 _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
             )
             _conn_local.conn = conn
+            if _identity_recheck is not None:
+                _identity_recheck(f"rpc:{path}:retry_send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
             )
             resp = conn.getresponse()
             data = resp.read().decode("utf-8")
+    except mutation_gate.MutationBlocked:
+        raise
     except _SageRPCFailure:
         raise
     except Exception:
@@ -1720,7 +1729,15 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10, *, _identity_recheck=No
     if _identity_recheck is not None:
         _identity_recheck(f"rpc:{endpoint}")
     try:
-        result = _sage_post(endpoint, payload, timeout=timeout)
+        if _identity_recheck is None:
+            result = _sage_post(endpoint, payload, timeout=timeout)
+        else:
+            result = _sage_post(
+                endpoint,
+                payload,
+                timeout=timeout,
+                _identity_recheck=_identity_recheck,
+            )
 
         if WALLET_DEBUG:
             elapsed = time.time() - start
@@ -1730,6 +1747,8 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10, *, _identity_recheck=No
                 )
 
         return result
+    except mutation_gate.MutationBlocked:
+        raise
     except _SageRPCFailure as error:
         diagnostic = _build_sage_diagnostic(
             endpoint=endpoint,
@@ -3408,7 +3427,10 @@ def _submit_coin_spends_if_needed(
                 "partial": False,
             },
             timeout=30,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as exc:
         return {
             "success": False,
@@ -3444,7 +3466,10 @@ def _submit_coin_spends_if_needed(
                 "spend_bundle": spend_bundle,
             },
             timeout=30,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as exc:
         return {
             "success": False,
@@ -4769,6 +4794,7 @@ def cancel_offer(
             payload,
             timeout=timeout,
             retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
         )
         result = _submit_coin_spends_if_needed(
             result,
@@ -5679,6 +5705,7 @@ def build_cancel_offers_batch_unsigned(
         {"offer_ids": unique_trade_ids, "fee": "0", "auto_submit": False},
         timeout=rpc_timeout,
         retry_transport_error=False,
+        _identity_recheck=_identity_recheck,
     )
     cancel_result = _validate_cancel_unsigned_component(
         cancel_result, 0, normalized_source_ids
@@ -5729,6 +5756,7 @@ def build_cancel_offers_batch_unsigned(
         },
         timeout=60,
         retry_transport_error=False,
+        _identity_recheck=_identity_recheck,
     )
     fee_result = _validate_cancel_unsigned_component(
         fee_result, fee_mojos, [normalized_fee_coin_id]
@@ -5936,6 +5964,7 @@ def cancel_offers_batch(
             payload,
             timeout=rpc_timeout,
             retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
         )
         result = _validate_unsigned_component(
             result,
@@ -5963,6 +5992,7 @@ def cancel_offers_batch(
                 },
                 timeout=60,
                 retry_transport_error=False,
+                _identity_recheck=_identity_recheck,
             )
             fee_result = _validate_unsigned_component(
                 fee_result,
@@ -6958,7 +6988,12 @@ def delete_offer(offer_id: str, *, _identity_recheck=None) -> bool:
     if _identity_recheck is not None:
         _identity_recheck("delete_offer")
     try:
-        result = _sage_post("delete_offer", {"offer_id": bare_id}, timeout=10)
+        result = _sage_post(
+            "delete_offer",
+            {"offer_id": bare_id},
+            timeout=10,
+            _identity_recheck=_identity_recheck,
+        )
         if WALLET_DEBUG:
             _console(f"   [Sage] delete_offer {bare_id[:16]}... → {result}")
         if result is None:
@@ -6979,6 +7014,8 @@ def delete_offer(offer_id: str, *, _identity_recheck=None) -> bool:
                 )
             return False
         return True
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as e:
         if not _quiet_mode:
             _console(f"   ⚠️ [Sage] delete_offer {bare_id[:16]}... failed: {e}")

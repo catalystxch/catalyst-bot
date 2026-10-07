@@ -295,7 +295,9 @@ def test_validated_result_rechecks_before_sign_and_submit(monkeypatch):
     events = []
     sealed = wallet_sage.validate_unsigned_transaction_effect(response(), contract())
 
-    def post(endpoint, payload, timeout=30):
+    def post(endpoint, payload, timeout=30, *, _identity_recheck=None):
+        if _identity_recheck is not None:
+            _identity_recheck(f"rpc:{endpoint}:send")
         events.append(endpoint)
         if endpoint == "sign_coin_spends":
             return {"spend_bundle": {"aggregated_signature": "sig", "coin_spends": []}}
@@ -308,8 +310,10 @@ def test_validated_result_rechecks_before_sign_and_submit(monkeypatch):
     assert result["success"] is True
     assert events == [
         "check:create_transaction:sign",
+        "check:rpc:sign_coin_spends:send",
         "sign_coin_spends",
         "check:create_transaction:submit",
+        "check:rpc:submit_transaction:send",
         "submit_transaction",
     ]
 

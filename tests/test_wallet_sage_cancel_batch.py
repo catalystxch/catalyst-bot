@@ -293,6 +293,7 @@ class WalletSageCancelBatchTests(unittest.TestCase):
             },
             timeout=60,
             retry_transport_error=False,
+            _identity_recheck=None,
         )
 
     def test_cancel_offer_treats_mempool_conflict_as_pending_cancel(self):
