@@ -1154,8 +1154,6 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     # Verify a multi-page read with a second traversal because offset pages
     # can shift while the wallet's open book changes.
     page_size = end - start
-    if len(offers) < page_size:
-        return offers
 
     def complete_book(first_page):
         rows = list(first_page)
@@ -1190,6 +1188,8 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     first_book = complete_book(offers)
     if first_book is None:
         return None
+    if len(offers) < page_size:
+        return first_book
     second_page = _read_chia_offer_page(include_completed, 0, page_size)
     if second_page is None:
         return None

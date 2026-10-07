@@ -62,6 +62,22 @@ def test_general_chia_offer_reader_accepts_explicit_empty_page():
         assert wallet_chia.get_all_offers(False, 0, 50) == []
 
 
+def test_open_chia_offer_reader_rejects_idless_short_page():
+    row = {"status": "PENDING_ACCEPT", "summary": {"offered": {}, "requested": {}}}
+    with patch.object(
+        wallet_chia, "rpc", return_value={"success": True, "trades": [row]}
+    ):
+        assert wallet_chia.get_all_offers(False, 0, 50) is None
+
+
+def test_open_chia_offer_reader_rejects_duplicate_ids_on_short_page():
+    rows = [{"trade_id": "same"}, {"trade_id": "same"}]
+    with patch.object(
+        wallet_chia, "rpc", return_value={"success": True, "trades": rows}
+    ):
+        assert wallet_chia.get_all_offers(False, 0, 50) is None
+
+
 def test_open_chia_offer_reader_retrieves_all_pages_before_claiming_freshness():
     all_rows = [{"trade_id": f"trade-{index}"} for index in range(501)]
 
