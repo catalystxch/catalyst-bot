@@ -34079,7 +34079,7 @@
 
                 // Render fingerprint cards
                 cards.innerHTML = data.fingerprints.map((fp, i) => `
-                    <button type="button" class="fp-card${currentFp === fp.fingerprint ? ' selected' : ''}" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
+                    <button type="button" class="fp-card${currentFp === fp.fingerprint ? ' selected' : ''}" data-fingerprint="${escapeAttr(fp.fingerprint)}" aria-label="${escapeAttr(fp.label || 'Wallet ' + (i + 1))} ${escapeAttr(fp.fingerprint)} →">
                         <span class="fp-card-icon" aria-hidden="true">🔑</span>
                         <span class="fp-card-info">
                             <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>
@@ -38484,7 +38484,7 @@ async function startupShowFingerprints() {
 
         const container = document.getElementById('startupFpCards');
         container.innerHTML = data.fingerprints.map((fp, i) => `
-            <button type="button" class="fp-card" data-fingerprint="${escapeHtml(fp.fingerprint)}" aria-label="${escapeHtml(fp.label || 'Wallet ' + (i + 1))} ${escapeHtml(fp.fingerprint)} →">
+            <button type="button" class="fp-card" data-fingerprint="${escapeAttr(fp.fingerprint)}" aria-label="${escapeAttr(fp.label || 'Wallet ' + (i + 1))} ${escapeAttr(fp.fingerprint)} →">
                 <span class="fp-card-icon" aria-hidden="true">🔑</span>
                 <span class="fp-card-info">
                     <span class="fp-card-label">${escapeHtml(fp.label || 'Wallet ' + (i + 1))}</span>

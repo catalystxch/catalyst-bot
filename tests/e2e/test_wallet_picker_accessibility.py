@@ -84,6 +84,25 @@ def test_long_wallet_label_wraps_inside_picker(page):
     assert geometry["arrowRight"] <= geometry["right"] + 1
 
 
+@pytest.mark.parametrize(
+    ("show_picker", "card_selector"),
+    [
+        ("showWalletPickerModal()", "#walletPickerCards .fp-card"),
+        ("startupShowFingerprints()", "#startupFpCards .fp-card"),
+    ],
+)
+def test_wallet_label_cannot_install_event_handler(page, show_picker, card_selector):
+    label = 'Wallet" onpointerenter="window.__walletLabelEvent=true" x="'
+    _load_picker_page(page, label)
+    page.evaluate(show_picker)
+
+    card = page.locator(card_selector)
+    expect(card).to_have_count(1)
+    assert card.get_attribute("onpointerenter") is None
+    card.dispatch_event("pointerenter")
+    assert page.evaluate("window.__walletLabelEvent === true") is False
+
+
 def test_disabled_start_button_describes_its_reason(page):
     _load_picker_page(page)
     start = page.locator("#startBtn")
