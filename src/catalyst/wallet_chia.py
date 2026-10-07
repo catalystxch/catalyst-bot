@@ -1149,38 +1149,54 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     if offers is None or include_completed or start != 0 or end <= start:
         return offers
 
-    # Safety callers use the open book as one authoritative snapshot. A full
-    # Chia page is not proof that the book ends there: older live offers can
-    # belong to the selected asset even when newer unrelated offers fill it.
+    # Safety callers need the complete open book. A full Chia page is not
+    # proof that the book ends there: older offers can belong to this asset.
+    # Verify a multi-page read with a second traversal because offset pages
+    # can shift while the wallet's open book changes.
     page_size = end - start
-    seen_ids = set()
-    page_count = 1
-    page = offers
-    while len(offers) >= page_size:
-        if len(page) > page_size:
-            return None
-        page_ids = [
-            str(row.get("trade_id") or row.get("offer_id") or "").strip()
-            for row in page
-        ]
-        if any(not trade_id or trade_id in seen_ids for trade_id in page_ids):
-            return None
-        if len(set(page_ids)) != len(page_ids):
-            return None
-        seen_ids.update(page_ids)
-        if len(page) < page_size:
-            return offers
-        if page_count >= 40:
-            return None
-        next_start = page_count * page_size
-        page = _read_chia_offer_page(
-            include_completed, next_start, next_start + page_size
-        )
-        if page is None:
-            return None
-        offers.extend(page)
-        page_count += 1
-    return offers
+    if len(offers) < page_size:
+        return offers
+
+    def complete_book(first_page):
+        rows = list(first_page)
+        seen_ids = set()
+        page_count = 1
+        page = first_page
+        while True:
+            if len(page) > page_size:
+                return None
+            page_ids = [
+                str(row.get("trade_id") or row.get("offer_id") or "").strip()
+                for row in page
+            ]
+            if any(not trade_id or trade_id in seen_ids for trade_id in page_ids):
+                return None
+            if len(set(page_ids)) != len(page_ids):
+                return None
+            seen_ids.update(page_ids)
+            if len(page) < page_size:
+                return rows
+            if page_count >= 40:
+                return None
+            next_start = page_count * page_size
+            page = _read_chia_offer_page(
+                include_completed, next_start, next_start + page_size
+            )
+            if page is None:
+                return None
+            rows.extend(page)
+            page_count += 1
+
+    first_book = complete_book(offers)
+    if first_book is None:
+        return None
+    second_page = _read_chia_offer_page(include_completed, 0, page_size)
+    if second_page is None:
+        return None
+    second_book = complete_book(second_page)
+    if second_book is None:
+        return None
+    return second_book if first_book == second_book else None
 
 
 def get_authoritative_offer_history(

@@ -75,7 +75,7 @@ def test_open_chia_offer_reader_retrieves_all_pages_before_claiming_freshness():
         result = wallet_chia.get_all_offers(False, 0, 500)
 
     assert result == all_rows
-    assert rpc.call_count == 2
+    assert rpc.call_count == 4
 
 
 def test_open_chia_offer_reader_continues_after_multiple_full_pages():
@@ -91,7 +91,7 @@ def test_open_chia_offer_reader_continues_after_multiple_full_pages():
         result = wallet_chia.get_all_offers(False, 0, 500)
 
     assert result == all_rows
-    assert rpc.call_count == 3
+    assert rpc.call_count == 6
 
 
 def test_open_chia_offer_reader_rejects_failed_later_page():
@@ -124,7 +124,7 @@ def test_open_chia_offer_reader_confirms_exact_page_multiple_is_complete():
 
     with patch.object(wallet_chia, "rpc", side_effect=paged_rpc) as rpc:
         assert wallet_chia.get_all_offers(False, 0, 50) == rows
-    assert rpc.call_count == 3
+    assert rpc.call_count == 6
 
 
 def test_open_chia_offer_reader_fails_closed_at_page_limit():
@@ -145,6 +145,30 @@ def test_open_chia_offer_reader_rejects_overfull_page():
     ) as rpc:
         assert wallet_chia.get_all_offers(False, 0, 50) is None
     assert rpc.call_count == 1
+
+
+def test_open_chia_offer_reader_rejects_book_shift_during_pagination():
+    pages = [
+        {"success": True, "trades": [{"trade_id": "a"}, {"trade_id": "b"}]},
+        {"success": True, "trades": [{"trade_id": "d"}]},
+        {"success": True, "trades": [{"trade_id": "b"}, {"trade_id": "c"}]},
+        {"success": True, "trades": [{"trade_id": "d"}]},
+    ]
+    with patch.object(wallet_chia, "rpc", side_effect=pages) as rpc:
+        assert wallet_chia.get_all_offers(False, 0, 2) is None
+    assert rpc.call_count == 4
+
+
+def test_open_chia_offer_reader_rejects_changed_status_between_passes():
+    pages = [
+        {"success": True, "trades": [{"trade_id": "a", "status": "PENDING_ACCEPT"}]},
+        {"success": True, "trades": []},
+        {"success": True, "trades": [{"trade_id": "a", "status": "PENDING_CANCEL"}]},
+        {"success": True, "trades": []},
+    ]
+    with patch.object(wallet_chia, "rpc", side_effect=pages) as rpc:
+        assert wallet_chia.get_all_offers(False, 0, 1) is None
+    assert rpc.call_count == 4
 
 
 def test_authoritative_chia_history_keeps_requested_page_bounds():
