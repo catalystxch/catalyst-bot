@@ -29,8 +29,29 @@ serial Windows backend passed **7,368 tests, 246 skipped, 447 subtests** in
 21 minutes 4 seconds. During the run, only the older original-profile app
 owned connections to the operator's Sage RPC port; the pytest process did
 not connect to it. Ruff check, format check, and `git diff --check` passed.
-Exact-source CI, clean package, installer, original-profile acceptance, and
-final review remain pending at this checkpoint.
+The exact source is `b5725c38009041bdf22803dca7e30df048de31a9`.
+A clean detached Windows build produced `Catalyst.exe` SHA-256
+`52069C0B1BB243CEFD30318335807CD7AD484766EFACD60FA8DFC4A51A42E7AD`;
+the bundled `bot_gui.html` is byte-identical to the prior package at
+`A696815D885412C94E1B9B460D2976ED80288819A6E023C0DE60FC4AD0A32609`.
+Packaged API, synthetic Sage mTLS worker, interrupted-publication recovery,
+and isolated native clean/duplicate/persisted/safety smokes passed. The
+192-entry ZIP passed CRC and embedded-EXE hash checks; its extracted EXE
+passed API and synthetic Sage smokes. A unique-AppId QA installer
+clean-installed to E:, its EXE hash matched, installed API and synthetic Sage
+smokes passed, and silent uninstall removed its EXE and QA registry key.
+Defender real-time protection was enabled and custom EXE/ZIP/installer scans
+found no attributable detection.
+
+The [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/d23d9d3db3c642ba48d422687930a21fab7f3502/acceptance-artifacts/CATalyst-b5725c3-primary-acceptance.zip)
+has SHA-256 `09EF019F3EF0822E6B6205C0013C05FEC2B7E483F0C7D825DF4D8F1A22AA90AB`.
+The [unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/d23d9d3db3c642ba48d422687930a21fab7f3502/acceptance-artifacts/Catalyst-Setup-b5725c3-1.4.0.exe)
+has SHA-256 `69B9C9374399BA1E434ED9637B568B674F12A065FED45799A5B0BBDA71BF79D1`.
+Both files and the [manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/d23d9d3db3c642ba48d422687930a21fab7f3502/acceptance-artifacts/SHA256SUMS-b5725c3.txt)
+are pinned at artifact commit `d23d9d3db3c642ba48d422687930a21fab7f3502`;
+independent HTTP downloads matched their hashes. These are acceptance
+artifacts, not a release. Exact-source CI unit tests were still running at
+this checkpoint. Original-profile acceptance and final review remain open.
 
 This narrows the interval between lease validation and an outbound Sage
 request. It does not make host scheduling and Sage delivery atomic: a pause
