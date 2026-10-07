@@ -1096,6 +1096,15 @@ def test_grouped_cancel_conflicts_with_sibling_summary_not_bound_to_task4_facts(
     assert result["reason_code"] == "CANCEL_COHORT_MEMBER_CONTRADICTION"
 
 
+def test_grouped_cancel_rejects_conflicting_sibling_offer_alias():
+    context, evidence = _grouped_cancel_contradiction_case()
+    evidence["offer_history"]["records"][1]["offer_id"] = TRADE
+
+    result = _classify(evidence, cancel_context=context)
+
+    assert result["classification"] == UNKNOWN
+
+
 def test_same_wallet_self_take_is_fill_not_cancel():
     evidence = _evidence(
         transactions=[
@@ -3092,6 +3101,39 @@ def test_sage_coin_asset_inference_rejects_conflicting_duplicate_history_row(
     )
 
     assert wallet_sage._exact_authoritative_offer_asset_ids({TRADE}) == {}
+
+
+@pytest.mark.parametrize("conflicting_alias", [OTHER_TRADE, "not-a-hex-offer-id"])
+def test_terminal_reconciliation_rejects_conflicting_sage_offer_alias(
+    conflicting_alias,
+):
+    offer = _offer()
+    offer["offer_id"] = conflicting_alias
+
+    result = classify_terminal_evidence(_intent(), _evidence(offers=[offer]), now=AFTER)
+
+    assert result["classification"] == UNKNOWN
+
+
+def test_terminal_reconciliation_accepts_equivalent_sage_offer_alias():
+    offer = _offer()
+    offer["offer_id"] = "0x" + TRADE.upper()
+
+    result = classify_terminal_evidence(_intent(), _evidence(offers=[offer]), now=AFTER)
+
+    assert result["classification"] == FILLED_PROVEN
+
+
+@pytest.mark.parametrize("conflicting_alias", [OTHER_TRADE, "not-a-hex-offer-id"])
+def test_terminal_reconciliation_rejects_conflicting_secondary_sage_alias(
+    conflicting_alias,
+):
+    offer = _offer(trade_id=conflicting_alias)
+    offer["offer_id"] = TRADE
+
+    result = classify_terminal_evidence(_intent(), _evidence(offers=[offer]), now=AFTER)
+
+    assert result["classification"] == UNKNOWN
 
 
 @pytest.mark.parametrize(
