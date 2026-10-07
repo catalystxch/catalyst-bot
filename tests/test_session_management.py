@@ -203,23 +203,46 @@ class SessionManagementTests(unittest.TestCase):
             self.assertFalse(_api_server._fresh_start_is_set())
 
     # ------------------------------------------------------------------
-    # 6. _FRESH_START_FLAG resolves to the project directory
+    # 6. fresh-start persistence uses the writable user profile
     # ------------------------------------------------------------------
 
-    def test_flag_path_is_in_project_directory(self):
-        """_FRESH_START_FLAG must live next to api_server.py, not in a temp dir."""
+    def test_fresh_start_flag_persists_in_user_data_directory(self):
+        """A read-only installation must not prevent fresh-start persistence."""
+        from user_paths import data_dir
+
         flag = _api_server._FRESH_START_FLAG
-        expected_dir = os.path.dirname(os.path.abspath(_api_server.__file__))
+        expected_dir = os.path.abspath(data_dir())
         actual_dir = os.path.dirname(os.path.abspath(flag))
         self.assertEqual(
             actual_dir,
             expected_dir,
-            f"Flag path {flag!r} is not in the project directory {expected_dir!r}",
+            f"Flag path {flag!r} is outside the writable profile {expected_dir!r}",
         )
-        self.assertTrue(
-            flag.endswith(".fresh_start_chosen"),
-            f"Flag file should be named .fresh_start_chosen, got: {flag!r}",
-        )
+        self.assertFalse(os.path.exists(flag))
+        try:
+            _api_server._fresh_start_set()
+            self.assertTrue(_api_server._fresh_start_is_set())
+        finally:
+            _api_server._fresh_start_clear()
+        self.assertFalse(os.path.exists(flag))
+
+    def test_fresh_start_flag_write_failure_is_reported(self):
+        """A failed durable choice cannot be reported as a successful reset."""
+        with patch(
+            "builtins.open", side_effect=PermissionError("profile is read-only")
+        ):
+            with self.assertRaises(PermissionError):
+                _api_server._fresh_start_set()
+
+    def test_resume_flag_clear_failure_is_reported(self):
+        """Resume choice cannot succeed while the old fresh-start flag remains."""
+        with (
+            patch.object(_api_server, "_FRESH_START_FLAG", self._flag_path),
+            patch("os.path.exists", return_value=True),
+            patch("os.remove", side_effect=PermissionError("profile is read-only")),
+        ):
+            with self.assertRaises(PermissionError):
+                _api_server._fresh_start_clear()
 
     # ------------------------------------------------------------------
     # 7. api_check_resume() returns can_resume=False when bot is running

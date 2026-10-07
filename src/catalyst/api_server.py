@@ -3476,10 +3476,9 @@ if not hasattr(cfg, "RUN_HISTORY_CUTOFF"):
 # resume modal doesn't reappear.  Uses a flag file rather than memory so
 # it survives the app being fully closed and reopened.
 import os as _os
+from user_paths import data_dir as _user_data_dir
 
-_FRESH_START_FLAG = _os.path.join(
-    _os.path.dirname(_os.path.abspath(__file__)), ".fresh_start_chosen"
-)
+_FRESH_START_FLAG = _os.path.join(_user_data_dir(), ".fresh_start_chosen")
 
 
 def _fresh_start_is_set() -> bool:
@@ -3487,18 +3486,13 @@ def _fresh_start_is_set() -> bool:
 
 
 def _fresh_start_set():
-    try:
-        open(_FRESH_START_FLAG, "w").close()
-    except Exception:
+    with open(_FRESH_START_FLAG, "w"):
         pass
 
 
 def _fresh_start_clear():
-    try:
-        if _os.path.exists(_FRESH_START_FLAG):
-            _os.remove(_FRESH_START_FLAG)
-    except Exception:
-        pass
+    if _os.path.exists(_FRESH_START_FLAG):
+        _os.remove(_FRESH_START_FLAG)
 
 
 # ---------------------------------------------------------------------------

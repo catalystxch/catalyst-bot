@@ -1130,6 +1130,25 @@ def api_bot_start():
     with server._bot_cancel_lifecycle_lock:
         if cancel_all_in_progress():
             return cancel_all_start_block()
+        # A stale flag would hide live-book recovery on restart. Fail before
+        # bot.start(), since a failed cleanup after start would be too late.
+        try:
+            server._fresh_start_clear()
+        except OSError as exc:
+            slog(
+                "SESSION",
+                "Bot start blocked because the fresh-start choice could not be cleared",
+                {"error": str(exc)[:256]},
+                level="error",
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "SESSION_CHOICE_NOT_DURABLE",
+                    "error": "Fresh-start choice could not be cleared from the user data directory",
+                }
+            ), 500
         server._reset_runtime_session_stats()
         started = bot.start()
     if not started:
@@ -1149,11 +1168,6 @@ def api_bot_start():
                 "bot_status": state.get("status") or "blocked",
             }
         ), 400
-    # Clear the fresh-start flag now that a real run has begun.
-    # This ensures the resume modal shows correctly on the NEXT restart —
-    # the flag was only meant to suppress the modal within a single session
-    # (so a hot-reload after choosing "Start Fresh" doesn't re-show it).
-    server._fresh_start_clear()
     server.events.emit("bot_control", {"action": "started"})
     result = {"success": True, "status": "started"}
     if warnings:

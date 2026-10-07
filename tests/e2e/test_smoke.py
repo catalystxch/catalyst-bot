@@ -914,6 +914,145 @@ def test_expired_bootstrap_recovery_modal_does_not_offer_start(page):
     assert "active" not in page.locator("#resumeSessionModal").get_attribute("class")
 
 
+def test_skipping_incomplete_resume_does_not_enable_start(page):
+    """A stalled live-book recheck must not leave a ready-looking Start button."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            const cat = {
+                asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                ticker_id: 'TEST_XCH', decimals: 3,
+            };
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            const selector = document.getElementById('catSelector');
+            const option = document.createElement('option');
+            option.value = cat.asset_id;
+            option.textContent = cat.name;
+            selector.appendChild(option);
+            selector.value = cat.asset_id;
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: cat,
+            });
+            settingsReviewed = false;
+            coinPrepStatus = 'none';
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkSettingsReviewed = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            fetchStatus = async () => {};
+            window.__resumeCheckCalled = false;
+            apiFetch = async path => {
+                if (String(path).includes('/check-resume')) {
+                    window.__resumeCheckCalled = true;
+                    return new Promise(resolve => { window.__resolveResumeCheck = resolve; });
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            document.getElementById('resumeSessionModal').classList.add('active');
+            window.__pendingResume = resumeSession();
+        }"""
+    )
+    page.wait_for_function("window.__resumeCheckCalled === true")
+    result = page.evaluate(
+        """async () => {
+            resumeSkip();
+            const immediate = {
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+            };
+            window.__resolveResumeCheck(new Response(JSON.stringify({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {
+                    asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                    ticker_id: 'TEST_XCH', decimals: 3,
+                },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            const restored = await window.__pendingResume;
+            setSettingsReviewedState(true);
+            setCoinPrepStatus('done');
+            return {
+                immediate,
+                restored,
+                modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+            };
+        }"""
+    )
+
+    assert result == {
+        "immediate": {"disabled": True, "canAttempt": False},
+        "restored": False,
+        "modalActive": False,
+        "disabled": True,
+        "canAttempt": False,
+    }
+
+
+def test_verified_resume_enables_start_after_live_book_check(page):
+    """A completed recheck should still make the recovered-book start available."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                ticker_id: 'TEST_XCH', decimals: 3,
+            };
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            const selector = document.getElementById('catSelector');
+            const option = document.createElement('option');
+            option.value = cat.asset_id;
+            option.textContent = cat.name;
+            selector.appendChild(option);
+            selector.value = cat.asset_id;
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: cat,
+            });
+            settingsReviewed = false;
+            coinPrepStatus = 'none';
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkSettingsReviewed = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => new Response(JSON.stringify(
+                String(path).includes('/check-resume')
+                    ? { can_resume: true, offer_count: 1, buy_count: 1,
+                        sell_count: 0, active_cat: cat }
+                    : { success: true }
+            ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const restored = await resumeSession();
+            return {
+                restored,
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+                startChoice: !!document.querySelector('#resumeSessionModal button[onclick="resumeStartNow()"]'),
+            };
+        }"""
+    )
+
+    assert result == {
+        "restored": True,
+        "disabled": False,
+        "canAttempt": True,
+        "startChoice": True,
+    }
+
+
 def test_resume_start_sends_explicit_existing_offer_authority_request(page):
     """Only the recovered-book CTA may request the exact live-offer start path."""
 

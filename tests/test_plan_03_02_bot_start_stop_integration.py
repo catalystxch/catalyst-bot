@@ -223,6 +223,18 @@ class TestBotStartContract(_TempDB):
         self._start(self._make_bot(running=False))
         self.assertFalse(api_server._fresh_start_is_set())
 
+    def test_start_blocks_before_bot_runs_when_flag_cleanup_fails(self):
+        bot = self._make_bot(running=False)
+        with patch.object(
+            api_server,
+            "_fresh_start_clear",
+            side_effect=PermissionError("profile is read-only"),
+        ):
+            resp, _ = self._start(bot)
+        self.assertEqual(resp.status_code, 500)
+        self.assertFalse(resp.get_json().get("success"))
+        bot.start.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # DB state survives bot start

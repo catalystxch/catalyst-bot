@@ -19158,7 +19158,8 @@
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const hasPair = !!pair.selected;
             const restoredBookIsPrepared = hasResumedLiveBook();
-            return getStartSafetyState().allowed && isSettingsReviewedForCurrentPair()
+            return !_resumeSessionNeedsVerification
+                && getStartSafetyState().allowed && isSettingsReviewedForCurrentPair()
                 && hasPair
                 && coinPrepStatus !== 'checking'
                 && (coinPrepStatus !== 'none' || restoredBookIsPrepared);
@@ -31800,6 +31801,8 @@
 
         // Check if there are existing offers to resume
         let _resumeHandled = false;
+        let _resumeSessionAttemptId = 0;
+        let _resumeSessionNeedsVerification = false;
         let _updateAutoResumeAttempted = false;
         let _botStarting = false;  // Guards button text during startup
         let _botStartingAt = 0;    // Timestamp when _botStarting was set — safety timeout
@@ -31966,9 +31969,14 @@
         
         async function resumeSession() {
             _resumeHandled = true;
+            const attemptId = ++_resumeSessionAttemptId;
+            _resumeSessionNeedsVerification = true;
+            const startButton = document.getElementById('startBtn');
+            if (startButton) startButton.disabled = true;
             // User explicitly chose to resume — clear the fresh-start flag so the
             // next startup correctly shows the resume modal for the new session.
             try { await apiFetch(API_URL + '/session/resume-chosen', { method: 'POST' }); } catch (e) {}
+            if (attemptId !== _resumeSessionAttemptId) return false;
             const resumeCat = getResumeSelectedCAT();
             if ((!currentCAT || !currentCAT.asset_id) && resumeCat && resumeCat.asset_id) {
                 currentCAT = { ...resumeCat };
@@ -32001,7 +32009,7 @@
                         <span>This step re-syncs the CAT selection, wallet dropdown, and backend session state before the bot is allowed to continue.</span>
                     </div>
                     <div id="resumeSkipBtn" style="display: none; margin-top: 18px;" class="v4-modal-actions v4-modal-actions--center">
-                        <button class="btn" onclick="resumeSkip()" style="background: var(--slate-600); color: white; border: none; padding: 8px 24px; border-radius: 8px; cursor: pointer; font-size: 0.85em;">Skip — continue anyway</button>
+                        <button class="btn" onclick="resumeSkip()" style="background: var(--slate-600); color: white; border: none; padding: 8px 24px; border-radius: 8px; cursor: pointer; font-size: 0.85em;">Close — Start stays locked</button>
                     </div>
                 </div>
             `;
@@ -32014,12 +32022,6 @@
                 const skipBtn = document.getElementById('resumeSkipBtn');
                 if (skipBtn) skipBtn.style.display = 'block';
             }, 15000);
-
-            // Mark settings as reviewed (skip the settings banner)
-            setFreshStartTemplateState(false);
-            setSettingsReviewedState(true);
-            setCoinPrepStatus('skipped-safe'); // Existing live offers are already sized for the running book
-            checkSettingsReviewed();
 
             try {
                 // Step 1: Update GUI labels from currentCAT
@@ -32108,11 +32110,13 @@
                 } catch (e) {
                     debugWarn('[RESUME] /cat/select call failed (non-fatal):', e);
                 }
+                if (attemptId !== _resumeSessionAttemptId) return false;
 
                 // Step 4: Force status refresh (gets balances, prices, offers, Tibet data)
                 statusEl.textContent = 'Fetching balances and prices...';
                 progressBar.style.width = '70%';
                 await fetchStatus();
+                if (attemptId !== _resumeSessionAttemptId) return false;
 
                 // An idle status refresh may require explicit pair selection and
                 // clear the in-memory resume summary. Re-read the authoritative
@@ -32121,7 +32125,9 @@
                 const refreshedResumeResponse = await apiFetch(`${API_URL}/check-resume`, {
                     cache: 'no-store'
                 });
+                if (attemptId !== _resumeSessionAttemptId) return false;
                 const refreshedResume = await refreshedResumeResponse.json();
+                if (attemptId !== _resumeSessionAttemptId) return false;
                 const expectedResumeAssetId = resumeCat?.asset_id || currentCAT?.asset_id || '';
                 const refreshedResumeAssetId = refreshedResume?.active_cat?.asset_id || '';
                 if (
@@ -32144,6 +32150,11 @@
 
                 // Brief pause so user sees the "done" state
                 await new Promise(r => setTimeout(r, 600));
+                if (attemptId !== _resumeSessionAttemptId) return false;
+                setFreshStartTemplateState(false);
+                setSettingsReviewedState(true);
+                setCoinPrepStatus('skipped-safe'); // Verified live offers are already sized for the running book.
+                _resumeSessionNeedsVerification = false;
 
                 // Session is ready — transform the modal into a clear "what next?" step
                 // so the user sees both options without having to hunt for a button
@@ -32218,9 +32229,10 @@
                 return true;
 
             } catch (error) {
+                if (attemptId !== _resumeSessionAttemptId) return false;
                 debugError('[RESUME] Start failed:', error);
                 // Show error in the modal itself
-                statusEl.textContent = 'Failed to restore session. Close this and try Start Fresh.';
+                statusEl.textContent = 'Failed to restore session. Reload to retry before starting.';
                 statusEl.style.color = 'var(--sell-color)';
                 progressBar.style.background = 'var(--sell-color)';
                 progressBar.style.width = '100%';
@@ -32232,7 +32244,7 @@
                 closeBtn.onclick = () => {
                     document.getElementById('resumeSessionModal').classList.remove('active');
                     const startBtn = document.getElementById('startBtn');
-                    if (startBtn) { startBtn.disabled = !settingsReviewed; startBtn.innerHTML = '▶ Start Bot'; }
+                    if (startBtn) { startBtn.disabled = !canAttemptBotStart(); startBtn.innerHTML = '▶ Start Bot'; }
                 };
                 modalContent.appendChild(closeBtn);
                 return false;
@@ -32288,16 +32300,20 @@
         }
 
         function resumeSkip() {
-            // User clicked "Skip" on the loading modal — Start Bot stays locked until settings confirmed
+            // A skipped live-book check cannot authorize a resumed start.
+            ++_resumeSessionAttemptId;
+            _resumeSessionNeedsVerification = true;
             clearResumeSessionSummary();
             setFreshStartTemplateState(false);
+            setSettingsReviewedState(false);
+            setCoinPrepStatus('none');
             document.getElementById('resumeSessionModal').classList.remove('active');
             const startBtn = document.getElementById('startBtn');
-            if (startBtn) { startBtn.disabled = !settingsReviewed; startBtn.innerHTML = '▶ Start Bot'; }
+            if (startBtn) { startBtn.disabled = true; startBtn.innerHTML = '▶ Start Bot'; }
             updateStartupChecklist(bot_state);
             updateDashboardStartupLayout(bot_state);
-            showToast(settingsReviewed ? 'Session loading skipped — press Start Bot when ready' : 'Please review Settings before starting', settingsReviewed ? 'info' : 'warning');
-            debugLog('[RESUME] User skipped loading — settingsReviewed:', settingsReviewed);
+            showToast('Session recovery is unverified. Reload to retry before starting.', 'warning');
+            debugLog('[RESUME] User skipped loading — Start Bot remains locked');
         }
 
         // Leave the expired-campaign recovery prompt without changing the live book.
@@ -32319,6 +32335,10 @@
         }
 
         async function startBot(options = {}) {
+            if (_resumeSessionNeedsVerification) {
+                showToast('Session recovery is unverified. Reload to retry before starting.', 'warning');
+                return;
+            }
             const safety = getStartSafetyState();
             if (!safety.allowed) {
                 updateStartupChecklist(bot_state);
