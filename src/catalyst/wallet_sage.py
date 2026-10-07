@@ -5064,6 +5064,16 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
                 )
         normalized = filtered
 
+        seen_ids = set()
+        for offer in normalized:
+            trade_id = str(offer.get("trade_id") or offer.get("offer_id") or "").strip()
+            if not trade_id or trade_id in seen_ids:
+                get_all_offers._last_error = (
+                    "get_offers open offer IDs are missing or duplicated"
+                )
+                return None
+            seen_ids.add(trade_id)
+
     return normalized
 
 
