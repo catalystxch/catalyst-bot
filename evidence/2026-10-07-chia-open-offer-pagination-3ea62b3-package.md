@@ -1,0 +1,28 @@
+# Chia open-offer pagination and exact Windows package
+
+This is evidence for draft PR [#220](https://github.com/catalystxch/catalyst-bot/pull/220), not release authorization. All timestamps below are UTC.
+
+## Source and safety regression
+
+- Exact runtime/source: `3ea62b34abaa8b4616e3294ec9f373d4ab8941b2`.
+- Chia's `get_all_offers(include_completed=False)` previously returned only the requested bounded page. Startup and offer safety callers requested at most 200 or 500 rows, then treated that page as a fresh open book. More recent unrelated offers could hide an older selected-asset offer.
+- A 501-row regression failed before the first fix and passed after all pages were read. A 1,001-row case, later-page failure, repeated page, exact page multiple, overfull page, 40-page cap, and bounded reconciliation-history behavior also pass. Pagination aborts rather than returning a partial book on malformed or failed pages.
+- An offset-page shift regression then failed: removing an offer during traversal could skip another offer without repeating an ID. The final implementation reads multi-page books twice and accepts them only when the complete ordered records match. A changed-status case also fails closed. All **18** focused tests pass on exact source; Ruff check/format and `git diff --check` pass. All **11** exact-source PR checks passed, including unit tests, lint, CodeQL, Semgrep, Gitleaks, and security scan. A related wallet/offer suite passed **467 tests** before the second-pass follow-up. The exact-source full serial Windows backend passed **7,325 tests, 241 skipped, 433 subtests passed** in 1298.34 seconds.
+
+## Detached package
+
+- Detached build checkout `E:\catalyst-chia-pagination-736ab10-build` was advanced to exact `3ea62b3` before its first build. A subsequent foreground `python build.py` clean build completed successfully; `git rev-parse HEAD` confirmed the source. The folder name reflects its initial checkout, not the source of the package.
+- EXE `E:\catalyst-chia-pagination-736ab10-build\dist\Catalyst\Catalyst.exe`: SHA-256 `49A3DC1402FB6920702BAFD0A3338182AAF1F1E3ED9BAD6465F99699B6A42809`.
+- Bundled `bot_gui.html`: SHA-256 `B0C25FB5C23D5A0B20E78CCC0B23A8DAC29FCBF104B6DCCDAD7B3B76811F6781`.
+- ZIP: SHA-256 `DC633FF98BB94F3D0D90B898D229901B728A6E120335FCF44C1226F1352D9A71`; all **192** entries passed CRC. Extracted EXE hash matched and extracted API smoke passed.
+- Unsigned installer: SHA-256 `C174A25321FFE42332413F8F7DCD30F53DF21753E47711C965D83D20C3CCA53D`.
+- Packaged API, synthetic Sage RPC, interrupted-publication recovery, and native clean/duplicate/persisted/safety startup smokes passed using isolated user data. A unique-AppId QA installer clean-installed to E, produced the expected EXE hash, passed installed API and synthetic Sage smokes, then uninstalled with its EXE and QA registration absent. The original TEST 7 process remained untouched.
+- Defender real-time protection was enabled; custom scans of bundle, ZIP, and installer added zero detections (six before and after).
+- ZIP, unsigned installer, and SHA256 manifest were pinned at artifact commit `406e6d77ad5c26ff549c839dd2eaab9e251f9b84`. Independent HTTP downloads of all three matched local SHA-256 hashes; the manifest was normalized to Git's LF line endings before its byte-hash comparison.
+
+[Acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/406e6d77ad5c26ff549c839dd2eaab9e251f9b84/acceptance-artifacts/CATalyst-3ea62b3-primary-acceptance.zip) · [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/406e6d77ad5c26ff549c839dd2eaab9e251f9b84/acceptance-artifacts/Catalyst-Setup-3ea62b3-1.4.0.exe) · [SHA256 manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/406e6d77ad5c26ff549c839dd2eaab9e251f9b84/acceptance-artifacts/SHA256SUMS-3ea62b3.txt)
+
+## Original-profile status and open gates
+
+- The original TEST 7 profile still runs the predecessor `a14b342` EXE. Its exact-PID/hash stopped-profile monitor began `2026-10-07T02:34:36Z`; this is historical evidence for `3ea62b3` once the new source replaces it. No exact `3ea62b3` original-profile launch, UI traversal, or 24-hour window is claimed here.
+- Active-offer lifecycle/recovery, secondary original-profile exact-source acceptance, both final-candidate 24-hour windows, final review, and release authorization remain open. No new TEST 7 campaign or fee approval exists. Keep PR #220 draft; do not merge, tag, release, or claim public readiness.
