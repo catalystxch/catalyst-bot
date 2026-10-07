@@ -32666,20 +32666,36 @@ def heartbeat_runtime_mutation_lease(
     heartbeat_at: Any = None,
     lease_duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
+    database_ms = {"connection": 0, "begin": 0, "read": 0, "finish": 0, "close": 0}
     owner = _required_stability_text(owner_run_id, "owner_run_id")
     version = _exact_integer(expected_lease_version, "expected_lease_version")
     at = _stability_timestamp_or_now(heartbeat_at, "heartbeat_at timestamp")
     expiry = _stability_timestamp(lease_expires_at, "lease_expires_at timestamp")
     if expiry <= at:
         raise ValueError("lease_expires_at must be later than heartbeat_at")
+    started_ns = time.perf_counter_ns()
     conn = _stability_connection()
+    connected_ns = time.perf_counter_ns()
+    database_ms["connection"] = max(0, round((connected_ns - started_ns) / 1_000_000))
     try:
         conn.execute("BEGIN IMMEDIATE")
+        begun_ns = time.perf_counter_ns()
+        database_ms["begin"] = max(0, round((begun_ns - connected_ns) / 1_000_000))
         locked_at = _stability_wall_clock()
         safety_at = max(at, locked_at)
         current_row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
+        read_ns = time.perf_counter_ns()
+        database_ms["read"] = max(0, round((read_ns - begun_ns) / 1_000_000))
+
+        def with_timing(result: Dict[str, Any]) -> Dict[str, Any]:
+            database_ms["finish"] = max(
+                0, round((time.perf_counter_ns() - read_ns) / 1_000_000)
+            )
+            result["database_ms"] = database_ms
+            return result
+
         if current_row is None:
             raise RuntimeError("runtime mutation lease singleton is missing")
         current = dict(current_row)
@@ -32689,25 +32705,31 @@ def heartbeat_runtime_mutation_lease(
             or int(current["lease_version"]) != version
         ):
             conn.commit()
-            return {
-                "heartbeat": False,
-                "reason": "compare_and_set_failed",
-                "lease": current,
-            }
+            return with_timing(
+                {
+                    "heartbeat": False,
+                    "reason": "compare_and_set_failed",
+                    "lease": current,
+                }
+            )
         if current["expires_at"] <= safety_at:
             conn.commit()
-            return {
-                "heartbeat": False,
-                "reason": "lease_expired",
-                "lease": current,
-            }
+            return with_timing(
+                {
+                    "heartbeat": False,
+                    "reason": "lease_expired",
+                    "lease": current,
+                }
+            )
         if expiry <= current["expires_at"]:
             conn.commit()
-            return {
-                "heartbeat": False,
-                "reason": "new_expiry_not_monotonic",
-                "lease": current,
-            }
+            return with_timing(
+                {
+                    "heartbeat": False,
+                    "reason": "new_expiry_not_monotonic",
+                    "lease": current,
+                }
+            )
         effective_expiry = _post_lock_lease_expiry(
             at, expiry, safety_at, duration_seconds=lease_duration_seconds
         )
@@ -32725,28 +32747,40 @@ def heartbeat_runtime_mutation_lease(
         ).fetchone()
         if effective_expiry <= _stability_wall_clock():
             conn.rollback()
-            return {
-                "heartbeat": False,
-                "reason": "lease_expired",
-                "lease": current,
-            }
+            return with_timing(
+                {
+                    "heartbeat": False,
+                    "reason": "lease_expired",
+                    "lease": current,
+                }
+            )
         conn.commit()
         if effective_expiry <= _stability_wall_clock():
-            return {
-                "heartbeat": False,
-                "reason": "lease_expired",
+            return with_timing(
+                {
+                    "heartbeat": False,
+                    "reason": "lease_expired",
+                    "lease": dict(row),
+                }
+            )
+        return with_timing(
+            {
+                "heartbeat": cursor.rowcount == 1,
+                "reason": "heartbeat"
+                if cursor.rowcount == 1
+                else "compare_and_set_failed",
                 "lease": dict(row),
             }
-        return {
-            "heartbeat": cursor.rowcount == 1,
-            "reason": "heartbeat" if cursor.rowcount == 1 else "compare_and_set_failed",
-            "lease": dict(row),
-        }
+        )
     except Exception:
         conn.rollback()
         raise
     finally:
+        closing_ns = time.perf_counter_ns()
         conn.close()
+        database_ms["close"] = max(
+            0, round((time.perf_counter_ns() - closing_ns) / 1_000_000)
+        )
 
 
 def release_runtime_mutation_lease(

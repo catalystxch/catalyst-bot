@@ -2282,6 +2282,7 @@ class MutationGate:
                             lease_duration_seconds=self.lease_seconds,
                         )
                         result = _lease_public_result(result)
+                        database_ms = result.pop("database_ms", None)
                         if (
                             result.get("heartbeat")
                             and _as_utc(result["lease"]["expires_at"]) <= self._now()
@@ -2292,14 +2293,34 @@ class MutationGate:
                                 "heartbeat": False,
                                 "reason": "lease_expired",
                             }
-                        attempts.append(
-                            {
-                                "elapsed_ms": round(
-                                    (time.monotonic() - attempt_started) * 1000, 1
-                                ),
-                                "outcome": str(result.get("reason") or "unknown"),
+                        attempt_record = {
+                            "elapsed_ms": round(
+                                (time.monotonic() - attempt_started) * 1000, 1
+                            ),
+                            "outcome": str(result.get("reason") or "unknown"),
+                        }
+                        if type(database_ms) is dict and all(
+                            type(database_ms.get(stage)) is int
+                            and database_ms[stage] >= 0
+                            for stage in (
+                                "connection",
+                                "begin",
+                                "read",
+                                "finish",
+                                "close",
+                            )
+                        ):
+                            attempt_record["database_ms"] = {
+                                stage: database_ms[stage]
+                                for stage in (
+                                    "connection",
+                                    "begin",
+                                    "read",
+                                    "finish",
+                                    "close",
+                                )
                             }
-                        )
+                        attempts.append(attempt_record)
                     except Exception as exc:
                         failure = {
                             "elapsed_ms": round(

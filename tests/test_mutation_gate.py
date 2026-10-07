@@ -1096,6 +1096,80 @@ def test_failed_heartbeat_records_bounded_timing_without_exception_details(
     assert "private diagnostic detail" not in repr(data)
 
 
+def test_slow_heartbeat_connection_reports_database_stage_without_wallet_data(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def delayed_connection():
+        time.sleep(0.02)
+        return open_connection()
+
+    monkeypatch.setattr(database, "_stability_connection", delayed_connection)
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (category, message, data, level)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    diagnostics = [
+        data
+        for _category, message, data, _level in records
+        if message == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostics) == 1
+    stages = diagnostics[0]["attempts"][0]["database_ms"]
+    assert stages["connection"] >= 15
+    assert set(stages) == {"connection", "begin", "read", "finish", "close"}
+    assert all(type(value) is int and value >= 0 for value in stages.values())
+    assert "wallet" not in repr(stages).lower()
+
+
+def test_expired_heartbeat_logs_where_delayed_connection_spent_time(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def delayed_connection():
+        time.sleep(0.02)
+        clock.advance(25)
+        return open_connection()
+
+    monkeypatch.setattr(database, "_stability_connection", delayed_connection)
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    renewed = gate.heartbeat()
+    assert renewed["heartbeat"] is False
+    assert renewed["reason"] == "lease_expired"
+    assert "database_ms" not in renewed
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    assert timing["attempts"][0]["database_ms"]["connection"] >= 15
+
+
 def test_background_heartbeat_exception_fences_and_stops_immediately(
     isolated_gate_database, monkeypatch
 ):
