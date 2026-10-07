@@ -769,13 +769,21 @@ def _source_error(evidence: dict[str, Any], now: datetime) -> str | None:
     return None
 
 
+def _exact_offer_identity(offer: Any) -> str:
+    """Accept offer identity only when every present provider alias agrees."""
+
+    if type(offer) is not dict:
+        return ""
+    aliases = [_hex_id(offer[key]) for key in ("trade_id", "offer_id") if key in offer]
+    if not aliases or not aliases[0] or any(alias != aliases[0] for alias in aliases):
+        return ""
+    return aliases[0]
+
+
 def _offer_summary_matches(intent: dict[str, Any], offer: Any) -> bool:
     if type(offer) is not dict:
         return False
-    if (
-        _hex_id(_first_present(offer, "trade_id", "offer_id"))
-        != intent["sage_trade_id"]
-    ):
+    if _exact_offer_identity(offer) != intent["sage_trade_id"]:
         return False
     summary = offer.get("summary")
     if type(summary) is not dict:
@@ -1561,6 +1569,12 @@ def _classify_terminal_evidence(
         return _unknown("EVIDENCE_SCHEMA_INVALID")
     if any(type(row) is not dict for row in offer_rows):
         return _unknown("EVIDENCE_SCHEMA_INVALID")
+    for row in offer_rows:
+        aliases = [_hex_id(row[key]) for key in ("trade_id", "offer_id") if key in row]
+        if exact_intent["sage_trade_id"] in aliases and (
+            _exact_offer_identity(row) != exact_intent["sage_trade_id"]
+        ):
+            return _unknown("OFFER_IDENTITY_ALIAS_CONFLICT")
     try:
         offer_rows = _dedupe_records(offer_rows, "trade_id")
         transactions = _dedupe_records(transactions, "transaction_id")
@@ -1570,8 +1584,7 @@ def _classify_terminal_evidence(
         row
         for row in offer_rows
         if type(row) is dict
-        and _hex_id(_first_present(row, "trade_id", "offer_id"))
-        == exact_intent["sage_trade_id"]
+        and _exact_offer_identity(row) == exact_intent["sage_trade_id"]
     ]
     candidate_fills: list[dict[str, Any]] = []
     for row in transactions:
