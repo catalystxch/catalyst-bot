@@ -188,6 +188,23 @@ def test_windows_splash_url_carries_local_bootstrap(monkeypatch):
     )
 
 
+def test_desktop_startup_log_omits_private_bootstrap_credential():
+    import desktop_app
+
+    assert (
+        desktop_app._redacted_desktop_url(
+            "file:///E:/Catalyst/splash.html#bootstrap=private-token"
+        )
+        == "file:///E:/Catalyst/splash.html"
+    )
+    assert (
+        desktop_app._redacted_desktop_url(
+            "http://127.0.0.1:5000/?bootstrap=private-token"
+        )
+        == "http://127.0.0.1:5000/"
+    )
+
+
 def test_linux_desktop_window_wires_loopback_initial_url():
     text = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
 

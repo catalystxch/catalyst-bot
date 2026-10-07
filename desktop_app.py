@@ -27,7 +27,7 @@ import argparse
 import subprocess
 import importlib.util
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -177,6 +177,11 @@ def _initial_desktop_url() -> str:
         # A fragment survives native file navigation and remains local.
         return f"{pathlib.Path(splash_path).as_uri()}#bootstrap={token}"
     return flask_url
+
+
+def _redacted_desktop_url(url: str) -> str:
+    """Keep the startup log free of the private browser credential."""
+    return urlsplit(url)._replace(query="", fragment="").geturl()
 
 
 # True when the app is running without a visible console (pythonw.exe or
@@ -1182,7 +1187,7 @@ def run_desktop_mode(dev_mode: bool = False):
         _win_y = None
 
     _initial_url = _initial_desktop_url()
-    print(f"  Desktop window URL: {_initial_url.split('?', 1)[0]}", flush=True)
+    print(f"  Desktop window URL: {_redacted_desktop_url(_initial_url)}", flush=True)
 
     _create_window_kwargs = dict(
         title=APP_NAME,
