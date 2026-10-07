@@ -86,6 +86,26 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             ):
                 self.assertIsNone(wallet_sage.get_all_offers(include_completed=True))
 
+    def test_get_all_offers_rejects_open_offer_without_id(self):
+        row = {
+            "status": "OPEN",
+            "summary": {"offered": {"xch": 1000}, "requested": {"a" * 64: 1}},
+        }
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": [row]}
+        ):
+            self.assertIsNone(wallet_sage.get_all_offers(include_completed=False))
+
+    def test_get_all_offers_rejects_duplicate_open_offer_ids(self):
+        rows = [
+            {"trade_id": "b" * 64, "status": "OPEN"},
+            {"trade_id": "b" * 64, "status": "OPEN"},
+        ]
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": rows}
+        ):
+            self.assertIsNone(wallet_sage.get_all_offers(include_completed=False))
+
     def test_get_all_offers_keeps_unknown_statuses_when_filtering_open_book(self):
         rows = [
             {"trade_id": "a" * 64, "status": 99},
