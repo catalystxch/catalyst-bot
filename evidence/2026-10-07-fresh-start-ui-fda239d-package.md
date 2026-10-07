@@ -6,7 +6,7 @@ All times are UTC. This records acceptance evidence for draft PR #220, not relea
 
 - Exact runtime/source: `fda239da5ba609e66bdf77482ef14f541ff00757`. It adds a fail-closed UI result for failed POST `/api/session/fresh-start`: the recovery dialog remains open, the pair reset is not run, and no success toast appears. The post-load Skip path also keeps the dialog open until the request succeeds.
 - The parametrized initial/post-load failure regression failed before the fix: the modal closed, reset ran, and success was shown. It passed after the fix. A positive success case passed. The focused browser suite passed 5 tests; full Chromium passed 236 tests. Ruff check/format and diff check passed.
-- Backend production files are byte-identical to exact `293d823c486c792f90c188c4e840ce2a8ddecddf`, whose full serial Windows backend passed 7,315 tests, with 234 skipped and 433 subtests passed. Exact `fda239d` PR CI is still completing at this checkpoint; do not attribute an all-green result until verified.
+- Backend production files are byte-identical to exact `293d823c486c792f90c188c4e840ce2a8ddecddf`, whose full serial Windows backend passed 7,315 tests, with 234 skipped and 433 subtests passed. All 11 exact `fda239d` PR checks completed successfully, including unit tests, lint, CodeQL, Semgrep, Gitleaks, and security scan.
 
 ## Clean detached package
 
