@@ -2153,8 +2153,13 @@ def get_wallet_sync_status() -> dict:
         result = rpc("get_sync_status", {}, timeout=5)
         if _rpc_succeeded(result):
             raw_synced = result.get("synced")
-            synced_coins = result.get("synced_coins", 0) or 0
-            total_coins = result.get("total_coins", 0) or 0
+            synced_coins = result.get("synced_coins", 0)
+            total_coins = result.get("total_coins", 0)
+            valid_counts = (
+                type(synced_coins) is int
+                and type(total_coins) is int
+                and 0 <= synced_coins <= total_coins
+            )
 
             if raw_synced is True:
                 sync_state = "synced"
@@ -2164,13 +2169,23 @@ def get_wallet_sync_status() -> dict:
                 sync_state = "not_synced"
                 synced = False
                 syncing = True
-            elif total_coins > 0 and synced_coins >= total_coins:
+            elif (
+                raw_synced is None
+                and valid_counts
+                and total_coins > 0
+                and synced_coins == total_coins
+            ):
                 # Current Sage versions omit the boolean field and use
                 # synced_coins == total_coins to indicate a fully synced wallet.
                 sync_state = "synced"
                 synced = True
                 syncing = False
-            elif total_coins > 0 and synced_coins < total_coins:
+            elif (
+                raw_synced is None
+                and valid_counts
+                and total_coins > 0
+                and synced_coins < total_coins
+            ):
                 sync_state = "not_synced"
                 synced = False
                 syncing = True
