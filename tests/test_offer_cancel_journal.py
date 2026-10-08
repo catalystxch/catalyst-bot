@@ -5916,16 +5916,16 @@ def test_production_cancellation_callers_route_or_deny_before_adapter():
     assert "pending_methods" not in worker_cancel
     assert "rpc_cancel_offer" not in worker_cancel
 
-    # Task 16 owns removal/migration of the manual Sage debug route.  Until
-    # then its direct facade call is stable fail-closed and cannot reach an
-    # adapter without the opaque cancellation continuation.
+    # The retired diagnostic handler cannot create or cancel a wallet offer.
     market_source = (source_root / "blueprints" / "market.py").read_text(
         encoding="utf-8"
     )
     debug_route = market_source.split("def api_debug_sage_single_offer_test():", 1)[
         1
     ].split("\n@bp.route", 1)[0]
-    assert "cancel_offer(trade_id" in debug_route
+    assert '"debug_routes_disabled"' in debug_route
+    assert "create_offer(" not in debug_route
+    assert "cancel_offer(" not in debug_route
     wallet_source = (source_root / "wallet.py").read_text(encoding="utf-8")
     facade_cancel = wallet_source.split("def cancel_offer(", 1)[1].split(
         "\ndef cancel_offers_batch(", 1
