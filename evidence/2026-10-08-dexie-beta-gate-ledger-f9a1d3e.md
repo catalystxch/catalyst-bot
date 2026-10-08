@@ -1,0 +1,24 @@
+# Dexie-only beta gate ledger — exact `f9a1d3e`
+
+This ledger supersedes the [exact-544 checkpoint](2026-10-08-dexie-beta-gate-ledger.md)
+after a packaged-runtime startup recovery correction. A prior package, monitor
+window, or green check does not establish acceptance for this source.
+
+| Gate | Evidence at 2026-10-08 16:38 UTC | State |
+| --- | --- | --- |
+| Source and PR | Runtime/source `f9a1d3e4f7443595c44352d714d2aea3f1fef755` on draft [bot PR #220](https://github.com/catalystxch/catalyst-bot/pull/220), targeting `main`. All 11 exact-source checks passed. | Source CI passed; PR draft |
+| Backend and UI tests | Serial Windows backend 7,451 passed/246 skipped/455 subtests; final four zero-count latch positive/negative regressions passed separately because the negative cases were added after full collection. GitHub exact-commit unit tests passed. Bundled UI bytes equal the prior source whose isolated Chromium suite passed 245 tests. | Tested; no new frontend code |
+| Windows package | Clean detached EXE `8FD7BCA2BC8D5F996F1E3F92FE7FBCF319F5AD81C6BC9F1A2016126F1CA18804`, ZIP `BC71EA8DB5392BF0F34C6300EA9FBE3C970BCDD1D7FCBA2CA074F19D39C5B56C`, unsigned installer `866090EC211FB49A83659B308BC535100CD9913FEAD9F528E2FF423AB1E5714A`; pinned at artifact commit `fa4b58858f777b373894a117af7b74bb9c3692a7`. Bundle/API/Sage/recovery/native, ZIP CRC/extracted API/Sage, unique-AppId QA installer install/API/Sage/uninstall, Defender and independent HTTP hashes passed. | Candidate package verified; tagged release build open |
+| Independent restart | Secondary independently matched exact ZIP/installer/EXE hashes. Its isolated synthetic replay of the former `recovered=0, remaining=0` cancellation-latch failure reached allowed normal startup after latch resolution with no duplicate mutation. The distinct genuinely unresolved cancellation control stayed diagnostics-only with inactive lease and zero mock Sage mutation RPCs. Four focused and 307 affected tests passed; patch review found no issue. | Positive and fail-closed controls passed in isolation |
+| Primary original TEST 7 stopped profile | Verified old process exited normally with zero offers/pending and unchanged balances. Exact `f9a1d3e` app became sole PID 38104/port 5000 owner; its first monitor sample at `2026-10-08T16:38:35.606045Z` had synced mainnet TEST 7, fingerprint 736588221, CAT wallet 2, exact MZ asset, stopped bot, zero offers/pending, unchanged balances, and safety allowed with owned lease. | Initial read-only start passed |
+| Primary stopped-profile 24 hours | Exact-PID/hash monitor PID 153112 writes `E:\catalyst-stability-monitor-f9a1d3e\trace-60s.jsonl` every 60 seconds. The window cannot pass before **2026-10-09T16:38:35.606045Z** plus complete trace/end-state audit. The older exact-544 traces are historical. | In progress |
+| Secondary 24 hours and live identity | Secondary exact-544 isolated synthetic canary is historical for this source; it logged a low-disk alert after the secondary C: drive dropped below 1 GiB during the exact-f9 restart probes. Further test launches there paused while only disposable test files are assessed for safe cleanup. Its original Sage installation has Harvestr fingerprint 3702373391 but not required TEST 7 fingerprint 736588221. No Harvestr wallet action is authorized. | Exact-f9 secondary endurance, disk capacity, and original TEST 7 identity decision open |
+| Live wallet lifecycle | No new TEST 7 campaign or valid fee approval. A specific 24-hour campaign/fee question remains unanswered. No exact-f9 mainnet offer create/requote/fill/cancel/recovery, Coin Prep, fee-ledger or active 24-hour window has run. The older `c665` fee approval is invalid. | Open; no wallet effect authorized by this ledger |
+| Native UI and final review | Earlier isolated packaged UI traversal and Chromium checks passed. Full exact-f9 original-profile native UI and active-state checks, final release review, signed/tagged beta manifest and website synchronization remain open. | Open |
+| Website | Draft [website PR #89](https://github.com/Lowestofttim/catalystxch/pull/89) at `8c214258eb2b76fb159b4931fe42dac17f316f9e` targets `main`, is mergeable, and its validator passed. It retains the older v1.3.21 public download until the exact beta is approved and published. | Staged, not deployed |
+
+The [exact correction and package evidence](2026-10-08-zero-count-startup-latch-recovery-f9a1d3e.md)
+records the red/green regression, pinned package links, independent download
+hashes, QA installer, and original-profile rollover. Keep both PRs draft until
+the open gates are reviewed; no merge, tag, release, website deployment or
+public-readiness claim has occurred.
