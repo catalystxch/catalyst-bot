@@ -83,6 +83,21 @@ but the unique AppId and name kept the installation separate. Defender
 antivirus and real-time protection were enabled; custom scans of the bundle,
 ZIP, and installer completed with the six prior detection records unchanged.
 
+An additional isolated same-version upgrade check installed the prior exact
+`96d5908` QA installer under `E:\catalyst-7ce8ffa-upgrade-qa\installed` using
+the separate QA AppId `EA982408-C540-41A0-9866-4E89D051401E`. Its installed
+EXE matched SHA-256 `99EFA45E430F7BBE8C49EAB9EEB735395762B0631A0CD66FA4B84C2F18D61664`.
+A QA variant compiled from the exact `7ce8ffa` bundle with the same QA AppId
+and uninstall key upgraded that installation in place with exit code zero.
+The installed EXE then matched `47198CA321C9E36692929D9661EEF99D51037743AB5EAB71D42022DDE3C92B77`,
+the registry retained the isolated E: install path, and an in-directory
+sentinel survived. The upgraded EXE passed the packaged API and synthetic
+Sage RPC smokes. The QA uninstaller returned zero, removed the EXE and its
+HKCU entry, preserved the sentinel, and left the original TEST 7 process
+running from its separate path. Test logs and the QA script are retained in
+`E:\catalyst-7ce8ffa-upgrade-qa`. This verifies the installer upgrade path in
+isolation; it does not establish original-profile live recovery.
+
 The binaries and manifest were pinned at artifact commit
 `09d851342dcd0094e2ded1679db63f2e55d01438`:
 [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/09d851342dcd0094e2ded1679db63f2e55d01438/acceptance-artifacts/CATalyst-7ce8ffa-primary-acceptance.zip),
