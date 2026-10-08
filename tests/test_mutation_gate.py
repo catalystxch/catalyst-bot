@@ -926,6 +926,239 @@ def test_heartbeat_keeps_full_lease_after_database_lock_wait(
     assert expires_at - heartbeat_at == timedelta(seconds=30)
 
 
+def test_default_lease_survives_snapshot_length_pause_and_still_fences_expiry(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("UPDATE runtime_mutation_lease"):
+                clock.advance(45)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+
+    renewed = gate.heartbeat()
+
+    assert renewed["heartbeat"] is True
+    assert gate.require_allowed("offer.create").allowed is True
+    clock.advance(91)
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_allowed("offer.create")
+    contender = mutation_gate.MutationGate(
+        run_id="run-b",
+        owner_pid=222,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda pid, host: (pid, host) == (111, "test-host"),
+    )
+    assert contender.acquire()["reason"] == "prior_owner_alive"
+
+
+def test_long_lease_keeps_ten_second_heartbeat_cadence(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    observed = []
+    monkeypatch.setattr(
+        gate._heartbeat_stop,
+        "wait",
+        lambda interval: observed.append(interval) or True,
+    )
+
+    assert gate.start_heartbeat() is True
+    gate._heartbeat_thread.join(timeout=1)
+    assert observed == [10.0]
+
+
+@pytest.mark.parametrize(
+    ("pause_seconds", "paused_stage", "expected_heartbeat", "expected_mutation"),
+    [
+        (45, "update", True, "allowed"),
+        (85, "update", False, "HEARTBEAT_FAILED"),
+        (85, "commit", False, "HEARTBEAT_FAILED"),
+    ],
+)
+def test_long_lease_blocks_mutation_while_heartbeat_write_is_stalled(
+    isolated_gate_database,
+    monkeypatch,
+    pause_seconds,
+    paused_stage,
+    expected_heartbeat,
+    expected_mutation,
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    entered = threading.Event()
+    release = threading.Event()
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                entered.set()
+                assert release.wait(timeout=5)
+                clock.advance(pause_seconds)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if paused_stage == "commit":
+                entered.set()
+                assert release.wait(timeout=5)
+                clock.advance(pause_seconds)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+    heartbeat_results = []
+    heartbeat_thread = threading.Thread(
+        target=lambda: heartbeat_results.append(gate.heartbeat())
+    )
+    heartbeat_thread.start()
+    assert entered.wait(timeout=5)
+    mutation_results = []
+
+    def require_mutation():
+        try:
+            gate.require_allowed("offer.create")
+            mutation_results.append("allowed")
+        except mutation_gate.MutationBlocked as exc:
+            mutation_results.append(exc.reason_code)
+
+    mutation_thread = threading.Thread(target=require_mutation)
+    mutation_thread.start()
+    mutation_thread.join(timeout=0.05)
+    assert mutation_thread.is_alive()
+    assert mutation_results == []
+    release.set()
+    heartbeat_thread.join(timeout=5)
+    mutation_thread.join(timeout=5)
+
+    assert not heartbeat_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert heartbeat_results[0]["heartbeat"] is expected_heartbeat
+    assert mutation_results == [expected_mutation]
+
+
+@pytest.mark.parametrize("paused_stage", ["update", "commit"])
+def test_same_run_acquire_cannot_renew_after_prior_lease_expires_during_write(
+    isolated_gate_database, monkeypatch, paused_stage
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                clock.advance(85)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if paused_stage == "commit":
+                clock.advance(85)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+
+    renewed = gate.acquire()
+
+    assert renewed["acquired"] is False
+    assert renewed["reason"] == "lease_expired"
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_allowed("offer.create")
+
+
 def test_acquire_keeps_full_lease_after_database_lock_wait(
     isolated_gate_database, monkeypatch
 ):
@@ -2415,6 +2648,78 @@ def test_parent_heartbeat_keeps_delegation_valid_but_new_lease_epoch_does_not(
     assert (
         parent.validate_worker_environment(env)["reason"] == "worker_delegation_invalid"
     )
+
+
+def test_long_parent_lease_does_not_extend_worker_authority_without_heartbeat(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    parent = mutation_gate.MutationGate(
+        run_id="long-lease-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:stale-parent",
+        purpose="coin_prep",
+        worker_id="worker-stale-parent",
+        ttl_seconds=120,
+    )
+    environment = handoff.to_environment()
+    assert parent.validate_worker_environment(environment)["allowed"] is True
+
+    clock.advance(31)
+    assert parent.status().allowed is True
+    assert parent.validate_worker_environment(environment) == {
+        "allowed": False,
+        "reason": "parent_lease_invalid",
+    }
+
+    assert parent.heartbeat()["heartbeat"] is True
+    assert parent.validate_worker_environment(environment)["allowed"] is True
+
+
+def test_worker_rechecks_parent_freshness_after_delayed_authorization_read(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    parent = mutation_gate.MutationGate(
+        run_id="delayed-worker-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:delayed-read",
+        purpose="coin_prep",
+        worker_id="worker-delayed-read",
+        ttl_seconds=120,
+    )
+    original_snapshot = database.get_mutation_authorization_snapshot
+
+    def delayed_snapshot(**kwargs):
+        snapshot = original_snapshot(**kwargs)
+        clock.advance(31)
+        return snapshot
+
+    monkeypatch.setattr(
+        database, "get_mutation_authorization_snapshot", delayed_snapshot
+    )
+    assert parent.validate_worker_environment(handoff.to_environment()) == {
+        "allowed": False,
+        "reason": "parent_lease_invalid",
+    }
 
 
 def test_os_pid_liveness_is_fail_closed_for_remote_host_and_current_process():

@@ -137,10 +137,11 @@ _TERMINAL_PROCESS_FENCES = frozenset(
 )
 
 # SQLite's configured busy timeout can consume roughly five seconds per lease
-# write.  Four bounded attempts fit inside the remaining lease window when the
-# normal heartbeat starts one third into a 30-second lease, while letting a
-# short burst of bot shutdown writes drain without permanently fencing the run.
+# write. Four bounded attempts can drain a short burst of bot shutdown writes
+# within the 90-second process lease. The normal heartbeat cadence stays at
+# 10 seconds; worker authority retains a 30-second heartbeat-freshness limit.
 _HEARTBEAT_MAX_ATTEMPTS = 4
+_WORKER_PARENT_HEARTBEAT_MAX_AGE_SECONDS = 30
 
 
 def _market_authority_failure(reason_code: str) -> dict[str, Any]:
@@ -1283,7 +1284,7 @@ class MutationGate:
         owner_host: str,
         wallet_fingerprint_hash: str,
         network: str,
-        lease_seconds: int = 30,
+        lease_seconds: int = 90,
         clock: Callable[[], datetime] = _utc_now,
         pid_liveness: Callable[[int, str], Optional[bool]] = pid_liveness,
         read_only: bool = False,
@@ -2382,7 +2383,7 @@ class MutationGate:
             interval = (
                 float(interval_seconds)
                 if interval_seconds is not None
-                else max(1.0, self.lease_seconds / 3)
+                else min(10.0, max(1.0, self.lease_seconds / 3))
             )
             if interval <= 0 or interval >= self.lease_seconds:
                 raise ValueError("heartbeat interval must be within the lease duration")
@@ -2588,12 +2589,15 @@ class MutationGate:
             else self.wallet_fingerprint_hash,
             network=network if network is not None else self.network,
             now=self._now(),
+            now_after_read=self._now,
         )
 
     def validate_worker_environment(
         self, environment: Mapping[str, str]
     ) -> dict[str, Any]:
-        return validate_worker_environment(environment, now=self._now())
+        return _validate_worker_environment(
+            environment, now=self._now(), now_after_read=self._now
+        )
 
     def revoke_worker_delegation(self, delegation: WorkerDelegation) -> dict[str, Any]:
         if type(delegation) is not WorkerDelegation:
@@ -2621,6 +2625,7 @@ def _validate_worker_delegation(
     wallet_fingerprint_hash: Any,
     network: Any,
     now: datetime,
+    now_after_read: Optional[Callable[[], datetime]] = None,
     wallet_identity_payload: Any = None,
     wallet_identity_digest: Any = None,
     parent_lease_epoch: Any = None,
@@ -2654,6 +2659,13 @@ def _validate_worker_delegation(
         )
         row = authorization["delegation"]
         if row is None:
+            return _invalid_worker()
+        # A read can stall across a host snapshot. Authorize against the time
+        # after it returns, not only the time captured before SQLite opened.
+        verified_now = max(
+            now, _as_utc(now_after_read()) if now_after_read is not None else now
+        )
+        if _as_utc(row.get("expires_at")) <= verified_now:
             return _invalid_worker()
         if not hmac.compare_digest(
             str(row.get("worker_id") or ""), values["worker_id"]
@@ -2747,7 +2759,15 @@ def _validate_worker_delegation(
         )
         if actual != expected:
             return _invalid_worker("parent_lease_invalid")
-        if _as_utc(lease.get("expires_at")) <= now:
+        if _as_utc(lease.get("expires_at")) <= verified_now:
+            return _invalid_worker("parent_lease_invalid")
+        # The parent may hold a longer process lease to survive a snapshot,
+        # but a delegated worker must not gain a longer orphan-effect window.
+        if (
+            _as_utc(lease.get("heartbeat_at"))
+            + timedelta(seconds=_WORKER_PARENT_HEARTBEAT_MAX_AGE_SECONDS)
+            <= verified_now
+        ):
             return _invalid_worker("parent_lease_invalid")
         return {
             "allowed": True,
@@ -2768,6 +2788,7 @@ def _validate_worker_environment(
     environment: Mapping[str, str],
     *,
     now: Optional[datetime] = None,
+    now_after_read: Optional[Callable[[], datetime]] = None,
     allowed_blocking_operation_id: Optional[str] = None,
     allowed_blocking_intent_id: Optional[str] = None,
     allowed_blocking_wallet_operation: str = "wallet:create_offer",
@@ -2776,6 +2797,7 @@ def _validate_worker_environment(
         return _invalid_worker()
     try:
         values = {name: environment.get(name) for name in _DELEGATION_ENV_NAMES}
+        clock = now_after_read or (_utc_now if now is None else lambda: _as_utc(now))
         return _validate_worker_delegation(
             delegation_id=values[DELEGATION_ID_ENV],
             raw_token=values[DELEGATION_TOKEN_ENV],
@@ -2788,7 +2810,8 @@ def _validate_worker_environment(
             wallet_identity_payload=values[DELEGATION_IDENTITY_ENV],
             wallet_identity_digest=values[DELEGATION_IDENTITY_DIGEST_ENV],
             parent_lease_epoch=values[DELEGATION_PARENT_EPOCH_ENV],
-            now=_as_utc(now or _utc_now()),
+            now=_as_utc(clock()),
+            now_after_read=clock,
             allowed_blocking_operation_id=allowed_blocking_operation_id,
             allowed_blocking_intent_id=allowed_blocking_intent_id,
             allowed_blocking_wallet_operation=allowed_blocking_wallet_operation,
@@ -3461,7 +3484,7 @@ def initialize(
     run_id: Optional[str] = None,
     owner_pid: Optional[int] = None,
     owner_host: Optional[str] = None,
-    lease_seconds: int = 30,
+    lease_seconds: int = 90,
     start_heartbeat: bool = True,
     acquire_lease: bool = True,
     wallet_identity_binding: Optional[WalletIdentityBinding] = None,

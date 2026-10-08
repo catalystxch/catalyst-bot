@@ -32633,7 +32633,10 @@ def acquire_runtime_mutation_lease(
                 """,
                 (safety_at, safety_at, prior_parent),
             )
-        if effective_expiry <= _stability_wall_clock():
+        finished_at = _stability_wall_clock()
+        if effective_expiry <= finished_at or (
+            reason == "renewed" and current["expires_at"] <= finished_at
+        ):
             conn.rollback()
             return {
                 "acquired": False,
@@ -32644,7 +32647,10 @@ def acquire_runtime_mutation_lease(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
         conn.commit()
-        if effective_expiry <= _stability_wall_clock():
+        finished_at = _stability_wall_clock()
+        if effective_expiry <= finished_at or (
+            reason == "renewed" and current["expires_at"] <= finished_at
+        ):
             return {
                 "acquired": False,
                 "reason": "lease_expired",
@@ -32746,7 +32752,8 @@ def heartbeat_runtime_mutation_lease(
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
-        if effective_expiry <= _stability_wall_clock():
+        finished_at = _stability_wall_clock()
+        if effective_expiry <= finished_at or current["expires_at"] <= finished_at:
             conn.rollback()
             return with_timing(
                 {
@@ -32756,7 +32763,8 @@ def heartbeat_runtime_mutation_lease(
                 }
             )
         conn.commit()
-        if effective_expiry <= _stability_wall_clock():
+        finished_at = _stability_wall_clock()
+        if effective_expiry <= finished_at or current["expires_at"] <= finished_at:
             return with_timing(
                 {
                     "heartbeat": False,
