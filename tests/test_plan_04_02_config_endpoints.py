@@ -36,6 +36,10 @@ except (ModuleNotFoundError, ImportError) as exc:
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -64,32 +68,36 @@ class _FlaskBase(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestConfigGet(_FlaskBase):
-    def test_returns_200_without_token(self):
+    def test_requires_token(self):
         resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_returns_200_with_token(self):
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_is_flat_dict(self):
-        resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIsInstance(body, dict)
 
     def test_wallet_type_key_present(self):
-        resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("WALLET_TYPE", body)
 
     def test_dry_run_key_present(self):
-        resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("DRY_RUN", body)
 
     def test_spread_bps_key_present(self):
-        resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("SPREAD_BPS", body)
 
     def test_credentials_excluded(self):
-        resp = self.client.get("/api/config", environ_base=self._LOOPBACK)
+        resp = self._get("/api/config", environ_base=self._LOOPBACK)
         body = resp.get_json()
         # Sensitive keys should not appear in the public config response
         self.assertNotIn("CHIA_WALLET_CERT", body)

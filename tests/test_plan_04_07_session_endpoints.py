@@ -41,6 +41,10 @@ _FAKE_SESSION_SUMMARY = {
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -163,7 +167,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_can_resume_key(self):
@@ -173,7 +177,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         self.assertIn("can_resume", resp.get_json())
 
     def test_bot_running_returns_cannot_resume(self):
@@ -181,7 +185,7 @@ class TestCheckResume(_FlaskBase):
         bot._loop_count = 5
         bot.is_running.return_value = True
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
         self.assertEqual(body.get("reason"), "bot_already_running")
@@ -217,7 +221,7 @@ class TestCheckResume(_FlaskBase):
             patch("database.get_connection", return_value=MagicMock()),
             patch("database.get_open_offers", return_value=[]),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertTrue(body["can_resume"])
@@ -250,7 +254,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
@@ -262,7 +266,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=True),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
         self.assertEqual(body.get("reason"), "fresh_start_chosen")
@@ -274,7 +278,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
 
@@ -292,7 +296,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["can_resume"])
         self.assertIn("buy_count", body)
@@ -330,7 +334,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -346,7 +350,7 @@ class TestCheckResume(_FlaskBase):
             patch("chia_node.is_startup_authorised", return_value=False),
             patch("wallet.get_all_offers") as get_all_offers,
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertFalse(body["can_resume"])

@@ -35,6 +35,10 @@ except (ModuleNotFoundError, ImportError) as exc:
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -82,7 +86,7 @@ class _FlaskBase(unittest.TestCase):
         )
 
     def _get_status(self):
-        return self.client.get(
+        return self._get(
             "/api/coin-prep/status",
             headers=self.auth,
             environ_base=self._LOOPBACK,
@@ -865,7 +869,7 @@ class TestCoinPrepVerify(_FlaskBase):
                 "_tier_size_drift_findings",
             ) as legacy_drift,
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4"
                 "&inner_xch=999&inner_cat=999999&inner_count=50"
@@ -926,7 +930,7 @@ class TestCoinPrepVerify(_FlaskBase):
             ),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
                 environ_base=self._LOOPBACK,
@@ -944,7 +948,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&prepared_xch_size=0.5&prepared_cat_size=500&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
@@ -959,7 +963,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&sniper_xch=0.33&sniper_cat=4400"
                 "&sniper_xch_count=20&sniper_cat_count=20",
@@ -978,7 +982,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
@@ -1006,7 +1010,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=six_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4",
                 environ_base=self._LOOPBACK,
@@ -1028,7 +1032,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=ten_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4&xch_reserve=3",
                 environ_base=self._LOOPBACK,
@@ -1051,7 +1055,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=pending_outgoing),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&liquidity_mode=buy_only"
                 "&prepared_xch_size=1&max_buy=4",
                 environ_base=self._LOOPBACK,
@@ -1076,7 +1080,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", side_effect=balance),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&inner_xch=4&inner_cat=4"
                 "&inner_count=2&xch_reserve=1&cat_reserve=1"
                 "&topup_pool_xch=2&topup_pool_cat=2",
@@ -1102,7 +1106,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=nine_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4&topup_pool_xch=2",
                 environ_base=self._LOOPBACK,
@@ -1118,7 +1122,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&inner_xch=2&inner_cat=1"
                 "&inner_xch_count=17&inner_cat_count=8",
                 environ_base=self._LOOPBACK,
@@ -1145,7 +1149,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4",
                 environ_base=self._LOOPBACK,
@@ -1168,7 +1172,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=one_mojo),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false"
                 "&xch_reserve=0.0000000000006&cat_reserve=0.0006"
                 "&topup_pool_xch=0.0000000000006&topup_pool_cat=0.0006"
@@ -1188,7 +1192,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false",
                 environ_base=self._LOOPBACK,
             )
@@ -1200,7 +1204,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
@@ -1234,7 +1238,7 @@ class TestCoinPrepVerify(_FlaskBase):
             ),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&inner_xch=1&inner_cat=10&inner_count=2",
                 environ_base=self._LOOPBACK,
@@ -1265,7 +1269,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&liquidity_mode=sell_only"
                 "&inner_cat=10&inner_count=2",
                 environ_base=self._LOOPBACK,
@@ -1294,7 +1298,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&liquidity_mode=sell_only"
                 "&inner_cat=10&inner_count=1&fees_xch=0.0005&fees_count=1",
                 environ_base=self._LOOPBACK,

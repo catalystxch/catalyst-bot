@@ -200,6 +200,7 @@ def test_explicit_coin_prep_verify_fetches_fresh_price_when_cache_empty(monkeypa
     response = client.get(
         "/api/coin-prep/verify?tier_enabled=true"
         "&inner_xch=0.1&inner_cat=100&inner_count=2",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     )
 
