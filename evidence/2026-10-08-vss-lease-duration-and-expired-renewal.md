@@ -98,6 +98,17 @@ running from its separate path. Test logs and the QA script are retained in
 `E:\catalyst-7ce8ffa-upgrade-qa`. This verifies the installer upgrade path in
 isolation; it does not establish original-profile live recovery.
 
+The same isolated QA AppId then passed a manual same-version rollback and
+restore sequence: `96d5908 → 7ce8ffa → 96d5908 → 7ce8ffa`. Each installer
+returned zero, each installed EXE matched its expected SHA-256 above, the
+HKCU registration retained the same isolated E: path, and the in-directory
+sentinel survived every replacement. The restored `7ce8ffa` EXE passed
+packaged API and synthetic Sage RPC smokes. Final QA uninstall returned zero,
+removed its EXE and HKCU registration, preserved the sentinel, and left the
+original TEST 7 process untouched. The step logs are in
+`E:\catalyst-7ce8ffa-upgrade-qa`. This is an intentional reinstall of the
+prior version and restoration; it does not simulate a mid-install failure.
+
 The binaries and manifest were pinned at artifact commit
 `09d851342dcd0094e2ded1679db63f2e55d01438`:
 [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/09d851342dcd0094e2ded1679db63f2e55d01438/acceptance-artifacts/CATalyst-7ce8ffa-primary-acceptance.zip),
