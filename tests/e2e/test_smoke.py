@@ -2584,6 +2584,97 @@ def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping
     assert any("retry" in str(item["detail"]).lower() for item in result["progress"])
 
 
+def test_shutdown_does_not_close_native_window_while_backend_is_alive(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let closeCalls = 0;
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            window.pywebview = {
+                api: {confirm_close_window: async () => {
+                    closeCalls += 1;
+                    return {success: true};
+                }}
+            };
+            try {
+                const closed = await closeDesktopWindowAfterShutdown({backendStopped: false});
+                return {closed, closeCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result == {"closed": False, "closeCalls": 0}
+
+
+def test_shutdown_rejection_keeps_native_window_open(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let closeCalls = 0;
+            const steps = [];
+            document.getElementById('shutdownCancelOffers').checked = false;
+            addLogEntry = () => {};
+            waitForShutdownBotStop = async () => true;
+            startupWaitForBackendShutdown = async () => {
+                throw new Error('A rejected shutdown must not wait for backend death.');
+            };
+            closeDesktopWindowAfterShutdown = async () => {
+                closeCalls += 1;
+                return true;
+            };
+            setShutdownStep = (name, status, detail) => steps.push({name, status, detail});
+            apiFetch = async (path) => {
+                if (path.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({success: true}), {status: 200});
+                }
+                if (path.endsWith('/shutdown')) {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        reason: 'CANCEL_ALL_IN_PROGRESS',
+                        error: 'Wait for authoritative Cancel All proof before shutdown'
+                    }), {status: 409});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+            await confirmShutdown();
+            return {closeCalls, steps};
+        }"""
+    )
+    assert result["closeCalls"] == 0
+    assert any(
+        step["name"] == "Server" and step["status"] == "error"
+        for step in result["steps"]
+    )
+
+
+def test_shutdown_health_error_is_not_process_exit(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalFetch = window.fetch;
+            let probes = 0;
+            window.fetch = async () => {
+                probes += 1;
+                return new Response('{}', {status: 503});
+            };
+            try {
+                return {stopped: await startupWaitForBackendShutdown(650), probes};
+            } finally {
+                window.fetch = originalFetch;
+            }
+        }"""
+    )
+    assert result["stopped"] is False
+    assert result["probes"] >= 2
+
+
 def test_shutdown_stop_poll_times_out_fail_closed(page):
     """A stop that never becomes authoritative must not proceed to cancellation."""
 

@@ -1779,6 +1779,16 @@ class AppBridge:
 
             import desktop_app as _da
 
+            readiness = _da._cleanup()
+            if type(readiness) is not dict or readiness.get("released") is not True:
+                return {
+                    "success": False,
+                    "error": "Native shutdown is waiting for wallet mutation proof.",
+                    "reason": readiness.get("reason", "native_close_unproven")
+                    if type(readiness) is dict
+                    else "native_close_unproven",
+                }
+
             if hasattr(_da, "_state"):
                 _da._state["confirmed_close"] = True
                 # Persist window geometry now — destroy() may bypass the
@@ -1881,6 +1891,18 @@ class AppBridge:
     def close_window(self):
         """Close the window."""
         try:
+            import desktop_app as _da
+
+            readiness = _da._cleanup()
+            if type(readiness) is not dict or readiness.get("released") is not True:
+                return {
+                    "success": False,
+                    "error": "Native shutdown is waiting for wallet mutation proof.",
+                    "reason": readiness.get("reason", "native_close_unproven")
+                    if type(readiness) is dict
+                    else "native_close_unproven",
+                }
+
             import webview
 
             if webview.windows:

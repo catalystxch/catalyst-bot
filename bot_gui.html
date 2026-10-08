@@ -33967,47 +33967,47 @@
                 }
 
                 // Step 3: Shut down the server and close the window.
-                // The server may die mid-request (killing the webview before
-                // the DOM can paint), so we mark this step done BEFORE firing
-                // the shutdown.  That way the user sees all three steps green
-                // with a clean "Shutdown complete" state before the window
-                // closes — much more polished than a frozen "Working" dot.
                 setShutdownStep('Server', 'active', 'Sending shutdown signal...');
                 updateShutdownProgress('Closing...', 'Stopping the server.');
                 addLogEntry('info', '   Step 3: Shutting down server...');
-
-                // Brief pause so the "active" state renders (gives visual
-                // continuity: grey → red → green across all three steps).
-                await new Promise(r => setTimeout(r, 400));
-
-                // Mark done and show the final state BEFORE the shutdown call.
-                setShutdownStep('Server', 'done', 'Server stopped.');
-                addLogEntry('success', '   Server shutdown initiated');
-                finishShutdownProgress(true, 'Shutdown complete. Closing the window now.');
-
-                // Hold the all-green state for a moment so it's visible.
-                await new Promise(r => setTimeout(r, 1000));
-
-                // Now actually fire the shutdown.  If the server dies mid-
-                // request the catch sets backendStopped = true — that's fine,
-                // the user already sees the complete state above.
                 let backendStopped = false;
+                let shutdownRejected = false;
                 try {
-                    await apiFetch(`${API_URL}/shutdown`, {
+                    const response = await apiFetch(`${API_URL}/shutdown`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ cancel_offers: false })
                     });
-                    backendStopped = await startupWaitForBackendShutdown(7000);
+                    if (!response.ok) {
+                        shutdownRejected = true;
+                        const body = await response.json().catch(() => ({}));
+                        throw new Error(body.error || body.reason || 'Server rejected shutdown.');
+                    }
+                    const body = await response.json();
+                    if (body.success !== true) {
+                        shutdownRejected = true;
+                        throw new Error(body.error || body.reason || 'Server rejected shutdown.');
+                    }
                 } catch(e) {
-                    backendStopped = true;
+                    if (shutdownRejected) throw e;
+                    // The process may exit before its HTTP response arrives.
+                    // Observe backend death instead of assuming that happened.
                 }
+                backendStopped = await startupWaitForBackendShutdown(45000);
+                if (!backendStopped) {
+                    throw new Error('Server is still running; wallet mutation shutdown is unproven.');
+                }
+                setShutdownStep('Server', 'done', 'Server stopped.');
+                finishShutdownProgress(true, 'Shutdown complete. Closing the window now.');
 
                 // Close the desktop window.
                 const closed = await closeDesktopWindowAfterShutdown({
                     backendStopped,
-                    extraWaitMs: backendStopped ? 500 : 1500
+                    extraWaitMs: 500
                 });
+                if (!closed && IS_DESKTOP) {
+                    throw new Error('Desktop close was blocked because shutdown proof is incomplete.');
+                }
                 if (!closed) {
                     addLogEntry('info', '   Server stopped. You can close this tab.');
                 }
@@ -37733,24 +37733,28 @@ async function startupChooseConnectSage() {
 
 async function startupWaitForBackendShutdown(timeoutMs = 6000) {
     const deadline = Date.now() + Math.max(500, Number(timeoutMs) || 0);
+    let consecutiveConnectionFailures = 0;
     while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 250));
         try {
-            const probe = await apiFetch(`${API_URL}/alerts`, {
+            // Probe the HTTP server itself. A bridge or endpoint error still
+            // means the process may be alive, so neither proves shutdown.
+            await fetch(`${API_URL}/health`, {
                 cache: 'no-store',
-                signal: AbortSignal.timeout(1000)
+                mode: 'no-cors',
+                signal: AbortSignal.timeout(3000)
             });
-            if (!probe.ok) {
-                return true;
-            }
+            consecutiveConnectionFailures = 0;
         } catch (err) {
-            return true;
+            consecutiveConnectionFailures += 1;
+            if (consecutiveConnectionFailures >= 3) return true;
         }
     }
     return false;
 }
 
 async function closeDesktopWindowAfterShutdown({ backendStopped = false, extraWaitMs = 0 } = {}) {
+    if (!backendStopped) return false;
     const waitMs = Math.max(0, Number(extraWaitMs) || 0);
     if (waitMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -37811,18 +37815,19 @@ async function closeDesktopWindowAfterShutdown({ backendStopped = false, extraWa
             // confirmed-close flag so the on_closing handler doesn't
             // re-open the shutdown modal in a loop.
             if (typeof window.pywebview.api.confirm_close_window === 'function') {
-                await window.pywebview.api.confirm_close_window();
-                return true;
+                const result = await window.pywebview.api.confirm_close_window();
+                return result?.success === true;
             }
             if (typeof window.pywebview.api.close_window === 'function') {
-                await window.pywebview.api.close_window();
-                return true;
+                const result = await window.pywebview.api.close_window();
+                return result?.success === true;
             }
         }
     } catch (err) {
         debugWarn('[STARTUP] Desktop close failed:', err);
     }
 
+    if (IS_DESKTOP) return false;
     try {
         window.close();
     } catch (err) {

@@ -1241,11 +1241,14 @@ def run_desktop_mode(dev_mode: bool = False):
     def on_closing():
         # If the user already confirmed via the modal, let it through.
         if _state.get("confirmed_close"):
+            readiness = _cleanup()
+            if readiness.get("released") is not True:
+                _state["confirmed_close"] = False
+                return False
             try:
                 _save_window_state(window)
             except Exception:
                 pass
-            _cleanup()
             if tray:
                 try:
                     tray.stop()
@@ -1265,12 +1268,14 @@ def run_desktop_mode(dev_mode: bool = False):
             pass
 
         if not bot_running:
-            # Safe path — save state and close.
+            # A stopped bot may still have an active Cancel All proof worker.
+            readiness = _cleanup()
+            if readiness.get("released") is not True:
+                return False
             try:
                 _save_window_state(window)
             except Exception:
                 pass
-            _cleanup()
             if tray:
                 try:
                     tray.stop()
@@ -1288,13 +1293,7 @@ def run_desktop_mode(dev_mode: bool = False):
             print("\n  Alt+F4 intercepted — showing shutdown confirmation.", flush=True)
         except Exception as e:
             print(f"  [CLOSE] Could not show shutdown modal: {e}", flush=True)
-            # Fall back to hard close so the user isn't trapped
-            try:
-                _save_window_state(window)
-            except Exception:
-                pass
-            _cleanup()
-            return True
+            return False
         # Cancel this close event — the modal will set confirmed_close
         # and re-invoke the close when it finishes the graceful sequence.
         return False
@@ -1326,7 +1325,10 @@ def run_desktop_mode(dev_mode: bool = False):
     # If we get here, all windows are closed
     print("\n  Desktop window closed.")
     print("  Stopping bot...", flush=True)
-    _cleanup()
+    # Some window backends can bypass on_closing(). Never take their window
+    # disappearance as proof that a wallet mutation has drained.
+    while _cleanup().get("released") is not True:
+        time.sleep(1)
     print("  Shutdown complete. Goodbye!", flush=True)
     time.sleep(0.5)  # Brief pause so user can see the shutdown messages
     os._exit(0)  # Force exit - daemon threads (Flask, tray) won't block
@@ -1494,7 +1496,8 @@ def _show_window(webview_module):
 
 def _quit_app(webview_module, tray):
     """Clean shutdown from tray quit action (fallback for non-graceful paths)."""
-    _cleanup()
+    if _cleanup().get("released") is not True:
+        return
     try:
         # Destroy all webview windows
         for win in webview_module.windows:
@@ -1538,7 +1541,7 @@ def _tray_graceful_quit(webview_module, tray):
 
 
 def _cleanup():
-    """Clean shutdown of bot and modules."""
+    """Release wallet mutation ownership before a native hard exit."""
     try:
         from database import log_event
 
@@ -1547,11 +1550,11 @@ def _cleanup():
         pass
 
     try:
-        import api_server
+        from native_shutdown import native_close_readiness
 
-        api_server.quiesce_and_release_mutation_runtime()
+        return native_close_readiness()
     except Exception:
-        pass
+        return {"released": False, "reason": "native_close_preflight_unavailable"}
 
 
 def _poll_tray_status(tray, interval: float = 3.0):
