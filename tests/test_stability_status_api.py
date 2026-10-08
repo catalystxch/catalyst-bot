@@ -1,6 +1,22 @@
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+
+def test_public_safety_wallet_label_is_per_run_and_not_reversible(monkeypatch):
+    import api_server
+
+    wallet_hash = api_server.mutation_gate.wallet_fingerprint_hash(736588221)
+    monkeypatch.setattr(api_server, "_PUBLIC_SAFETY_ID_KEY", b"first test process key")
+    first = api_server._public_safety_wallet_label(wallet_hash)
+    monkeypatch.setattr(api_server, "_PUBLIC_SAFETY_ID_KEY", b"second test process key")
+    second = api_server._public_safety_wallet_label(wallet_hash)
+
+    assert re.fullmatch(r"run:[0-9a-f]{12}…", first)
+    assert re.fullmatch(r"run:[0-9a-f]{12}…", second)
+    assert first != second
+    assert wallet_hash[:12] not in (first + second)
 
 
 def _gate_status(*, allowed=False, reason_code="UNRESOLVED_OPERATIONS"):
@@ -138,11 +154,9 @@ def test_safety_status_contract_is_actionable_bounded_and_redacted(monkeypatch):
         "reservations": 0,
         "publication_claims": 0,
     }
-    assert safety["identity"] == {
-        "wallet_fingerprint": "sha256:ffffffffffff…",
-        "network": "mainnet",
-        "lease_owner": "other_run",
-    }
+    assert re.fullmatch(r"run:[0-9a-f]{12}…", safety["identity"]["wallet_fingerprint"])
+    assert safety["identity"]["network"] == "mainnet"
+    assert safety["identity"]["lease_owner"] == "other_run"
     assert safety["source_ages_seconds"] == {
         "lease": 2,
         "wallet_identity_freshness": 4,

@@ -31,6 +31,7 @@ import threading
 import secrets
 import webbrowser
 import hashlib
+import hmac
 
 # When run as the entry point (`python api_server.py`), Python loads this file
 # as the `__main__` module — `sys.modules` has no `api_server` key. Any
@@ -800,6 +801,7 @@ _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN") or secrets.token_urls
 os.environ["BOT_LOCAL_WRITE_TOKEN"] = _LOCAL_API_TOKEN
 _LOCAL_API_COOKIE_VALUE = secrets.token_urlsafe(32)
 _LOCAL_API_BOOTSTRAP_TOKEN = secrets.token_urlsafe(32)
+_PUBLIC_SAFETY_ID_KEY = secrets.token_bytes(32)
 
 # ---------------------------------------------------------------------------
 # Security helpers
@@ -1749,6 +1751,14 @@ def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
     return "REVIEW_SAFETY_DIAGNOSTICS"
 
 
+def _public_safety_wallet_label(wallet_hash: str) -> str:
+    """Correlate one run without exposing a reversible wallet hash prefix."""
+    digest = hmac.new(
+        _PUBLIC_SAFETY_ID_KEY, wallet_hash.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return f"run:{digest[:12]}…"
+
+
 def get_public_stability_status() -> dict:
     """Return the stable, redacted Task 10 diagnostics contract."""
 
@@ -1864,7 +1874,7 @@ def get_public_stability_status() -> dict:
         malformed = True
         redacted_fingerprint = None
     else:
-        redacted_fingerprint = f"sha256:{wallet_hash[:12]}…"
+        redacted_fingerprint = _public_safety_wallet_label(wallet_hash)
     if (
         type(network) is not str
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", network) is None

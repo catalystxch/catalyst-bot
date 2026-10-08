@@ -661,7 +661,7 @@ renderSafetyDiagnosticsStatus({
   source: 'durable_latch',
   blocking_operation_count: 1,
   blocker_counts: { operations: 1, reservations: 0, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:00:30.000000Z' },
   recovery: {
     failed_check: 'authority_revalidation',
@@ -695,7 +695,7 @@ renderSafetyDiagnosticsStatus({
   source: 'operation_journal',
   blocking_operation_count: 2,
   blocker_counts: { operations: 2, reservations: 1, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
   recovery: {
     failed_check: 'unresolved_operations',
@@ -729,7 +729,7 @@ renderSafetyDiagnosticsStatus({
   source: 'lease',
   blocking_operation_count: 0,
   blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
   recovery: {
     failed_check: null,
@@ -764,7 +764,7 @@ renderSafetyDiagnosticsStatus({
   source: 'lease',
   blocking_operation_count: 0,
   blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-03-03T12:02:00.000000Z' },
   recovery: {
     failed_check: null,
@@ -796,7 +796,7 @@ renderSafetyDiagnosticsStatus({
   source: 'lease',
   blocking_operation_count: 0,
   blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
   recovery: {
     failed_check: null,
@@ -828,7 +828,7 @@ const safety = {
   source: 'lease',
   blocking_operation_count: 0,
   blocker_counts: { operations: 0, reservations: 0, publication_claims: 0 },
-  identity: { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
+  identity: { wallet_fingerprint: 'run:ffffffffffff…', network: 'mainnet', lease_owner: 'this_run' },
   lease: { active: true, owner: 'this_run', version: 4, expires_at: '2026-08-21T12:02:00.000000Z' },
   recovery: {
     failed_check: null,
@@ -845,8 +845,8 @@ const safety = {
 };
 renderSafetyDiagnosticsStatus(safety);
 assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Allowed');
-assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Wallet sha256:ffffffffffff… · Network mainnet');
-safety.identity = { wallet_fingerprint: 'sha256:ffffffffffff…', network: 'unknown', lease_owner: 'this_run' };
+assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Wallet run:ffffffffffff… · Network mainnet');
+safety.identity = { wallet_fingerprint: 'run:ffffffffffff…', network: 'unknown', lease_owner: 'this_run' };
 renderSafetyDiagnosticsStatus(safety);
 assert.strictEqual(elements.safetyDiagnosticsState.textContent, 'Blocked');
 assert.strictEqual(elements.safetyDiagnosticsBinding.textContent, 'Unknown');

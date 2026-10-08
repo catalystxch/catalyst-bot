@@ -15675,7 +15675,7 @@
             const actionKnown = typeof value.recommended_action === 'string'
                 && Object.prototype.hasOwnProperty.call(SAFETY_DIAGNOSTICS_ACTIONS, value.recommended_action);
             const fingerprintKnown = typeof identity.wallet_fingerprint === 'string'
-                && /^sha256:[0-9a-f]{12}…$/.test(identity.wallet_fingerprint);
+                && /^run:[0-9a-f]{12}…$/.test(identity.wallet_fingerprint);
             const networkKnown = typeof identity.network === 'string'
                 && identity.network !== 'unknown'
                 && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(identity.network);
