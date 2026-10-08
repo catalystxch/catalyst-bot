@@ -1,0 +1,29 @@
+# Stopped Cancel All and native shutdown: exact `7a27999` candidate
+
+## Scope and source
+
+The runtime/source is `7a279999d7eb448788e259d569c39fbc011178eb` on draft child PR #253 into the draft PR #220 branch. The test-only child `b22d8b29c857c9b7cb32e97401a8ab10d279f235` corrects a pre-existing desktop cleanup test that had no owned runtime, so it entered the valid first-launch close path instead of central quiescence. No runtime or packaged byte changed in the child.
+
+The candidate makes stopped Cancel All enumerate the complete Sage offer history, combine wallet-only and database targets, separate ordinary and campaign-scoped fee cohorts, and demand authoritative terminal proof plus a fresh complete wallet read before reporting completion. A circuit-breaker cancellation stays pending until the wallet book is proven empty; requote cooldown remains clear when no replacement was created. API and native close paths refuse to cut off active Cancel All or another unproven mutation, while an idle first launch with no mutation runtime can close.
+
+The secondary PC independently reviewed exact `7a27999` against PR #220 parent `de2139ba7efe85720f518191ed8413699d072889` and reported no concrete correctness or safety findings. It confirmed the parent is an ancestor, `git diff --check` was clean, and all seven changed Python source files compiled in memory. This was a source review, not live-wallet acceptance.
+
+A separate Codex Security diff scan of all eight changed source files in `de2139ba..b22d8b2` completed with no reportable findings. Its sealed report is at `C:\Users\t_you\.codex\state\plugins\codex-security\scans\catalyst-pr220-alias-integration\b22d8b29c857c9b7cb32e97401a8ab10d279f235_20261008T224219Z_mnezqd51\report.md`. This source review does not replace runtime or wallet acceptance.
+
+## Verification
+
+The focused Windows backend passed **123 tests and 4 subtests** (`E:\catalyst-cancel-wallet-final-targeted.log`, SHA-256 `2657017245DAAA251492107B1FEEEF4554C1368DA506DE20BCAF3A3CFD492D66`). Full isolated Chromium passed **250 tests** (`E:\catalyst-cancel-wallet-final-chromium.log`, SHA-256 `FE1735FFCFCDED9F617690CC3D7F1BD83FFCC8DFCE4CFB7B8FF0DFB004AE0A41`). Ruff, format, and diff checks passed.
+
+The first complete serial Windows backend run found one outdated test setup: **7,475 passed, 251 skipped, 455 subtests passed, one failed** (`E:\catalyst-cancel-wallet-final-backend.log`, SHA-256 `582AC690658C775AAB24453936E179675E5A217914FACBDEFD10110F73741593`). The isolated test reproduced the same failure. `desktop_app._cleanup()` now delegates to `native_close_readiness()`, whose no-runtime branch safely returns without calling central quiescence. The test had mocked central quiescence but supplied no owned runtime. The test-only child supplies an owned runtime, proves `begin_quiesce` precedes the central call, and retains the direct-release prohibition. The corrected case plus adjacent native close regressions passed **7 tests**. The complete serial backend rerun on exact `b22d8b2` then passed **7,476 tests, 251 skipped, and 455 subtests** in 22 minutes 2 seconds (`E:\catalyst-cancel-wallet-b22-full-backend.log`, SHA-256 `4A1F91B59435F1C0C0323EAB4FC85745708C39E6AF83F8AAFA546233B6FB062C`).
+
+The clean detached Windows package was built from exact `7a27999`. The EXE SHA-256 is `66FF84A8CA69E0C9CFCAFFFE464F1D6A419CD0A2EEDCD4E20BE98F21F10A2BF8`; bundled UI SHA-256 is `6C571083E49B82B34F49628FF2A44C6A54EE8080F8558963B9BDF36691D3F8B0`. The 192-entry ZIP SHA-256 is `3BE6F5855E6A73292AC0BBAAD7911E8AA8FB9D76D03AFCB6A1E90310938CA1AE`; its CRC, safe paths, embedded EXE, and UI hashes passed. The unsigned Inno Setup installer SHA-256 is `EEB5A41943CF1031C2F0AFB02DC0CAF0F02AE09EB2BE27F2370C99F51C60F9A6`. Defender custom scans found no new detection. These files and `SHA256SUMS-7a27999.txt` are pinned at artifact commit `eded172ebcff4447f2f4983216e4274f190d074e`; independent primary HTTP downloads of ZIP, installer, and manifest matched the local hashes. The secondary PC independently matched all pinned artifacts and Git blobs, verified ZIP CRC and safe paths, embedded EXE/UI hashes, v1.4.0 metadata, and `NotSigned` status without executing a new package.
+
+The secondary check exposed a capacity failure: C: fell from 2.741 GiB to 0.612 GiB free while Git auto-maintenance/repack ran and Windows expanded `pagefile.sys` to 9,206,800,384 bytes. The secondary stopped only the orphaned Git process tree; its guarded deletion of 127,853,657 bytes of temporary Git pack files was blocked by execution policy, so no further deletion was attempted. All three existing monitor/app pairs remained alive and responsive. This is a real low-disk warning, and the secondary exact-candidate runtime must not launch until capacity is restored and the existing monitors finish.
+
+A fresh secondary check at `2026-10-08T22:46:11Z` found 795,967,488 bytes (0.741 GiB) free, still below the 1 GiB alert threshold. All six expected monitor/app processes were present and responsive, and no process was running from the new `7a27999` artifact directory.
+
+Packaged API, synthetic Sage, native startup/recovery, extracted ZIP runtime, and isolated installer execution remain open while earlier exact-f9 process-count stability monitors run on both PCs. Launching another `Catalyst.exe` would invalidate those monitored windows. The exact `7a27999` runtime has not run against the original TEST 7 profile and has no final-candidate 24-hour window.
+
+## Release gate
+
+PR #253 and PR #220 remain draft. Mainnet active-offer lifecycle/recovery, both final-candidate 24-hour windows, secondary original-profile identity/live acceptance, full native UI, final review, and website beta publication remain open. No new TEST 7 campaign or fee scope has been approved; no wallet action was taken for this change. This package is acceptance evidence, not a public release or readiness claim.
