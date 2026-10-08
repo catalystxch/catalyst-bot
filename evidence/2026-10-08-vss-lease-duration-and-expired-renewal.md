@@ -53,8 +53,43 @@ alive. Worker freshness and delayed-authorization-read regressions passed.
 The final affected mutation-gate, long-gap-recovery and offer-journal suite
 passed **561 tests**. The complete serial local Windows backend passed
 **7,425 tests, 246 skipped, 455 subtests** in 20 minutes 45 seconds. Ruff
-check, Ruff format check and `git diff --check` passed. Exact package, CI,
-and original-profile live acceptance are pending.
+check, Ruff format check and `git diff --check` passed. Runtime/source commit
+`7ce8ffafef3ac8e14c269348c5285a2e268e2734` was pushed to draft PR
+#220. All **11** exact-source PR checks passed, including unit tests,
+CodeQL, Semgrep, lint, and secret scanning. Original-profile live acceptance
+is pending.
+
+## Exact detached Windows package
+
+Built from clean detached source `7ce8ffa` in
+`E:\catalyst-vss-lease-7ce8ffa-build`; the build-generated `_version.py` is
+the only tracked change in that checkout.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `Catalyst.exe` | `47198CA321C9E36692929D9661EEF99D51037743AB5EAB71D42022DDE3C92B77` |
+| Bundled `bot_gui.html` | `A696815D885412C94E1B9B460D2976ED80288819A6E023C0DE60FC4AD0A32609` |
+| ZIP | `B755796AE4327B941C10EB4B0E44097FD4FE95A20AAEDCAD01219AFE963522A4` |
+| Unsigned installer | `42B7439C67628FE5ECC02D2555246B490714131159A3EB63A7072596A511FDE3` |
+
+Packaged API, synthetic Sage RPC worker, interrupted-publication recovery,
+and clean/duplicate/persisted native launch smokes passed. The ZIP has 192
+files and 242 entries, passed CRC, and contains the exact EXE hash; its
+extracted EXE passed the API smoke. An isolated QA installer with a unique
+AppId and name installed the exact EXE to a distinct current-user Programs
+directory, passed installed API and synthetic Sage smokes, then uninstalled
+with its registration and EXE absent. Its `/DIR` override did not take effect,
+but the unique AppId and name kept the installation separate. Defender
+antivirus and real-time protection were enabled; custom scans of the bundle,
+ZIP, and installer completed with the six prior detection records unchanged.
+
+The binaries and manifest were pinned at artifact commit
+`09d851342dcd0094e2ded1679db63f2e55d01438`:
+[ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/09d851342dcd0094e2ded1679db63f2e55d01438/acceptance-artifacts/CATalyst-7ce8ffa-primary-acceptance.zip),
+[unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/09d851342dcd0094e2ded1679db63f2e55d01438/acceptance-artifacts/Catalyst-Setup-7ce8ffa-1.4.0.exe),
+and [SHA-256 manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/09d851342dcd0094e2ded1679db63f2e55d01438/acceptance-artifacts/SHA256SUMS-7ce8ffa.txt).
+Independent HTTP downloads of both binaries matched their hashes; the
+downloaded ZIP passed CRC and contained the same EXE hash.
 
 The older TEST 7 app remains in its read-only `HEARTBEAT_FAILED` fence. No
 wallet effect, campaign start, or existing-profile restart was performed by
