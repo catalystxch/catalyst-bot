@@ -120,6 +120,11 @@ This is isolated evidence, not secondary original-profile live acceptance.
 The secondary C: drive dropped below 1 GiB during the runs, so further test
 launches there stopped pending safe recovery of disk space. Its older exact-544
 canary recorded a low-disk alert and cannot count toward this final source.
+The secondary read-only inventory found C: at 610,938,880 bytes free, with no
+suitable alternate data volume. Eleven inactive, user-owned pytest temporary
+directories total 2,404,734,427 bytes; none was deleted. The active Harvestr
+and synthetic canaries and their monitors remained intact. Secondary exact-f9
+endurance remains paused until the machine has adequate free space.
 
 ## Primary original-profile stopped start
 
