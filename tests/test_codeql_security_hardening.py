@@ -13,6 +13,7 @@ import sage_node
 from blueprints import bot as bot_routes
 from blueprints import coin_prep as coin_prep_routes
 from blueprints import config_bp
+from blueprints import market as market_routes
 import coin_prep_worker
 
 
@@ -506,6 +507,32 @@ def test_coin_prep_status_hides_drift_exception_details():
     body = resp.get_json()
     assert body["tier_size_drift_error"] == "Tier status unavailable"
     assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_disabled_debug_handlers_fail_closed_without_request_guard():
+    handlers = (
+        ("/api/debug/coinprep", market_routes.api_debug_coinprep, "GET"),
+        ("/api/debug/pricing", market_routes.api_debug_pricing, "GET"),
+        (
+            "/api/debug/sage-single-offer-test",
+            market_routes.api_debug_sage_single_offer_test,
+            "POST",
+        ),
+    )
+    with (
+        patch.object(api_server, "bot", None),
+        patch("requests.get", side_effect=RuntimeError("unexpected network access")),
+        patch(
+            "wallet.get_wallet_type",
+            side_effect=AssertionError("debug handler touched wallet"),
+        ),
+    ):
+        for path, handler, method in handlers:
+            with api_server.app.test_request_context(path, method=method):
+                result = handler()
+            response, status = result if isinstance(result, tuple) else (result, 200)
+            assert status == 404, path
+            assert response.get_json()["error"] == "debug_routes_disabled"
 
 
 def test_config_change_address_result_hides_wallet_exception_details(monkeypatch):
