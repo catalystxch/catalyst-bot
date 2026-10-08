@@ -1520,7 +1520,9 @@ class TestShutdown(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_cancel_all_state", {"running": False}),
             patch.object(api_server, "_cancel_all_thread", None),
-            patch.object(api_server.mutation_gate, "current_runtime", return_value=None),
+            patch.object(
+                api_server.mutation_gate, "current_runtime", return_value=None
+            ),
             patch("threading.Thread") as mock_thread,
             patch.object(bot_blueprint.time, "sleep"),
             patch.object(bot_blueprint, "backup_database"),
