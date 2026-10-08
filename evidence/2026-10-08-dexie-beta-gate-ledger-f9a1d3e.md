@@ -17,6 +17,17 @@ window, or green check does not establish acceptance for this source.
 | Native UI and final review | Earlier isolated packaged UI traversal and Chromium checks passed. Full exact-f9 original-profile native UI and active-state checks, final release review, signed/tagged beta manifest and website synchronization remain open. | Open |
 | Website | Draft [website PR #89](https://github.com/Lowestofttim/catalystxch/pull/89) at `8c214258eb2b76fb159b4931fe42dac17f316f9e` targets `main`, is mergeable, and its validator passed. It retains the older v1.3.21 public download until the exact beta is approved and published. | Staged, not deployed |
 
+At `2026-10-08T18:15Z`, the secondary PC preserved an
+`unexpected_catalyst_process_count` alert in its **older exact-196** Harvestr
+monitor. That historical window is not a clean 24-hour pass. The alert arose
+when the isolated exact-f9 synthetic app ran alongside the stopped exact-196
+app. A read-only audit of the exact-f9 monitor confirmed that it checks its
+own executable path, PID and port owner rather than a global process count:
+55 exact-f9 samples had zero alerts, path/PID/port drift or mutating Sage RPCs.
+This is interim evidence only; the exact-f9 window still requires its complete
+24-hour trace and end-state review. The secondary C: drive had 2,939,863,040
+bytes free at that audit.
+
 The [exact correction and package evidence](2026-10-08-zero-count-startup-latch-recovery-f9a1d3e.md)
 records the red/green regression, pinned package links, independent download
 hashes, QA installer, and original-profile rollover. Keep both PRs draft until
