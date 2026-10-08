@@ -658,6 +658,7 @@ def test_wallet_and_trade_read_routes_require_local_credential():
         "/api/update/relaunch-intent",
         "/api/update/status",
         "/api/offers/cancel_all/status",
+        "/api/offers/open_count",
         "/api/market/fill-intel",
         "/api/market/intel",
         "/api/market/confidence",
@@ -709,6 +710,8 @@ def test_every_get_api_route_has_an_explicit_privacy_classification():
     # A new GET handler must be reviewed before another local process can
     # read it merely by connecting to the Flask port. Debug routes and SSE
     # have their own earlier guards; quarantine has a parameterized path.
+    # The bounded, redacted safety status stays public so a failed desktop
+    # startup and external stability monitor can report a fail-closed reason.
     public_or_separately_guarded = {
         "/api/amm/price",
         "/api/check-update",
@@ -724,7 +727,6 @@ def test_every_get_api_route_has_an_explicit_privacy_classification():
         "/api/market/price-history",
         "/api/market/slippage",
         "/api/market/summary",
-        "/api/offers/open_count",
         "/api/price",
         "/api/price/tibet",
         "/api/safety/quarantine/<quarantine_id>",

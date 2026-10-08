@@ -269,6 +269,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/wallet/sage-running",
         "/api/sage/cert-candidates",
         "/api/offers",
+        "/api/offers/open_count",
         "/api/offers/cancel_all/status",
         "/api/offers/diagnostic",
         "/api/fills",
