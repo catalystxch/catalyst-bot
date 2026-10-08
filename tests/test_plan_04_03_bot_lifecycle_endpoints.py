@@ -1473,6 +1473,41 @@ class TestShutdown(_FlaskBase):
         self.assertEqual(resp.status_code, 400)
         mock_thread.assert_not_called()
 
+    def test_shutdown_rejects_inflight_cancel_all_before_starting_thread(self):
+        with (
+            patch.object(api_server, "_cancel_all_state", {"running": True}),
+            patch("threading.Thread") as mock_thread,
+        ):
+            resp = self._post("/api/shutdown", {"cancel_offers": False})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["reason"], "CANCEL_ALL_IN_PROGRESS")
+        mock_thread.assert_not_called()
+
+    def test_shutdown_does_not_exit_when_quiescence_cannot_release_lease(self):
+        from blueprints import bot as bot_blueprint
+
+        fake_bot = MagicMock()
+        fake_bot.splash_node.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", fake_bot),
+            patch.object(api_server, "_coin_prep_proc", None),
+            patch("threading.Thread") as mock_thread,
+            patch.object(bot_blueprint.time, "sleep"),
+            patch.object(bot_blueprint, "backup_database"),
+            patch("database.get_connection") as connection,
+            patch.object(
+                api_server,
+                "quiesce_and_release_mutation_runtime",
+                return_value={"released": False, "reason": "mutations_in_flight"},
+            ),
+            patch.object(bot_blueprint.os, "_exit") as exit_process,
+        ):
+            resp = self._post("/api/shutdown", {"cancel_offers": False})
+            connection.return_value.execute.return_value = None
+            mock_thread.call_args.kwargs["target"]()
+        self.assertEqual(resp.status_code, 200)
+        exit_process.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

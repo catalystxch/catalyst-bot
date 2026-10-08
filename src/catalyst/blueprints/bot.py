@@ -1218,6 +1218,40 @@ def api_shutdown():
             }
         ), 409
 
+    # Keep the wallet-wide proof worker alive until it has reached Task 9
+    # terminal evidence. The lifecycle lock also serializes this check with
+    # reserving a new Cancel All worker or starting the bot.
+    with api_server._bot_cancel_lifecycle_lock:
+        try:
+            with api_server._cancel_all_state_lock:
+                cancel_active = api_server._cancel_all_state.get("running") is not False
+            cancel_thread = api_server._cancel_all_thread
+            cancel_active = cancel_active or (
+                cancel_thread is not None and cancel_thread.is_alive()
+            )
+        except Exception:
+            cancel_active = True
+        if cancel_active:
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CANCEL_ALL_IN_PROGRESS",
+                    "error": "Wait for authoritative Cancel All proof before shutdown",
+                }
+            ), 409
+        runtime = api_server.mutation_gate.current_runtime()
+        if runtime is not None:
+            try:
+                runtime.begin_quiesce()
+            except Exception:
+                return jsonify(
+                    {
+                        "success": False,
+                        "reason": "SHUTDOWN_QUIESCE_UNAVAILABLE",
+                        "error": "Could not reserve safe shutdown",
+                    }
+                ), 503
+
     def _do_shutdown():
         """Run shutdown sequence in background thread so the HTTP response returns first."""
         time.sleep(0.5)  # Let the response reach the browser
@@ -1294,7 +1328,19 @@ def api_shutdown():
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
         # 5. Release ownership only after every producer is proven quiescent.
-        api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
+        release = api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
+        if type(release) is not dict or release.get("released") is not True:
+            slog(
+                "SHUTDOWN",
+                "Shutdown remains in safety fence because mutation quiescence is unproven",
+                {
+                    "reason": (release or {}).get("reason")
+                    if type(release) is dict
+                    else "invalid_result"
+                },
+                level="error",
+            )
+            return
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()

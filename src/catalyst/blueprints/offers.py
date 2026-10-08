@@ -1138,6 +1138,29 @@ def _api_cancel_all_locked():
                         _terminal_ids = _authoritatively_terminal_offer_ids(
                             _cancel_open_ids
                         )
+                    # Task 9 proves the planned targets, not wallet-wide
+                    # emptiness. A new offer can appear while those cancels
+                    # are pending, and a bounded/cached refresh cannot prove
+                    # it absent. Require a fresh complete Sage history before
+                    # reporting Cancel All complete or allowing shutdown.
+                    _final_history = load_sage_offer_history(
+                        get_all_offers=read_authoritative_page,
+                        include_completed=False,
+                        page_size=500,
+                        max_pages=20,
+                    )
+                    if _final_history.get("complete") is not True or _final_history.get(
+                        "read_error"
+                    ):
+                        raise RuntimeError(
+                            "Final wallet offer history is incomplete; "
+                            "Cancel All remains unconfirmed."
+                        )
+                    if _final_history["records"]:
+                        raise RuntimeError(
+                            "New or unresolved wallet offers remain after "
+                            "cancellation; run Cancel All again."
+                        )
                     durable_manager.expect_empty_wallet_offer_book(
                         "manual_cancel_all_confirmed"
                     )

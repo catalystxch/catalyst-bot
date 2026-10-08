@@ -815,7 +815,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if stopped.offer_manager.cancel_offers.call_count
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch("wallet.cancel_offers_batch") as direct_batch,
             patch("wallet.is_offer_time_expired", return_value=False),
@@ -926,9 +930,14 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
+                side_effect=lambda **_bounds: (
+                    []
+                    if reconciled["done"]
+                    else [
+                        {"trade_id": trade_id, "status": "ACTIVE"}
+                        for trade_id in trade_ids
+                    ]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -982,7 +991,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if stopped.offer_manager.cancel_offers.call_count
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -1002,6 +1015,89 @@ class TestCancelAllPost(_FlaskBase):
             "manual_cancel_all_confirmed"
         )
         stopped.offer_manager.sync_from_wallet.assert_called_once_with()
+
+    def test_cancel_all_does_not_complete_when_new_wallet_offer_appears(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        initial_id = "a" * 64
+        late_id = "b" * 64
+
+        def read_page(**_bounds):
+            trade_id = (
+                late_id
+                if stopped.offer_manager.cancel_offers.call_count
+                else initial_id
+            )
+            return {
+                "success": True,
+                "offers": [{"trade_id": trade_id, "status": "ACTIVE"}],
+                "end_of_history": True,
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    initial_id: {
+                        "sage_trade_id": initial_id,
+                        "outcome": "CANCELLED_PROVEN",
+                    }
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            self._post("/api/offers/cancel_all")
+
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
+
+    def test_cancel_all_does_not_complete_when_final_wallet_read_fails(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+
+        def read_page(**_bounds):
+            if stopped.offer_manager.cancel_offers.call_count:
+                return {"success": False, "offers": [], "end_of_history": False}
+            return {
+                "success": True,
+                "offers": [{"trade_id": trade_id, "status": "ACTIVE"}],
+                "end_of_history": True,
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    trade_id: {"sage_trade_id": trade_id, "outcome": "CANCELLED_PROVEN"}
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            self._post("/api/offers/cancel_all")
+
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
 
     def test_cancel_all_completed_at_deadline_is_not_reported_as_zero_pending_error(
         self,
@@ -1044,7 +1140,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if reconciled["done"]
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -1171,9 +1271,20 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
+                side_effect=lambda **_bounds: (
+                    []
+                    if len(records) == len(trade_ids)
+                    and all(
+                        records[trade_id]["sage_trade_id"] == trade_id
+                        and records[trade_id]["outcome"]
+                        in {"CANCELLED_PROVEN", "EXPIRED_PROVEN"}
+                        for trade_id in trade_ids
+                    )
+                    else [
+                        {"trade_id": trade_id, "status": "ACTIVE"}
+                        for trade_id in trade_ids
+                    ]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -1300,6 +1411,8 @@ class TestCancelAllPost(_FlaskBase):
             return object()
 
         def read_page(*, include_completed, start=0, end=50):
+            if stopped.offer_manager.cancel_offers.call_count:
+                return []
             return [
                 {"trade_id": trade_id, "status": "ACTIVE"}
                 for trade_id in trade_ids[start:end]
@@ -1477,8 +1590,10 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                side_effect=lambda **_bounds: [
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                    if trade_id not in terminal_ids
                 ],
             ),
             patch(
@@ -1652,8 +1767,10 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                side_effect=lambda **_bounds: [
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                    if trade_id not in terminal_ids
                 ],
             ),
             patch(
