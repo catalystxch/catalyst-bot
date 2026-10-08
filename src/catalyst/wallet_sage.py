@@ -4022,7 +4022,13 @@ def get_wallet_balance(wallet_id: int):
         if _rpc_succeeded(sync):
             sel_val = sync.get("selectable_balance")
             if sel_val is not None:
-                spendable = int(sel_val)
+                exact_balance = _exact_nonnegative_atomic_amount(sel_val)
+                if exact_balance is None:
+                    return {
+                        "success": False,
+                        "error": "XCH selectable balance is not an exact atomic amount",
+                    }
+                spendable = exact_balance
 
         # Step 2: get ALL owned XCH coins (free + offer-locked) for total
         owned_coins = _get_complete_sage_coin_rows(None, "owned", timeout=10)
@@ -6558,6 +6564,16 @@ def _exact_positive_atomic_amount(value) -> Optional[int]:
     ):
         return int(value)
     return None
+
+
+def _exact_nonnegative_atomic_amount(value) -> Optional[int]:
+    """Return an exact nonnegative mojo amount, including a zero balance."""
+
+    if type(value) is int and value == 0:
+        return 0
+    if type(value) is str and value == "0":
+        return 0
+    return _exact_positive_atomic_amount(value)
 
 
 _MAX_GET_COINS_BY_IDS = 4096

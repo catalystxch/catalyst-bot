@@ -102,6 +102,35 @@ def test_xch_balance_includes_later_owned_page(monkeypatch):
     assert result["wallet_balance"]["confirmed_wallet_balance"] == 50100
 
 
+@pytest.mark.parametrize("selectable", [True, 1.5, -1, 2**513])
+def test_xch_balance_rejects_nonexact_selectable_amount(monkeypatch, selectable):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: False)
+
+    def fake_rpc(endpoint, payload, timeout):
+        if endpoint == "get_sync_status":
+            return {"selectable_balance": selectable}
+        return {"coins": [_coin(1)], "total": 1}
+
+    monkeypatch.setattr(wallet_sage, "rpc", fake_rpc)
+    result = wallet_sage.get_wallet_balance(1)
+    assert result["success"] is False
+
+
+@pytest.mark.parametrize("selectable", [0, "0"])
+def test_xch_balance_accepts_exact_zero_selectable_amount(monkeypatch, selectable):
+    monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: False)
+
+    def fake_rpc(endpoint, payload, timeout):
+        if endpoint == "get_sync_status":
+            return {"selectable_balance": selectable}
+        return {"coins": [_coin(1)], "total": 1}
+
+    monkeypatch.setattr(wallet_sage, "rpc", fake_rpc)
+    result = wallet_sage.get_wallet_balance(1)
+    assert result["success"] is True
+    assert result["wallet_balance"]["spendable_balance"] == 0
+
+
 def test_spendable_rpc_includes_later_page_for_coin_watcher(monkeypatch):
     monkeypatch.setattr(wallet_sage, "_is_cat_wallet", lambda _wid: False)
 
