@@ -529,6 +529,21 @@ def test_coin_prep_status_requires_local_api_credential():
     assert authorized.get_json()["success"] is True
 
 
+def test_bootstrap_status_requires_local_api_credential():
+    client, loopback = _api_client()
+
+    unauthorized = client.get("/api/bootstrap/status", environ_base=loopback)
+    assert unauthorized.status_code == 401
+    assert unauthorized.get_json() == {"error": "unauthorized"}
+
+    authorized = client.get(
+        "/api/bootstrap/status",
+        environ_base=loopback,
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+    )
+    assert authorized.status_code == 200
+
+
 def test_disabled_debug_handlers_fail_closed_without_request_guard():
     handlers = (
         ("/api/debug/coinprep", market_routes.api_debug_coinprep, "GET"),

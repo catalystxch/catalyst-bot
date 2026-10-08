@@ -222,6 +222,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/status",
         "/api/dashboard",
         "/api/coin-prep/status",
+        "/api/bootstrap/status",
         "/api/logs",
         "/api/logs/download",
         "/api/superlog/stats",
