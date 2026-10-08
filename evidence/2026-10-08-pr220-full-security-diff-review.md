@@ -5,9 +5,18 @@ reviewed the immutable range
 `bfa25b6eac12faa4585dcf6c710ad63278431509..1a1aeaaca6d54d035ff56cbe1db4f5bd532df40a`
 against `SECURITY.md`. Its 59 changed-file worklist was fully reviewed,
 including deleted baseline code and supporting call sites where relevant.
-The completed scan reported **zero reportable findings** and complete
-changed-diff coverage. The sealed report SHA-256 is
+The completed scan reported **zero reportable findings** across that
+worklist. The sealed report SHA-256 is
 `3728F6DA1F780F67734BE8C924626FCB108A35DBC58F2287717BF360EA81D06E`.
+
+The generated worklist omitted `installer.iss`, `README.md`, and
+`THIRD_PARTY_NOTICES.md` from the selected source/evidence items. A separate
+manual diff review found that the installer change is a compile-time guard
+rejecting an EXE whose file version differs from the requested installer
+version. The two documentation changes did not introduce executable behavior.
+This supplemental review found no reportable issue. The sealed scan's
+59-item coverage claim applies to its generated worklist, not every file in
+the PR diff.
 
 Reviewed risk areas were loopback/API/bridge authentication and private data,
 HTML rendering, Coin Prep fee authority and unsigned effects, database and
