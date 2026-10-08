@@ -1,7 +1,7 @@
 """Slice 04-14 — dashboard endpoint contract tests.
 
 Tests GET /api/dashboard:
-  - No auth required (read-only aggregator)
+  - Local browser authentication and same-origin provenance required
   - Returns 200 with all required top-level keys
   - bot=None returns safe empty shapes for bot-dependent fields
 """
@@ -66,6 +66,7 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
         self.client.get(
             f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
             environ_base=self._LOOPBACK,

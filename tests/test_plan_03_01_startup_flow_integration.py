@@ -109,6 +109,7 @@ class _TempDB(unittest.TestCase):
 
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
         self.client.get(
             f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
             environ_base=_LOOPBACK,

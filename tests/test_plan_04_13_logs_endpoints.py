@@ -36,6 +36,7 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
         self.client.get(
