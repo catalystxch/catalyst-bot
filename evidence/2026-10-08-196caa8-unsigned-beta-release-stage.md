@@ -24,6 +24,14 @@ release workflow's protected-main tag, public source release, GitHub release
 asset download, signed update manifest, or website synchronization. The
 installer must be rechecked if the runtime candidate changes.
 
+The primary PC also ran `scripts/sign_update_manifest.py`'s manifest builder
+against the exact staged installer and sidecar, using the workflow's v1.4.0
+release-channel URLs. It produced version `1.4.0`, tag `v1.4.0`, the exact
+installer name, size and SHA-256 above. An ephemeral Ed25519 test key signed
+the canonical manifest, and the corresponding test public key verified the
+signature. This proves local input and signing compatibility only; it does not
+exercise the production secret, remote release assets, or publication.
+
 ## Independent secondary-PC check
 
 The Harvestr secondary PC independently checked the pinned 38,420,711-byte
