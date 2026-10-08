@@ -48,6 +48,14 @@ weaken the safety boundary without that proof. Exact `60e2875` has not run
 against the original profile, and its own live lifecycle and both 24-hour
 windows remain open.
 
+Source review found that `MutationGate.acquire()` explicitly rejects an
+expired lease owned by the same run, and a different live process cannot take
+over an expired lease while the prior owner PID remains alive. These checks
+explain why the running process stays fenced after storage resumes. Existing
+recovery-successor adoption is tied to a frozen recovery epoch and also
+requires proof that a different prior owner is dead. An automatic restart or
+same-run lease renewal is therefore not an established safe fix.
+
 After preserving the failure, the read-only safety monitor child PID
 `153544` and wrapper PID `160880` were verified by exact command line and
 stopped because the failed trace had no remaining acceptance value. The
