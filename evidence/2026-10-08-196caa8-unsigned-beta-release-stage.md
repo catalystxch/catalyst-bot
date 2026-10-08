@@ -23,3 +23,20 @@ candidate package evidence. This filename/sidecar check does not exercise the
 release workflow's protected-main tag, public source release, GitHub release
 asset download, signed update manifest, or website synchronization. The
 installer must be rechecked if the runtime candidate changes.
+
+## Independent secondary-PC check
+
+The Harvestr secondary PC independently checked the pinned 38,420,711-byte
+installer at SHA-256 `C1E3550885287EF0BA33C85A0EF5752C6D574F0A4B8BE3CA97AB5FBF5C07CBFF`.
+It staged the required release filename through a same-volume hard link to
+preserve disk space and verified the lowercase two-space sidecar, `NotSigned`
+Authenticode status, and trimmed `1.4.0` product version. Its focused
+`tests/test_unsigned_windows_beta_release.py` run passed **5/5**. No release or
+wallet action occurred. The independent report is
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\monitor-196caa8-original-20261008T0945BST\UNSIGNED-BETA-INSTALLER-AUDIT.md`,
+reported SHA-256
+`4CC1722338E7813AF5E114976DA19BC22FE71C2DE69CF334BD533CF926930E0C`.
+The secondary PC reported exact original-profile monitor sample 22 at
+`2026-10-08T09:03:15.3178136Z` with zero alerts, a stopped bot, owned lease,
+zero active offers or pending/fillable Sage offers, and unchanged Harvestr
+balances. That early sample does not satisfy its 24-hour window.
