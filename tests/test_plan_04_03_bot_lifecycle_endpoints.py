@@ -1488,9 +1488,13 @@ class TestShutdown(_FlaskBase):
 
         fake_bot = MagicMock()
         fake_bot.splash_node.is_running.return_value = False
+        runtime = MagicMock()
         with (
             patch.object(api_server, "bot", fake_bot),
             patch.object(api_server, "_coin_prep_proc", None),
+            patch.object(
+                api_server.mutation_gate, "current_runtime", return_value=runtime
+            ),
             patch("threading.Thread") as mock_thread,
             patch.object(bot_blueprint.time, "sleep"),
             patch.object(bot_blueprint, "backup_database"),
@@ -1507,6 +1511,27 @@ class TestShutdown(_FlaskBase):
             mock_thread.call_args.kwargs["target"]()
         self.assertEqual(resp.status_code, 200)
         exit_process.assert_not_called()
+
+    def test_pristine_no_runtime_shutdown_can_exit(self):
+        """First-launch Close app has no wallet mutation authority to release."""
+        from blueprints import bot as bot_blueprint
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(api_server, "_cancel_all_state", {"running": False}),
+            patch.object(api_server, "_cancel_all_thread", None),
+            patch.object(api_server.mutation_gate, "current_runtime", return_value=None),
+            patch("threading.Thread") as mock_thread,
+            patch.object(bot_blueprint.time, "sleep"),
+            patch.object(bot_blueprint, "backup_database"),
+            patch("database.get_connection"),
+            patch.object(bot_blueprint.os, "_exit") as exit_process,
+        ):
+            response = self._post("/api/shutdown", {"cancel_offers": False})
+            mock_thread.call_args.kwargs["target"]()
+
+        self.assertEqual(response.status_code, 200)
+        exit_process.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

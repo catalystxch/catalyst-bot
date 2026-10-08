@@ -2700,6 +2700,35 @@ def test_native_close_refusal_does_not_use_fallback(page):
     assert result == {"closed": False, "fallbackCalls": 0}
 
 
+def test_first_launch_close_uses_native_proof_if_backend_stays_alive(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            let proofCalls = 0;
+            window.pywebview = {api: {
+                confirm_close_window: async () => {
+                    proofCalls += 1;
+                    return {success: true};
+                }
+            }};
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {status: 200});
+            startupWaitForBackendShutdown = async () => false;
+            try {
+                await startupCloseFromRiskDisclosure();
+                return {proofCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result["proofCalls"] == 1
+
+
 def test_shutdown_stop_poll_times_out_fail_closed(page):
     """A stop that never becomes authoritative must not proceed to cancellation."""
 

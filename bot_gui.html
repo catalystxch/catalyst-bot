@@ -37868,7 +37868,10 @@ async function startupCloseFromRiskDisclosure() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cancel_offers: false })
         });
-        if (response.ok) {
+        const shutdownResult = response.ok
+            ? await response.json().catch(() => ({}))
+            : {};
+        if (response.ok && shutdownResult.success === true) {
             shutdownRequested = true;
             if (statusEl) {
                 statusEl.style.color = 'var(--status-success)';
@@ -37886,10 +37889,22 @@ async function startupCloseFromRiskDisclosure() {
         debugWarn('[STARTUP] Shutdown request failed:', err);
     }
 
-    const closed = await closeDesktopWindowAfterShutdown({
+    let closed = await closeDesktopWindowAfterShutdown({
         backendStopped,
         extraWaitMs: shutdownRequested && !backendStopped ? 1200 : 0
     });
+    if (!closed && shutdownRequested && IS_DESKTOP &&
+        window.pywebview?.api?.confirm_close_window) {
+        // The pristine wallet-setup shell may have no mutation runtime, so
+        // the backend can remain alive after an accepted shutdown request.
+        // The native bridge proves there is no live mutation before closing.
+        try {
+            const proof = await window.pywebview.api.confirm_close_window();
+            closed = proof?.success === true;
+        } catch (err) {
+            debugWarn('[STARTUP] Native close proof failed:', err);
+        }
+    }
     if (!closed && statusEl) {
         statusEl.style.color = 'var(--sell-color)';
         statusEl.textContent = shutdownRequested
