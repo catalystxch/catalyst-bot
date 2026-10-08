@@ -251,6 +251,7 @@ def test_sage_cert_candidates_rejects_unconfigured_data_dir(tmp_path):
     resp = client.get(
         "/api/sage/cert-candidates",
         query_string={"data_dir": str(tmp_path / "UnconfiguredSage")},
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
         environ_base=loopback,
     )
 
@@ -270,6 +271,7 @@ def test_sage_cert_candidates_accepts_configured_data_dir(tmp_path):
         resp = client.get(
             "/api/sage/cert-candidates",
             query_string={"data_dir": str(data_dir)},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
             environ_base=loopback,
         )
 
@@ -542,6 +544,46 @@ def test_bootstrap_status_requires_local_api_credential():
         headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
     )
     assert authorized.status_code == 200
+
+
+def test_private_wallet_diagnostic_reads_require_local_api_credential():
+    client, loopback = _api_client()
+    for path in (
+        "/api/health/runtime",
+        "/api/sage/fingerprints",
+        "/api/sage/cert-candidates",
+        "/api/offers/diagnostic",
+        "/api/reservations",
+    ):
+        response = client.get(path, environ_base=loopback)
+        assert response.status_code == 401, path
+        assert response.get_json() == {"error": "unauthorized"}, path
+
+
+def test_runtime_health_get_cannot_trigger_auto_repair():
+    client, loopback = _api_client()
+    auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
+    with patch("bot_health.run_runtime_checks") as checks:
+        response = client.get(
+            "/api/health/runtime?repair=true&force=true",
+            headers=auth,
+            environ_base=loopback,
+        )
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "repair_requires_internal_cycle"}
+    checks.assert_not_called()
+
+    with patch(
+        "bot_health.run_runtime_checks",
+        return_value=SimpleNamespace(to_dict=lambda: {"healthy": True}),
+    ) as checks:
+        response = client.get(
+            "/api/health/runtime?repair=false&force=true",
+            headers=auth,
+            environ_base=loopback,
+        )
+    assert response.status_code == 200
+    checks.assert_called_once_with(auto_repair=False, force=True)
 
 
 def test_disabled_debug_handlers_fail_closed_without_request_guard():

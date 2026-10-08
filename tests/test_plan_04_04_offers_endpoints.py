@@ -1683,6 +1683,7 @@ def test_offer_diagnostic_rejects_cached_wallet_book_after_sage_read_failure():
     ):
         result = api_server.app.test_client().get(
             "/api/offers/diagnostic",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
         )
 
@@ -1711,6 +1712,7 @@ def test_offer_diagnostic_accepts_fresh_empty_wallet_book():
     ):
         result = api_server.app.test_client().get(
             "/api/offers/diagnostic",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
         )
 

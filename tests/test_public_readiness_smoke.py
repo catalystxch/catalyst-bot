@@ -100,7 +100,9 @@ class PublicReadinessSmokeTests(unittest.TestCase):
             side_effect=RuntimeError("secret wallet rpc traceback"),
         ):
             resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+                "/api/sage/fingerprints",
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
             )
 
         self.assertEqual(resp.status_code, 500)

@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   build:
+    # The v1.4.0 unsigned beta has a separate, opt-in prerelease workflow.
+    if: github.ref_name != 'v1.4.0'
     strategy:
       fail-fast: false
       matrix:
@@ -607,6 +609,7 @@ jobs:
           }
 
   publish-release:
+    if: github.ref_name != 'v1.4.0'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5

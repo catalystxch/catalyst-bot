@@ -59,9 +59,9 @@ jobs:
           }
           $release = gh release view $env:RELEASE_REF `
             --repo $env:SOURCE_REPOSITORY `
-            --json isDraft,tagName | ConvertFrom-Json
-          if ($release.isDraft -or $release.tagName -ne $env:RELEASE_REF) {
-            throw "$($env:RELEASE_REF) is not a matching public release"
+            --json isDraft,isPrerelease,tagName | ConvertFrom-Json
+          if ($release.isDraft -or -not $release.isPrerelease -or $release.tagName -ne $env:RELEASE_REF) {
+            throw "$($env:RELEASE_REF) is not a matching public beta prerelease"
           }
           "version=$($env:RELEASE_REF.TrimStart('v'))" >> $env:GITHUB_OUTPUT
 
@@ -201,6 +201,7 @@ jobs:
           $sidecar = "$installer.sha256"
           python scripts/sign_update_manifest.py `
             --version $env:RELEASE_REF `
+            --channel beta `
             --installer $installer `
             --sha256-file $sidecar `
             --download-base-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/download/$($env:RELEASE_REF)" `
@@ -241,7 +242,9 @@ jobs:
             --repo $env:RELEASE_CHANNEL_REPOSITORY `
             --title "CATalyst $($env:RELEASE_REF)" `
             --notes-file release_notes_unsigned_beta.md `
-            --draft
+            --draft `
+            --prerelease `
+            --latest=false
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to create staged unsigned Windows beta release"
           }
@@ -253,7 +256,8 @@ jobs:
           gh release edit $env:RELEASE_REF `
             --repo $env:RELEASE_CHANNEL_REPOSITORY `
             --draft=false `
-            --latest
+            --prerelease `
+            --latest=false
           if ($LASTEXITCODE -ne 0) {
             throw "Unsigned Windows beta publication failed; the release remains a draft"
           }

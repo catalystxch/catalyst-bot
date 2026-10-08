@@ -307,14 +307,14 @@ class TestSageFingerprints(_FlaskBase):
     def test_returns_200(self):
         with patch("chia_node.get_available_fingerprints", return_value=[]):
             resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+                "/api/sage/fingerprints", headers=self.auth, environ_base=self._LOOPBACK
             )
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_fingerprints_list(self):
         with patch("chia_node.get_available_fingerprints", return_value=["12345678"]):
             resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+                "/api/sage/fingerprints", headers=self.auth, environ_base=self._LOOPBACK
             )
         body = resp.get_json()
         self.assertTrue(body.get("success"))
@@ -759,7 +759,9 @@ class TestSageCertCandidates(_FlaskBase):
             patch("sage_node.detect_sage_cert_path", return_value=None),
         ):
             resp = self.client.get(
-                "/api/sage/cert-candidates", environ_base=self._LOOPBACK
+                "/api/sage/cert-candidates",
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
             )
 
         body = resp.get_json()

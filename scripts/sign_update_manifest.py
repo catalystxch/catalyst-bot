@@ -84,7 +84,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
     return {
         "schema": 1,
         "app": "CATalyst",
-        "channel": "stable",
+        "channel": getattr(args, "channel", "stable"),
         "version": version,
         "tag": tag,
         "published_at": now.isoformat().replace("+00:00", "Z"),
@@ -123,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version", required=True, help="Release tag or version, e.g. v1.2.7"
     )
+    parser.add_argument("--channel", choices=("stable", "beta"), default="stable")
     parser.add_argument(
         "--installer", required=True, help="Path to Catalyst-Setup-vX.Y.Z.exe"
     )
