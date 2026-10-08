@@ -1459,6 +1459,20 @@ class TestShutdown(_FlaskBase):
         # Thread should have been started for the background shutdown
         mock_thread.assert_called()
 
+    def test_direct_shutdown_with_cancel_requires_wallet_wide_cancel_flow(self):
+        """The desktop cancels and proves wallet offers before shutdown."""
+        with patch("threading.Thread") as mock_thread:
+            resp = self._post("/api/shutdown", {"cancel_offers": True})
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()["reason"], "WALLET_WIDE_CANCEL_REQUIRED")
+        mock_thread.assert_not_called()
+
+    def test_shutdown_rejects_non_boolean_cancel_choice(self):
+        with patch("threading.Thread") as mock_thread:
+            resp = self._post("/api/shutdown", {"cancel_offers": "false"})
+        self.assertEqual(resp.status_code, 400)
+        mock_thread.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

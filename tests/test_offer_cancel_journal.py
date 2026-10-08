@@ -5115,6 +5115,15 @@ def test_cancel_all_routes_every_member_through_durable_typed_path(
         effect=effect,
         identity_count=8,
     )
+    monkeypatch.setattr(
+        "wallet.get_authoritative_offer_history",
+        lambda **_kwargs: {
+            "success": True,
+            "offers": [],
+            "total": 0,
+            "end_of_history": True,
+        },
+    )
     results = OfferManager().cancel_all(cat_asset_id=ASSET_ID)
 
     assert effects == trade_ids

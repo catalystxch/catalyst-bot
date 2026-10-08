@@ -1191,50 +1191,44 @@ def api_bot_stop():
 
 @bp.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
-    """Full shutdown — stop bot, cancel offers, kill server.
+    """Full shutdown after any wallet-wide cancellation has completed.
 
     Called by the GUI 'Shutdown' button or when the user wants
     to cleanly exit everything.
     """
     bot = api_server.bot
-    try:
-        cancel_first = bool(
-            (request.get_json(silent=True) or {}).get("cancel_offers", False)
-        )
-    except Exception:
-        cancel_first = False
+    payload = request.get_json(silent=True)
+    if payload is not None and type(payload) is not dict:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    if type(payload) is dict and (
+        "cancel_offers" in payload and type(payload["cancel_offers"]) is not bool
+    ):
+        return jsonify({"success": False, "error": "invalid_cancel_offers"}), 400
+    cancel_first = type(payload) is dict and payload.get("cancel_offers") is True
+    if cancel_first:
+        # The desktop performs the wallet-wide, proof-gated Cancel All workflow
+        # while the server is still available, then calls this route with
+        # cancel_offers=false. This endpoint cannot safely submit a pair-scoped
+        # manager cancellation and exit before authoritative terminal proof.
+        return jsonify(
+            {
+                "success": False,
+                "reason": "WALLET_WIDE_CANCEL_REQUIRED",
+                "error": "Cancel all wallet offers and verify terminal proof before shutdown",
+            }
+        ), 409
 
     def _do_shutdown():
         """Run shutdown sequence in background thread so the HTTP response returns first."""
         time.sleep(0.5)  # Let the response reach the browser
-        cancel_permit = None
-        perform_cancel = cancel_first
-        if perform_cancel:
-            try:
-                cancel_permit = api_server.mutation_gate.enter_mutation(
-                    "api:bot.api_shutdown.background_cancel"
-                )
-            except api_server.mutation_gate.MutationBlocked:
-                perform_cancel = False
-
         print("\n🛑 SHUTDOWN sequence starting...", flush=True)
 
-        # Stop offer creation/repost loops before wallet-wide cancellation.
         # Central cleanup repeats this stop and proves it before lease release.
         if bot is not None:
             try:
                 bot.stop(wait=True)
             except Exception:
-                perform_cancel = False
-            if perform_cancel:
-                for producer in api_server._shutdown_thread_refs(bot):
-                    try:
-                        if producer.is_alive():
-                            perform_cancel = False
-                            break
-                    except Exception:
-                        perform_cancel = False
-                        break
+                pass
 
         # 0. Kill coin prep subprocess if it's still running
         try:
@@ -1260,32 +1254,7 @@ def api_shutdown():
         except Exception as e:
             print(f"   ⚠️ Coin prep cleanup: {e}", flush=True)
 
-        # 2. Cancel all offers if requested
-        if perform_cancel and bot and bot.offer_manager:
-            print("   Cancelling all offers...", flush=True)
-            cancelled = 0
-            try:
-                result = bot.offer_manager.cancel_all()
-                cancelled = sum(1 for r in result.values() if r and r.get("success"))
-                print(f"   ✅ Cancelled {cancelled} offers", flush=True)
-            except Exception as e:
-                print(f"   ⚠️ Cancel failed: {e}", flush=True)
-
-            # A wallet row disappearing after a submitted cancellation is not
-            # authoritative terminal evidence: it could also be a partial RPC
-            # response or a racing fill.  Keep the durable offer and coin lock
-            # intact until reconciliation proves the terminal outcome.
-            if cancelled:
-                print(
-                    f"   ⏳ {cancelled} cancellation request(s) submitted; "
-                    "authoritative terminal reconciliation remains pending",
-                    flush=True,
-                )
-
-        if cancel_permit is not None:
-            api_server.mutation_gate.exit_mutation(cancel_permit)
-
-        # 3. Stop Splash node (in case bot.stop() didn't cover it)
+        # 2. Stop Splash node (in case bot.stop() didn't cover it)
         try:
             if bot and hasattr(bot, "splash_node") and bot.splash_node.is_running():
                 bot.splash_node.stop()

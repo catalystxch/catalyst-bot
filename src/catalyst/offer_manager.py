@@ -8373,6 +8373,50 @@ class OfferManager:
             for continuation, _journal, _wallet_hash, _network in authorities.values():
                 wallet.close_offer_cancel_continuation(continuation)
 
+    @staticmethod
+    def _cancel_fee_scope_groups(trade_ids: List[str]) -> List[dict]:
+        """Partition a wallet book without crossing campaign fee authorities.
+
+        A call to cancel_offers may consume one campaign's protected Coin Prep
+        allowance. Ordinary wallet offers and other campaigns must therefore
+        be separate cohorts. Ordinary offers go first; each subsequent call to
+        cancel_all rereads Sage and can advance only after earlier targets have
+        authoritative terminal proof.
+        """
+        ordinary = []
+        campaigns = {}
+        seen = set()
+        for trade_id in trade_ids:
+            if trade_id in seen:
+                continue
+            seen.add(trade_id)
+            creation_intent = database.get_offer_intent_by_trade_id(trade_id)
+            purpose = (
+                str(creation_intent.get("purpose") or "")
+                if type(creation_intent) is dict
+                else ""
+            )
+            if not purpose.startswith("bootstrap:"):
+                ordinary.append(trade_id)
+                continue
+            parts = purpose.split(":")
+            if (
+                len(parts) != 4
+                or parts[0] != "bootstrap"
+                or parts[2] != "revision"
+                or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+            ):
+                raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+            campaigns.setdefault(parts[1], []).append(trade_id)
+        groups = []
+        if ordinary:
+            groups.append({"trade_ids": ordinary, "campaign_id": None})
+        groups.extend(
+            {"trade_ids": campaigns[campaign_id], "campaign_id": campaign_id}
+            for campaign_id in sorted(campaigns)
+        )
+        return groups
+
     def cancel_all(
         self,
         cat_asset_id: str = None,
@@ -8387,9 +8431,8 @@ class OfferManager:
         reserved fee coin, then authoritatively reconciled before another wallet
         effect. The outer batching keeps proof and recovery work bounded.
 
-        First checks the database. If the DB has no open offers (e.g. pre-existing
-        offers that were never inserted), falls back to fetching directly from the
-        wallet RPC.
+        Reconcile database targets with a complete authoritative wallet read.
+        A database row cannot prove that a Sage-only offer does not exist.
 
         Args:
             side_filter: If "buy", cancel only buy offers. If "sell", cancel only
@@ -8411,6 +8454,12 @@ class OfferManager:
                 )
 
         asset_id = cat_asset_id or cfg.CAT_ASSET_ID
+        # Resolve prior submitted cancels before snapshotting either source.
+        # A later fee cohort must not cross an unresolved wallet effect.
+        if self.reconcile_submitted_cancels_only() < 0:
+            raise RuntimeError("CANCEL_ALL_PRIOR_COHORT_UNRESOLVED")
+        if database.get_unresolved_offer_operation_blockers():
+            raise RuntimeError("CANCEL_ALL_PRIOR_COHORT_UNRESOLVED")
         open_offers = get_open_offers(cat_asset_id=asset_id)
 
         # Apply side filter if specified (e.g. position circuit breaker only
@@ -8427,35 +8476,60 @@ class OfferManager:
 
         trade_ids = [o["trade_id"] for o in open_offers]
 
-        # Fallback: if DB has nothing, check the wallet directly
-        if not trade_ids:
-            log_event(
-                "info", "cancel_all", "DB has 0 open offers — fetching from wallet RPC"
+        from offer_reconciliation import load_sage_offer_history
+        from wallet import get_authoritative_offer_history
+
+        def read_authoritative_page(**bounds):
+            page = get_authoritative_offer_history(**bounds)
+            if type(page) is dict and page.get("success") is False:
+                return None
+            return page
+
+        offer_history = load_sage_offer_history(
+            get_all_offers=read_authoritative_page,
+            include_completed=False,
+            page_size=500,
+            max_pages=20,
+        )
+        if offer_history.get("complete") is not True or offer_history.get("read_error"):
+            raise RuntimeError("CANCEL_ALL_WALLET_HISTORY_INCOMPLETE")
+        try:
+            open_buys, open_sells, _ = classify_offers_from_list(
+                offer_history["records"], asset_id
             )
-            try:
-                all_wallet = get_all_offers(include_completed=False, start=0, end=500)
-                if all_wallet:
-                    open_buys, open_sells, _ = classify_offers_from_list(
-                        all_wallet, asset_id
-                    )
-                    if _side == "buy":
-                        side_offers = open_buys
-                    elif _side == "sell":
-                        side_offers = open_sells
-                    else:
-                        side_offers = open_buys + open_sells
-                    for o in side_offers:
-                        tid = o.get("trade_id", "")
-                        if tid and tid not in trade_ids:
-                            trade_ids.append(tid)
-                    if trade_ids:
-                        log_event(
-                            "info",
-                            "cancel_all",
-                            f"Found {len(trade_ids)} open offers from wallet RPC",
-                        )
-            except Exception as e:
-                log_event("error", "cancel_all", f"Wallet RPC fallback failed: {e}")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("CANCEL_ALL_WALLET_OFFERS_UNCLASSIFIABLE") from exc
+        side_offers = (
+            open_buys
+            if _side == "buy"
+            else open_sells
+            if _side == "sell"
+            else open_buys + open_sells
+        )
+        seen_trade_ids = set(trade_ids)
+        for offer in side_offers:
+            trade_id = offer.get("trade_id") or offer.get("offer_id")
+            if type(trade_id) is not str or not trade_id:
+                raise RuntimeError("CANCEL_ALL_WALLET_OFFERS_UNCLASSIFIABLE")
+            if trade_id not in seen_trade_ids:
+                trade_ids.append(trade_id)
+                seen_trade_ids.add(trade_id)
+
+        fee_scope_groups = self._cancel_fee_scope_groups(trade_ids)
+        if fee_approval_id is not None and (
+            len(fee_scope_groups) != 1 or fee_scope_groups[0]["campaign_id"] is None
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        if len(fee_scope_groups) > 1:
+            deferred = sum(len(group["trade_ids"]) for group in fee_scope_groups[1:])
+            log_event(
+                "warning",
+                "cancel_all_fee_scope_deferred",
+                f"Deferring {deferred} offer(s) in other fee scopes until "
+                "the first cohort has authoritative terminal proof",
+            )
+        if fee_scope_groups:
+            trade_ids = fee_scope_groups[0]["trade_ids"]
 
         if not trade_ids:
             self.expect_empty_wallet_offer_book("cancel_all_no_active_offers")

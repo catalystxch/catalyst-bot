@@ -3222,7 +3222,7 @@ class BotLoop:
                     side_filter=blocked_side,
                 )
 
-            cancelled = sum(
+            submitted = sum(
                 1 for item in result.values() if item and item.get("success")
             )
             failed = sum(
@@ -3230,12 +3230,14 @@ class BotLoop:
             )
             log_event(
                 "warning",
-                "circuit_breaker_cancel_done",
-                f"CB safety cancel complete — cancelled {cancelled}, failed {failed}",
+                "circuit_breaker_cancel_progress",
+                f"CB safety cancel: submitted {submitted}, failed {failed}; "
+                "authoritative terminal proof remains required",
             )
-            # Only mark safed once cancel actually succeeded (or partially succeeded).
-            # If all cancels failed, leave _safed=False so next cycle retries.
-            if cancelled > 0 or failed == 0:
+            # A successful RPC is only a submitted mutation. cancel_all() can
+            # return an empty result only after a complete authoritative wallet
+            # inventory and the DB both contain no matching open offers.
+            if not result:
                 self._circuit_breaker_offer_safed = True
             try:
                 self.coin_manager.snapshot_coins("circuit_breaker_cancel")

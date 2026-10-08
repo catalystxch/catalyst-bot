@@ -619,6 +619,9 @@ class TestCancelAllPost(_FlaskBase):
         )
         history_patch.start()
         self.addCleanup(history_patch.stop)
+        intent_patch = patch("database.get_offer_intent_by_trade_id", return_value=None)
+        intent_patch.start()
+        self.addCleanup(intent_patch.stop)
 
     def test_coin_prep_cancel_requires_exact_approval_shape(self):
         stopped = _make_bot()
@@ -732,6 +735,10 @@ class TestCancelAllPost(_FlaskBase):
             patch(
                 "wallet.get_all_offers",
                 return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                return_value={"purpose": f"bootstrap:{'c' * 64}:revision:1"},
             ),
             patch("wallet.is_offer_time_expired", return_value=False),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
@@ -1495,6 +1502,111 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["total_batches"], 3)
         self.assertEqual(status["current_batch"], 3)
         self.assertEqual(status["cancelled"], 10)
+
+    def test_stopped_cancel_all_separates_bootstrap_and_orphan_fee_scopes(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        bootstrap_id, orphan_id, campaign_id = "a" * 64, "b" * 64, "c" * 64
+        terminal_ids = set()
+        submitted = []
+
+        def cancel_batch(trade_ids, **kwargs):
+            submitted.append((tuple(trade_ids), kwargs))
+            terminal_ids.update(trade_ids)
+            return {trade_id: {"success": True} for trade_id in trade_ids}
+
+        def terminal_records(candidates):
+            return {
+                trade_id: {
+                    "intent_id": f"intent:{trade_id}",
+                    "sage_trade_id": trade_id,
+                    "outcome": "CANCELLED_PROVEN",
+                }
+                for trade_id in candidates
+                if trade_id in terminal_ids
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        stopped.offer_manager.cancel_offers.side_effect = cancel_batch
+        rows = [
+            {"trade_id": trade_id, "status": "ACTIVE"}
+            for trade_id in (bootstrap_id, orphan_id)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": rows,
+                    "total": 2,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                side_effect=lambda trade_id: (
+                    {"purpose": f"bootstrap:{campaign_id}:revision:1"}
+                    if trade_id == bootstrap_id
+                    else None
+                ),
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                side_effect=terminal_records,
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item[0] for item in submitted], [(orphan_id,), (bootstrap_id,)]
+        )
+        self.assertEqual(submitted[0][1]["reason"], "manual_cancel_all")
+        self.assertEqual(submitted[1][1]["reason"], "coin_prep_cancel_all")
+
+    def test_stopped_cancel_all_rejects_one_approval_for_mixed_fee_scopes(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        bootstrap_id, orphan_id, campaign_id = "a" * 64, "b" * 64, "c" * 64
+        rows = [
+            {"trade_id": trade_id, "status": "ACTIVE"}
+            for trade_id in (bootstrap_id, orphan_id)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": rows,
+                    "total": 2,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                side_effect=lambda trade_id: (
+                    {"purpose": f"bootstrap:{campaign_id}:revision:1"}
+                    if trade_id == bootstrap_id
+                    else None
+                ),
+            ),
+        ):
+            response = self._post(
+                "/api/offers/cancel_all",
+                {"source": "coin_prep", "fee_approval_id": "d" * 64},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.get_json()["reason"], "FEE_CANCELLATION_SCOPE_INVALID"
+        )
+        stopped.offer_manager.cancel_offers.assert_not_called()
 
     def test_stopped_cancel_all_retries_only_the_current_fee_safe_batch(self):
         """An older failed cancel outside the batch must never steal its retry slot."""

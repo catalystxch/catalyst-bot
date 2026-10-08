@@ -120,7 +120,15 @@ class TestCancelAllConfirmed(_TempDB):
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
             patch.object(om, "cancel_offers", return_value=bulk_response),
-            patch.object(_om_mod, "get_all_offers", return_value=[]),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "total": 0,
+                    "end_of_history": True,
+                },
+            ),
         ):
             return om.cancel_all(cat_asset_id=_ASSET)
 
@@ -170,6 +178,196 @@ class TestCancelAllConfirmed(_TempDB):
         for i in range(2):
             self.assertIn(f"rt-{i}", result)
 
+    def test_tracked_offer_does_not_hide_untracked_live_wallet_offer(self):
+        tracked_id = "a" * 64
+        untracked_id = "b" * 64
+        _add_offer(tracked_id)
+        wallet_rows = [
+            {
+                "trade_id": trade_id,
+                "status": "PENDING_ACCEPT",
+                "summary": {
+                    "offered": {"xch": 1000},
+                    "requested": {_ASSET: 100},
+                },
+            }
+            for trade_id in (tracked_id, untracked_id)
+        ]
+        dispatched = []
+
+        def cancel_ids(trade_ids, **_kwargs):
+            dispatched.append(tuple(trade_ids))
+            return {trade_id: {"success": True} for trade_id in trade_ids}
+
+        manager = OfferManager()
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(manager, "cancel_offers", side_effect=cancel_ids),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": wallet_rows,
+                    "total": 2,
+                    "end_of_history": True,
+                },
+            ),
+        ):
+            result = manager.cancel_all(cat_asset_id=_ASSET)
+
+        self.assertEqual(dispatched, [(tracked_id, untracked_id)])
+        self.assertEqual(set(result), {tracked_id, untracked_id})
+
+    def test_incomplete_wallet_history_prevents_partial_cancel(self):
+        tracked_id = "a" * 64
+        _add_offer(tracked_id)
+        manager = OfferManager()
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(manager, "cancel_offers") as dispatcher,
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={"success": False},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "CANCEL_ALL_WALLET_HISTORY_INCOMPLETE"
+            ):
+                manager.cancel_all(cat_asset_id=_ASSET)
+        dispatcher.assert_not_called()
+
+    def test_unresolved_prior_cancel_blocks_next_fee_cohort(self):
+        trade_id = "a" * 64
+        _add_offer(trade_id)
+        manager = OfferManager()
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(manager, "cancel_offers") as dispatcher,
+            patch.object(manager, "reconcile_submitted_cancels_only", return_value=-1),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "total": 0,
+                    "end_of_history": True,
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "CANCEL_ALL_PRIOR_COHORT_UNRESOLVED"
+            ):
+                manager.cancel_all(cat_asset_id=_ASSET)
+        dispatcher.assert_not_called()
+
+    def test_side_filter_includes_wallet_only_blocked_side(self):
+        tracked_buy = "a" * 64
+        wallet_buy = "b" * 64
+        wallet_sell = "c" * 64
+        _add_offer(tracked_buy, "buy")
+        wallet_rows = [
+            {
+                "trade_id": trade_id,
+                "status": "PENDING_ACCEPT",
+                "summary": {
+                    "offered": {"xch": 1000} if side == "buy" else {_ASSET: 100},
+                    "requested": {_ASSET: 100} if side == "buy" else {"xch": 1000},
+                },
+            }
+            for trade_id, side in (
+                (tracked_buy, "buy"),
+                (wallet_buy, "buy"),
+                (wallet_sell, "sell"),
+            )
+        ]
+        manager = OfferManager()
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(manager, "cancel_offers", return_value={}) as dispatcher,
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": wallet_rows,
+                    "total": 3,
+                    "end_of_history": True,
+                },
+            ),
+        ):
+            manager.cancel_all(cat_asset_id=_ASSET, side_filter="buy")
+        self.assertEqual(dispatcher.call_args.args[0], [tracked_buy, wallet_buy])
+
+    def test_bootstrap_and_orphan_cancel_in_separate_fee_scopes(self):
+        bootstrap_id = "a" * 64
+        orphan_id = "b" * 64
+        campaign_id = "c" * 64
+        _add_offer(bootstrap_id)
+
+        def wallet_row(trade_id):
+            return {
+                "trade_id": trade_id,
+                "status": "PENDING_ACCEPT",
+                "summary": {
+                    "offered": {"xch": 1000},
+                    "requested": {_ASSET: 100},
+                },
+            }
+
+        wallet_rows = [wallet_row(bootstrap_id), wallet_row(orphan_id)]
+        calls = []
+
+        def cancel_ids(trade_ids, **kwargs):
+            calls.append((tuple(trade_ids), kwargs))
+            return {trade_id: {"success": True} for trade_id in trade_ids}
+
+        def creation_intent(trade_id):
+            if trade_id == bootstrap_id:
+                return {"purpose": f"bootstrap:{campaign_id}:revision:1"}
+            return None
+
+        def history(**_kwargs):
+            return {
+                "success": True,
+                "offers": wallet_rows,
+                "total": len(wallet_rows),
+                "end_of_history": True,
+            }
+
+        manager = OfferManager()
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(manager, "cancel_offers", side_effect=cancel_ids),
+            patch.object(
+                _db, "get_offer_intent_by_trade_id", side_effect=creation_intent
+            ),
+            patch("wallet.get_authoritative_offer_history", side_effect=history),
+        ):
+            manager.cancel_all(cat_asset_id=_ASSET)
+            self.assertEqual(calls[0][0], (orphan_id,))
+            self.assertIsNone(calls[0][1]["fee_approval_id"])
+
+            # Only authoritative proof that the first cohort is gone permits
+            # the bootstrap campaign's distinct protected fee scope next.
+            wallet_rows[:] = [wallet_row(bootstrap_id)]
+            manager.cancel_all(cat_asset_id=_ASSET)
+            self.assertEqual(calls[1][0], (bootstrap_id,))
+
+    def test_distinct_bootstrap_campaigns_have_distinct_fee_cohorts(self):
+        first, second = "a" * 64, "b" * 64
+        purposes = {
+            first: f"bootstrap:{'c' * 64}:revision:1",
+            second: f"bootstrap:{'d' * 64}:revision:2",
+        }
+        with patch.object(
+            _db,
+            "get_offer_intent_by_trade_id",
+            side_effect=lambda trade_id: {"purpose": purposes[trade_id]},
+        ):
+            groups = OfferManager._cancel_fee_scope_groups([second, first])
+
+        self.assertEqual([group["trade_ids"] for group in groups], [[first], [second]])
+        self.assertNotEqual(groups[0]["campaign_id"], groups[1]["campaign_id"])
+
 
 # ---------------------------------------------------------------------------
 # 2. cancel_all() — pending-cancel path (submitted but not confirmed)
@@ -190,7 +388,15 @@ class TestCancelAllPending(_TempDB):
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
             patch.object(om, "cancel_offers", return_value=bulk),
-            patch.object(_om_mod, "get_all_offers", return_value=[]),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "total": 0,
+                    "end_of_history": True,
+                },
+            ),
         ):
             om.cancel_all(cat_asset_id=_ASSET)
         # Pending cancel — DB status unchanged (still "open")
@@ -213,7 +419,15 @@ class TestCancelAllSideFilter(_TempDB):
         with (
             patch.object(_om_mod, "cfg", fake_cfg),
             patch.object(om, "cancel_offers", return_value=bulk_response),
-            patch.object(_om_mod, "get_all_offers", return_value=[]),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "total": 0,
+                    "end_of_history": True,
+                },
+            ),
         ):
             return om.cancel_all(cat_asset_id=_ASSET, side_filter=side_filter)
 
@@ -266,7 +480,15 @@ class TestCancelAllExceptionHandling(_TempDB):
                 "cancel_offers",
                 side_effect=RuntimeError("wallet offline"),
             ),
-            patch.object(_om_mod, "get_all_offers", return_value=[]),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [],
+                    "total": 0,
+                    "end_of_history": True,
+                },
+            ),
         ):
             # Should not raise
             result = om.cancel_all(cat_asset_id=_ASSET)

@@ -918,6 +918,48 @@ def _api_cancel_all_locked():
                     503,
                 )
 
+            from offer_manager import OfferManager
+
+            try:
+                fee_scope_groups = OfferManager._cancel_fee_scope_groups(open_ids)
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "cancel_all_fee_scope_unavailable",
+                    f"Could not verify wallet offer fee scopes: {type(exc).__name__}",
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="Wallet offer fee scope could not be verified",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "Wallet offer fee scope could not be verified",
+                        "reason": "FEE_CANCELLATION_SCOPE_UNVERIFIED",
+                    }
+                ), 503
+            if fee_approval_id is not None and (
+                len(fee_scope_groups) != 1 or fee_scope_groups[0]["campaign_id"] is None
+            ):
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="The supplied approval cannot cover multiple fee scopes",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "The supplied approval cannot cover multiple fee scopes",
+                        "reason": "FEE_CANCELLATION_SCOPE_INVALID",
+                    }
+                ), 409
+
             # Set initial progress state — frontend polls this immediately.
             _set_cancel_all_state(
                 running=True,
@@ -975,9 +1017,13 @@ def _api_cancel_all_locked():
                         and 1 <= raw_capacity <= len(_cancel_open_ids)
                         else len(_cancel_open_ids)
                     )
-                    _cancel_batches = _balanced_cancel_batches(
-                        _cancel_open_ids, _batch_capacity
-                    )
+                    _cancel_batches = [
+                        (batch, group["campaign_id"])
+                        for group in fee_scope_groups
+                        for batch in _balanced_cancel_batches(
+                            group["trade_ids"], _batch_capacity
+                        )
+                    ]
                     _deadline_seconds = _cancel_all_deadline_seconds(
                         len(_cancel_open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
@@ -994,7 +1040,7 @@ def _api_cancel_all_locked():
                         current_batch=1,
                         pending=len(_cancel_open_ids) - len(_terminal_ids),
                     )
-                    for _batch_index, _cancel_batch in enumerate(
+                    for _batch_index, (_cancel_batch, _campaign_id) in enumerate(
                         _cancel_batches, start=1
                     ):
                         _batch_targets = [
@@ -1024,12 +1070,12 @@ def _api_cancel_all_locked():
                         _cancel_kwargs = {
                             "reason": (
                                 "coin_prep_cancel_all"
-                                if fee_approval_id
+                                if _campaign_id is not None
                                 else "manual_cancel_all"
                             ),
                             "force_storm": True,
                         }
-                        if fee_approval_id:
+                        if fee_approval_id and _campaign_id is not None:
                             _cancel_kwargs["fee_approval_id"] = fee_approval_id
                         _batch_retry_attempts = {
                             trade_id: _retry_failed_attempts[trade_id]
@@ -1113,7 +1159,7 @@ def _api_cancel_all_locked():
                         batch_size=_batch_capacity,
                         total_batches=len(_cancel_batches),
                         current_batch=len(_cancel_batches),
-                        batch_cancelled=len(_cancel_batches[-1]),
+                        batch_cancelled=len(_cancel_batches[-1][0]),
                         batch_failed=0,
                         cancelled=len(_terminal_ids),
                         confirmed=len(_terminal_ids),
