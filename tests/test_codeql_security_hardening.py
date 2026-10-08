@@ -501,12 +501,32 @@ def test_coin_prep_status_hides_drift_exception_details():
             side_effect=RuntimeError("secret tier traceback at C:\\private"),
         ),
     ):
-        resp = client.get("/api/coin-prep/status", environ_base=loopback)
+        resp = client.get(
+            "/api/coin-prep/status",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
 
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["tier_size_drift_error"] == "Tier status unavailable"
     assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_coin_prep_status_requires_local_api_credential():
+    client, loopback = _api_client()
+
+    unauthorized = client.get("/api/coin-prep/status", environ_base=loopback)
+    assert unauthorized.status_code == 401
+    assert unauthorized.get_json() == {"error": "unauthorized"}
+
+    authorized = client.get(
+        "/api/coin-prep/status",
+        environ_base=loopback,
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+    )
+    assert authorized.status_code == 200
+    assert authorized.get_json()["success"] is True
 
 
 def test_disabled_debug_handlers_fail_closed_without_request_guard():

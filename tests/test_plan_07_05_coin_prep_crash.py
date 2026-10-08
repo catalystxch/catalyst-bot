@@ -184,6 +184,7 @@ class TestCoinPrepStatusEndpointCrashDetection(unittest.TestCase):
         ):
             return self.client.get(
                 "/api/coin-prep/status",
+                headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
                 environ_base=_LOOPBACK,
             )
 

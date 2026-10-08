@@ -333,6 +333,7 @@ class _TempDB(unittest.TestCase):
         ):
             return self.client.get(
                 "/api/coin-prep/status",
+                headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
             )
 

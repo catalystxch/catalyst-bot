@@ -81,6 +81,13 @@ class _FlaskBase(unittest.TestCase):
             environ_base=self._LOOPBACK,
         )
 
+    def _get_status(self):
+        return self.client.get(
+            "/api/coin-prep/status",
+            headers=self.auth,
+            environ_base=self._LOOPBACK,
+        )
+
 
 # ---------------------------------------------------------------------------
 # 1. GET /api/coin-prep/status
@@ -102,17 +109,17 @@ class TestCoinPrepStatus(_FlaskBase):
 
     def test_returns_200(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         self.assertEqual(resp.status_code, 200)
 
     def test_success_key_true(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         self.assertTrue(resp.get_json().get("success"))
 
     def test_response_has_running_complete_keys(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         body = resp.get_json()
         self.assertIn("running", body)
         self.assertIn("complete", body)
@@ -122,9 +129,7 @@ class TestCoinPrepStatus(_FlaskBase):
         api_server._coin_prep_state["running"] = False
         try:
             with patch("database.get_coin_summary", return_value={}):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
             self.assertFalse(resp.get_json()["running"])
         finally:
             api_server._coin_prep_state["running"] = orig
@@ -140,7 +145,7 @@ class TestCoinPrepStatus(_FlaskBase):
             patch("database.get_coin_summary", return_value=summary),
             patch.object(api_server, "bot", None),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         body = resp.get_json()
         self.assertEqual(body.get("xch_free_coins"), 5)
         self.assertEqual(body.get("cat_free_coins"), 10)
@@ -189,9 +194,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ),
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         for key in (
@@ -256,9 +259,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ) as read_status,
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["fee_approval_id"], approval_id)
@@ -323,9 +324,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ) as read_status,
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["fee_approval_id"], renewed_approval_id)
@@ -381,9 +380,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ) as read_status,
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["bootstrap_campaign_id"], active_campaign_id)
@@ -422,9 +419,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ),
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertNotIn("fee_approval_id", body)
@@ -493,9 +488,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ) as read_status,
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["fee_approval_id"], renewed_approval_id)
@@ -521,7 +514,7 @@ class TestCoinPrepStatus(_FlaskBase):
             ),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
 
         body = resp.get_json()
         self.assertTrue(body.get("needs_coin_prep"))
@@ -549,7 +542,7 @@ class TestCoinPrepStatus(_FlaskBase):
             ) as legacy_drift,
             patch("database.get_coin_summary", return_value={}),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["coin_prep_mode"], "bootstrap_exact")
@@ -629,9 +622,7 @@ class TestCoinPrepStatus(_FlaskBase):
                     return_value=[],
                 ),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertTrue(body["complete"])
@@ -716,9 +707,7 @@ class TestCoinPrepStatus(_FlaskBase):
                     return_value=[],
                 ),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertTrue(body["complete"])
@@ -781,9 +770,7 @@ class TestCoinPrepStatus(_FlaskBase):
                     return_value=[],
                 ),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertFalse(body["complete"])
