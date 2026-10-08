@@ -5085,6 +5085,10 @@ def test_desktop_cleanup_uses_central_quiescence_and_never_releases_directly(
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     calls = []
+    runtime = SimpleNamespace(begin_quiesce=lambda: calls.append("begin"))
+    monkeypatch.setattr(api_server.mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    monkeypatch.setattr(api_server, "_cancel_all_thread", None)
     monkeypatch.setattr(
         api_server,
         "release_mutation_runtime",
@@ -5100,9 +5104,10 @@ def test_desktop_cleanup_uses_central_quiescence_and_never_releases_directly(
     )
     monkeypatch.setattr(database, "log_event", lambda *_args, **_kwargs: None)
 
-    desktop_app._cleanup()
+    result = desktop_app._cleanup()
 
-    assert calls == ["central"]
+    assert result == {"released": False}
+    assert calls == ["begin", "central"]
 
 
 def test_inflight_mutation_quiescence_blocks_new_work_and_lease_release(
