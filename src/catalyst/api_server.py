@@ -1382,6 +1382,33 @@ def _request_origin_matches_app() -> bool:
     )
 
 
+def _private_read_has_browser_provenance() -> bool:
+    """Require positive same-origin evidence for cookie-only private reads."""
+    fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if fetch_site:
+        return fetch_site == "same-origin"
+
+    supplied = [
+        request.headers.get(name, "").strip()
+        for name in ("Origin", "Referer")
+        if request.headers.get(name, "").strip()
+    ]
+    if not supplied:
+        return False
+    for raw_url in supplied:
+        try:
+            parsed = urlparse(raw_url)
+        except Exception:
+            return False
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not _is_loopback_addr(parsed.hostname)
+            or parsed.netloc.lower() != (request.host or "").lower()
+        ):
+            return False
+    return True
+
+
 def _get_sage_signing_block_reason():
     """Return a message when the active Sage key is present but cannot sign."""
     try:
@@ -4022,7 +4049,15 @@ def enforce_local_runtime_guard():
     if private_read:
         if not _has_valid_local_token():
             return jsonify({"error": "unauthorized"}), 401
-        if request.headers.get("Sec-Fetch-Site", "") in {"cross-site", "same-site"}:
+        if request.headers.get("Sec-Fetch-Site", "").strip().lower() in {
+            "cross-site",
+            "same-site",
+        }:
+            return jsonify({"error": "origin_not_allowed"}), 403
+        if not _private_read_has_browser_provenance() and not secrets.compare_digest(
+            str(request.headers.get(_LOCAL_API_TOKEN_HEADER, "") or ""),
+            _LOCAL_API_TOKEN,
+        ):
             return jsonify({"error": "origin_not_allowed"}), 403
         # Private GET handlers may refresh durable state while computing their
         # response. HEAD must not dispatch any of them for a body it discards.

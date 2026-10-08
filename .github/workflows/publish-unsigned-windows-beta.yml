@@ -64,23 +64,42 @@ jobs:
             throw "$($env:RELEASE_REF) is not a matching public beta prerelease"
           }
           "version=$($env:RELEASE_REF.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+          "source_commit=$tagCommit" >> $env:GITHUB_OUTPUT
 
-      - name: Download official Windows release assets
+      - name: Build unsigned Windows installer from exact release tag
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ inputs.tag }}
-          SOURCE_REPOSITORY: catalystxch/catalyst-bot
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          gh release download $env:RELEASE_REF `
-            --repo $env:SOURCE_REPOSITORY `
-            --pattern "Catalyst-Setup-$($env:RELEASE_REF).exe" `
-            --pattern "Catalyst-Setup-$($env:RELEASE_REF).exe.sha256" `
-            --dir release
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to download official Windows release assets"
+          $tagCommit = $env:SOURCE_COMMIT
+          git checkout --detach $tagCommit
+          if ($LASTEXITCODE -ne 0 -or (git rev-parse HEAD).Trim() -cne $tagCommit) {
+            throw "Unable to check out the exact release tag commit"
           }
+          python -m pip install pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install PyInstaller" }
+          python -m pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install release dependencies" }
+          python scripts/sync_release_metadata.py $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "Unable to synchronize release version" }
+          python build.py
+          if ($LASTEXITCODE -ne 0) { throw "Exact-tag Windows build failed" }
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Unable to install Inno Setup" }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc)) { throw "ISCC.exe is unavailable" }
+          (Get-Content installer.iss) -replace 'MyAppVersion     ".*"', "MyAppVersion     `"$($env:RELEASE_VERSION)`"" |
+            Set-Content installer.iss
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Exact-tag installer build failed" }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $name = "Catalyst-Setup-$($env:RELEASE_REF).exe"
+          Move-Item -LiteralPath "Output/Catalyst-Setup-$($env:RELEASE_VERSION).exe" `
+            -Destination "release/$name"
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath "release/$name").Hash.ToLowerInvariant()
+          "$digest  $name" | Set-Content -NoNewline -Encoding ascii "release/$name.sha256"
 
       - name: Prove installer identity and unsigned status
         shell: pwsh
@@ -176,9 +195,13 @@ jobs:
           RELEASE_REF: ${{ inputs.tag }}
           SOURCE_REPOSITORY: catalystxch/catalyst-bot
           RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CATALYST_UPDATE_SIGNING_KEY_B64)) {
             throw "CATALYST_UPDATE_SIGNING_KEY_B64 is required"
+          }
+          if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_COMMIT) {
+            throw "Release source changed before manifest signing"
           }
           gh release view $env:RELEASE_REF `
             --repo $env:SOURCE_REPOSITORY `
@@ -202,6 +225,7 @@ jobs:
           python scripts/sign_update_manifest.py `
             --version $env:RELEASE_REF `
             --channel beta `
+            --source-commit $env:SOURCE_COMMIT `
             --installer $installer `
             --sha256-file $sidecar `
             --download-base-url "https://github.com/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/download/$($env:RELEASE_REF)" `

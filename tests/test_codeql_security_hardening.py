@@ -617,6 +617,48 @@ def test_coin_inventory_get_requires_local_credential_before_worker_status_check
         assert cross_site.status_code == 403
         bot.coin_manager.check_coin_prep_status.assert_called_once()
 
+        missing_provenance = client.get("/api/coins", environ_base=loopback)
+        assert missing_provenance.status_code == 403
+        bot.coin_manager.check_coin_prep_status.assert_called_once()
+
+        same_origin = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert same_origin.status_code == 200
+
+        same_origin_referer = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Referer": "http://localhost/console"},
+        )
+        assert same_origin_referer.status_code == 200
+
+        foreign_referer = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Referer": "https://example.invalid/"},
+        )
+        assert foreign_referer.status_code == 403
+
+        header_client = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert header_client.status_code == 200
+
+        foreign_header_client = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={
+                "X-Bot-Local-Token": api_server._LOCAL_API_TOKEN,
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        assert foreign_header_client.status_code == 403
+
 
 def test_wallet_and_trade_read_routes_require_local_credential():
     client, loopback = _api_client()
