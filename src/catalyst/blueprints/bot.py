@@ -1328,7 +1328,12 @@ def api_shutdown():
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
         # 5. Release ownership only after every producer is proven quiescent.
-        release = api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
+        # The pristine wallet-setup shell has no mutation runtime to release.
+        # Use the same native shutdown authority so that exact no-runtime
+        # state can close while an unproven producer still fails closed.
+        from native_shutdown import native_close_readiness
+
+        release = native_close_readiness()
         if type(release) is not dict or release.get("released") is not True:
             slog(
                 "SHUTDOWN",
