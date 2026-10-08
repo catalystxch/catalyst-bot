@@ -53,6 +53,20 @@ remained PID `120856` in its separate path. Defender antivirus and real-time
 protection were enabled; custom scans of the bundle, ZIP, and installer left
 the prior six detection records unchanged.
 
+A second isolated installer run used unique QA AppId
+`EE494A15-BA06-4454-9425-8BA9D917D32C` under
+`E:\catalyst-security-65e4968-upgrade-qa`. It installed the prior verified
+`7ce8ffa` package (EXE SHA-256
+`47198CA321C9E36692929D9661EEF99D51037743AB5EAB71D42022DDE3C92B77`),
+upgraded in place to the exact `65e4968` package, rolled back to `7ce8ffa`,
+and restored `65e4968`. All four installers exited successfully. At each
+step the installed EXE hash matched the expected version, and a QA sentinel
+in the install directory survived. The restored package passed installed API
+and synthetic Sage smokes. QA uninstall removed the EXE and unique current-user
+registration while retaining the sentinel. Logs are in that QA directory.
+This exercises same-version replacement and rollback; it does not simulate a
+crash during installation. The original TEST 7 process was not touched.
+
 The binaries and manifest were pinned at artifact commit
 `51560ec34ba40b39c0f1a83a55211ac3b8f2c6ac`:
 [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/51560ec34ba40b39c0f1a83a55211ac3b8f2c6ac/acceptance-artifacts/CATalyst-65e4968-primary-acceptance.zip),
