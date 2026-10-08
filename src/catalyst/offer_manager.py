@@ -5882,12 +5882,15 @@ class OfferManager:
                     "requote_cold_start_queued",
                     f"Queued {len(fresh)} fresh {side} offers to Dexie",
                 )
-            # Cold start did real work — stamp the cooldown timer
-            with self._lock:
-                self._last_requote_time[side] = time.time()
+            # An empty result means the wallet/coin or publication gate did
+            # not create a replacement. Leave the side eligible to retry on
+            # the next cycle rather than imposing a false cooldown.
+            if fresh:
+                with self._lock:
+                    self._last_requote_time[side] = time.time()
             return {
                 "offers": fresh,
-                "fully_replaced": True,
+                "fully_replaced": bool(fresh),
                 "replaced_count": len(fresh),
                 "target_count": 0,
                 "original_target_count": 0,
@@ -6040,8 +6043,9 @@ class OfferManager:
         # Queueing publication is not visibility.  The parent remains intact
         # until the registry visibility boundary is durably recorded and Task
         # 8 independently authorizes cancellation.
-        with self._lock:
-            self._last_requote_time[side] = time.time()
+        if new_offers:
+            with self._lock:
+                self._last_requote_time[side] = time.time()
         return {
             "offers": new_offers,
             "fully_replaced": False,
