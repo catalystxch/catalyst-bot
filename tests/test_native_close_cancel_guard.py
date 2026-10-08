@@ -36,6 +36,38 @@ def test_native_close_rejects_unproven_mutation_quiescence(monkeypatch):
     runtime.begin_quiesce.assert_called_once_with()
 
 
+def test_native_close_allows_proven_release(monkeypatch):
+    runtime = MagicMock()
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    monkeypatch.setattr(api_server, "_cancel_all_thread", None)
+    monkeypatch.setattr(api_server.mutation_gate, "current_runtime", lambda: runtime)
+    with patch.object(
+        api_server,
+        "quiesce_and_release_mutation_runtime",
+        return_value={"released": True},
+    ):
+        result = native_close_readiness()
+
+    assert result == {"released": True}
+    runtime.begin_quiesce.assert_called_once_with()
+
+
+def test_native_close_allows_no_runtime_only_when_idle(monkeypatch):
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    monkeypatch.setattr(api_server, "_cancel_all_thread", None)
+    monkeypatch.setattr(api_server.mutation_gate, "current_runtime", lambda: None)
+    monkeypatch.setattr(api_server, "bot", SimpleNamespace(is_running=lambda: False))
+    assert native_close_readiness() == {
+        "released": True,
+        "reason": "no_mutation_runtime",
+    }
+    monkeypatch.setattr(api_server, "bot", SimpleNamespace(is_running=lambda: True))
+    assert native_close_readiness() == {
+        "released": False,
+        "reason": "runtime_unavailable",
+    }
+
+
 def test_bridge_confirm_close_keeps_window_when_proof_incomplete(monkeypatch):
     window = MagicMock()
     fake_webview = SimpleNamespace(windows=[window])

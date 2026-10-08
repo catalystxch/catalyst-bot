@@ -1543,18 +1543,21 @@ def _tray_graceful_quit(webview_module, tray):
 def _cleanup():
     """Release wallet mutation ownership before a native hard exit."""
     try:
+        from native_shutdown import native_close_readiness
+
+        readiness = native_close_readiness()
+    except Exception:
+        return {"released": False, "reason": "native_close_preflight_unavailable"}
+    if readiness.get("released") is not True:
+        return readiness
+
+    try:
         from database import log_event
 
         log_event("info", "app_shutdown", f"Desktop app v{APP_VERSION} shutting down")
     except Exception:
         pass
-
-    try:
-        from native_shutdown import native_close_readiness
-
-        return native_close_readiness()
-    except Exception:
-        return {"released": False, "reason": "native_close_preflight_unavailable"}
+    return readiness
 
 
 def _poll_tray_status(tray, interval: float = 3.0):
