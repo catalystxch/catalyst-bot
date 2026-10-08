@@ -2160,8 +2160,15 @@ def get_wallet_sync_status() -> dict:
                 and type(total_coins) is int
                 and 0 <= synced_coins <= total_coins
             )
+            counts_present = "synced_coins" in result or "total_coins" in result
+            counts_confirm_synced = not counts_present or (
+                "synced_coins" in result
+                and "total_coins" in result
+                and valid_counts
+                and synced_coins == total_coins
+            )
 
-            if raw_synced is True:
+            if raw_synced is True and counts_confirm_synced:
                 sync_state = "synced"
                 synced = True
                 syncing = False

@@ -310,6 +310,23 @@ class TestNodeSyncLoss(unittest.TestCase):
                 self.assertEqual(status["sync_state"], "unknown")
                 self.assertFalse(status["synced"])
 
+    def test_sync_status_explicit_true_cannot_override_conflicting_counts(self):
+        for counts in (
+            {"synced_coins": 9, "total_coins": 10},
+            {"synced_coins": 11, "total_coins": 10},
+            {"synced_coins": "10", "total_coins": 10},
+            {"synced_coins": 10},
+        ):
+            with self.subTest(counts=counts):
+                with patch(
+                    "wallet_sage.rpc",
+                    return_value={"success": True, "synced": True, **counts},
+                ):
+                    status = wallet_sage.get_wallet_sync_status()
+
+                self.assertEqual(status["sync_state"], "unknown")
+                self.assertFalse(status["synced"])
+
     def test_sync_status_does_not_infer_sync_from_malformed_explicit_flag(self):
         with patch(
             "wallet_sage.rpc",
