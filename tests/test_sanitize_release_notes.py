@@ -15,3 +15,18 @@ def test_sanitize_release_notes_removes_private_repo_links():
     assert "Full Changelog" not in cleaned
     assert "* Use signed public update manifest by @Lowestofttim" in cleaned
     assert "* Polish upgrade modal" in cleaned
+
+
+def test_sanitize_release_notes_keeps_label_for_private_issue_form_link():
+    notes = (
+        "Report defects through the "
+        "[CATalyst issue forms](https://github.com/catalystxch/catalyst-bot/issues/new/choose). "
+        "Read the [beta guide](https://catalystxch.com/beta-guide.html)."
+    )
+
+    cleaned = sanitize_release_notes(notes, "catalystxch/catalyst-bot")
+
+    assert cleaned == (
+        "Report defects through the CATalyst issue forms. "
+        "Read the [beta guide](https://catalystxch.com/beta-guide.html)."
+    )

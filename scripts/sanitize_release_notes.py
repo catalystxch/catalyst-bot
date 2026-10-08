@@ -20,7 +20,7 @@ def sanitize_release_notes(text: str, private_repo: str) -> str:
             flags=re.IGNORECASE,
         )
         notes = re.sub(
-            rf"\[([^\]]+)\]\(https://github\.com/{escaped_repo}/(?:pull|issues)/\d+\)",
+            rf"\[([^\]]+)\]\(https://github\.com/{escaped_repo}/[^)\s]+\)",
             r"\1",
             notes,
             flags=re.IGNORECASE,
