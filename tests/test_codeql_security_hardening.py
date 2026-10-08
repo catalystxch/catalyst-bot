@@ -409,6 +409,24 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
     assert "secret persist traceback" not in resp.get_data(as_text=True).lower()
 
 
+def test_full_node_status_hides_watcher_exception_details(monkeypatch):
+    class BrokenWatcher:
+        @property
+        def _full_node_active(self):
+            raise RuntimeError("secret watcher traceback at C:\\private\\wallet.key")
+
+    client, loopback = _api_client()
+    monkeypatch.setattr("mempool_watcher._watcher_instance", BrokenWatcher())
+
+    resp = client.get("/api/full-node/status", environ_base=loopback)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["success"] is True
+    assert body["watcher_error"] == "Watcher status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
 def test_config_change_address_result_hides_wallet_exception_details(monkeypatch):
     client, loopback = _api_client()
     auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}

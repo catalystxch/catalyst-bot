@@ -288,8 +288,8 @@ def api_full_node_status():
             status["pending_fill_warns"] = len(
                 getattr(w, "_fill_warned_coin_ids", {}) or {}
             )
-    except Exception as _err:
-        status["watcher_error"] = str(_err)
+    except Exception:
+        status["watcher_error"] = "Watcher status unavailable"
     return jsonify(status)
 
 
