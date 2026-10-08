@@ -47,3 +47,14 @@ new exact-candidate acceptance; extending the lease duration alone would
 weaken the safety boundary without that proof. Exact `60e2875` has not run
 against the original profile, and its own live lifecycle and both 24-hour
 windows remain open.
+
+After preserving the failure, the read-only safety monitor child PID
+`153544` and wrapper PID `160880` were verified by exact command line and
+stopped because the failed trace had no remaining acceptance value. The
+CATalyst process PID `120856` remained running in its safety fence. The
+independent OS timeline sampler had already ended.
+
+After both monitors stopped, the safety trace contained 309 lines and had
+SHA-256 `C79A5ED4C0AE8B948B2050A21AA98BDD09395B2046C5C68F8ECB3C0EBE1030E7`.
+The 3,660-line OS timeline had SHA-256
+`0C928EA400DD090722A0E1E042A65D3D0E35B94DDAD124532365347363C2798E`.
