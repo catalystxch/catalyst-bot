@@ -8257,6 +8257,43 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(
     ]
 
 
+@pytest.mark.parametrize("clears_latch", [True, False])
+def test_desktop_refreshes_authorization_after_zero_count_latch_recovery(
+    monkeypatch, clears_latch
+):
+    """A cleared cancellation latch must not leave startup in stale diagnostics."""
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    blocked = {
+        "allowed": False,
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "failed_check": "unresolved_operations",
+    }
+    latch = {"cleared": False}
+    calls = []
+
+    def authorize():
+        calls.append("authorize")
+        if latch["cleared"]:
+            return {"allowed": True, "reason_code": "", "failed_check": None}
+        return blocked
+
+    def recover():
+        calls.append("recover")
+        latch["cleared"] = clears_latch
+        return {"examined": 0, "recovered": 0, "remaining": 0}
+
+    monkeypatch.setattr(database, "init_database", lambda: None)
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setattr(api_server, "recover_legacy_startup_reservations", recover)
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is clears_latch
+    assert calls == ["authorize", "recover", "authorize"]
+
+
 def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
     monkeypatch,
 ):

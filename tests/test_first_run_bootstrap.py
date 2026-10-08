@@ -605,6 +605,47 @@ def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(
     assert api_server.wallet_setup_bootstrap_active() is False
 
 
+@pytest.mark.parametrize("clears_latch", [True, False])
+def test_bootstrap_promotion_refreshes_after_zero_count_latch_recovery(
+    monkeypatch, clears_latch
+):
+    import api_server
+
+    latch = {"cleared": False}
+    calls = []
+
+    def authorize():
+        calls.append("authorize")
+        return {
+            "allowed": latch["cleared"],
+            "reason_code": "" if latch["cleared"] else "UNRESOLVED_OPERATIONS",
+        }
+
+    def recover():
+        calls.append("recover")
+        latch["cleared"] = clears_latch
+        return {"examined": 0, "recovered": 0, "remaining": 0}
+
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setattr(api_server, "recover_legacy_startup_reservations", recover)
+    monkeypatch.setattr(api_server, "create_bot", lambda: calls.append("bot"))
+    monkeypatch.setattr(
+        api_server,
+        "_start_owned_runtime_services",
+        lambda authorization: calls.append(("services", authorization["allowed"])),
+    )
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    result = api_server.promote_wallet_setup_bootstrap()
+
+    assert result["allowed"] is clears_latch
+    expected = ["authorize", "recover", "authorize"]
+    if clears_latch:
+        expected.extend(["bot", ("services", True)])
+    assert calls == expected
+
+
 def test_bootstrap_promotion_retries_legacy_recovery_while_sage_restarts(
     monkeypatch,
 ):

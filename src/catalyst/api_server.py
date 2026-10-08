@@ -3922,7 +3922,12 @@ def promote_wallet_setup_bootstrap() -> dict:
             recovery = None
             try:
                 recovery = recover_legacy_startup_reservations()
-                if recovery.get("recovered", 0) > 0:
+                # Recovery may clear a proven cancellation latch while
+                # reporting zero newly recovered journal rows. Always recheck
+                # the authoritative gate before ending on zero remaining.
+                if isinstance(recovery, dict) and (
+                    recovery.get("recovered", 0) > 0 or recovery.get("remaining") == 0
+                ):
                     authorization = initialize_mutation_runtime()
             except Exception as recovery_error:
                 slog(

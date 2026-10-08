@@ -1943,7 +1943,13 @@ def _initialize_startup_ownership() -> dict:
             recovery = None
             try:
                 recovery = api_server.recover_legacy_startup_reservations()
-                if recovery.get("recovered", 0) > 0:
+                # The proof pass can clear a durable cancellation latch even
+                # when it creates no new journal recovery row. Its count is
+                # not the authority; recheck the gate before a zero-remaining
+                # result ends this bounded retry loop.
+                if isinstance(recovery, dict) and (
+                    recovery.get("recovered", 0) > 0 or recovery.get("remaining") == 0
+                ):
                     authorization = api_server.initialize_mutation_runtime()
                     authorization = _recover_startup_publication_claims(
                         api_server, authorization
