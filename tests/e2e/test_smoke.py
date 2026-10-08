@@ -2675,6 +2675,31 @@ def test_shutdown_health_error_is_not_process_exit(page):
     assert result["probes"] >= 2
 
 
+def test_native_close_refusal_does_not_use_fallback(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            let fallbackCalls = 0;
+            window.pywebview = {api: {
+                confirm_close_window: async () => ({success: false, reason: 'mutations_in_flight'}),
+                close_window: async () => {fallbackCalls += 1; return {success: true};}
+            }};
+            try {
+                const closed = await closeDesktopWindowAfterShutdown({backendStopped: true});
+                return {closed, fallbackCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result == {"closed": False, "fallbackCalls": 0}
+
+
 def test_shutdown_stop_poll_times_out_fail_closed(page):
     """A stop that never becomes authoritative must not proceed to cancellation."""
 
