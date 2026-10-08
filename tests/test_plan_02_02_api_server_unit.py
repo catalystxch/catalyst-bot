@@ -145,6 +145,7 @@ class TestBotStateEndpoint(unittest.TestCase):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
+        self.headers = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         api_server._rate_limit_log.clear()
 
     def tearDown(self):
@@ -152,7 +153,9 @@ class TestBotStateEndpoint(unittest.TestCase):
 
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/bot/state", environ_base=self.loopback)
+            resp = self.client.get(
+                "/api/bot/state", headers=self.headers, environ_base=self.loopback
+            )
         self.assertEqual(resp.status_code, 500)
         body = resp.get_json()
         self.assertIn("error", body)
@@ -165,7 +168,9 @@ class TestBotStateEndpoint(unittest.TestCase):
             get_state=lambda: {"running": False, "coins": {}},
         )
         with patch.object(api_server, "bot", fake_bot):
-            resp = self.client.get("/api/bot/state", environ_base=self.loopback)
+            resp = self.client.get(
+                "/api/bot/state", headers=self.headers, environ_base=self.loopback
+            )
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertIsInstance(body, dict)
@@ -185,13 +190,18 @@ class TestConfigGetEndpoint(unittest.TestCase):
     def tearDown(self):
         api_server._rate_limit_log.clear()
 
-    def test_config_get_is_public_read(self):
-        # /api/config GET does not require a token — it's read-only
+    def test_config_get_requires_local_token(self):
         resp = self.client.get("/api/config", environ_base=self.loopback)
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get(
+            "/api/config", headers=self.headers, environ_base=self.loopback
+        )
         self.assertEqual(resp.status_code, 200)
 
     def test_config_get_response_is_flat_dict(self):
-        resp = self.client.get("/api/config", environ_base=self.loopback)
+        resp = self.client.get(
+            "/api/config", headers=self.headers, environ_base=self.loopback
+        )
         body = resp.get_json()
         self.assertIsInstance(body, dict)
         # cfg.to_dict() returns a flat dict of config keys
@@ -199,7 +209,9 @@ class TestConfigGetEndpoint(unittest.TestCase):
         self.assertIn("DRY_RUN", body)
 
     def test_config_get_contains_spread_bps(self):
-        resp = self.client.get("/api/config", environ_base=self.loopback)
+        resp = self.client.get(
+            "/api/config", headers=self.headers, environ_base=self.loopback
+        )
         body = resp.get_json()
         self.assertIn("SPREAD_BPS", body)
 

@@ -248,6 +248,7 @@ def _endpoint_checks() -> list[EndpointCheck]:
             "GET",
             "/api/wallet/sage-running",
             ("running", "rpc_authenticated", "rpc_port_listening"),
+            requires_token=True,
         ),
         EndpointCheck(
             "POST",
@@ -260,31 +261,37 @@ def _endpoint_checks() -> list[EndpointCheck]:
             "GET",
             "/api/sage/startup-status",
             ("phase", "message", "wallet_type", "preload_running"),
+            requires_token=True,
         ),
         EndpointCheck(
             "GET",
             "/api/config/validate",
             ("is_valid", "errors", "warnings", "error_count", "warning_count"),
+            requires_token=True,
         ),
         EndpointCheck(
             "GET",
             "/api/config",
             ("DEXIE_API_BASE", "SPLASH_ENABLED"),
+            requires_token=True,
         ),
         EndpointCheck(
             "GET",
             "/api/diagnostics/api-stats",
             ("spacescan.available", "coinset.available", "dexie.available"),
+            requires_token=True,
         ),
         EndpointCheck(
             "GET",
             "/api/self-test",
             ("all_ok", "results"),
+            requires_token=True,
         ),
         EndpointCheck(
             "GET",
             "/api/doctor?force=true",
             ("can_start", "summary", "checks"),
+            requires_token=True,
             timeout_s=25.0,
         ),
     ]

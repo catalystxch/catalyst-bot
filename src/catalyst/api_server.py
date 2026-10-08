@@ -214,19 +214,74 @@ _TOKEN_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
 }
 
-# Logs, crash reports, exported settings and trade history may contain private
-# local data even though they are GET requests. Do not hand them to another
-# loopback process merely because it can connect to this TCP port.
+# Wallet, trade, configuration, and operational data remain private even on
+# GET routes. Do not hand them to another loopback process merely because it
+# can connect to this TCP port. The route-inventory regression test requires
+# every new GET handler to be classified before release.
 _PRIVATE_READ_ROUTES = frozenset(
     {
         "/api/status",
         "/api/dashboard",
+        "/api/stats",
+        "/api/inventory",
+        "/api/config",
+        "/api/config/validate",
+        "/api/fees/status",
+        "/api/fingerprint",
+        "/api/wallets/detect",
+        "/api/cats",
         "/api/coin-prep/status",
+        "/api/coins",
+        "/api/coin-prep/verify",
         "/api/bootstrap/status",
+        "/api/bootstrap/walletconnect/config",
+        "/api/bootstrap/partial-capability",
+        "/api/bootstrap/capabilities/partial-offers",
+        "/api/check-resume",
+        "/api/bot/state",
+        "/api/bot/price",
+        "/api/boost/state",
         "/api/health/runtime",
+        "/api/diagnostics/runtime",
+        "/api/diagnostics/api-stats",
+        "/api/dbx/info",
+        "/api/full-node/status",
+        "/api/doctor",
+        "/api/self-test",
+        "/api/alerts",
+        "/api/token_overview",
+        "/api/risk/spreads",
+        "/api/settings/defaults",
+        "/api/smart-defaults",
+        "/api/console/status",
+        "/api/splash/node",
+        "/api/splash/node/output",
+        "/api/splash/receive",
+        "/api/splash/setup/check",
+        "/api/splash/setup/progress",
+        "/api/splash/setup/release",
+        "/api/splash/stats",
+        "/api/watchdog/shape-fix-status",
+        "/api/update/relaunch-intent",
+        "/api/update/status",
         "/api/sage/fingerprints",
+        "/api/sage/startup-status",
+        "/api/wallet/sage-running",
         "/api/sage/cert-candidates",
+        "/api/offers",
+        "/api/offers/cancel_all/status",
         "/api/offers/diagnostic",
+        "/api/fills",
+        "/api/fills/classified",
+        "/api/fills/arb-wallets",
+        "/api/market/fill-intel",
+        "/api/market/intel",
+        "/api/market/confidence",
+        "/api/market/dbx",
+        "/api/pnl",
+        "/api/pnl/reset-preview",
+        "/api/dbx/pending",
+        "/api/splash/incoming/list",
         "/api/reservations",
         "/api/logs",
         "/api/logs/download",
@@ -3946,12 +4001,22 @@ def enforce_local_runtime_guard():
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
-    if (
-        request.method == "GET"
-        and path in _PRIVATE_READ_ROUTES
-        and not _has_valid_local_token()
-    ):
-        return jsonify({"error": "unauthorized"}), 401
+    # Flask dispatches HEAD to GET handlers. Guard both before any handler can
+    # read wallet data or perform status-maintenance work. Cookie-authenticated
+    # browser navigations from a different local origin must not trigger a GET
+    # with side effects (notably /api/coins) through SameSite=Lax cookies.
+    private_read = request.method in {"GET", "HEAD"} and (
+        path in _PRIVATE_READ_ROUTES or path.startswith("/api/safety/quarantine/")
+    )
+    if private_read:
+        if not _has_valid_local_token():
+            return jsonify({"error": "unauthorized"}), 401
+        if request.headers.get("Sec-Fetch-Site", "") in {"cross-site", "same-site"}:
+            return jsonify({"error": "origin_not_allowed"}), 403
+        # Private GET handlers may refresh durable state while computing their
+        # response. HEAD must not dispatch any of them for a body it discards.
+        if request.method == "HEAD":
+            return Response(status=405)
 
     if request.method in {
         "POST",

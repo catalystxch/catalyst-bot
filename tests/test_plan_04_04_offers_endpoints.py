@@ -64,6 +64,11 @@ class _FlaskBase(unittest.TestCase):
             environ_base=self._LOOPBACK,
         )
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
+
 
 def _make_bot(offers=([], [], [])):
     bot = MagicMock()
@@ -332,17 +337,17 @@ def test_shutdown_offer_disposition_qualifies_catalyst_tracked_visibility():
 class TestOffersGet(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_bot_set_returns_200(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_buys_sells_counts(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("buys", body)
         self.assertIn("sells", body)
@@ -351,7 +356,7 @@ class TestOffersGet(_FlaskBase):
 
     def test_empty_offers_returns_zero_counts(self):
         with patch.object(api_server, "bot", _make_bot(offers=([], [], []))):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertEqual(body["buy_count"], 0)
         self.assertEqual(body["sell_count"], 0)
@@ -363,7 +368,7 @@ class TestOffersGet(_FlaskBase):
             {"fresh": False, "using_cache": False},
         )
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.get_json()["error"], "wallet_offer_sync_stale")
 
@@ -376,15 +381,11 @@ class TestOffersGet(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllStatus(_FlaskBase):
     def test_returns_200_always(self):
-        resp = self.client.get(
-            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/offers/cancel_all/status", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_success_key(self):
-        resp = self.client.get(
-            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/offers/cancel_all/status", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body.get("success"))
 
@@ -414,17 +415,17 @@ class TestOpenOfferCount(_FlaskBase):
         super().tearDown()
 
     def test_returns_200(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_open_count(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("open_count", body)
         self.assertIsInstance(body["open_count"], int)
 
     def test_success_key_true_on_success(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body.get("success"))
 
@@ -741,7 +742,7 @@ class TestCancelAllPost(_FlaskBase):
             )
 
         self.assertEqual(response.status_code, 200)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["phase"], "error")
@@ -771,7 +772,7 @@ class TestCancelAllPost(_FlaskBase):
             response = self._post("/api/offers/cancel_all")
 
         self.assertEqual(response.status_code, 200)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["phase"], "error")
@@ -842,7 +843,7 @@ class TestCancelAllPost(_FlaskBase):
         stopped.coin_manager.refresh_fee_pool_from_wallet.assert_called_once_with()
         direct_batch.assert_not_called()
 
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(
@@ -932,7 +933,7 @@ class TestCancelAllPost(_FlaskBase):
 
         self.assertEqual(response.status_code, 200)
         stopped.offer_manager.retry_failed_cancels.assert_called_once_with(trade_ids)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(
@@ -1048,7 +1049,7 @@ class TestCancelAllPost(_FlaskBase):
             response = self._post("/api/offers/cancel_all")
 
         self.assertEqual(response.status_code, 200)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["phase"], "complete")
@@ -1111,7 +1112,7 @@ class TestCancelAllPost(_FlaskBase):
 
         def poll():
             snapshots.append(
-                self.client.get(
+                self._get(
                     "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
                 ).get_json()
             )
@@ -1190,7 +1191,7 @@ class TestCancelAllPost(_FlaskBase):
             )
             self.assertNotIn("_target_trade_ids", snapshot)
         # Only the worker may declare completion, after the retry call returns.
-        final = self.client.get(
+        final = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertTrue(final["complete"])
@@ -1321,7 +1322,7 @@ class TestCancelAllPost(_FlaskBase):
             reason="manual_cancel_all",
             force_storm=True,
         )
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["total"], 500)
@@ -1487,7 +1488,7 @@ class TestCancelAllPost(_FlaskBase):
             [trade_id for batch in submitted_batches for trade_id in batch],
             trade_ids,
         )
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["batch_size"], 4)
@@ -1553,7 +1554,7 @@ class TestCancelAllPost(_FlaskBase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(retried_batches, [trade_ids[:2], trade_ids[2:]])
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertTrue(status["complete"])
@@ -1607,7 +1608,7 @@ class TestCancelAllPost(_FlaskBase):
         direct_batch.assert_not_called()
         start_thread.assert_not_called()
 
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertFalse(status["running"])

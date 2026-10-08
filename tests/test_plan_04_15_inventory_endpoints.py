@@ -41,10 +41,16 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         api_server._rate_limit_log.clear()
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
+
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -56,23 +62,23 @@ class _FlaskBase(unittest.TestCase):
 class TestInventory(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_returns_200_with_bot(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_net_position(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("net_position_cat", body)
 
     def test_response_has_circuit_breaker(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         self.assertIn("circuit_breaker_active", resp.get_json())
 
 
@@ -85,17 +91,17 @@ class TestInventory(_FlaskBase):
 class TestRiskSpreads(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/risk/spreads", environ_base=self._LOOPBACK)
+            resp = self._get("/api/risk/spreads", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_returns_200_with_bot(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/risk/spreads", environ_base=self._LOOPBACK)
+            resp = self._get("/api/risk/spreads", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_spread_keys(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/risk/spreads", environ_base=self._LOOPBACK)
+            resp = self._get("/api/risk/spreads", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in (
             "buy_spread_bps",
@@ -110,7 +116,7 @@ class TestRiskSpreads(_FlaskBase):
     def test_get_adjusted_spread_called_for_both_sides(self):
         bot = _make_bot()
         with patch.object(api_server, "bot", bot):
-            self.client.get("/api/risk/spreads", environ_base=self._LOOPBACK)
+            self._get("/api/risk/spreads", environ_base=self._LOOPBACK)
         calls = [str(c) for c in bot.risk_manager.get_adjusted_spread.call_args_list]
         self.assertTrue(any("buy" in c for c in calls))
         self.assertTrue(any("sell" in c for c in calls))

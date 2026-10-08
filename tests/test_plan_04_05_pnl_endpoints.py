@@ -99,6 +99,10 @@ def _make_db_conn(fill_count=0, rt_count=0):
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -129,7 +133,7 @@ class _FlaskBase(unittest.TestCase):
 class TestPnlGet(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_bot_set_returns_200(self):
@@ -137,7 +141,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("api_server.get_stats", return_value=_fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_stopped_pnl_uses_selected_asset_quote_without_advancing_engine(self):
@@ -159,7 +163,7 @@ class TestPnlGet(_FlaskBase):
                 return_value={"mid": "0.00008", "source": "dexie_bid_ask"},
             ) as quote,
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["pnl_mid_price_xch"], "0.00008")
@@ -183,7 +187,7 @@ class TestPnlGet(_FlaskBase):
                 return_value={"mid": "0.00008"},
             ) as quote,
         ):
-            response = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            response = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["pnl_mid_price_xch"], "0.00008")
@@ -194,7 +198,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("api_server.get_stats", return_value=_fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in (
             "realised_pnl_xch",
@@ -216,7 +220,7 @@ class TestPnlGet(_FlaskBase):
             patch("api_server.get_stats", return_value=_fake_stats()),
             patch.object(api_server.cfg, "MAX_POSITION_XCH", Decimal("63.3")),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.get_json()["max_position_xch"], "63.3")
 
@@ -225,7 +229,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("api_server.get_stats", return_value=_fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertEqual(body["total_fills"], 10)
         self.assertEqual(body["buy_fills"], 5)
@@ -236,7 +240,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("api_server.get_stats", return_value=_fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("sniper", body)
 
@@ -257,7 +261,7 @@ class TestPnlGet(_FlaskBase):
                 "database.get_market_analysis_cache", return_value={"price_usd": 0.01}
             ),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertEqual(body["xch_usd_price"], "2.1")
         self.assertEqual(body["xch_usd_source"], "spacescan")
@@ -284,7 +288,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch("api_server.get_stats", return_value=stats),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertEqual(body["realised_pnl_xch"], "0")
@@ -310,7 +314,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch("api_server.get_stats", return_value=stats),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertEqual(body["realised_pnl_xch"], "0")
@@ -337,7 +341,7 @@ class TestPnlGet(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch("api_server.get_stats", return_value=stats),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertEqual(body["realised_pnl_xch"], "0.008")
@@ -357,9 +361,7 @@ class TestPnlResetPreview(_FlaskBase):
             patch("api_server.get_stats", return_value=_fake_stats()),
             patch("database.get_connection", return_value=_make_db_conn()),
         ):
-            resp = self.client.get(
-                "/api/pnl/reset-preview", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/pnl/reset-preview", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_success_key_true(self):
@@ -367,9 +369,7 @@ class TestPnlResetPreview(_FlaskBase):
             patch("api_server.get_stats", return_value=_fake_stats()),
             patch("database.get_connection", return_value=_make_db_conn()),
         ):
-            resp = self.client.get(
-                "/api/pnl/reset-preview", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/pnl/reset-preview", environ_base=self._LOOPBACK)
         self.assertTrue(resp.get_json().get("success"))
 
     def test_response_has_required_keys(self):
@@ -377,9 +377,7 @@ class TestPnlResetPreview(_FlaskBase):
             patch("api_server.get_stats", return_value=_fake_stats()),
             patch("database.get_connection", return_value=_make_db_conn()),
         ):
-            resp = self.client.get(
-                "/api/pnl/reset-preview", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/pnl/reset-preview", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in ("has_data", "fills", "round_trips", "realised_pnl_xch"):
             self.assertIn(key, body)
@@ -389,9 +387,7 @@ class TestPnlResetPreview(_FlaskBase):
             patch("api_server.get_stats", return_value=_fake_stats()),
             patch("database.get_connection", return_value=_make_db_conn()),
         ):
-            resp = self.client.get(
-                "/api/pnl/reset-preview", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/pnl/reset-preview", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIsInstance(body["fills"], int)
         self.assertIsInstance(body["round_trips"], int)
@@ -403,9 +399,7 @@ class TestPnlResetPreview(_FlaskBase):
             patch("database.get_connection", return_value=_make_db_conn(0, 0)),
             patch.object(api_server, "bot", None),
         ):
-            resp = self.client.get(
-                "/api/pnl/reset-preview", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/pnl/reset-preview", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["has_data"])
 
@@ -644,7 +638,7 @@ class TestFillsExport(_FlaskBase):
             with patch.object(
                 api_server, "_build_fill_history_for_gui", return_value=[]
             ):
-                response = self.client.get(
+                response = self._get(
                     "/api/fills/export",
                     headers=self.auth,
                     environ_base=self._LOOPBACK,

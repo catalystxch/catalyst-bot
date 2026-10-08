@@ -69,6 +69,10 @@ def _green_market_confidence(
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN})
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -84,7 +88,7 @@ class TestSmartDefaults(_FlaskBase):
         with patch.object(
             api_server, "_calculate_smart_defaults", side_effect=_fake_defaults_response
         ):
-            resp = self.client.get("/api/smart-defaults", environ_base=self._LOOPBACK)
+            resp = self._get("/api/smart-defaults", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_default_liquidity_mode_two_sided(self):
@@ -95,7 +99,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get("/api/smart-defaults", environ_base=self._LOOPBACK)
+            self._get("/api/smart-defaults", environ_base=self._LOOPBACK)
         self.assertEqual(captured.get("liquidity_mode"), "two_sided")
 
     def test_buy_only_mode_forwarded(self):
@@ -106,7 +110,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?liquidity_mode=buy_only",
                 environ_base=self._LOOPBACK,
             )
@@ -120,7 +124,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?liquidity_mode=sell_only",
                 environ_base=self._LOOPBACK,
             )
@@ -134,7 +138,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?liquidity_mode=invalid_mode",
                 environ_base=self._LOOPBACK,
             )
@@ -148,7 +152,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?risk_profile=conservative",
                 environ_base=self._LOOPBACK,
             )
@@ -160,7 +164,7 @@ class TestSmartDefaults(_FlaskBase):
             "_calculate_smart_defaults",
             side_effect=Exception("market data unavailable"),
         ):
-            resp = self.client.get("/api/smart-defaults", environ_base=self._LOOPBACK)
+            resp = self._get("/api/smart-defaults", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
         body = resp.get_json()
         self.assertIn("error", body)
@@ -173,7 +177,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?xch_reserve=0.5&cat_reserve=100",
                 environ_base=self._LOOPBACK,
             )
@@ -188,7 +192,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?"
                 "asset_id=abc123&cat_wallet_id=7&cat_decimals=5&"
                 "cat_ticker_id=FOO_XCH&cat_name=Foo",
@@ -209,7 +213,7 @@ class TestSmartDefaults(_FlaskBase):
             return _fake_defaults_response(**kwargs)
 
         with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
-            self.client.get(
+            self._get(
                 "/api/smart-defaults?asset_id=abc123&cat_decimals=0",
                 environ_base=self._LOOPBACK,
             )

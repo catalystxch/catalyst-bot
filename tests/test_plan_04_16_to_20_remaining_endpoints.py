@@ -82,6 +82,11 @@ class _FlaskBase(unittest.TestCase):
             environ_base=self._LOOPBACK,
         )
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # 04-16: GET /api/market/intel
@@ -127,7 +132,7 @@ class TestMarketIntel(_FlaskBase):
 
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/intel", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def _get_intel(self):
@@ -139,7 +144,7 @@ class TestMarketIntel(_FlaskBase):
             "our_open_sells": 0,
             "source": "db",
         }
-        return self.client.get(
+        return self._get(
             "/api/market/intel",
             environ_base=self._LOOPBACK,
         )
@@ -159,7 +164,7 @@ class TestMarketIntel(_FlaskBase):
             patch("api_server._get_spacescan_market_context", return_value=empty_sc),
             patch("api_server._fetch_dbx_pair_status", return_value={}),
         ):
-            resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/intel", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_is_dict(self):
@@ -177,7 +182,7 @@ class TestMarketIntel(_FlaskBase):
             patch("api_server._get_spacescan_market_context", return_value=empty_sc),
             patch("api_server._fetch_dbx_pair_status", return_value={}),
         ):
-            resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/intel", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json(), dict)
 
     def test_stopped_market_intel_uses_live_orderbook_mid_for_spacescan_gap(self):
@@ -210,7 +215,7 @@ class TestMarketIntel(_FlaskBase):
             ) as spacescan_context,
             patch("api_server._fetch_dbx_pair_status", return_value={}),
         ):
-            resp = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/intel", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -244,7 +249,7 @@ class TestMarketIntel(_FlaskBase):
             ),
             patch("api_server._fetch_dbx_pair_status", return_value={}),
         ):
-            response = self.client.get("/api/market/intel", environ_base=self._LOOPBACK)
+            response = self._get("/api/market/intel", environ_base=self._LOOPBACK)
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
@@ -259,7 +264,7 @@ class TestMarketIntel(_FlaskBase):
     def test_slippage_endpoint_is_retired_without_wallet_or_provider_call(self):
         bot = _make_bot()
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         bot.price_engine.get_tibet_quote.assert_not_called()
@@ -278,7 +283,7 @@ class TestMarketIntel(_FlaskBase):
         bot._startup_self_test_results = {}
         bot.price_engine.get_tibet_quote.return_value = None
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["status"], "retired")
@@ -297,7 +302,7 @@ class TestMarketIntel(_FlaskBase):
         bot.price_engine.get_tibet_quote.return_value = None
 
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/market/slippage", environ_base=self._LOOPBACK)
+            resp = self._get("/api/market/slippage", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["status"], "retired")
@@ -350,7 +355,7 @@ class TestMarketSummary(_FlaskBase):
                 patch.object(api_server, "bot", bot),
                 patch("requests.get", return_value=EmptyResponse()),
             ):
-                body = self.client.get(
+                body = self._get(
                     "/api/market/summary", environ_base=self._LOOPBACK
                 ).get_json()
         finally:
@@ -402,8 +407,8 @@ class TestMarketSummary(_FlaskBase):
 
         try:
             with patch("requests.get", side_effect=fake_get):
-                self.client.get("/api/market/summary", environ_base=self._LOOPBACK)
-                self.client.get("/api/market/summary", environ_base=self._LOOPBACK)
+                self._get("/api/market/summary", environ_base=self._LOOPBACK)
+                self._get("/api/market/summary", environ_base=self._LOOPBACK)
         finally:
             api_server._active_cat.clear()
             api_server._active_cat.update(original_cat)
@@ -443,12 +448,8 @@ class TestMarketSummary(_FlaskBase):
 
         try:
             with patch("requests.get", side_effect=fake_get):
-                first = self.client.get(
-                    "/api/market/summary", environ_base=self._LOOPBACK
-                )
-                second = self.client.get(
-                    "/api/market/summary", environ_base=self._LOOPBACK
-                )
+                first = self._get("/api/market/summary", environ_base=self._LOOPBACK)
+                second = self._get("/api/market/summary", environ_base=self._LOOPBACK)
         finally:
             api_server._active_cat.clear()
             api_server._active_cat.update(original_cat)
@@ -512,7 +513,7 @@ class TestMarketSummary(_FlaskBase):
                 patch.object(api_server, "bot", bot),
                 patch("requests.get", side_effect=fake_get),
             ):
-                body = self.client.get(
+                body = self._get(
                     "/api/market/summary", environ_base=self._LOOPBACK
                 ).get_json()
         finally:
@@ -539,12 +540,12 @@ class TestMarketSummary(_FlaskBase):
 class TestSpacescanStatus(_FlaskBase):
     def test_returns_200(self):
         with patch("spacescan.get_api_stats", return_value={}):
-            resp = self.client.get("/api/spacescan/status", environ_base=self._LOOPBACK)
+            resp = self._get("/api/spacescan/status", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_configured_key(self):
         with patch("spacescan.get_api_stats", return_value={}):
-            resp = self.client.get("/api/spacescan/status", environ_base=self._LOOPBACK)
+            resp = self._get("/api/spacescan/status", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("configured", body)
         self.assertIn("tier", body)
@@ -665,19 +666,20 @@ class TestSpacescanSetup(_FlaskBase):
 class TestFeesStatus(_FlaskBase):
     def test_returns_200(self):
         with patch("api_server.get_fee_settings_snapshot", return_value={}):
-            resp = self.client.get("/api/fees/status", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fees/status", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_success_key_true(self):
         with patch("api_server.get_fee_settings_snapshot", return_value={}):
-            resp = self.client.get("/api/fees/status", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fees/status", environ_base=self._LOOPBACK)
         self.assertTrue(resp.get_json().get("success"))
 
-    def test_no_auth_required(self):
-        # GET endpoint — no token needed
+    def test_local_auth_required(self):
         with patch("api_server.get_fee_settings_snapshot", return_value={}):
-            resp = self.client.get("/api/fees/status", environ_base=self._LOOPBACK)
-        self.assertEqual(resp.status_code, 200)
+            denied = self.client.get("/api/fees/status", environ_base=self._LOOPBACK)
+            allowed = self._get("/api/fees/status", environ_base=self._LOOPBACK)
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +722,7 @@ class TestSniperViaPlnl(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch("api_server.get_stats", return_value=self._fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("sniper", body)
         self.assertIsInstance(body["sniper"], dict)
@@ -732,7 +734,7 @@ class TestSniperViaPlnl(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch("api_server.get_stats", return_value=self._fake_stats()),
         ):
-            resp = self.client.get("/api/pnl", environ_base=self._LOOPBACK)
+            resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertEqual(body["sniper"].get("total_snipes"), 5)
 
@@ -754,7 +756,7 @@ class TestCircuitBreakerViaInventory(_FlaskBase):
             "circuit_breaker_reason": "",
         }
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["circuit_breaker_active"])
 
@@ -766,7 +768,7 @@ class TestCircuitBreakerViaInventory(_FlaskBase):
             "circuit_breaker_reason": "position_limit_exceeded",
         }
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/inventory", environ_base=self._LOOPBACK)
+            resp = self._get("/api/inventory", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["circuit_breaker_active"])
         self.assertEqual(body["circuit_breaker_reason"], "position_limit_exceeded")
