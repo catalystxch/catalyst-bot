@@ -2482,8 +2482,8 @@ def api_status():
                 # get_inventory_state() already serializes Decimals to strings,
                 # but wrap in _serialize_dict for defence-in-depth.
                 risk_out = api_server._serialize_dict(dict(inv))
-        except Exception as _risk_err:
-            risk_out = {"error": f"risk_state_unavailable: {_risk_err}"}
+        except Exception:
+            risk_out = {"error": "risk_state_unavailable"}
 
         try:
             lifecycle_out = get_offer_lifecycle_summary(

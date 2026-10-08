@@ -289,6 +289,24 @@ class TestBotPriceContract(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestStatusEndpointSmoke(_FlaskBase):
+    def test_status_hides_risk_inventory_exception_details(self):
+        bot = _fake_bot_stopped()
+
+        def unavailable_inventory():
+            raise RuntimeError("secret risk traceback C:/wallet/private.key")
+
+        bot.risk_manager = types.SimpleNamespace(
+            get_inventory_state=unavailable_inventory
+        )
+        with patch.object(api_server, "bot", bot):
+            response = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        body = response.get_data(as_text=True).lower()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("risk_state_unavailable", body)
+        self.assertNotIn("secret risk traceback", body)
+        self.assertNotIn("private.key", body)
+
     def test_status_includes_runtime_safety_for_prebot_and_stopped_bot(self):
         for bot in (None, _fake_bot_stopped()):
             with (
