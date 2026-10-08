@@ -2643,10 +2643,12 @@ def api_diagnostics_api_stats():
                 age_secs = get_market_analysis_cache_age_secs(asset_id, "spacescan")
                 if age_secs is not None:
                     payload["spacescan"]["token_context_cache_age_secs"] = int(age_secs)
-        except Exception as cache_err:
-            payload["spacescan"]["token_context_cache_error"] = str(cache_err)
-    except Exception as e:
-        payload["spacescan"]["error"] = str(e)
+        except Exception:
+            payload["spacescan"]["token_context_cache_error"] = (
+                "Spacescan cache status unavailable"
+            )
+    except Exception:
+        payload["spacescan"]["error"] = "Spacescan status unavailable"
 
     # Merge any spacescan calls recorded via the centralized tracker
     # (currently market_data_collector routes through spacescan.record_external_call,
@@ -2694,8 +2696,8 @@ def api_diagnostics_api_stats():
                     getattr(bot.coinset_client, "_rate_limited_until", 0.0) or 0
                 ),
             }
-    except Exception as e:
-        payload["coinset"]["error"] = str(e)
+    except Exception:
+        payload["coinset"]["error"] = "Coinset status unavailable"
 
     # Merge "direct" Coinset calls (tx_fees fee-estimate, anything not
     # going through coinset_client). These come from the centralized
@@ -2771,8 +2773,8 @@ def api_diagnostics_api_stats():
                     getattr(bot.dexie_manager, "_v3_pairs_cache", None)
                 ),
             }
-    except Exception as e:
-        payload["dexie"]["error"] = str(e)
+    except Exception:
+        payload["dexie"]["error"] = "Dexie status unavailable"
 
     # Merge "direct" Dexie calls (Smart Settings, market intel, deposit
     # advisor, fill verification, doctor, sage_node, etc.) — these
@@ -2828,8 +2830,8 @@ def api_diagnostics_api_stats():
             }
         else:
             payload["splash"] = {"available": False}
-    except Exception as e:
-        payload["splash"] = {"available": False, "error": str(e)}
+    except Exception:
+        payload["splash"] = {"available": False, "error": "Splash status unavailable"}
 
     # One-release compatibility marker. TibetSwap has shut down permanently;
     # historical counters are not promoted into live provider health.

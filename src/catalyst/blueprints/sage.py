@@ -640,6 +640,16 @@ def api_sage_cert_candidates():
         import sage_node
 
         data_dir = str(request.args.get("data_dir", "") or "").strip()
+        if data_dir:
+            selected = os.path.normcase(os.path.normpath(data_dir))
+            allowed = {
+                os.path.normcase(os.path.normpath(root))
+                for root in sage_node._candidate_sage_data_dirs()
+            }
+            if data_dir.startswith(("\\\\", "//")) or selected not in allowed:
+                return jsonify(
+                    {"success": False, "error": "Unconfigured Sage data folder"}
+                ), 400
         extra_dirs = [data_dir] if data_dir else None
         candidates = sage_node.get_sage_cert_candidates(extra_dirs)
         detected = sage_node.detect_sage_cert_path(extra_dirs)

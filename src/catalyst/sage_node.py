@@ -1688,6 +1688,12 @@ def validate_sage_cert_pair(
     if not cert_path or not cert_path.strip():
         return False, "Choose Sage's wallet.crt file.", "", ""
 
+    # A browser request must not make path resolution probe an SMB share.
+    if cert_path.strip().startswith(("\\\\", "//")) or key_path.strip().startswith(
+        ("\\\\", "//")
+    ):
+        return False, "Network certificate paths are not allowed.", "", ""
+
     try:
         cert_real = os.path.realpath(_normalise_path(cert_path))
     except Exception:

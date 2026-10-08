@@ -1997,8 +1997,8 @@ def api_coin_prep_status():
                 _drift = _tier_size_drift_findings(allow_fresh_price=False)
                 result["tier_size_drift"] = _drift
                 _mark_payload_needs_coin_prep_for_drift(result, _drift)
-            except Exception as _drift_err:
-                result["tier_size_drift_error"] = str(_drift_err)[:200]
+            except Exception:
+                result["tier_size_drift_error"] = "Tier status unavailable"
 
         # Include the recent coin prep transcript for the inline console.
         # We prefer DB-backed events because that captures both structured

@@ -229,6 +229,53 @@ def test_sage_cert_pair_rejects_unknown_custom_root(tmp_path):
     assert "detected Sage data folder" in reason
 
 
+def test_sage_cert_pair_rejects_network_path_before_resolution():
+    with patch.object(
+        sage_node.os.path,
+        "realpath",
+        side_effect=AssertionError("network path was resolved"),
+    ) as resolve:
+        ok, reason, _, _ = sage_node.validate_sage_cert_pair(
+            r"\\attacker\share\ssl\wallet.crt"
+        )
+
+    assert ok is False
+    assert reason == "Network certificate paths are not allowed."
+    resolve.assert_not_called()
+
+
+def test_sage_cert_candidates_rejects_unconfigured_data_dir(tmp_path):
+    client, loopback = _api_client()
+
+    resp = client.get(
+        "/api/sage/cert-candidates",
+        query_string={"data_dir": str(tmp_path / "UnconfiguredSage")},
+        environ_base=loopback,
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["success"] is False
+
+
+def test_sage_cert_candidates_accepts_configured_data_dir(tmp_path):
+    data_dir = tmp_path / "PortableSage"
+    ssl_dir = data_dir / "ssl"
+    ssl_dir.mkdir(parents=True)
+    (ssl_dir / "wallet.crt").write_text("cert", encoding="utf-8")
+    (ssl_dir / "wallet.key").write_text("key", encoding="utf-8")
+    client, loopback = _api_client()
+
+    with patch.dict("os.environ", {"SAGE_ALLOWED_CERT_ROOTS": str(data_dir)}):
+        resp = client.get(
+            "/api/sage/cert-candidates",
+            query_string={"data_dir": str(data_dir)},
+            environ_base=loopback,
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["detected_cert_path"] == str(ssl_dir / "wallet.crt")
+
+
 class _StartableBot:
     def __init__(self):
         self.started = False
@@ -424,6 +471,40 @@ def test_full_node_status_hides_watcher_exception_details(monkeypatch):
     body = resp.get_json()
     assert body["success"] is True
     assert body["watcher_error"] == "Watcher status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_provider_stats_hide_exception_details():
+    client, loopback = _api_client()
+
+    with patch(
+        "spacescan.get_api_stats",
+        side_effect=RuntimeError("secret Spacescan traceback at C:\\private"),
+    ):
+        resp = client.get("/api/diagnostics/api-stats", environ_base=loopback)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["spacescan"]["available"] is False
+    assert body["spacescan"]["error"] == "Spacescan status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_coin_prep_status_hides_drift_exception_details():
+    client, loopback = _api_client()
+
+    with (
+        patch.dict(api_server._coin_prep_state, {"running": False}),
+        patch(
+            "blueprints.coin_prep._tier_size_drift_findings",
+            side_effect=RuntimeError("secret tier traceback at C:\\private"),
+        ),
+    ):
+        resp = client.get("/api/coin-prep/status", environ_base=loopback)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["tier_size_drift_error"] == "Tier status unavailable"
     assert "private" not in resp.get_data(as_text=True).lower()
 
 
