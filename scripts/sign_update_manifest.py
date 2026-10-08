@@ -59,7 +59,9 @@ def build_manifest(args: argparse.Namespace) -> dict:
     tag = _version_tag(args.version)
     channel = getattr(args, "channel", "stable")
     source_commit = getattr(args, "source_commit", None)
-    if channel == "beta" and not re.fullmatch(r"[a-f0-9]{40}", str(source_commit or "")):
+    if channel == "beta" and not re.fullmatch(
+        r"[a-f0-9]{40}", str(source_commit or "")
+    ):
         raise ValueError("beta source commit must be a full lowercase Git SHA")
     version = tag.lstrip("vV")
     installer_name = installer.name

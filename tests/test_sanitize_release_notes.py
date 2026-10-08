@@ -33,7 +33,9 @@ def test_sanitize_release_notes_keeps_label_for_private_issue_form_link():
 
 
 def test_sanitize_release_notes_keeps_label_for_repo_root_link():
-    notes = "Read [source](https://github.com/catalystxch/catalyst-bot/) before testing."
+    notes = (
+        "Read [source](https://github.com/catalystxch/catalyst-bot/) before testing."
+    )
 
     cleaned = sanitize_release_notes(notes, "catalystxch/catalyst-bot")
 
