@@ -142,10 +142,23 @@ an owned lease, synced mainnet TEST 7, unchanged balances, and zero pending
 or nonterminal Sage offers. The monitor script is
 `E:\catalyst-stability-monitor-f9a1d3e\monitor.py`, SHA-256
 `B3F09C5B61A70F56313CD1D700EA2D3D438B94B2877F03BCF9CA7C008E53A066`;
-its growing trace is `trace-60s.jsonl` in that directory. The stopped-profile
-24-hour gate cannot count before **2026-10-09T16:38:35.606045Z**, followed by
-complete trace and end-state review. The old `5446496` monitor was stopped
-after preserving its clean pre-rollover samples; it is historical evidence.
+its initial trace is `trace-60s.jsonl` in that directory. The old `5446496`
+monitor was stopped after preserving its clean pre-rollover samples; it is
+historical evidence.
+
+At 16:42:35Z, the initial exact-f9 monitor recorded one
+`PROCESS_COUNT_NOT_ONE` alert while isolated QA installer upgrade work was
+running. Port 5000 still belonged solely to original-profile PID 38104,
+and the app retained its allowed safety state and owned lease. The QA logs
+place the same-version upgrade between 16:42:28Z and rollback at 16:43:06Z.
+That trace cannot count as a clean 24-hour window. Once QA finished and only
+PID 38104 remained, the verified monitor PID 153112 was stopped. A new
+exact-PID/hash monitor PID 39492 started `trace-60s-clean.jsonl` at
+**2026-10-08T16:47:12.356808Z**. Its first sample had no alerts, sole
+process and port ownership, an owned lease, synced TEST 7, unchanged
+balances, and zero pending/nonterminal offers. This clean stopped-profile
+window cannot pass before **2026-10-09T16:47:12.356808Z**, followed by
+complete trace and end-state review.
 
 No mainnet wallet action, new campaign, fee approval, or offer effect occurred.
 The separate live offer lifecycle, final-candidate active-profile window,
