@@ -2,7 +2,8 @@
 
 Draft PR [#220](https://github.com/catalystxch/catalyst-bot/pull/220) remains open against `main`.
 The exact runtime/source commit is `65e496842c6dfd3da1e96077320e72566431ec56`.
-The PR head `8f5179fc423eee1abf6e47c537dd2f19e7ec0355` adds only tests.
+Test-only child `8f5179fc423eee1abf6e47c537dd2f19e7ec0355` adds only tests;
+its later descendants change only documentation and evidence.
 
 ## Corrections
 
