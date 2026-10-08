@@ -59,9 +59,15 @@ The binaries and manifest were pinned at artifact commit
 and [SHA-256 manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/914ebe03a407b0e8dd8379d32634a61b118c2c61/acceptance-artifacts/SHA256SUMS-5cf93bf.txt).
 Independent HTTP downloads of the ZIP and installer matched the hashes above.
 The downloaded ZIP passed CRC and contained 192 files and the exact EXE hash.
-Exact-candidate native desktop launch was not attempted during this package
-check because it would foreground a window on the original PC; native UI
-acceptance remains open.
+An isolated native first-launch smoke used empty data directory
+`E:\catalyst-5cf93bf-native-smoke` and loopback port `55007`. The exact EXE
+ran as PID `159308`, opened a CATalyst desktop window and JS bridge, served a
+healthy local API with a stopped bot, and blocked trading because the isolated
+profile had no wallet identity binding. `CloseMainWindow` caused normal app
+shutdown; the PID and port were absent afterward. The original TEST 7 process
+remained sole owner of port `5000`. No wallet mutation or Risk Disclosure
+acknowledgement occurred in the isolated profile. Full native UI acceptance
+against the exact candidate remains open.
 
 ## Live and release gates
 
