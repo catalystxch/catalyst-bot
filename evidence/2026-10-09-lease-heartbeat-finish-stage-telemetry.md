@@ -18,4 +18,13 @@ Three focused regressions inject a 20 ms delay separately into the real SQLite h
 
 The next runtime occurrence must be interpreted from the new stage fields and correlated with system/backup events. No 24-hour gate is credited from the invalid `7a27999` trace.
 
+The docs/evidence-only PR head `d3d22f94dd1d2c35002561a52d37f2afc64d10df`
+completed all 11 GitHub checks, including unit tests, on 2026-10-09. A sealed
+Codex Security diff scan (`14cb5418-300c-47e3-9ea9-071e418fc113`) reviewed
+all 18 changed source files in the incremental range
+`1a1aeaaca6d54d035ff56cbe1db4f5bd532df40a..0bf034633d555ef658e1c65630430b10944c53ac`.
+It recorded no plausible security finding. This offline source review did not
+rerun tests, launch the app, touch the wallet, or establish whole-PR security
+or live acceptance.
+
 An isolated database initialized on E: reported `journal_mode=wal` and `synchronous=2` (`FULL`) for its short-lived lease connection. A commit can therefore wait on durable storage during snapshot I/O, but this is only a hypothesis about the live stall. The read-only measurement itself succeeded. Its temporary directory `E:\tmphtr7hvna` could not be removed because automatic approval review rejected the cleanup command before execution; no alternate deletion was attempted.
