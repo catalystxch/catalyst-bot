@@ -6339,6 +6339,11 @@ class BotLoop:
         """Check if the bot loop is running."""
         return self._running
 
+    def is_stopped(self) -> bool:
+        """Prove the bot reached its terminal stop state without GUI stat reads."""
+        with self._state_lock:
+            return not self._running and self._bot_state.get("status") == "stopped"
+
     def _current_splash_pair_label(self) -> str:
         ticker = (
             str(getattr(cfg, "CAT_TICKER_ID", "") or getattr(cfg, "CAT_NAME", "CAT"))

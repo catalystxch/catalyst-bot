@@ -17,6 +17,21 @@ class _NoOp:
         return False
 
 
+def test_terminal_stop_proof_reads_only_core_bot_state():
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._state_lock = threading.Lock()
+    loop._bot_state = {"status": "stopping"}
+    loop._running = False
+
+    assert loop.is_stopped() is False
+
+    loop._bot_state["status"] = "stopped"
+    assert loop.is_stopped() is True
+
+    loop._running = True
+    assert loop.is_stopped() is False
+
+
 def test_async_stop_finalizer_does_not_publish_stopped_while_cycle_is_alive(
     monkeypatch,
 ):

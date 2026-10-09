@@ -1466,7 +1466,7 @@ class TestCoinPrepTrigger(_FlaskBase):
         bot = MagicMock()
         bot.is_running.side_effect = [True, False]
         bot.stop.return_value = True
-        bot.get_state.return_value = {"status": "stopped"}
+        bot.is_stopped.return_value = True
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -1482,7 +1482,7 @@ class TestCoinPrepTrigger(_FlaskBase):
         bot = MagicMock()
         bot.is_running.side_effect = [True, False]
         bot.stop.return_value = False
-        bot.get_state.return_value = {"status": "stopping"}
+        bot.is_stopped.return_value = False
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -1501,7 +1501,7 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_already_stopping_bot_blocks_coin_prep_worker(self):
         bot = MagicMock()
         bot.is_running.return_value = False
-        bot.get_state.return_value = {"status": "stopping"}
+        bot.is_stopped.return_value = False
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -1520,7 +1520,7 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_manual_topup_blocks_while_bot_is_stopping(self):
         bot = MagicMock()
         bot.is_running.return_value = False
-        bot.get_state.return_value = {"status": "stopping"}
+        bot.is_stopped.return_value = False
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/coins/topup")
 
@@ -1530,12 +1530,48 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_manual_coin_prep_blocks_while_bot_is_stopping(self):
         bot = MagicMock()
         bot.is_running.return_value = False
-        bot.get_state.return_value = {"status": "stopping"}
+        bot.is_stopped.return_value = False
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/coins/prep", {"fee_approval_id": "a" * 64})
 
         self.assertEqual(resp.status_code, 409)
         bot.coin_manager.start_coin_prep.assert_not_called()
+
+    def test_stopped_bot_proof_does_not_collect_unrelated_gui_stats(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.is_stopped.return_value = True
+        bot.get_state.side_effect = RuntimeError("unrelated dashboard stats failed")
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ),
+            patch.object(api_server, "bot", bot),
+        ):
+            mock_thread.return_value.start = MagicMock()
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 200)
+        bot.get_state.assert_not_called()
+
+    def test_manual_coin_routes_use_terminal_stop_proof_without_gui_stats(self):
+        for path, body, method_name in (
+            ("/api/coins/topup", None, "start_topup"),
+            ("/api/coins/prep", {"fee_approval_id": "a" * 64}, "start_coin_prep"),
+        ):
+            with self.subTest(path=path):
+                bot = MagicMock()
+                bot.is_stopped.return_value = True
+                bot.get_state.side_effect = RuntimeError(
+                    "unrelated dashboard stats failed"
+                )
+                with patch.object(api_server, "bot", bot):
+                    resp = self._post(path, body)
+
+                self.assertEqual(resp.status_code, 200)
+                getattr(bot.coin_manager, method_name).assert_called_once()
+                bot.get_state.assert_not_called()
 
     def test_duplicate_trigger_does_not_start_second_worker(self):
         with (

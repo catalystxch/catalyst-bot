@@ -1280,7 +1280,7 @@ def api_coin_topup():
         return jsonify({"error": "Bot not initialised"}), 500
 
     # Block if bot is live — topup splits coins and races with offer creation
-    if bot.is_running() or bot.get_state().get("status") != "stopped":
+    if not bot.is_stopped():
         return jsonify(
             {
                 "error": "Stop the bot before manual top-up. "
@@ -1304,7 +1304,7 @@ def api_coin_prep():
         return jsonify({"error": "Bot not initialised"}), 500
 
     # Block if bot is live — coin prep splits/combines and races with offer creation
-    if bot.is_running() or bot.get_state().get("status") != "stopped":
+    if not bot.is_stopped():
         return jsonify(
             {
                 "error": "Stop the bot before manual coin prep. "
@@ -2732,11 +2732,7 @@ def _api_coin_prep_trigger_locked():
         if bot:
             was_running = bot.is_running()
             stop_completed = bot.stop(wait=True) is True if was_running else True
-            bot_stopped = (
-                stop_completed
-                and not bot.is_running()
-                and bot.get_state().get("status") == "stopped"
-            )
+            bot_stopped = stop_completed and bot.is_stopped()
             if not bot_stopped:
                 return (
                     jsonify(
