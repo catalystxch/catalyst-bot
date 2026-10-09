@@ -42,6 +42,21 @@ unchanged balances, zero pending transactions, and zero nonterminal offers.
 The audit reports `in_progress` with zero problems. Veeam/VSS processes were
 present in that sample and are part of the observed environment.
 
+An additional unauthenticated, read-only loopback check against the live exact
+EXE returned HTTP 401 for `/api/status`, `/api/coin-prep/status`,
+`/api/bootstrap/status`, `/api/splash/node`, and `/api/splash/stats`. No
+`splash.exe` process was running at that check. This verifies the private
+status guard and current stopped-profile process state; it does not prove
+Splash peer receipt or authorize starting the daemon.
+
+The prepared `end_state_audit.py --preflight` was exercised while the monitor
+was live. At 2026-10-09T11:34:14Z it reported zero trace problems and zero
+snapshot alerts, one exact MZ CAT metadata match, stopped prior campaign,
+zero authoritative fee spend, no campaign fee approval, resolved safety latch,
+active lease, and live monitor PID. It correctly returned exit 2 with
+`trace_status: in_progress` and `ready_for_end_state: false`; it did not
+prematurely qualify the 24-hour window.
+
 The earliest 24-hour elapsed point is **2026-10-10T11:12:28Z**. The monitor
 plans 25 hours, and only its completed trace plus fresh end-state process,
 Sage, DB, campaign, ledger, and UI review can qualify this window. A clean
