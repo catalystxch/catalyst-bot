@@ -32675,7 +32675,16 @@ def heartbeat_runtime_mutation_lease(
     def elapsed_ms(start_ns: int, end_ns: int) -> int:
         return min(3_600_000, max(0, round((end_ns - start_ns) / 1_000_000)))
 
-    database_ms = {"connection": 0, "begin": 0, "read": 0, "finish": 0, "close": 0}
+    database_ms = {
+        "connection": 0,
+        "begin": 0,
+        "read": 0,
+        "update": 0,
+        "readback": 0,
+        "commit": 0,
+        "finish": 0,
+        "close": 0,
+    }
     owner = _required_stability_text(owner_run_id, "owner_run_id")
     version = _exact_integer(expected_lease_version, "expected_lease_version")
     at = _stability_timestamp_or_now(heartbeat_at, "heartbeat_at timestamp")
@@ -32703,6 +32712,11 @@ def heartbeat_runtime_mutation_lease(
             result["database_ms"] = database_ms
             return result
 
+        def commit_with_timing() -> None:
+            commit_ns = time.perf_counter_ns()
+            conn.commit()
+            database_ms["commit"] = elapsed_ms(commit_ns, time.perf_counter_ns())
+
         if current_row is None:
             raise RuntimeError("runtime mutation lease singleton is missing")
         current = dict(current_row)
@@ -32711,7 +32725,7 @@ def heartbeat_runtime_mutation_lease(
             or current["owner_run_id"] != owner
             or int(current["lease_version"]) != version
         ):
-            conn.commit()
+            commit_with_timing()
             return with_timing(
                 {
                     "heartbeat": False,
@@ -32720,7 +32734,7 @@ def heartbeat_runtime_mutation_lease(
                 }
             )
         if current["expires_at"] <= safety_at:
-            conn.commit()
+            commit_with_timing()
             return with_timing(
                 {
                     "heartbeat": False,
@@ -32729,7 +32743,7 @@ def heartbeat_runtime_mutation_lease(
                 }
             )
         if expiry <= current["expires_at"]:
-            conn.commit()
+            commit_with_timing()
             return with_timing(
                 {
                     "heartbeat": False,
@@ -32749,9 +32763,12 @@ def heartbeat_runtime_mutation_lease(
             """,
             (safety_at, effective_expiry, safety_at, owner, version, safety_at),
         )
+        updated_ns = time.perf_counter_ns()
+        database_ms["update"] = elapsed_ms(read_ns, updated_ns)
         row = conn.execute(
             "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
         ).fetchone()
+        database_ms["readback"] = elapsed_ms(updated_ns, time.perf_counter_ns())
         finished_at = _stability_wall_clock()
         if effective_expiry <= finished_at or current["expires_at"] <= finished_at:
             conn.rollback()
@@ -32762,7 +32779,7 @@ def heartbeat_runtime_mutation_lease(
                     "lease": current,
                 }
             )
-        conn.commit()
+        commit_with_timing()
         finished_at = _stability_wall_clock()
         if effective_expiry <= finished_at or current["expires_at"] <= finished_at:
             return with_timing(

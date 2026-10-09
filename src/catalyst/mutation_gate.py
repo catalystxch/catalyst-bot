@@ -2307,6 +2307,9 @@ class MutationGate:
                                 "connection",
                                 "begin",
                                 "read",
+                                "update",
+                                "readback",
+                                "commit",
                                 "finish",
                                 "close",
                             )
@@ -2317,6 +2320,9 @@ class MutationGate:
                                     "connection",
                                     "begin",
                                     "read",
+                                    "update",
+                                    "readback",
+                                    "commit",
                                     "finish",
                                     "close",
                                 )

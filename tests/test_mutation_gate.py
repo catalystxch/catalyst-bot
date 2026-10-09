@@ -1361,9 +1361,82 @@ def test_slow_heartbeat_connection_reports_database_stage_without_wallet_data(
     assert len(diagnostics) == 1
     stages = diagnostics[0]["attempts"][0]["database_ms"]
     assert stages["connection"] >= 15
-    assert set(stages) == {"connection", "begin", "read", "finish", "close"}
+    assert set(stages) == {
+        "connection",
+        "begin",
+        "read",
+        "update",
+        "readback",
+        "commit",
+        "finish",
+        "close",
+    }
     assert all(type(value) is int and value >= 0 for value in stages.values())
     assert "wallet" not in repr(stages).lower()
+
+
+@pytest.mark.parametrize("slow_stage", ["update", "readback", "commit"])
+def test_slow_heartbeat_finish_identifies_durable_step(
+    isolated_gate_database, monkeypatch, slow_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    class DelayedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if slow_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                time.sleep(0.02)
+            elif slow_stage == "readback" and sql == (
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                # The first SELECT reads the pre-update lease.
+                self.read_count = getattr(self, "read_count", 0) + 1
+                if self.read_count == 2:
+                    time.sleep(0.02)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if slow_stage == "commit":
+                time.sleep(0.02)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: DelayedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    stages = timing["attempts"][0]["database_ms"]
+    assert stages[slow_stage] >= 15
+    assert stages["finish"] >= stages[slow_stage]
 
 
 @pytest.mark.parametrize("delayed_stage", ["begin", "read", "finish", "close"])
@@ -1425,7 +1498,16 @@ def test_slow_heartbeat_database_stage_is_attributed(
     )
     stages = timing["attempts"][0]["database_ms"]
     assert stages[delayed_stage] >= 15
-    assert set(stages) == {"connection", "begin", "read", "finish", "close"}
+    assert set(stages) == {
+        "connection",
+        "begin",
+        "read",
+        "update",
+        "readback",
+        "commit",
+        "finish",
+        "close",
+    }
 
 
 @pytest.mark.parametrize("paused_stage", ["begin", "read", "finish", "close"])
