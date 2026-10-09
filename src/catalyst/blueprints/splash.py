@@ -114,11 +114,19 @@ def api_splash_receive():
         )
         node_action = "error"
 
-    log_event(
-        "info",
-        "splash_receive_toggled",
-        f"Splash listening {'enabled' if enabled else 'disabled'} ({node_action})",
-    )
+    node_failed = node_action in {"start_failed", "restart_failed", "error"}
+    if node_failed:
+        log_event(
+            "warning",
+            "splash_receive_apply_failed",
+            f"Splash listening setting saved but node action failed ({node_action})",
+        )
+    else:
+        log_event(
+            "info",
+            "splash_receive_toggled",
+            f"Splash listening {'enabled' if enabled else 'disabled'} ({node_action})",
+        )
 
     payload = bot.get_splash_receive_stats()
     api_server.events.emit("splash_incoming", payload)
@@ -131,14 +139,18 @@ def api_splash_receive():
         },
     )
 
-    return jsonify(
-        {
-            "success": True,
-            "enabled": enabled,
-            "node_action": node_action,
-            "stats": api_server._serialize_dict(payload),
-        }
-    )
+    response = {
+        "success": not node_failed,
+        "enabled": enabled,
+        "node_action": node_action,
+        "stats": api_server._serialize_dict(payload),
+    }
+    if node_failed:
+        response["error"] = (
+            "Splash listening setting was saved, but the node could not apply it"
+        )
+        return jsonify(response), 503
+    return jsonify(response)
 
 
 @bp.route("/api/splash/node")

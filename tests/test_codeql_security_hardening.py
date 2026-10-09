@@ -921,7 +921,8 @@ def test_splash_receive_node_action_hides_exception_details(monkeypatch):
             environ_base=loopback,
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert resp.get_json()["success"] is False
     assert "secret splash traceback" not in resp.get_data(as_text=True).lower()
 
 
