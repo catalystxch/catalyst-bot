@@ -43,6 +43,12 @@ monitor is in progress; live and final acceptance remain open.
 - The complete serial local Windows backend passed **7,528 tests, 259 skipped,
   and 455 subtests** in 26m59s. Repository-wide Ruff passed. All **11** PR
   checks passed on the evidence-only head `cf8289a7e52665b9ab45b4451dcaf32f709551ec`.
+- The exact-source isolated browser run, `python -m pytest tests/e2e --e2e -q
+  --disable-warnings --tb=short`, passed **258 tests** in 212.81 seconds with
+  exit code 0. It used the test fixture's isolated Flask shell on port 5099
+  and did not operate the original TEST 7 wallet or port 5000. The saved log
+  and exit code are `E:\catalyst-pr220-ce3ba7a-browser-e2e.log` and
+  `E:\catalyst-pr220-ce3ba7a-browser-e2e.exit`.
 - Exact runtime/source commit: `ce3ba7abacfb76fc327964496c7efab671c9af16`;
   test-only child: `1911a06` on draft PR #220. Independent secondary review
   used immutable Git objects and reported no security finding on the preceding
