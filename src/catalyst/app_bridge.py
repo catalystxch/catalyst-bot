@@ -299,16 +299,11 @@ class AppBridge:
     @_safe
     def stop_bot(self, _body=None):
         """Stop the bot loop. Maps to POST /api/bot/stop."""
-        api = self.api
-        bot = api.bot
-        if bot is None:
-            return {"success": False, "error": "Bot not initialized"}
-        bot.stop(wait=False)
-        try:
-            api.events.emit("bot_control", {"action": "stopped"})
-        except Exception:
-            pass
-        return {"status": "stopped"}
+        import api_server
+
+        with api_server.app.test_request_context("/api/bot/stop", method="POST"):
+            resp = api_server.api_bot_stop()
+        return _unwrap_flask_response(resp)
 
     @_safe
     def get_bot_state(self):

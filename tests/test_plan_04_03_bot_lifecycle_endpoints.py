@@ -1418,13 +1418,48 @@ class TestBotStop(_FlaskBase):
             resp = self._post("/api/bot/stop")
         body = resp.get_json()
         self.assertIn("status", body)
-        self.assertEqual(body["status"], "stopped")
+        self.assertEqual(body["status"], "stopping")
 
     def test_stop_calls_bot_stop(self):
         bot = _make_bot(running=True)
         with patch.object(api_server, "bot", bot):
             self._post("/api/bot/stop")
         bot.stop.assert_called_once()
+
+    def test_async_stop_reports_stopping_while_finalizer_is_pending(self):
+        bot = _make_bot(running=True)
+        bot.get_state.return_value = {"running": False, "status": "stopping"}
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.events, "emit") as emit,
+        ):
+            resp = self._post("/api/bot/stop")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "stopping")
+        emit.assert_any_call("bot_control", {"action": "stopping"})
+        self.assertNotIn(
+            (("bot_control", {"action": "stopped"}), {}),
+            [(call.args, call.kwargs) for call in emit.call_args_list],
+        )
+
+    def test_native_async_stop_reports_stopping_while_finalizer_is_pending(self):
+        from app_bridge import AppBridge
+
+        bot = _make_bot(running=True)
+        bot.get_state.return_value = {"running": False, "status": "stopping"}
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.events, "emit") as emit,
+        ):
+            result = AppBridge().stop_bot()
+
+        self.assertEqual(result["status"], "stopping")
+        emit.assert_any_call("bot_control", {"action": "stopping"})
+        self.assertNotIn(
+            (("bot_control", {"action": "stopped"}), {}),
+            [(call.args, call.kwargs) for call in emit.call_args_list],
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1408,6 +1408,65 @@ def test_empty_offers_explains_running_follow_block_and_clears_on_recovery(page)
     expect(empty).to_contain_text("Start the bot")
 
 
+def test_stopping_cycle_is_not_rendered_as_stopped_or_restartable(page):
+    """An in-flight stop keeps the visible state and controls nonterminal."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        updateUI(bot_state);
+    }""")
+
+    expect(page.locator("#statusBadge")).to_contain_text("Stopping")
+    expect(page.locator("#startBtn")).to_be_disabled()
+    expect(page.locator("#stopBtn")).to_be_disabled()
+
+
+def test_stop_fallback_does_not_reenable_button_while_cycle_is_stopping(page):
+    """A slow finalizer must not make Stop look available again at 30 seconds."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate("""async () => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        const originalSetTimeout = window.setTimeout;
+        let restore;
+        window.setTimeout = (callback, delay, ...args) => {
+            if (delay === 30000) {
+                restore = callback;
+                return 12345;
+            }
+            return originalSetTimeout(callback, delay, ...args);
+        };
+        apiFetch = async () => new Response(JSON.stringify({status: 'stopping'}));
+        try {
+            await stopBot();
+            restore();
+            const button = document.getElementById('stopBtn');
+            return {disabled: button.disabled, text: button.textContent};
+        } finally {
+            window.setTimeout = originalSetTimeout;
+        }
+    }""")
+    assert result["disabled"] is True
+    assert "Stopping" in result["text"]
+
+
+def test_stop_control_event_reports_nonterminal_state(page):
+    """The event log must reflect an in-progress stop, not silently drop it."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate("""() => {
+        const entries = [];
+        addLogEntry = (level, message) => entries.push({level, message});
+        handleSSEEvent({type: 'bot_control', data: {action: 'stopping'}});
+        return entries;
+    }""")
+    assert len(result) == 1
+    assert "stopping" in result[0]["message"].lower()
+
+
 def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     """Reload must not paint Follow mode while a durable campaign is active."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

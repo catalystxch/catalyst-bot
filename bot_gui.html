@@ -13974,7 +13974,7 @@
         // -----------------------------------------------------------------
         // V4: Update sidebar status dot to match bot state
         // -----------------------------------------------------------------
-        function v4UpdateSidebarStatus(isRunning, hasError) {
+        function v4UpdateSidebarStatus(isRunning, hasError, status = '') {
             const dot = document.getElementById('v4SidebarDot');
             const label = document.getElementById('v4SidebarStatus');
             if (!dot || !label) return;
@@ -13986,6 +13986,8 @@
             } else if (isRunning) {
                 dot.classList.add('running');
                 label.textContent = 'Running';
+            } else if (status === 'stopping') {
+                label.textContent = 'Stopping';
             } else {
                 dot.classList.add('stopped');
                 label.textContent = 'Idle';
@@ -19158,7 +19160,8 @@
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const hasPair = !!pair.selected;
             const restoredBookIsPrepared = hasResumedLiveBook();
-            return !_resumeSessionNeedsVerification
+            return bot_state?.status !== 'stopping'
+                && !_resumeSessionNeedsVerification
                 && getStartSafetyState().allowed && isSettingsReviewedForCurrentPair()
                 && hasPair
                 && coinPrepStatus !== 'checking'
@@ -24982,6 +24985,7 @@
                 dismissStartupOverlaysForRunningBot();
             }
             const botStatus = data.status || (isRunning ? 'running' : 'stopped');
+            const isStopping = botStatus === 'stopping';
             let badgeText = isRunning ? '● Running' : '◯ Stopped';
             let badgeClass = isRunning ? 'status-running' : 'status-stopped';
             if (botStatus === 'blocked') {
@@ -24993,15 +24997,18 @@
             } else if (botStatus === 'recovering') {
                 badgeText = '● Recovering';
                 badgeClass = 'status-recovering';
+            } else if (isStopping) {
+                badgeText = '◎ Stopping';
+                badgeClass = 'status-starting';
             }
             document.getElementById('statusBadge').textContent = badgeText;
             document.getElementById('statusBadge').className = `status-badge ${badgeClass}`;
             // Enable/disable Live Controls based on bot state
             lcUpdateState(isRunning);
             // Lock settings toggles that shouldn't change while running
-            updateSettingsLocks(isRunning);
+            updateSettingsLocks(isRunning || isStopping);
             // V4: Update sidebar status dot
-            v4UpdateSidebarStatus(isRunning, false);
+            v4UpdateSidebarStatus(isRunning, false, botStatus);
             // Live Activity: pulse indicator
             laUpdatePulse(isRunning);
             v4UpdateHeroStrip(data);
@@ -25036,17 +25043,17 @@
                         startBtn.innerHTML = '● Running';
                     }
                 } else {
-                    startBtn.disabled = !canAttemptBotStart();
-                    startBtn.innerHTML = '▶ Start Bot';
+                    startBtn.disabled = isStopping || !canAttemptBotStart();
+                    startBtn.innerHTML = isStopping ? '◎ Stopping...' : '▶ Start Bot';
                 }
             }
             const stopBtn = document.getElementById('stopBtn');
             stopBtn.disabled = !isRunning;
             if (!isRunning) {
-                stopBtn.textContent = '⏹ Stop';  // Reset from "⏳ Stopping..."
+                stopBtn.textContent = isStopping ? '⏳ Stopping...' : '⏹ Stop';
             }
-            updateCancelAllButtonState(isRunning);
-            updateDataResetButtonState(isRunning);
+            updateCancelAllButtonState(isRunning || isStopping);
+            updateDataResetButtonState(isRunning || isStopping);
             
 
             // Stats
@@ -28554,6 +28561,8 @@
             if (type === 'bot_control' && data) {
                 if (data.action === 'started') {
                     addLogEntry('success', '▶️ Bot started');
+                } else if (data.action === 'stopping') {
+                    addLogEntry('info', '⏳ Bot stopping');
                 } else if (data.action === 'stopped') {
                     addLogEntry('info', '⏹️ Bot stopped');
                 }
@@ -32510,12 +32519,13 @@
                 stopBtn.textContent = '⏳ Stopping...';
                 stopBtn.disabled = true;
             }
-            // Safety fallback: after 30s, restore the button regardless.
-            // The polling loop will flip it back to ▶ Start once bot_state
-            // reports running=false; this prevents an indefinite "Stopping..."
-            // state if that poll is delayed or the request itself hung.
+            // If the request hangs, allow another stop attempt only while the
+            // bot still reports running. A finalizer in progress is not stopped.
             const safetyRestore = setTimeout(() => {
-                if (stopBtn && stopBtn.disabled && stopBtn.textContent === '⏳ Stopping...') {
+                if (bot_state?.status !== 'stopping'
+                        && bot_state?.running
+                        && stopBtn && stopBtn.disabled
+                        && stopBtn.textContent === '⏳ Stopping...') {
                     stopBtn.textContent = '⏹ Stop';
                     stopBtn.disabled = false;
                 }
@@ -32529,7 +32539,7 @@
                 });
                 clearTimeout(timeout);
                 const result = await response.json();
-                // API returns {status: "stopped"} on success, {error: ...} on failure
+                // API returns the observed stop phase or an error.
                 if (result.error) {
                     showToast(formatError(result), 'warning');
                     // Restore button if it was a real error
@@ -32544,8 +32554,7 @@
             } catch (error) {
                 // Server was likely busy — set flag directly and let loop exit naturally
                 showToast('Stop signal sent — bot will stop after current loop finishes', 'info');
-                // Don't clear safetyRestore — let it restore the button after
-                // 30s in case the bot doesn't actually stop.
+                // Keep the fallback for a hung request while the bot is running.
             }
         }
 

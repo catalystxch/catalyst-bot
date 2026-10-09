@@ -60,6 +60,17 @@ def test_start_safety_fresh_allowed_state_keeps_prepared_start_available(page):
     expect(page.locator("#startupReadyCtaBtn")).to_be_enabled()
 
 
+def test_start_remains_disabled_while_previous_bot_cycle_is_stopping(page):
+    _ready_setup(page, "allowed")
+    page.evaluate("""() => {
+        bot_state.status = 'stopping';
+        updateStartupChecklist(bot_state);
+    }""")
+
+    assert page.evaluate("canAttemptBotStart()") is False
+    expect(page.locator("#startupReadyCtaBtn")).to_be_disabled()
+
+
 def test_start_safety_failure_explains_reason_and_does_not_dispatch(page):
     _ready_setup(page)
     result = page.evaluate(

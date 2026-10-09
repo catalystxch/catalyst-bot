@@ -1185,8 +1185,16 @@ def api_bot_stop():
         return jsonify({"error": "Bot not initialised"}), 500
 
     bot.stop(wait=False)
-    server.events.emit("bot_control", {"action": "stopped"})
-    return jsonify({"status": "stopped"})
+    try:
+        state = bot.get_state() or {}
+    except Exception:
+        state = {}
+    # stop(wait=False) only signals the loop. The finalizer may still be
+    # waiting for a wallet operation, so report completion only if the bot
+    # has already published its terminal state.
+    status = "stopped" if state.get("status") == "stopped" else "stopping"
+    server.events.emit("bot_control", {"action": status})
+    return jsonify({"status": status})
 
 
 @bp.route("/api/shutdown", methods=["POST"])

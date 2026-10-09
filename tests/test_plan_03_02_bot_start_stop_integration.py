@@ -12,7 +12,7 @@ Tests the full bot start → stop cycle at the DB + endpoint level:
     - events.emit("bot_control", ...) fires on start and stop.
 
   Bot stop:
-    - /api/bot/stop transitions bot to stopped state.
+    - /api/bot/stop reports the asynchronous stopping phase.
     - DB fills are unaffected by stop.
     - Stopping an already-stopped bot is safe (no crash).
 
@@ -277,14 +277,14 @@ class TestBotStopPreservesFills(_TempDB):
         resp, _ = self._stop(self._make_bot(running=True))
         self.assertEqual(resp.status_code, 200)
 
-    def test_stop_response_has_status_stopped(self):
+    def test_stop_response_has_status_stopping(self):
         resp, _ = self._stop(self._make_bot(running=True))
         body = resp.get_json()
-        self.assertEqual(body.get("status"), "stopped")
+        self.assertEqual(body.get("status"), "stopping")
 
     def test_stop_emits_bot_control_event(self):
         _, mock_events = self._stop(self._make_bot(running=True))
-        mock_events.emit.assert_called_with("bot_control", {"action": "stopped"})
+        mock_events.emit.assert_called_with("bot_control", {"action": "stopping"})
 
     def test_fills_survive_bot_stop(self):
         """Fills inserted before stop are still present after stop."""
