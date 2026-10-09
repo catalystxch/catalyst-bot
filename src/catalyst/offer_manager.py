@@ -3147,6 +3147,27 @@ class OfferManager:
                         "sage_trade_id": trade_id,
                     }
                 )
+                selected_coin = self._normalize_coin_ref(intent.selected_coin_id)
+                if (
+                    verification["verified"] is not True
+                    or verification["selected_present"] is not True
+                    or selected_coin not in verification["locked_coin_ids"]
+                ):
+                    database.finalize_offer_intent(
+                        intent_id=intent.intent_id,
+                        operation_id=intent.operation_id,
+                        event_id=f"{intent.operation_id}:finalized:locked-input-unknown",
+                        lifecycle_state="creation_unknown",
+                        outcome="UNKNOWN",
+                        wallet_identity_json=journal,
+                        evidence_json=evidence,
+                        reason_code="SAGE_SELECTED_INPUT_UNVERIFIED",
+                        finalized_at=finalized_at,
+                        finalize_selected_coin_reservations=True,
+                    )
+                    return self._existing_creation_result(
+                        intent, database.get_offer_intent(intent.intent_id)
+                    )
                 self._offer_creation_crash_boundary("before_trade_id_commit", intent)
                 database.finalize_offer_intent(
                     intent_id=intent.intent_id,

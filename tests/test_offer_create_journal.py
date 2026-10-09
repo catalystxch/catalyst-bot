@@ -2006,6 +2006,69 @@ def test_offer_manager_malformed_or_contradictory_sage_identity_is_unknown(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
 
 
+@pytest.mark.parametrize(
+    "verification",
+    [
+        {
+            "verified": False,
+            "locked_coin_ids": [],
+            "selected_present": False,
+        },
+        {
+            "verified": True,
+            "locked_coin_ids": ["0x" + COIN_B],
+            "selected_present": False,
+        },
+    ],
+    ids=["no_sage_locked_input_evidence", "sage_locked_another_coin"],
+)
+def test_offer_manager_does_not_confirm_creation_without_selected_sage_input(
+    isolated_database,
+    monkeypatch,
+    verification,
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+
+    def effect(*_args, **_kwargs):
+        effects.append(True)
+        return {
+            "success": True,
+            "trade_id": "3" * 64,
+            "offer": VALID_SAGE_OFFER,
+            "_catalyst_effect_attempted": True,
+        }
+
+    begun, _closed = _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    manager = offer_manager.OfferManager()
+    monkeypatch.setattr(
+        manager,
+        "_verify_sage_offer_locked_inputs",
+        lambda *_args, **_kwargs: verification,
+    )
+
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+    )
+
+    intent = database.get_offer_intent(begun[0]["intent_id"])
+    assert result["success"] is False
+    assert result["reason"] == "OFFER_CREATION_RECONCILIATION_REQUIRED"
+    assert effects == [True]
+    assert intent["lifecycle_state"] == "creation_unknown"
+    assert database.get_offer("3" * 64) is None
+    assert database.list_publication_outbox(intent_id=intent["intent_id"]) == []
+    assert (
+        database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
+        == "reserved"
+    )
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+
+
 def test_offer_manager_hostile_success_fields_finalize_unknown_without_raising(
     isolated_database,
     monkeypatch,
@@ -2575,9 +2638,9 @@ def test_offer_manager_concurrent_creation_has_exactly_one_effect_winner(
         monkeypatch.setattr(
             manager,
             "_verify_sage_offer_locked_inputs",
-            lambda *_args, **_kwargs: {
+            lambda _wallet_id, _trade_id, selected_coin_id, **_kwargs: {
                 "verified": True,
-                "locked_coin_ids": ["0x" + COIN_A],
+                "locked_coin_ids": ["0x" + selected_coin_id],
                 "selected_present": True,
             },
         )

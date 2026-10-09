@@ -9125,7 +9125,7 @@ class BotLoop:
             total_offers = len(buy_ids) + len(sell_ids)
             if (
                 total_offers > 0
-                and cfg.DEXIE_AUTO_POST
+                and (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False))
                 and not self._startup_repost_done
             ):
                 self._startup_repost_done = True
@@ -15930,22 +15930,29 @@ class BotLoop:
         total_offers: Optional[int] = None,
     ) -> bool:
         """Run Dexie/Splash visibility confirmation in a background thread."""
-        if not cfg.DEXIE_AUTO_POST:
+        if not (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False)):
             return False
 
         with self._startup_repost_lock:
             if self._startup_repost_thread and self._startup_repost_thread.is_alive():
                 return False
 
+            publisher = (
+                "Dexie and Splash"
+                if cfg.DEXIE_AUTO_POST and getattr(cfg, "SPLASH_ENABLED", False)
+                else "Dexie"
+                if cfg.DEXIE_AUTO_POST
+                else "Splash"
+            )
             if reason == "startup_resume":
                 msg = (
-                    f"Checking {int(total_offers or 0)} existing offers on Dexie in the background "
+                    f"Checking {int(total_offers or 0)} existing offers on {publisher} in the background "
                     "while the bot resumes"
                 )
             elif reason == "connectivity_recovery":
-                msg = "Pricing recovered — checking existing offers on Dexie in the background"
+                msg = f"Pricing recovered — checking existing offers on {publisher} in the background"
             else:
-                msg = "Checking existing offers on Dexie in the background"
+                msg = f"Checking existing offers on {publisher} in the background"
             log_event("info", "dexie_repost_background", msg)
 
             if getattr(cfg, "SPLASH_ENABLED", False):
@@ -15995,7 +16002,7 @@ class BotLoop:
 
         Called on startup and after connectivity recovery.
         """
-        if not cfg.DEXIE_AUTO_POST:
+        if not (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False)):
             return
         if not self._running:
             return
@@ -16138,8 +16145,9 @@ class BotLoop:
                     return False
 
             for trade_id, bech32 in fast_queue:
-                if queue_visibility(self.dexie_manager, bech32, trade_id, "dexie"):
-                    count += 1
+                if cfg.DEXIE_AUTO_POST:
+                    if queue_visibility(self.dexie_manager, bech32, trade_id, "dexie"):
+                        count += 1
                 if getattr(cfg, "SPLASH_ENABLED", False):
                     if queue_visibility(
                         self.splash_manager, bech32, trade_id, "splash"
@@ -16161,7 +16169,7 @@ class BotLoop:
                     try:
                         bech32 = get_offer_bech32(trade_id)
                         if bech32:
-                            if dexie_needed:
+                            if dexie_needed and cfg.DEXIE_AUTO_POST:
                                 if queue_visibility(
                                     self.dexie_manager, bech32, trade_id, "dexie"
                                 ):
@@ -16314,7 +16322,7 @@ class BotLoop:
                     f"{skipped} skipped; peer delivery unverified"
                     + (" in the background" if background else ""),
                 )
-            elif count == 0:
+            elif count == 0 and splash_count == 0 and cfg.DEXIE_AUTO_POST:
                 log_event(
                     "info",
                     "dexie_repost_done",
