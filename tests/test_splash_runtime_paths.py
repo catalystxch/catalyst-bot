@@ -1,5 +1,6 @@
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -285,7 +286,7 @@ def test_splash_node_offer_hook_uses_actual_flask_port(
 
     node = splash_node.SplashNode()
     node._binary_path = "splash.exe"
-    node._kill_stale_process = lambda port: None
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
 
     node._launch_process()
 
@@ -297,6 +298,84 @@ def test_splash_node_offer_hook_uses_actual_flask_port(
         assert "http://localhost:5000/api/splash/incoming" not in captured["cmd"]
     else:
         assert "--offer-hook" not in captured["cmd"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process ownership regression")
+def test_splash_start_does_not_terminate_unowned_listener(monkeypatch):
+    """An occupied submit port is not proof that CATalyst owns its listener."""
+    import splash_node
+    from config import cfg
+
+    commands = []
+    launched = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command[0])
+        if command[0] == "netstat":
+            return SimpleNamespace(
+                stdout="TCP 127.0.0.1:4000 0.0.0.0:0 LISTENING 8888\n"
+            )
+        if command[0] == "wmic":
+            return SimpleNamespace(stdout="Name\nsplash.exe\n")
+        return SimpleNamespace(stdout="")
+
+    class FakeProcess:
+        pid = 9999
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    def fake_popen(command, **_kwargs):
+        launched.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+    monkeypatch.setattr(splash_node.subprocess, "run", fake_run)
+    monkeypatch.setattr(splash_node.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_is_port_in_use", lambda port: port == 4000)
+
+    with pytest.raises(RuntimeError, match="4000"):
+        node._launch_process()
+
+    assert "taskkill" not in commands
+    assert launched == []
+
+
+def test_splash_start_reports_occupied_submit_port_before_starting_thread(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            started_threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_is_port_in_use", lambda port: port == 4000)
+
+    assert node.start() is False
+    assert node.is_running() is False
+    assert started_threads == []
 
 
 def test_splash_output_reader_keeps_reading_lines(monkeypatch):

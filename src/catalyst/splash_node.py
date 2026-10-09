@@ -201,6 +201,14 @@ class SplashNode:
             )
             return False
 
+        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+        port_str = submit_host.rstrip("/").split(":")[-1]
+        submit_port = int(port_str) if port_str.isdigit() else 4000
+        try:
+            self._require_free_submit_port(submit_port)
+        except RuntimeError:
+            return False
+
         self._running = True
         self._restart_count = 0
 
@@ -304,149 +312,12 @@ class SplashNode:
         except Exception:
             return False
 
-    def _kill_stale_process(self, port: int):
-        """Kill any stale Splash process holding our port.
-
-        On Windows, uses netstat + taskkill to find and kill the process
-        bound to the given port. This handles orphan Splash instances
-        left behind from a previous bot run.
-        """
-        if not self._is_port_in_use(port):
-            return  # Port is free, nothing to do
-
-        log_event(
-            "warning",
-            "splash_node_stale",
-            f"Port {port} already in use — killing stale process",
-        )
-
-        if sys.platform == "win32":
-            try:
-                # Find PID using the port via netstat
-                result = subprocess.run(
-                    ["netstat", "-ano"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    **hidden_subprocess_kwargs(),
-                )
-                stale_pid = None
-                for line in result.stdout.splitlines():
-                    # Look for LISTENING on our port
-                    if f":{port}" in line and "LISTENING" in line:
-                        parts = line.split()
-                        if parts:
-                            stale_pid = parts[-1]
-                            break
-
-                if stale_pid and stale_pid.isdigit():
-                    # Verify the process is actually a Splash binary before killing
-                    is_splash = False
-                    try:
-                        name_result = subprocess.run(
-                            [
-                                "wmic",
-                                "process",
-                                "where",
-                                f"ProcessId={stale_pid}",
-                                "get",
-                                "Name",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                            **hidden_subprocess_kwargs(),
-                        )
-                        proc_name = name_result.stdout.lower()
-                        is_splash = "splash" in proc_name
-                    except Exception:
-                        pass  # If we can't verify, don't kill
-                    if not is_splash:
-                        log_event(
-                            "warning",
-                            "splash_node_stale",
-                            f"PID {stale_pid} on port {port} is not a Splash process — skipping kill",
-                        )
-                    else:
-                        log_event(
-                            "info",
-                            "splash_node_stale",
-                            f"Found stale Splash PID {stale_pid} on port {port} — killing",
-                        )
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", stale_pid],
-                            capture_output=True,
-                            timeout=5,
-                            **hidden_subprocess_kwargs(),
-                        )
-                    # Give the OS a moment to release the port
-                    time.sleep(1.5)
-                else:
-                    log_event(
-                        "warning",
-                        "splash_node_stale",
-                        f"Port {port} in use but could not identify PID",
-                    )
-            except Exception as e:
-                log_event(
-                    "warning", "splash_node_stale", f"Failed to kill stale process: {e}"
-                )
-        else:
-            # Unix: use lsof + kill, but verify process name before killing
-            try:
-                result = subprocess.run(
-                    ["lsof", "-ti", f":{port}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                pids = result.stdout.strip().split()
-                killed_any = False
-                for pid in pids:
-                    if not pid.isdigit():
-                        continue
-                    # Verify this is a splash process before killing — /proc
-                    # on Linux, ps fallback elsewhere.
-                    is_splash = False
-                    try:
-                        proc_cmd_path = f"/proc/{pid}/cmdline"
-                        if os.path.exists(proc_cmd_path):
-                            with open(proc_cmd_path, "rb") as _pf:
-                                cmdline = _pf.read().decode("utf-8", errors="replace")
-                            is_splash = "splash" in cmdline.lower()
-                        else:
-                            ps_res = subprocess.run(
-                                ["ps", "-p", pid, "-o", "comm="],
-                                capture_output=True,
-                                text=True,
-                                timeout=3,
-                            )
-                            is_splash = "splash" in (ps_res.stdout or "").lower()
-                    except Exception:
-                        is_splash = False
-
-                    if not is_splash:
-                        log_event(
-                            "warning",
-                            "splash_node_stale",
-                            f"Refusing to kill PID {pid} on port {port} — "
-                            f"not a splash process",
-                        )
-                        continue
-
-                    log_event(
-                        "info",
-                        "splash_node_stale",
-                        f"Killing stale PID {pid} on port {port}",
-                    )
-                    os.kill(int(pid), signal.SIGTERM)
-                    killed_any = True
-                if killed_any:
-                    time.sleep(1.5)
-            except Exception as e:
-                log_event(
-                    "warning", "splash_node_stale", f"Failed to kill stale process: {e}"
-                )
+    def _require_free_submit_port(self, port: int) -> None:
+        """Refuse to replace a listener whose ownership cannot be proven."""
+        if self._is_port_in_use(port):
+            message = f"Splash submission port {port} is already in use"
+            log_event("warning", "splash_node_port_in_use", message)
+            raise RuntimeError(message)
 
     def _launch_process(self):
         """Launch the Splash binary with the correct flags."""
@@ -454,11 +325,12 @@ class SplashNode:
         if not binary:
             raise FileNotFoundError("Splash binary path not set")
 
-        # Kill any stale Splash process from a previous run
+        # Another listener may be an operator-managed Splash node. Never
+        # terminate a process based only on its name and listening port.
         submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
         port_str = submit_host.rstrip("/").split(":")[-1]
         stale_port = int(port_str) if port_str.isdigit() else 4000
-        self._kill_stale_process(stale_port)
+        self._require_free_submit_port(stale_port)
 
         # Build command line
         submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
