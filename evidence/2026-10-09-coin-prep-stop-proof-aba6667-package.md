@@ -79,7 +79,8 @@ Git stores it with LF line endings, while the local PowerShell copy uses CRLF.
 The local source-build manifest hash above is a separate file with the
 unversioned installer name.
 
-This package is not yet the PR #220 candidate. PR integration and CI remain open.
+This source was integrated into draft PR #220 by a non-force fast-forward.
+The exact-source PR CI and original-profile live acceptance remain open.
 Original-profile live testing remains on prior source
 `0534103`; no wallet effect was made for this fix. No 24-hour credit transfers
 between source candidates. PR #220 stays draft.
