@@ -16402,9 +16402,11 @@
         // Lock certain settings toggles while bot is running
         function updateSettingsLocks(isRunning) {
             const lockTargets = [
-                { id: 'configCoinPrepEnabled', lockId: 'coinPrepLock' },
-                { id: 'configSplashEnabled', lockId: 'splashLock' }
+                { id: 'configCoinPrepEnabled', lockId: 'coinPrepLock' }
             ];
+            if (!DEXIE_ONLY_BETA) {
+                lockTargets.push({ id: 'configSplashEnabled', lockId: 'splashLock' });
+            }
             lockTargets.forEach(({ id, lockId }) => {
                 const cb = document.getElementById(id);
                 if (!cb) return;

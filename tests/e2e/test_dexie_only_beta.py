@@ -13,6 +13,10 @@ def test_splash_setting_is_inert_and_not_user_toggleable(app_page):
 
     assert toggle.count() == 1
     assert toggle.is_disabled()
+    app_page.evaluate("updateSettingsLocks(true)")
+    assert app_page.locator("#splashLock").count() == 0
+    app_page.evaluate("updateSettingsLocks(false)")
+    assert toggle.is_disabled()
     assert toggle.get_attribute("type") == "hidden"
     assert (
         app_page.get_by_text(
