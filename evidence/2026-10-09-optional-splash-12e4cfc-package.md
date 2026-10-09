@@ -15,6 +15,10 @@ Exact runtime and package source: `12e4cfc4e8655e5a4b17a6b0126537eb8b0e33cb` on 
 - ZIP, installer, and manifest were independently downloaded by HTTP from immutable artifact commit `231063d00d1c77114e75941a00a40a1d6a5c4728`. Downloaded lengths and SHA-256 hashes matched the local builds and manifest.
 - The saved Splash binary on primary TEST 7 and the independently checked secondary PC had SHA-256 `52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8`, matching the official Splash 0.2.0 AMD64 sidecar. Neither machine had a running Splash daemon during the read-only checks.
 
+### Independent secondary-PC verification
+
+The other PC independently verified the exact `12e4cfc` commit and immutable artifact commit, downloaded the ZIP and installer directly over HTTP and hashed them in memory, and checked the ZIP's 242 safe entries and CRCs. Its embedded executable and UI hashes matched this manifest. It confirmed the installer is unsigned and ran feasible exact-source Splash/default tests: **160 passed with four subtests**; changed-file Ruff passed. Its original Harvestr profile remained read-only with a stopped bot, no pending/fillable offers, and unchanged balances. Available C: space fell from 1.304 GiB to 1.160 GiB, below the 2 GiB staging threshold, so it did not extract, install, build, launch Splash, or start a new stability window. Secondary native/live acceptance remains open.
+
 | Artifact | SHA-256 |
 | --- | --- |
 | `E:\catalyst-splash-12e4cfc-build\dist\Catalyst\Catalyst.exe` | `A53AE21F80A71ABA4CE3BD8E835A9C0A2A17B3059B418B96F401FEA828686363` |
