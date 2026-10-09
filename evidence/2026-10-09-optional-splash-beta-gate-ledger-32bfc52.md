@@ -15,7 +15,7 @@ its title; it is not deployed.
 | Splash optional behavior | Outbound publication and startup failure paths covered by focused/integration tests. The managed submission bind now stays on loopback and does not terminate unowned listeners. Actual remote peer receipt of a real offer remains unverified. | Partial |
 | Primary original TEST 7 profile | Still runs historical `515b41c` package with stopped bot, zero open offers. The exact `32bfc52` package has not run against it. | Open |
 | Primary exact 24-hour window | Read-only exact-PID/hash monitor and auditors are prepared at `E:\catalyst-stability-monitor-32bfc52-prepared` but have not started. Its negative guard rejected historical PID 150240 before writing a trace. The running historical monitor recorded `PROCESS_COUNT_NOT_ONE` at sample 282 (2026-10-09T08:41:27Z), so it is non-clean and cannot count. The transient second process has not been attributed. | Open |
-| Secondary original Harvestr profile | Exact-source static/focused tests and HTTP artifact checks passed. Fresh C: free space was 1,297,870,848 bytes, which is 960,967,250 bytes short of staging ZIP plus extraction while retaining the 2 GiB reserve. The exact package has not been staged or run there. | Open |
+| Secondary original Harvestr profile | Exact-source static/focused tests and HTTP artifact checks passed. A later read-only C: check found 1,517,764,608 bytes free, still 741,073,490 bytes short of staging ZIP plus extraction while retaining the 2 GiB reserve. The exact package has not been staged or run there. | Open |
 | Secondary exact 24-hour window | Historical exact-`196caa8` monitor completed with 755 alert-bearing samples and a 123.162-second gap; it is non-clean. No `32bfc52` window has started. | Open |
 | Live wallet lifecycle/recovery | New campaign/fee scope has no specific approval. No live active-offer publish, fill, requote, cancel/restart/recovery evidence on this candidate. | Open |
 | Full original-profile UI and final review | Not complete on both profiles. | Open |
@@ -44,6 +44,33 @@ binary copies were present on disk (SHA-256
 but none was running. The secondary PC therefore cannot yet witness a remote
 receipt. No daemon, hook server, offer, or wallet action was launched for
 this check, and the earlier blocked daemon-launch decision was preserved.
+
+A further read-only secondary inspection at 2026-10-09T10:04Z identified
+nine old development-only directories (two virtual environments, workspace
+`tmp`, and six generated `dist` trees) totaling 1,188,712,915 logical bytes.
+None matched a running process path or command line. This is an operator
+cleanup proposal only: no file was moved or deleted, the earlier automatic
+cleanup rejection still applies, and logical bytes do not guarantee equal
+NTFS space recovery. The measured shortfall at that checkpoint was
+741,073,490 bytes.
+
+Splash 0.2.0 source and the pinned secondary binary SHA-256
+`52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8`
+support an isolated independent receiver with a loopback-only raw offer hook
+and metrics endpoint, and **no submission endpoint**. The proposed hook and
+metrics ports `14020` and `14021` were free at the read-only snapshot. The
+receiver can join peers through outbound discovery with a loopback P2P bind,
+but that would prove gossip receipt rather than a deterministic direct link.
+For primary-to-secondary direct dialing, its P2P listener would need the
+secondary LAN interface and a narrow inbound firewall rule. The exact
+CATalyst managed sender does not expose `--known-peer`, so a direct link
+without changing the sender would instead require the secondary to dial the
+primary peer, with a narrow primary-side inbound rule and the primary peer ID.
+The PCs are on the same LAN, but neither direction has been configured or
+tested. Historical broad `splash.exe` firewall rules are path-specific and
+are not witness authorization. No listener or rule was created. A raw
+byte-identical offer at this separate hook, with peer and sender evidence,
+remains the required proof.
 
 Before any mainnet wallet action, recheck exact process/path/hash, Sage
 network/fingerprint, wallet ID and asset, balances, pending and open offers,
