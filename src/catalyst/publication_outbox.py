@@ -302,7 +302,13 @@ def classify_provider_result(
                 or (
                     safe_publisher == "splash"
                     and 200 <= status < 300
-                    and reason == "SPLASH_APPLICATION_REJECTED"
+                    and reason
+                    in {
+                        "SPLASH_SEND_FAILED",
+                        "SPLASH_INVALID_OFFER",
+                        "SPLASH_OFFER_TOO_LARGE",
+                        "SPLASH_APPLICATION_REJECTED",
+                    }
                 )
             )
             or type(response_digest) is not str
@@ -320,8 +326,12 @@ def classify_provider_result(
         }
         if (
             status == 429
-            or (status == 400 and reason == "INVALID_OFFER")
-            or (safe_publisher == "splash" and reason == "SPLASH_APPLICATION_REJECTED")
+            or (
+                safe_publisher == "dexie"
+                and status == 400
+                and reason == "INVALID_OFFER"
+            )
+            or (safe_publisher == "splash" and reason == "SPLASH_SEND_FAILED")
         ):
             return PublicationDecision(PublicationState.RETRYABLE, evidence)
         return PublicationDecision(PublicationState.UNRESOLVED, evidence)

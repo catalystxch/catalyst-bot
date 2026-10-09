@@ -312,6 +312,24 @@ def test_provider_result_policy_retries_only_explicit_no_effect(result, expected
     assert decision.state is expected_state
 
 
+def test_splash_http_400_invalid_offer_does_not_retry_the_same_payload():
+    decision = publication_policy.classify_provider_result(
+        publisher="splash",
+        result={
+            "outcome": "no_effect",
+            "provider": "splash",
+            "reason_code": "INVALID_OFFER",
+            "request_sha256": _sha("request"),
+            "response_sha256": _sha("response"),
+            "status_code": 400,
+            "acceptance": False,
+        },
+        expected_idempotency_key="expected-key",
+        expected_request_sha256=_sha("request"),
+    )
+    assert decision.state is PublicationState.UNRESOLVED
+
+
 def test_confirmation_transactionally_enqueues_both_destinations_by_reference(
     isolated_database,
 ):
@@ -2463,7 +2481,7 @@ def test_splash_http_2xx_without_remote_id_is_a_durable_acknowledgement(
     )
 
 
-def test_splash_http_200_application_rejection_is_retryable_not_acknowledged(
+def test_splash_http_200_temporary_send_failure_is_retryable_not_acknowledged(
     isolated_database, monkeypatch
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
@@ -2478,7 +2496,7 @@ def test_splash_http_200_application_rejection_is_retryable_not_acknowledged(
         lease_expires_provider=lambda _now: LEASE_END,
     )
     response = _TransportResponse(
-        200, {"success": False, "error": "Invalid offer format"}
+        200, {"success": False, "error": "Failed to send offer to network"}
     )
     calls = []
 
@@ -2498,6 +2516,48 @@ def test_splash_http_200_application_rejection_is_retryable_not_acknowledged(
     assert result["requeued"] == 1
     assert row["state"] == "retryable"
     assert row["acknowledgement_json"] is None
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        "Invalid offer format",
+        "Invalid offer format: not a valid bech32 string",
+        "Offer exceeds maximum size of 307200 bytes",
+        "Unexpected local node rejection",
+    ],
+)
+def test_splash_permanent_or_unknown_rejection_requires_review_without_redispatch(
+    isolated_database, monkeypatch, provider_error
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash-invalid",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    calls = []
+
+    def rejected_by_local_node(url, **kwargs):
+        calls.append((url, kwargs))
+        return _TransportResponse(200, {"success": False, "error": provider_error})
+
+    monkeypatch.setattr(splash_manager.requests, "post", rejected_by_local_node)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+    assert result["posted"] == 0
+    assert result["requeued"] == 0
+    assert row["state"] == "unresolved"
+    assert row["acknowledgement_json"] is None
+    manager.flush_queue()
+    assert len(calls) == 1
 
 
 def test_splash_legacy_post_does_not_accept_http_200_application_rejection(

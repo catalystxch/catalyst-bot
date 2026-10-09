@@ -544,6 +544,19 @@ class SplashManager:
                     except Exception:
                         data = None
                     if type(data) is dict and data.get("success") is False:
+                        error = data.get("error")
+                        if error == "Failed to send offer to network":
+                            reason = "SPLASH_SEND_FAILED"
+                        elif type(error) is str and error.startswith(
+                            "Invalid offer format"
+                        ):
+                            reason = "SPLASH_INVALID_OFFER"
+                        elif type(error) is str and error.startswith(
+                            "Offer exceeds maximum size"
+                        ):
+                            reason = "SPLASH_OFFER_TOO_LARGE"
+                        else:
+                            reason = "SPLASH_APPLICATION_REJECTED"
                         return {
                             "outcome": "no_effect",
                             "acceptance": False,
@@ -551,7 +564,7 @@ class SplashManager:
                             "request_sha256": request_digest,
                             "response_sha256": response_digest,
                             "status_code": r.status_code,
-                            "reason_code": "SPLASH_APPLICATION_REJECTED",
+                            "reason_code": reason,
                         }
                     if type(data) is not dict or data.get("success") is not True:
                         return {
