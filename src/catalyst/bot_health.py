@@ -1444,9 +1444,10 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
             title="Splash daemon has no peers",
             message=(
                 "Splash is running but not connected to any P2P peers. "
-                "Check that your firewall/router allows inbound TCP on "
-                f"port {getattr(cfg, 'SPLASH_P2P_PORT', 11511)}. Without "
-                "peers the bot can't relay offers over the Splash network."
+                "Check network connectivity, peer discovery, and firewall "
+                "settings for the Splash P2P port "
+                f"{getattr(cfg, 'SPLASH_P2P_PORT', 11511)}. Without peers "
+                "the bot can't relay offers over the Splash network."
             ),
             severity="warning",
         )
