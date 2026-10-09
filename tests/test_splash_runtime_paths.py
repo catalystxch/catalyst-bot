@@ -378,6 +378,70 @@ def test_splash_start_reports_occupied_submit_port_before_starting_thread(monkey
     assert started_threads == []
 
 
+@pytest.mark.parametrize("submit_url", ["http://192.0.2.9:4000", "http://0.0.0.0:4000"])
+def test_managed_splash_refuses_non_loopback_submit_bind(monkeypatch, submit_url):
+    import splash_node
+    from config import cfg
+
+    launched = []
+
+    class FakeProcess:
+        pid = 9999
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    def fake_popen(command, **_kwargs):
+        launched.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", submit_url)
+    monkeypatch.setattr(splash_node.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
+
+    with pytest.raises(ValueError, match="loopback"):
+        node._launch_process()
+
+    assert launched == []
+
+
+def test_splash_start_reports_non_loopback_submit_url_without_thread(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            started_threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://192.0.2.9:4000")
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
+
+    assert node.start() is False
+    assert node.is_running() is False
+    assert started_threads == []
+
+
 def test_splash_output_reader_keeps_reading_lines(monkeypatch):
     import splash_node
 

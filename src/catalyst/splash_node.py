@@ -1,14 +1,14 @@
 """Auto-launch and monitor the Splash P2P binary as a managed subprocess
 
 Owns the lifecycle of the Splash P2P node that broadcasts and receives
-offers across the Chia ecosystem. Discovers the executable, clears any
-stale processes holding the target port, starts Splash with the correct
+offers across the Chia ecosystem. Discovers the executable, refuses
+unowned listeners on the target port, starts Splash with the correct
 CLI flags, captures stdout for status, and restarts on crash up to a
 configured maximum.
 
 Key responsibilities:
     - Locate splash.exe (configured path, user data dir, bundled path, or PATH)
-    - Clean stale listeners on the submission port (default 4000)
+    - Require a free loopback submission port (default 4000)
     - Launch as a hidden subprocess and pipe stdout into logs
     - Health/status reporting and crash-restart up to a max count
 
@@ -201,11 +201,12 @@ class SplashNode:
             )
             return False
 
-        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
-        port_str = submit_host.rstrip("/").split(":")[-1]
-        submit_port = int(port_str) if port_str.isdigit() else 4000
         try:
+            submit_port = self._managed_submit_port()
             self._require_free_submit_port(submit_port)
+        except ValueError as exc:
+            log_event("warning", "splash_node_invalid_submit_url", str(exc))
+            return False
         except RuntimeError:
             return False
 
@@ -312,6 +313,32 @@ class SplashNode:
         except Exception:
             return False
 
+    @staticmethod
+    def _managed_submit_port() -> int:
+        """Accept only an explicit loopback HTTP endpoint for the managed node."""
+        submit_url = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+        parsed = urlsplit(str(submit_url))
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "Managed Splash submission URL needs a valid loopback port"
+            ) from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"localhost", "127.0.0.1"}
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "Managed Splash submission URL must be loopback HTTP with an explicit port"
+            )
+        return port
+
     def _require_free_submit_port(self, port: int) -> None:
         """Refuse to replace a listener whose ownership cannot be proven."""
         if self._is_port_in_use(port):
@@ -327,20 +354,11 @@ class SplashNode:
 
         # Another listener may be an operator-managed Splash node. Never
         # terminate a process based only on its name and listening port.
-        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
-        port_str = submit_host.rstrip("/").split(":")[-1]
-        stale_port = int(port_str) if port_str.isdigit() else 4000
-        self._require_free_submit_port(stale_port)
+        submit_port = self._managed_submit_port()
+        self._require_free_submit_port(submit_port)
 
         # Build command line
-        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
-        # Extract host:port from URL (e.g., "http://localhost:4000" → "127.0.0.1:4000")
-        submit_bind = submit_host.replace("http://", "").replace("https://", "")
-        # Bind to loopback only — never expose offer submission to the network
-        if submit_bind.startswith("localhost"):
-            submit_bind = submit_bind.replace("localhost", "127.0.0.1")
-        elif submit_bind.startswith("0.0.0.0"):
-            submit_bind = submit_bind.replace("0.0.0.0", "127.0.0.1")
+        submit_bind = f"127.0.0.1:{submit_port}"
 
         # P2P listen port (optional)
         p2p_port = getattr(cfg, "SPLASH_P2P_PORT", 11511)
