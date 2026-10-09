@@ -20,6 +20,22 @@ its title; it is not deployed.
 | Live wallet lifecycle/recovery | New campaign/fee scope has no specific approval. No live active-offer publish, fill, requote, cancel/restart/recovery evidence on this candidate. | Open |
 | Full original-profile UI and final review | Not complete on both profiles. | Open |
 
+## Splash peer-delivery proof
+
+The [upstream Splash README](https://github.com/dexie-space/splash#splash-indexing)
+says the node forwards offers rather than indexing or storing them, and
+documents an independent `--offer-hook` receiver. For the live gate, record
+the exact active signed offer and its hash, the CATalyst-to-local-Splash
+submission acknowledgement, connected-peer evidence, and receipt of that
+same offer at a separately controlled Splash peer's hook. Reconcile the
+offer with Sage and CATalyst's durable publication row, and preserve the
+receiver's raw timestamped evidence. The test must distinguish that receipt
+from any parallel Dexie publication of the same offer. A local 2xx response,
+a local broadcast counter, or Dexie visibility alone cannot prove remote
+Splash receipt.
+This protocol is prepared only; no active offer or independent receiver has
+been exercised on `32bfc52`.
+
 Before any mainnet wallet action, recheck exact process/path/hash, Sage
 network/fingerprint, wallet ID and asset, balances, pending and open offers,
 safety, campaign and fee ledger. The prior campaign and its old approval do
