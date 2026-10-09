@@ -16074,6 +16074,8 @@ class BotLoop:
             skip_count = 0
             fast_queue = []  # Have bech32 in DB, just need to post to Dexie
             slow_queue = []  # Missing bech32, need wallet RPC
+            splash_only_fast = []  # Already on Dexie, still eligible for Splash
+            splash_only_slow = []
 
             for offer in db_offers:
                 trade_id = offer.get("trade_id", "")
@@ -16092,6 +16094,11 @@ class BotLoop:
                             self.dexie_manager._posted_fingerprints.add(
                                 self.dexie_manager._fingerprint(bech32)
                             )
+                    if getattr(cfg, "SPLASH_ENABLED", False):
+                        if bech32:
+                            splash_only_fast.append((trade_id, bech32))
+                        else:
+                            splash_only_slow.append(trade_id)
                     continue
 
                 if bech32:
@@ -16139,18 +16146,26 @@ class BotLoop:
                     ):
                         splash_count += 1
 
+            for trade_id, bech32 in splash_only_fast:
+                if queue_visibility(self.splash_manager, bech32, trade_id, "splash"):
+                    splash_count += 1
+
             # Slow path: fetch bech32 from wallet RPC for offers without it
-            if slow_queue:
+            if slow_queue or splash_only_slow:
                 from wallet import get_offer_bech32
 
-                for trade_id in slow_queue:
+                for trade_id, dexie_needed in [
+                    *((trade_id, True) for trade_id in slow_queue),
+                    *((trade_id, False) for trade_id in splash_only_slow),
+                ]:
                     try:
                         bech32 = get_offer_bech32(trade_id)
                         if bech32:
-                            if queue_visibility(
-                                self.dexie_manager, bech32, trade_id, "dexie"
-                            ):
-                                count += 1
+                            if dexie_needed:
+                                if queue_visibility(
+                                    self.dexie_manager, bech32, trade_id, "dexie"
+                                ):
+                                    count += 1
                             if getattr(cfg, "SPLASH_ENABLED", False):
                                 if queue_visibility(
                                     self.splash_manager, bech32, trade_id, "splash"

@@ -1,5 +1,6 @@
 """Repost status must reflect each publisher's actual response."""
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -154,3 +155,60 @@ def test_failed_dexie_repost_does_not_block_independent_splash(
     assert len(splash_flushes) == int(splash_enabled)
     if splash_enabled:
         assert any(event == "splash_repost_done" for _, event, _, _ in events)
+
+
+@pytest.mark.parametrize("stored_bech32", [True, False])
+def test_dexie_mapped_open_offer_is_still_submitted_to_splash(
+    monkeypatch, stored_bech32
+):
+    dexie_queued = []
+    splash_queued = []
+    splash_flushes = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet_with_meta=lambda: (
+            ([{"trade_id": "offer-trade", "side": "buy"}], [], []),
+            {"fresh": True, "using_cache": False},
+        )
+    )
+    loop.dexie_manager = SimpleNamespace(
+        _lock=threading.Lock(),
+        _posted_fingerprints=set(),
+        _fingerprint=lambda _offer: "fingerprint",
+        queue_post=lambda *_args, **_kwargs: dexie_queued.append(True),
+        flush_queue=lambda **_kwargs: {"posted": 0, "failed": 0, "skipped": 0},
+    )
+
+    def flush_splash(**_kwargs):
+        splash_flushes.append(True)
+        return {"posted": 1, "failed": 0, "skipped": 0, "requeued": 0}
+
+    loop.splash_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: splash_queued.append(True),
+        flush_queue=flush_splash,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "a" * 64)
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "offer-trade",
+                "side": "buy",
+                "offer_bech32": "offer1example" if stored_bech32 else None,
+                "dexie_id": "dexie-123",
+            }
+        ],
+    )
+    monkeypatch.setattr("wallet.get_offer_bech32", lambda _trade_id: "offer1example")
+    monkeypatch.setattr(database, "update_offer_bech32", lambda *_args: None)
+    monkeypatch.setattr(bot_loop, "log_event", lambda *_args, **_kwargs: None)
+
+    assert loop._repost_active_offers_to_dexie(reason="startup_resume") is not False
+    assert not dexie_queued
+    assert splash_queued == [True]
+    assert splash_flushes == [True]
