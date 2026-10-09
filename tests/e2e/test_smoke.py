@@ -1421,6 +1421,7 @@ def test_stopping_cycle_is_not_rendered_as_stopped_or_restartable(page):
     expect(page.locator("#statusBadge")).to_contain_text("Stopping")
     expect(page.locator("#startBtn")).to_be_disabled()
     expect(page.locator("#stopBtn")).to_be_disabled()
+    expect(page.locator("#startupGuide")).to_have_class(re.compile("dashboard-section-hidden"))
 
 
 def test_stop_fallback_does_not_reenable_button_while_cycle_is_stopping(page):

@@ -19336,7 +19336,8 @@
 
         function updateDashboardStartupLayout(data = bot_state) {
             const isRunning = !!(data && data.running);
-            const showLiveDashboard = isRunning || _botStarting;
+            const isStopping = data?.status === 'stopping';
+            const showLiveDashboard = isRunning || isStopping || _botStarting;
             // #liveControls moved to Settings → Live sub-tab (2026-04-22),
             // so it's no longer part of the dashboard's running/idle toggle set.
             ['heroStrip', 'marketStrip', 'dashboardActivityRow', 'dashboardAdvisorRow', 'activeFeaturesBar'].forEach((id) => {
