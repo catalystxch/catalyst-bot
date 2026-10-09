@@ -974,7 +974,7 @@ class Config:
         except (ValueError, TypeError):
             self.SPLASH_POST_RETRY_SLEEP = 1.5
         self.SPLASH_RECEIVE_ENABLED = (
-            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_RECEIVE_ENABLED", True)
+            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_RECEIVE_ENABLED", False)
         )
         self.SPLASH_RECEIVE_POLL_SECS = _int("SPLASH_RECEIVE_POLL_SECS", 5)
         self.SPLASH_RECEIVE_BATCH_SIZE = _int("SPLASH_RECEIVE_BATCH_SIZE", 10)
