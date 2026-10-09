@@ -43,7 +43,6 @@ jobs:
           persist-credentials: false
 
       - name: Run Gitleaks
-        # Official v8.30.1 GHCR image; avoids Docker Hub's anonymous pull limit.
-        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        uses: docker://zricethezav/gitleaks:v8.30.1
         with:
           args: detect --source=/github/workspace --no-banner --redact --exit-code=1 --verbose
