@@ -247,6 +247,7 @@ class _TempDB(unittest.TestCase):
     def _make_bot(self):
         bot = MagicMock()
         bot.is_running.return_value = False
+        bot.get_state.return_value = {"status": "stopped"}
         bot.stop = MagicMock()
         bot.coin_manager._prep_process = None
         bot.coin_manager._prep_running = False
@@ -378,6 +379,7 @@ class TestCoinPrepFullCycle(_TempDB):
     def test_trigger_rechecks_wallet_book_after_stopping_live_bot(self):
         bot = self._make_bot()
         bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = True
         appeared = {
             "complete": True,
             "open_offer_count": 1,

@@ -1280,7 +1280,7 @@ def api_coin_topup():
         return jsonify({"error": "Bot not initialised"}), 500
 
     # Block if bot is live — topup splits coins and races with offer creation
-    if bot.is_running():
+    if bot.is_running() or bot.get_state().get("status") != "stopped":
         return jsonify(
             {
                 "error": "Stop the bot before manual top-up. "
@@ -1304,7 +1304,7 @@ def api_coin_prep():
         return jsonify({"error": "Bot not initialised"}), 500
 
     # Block if bot is live — coin prep splits/combines and races with offer creation
-    if bot.is_running():
+    if bot.is_running() or bot.get_state().get("status") != "stopped":
         return jsonify(
             {
                 "error": "Stop the bot before manual coin prep. "
@@ -2729,9 +2729,15 @@ def _api_coin_prep_trigger_locked():
                 423,
             )
 
-        if bot and bot.is_running():
-            bot.stop(wait=True)
-            if bot.is_running():
+        if bot:
+            was_running = bot.is_running()
+            stop_completed = bot.stop(wait=True) is True if was_running else True
+            bot_stopped = (
+                stop_completed
+                and not bot.is_running()
+                and bot.get_state().get("status") == "stopped"
+            )
+            if not bot_stopped:
                 return (
                     jsonify(
                         {
@@ -2746,14 +2752,15 @@ def _api_coin_prep_trigger_locked():
                     ),
                     503,
                 )
-            log_event(
-                "info",
-                "coin_prep_bot_stopped",
-                "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
-            )
-            api_server.events.emit(
-                "bot_control", {"action": "stopped", "reason": "coin_prep"}
-            )
+            if was_running:
+                log_event(
+                    "info",
+                    "coin_prep_bot_stopped",
+                    "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
+                )
+                api_server.events.emit(
+                    "bot_control", {"action": "stopped", "reason": "coin_prep"}
+                )
 
         # If a previous worker is still running, kill it first.
         # Two workers operating on the same wallet simultaneously causes

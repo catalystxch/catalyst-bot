@@ -1465,6 +1465,8 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_stops_bot_if_running(self):
         bot = MagicMock()
         bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = True
+        bot.get_state.return_value = {"status": "stopped"}
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -1475,6 +1477,65 @@ class TestCoinPrepTrigger(_FlaskBase):
             mock_thread.return_value.start = MagicMock()
             self._post("/api/coin-prep/trigger")
         bot.stop.assert_called_once_with(wait=True)
+
+    def test_incomplete_bot_stop_blocks_coin_prep_worker(self):
+        bot = MagicMock()
+        bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = False
+        bot.get_state.return_value = {"status": "stopping"}
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ) as mock_reset,
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "coin_prep_bot_stop_incomplete")
+        bot.stop.assert_called_once_with(wait=True)
+        mock_reset.assert_not_called()
+        mock_thread.assert_not_called()
+
+    def test_already_stopping_bot_blocks_coin_prep_worker(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.get_state.return_value = {"status": "stopping"}
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ) as mock_reset,
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "coin_prep_bot_stop_incomplete")
+        bot.stop.assert_not_called()
+        mock_reset.assert_not_called()
+        mock_thread.assert_not_called()
+
+    def test_manual_topup_blocks_while_bot_is_stopping(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.get_state.return_value = {"status": "stopping"}
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/coins/topup")
+
+        self.assertEqual(resp.status_code, 409)
+        bot.coin_manager.start_topup.assert_not_called()
+
+    def test_manual_coin_prep_blocks_while_bot_is_stopping(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.get_state.return_value = {"status": "stopping"}
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/coins/prep", {"fee_approval_id": "a" * 64})
+
+        self.assertEqual(resp.status_code, 409)
+        bot.coin_manager.start_coin_prep.assert_not_called()
 
     def test_duplicate_trigger_does_not_start_second_worker(self):
         with (
