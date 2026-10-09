@@ -17633,6 +17633,21 @@ class BotLoop:
     # State queries (for API/GUI)
     # -------------------------------------------------------------------
 
+    def stop_retry_available(self) -> bool:
+        """Allow another stop request only after an incomplete finalizer exits."""
+        with self._state_lock:
+            stopping = self._bot_state.get("status") == "stopping"
+        if not stopping or self._running:
+            return False
+        finalizer = getattr(self, "_stop_finalize_thread", None)
+        if finalizer is not None:
+            try:
+                if finalizer.is_alive():
+                    return False
+            except Exception:
+                return False
+        return True
+
     def get_state(self) -> Dict:
         """Get full bot state for the GUI/API."""
         # Guard: if __init__ hasn't finished, return minimal state to avoid
@@ -17642,6 +17657,7 @@ class BotLoop:
                 return dict(self._bot_state)
         with self._state_lock:
             state = dict(self._bot_state)
+        state["stop_retry_available"] = self.stop_retry_available()
         state["loop_duration"] = round(self._last_loop_duration, 2)
         state["loop_seconds"] = cfg.LOOP_SECONDS
         state["dry_run"] = cfg.DRY_RUN

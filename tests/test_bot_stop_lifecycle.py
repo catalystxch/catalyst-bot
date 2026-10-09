@@ -220,3 +220,27 @@ def test_sync_stop_stays_incomplete_when_splash_manager_survives(monkeypatch):
     assert loop.stop(wait=True) is False
     assert states[-1]["status"] == "stopping"
     assert "bot_stopped" not in events
+
+
+def test_stopping_bot_exposes_retry_only_after_failed_finalizer_exits():
+    """A finished failed stop must be retryable without reopening Start."""
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = False
+    loop._state_lock = threading.Lock()
+    loop._bot_state = {"running": False, "status": "stopping"}
+
+    class Finalizer:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+    finalizer = Finalizer()
+    loop._stop_finalize_thread = finalizer
+
+    assert hasattr(loop, "stop_retry_available")
+    assert loop.stop_retry_available() is False
+    finalizer.alive = False
+    assert loop.stop_retry_available() is True
+    loop._bot_state["status"] = "stopped"
+    assert loop.stop_retry_available() is False

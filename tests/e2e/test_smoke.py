@@ -1426,6 +1426,32 @@ def test_stopping_cycle_is_not_rendered_as_stopped_or_restartable(page):
     )
 
 
+def test_failed_stop_can_be_retried_from_dashboard_without_enabling_start(page):
+    """A terminal stop finalizer failure must leave a usable retry control."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        bot_state.stop_retry_available = true;
+        updateUI(bot_state);
+    }""")
+
+    expect(page.locator("#startBtn")).to_be_disabled()
+    expect(page.locator("#stopBtn")).to_be_enabled()
+    expect(page.locator("#stopBtn")).to_contain_text("Retry")
+    called = page.evaluate("""async () => {
+        const calls = [];
+        apiFetch = async path => {
+            calls.push(path);
+            return new Response(JSON.stringify({status: 'stopping'}));
+        };
+        await stopBot();
+        return calls;
+    }""")
+    assert called == ["/api/bot/stop"]
+
+
 def test_stop_fallback_does_not_reenable_button_while_cycle_is_stopping(page):
     """A slow finalizer must not make Stop look available again at 30 seconds."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

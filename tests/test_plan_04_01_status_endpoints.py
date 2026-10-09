@@ -507,6 +507,25 @@ class TestStatusEndpointSmoke(_FlaskBase):
         get_spendable_coin_count.assert_not_called()
         get_wallet_balance.assert_not_called()
 
+    def test_status_poll_preserves_incomplete_stop_and_retry_authority(self):
+        """Dashboard polling must not turn a failed stop into Stopped."""
+        stopping_bot = _fake_bot_stopped()
+        state = stopping_bot.get_state()
+        state.update(status="stopping", stop_retry_available=True)
+        stopping_bot.get_state = lambda: state
+
+        with (
+            patch.object(api_server, "bot", stopping_bot),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_events_since", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "stopping")
+        self.assertIs(resp.get_json()["stop_retry_available"], True)
+
     def test_stopped_status_reuses_one_bot_state_snapshot(self):
         stopped_bot = _fake_bot_stopped()
         original_get_state = stopped_bot.get_state

@@ -2530,6 +2530,9 @@ def api_status():
         # --- Assemble response ---
         result = {
             "running": raw.get("running", False),
+            "status": raw.get("status")
+            or ("running" if raw.get("running", False) else "stopped"),
+            "stop_retry_available": raw.get("stop_retry_available") is True,
             "runtime_safety": _runtime_safety_for_status(),
             "stats": stats_out,
             "balances": balances_out,

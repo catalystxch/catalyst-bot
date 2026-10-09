@@ -25051,9 +25051,11 @@
                 }
             }
             const stopBtn = document.getElementById('stopBtn');
-            stopBtn.disabled = !isRunning;
+            const stopRetryAvailable = isStopping && data.stop_retry_available === true;
+            stopBtn.disabled = !isRunning && !stopRetryAvailable;
             if (!isRunning) {
-                stopBtn.textContent = isStopping ? '⏳ Stopping...' : '⏹ Stop';
+                stopBtn.textContent = stopRetryAvailable ? '⏹ Retry Stop'
+                    : isStopping ? '⏳ Stopping...' : '⏹ Stop';
             }
             updateCancelAllButtonState(isRunning || isStopping);
             updateDataResetButtonState(isRunning || isStopping);
