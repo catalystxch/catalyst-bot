@@ -282,6 +282,8 @@ def test_sage_cert_candidates_accepts_configured_data_dir(tmp_path):
 class _StartableBot:
     def __init__(self):
         self.started = False
+        self.coin_manager = MagicMock()
+        self.coin_manager.is_busy.return_value = False
         self.offer_manager = MagicMock()
         self.offer_manager.sync_from_wallet.return_value = ([], [], [])
         self.offer_manager.get_wallet_sync_meta.return_value = {

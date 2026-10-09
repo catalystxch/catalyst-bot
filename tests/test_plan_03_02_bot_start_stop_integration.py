@@ -127,6 +127,7 @@ class _TempDB(unittest.TestCase):
         )
         bot.is_running.return_value = running
         bot.start.return_value = True
+        bot.coin_manager.is_busy.return_value = False
         bot.get_state.return_value = {"status": "running"}
         bot.market_intel.reset_session_stats = MagicMock()
         bot.splash_manager.reset_session_stats = MagicMock()

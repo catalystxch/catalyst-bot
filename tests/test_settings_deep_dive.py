@@ -295,6 +295,7 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     )
     fake_bot.is_running.return_value = False
     fake_bot.start.return_value = True
+    fake_bot.coin_manager.is_busy.return_value = False
 
     fake_cfg = types.SimpleNamespace(
         reload=MagicMock(),

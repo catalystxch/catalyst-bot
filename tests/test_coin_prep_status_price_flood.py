@@ -217,6 +217,8 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         def __init__(self):
             self.price_engine = price_engine
             self.started = False
+            self.coin_manager = MagicMock()
+            self.coin_manager.is_busy.return_value = False
             self.offer_manager = MagicMock()
             self.offer_manager.sync_from_wallet.return_value = ([], [], [])
             self.offer_manager.get_wallet_sync_meta.return_value = {

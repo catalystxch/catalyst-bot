@@ -459,6 +459,7 @@ class TestStartupPhase6BotStartValidation(_TempDB):
             )
             bot.is_running.return_value = False
             bot.start.return_value = True
+            bot.coin_manager.is_busy.return_value = False
             bot.market_intel.reset_session_stats = MagicMock()
             bot.splash_manager.reset_session_stats = MagicMock()
             bot.get_splash_receive_stats.return_value = {}
