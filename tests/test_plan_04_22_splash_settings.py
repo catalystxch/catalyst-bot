@@ -201,6 +201,21 @@ class TestSplashNode(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestSplashNodeStart(_FlaskBase):
+    def test_outbound_node_start_does_not_enable_inbound_listener(self):
+        bot = _make_bot()
+        update = MagicMock()
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "DEXIE_ONLY_BETA", False, create=True),
+            patch.object(api_server.cfg, "SPLASH_RECEIVE_ENABLED", False),
+            patch.object(api_server.cfg, "update", update),
+        ):
+            resp = self._post("/api/splash/node/start")
+
+        self.assertEqual(resp.status_code, 200)
+        bot.splash_node.start.assert_called_once_with()
+        update.assert_not_called()
+
     def test_requires_token(self):
         resp = self._post("/api/splash/node/start", auth=False)
         self.assertEqual(resp.status_code, 401)

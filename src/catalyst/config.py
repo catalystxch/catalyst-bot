@@ -24,9 +24,9 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values, load_dotenv, set_key
 
 
-# v1.4 beta is intentionally Dexie-only. Keep this as a release invariant,
-# rather than a user setting, so legacy profiles cannot reactivate Splash.
-DEXIE_ONLY_BETA = True
+# Splash remains an optional publication path in this beta. The release fence
+# can still be enabled to fail closed if a future package excludes that path.
+DEXIE_ONLY_BETA = False
 _DEXIE_ONLY_BETA_LOCKED_KEYS = frozenset({"SPLASH_ENABLED", "SPLASH_RECEIVE_ENABLED"})
 
 
@@ -961,7 +961,7 @@ class Config:
         self.COMPETITOR_AWARE_ENABLED = _bool("COMPETITOR_AWARE_ENABLED", False)
         self.DBX_MAX_SPREAD_BPS = _decimal("DBX_MAX_SPREAD_BPS", "500")
 
-        # ----- Splash Network (disabled for the Dexie-only v1.4 beta) -----
+        # ----- Splash Network (optional decentralized offer broadcasting) -----
         self.DEXIE_ONLY_BETA = DEXIE_ONLY_BETA
         self.SPLASH_ENABLED = (
             False if self.DEXIE_ONLY_BETA else _bool("SPLASH_ENABLED", False)

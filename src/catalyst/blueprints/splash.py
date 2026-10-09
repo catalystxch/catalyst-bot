@@ -157,13 +157,6 @@ def api_splash_node_start():
         return jsonify({"error": "Bot not initialised"}), 500
 
     try:
-        if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
-            cfg.update("SPLASH_RECEIVE_ENABLED", "true")
-            log_event(
-                "info",
-                "splash_receive_startup_default",
-                "Splash incoming listener enabled by default for node startup",
-            )
         started = bot.splash_node.start()
         status = bot.splash_node.get_status()
         return jsonify(

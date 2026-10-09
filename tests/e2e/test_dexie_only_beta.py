@@ -1,6 +1,4 @@
-"""Browser regressions for the v1.4 Dexie-only beta surface."""
-
-import re
+"""Browser regressions for optional Splash publication and startup."""
 
 import pytest
 
@@ -8,26 +6,26 @@ import pytest
 pytestmark = pytest.mark.e2e
 
 
-def test_splash_setting_is_inert_and_not_user_toggleable(app_page):
+def test_optional_splash_setting_and_status_are_available(app_page):
     toggle = app_page.locator("#configSplashEnabled")
 
     assert toggle.count() == 1
-    assert toggle.is_disabled()
+    assert toggle.get_attribute("type") == "checkbox"
+    assert not toggle.is_disabled()
+    app_page.evaluate("v4SwitchView('intel')")
+    assert app_page.locator("#splashNetworkCard").is_visible()
     app_page.evaluate("updateSettingsLocks(true)")
-    assert app_page.locator("#splashLock").count() == 0
-    app_page.evaluate("updateSettingsLocks(false)")
     assert toggle.is_disabled()
-    assert toggle.get_attribute("type") == "hidden"
-    assert (
-        app_page.get_by_text(
-            re.compile("Dexie-only beta.*Splash P2P is unavailable", re.I)
-        ).count()
-        == 1
+    assert app_page.locator("#splashLock").count() == 1
+    app_page.evaluate("updateSettingsLocks(false)")
+    assert not toggle.is_disabled()
+
+
+def test_splash_startup_gate_checks_node_before_continuing(app_page):
+    app_page.route(
+        "**/api/config",
+        lambda route: route.fulfill(status=200, json={"SPLASH_ENABLED": True}),
     )
-    assert app_page.locator("#splashNetworkCard").is_hidden()
-
-
-def test_splash_startup_gate_makes_no_api_request_in_dexie_only_beta(app_page):
     splash_requests = []
     app_page.on(
         "request",
@@ -38,18 +36,58 @@ def test_splash_startup_gate_makes_no_api_request_in_dexie_only_beta(app_page):
         ),
     )
 
-    app_page.evaluate(
-        """async () => {
-            await splashGateBegin();
-            await toggleSplashListening();
-            await setupSplashNode();
-            await splashGateInstall();
-            await splashGateStart();
-            await checkSplashInstalled();
-            await refreshVisibleSplashNodeStatus();
-        }"""
-    )
-    app_page.wait_for_timeout(250)
+    app_page.evaluate("splashGateBegin()")
+    app_page.wait_for_timeout(500)
 
-    assert splash_requests == []
+    assert any("/api/splash/setup/check" in url for url in splash_requests)
+    assert app_page.locator("#splashGateOverlay").is_visible()
+
+
+def test_disabled_optional_splash_skips_startup_install_gate(app_page):
+    app_page.route(
+        "**/api/config",
+        lambda route: route.fulfill(status=200, json={"SPLASH_ENABLED": False}),
+    )
+    splash_requests = []
+    app_page.on(
+        "request",
+        lambda request: (
+            splash_requests.append(request.url)
+            if "/api/splash/setup/check" in request.url
+            else None
+        ),
+    )
+
+    app_page.evaluate("splashGateBegin()")
+    app_page.wait_for_timeout(300)
+
+    assert not splash_requests
     assert app_page.locator("#splashGateOverlay").is_hidden()
+
+
+def test_running_splash_node_does_not_claim_peer_broadcast(app_page):
+    app_page.route(
+        "**/api/config",
+        lambda route: route.fulfill(status=200, json={"SPLASH_ENABLED": True}),
+    )
+    app_page.route(
+        "**/api/splash/setup/check",
+        lambda route: route.fulfill(
+            status=200, json={"installed": True, "version": "0.2.0"}
+        ),
+    )
+    app_page.route(
+        "**/api/splash/node",
+        lambda route: route.fulfill(
+            status=200,
+            json={"process_running": True, "api_reachable": True, "peers": 0},
+        ),
+    )
+
+    app_page.evaluate("splashGateBegin()")
+
+    assert app_page.locator("#splashGateTitle").inner_text() == "Splash node running"
+    assert (
+        "Peer broadcast is unverified"
+        in app_page.locator("#splashGateSubtitle").inner_text()
+    )

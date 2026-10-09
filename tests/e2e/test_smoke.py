@@ -1734,22 +1734,8 @@ def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(pag
 def test_market_intel_refreshes_splash_node_after_supervisor_restart(
     flask_server, page
 ):
-    """The dormant Splash UI still refreshes its PID outside the Dexie-only beta."""
+    """Visible Splash status refreshes its PID after a supervisor restart."""
 
-    def serve_legacy_ui(route):
-        if route.request.resource_type != "document":
-            route.continue_()
-            return
-        response = route.fetch()
-        body = response.text()
-        release_flag = "const DEXIE_ONLY_BETA = true;"
-        assert release_flag in body
-        route.fulfill(
-            response=response,
-            body=body.replace(release_flag, "const DEXIE_ONLY_BETA = false;", 1),
-        )
-
-    page.route("**/*", serve_legacy_ui)
     page.goto(flask_server, wait_until="domcontentloaded")
     reveal_app_shell_for_nav(page)
     page.evaluate(

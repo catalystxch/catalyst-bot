@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 from api_test_support import api_mutations_permitted
 
 
-def test_existing_profile_cannot_restore_splash_flags(tmp_path, monkeypatch):
-    """A legacy profile with Splash enabled must load as Dexie-only."""
+def test_explicit_profile_splash_opt_in_is_available(tmp_path, monkeypatch):
+    """Splash remains optional for publication when explicitly enabled."""
     import config
 
     env_path = tmp_path / ".env"
@@ -22,11 +22,11 @@ def test_existing_profile_cannot_restore_splash_flags(tmp_path, monkeypatch):
 
     candidate = config.Config()
 
-    assert candidate.DEXIE_ONLY_BETA is True
-    assert candidate.SPLASH_ENABLED is False
-    assert candidate.SPLASH_RECEIVE_ENABLED is False
-    assert candidate.update("SPLASH_ENABLED", "true") is False
-    assert candidate.update_persisted("SPLASH_RECEIVE_ENABLED", "true") is False
+    assert candidate.DEXIE_ONLY_BETA is False
+    assert candidate.SPLASH_ENABLED is True
+    assert candidate.SPLASH_RECEIVE_ENABLED is True
+    assert candidate.update("SPLASH_ENABLED", "false") is True
+    assert candidate.update_persisted("SPLASH_RECEIVE_ENABLED", "false") is True
 
 
 def test_direct_release_lock_fails_silently(monkeypatch):
@@ -77,6 +77,23 @@ def test_disabled_splash_node_cannot_start(monkeypatch):
     )
 
     assert node.start() is False
+    node.find_binary.assert_not_called()
+
+
+def test_optional_splash_node_disabled_setting_has_truthful_reason(monkeypatch):
+    import splash_node
+
+    monkeypatch.setattr(splash_node.cfg, "DEXIE_ONLY_BETA", False, raising=False)
+    monkeypatch.setattr(splash_node.cfg, "SPLASH_ENABLED", False, raising=False)
+    log = MagicMock()
+    monkeypatch.setattr(splash_node, "log_event", log)
+    node = splash_node.SplashNode()
+    node.find_binary = MagicMock(
+        side_effect=AssertionError("disabled Splash must not inspect a binary")
+    )
+
+    assert node.start() is False
+    assert "disabled in Settings" in log.call_args.args[2]
     node.find_binary.assert_not_called()
 
 

@@ -5998,18 +5998,6 @@ class BotLoop:
             target=self._coin_watcher_thread_run, daemon=True, name="coin-watcher"
         )
         self._coin_watcher_thread.start()
-        # If outbound Splash broadcasting is enabled, keep inbound listening on
-        # as well so the listener stats and pair-specific intake stay live.
-        if getattr(cfg, "SPLASH_ENABLED", False) and not getattr(
-            cfg, "SPLASH_RECEIVE_ENABLED", False
-        ):
-            cfg.SPLASH_RECEIVE_ENABLED = True
-            log_event(
-                "info",
-                "splash_receive_auto",
-                "Splash incoming listener auto-enabled alongside outbound broadcast",
-            )
-
         # Splash incoming watcher thread (classifies inbound P2P offers).
         # Extracted into _start_splash_receive() so the liveness watchdog
         # can restart this daemon if it dies mid-session — without that,

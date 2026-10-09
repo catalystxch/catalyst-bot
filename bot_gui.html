@@ -10446,7 +10446,7 @@
                 </div>
 
                 <!-- V3: Splash P2P Network Stats -->
-                <div id="splashNetworkCard" style="display: none; background: var(--bg-surface); border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; padding: 16px;">
+                <div id="splashNetworkCard" style="background: var(--bg-surface); border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; padding: 16px;">
                     <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px;">
                         <div style="font-weight: 600; color: var(--accent-cyan);">📡 Splash P2P Network <span style="font-size: 0.7em; font-weight: normal; color: rgba(255,255,255,0.4);">V3</span> <span class="cc-help">?<span class="cc-tooltip">Splash is Chia's peer-to-peer offer broadcasting network. Runs a local node that shares your offers directly with other Splash users — no central server needed.</span></span></div>
                         <span class="service-badge-inline service-badge-dexie"><img src="/brand/dexie_logo_official.png" alt="Dexie logo">Dexie Splash</span>
@@ -11571,10 +11571,10 @@
                         </div>
 
                         <div class="form-group" style="margin-bottom: 8px;">
-                            <input type="hidden" id="configSplashEnabled" value="false" disabled>
-                            <div style="padding: 10px 12px; border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; color: var(--text-secondary); font-size: 12px;">
-                                Dexie-only beta — Splash P2P is unavailable in this release.
-                            </div>
+                            <label style="display: flex; align-items: center; gap: 10px;">
+                                <input type="checkbox" id="configSplashEnabled" style="width: auto; margin: 0;">
+                                <span>Splash P2P <span class="cc-help">?<span class="cc-tooltip">Optionally broadcast offers via the Splash peer-to-peer network. Dexie remains the primary attributable offer book. Splash peer delivery can be unavailable when no peers are connected.</span></span></span>
+                            </label>
                         </div>
 
                         <div class="form-group" style="margin-bottom: 8px;">
@@ -35268,6 +35268,7 @@
                 transaction_fee_target_secs: parseInt(document.getElementById('configTransactionFeeTargetSecs').value) || 300,
                 fee_prep_count: parseInt(document.getElementById('configFeePrepCount').value) || 0,
                 fee_coin_size_xch: parseFloat(document.getElementById('configFeeCoinSizeXch').value) || 0,
+                splash_enabled: document.getElementById('configSplashEnabled').checked,
                 enable_coin_prep: document.getElementById('configCoinPrepEnabled').checked,
                 enable_runtime_coin_health: document.getElementById('configRuntimeCoinHealth').checked,
                 sage_set_change_address: document.getElementById('configSageChangeAddress').checked,
@@ -39149,7 +39150,7 @@ async function pollSplashProgress() {
 //   3. Running → Brief success, then dismiss
 // =====================================================================
 
-const DEXIE_ONLY_BETA = true;
+const DEXIE_ONLY_BETA = false;
 let _splashGatePhase = 'checking';  // checking | not_installed | installed | starting | running | done
 let _splashGatePollTimer = null;
 
@@ -39195,7 +39196,21 @@ async function splashGateRetry() {
 }
 
 async function splashGateBegin() {
-    if (DEXIE_ONLY_BETA) {
+    let splashEnabled = false;
+    if (!DEXIE_ONLY_BETA) {
+        try {
+            const response = await apiFetch(API_URL + '/config', {
+                signal: AbortSignal.timeout(5000)
+            });
+            if (!response.ok) throw new Error('Splash setting unavailable');
+            const settings = await response.json();
+            splashEnabled = settings.SPLASH_ENABLED === true ||
+                String(settings.SPLASH_ENABLED).toLowerCase() === 'true';
+        } catch (err) {
+            debugWarn('[SPLASH GATE] Could not read optional Splash setting:', err);
+        }
+    }
+    if (!splashEnabled) {
         const overlay = document.getElementById('splashGateOverlay');
         if (overlay) {
             overlay.classList.add('hidden');
@@ -39238,8 +39253,8 @@ async function splashGateBegin() {
         debugLog('[SPLASH GATE] Node status:', nodeData);
 
         if (nodeData.process_running) {
-            // Already running → success! Show brief info + link
-            splashGateSetPhase('running', 'Splash Connected', 'P2P node is running and broadcasting offers', '');
+            // Process health does not prove peer delivery or exact publication.
+            splashGateSetPhase('running', 'Splash node running', 'Peer broadcast is unverified; exact offer rediscovery is required', '');
             splashGateShowProgress(100);
             document.getElementById('splashGateLogo').textContent = '✅';
             document.getElementById('splashGateStatusText').innerHTML =
@@ -39462,18 +39477,18 @@ function splashGatePollUntilRunning() {
             if (data.process_running) {
                 // Node is running!
                 if (data.api_reachable) {
-                    // Fully ready
-                    debugLog('[SPLASH GATE] Node running + API reachable — success!');
-                    splashGateSetPhase('done', 'Splash Connected!', 'P2P node is running and accepting offers', '');
+                    // Local API readiness does not prove peer delivery.
+                    debugLog('[SPLASH GATE] Node running + API reachable');
+                    splashGateSetPhase('done', 'Splash node running', 'Peer broadcast is unverified; exact offer rediscovery is required', '');
                     splashGateShowProgress(100);
                     document.getElementById('splashGateLogo').textContent = '✅';
                     document.getElementById('splashGateStartingFeedback').style.display = 'none';
                     setTimeout(splashGateDismiss, 1200);
                     return;
                 } else if (pollCount >= 3) {
-                    // Running but API not confirmed — still good enough after 3 polls
-                    debugLog('[SPLASH GATE] Node running (API not yet confirmed) — proceeding');
-                    splashGateSetPhase('done', 'Splash Connected!', 'P2P node is running', '');
+                    // Optional Splash may be bypassed, but do not claim it is ready.
+                    debugLog('[SPLASH GATE] Node running (API not yet confirmed) — proceeding with Dexie');
+                    splashGateSetPhase('done', 'Splash API unverified', 'The node is running but local submission and peer broadcast are unverified', '');
                     splashGateShowProgress(100);
                     document.getElementById('splashGateLogo').textContent = '✅';
                     document.getElementById('splashGateStartingFeedback').style.display = 'none';

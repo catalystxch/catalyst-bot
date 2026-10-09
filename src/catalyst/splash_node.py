@@ -140,10 +140,15 @@ class SplashNode:
         if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
             cfg, "SPLASH_ENABLED", False
         ):
+            reason = (
+                "Splash node startup blocked: release is Dexie-only"
+                if getattr(cfg, "DEXIE_ONLY_BETA", False)
+                else "Splash node startup skipped: Splash is disabled in Settings"
+            )
             log_event(
                 "info",
                 "splash_node_disabled",
-                "Splash node startup blocked: v1.4 beta is Dexie-only",
+                reason,
             )
             return False
 
