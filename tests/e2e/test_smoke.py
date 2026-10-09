@@ -1421,7 +1421,9 @@ def test_stopping_cycle_is_not_rendered_as_stopped_or_restartable(page):
     expect(page.locator("#statusBadge")).to_contain_text("Stopping")
     expect(page.locator("#startBtn")).to_be_disabled()
     expect(page.locator("#stopBtn")).to_be_disabled()
-    expect(page.locator("#startupGuide")).to_have_class(re.compile("dashboard-section-hidden"))
+    expect(page.locator("#startupGuide")).to_have_class(
+        re.compile("dashboard-section-hidden")
+    )
 
 
 def test_stop_fallback_does_not_reenable_button_while_cycle_is_stopping(page):
@@ -1732,7 +1734,22 @@ def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(pag
 def test_market_intel_refreshes_splash_node_after_supervisor_restart(
     flask_server, page
 ):
-    """A visible Market Intel tab must replace a dead Splash PID without reload."""
+    """The dormant Splash UI still refreshes its PID outside the Dexie-only beta."""
+
+    def serve_legacy_ui(route):
+        if route.request.resource_type != "document":
+            route.continue_()
+            return
+        response = route.fetch()
+        body = response.text()
+        release_flag = "const DEXIE_ONLY_BETA = true;"
+        assert release_flag in body
+        route.fulfill(
+            response=response,
+            body=body.replace(release_flag, "const DEXIE_ONLY_BETA = false;", 1),
+        )
+
+    page.route("**/*", serve_legacy_ui)
     page.goto(flask_server, wait_until="domcontentloaded")
     reveal_app_shell_for_nav(page)
     page.evaluate(
