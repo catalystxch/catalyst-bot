@@ -1,8 +1,9 @@
 # Preserve an installed Splash node during a failed update
 
-Status: source regressions, focused checks, clean package, isolated installer,
-and independent artifact HTTP audit passed. Full backend, current CI,
-original-profile rollover and final live acceptance remain pending.
+Status: source regressions, complete serial backend, 11 PR checks, focused
+tests, clean package, isolated installer, independent artifact HTTP audit and
+original-profile read-only rollover passed. A new exact-candidate 25-hour
+monitor is in progress; live and final acceptance remain open.
 
 ## Defect and correction
 
@@ -39,11 +40,18 @@ original-profile rollover and final live acceptance remain pending.
   `test_splash_runtime_paths.py` and the broader **101-test** focused Splash
   set passed.
 - Changed-file Ruff, format, and `git diff --check` passed.
+- The complete serial local Windows backend passed **7,528 tests, 259 skipped,
+  and 455 subtests** in 26m59s. Repository-wide Ruff passed. All **11** PR
+  checks passed on the evidence-only head `cf8289a7e52665b9ab45b4451dcaf32f709551ec`.
 - Exact runtime/source commit: `ce3ba7abacfb76fc327964496c7efab671c9af16`;
   test-only child: `1911a06` on draft PR #220. Independent secondary review
-  used immutable Git objects and reported no security finding; the second PC
-  had only 0.891 GiB free, below its 2.5 GiB staging gate, so it did not run
-  tests, build, install, or mutate a wallet.
+  used immutable Git objects and reported no security finding on the preceding
+  source. A second immutable-object review of the exact correction and
+  test-only child found the pre-promotion issue resolved and zero reportable
+  findings; `git diff --check` and in-memory AST parsing passed. The second
+  PC had about 0.893 GiB free, below its 2.5 GiB staging gate, so it did not
+  run tests, build, install, launch, or mutate a wallet. Its focused static
+  scan is `c8e7108f-8d26-4d1d-9106-4d77ae7c2113`.
 - Clean detached Windows EXE SHA-256:
   `E082E07715172E1E42DC9D516B49241E597AC5EAE64EE7750D6766291AA4EF5D`;
   bundled UI SHA-256:
@@ -63,7 +71,7 @@ original-profile rollover and final live acceptance remain pending.
 - The earlier `1affe7b` original-profile monitor was deliberately ended for
   this candidate at about 12:52 UTC after 17 clean one-minute samples. Its
   process exit caused the expected terminal monitor error. It provides no
-  24-hour credit. Exact `ce3ba7a` has not run on the original profile yet.
+  24-hour credit.
 - A fresh original-profile read-only preflight before exact-candidate launch
   confirmed Sage mainnet `TEST 7`, fingerprint `736588221`, synthetic CAT wallet
   ID `2` bound to the exact MZ asset
@@ -74,6 +82,20 @@ original-profile rollover and final live acceptance remain pending.
   operations, stopped prior campaign, zero authoritative fee spend and no
   approval. The latch was resolved. No Catalyst process or port 5000 listener
   was present at this checkpoint.
+- Exact `ce3ba7a` was launched on the original profile as sole PID `120712`;
+  its process path and EXE SHA-256 matched the clean detached package, and it
+  owned loopback port 5000. Its health reported version `1.4.0` and bot
+  stopped; safety was allowed with an owned renewing lease and zero blockers.
+  The bound read-only monitor PID `146476` began at
+  **2026-10-09T13:28:18.882162Z**. First sample in
+  `E:\catalyst-stability-monitor-ce3ba7a-primary\trace-60s.jsonl` had zero
+  alerts, exact process/path/hash/port, synced Sage mainnet TEST 7, unchanged
+  XCH/MZ balances, zero pending and nonterminal Sage offers, zero durable DB
+  open offers/active campaigns/unresolved operations, stopped bot and owned
+  safety lease. The trace auditor reported `in_progress` with zero problems.
+  This is a new window for the exact candidate; do not award the 24-hour gate
+  before a complete continuous trace and fresh end-state review. The monitor
+  is planned for 25 hours through about 2026-10-10T14:28Z.
 
 No original-profile wallet action was taken for this fix. Real Splash peer
 receipt, live active-offer lifecycle and recovery, primary and secondary
