@@ -8,6 +8,7 @@ All functions are stateless transformations — no network, DB, or file I/O.
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from splash_manager import SplashManager
@@ -63,6 +64,14 @@ class TestSplashFingerprint(unittest.TestCase):
 
 @unittest.skipIf(_SKIP_SM is not None, f"splash_manager unavailable: {_SKIP_SM}")
 class TestSplashQueuePurge(unittest.TestCase):
+    def setUp(self):
+        for setting_patch in (
+            patch("splash_manager.cfg.DEXIE_ONLY_BETA", False, create=True),
+            patch("splash_manager.cfg.SPLASH_ENABLED", True, create=True),
+        ):
+            setting_patch.start()
+            self.addCleanup(setting_patch.stop)
+
     def test_purge_trade_ids_removes_only_matching_queued_offers(self):
         manager = SplashManager()
         manager.queue_post("offer1aaa", trade_id="keep")

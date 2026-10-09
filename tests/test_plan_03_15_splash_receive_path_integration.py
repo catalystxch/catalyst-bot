@@ -42,6 +42,10 @@ class _TempDB(unittest.TestCase):
     """Base: redirect the database module to a fresh temp SQLite file."""
 
     def setUp(self):
+        beta_patch = patch.object(api_server.cfg, "DEXIE_ONLY_BETA", False, create=True)
+        beta_patch.start()
+        self.addCleanup(beta_patch.stop)
+
         self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self._tmp.close()
         self._tmp_path = self._tmp.name

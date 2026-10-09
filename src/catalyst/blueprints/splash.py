@@ -31,6 +31,20 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
+def _dexie_only_beta_response(status: int = 409):
+    """Return the stable fail-closed response for disabled Splash mutations."""
+    return (
+        jsonify(
+            {
+                "success": False,
+                "reason": "DEXIE_ONLY_BETA",
+                "error": "Splash P2P is unavailable in the Dexie-only v1.4 beta",
+            }
+        ),
+        status,
+    )
+
+
 @bp.route("/api/splash/stats")
 def api_splash_stats():
     """Get Splash P2P broadcasting statistics."""
@@ -57,6 +71,8 @@ def api_splash_receive():
     """Get or update inbound Splash listening state."""
     bot = api_server.bot
     cfg = api_server.cfg
+    if request.method == "POST" and getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
@@ -135,6 +151,8 @@ def api_splash_node_start():
     """Start the Splash P2P node process (used by startup gate)."""
     bot = api_server.bot
     cfg = api_server.cfg
+    if getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
@@ -186,6 +204,8 @@ def api_splash_setup_check():
 @bp.route("/api/splash/setup/download", methods=["POST"])
 def api_splash_setup_download():
     """Start downloading the Splash binary (non-blocking)."""
+    if getattr(_api_server().cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     try:
         from splash_setup import start_background_download
 
@@ -236,6 +256,8 @@ def api_splash_incoming():
     """
     server = _api_server()
     cfg = server.cfg
+    if getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response(status=403)
     if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
         return jsonify({"error": "Splash receive disabled"}), 403
 

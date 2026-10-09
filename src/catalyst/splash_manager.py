@@ -312,6 +312,10 @@ class SplashManager:
             trade_id: Chia trade_id (for logging/tracking)
             force: If True, post even if fingerprint matches
         """
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
+            cfg, "SPLASH_ENABLED", False
+        ):
+            return
         if not offer_bech32 or not isinstance(offer_bech32, str):
             return
         offer_text = offer_bech32.strip()
@@ -360,7 +364,9 @@ class SplashManager:
 
         Returns summary: {posted: N, failed: N, skipped: N}
         """
-        if not getattr(cfg, "SPLASH_ENABLED", False):
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
+            cfg, "SPLASH_ENABLED", False
+        ):
             return {"posted": 0, "failed": 0, "skipped": 0, "disabled": True}
         if self._durable_outbox_owner is not None:
             return self._flush_durable_outbox(flush_all)

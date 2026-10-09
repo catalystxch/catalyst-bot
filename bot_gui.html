@@ -10446,7 +10446,7 @@
                 </div>
 
                 <!-- V3: Splash P2P Network Stats -->
-                <div style="background: var(--bg-surface); border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; padding: 16px;">
+                <div id="splashNetworkCard" style="display: none; background: var(--bg-surface); border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; padding: 16px;">
                     <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px;">
                         <div style="font-weight: 600; color: var(--accent-cyan);">📡 Splash P2P Network <span style="font-size: 0.7em; font-weight: normal; color: rgba(255,255,255,0.4);">V3</span> <span class="cc-help">?<span class="cc-tooltip">Splash is Chia's peer-to-peer offer broadcasting network. Runs a local node that shares your offers directly with other Splash users — no central server needed.</span></span></div>
                         <span class="service-badge-inline service-badge-dexie"><img src="/brand/dexie_logo_official.png" alt="Dexie logo">Dexie Splash</span>
@@ -11571,10 +11571,10 @@
                         </div>
 
                         <div class="form-group" style="margin-bottom: 8px;">
-                            <label style="display: flex; align-items: center; gap: 10px;">
-                                <input type="checkbox" id="configSplashEnabled" style="width: auto; margin: 0;">
-                                <span>Splash P2P <span class="cc-help">?<span class="cc-tooltip">Broadcasts offers via Dexie Splash peer-to-peer network for wider visibility. Requires Splash node installed. Disable if you don't have Splash installed or don't want P2P broadcasting.</span></span></span>
-                            </label>
+                            <input type="hidden" id="configSplashEnabled" value="false" disabled>
+                            <div style="padding: 10px 12px; border: 1px solid rgba(6,182,212,0.3); border-radius: 8px; color: var(--text-secondary); font-size: 12px;">
+                                Dexie-only beta — Splash P2P is unavailable in this release.
+                            </div>
                         </div>
 
                         <div class="form-group" style="margin-bottom: 8px;">
@@ -26441,6 +26441,7 @@
         }
 
         async function refreshVisibleSplashNodeStatus() {
+            if (DEXIE_ONLY_BETA) return;
             if (_v4CurrentView !== 'intel') return;
             try {
                 const response = await apiFetch(`${API_URL}/splash/node`);
@@ -26455,6 +26456,7 @@
         }
 
         async function toggleSplashListening() {
+            if (DEXIE_ONLY_BETA) return;
             const btn = document.getElementById('splashListenToggle');
             if (!btn) return;
 
@@ -35264,7 +35266,6 @@
                 transaction_fee_target_secs: parseInt(document.getElementById('configTransactionFeeTargetSecs').value) || 300,
                 fee_prep_count: parseInt(document.getElementById('configFeePrepCount').value) || 0,
                 fee_coin_size_xch: parseFloat(document.getElementById('configFeeCoinSizeXch').value) || 0,
-                splash_enabled: document.getElementById('configSplashEnabled').checked,
                 enable_coin_prep: document.getElementById('configCoinPrepEnabled').checked,
                 enable_runtime_coin_health: document.getElementById('configRuntimeCoinHealth').checked,
                 sage_set_change_address: document.getElementById('configSageChangeAddress').checked,
@@ -39010,6 +39011,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 // =====================================================================
 
 async function checkSplashInstalled() {
+    if (DEXIE_ONLY_BETA) return;
     try {
         const r = await apiFetch(API_URL + '/splash/setup/check');
         const data = await r.json();
@@ -39040,6 +39042,7 @@ async function checkSplashInstalled() {
 }
 
 async function setupSplashNode() {
+    if (DEXIE_ONLY_BETA) return;
     const btn = document.getElementById('splashSetupBtn');
     const msg = document.getElementById('splashSetupMsg');
     const bar = document.getElementById('splashProgressBar');
@@ -39144,6 +39147,7 @@ async function pollSplashProgress() {
 //   3. Running → Brief success, then dismiss
 // =====================================================================
 
+const DEXIE_ONLY_BETA = true;
 let _splashGatePhase = 'checking';  // checking | not_installed | installed | starting | running | done
 let _splashGatePollTimer = null;
 
@@ -39189,6 +39193,15 @@ async function splashGateRetry() {
 }
 
 async function splashGateBegin() {
+    if (DEXIE_ONLY_BETA) {
+        const overlay = document.getElementById('splashGateOverlay');
+        if (overlay) {
+            overlay.classList.add('hidden');
+            overlay.style.display = 'none';
+        }
+        spacescanGateBegin();
+        return;
+    }
     debugLog('[SPLASH GATE] Beginning Splash startup gate...');
 
     // Show the overlay
@@ -39287,6 +39300,7 @@ async function splashGateCheckForUpdate(installedVersion) {
 }
 
 async function splashGateInstall() {
+    if (DEXIE_ONLY_BETA) return;
     debugLog('[SPLASH GATE] Starting Splash install...');
     const btn = document.getElementById('splashGateInstallBtn');
     const msg = document.getElementById('splashGateInstallMsg');
@@ -39384,6 +39398,7 @@ async function splashGatePollDownload() {
 }
 
 async function splashGateStart() {
+    if (DEXIE_ONLY_BETA) return;
     debugLog('[SPLASH GATE] Starting Splash node...');
     const btn = document.getElementById('splashGateStartBtn');
     btn.disabled = true;

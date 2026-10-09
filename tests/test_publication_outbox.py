@@ -31,6 +31,7 @@ def _complete_requests_test_interface(monkeypatch):
             ConnectionError,
             raising=False,
         )
+    monkeypatch.setattr(splash_manager.cfg, "DEXIE_ONLY_BETA", False, raising=False)
 
 
 def _block_socket(*args, **kwargs):

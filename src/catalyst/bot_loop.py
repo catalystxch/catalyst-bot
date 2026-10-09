@@ -6523,6 +6523,12 @@ class BotLoop:
         re-invoke this if the daemon dies. Safe to call multiple times:
         if the current thread is still alive it is left alone.
         """
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        ):
+            self._splash_receive_thread = None
+            return
+
         existing = getattr(self, "_splash_receive_thread", None)
         if existing is not None and existing.is_alive():
             return
