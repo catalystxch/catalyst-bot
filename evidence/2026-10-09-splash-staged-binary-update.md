@@ -58,6 +58,16 @@ monitor is in progress; live and final acceptance remain open.
   PC had about 0.893 GiB free, below its 2.5 GiB staging gate, so it did not
   run tests, build, install, launch, or mutate a wallet. Its focused static
   scan is `c8e7108f-8d26-4d1d-9106-4d77ae7c2113`.
+- The secondary PC completed a separate immutable-object security review of
+  the full PR #220 production/release diff from
+  `bfa25b6eac12faa4585dcf6c710ad63278431509` through exact runtime
+  `ce3ba7abacfb76fc327964496c7efab671c9af16`: 71 changed artifacts,
+  with zero reportable findings after discovery, validation, and attack-path
+  analysis. The sealed Codex Security scan ID is
+  `55f73686-2a8c-4a6c-8931-828b13c79965`. This was static review only;
+  the secondary machine remained below its 2.5 GiB staging gate and did not
+  build, install, launch, exercise a provider, or operate a wallet. It does
+  not credit independent runtime or live acceptance.
 - Clean detached Windows EXE SHA-256:
   `E082E07715172E1E42DC9D516B49241E597AC5EAE64EE7750D6766291AA4EF5D`;
   bundled UI SHA-256:
