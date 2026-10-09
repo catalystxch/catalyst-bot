@@ -16181,11 +16181,46 @@ class BotLoop:
                         data={"reason": reason, "stage": "dexie_flush"},
                     )
                     return False
-                self.dexie_manager.flush_queue(flush_all=True)
+                dexie_result = self.dexie_manager.flush_queue(flush_all=True)
+                required_counts = ("posted", "failed", "skipped")
+                if type(dexie_result) is not dict or any(
+                    type(dexie_result.get(key)) is not int or dexie_result[key] < 0
+                    for key in required_counts
+                ) or (
+                    "requeued" in dexie_result
+                    and (
+                        type(dexie_result["requeued"]) is not int
+                        or dexie_result["requeued"] < 0
+                    )
+                ):
+                    log_event(
+                        "warning",
+                        "dexie_repost_incomplete",
+                        "Dexie repost returned no trustworthy result",
+                    )
+                    return False
+                dexie_posted = dexie_result["posted"]
+                dexie_skipped = dexie_result["skipped"]
+                if (
+                    dexie_result["failed"] > 0
+                    or dexie_result.get("requeued", 0) > 0
+                    or dexie_result.get("disabled") is True
+                    or dexie_result.get("authorization_blocked") is True
+                    or dexie_result.get("budget_exhausted") is True
+                    or dexie_posted + dexie_skipped < count
+                ):
+                    log_event(
+                        "warning",
+                        "dexie_repost_incomplete",
+                        "Dexie repost is incomplete",
+                        data={"queued": count, **dexie_result},
+                    )
+                    return False
                 log_event(
                     "info",
                     "dexie_repost_done",
-                    f"Re-posted {count} offers to Dexie"
+                    f"Posted {dexie_posted} offers to Dexie; "
+                    f"{dexie_skipped} skipped"
                     + (" in the background " if background else " ")
                     + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
                     f"{skip_count} already live)",
