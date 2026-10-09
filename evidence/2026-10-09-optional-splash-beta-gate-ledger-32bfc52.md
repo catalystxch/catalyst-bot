@@ -36,6 +36,15 @@ Splash receipt.
 This protocol is prepared only; no active offer or independent receiver has
 been exercised on `32bfc52`.
 
+An independent secondary-PC read-only check at 2026-10-09T09:52:32Z found
+no running `splash.exe`, offer hook, or metrics/submission listener. Historical
+CATalyst was the sole app listener on `127.0.0.1:5000`. Genuine Splash 0.2.0
+binary copies were present on disk (SHA-256
+`52FAAEF54CE5F38BCC7E174125E2A0FC725B75895B3E45CF8693121E278991B8`),
+but none was running. The secondary PC therefore cannot yet witness a remote
+receipt. No daemon, hook server, offer, or wallet action was launched for
+this check, and the earlier blocked daemon-launch decision was preserved.
+
 Before any mainnet wallet action, recheck exact process/path/hash, Sage
 network/fingerprint, wallet ID and asset, balances, pending and open offers,
 safety, campaign and fee ledger. The prior campaign and its old approval do
