@@ -26492,7 +26492,10 @@
                 btn.dataset.busy = '0';
                 btn.disabled = false;
                 if (result && result.stats) {
-                    renderSplashIntel({ splash_receive: result.stats });
+                    const receiveStats = result.pending
+                        ? { ...result.stats, active: false }
+                        : result.stats;
+                    renderSplashIntel({ splash_receive: receiveStats });
                 }
                 fetchMarketIntel();
             }

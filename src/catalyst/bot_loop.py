@@ -6145,18 +6145,21 @@ class BotLoop:
                     )
 
         # V3: Stop Splash node
+        splash_stop_failed = False
         if (
             self.splash_node.is_running()
             or getattr(self.splash_node, "_running", False) is True
         ):
             try:
                 if self.splash_node.stop() is False:
+                    splash_stop_failed = True
                     log_event(
                         "warning",
                         "splash_node_stop_failed",
                         "Splash child remained active after bot stop",
                     )
             except Exception as e:
+                splash_stop_failed = True
                 log_event(
                     "warning",
                     "splash_node_stop_failed",
@@ -6180,6 +6183,10 @@ class BotLoop:
                     name="bot-stop-finalizer",
                 )
                 self._stop_finalize_thread.start()
+            return False
+
+        if splash_stop_failed:
+            self._set_state(running=False, status="stopping")
             return False
 
         self._set_state(status="stopped")
@@ -6268,24 +6275,31 @@ class BotLoop:
                             f"{_t_name} thread did not exit within 10s",
                         )
 
+            splash_stop_failed = False
             try:
                 splash_running = bool(self.splash_node.is_running())
             except Exception:
-                splash_running = False
+                splash_running = True
             if splash_running or getattr(self.splash_node, "_running", False) is True:
                 try:
                     if self.splash_node.stop() is False:
+                        splash_stop_failed = True
                         log_event(
                             "warning",
                             "splash_node_stop_failed",
                             "Splash child remained active after bot stop",
                         )
                 except Exception as e:
+                    splash_stop_failed = True
                     log_event(
                         "warning",
                         "splash_node_stop_failed",
                         f"Splash node stop raised during shutdown: {e}",
                     )
+
+            if splash_stop_failed:
+                self._set_state(running=False, status="stopping")
+                return
 
             self._set_state(running=False, status="stopped")
 
@@ -6335,11 +6349,16 @@ class BotLoop:
 
         stats["enabled"] = bool(getattr(cfg, "SPLASH_RECEIVE_ENABLED", False))
         receive_thread = getattr(self, "_splash_receive_thread", None)
+        try:
+            node_running = bool(self.splash_node.is_running())
+        except Exception:
+            node_running = False
         stats["active"] = bool(
             stats["enabled"]
             and getattr(self, "_running", False)
             and receive_thread is not None
             and receive_thread.is_alive()
+            and node_running
         )
         stats["pair_asset_id"] = asset_id
         stats["pair_label"] = self._current_splash_pair_label()
@@ -6359,7 +6378,7 @@ class BotLoop:
                 # but never present them as a live peer snapshot after the
                 # managed process has stopped.  SplashNode.get_status() applies
                 # the same mask; this receive-stat path previously bypassed it.
-                if not self.splash_node.is_running():
+                if not node_running:
                     metrics["reachable"] = False
                 stats["node_metrics"] = metrics
             else:

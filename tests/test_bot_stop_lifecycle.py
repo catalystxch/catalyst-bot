@@ -126,3 +126,59 @@ def test_synchronous_stop_does_not_publish_stopped_while_cycle_is_alive(monkeypa
     assert states[-1] == {"running": False, "status": "stopping"}
     assert len(finalizers) == 1
     assert loop.splash_node.stopped is True
+
+
+def _loop_with_unstoppable_splash(monkeypatch):
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._stop_finalize_lock = threading.Lock()
+    loop._stop_finalize_thread = None
+    loop._thread = None
+    loop.coin_manager = _NoOp()
+    loop.offer_manager = type("OfferManager", (), {"_stop_requested": False})()
+    loop._watcher_stop_event = _NoOp()
+    loop._watcher_event = _NoOp()
+    loop.amm_monitor = _NoOp()
+    loop._splash_receive_thread = None
+    loop._health_thread = None
+    loop._watcher_thread = None
+    loop._coin_watcher_thread = None
+    loop._startup_repost_thread = None
+
+    class UnstoppableSplash:
+        def is_running(self):
+            return True
+
+        def stop(self):
+            return False
+
+    loop.splash_node = UnstoppableSplash()
+    states = []
+    events = []
+    loop._set_state = lambda **updates: states.append(updates)
+    loop._clear_alert = lambda _alert_id: None
+    monkeypatch.setattr(bot_loop, "_mempool_watcher_mod", None)
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda _level, event, _message, **_kwargs: events.append(event),
+    )
+    return loop, states, events
+
+
+def test_synchronous_stop_stays_incomplete_when_splash_child_survives(monkeypatch):
+    loop, states, events = _loop_with_unstoppable_splash(monkeypatch)
+
+    assert loop.stop(wait=True) is False
+    assert states[-1]["status"] == "stopping"
+    assert "bot_stopped" not in events
+
+
+def test_async_stop_stays_incomplete_when_splash_child_survives(monkeypatch):
+    loop, states, events = _loop_with_unstoppable_splash(monkeypatch)
+    loop._running = False
+
+    loop._finalize_stop()
+
+    assert states[-1]["status"] == "stopping"
+    assert "bot_stopped" not in events

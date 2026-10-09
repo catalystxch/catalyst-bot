@@ -49,6 +49,11 @@ class SplashNode:
     def __init__(self):
         self._process: Optional[subprocess.Popen] = None
         self._process_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop_epoch = 0
+        self._stopping = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running: bool = False
@@ -135,6 +140,11 @@ class SplashNode:
     # -------------------------------------------------------------------
 
     def start(self) -> bool:
+        """Admit one managed start at a time."""
+        with self._start_lock:
+            return self._start_serialized()
+
+    def _start_serialized(self) -> bool:
         """Launch the Splash binary in a background thread.
 
         Returns True if started, False if binary not found or already running.
@@ -155,9 +165,11 @@ class SplashNode:
             )
             return False
 
-        if self._running or self.is_running():
-            log_event("info", "splash_node", "Splash node already running")
-            return False
+        with self._lifecycle_lock:
+            if self._stopping or self._running or self.is_running():
+                log_event("info", "splash_node", "Splash node already running")
+                return False
+            stop_epoch = self._stop_epoch
 
         binary = self.find_binary()
         if not binary:
@@ -213,14 +225,30 @@ class SplashNode:
         except RuntimeError:
             return False
 
-        self._stop_event.clear()
-        self._running = True
-        self._restart_count = 0
-
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="splash-node"
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if (
+                self._stopping
+                or self._stop_epoch != stop_epoch
+                or self._running
+                or self.is_running()
+            ):
+                return False
+            self._stop_event.clear()
+            self._running = True
+            self._restart_count = 0
+            self._thread = threading.Thread(
+                target=self._run_loop, daemon=True, name="splash-node"
+            )
+            try:
+                self._thread.start()
+            except Exception as exc:
+                self._running = False
+                self._stop_event.set()
+                self._thread = None
+                log_event(
+                    "warning", "splash_node_start_error", f"Manager start failed: {exc}"
+                )
+                return False
 
         log_event(
             "info",
@@ -231,9 +259,19 @@ class SplashNode:
 
     def stop(self) -> bool:
         """Stop the managed node; report whether its child has exited."""
-        self._running = False
-        self._stop_event.set()
+        with self._stop_lock:
+            with self._lifecycle_lock:
+                self._stopping = True
+                self._stop_epoch += 1
+                self._running = False
+                self._stop_event.set()
+            try:
+                return self._stop_serialized()
+            finally:
+                with self._lifecycle_lock:
+                    self._stopping = False
 
+    def _stop_serialized(self) -> bool:
         # A manager thread may be inside Popen when stop arrives. Wait for
         # that launch to finish so a child cannot appear after we report stop.
         with self._process_lock:

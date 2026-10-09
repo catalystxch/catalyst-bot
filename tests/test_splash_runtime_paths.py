@@ -200,6 +200,89 @@ def test_splash_stop_waits_for_prior_manager_before_restart():
     assert manager.is_alive() is False
 
 
+def test_concurrent_splash_starts_admit_only_one_manager(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    entered = threading.Event()
+    release = threading.Event()
+    manager_done = threading.Event()
+    manager_calls = []
+    results = []
+    node = splash_node.SplashNode()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+
+    def slow_binary_lookup():
+        entered.set()
+        assert release.wait(timeout=3)
+        return "splash.exe"
+
+    def manager_loop():
+        manager_calls.append(1)
+        manager_done.wait(timeout=3)
+
+    monkeypatch.setattr(node, "find_binary", slow_binary_lookup)
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+    monkeypatch.setattr(node, "_run_loop", manager_loop)
+
+    first = threading.Thread(target=lambda: results.append(node.start()))
+    second = threading.Thread(target=lambda: results.append(node.start()))
+    try:
+        first.start()
+        assert entered.wait(timeout=3)
+        second.start()
+        time.sleep(0.1)
+        release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        assert not first.is_alive() and not second.is_alive()
+        assert results.count(True) == 1
+        assert manager_calls == [1]
+    finally:
+        release.set()
+        manager_done.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        node.stop()
+
+
+def test_splash_start_cannot_pass_stop_waiting_for_old_manager(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    joining = threading.Event()
+    release = threading.Event()
+
+    class OldManager:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            joining.set()
+            assert release.wait(timeout=3)
+            self.alive = False
+
+    node = splash_node.SplashNode()
+    node._running = True
+    node._thread = OldManager()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+    stopper = threading.Thread(target=node.stop)
+    try:
+        stopper.start()
+        assert joining.wait(timeout=3)
+        assert node.start() is False
+    finally:
+        release.set()
+        stopper.join(timeout=3)
+        node.stop()
+
+
 def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):
     import splash_node
     from config import cfg
@@ -363,6 +446,36 @@ def test_stopped_splash_receive_stats_do_not_publish_cached_metrics_as_live(
     assert stats["node_metrics"]["reachable"] is False
     assert stats["node_metrics"]["peers"] == 4
     assert stats["node_metrics"]["offers_received"] == 3619
+
+
+def test_receive_worker_without_splash_child_is_not_active(monkeypatch):
+    import bot_loop
+    import database
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "CAT_ASSET_ID", "ab" * 32, raising=False)
+    monkeypatch.setattr(database, "get_splash_incoming_stats", lambda **_kw: {})
+
+    class LiveWorker:
+        def is_alive(self):
+            return True
+
+    class NoChild:
+        def is_running(self):
+            return False
+
+        def get_metrics(self):
+            return {"reachable": False}
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._splash_receive_thread = LiveWorker()
+    loop.splash_node = NoChild()
+    loop._splash_receive_interval = 5
+    loop._splash_receive_batch_size = 10
+
+    assert loop.get_splash_receive_stats()["active"] is False
 
 
 def test_splash_download_refuses_release_without_checksum(monkeypatch):

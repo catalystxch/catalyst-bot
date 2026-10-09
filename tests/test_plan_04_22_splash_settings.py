@@ -219,6 +219,7 @@ class TestSplashReceive(_FlaskBase):
     def test_post_scheduled_node_start_reports_pending_not_applied(self):
         bot = _make_bot()
         bot.splash_node.start.return_value = True
+        bot.get_splash_receive_stats.return_value = {"enabled": True, "active": True}
         with (
             patch.object(api_server, "bot", bot),
             patch.object(api_server.cfg, "update", return_value=True),
@@ -229,6 +230,7 @@ class TestSplashReceive(_FlaskBase):
         self.assertIs(body["pending"], True)
         self.assertIs(body["applied"], False)
         self.assertEqual(body["node_action"], "starting")
+        self.assertIs(body["stats"]["active"], False)
 
     def test_post_reports_node_restart_failure_after_config_save(self):
         bot = _make_bot()
@@ -393,6 +395,27 @@ class TestSplashNodeStart(_FlaskBase):
         self.assertEqual(resp.status_code, 202)
         self.assertIs(resp.get_json()["pending"], True)
         self.assertNotIn("node started", resp.get_json()["message"].lower())
+
+    def test_duplicate_node_start_reports_already_running(self):
+        bot = _make_bot()
+        bot.splash_node.start.return_value = False
+        bot.splash_node.is_running.return_value = True
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/splash/node/start")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIs(resp.get_json()["success"], True)
+        self.assertIn("already running", resp.get_json()["message"].lower())
+
+    def test_duplicate_node_start_reports_existing_pending_manager(self):
+        bot = _make_bot()
+        bot.splash_node.start.return_value = False
+        bot.splash_node.is_running.return_value = False
+        bot.splash_node._running = True
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/splash/node/start")
+        self.assertEqual(resp.status_code, 202)
+        self.assertIs(resp.get_json()["pending"], True)
+        self.assertIs(resp.get_json()["success"], True)
 
 
 # ---------------------------------------------------------------------------

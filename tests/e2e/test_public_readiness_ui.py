@@ -24,17 +24,23 @@ def test_splash_pending_start_does_not_claim_listening_enabled(page):
             window.apiFetch = async () => new Response(JSON.stringify({
                 success: false, applied: false, pending: true,
                 node_action: 'starting',
-                stats: {enabled: true, active: false, node_metrics: {}}
+                stats: {enabled: true, active: true, node_metrics: {}}
             }), {status: 202, headers: {'Content-Type': 'application/json'}});
             window.fetchMarketIntel = async () => {};
             window.showToast = (message, kind) => toasts.push({message, kind});
             window.addLogEntry = () => {};
             await window.toggleSplashListening();
-            return {text: btn.textContent, busy: btn.dataset.busy, toasts};
+            return {
+                text: btn.textContent,
+                status: document.getElementById('splashListenStatus').textContent,
+                busy: btn.dataset.busy,
+                toasts
+            };
         }"""
     )
 
     assert result["text"] == "Listening Enabled"
+    assert result["status"] != "ON"
     assert result["busy"] == "0"
     assert not any(t["kind"] == "success" for t in result["toasts"])
     assert any("starting" in t["message"].lower() for t in result["toasts"])

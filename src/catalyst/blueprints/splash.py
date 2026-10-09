@@ -151,6 +151,8 @@ def api_splash_receive():
         )
 
     payload = bot.get_splash_receive_stats()
+    if pending:
+        payload["active"] = False
     api_server.events.emit("splash_incoming", payload)
     api_server.events.emit(
         "config_changed",
@@ -202,16 +204,22 @@ def api_splash_node_start():
     try:
         started = bot.splash_node.start()
         status = bot.splash_node.get_status()
+        if started:
+            message, pending, http_status = "Splash node start scheduled", True, 202
+        elif bot.splash_node.is_running():
+            message, pending, http_status = "Splash node already running", False, 200
+        elif getattr(bot.splash_node, "_running", False) is True:
+            message, pending, http_status = "Splash node already starting", True, 202
+        else:
+            message, pending, http_status = "Failed to start Splash node", False, 503
         return jsonify(
             {
-                "success": started,
-                "pending": bool(started),
-                "message": "Splash node start scheduled"
-                if started
-                else "Failed to start Splash node",
+                "success": http_status != 503,
+                "pending": pending,
+                "message": message,
                 "status": status,
             }
-        ), (202 if started else 503)
+        ), http_status
     except Exception:
         return api_server._api_exception(request.path)
 
