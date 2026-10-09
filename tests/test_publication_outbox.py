@@ -2393,9 +2393,12 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     def fake_post(url, **kwargs):
         calls.append((url, kwargs))
         key = kwargs["headers"]["idempotency-key"]
+        payload = {"id": provider_id, "idempotency_key": key}
+        if publisher == "splash":
+            payload["success"] = True
         return _TransportResponse(
             201,
-            {"id": provider_id, "idempotency_key": key},
+            payload,
         )
 
     monkeypatch.setattr(module.requests, "post", fake_post)
@@ -2413,11 +2416,11 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     acknowledgement = __import__("json").loads(row["acknowledgement_json"])
     assert acknowledgement["provider_response_id"] == provider_id
     assert acknowledgement["request_sha256"] == row["request_sha256"]
+    expected_payload = {"id": provider_id, "idempotency_key": row["idempotency_key"]}
+    if publisher == "splash":
+        expected_payload["success"] = True
     assert acknowledgement["response_sha256"] == _sha(
-        calls[0][0]
-        and _TransportResponse(
-            201, {"id": provider_id, "idempotency_key": row["idempotency_key"]}
-        ).content.decode()
+        calls[0][0] and _TransportResponse(201, expected_payload).content.decode()
     )
 
 
@@ -2458,6 +2461,62 @@ def test_splash_http_2xx_without_remote_id_is_a_durable_acknowledgement(
     assert acknowledgement["provider_response_id"] == (
         f"splash-http-200:{_sha(response.content.decode())}"
     )
+
+
+def test_splash_http_200_application_rejection_is_retryable_not_acknowledged(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash-rejected",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    response = _TransportResponse(
+        200, {"success": False, "error": "Invalid offer format"}
+    )
+    calls = []
+
+    def rejected_by_local_node(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(splash_manager.requests, "post", rejected_by_local_node)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+
+    assert len(calls) == 1
+    assert result["posted"] == 0
+    assert result["failed"] == 1
+    assert result["requeued"] == 1
+    assert row["state"] == "retryable"
+    assert row["acknowledgement_json"] is None
+
+
+def test_splash_legacy_post_does_not_accept_http_200_application_rejection(
+    monkeypatch,
+):
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_POST_RETRIES", 0, raising=False)
+    monkeypatch.setattr(
+        splash_manager.requests,
+        "post",
+        lambda *_args, **_kwargs: _TransportResponse(
+            200, {"success": False, "error": "Failed to send offer to network"}
+        ),
+    )
+
+    result = manager._post_single("offer1test", "trade-rejected")
+
+    assert result["success"] is False
+    assert manager.get_stats()["total_posted"] == 0
 
 
 def test_legacy_splash_missing_id_blocker_recovers_without_redispatch(

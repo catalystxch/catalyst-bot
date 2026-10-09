@@ -297,7 +297,14 @@ def classify_provider_result(
         if (
             result.get("acceptance") is not False
             or type(status) is not int
-            or not 400 <= status < 500
+            or not (
+                400 <= status < 500
+                or (
+                    safe_publisher == "splash"
+                    and 200 <= status < 300
+                    and reason == "SPLASH_APPLICATION_REJECTED"
+                )
+            )
             or type(response_digest) is not str
             or _FINGERPRINT_RE.fullmatch(response_digest) is None
             or type(reason) is not str
@@ -311,7 +318,11 @@ def classify_provider_result(
             "response_sha256": response_digest,
             "status_code": status,
         }
-        if status == 429 or (status == 400 and reason == "INVALID_OFFER"):
+        if (
+            status == 429
+            or (status == 400 and reason == "INVALID_OFFER")
+            or (safe_publisher == "splash" and reason == "SPLASH_APPLICATION_REJECTED")
+        ):
             return PublicationDecision(PublicationState.RETRYABLE, evidence)
         return PublicationDecision(PublicationState.UNRESOLVED, evidence)
     return unresolved(

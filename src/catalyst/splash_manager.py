@@ -1,8 +1,8 @@
 """Queue and broadcast offers to the Splash P2P peer mesh for Chia offers
 
-Splash is Dexie's peer-to-peer network — every connected peer receives
-every offer, so broadcasting here widens fill opportunities alongside
-direct Dexie posting. This module talks to the locally-running Splash
+Splash is Dexie's peer-to-peer network. Broadcasting can widen fill
+opportunities alongside direct Dexie posting; local submission does not
+prove delivery to a peer. This module talks to the locally-running Splash
 binary's HTTP submission endpoint and applies the same fingerprint-based
 deduplication and queue-flush-retry pattern used by dexie_manager.
 
@@ -543,6 +543,23 @@ class SplashManager:
                         data = r.json()
                     except Exception:
                         data = None
+                    if type(data) is dict and data.get("success") is False:
+                        return {
+                            "outcome": "no_effect",
+                            "acceptance": False,
+                            "provider": "splash",
+                            "request_sha256": request_digest,
+                            "response_sha256": response_digest,
+                            "status_code": r.status_code,
+                            "reason_code": "SPLASH_APPLICATION_REJECTED",
+                        }
+                    if type(data) is not dict or data.get("success") is not True:
+                        return {
+                            "outcome": "ambiguous",
+                            "provider": "splash",
+                            "request_sha256": request_digest,
+                            "reason_code": "MALFORMED_PROVIDER_RESPONSE",
+                        }
                     return {
                         "outcome": "acknowledged",
                         "provider": "splash",
@@ -613,7 +630,17 @@ class SplashManager:
                     timeout=timeout,
                 )
 
+                response_data = None
                 if 200 <= r.status_code < 300:
+                    try:
+                        response_data = r.json()
+                    except Exception:
+                        pass
+                if (
+                    200 <= r.status_code < 300
+                    and type(response_data) is dict
+                    and response_data.get("success") is True
+                ):
                     # Mark as posted + reset health tracking — lock-protected.
                     recovered = False
                     with self._lock:
@@ -635,16 +662,11 @@ class SplashManager:
                     )
 
                     provider_response_id = None
-                    try:
-                        response_data = r.json()
-                    except Exception:
-                        response_data = None
-                    if isinstance(response_data, dict):
-                        provider_response_id = (
-                            response_data.get("id")
-                            or response_data.get("offer_id")
-                            or response_data.get("idempotency_key")
-                        )
+                    provider_response_id = (
+                        response_data.get("id")
+                        or response_data.get("offer_id")
+                        or response_data.get("idempotency_key")
+                    )
                     if provider_response_id is None:
                         provider_response_id = r.headers.get("idempotency-key")
                     return {
