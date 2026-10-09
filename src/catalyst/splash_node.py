@@ -48,6 +48,8 @@ class SplashNode:
 
     def __init__(self):
         self._process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running: bool = False
         self._restart_count: int = 0
@@ -153,7 +155,7 @@ class SplashNode:
             )
             return False
 
-        if self._running:
+        if self._running or self.is_running():
             log_event("info", "splash_node", "Splash node already running")
             return False
 
@@ -211,6 +213,7 @@ class SplashNode:
         except RuntimeError:
             return False
 
+        self._stop_event.clear()
         self._running = True
         self._restart_count = 0
 
@@ -226,30 +229,65 @@ class SplashNode:
         )
         return True
 
-    def stop(self):
-        """Stop the Splash node."""
+    def stop(self) -> bool:
+        """Stop the managed node; report whether its child has exited."""
         self._running = False
+        self._stop_event.set()
 
-        if self._process:
-            try:
-                if sys.platform == "win32":
-                    self._process.terminate()
-                else:
-                    self._process.send_signal(signal.SIGTERM)
+        # A manager thread may be inside Popen when stop arrives. Wait for
+        # that launch to finish so a child cannot appear after we report stop.
+        with self._process_lock:
+            if self._process:
+                process = self._process
+                try:
+                    if sys.platform == "win32":
+                        process.terminate()
+                    else:
+                        process.send_signal(signal.SIGTERM)
 
-                # Wait up to 5 seconds for clean exit
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            except Exception as e:
-                log_event(
-                    "debug", "splash_node_stop_error", f"Error stopping Splash: {e}"
-                )
-            finally:
+                    # Wait up to 5 seconds for clean exit
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                        process.wait(timeout=5)
+                    except Exception as e:
+                        log_event(
+                            "warning",
+                            "splash_node_stop_error",
+                            f"Error killing Splash: {e}",
+                        )
+                        return False
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "splash_node_stop_error",
+                        f"Error stopping Splash: {e}",
+                    )
+                    return False
+                if process.poll() is None:
+                    log_event(
+                        "warning",
+                        "splash_node_stop_error",
+                        "Splash child is still running",
+                    )
+                    return False
                 self._process = None
                 self._pid = None
 
+        manager = self._thread
+        if manager and manager is not threading.current_thread() and manager.is_alive():
+            manager.join(timeout=5)
+            if manager.is_alive():
+                log_event(
+                    "warning",
+                    "splash_node_stop_error",
+                    "Splash manager did not exit after stop",
+                )
+                return False
+
         log_event("info", "splash_node_stopped", "Splash node stopped")
+        return True
 
     # -------------------------------------------------------------------
     # Run loop (background thread)
@@ -270,12 +308,16 @@ class SplashNode:
 
             # Cooldown between restarts
             if self._restart_count > 0:
-                time.sleep(self._restart_cooldown)
+                self._stop_event.wait(self._restart_cooldown)
                 if not self._running:
                     break
 
             try:
-                self._launch_process()
+                with self._process_lock:
+                    if not self._running:
+                        break
+                    self._launch_process()
+                    process = self._process
             except Exception as e:
                 log_event(
                     "error", "splash_node_launch_error", f"Failed to launch Splash: {e}"
@@ -284,8 +326,8 @@ class SplashNode:
                 continue
 
             # Wait for process to exit
-            if self._process:
-                returncode = self._process.wait()
+            if process:
+                returncode = process.wait()
 
                 if self._running:
                     # Unexpected exit — will restart

@@ -6145,12 +6145,20 @@ class BotLoop:
                     )
 
         # V3: Stop Splash node
-        if self.splash_node.is_running():
+        if (
+            self.splash_node.is_running()
+            or getattr(self.splash_node, "_running", False) is True
+        ):
             try:
-                self.splash_node.stop()
+                if self.splash_node.stop() is False:
+                    log_event(
+                        "warning",
+                        "splash_node_stop_failed",
+                        "Splash child remained active after bot stop",
+                    )
             except Exception as e:
                 log_event(
-                    "debug",
+                    "warning",
                     "splash_node_stop_failed",
                     f"Splash node stop raised during shutdown: {e}",
                 )
@@ -6264,12 +6272,17 @@ class BotLoop:
                 splash_running = bool(self.splash_node.is_running())
             except Exception:
                 splash_running = False
-            if splash_running:
+            if splash_running or getattr(self.splash_node, "_running", False) is True:
                 try:
-                    self.splash_node.stop()
+                    if self.splash_node.stop() is False:
+                        log_event(
+                            "warning",
+                            "splash_node_stop_failed",
+                            "Splash child remained active after bot stop",
+                        )
                 except Exception as e:
                     log_event(
-                        "debug",
+                        "warning",
                         "splash_node_stop_failed",
                         f"Splash node stop raised during shutdown: {e}",
                     )
@@ -14873,9 +14886,11 @@ class BotLoop:
         # Splash incoming watcher classifies inbound P2P offers. Previously
         # the watchdog named it in the docstring but never actually checked
         # it, so a crash left Splash receive silently dead while the bot
-        # kept quoting. Include it here — only when Splash is enabled, so
-        # we don't "restart" a thread that was intentionally not started.
-        if getattr(cfg, "SPLASH_ENABLED", False):
+        # kept quoting. Follow the worker's own receive-mode startup gate;
+        # outbound-only Splash has no classifier thread to restart.
+        if getattr(cfg, "SPLASH_RECEIVE_ENABLED", False) and not getattr(
+            cfg, "DEXIE_ONLY_BETA", False
+        ):
             critical_threads.append(
                 ("splash-receive", "_splash_receive_thread", self._start_splash_receive)
             )

@@ -55,3 +55,30 @@ def test_retired_tibetswap_price_watcher_is_not_restarted_as_crashed(monkeypatch
 
     assert restarted == []
     assert not any(event == "background_thread_died" for _, event, _ in events)
+
+
+def test_receive_only_splash_worker_is_restarted_after_crash(monkeypatch):
+    import bot_loop
+
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+    watcher = object.__new__(bot_loop.BotLoop)
+    watcher._running = True
+    watcher._health_thread = None
+    watcher._coin_watcher_thread = None
+    watcher._splash_receive_thread = DeadThread()
+    watcher._start_health_monitor = lambda: None
+    watcher._start_coin_watcher = lambda: None
+    restarted = []
+    watcher._start_splash_receive = lambda: restarted.append("splash-receive")
+    watcher._emit_alert = lambda *_args, **_kwargs: None
+    watcher._clear_alert = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_RECEIVE_ENABLED", True)
+    monkeypatch.setattr(bot_loop, "log_event", lambda *_args, **_kwargs: None)
+
+    watcher._check_background_thread_liveness()
+
+    assert restarted == ["splash-receive"]

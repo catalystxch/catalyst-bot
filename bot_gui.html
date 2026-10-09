@@ -26467,21 +26467,21 @@
             btn.disabled = true;
             btn.textContent = currentlyEnabled ? 'Stopping...' : 'Starting...';
 
+            let result = null;
             try {
                 const response = await apiFetch('/api/splash/receive', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ enabled: !currentlyEnabled })
                 });
-                const result = await response.json();
+                result = await response.json();
                 if (!response.ok || result.error) {
                     throw new Error(result.error || 'Could not update Splash listening');
                 }
-
-                if (result.stats) {
-                    renderSplashIntel({ splash_receive: result.stats });
+                if (result.pending) {
+                    if (typeof showToast === 'function') showToast('Splash node starting; listening is not active yet', 'info');
+                    return;
                 }
-                fetchMarketIntel();
 
                 const msg = !currentlyEnabled ? 'Splash listening enabled' : 'Splash listening disabled';
                 if (typeof showToast === 'function') showToast(msg, 'success');
@@ -26491,6 +26491,10 @@
             } finally {
                 btn.dataset.busy = '0';
                 btn.disabled = false;
+                if (result && result.stats) {
+                    renderSplashIntel({ splash_receive: result.stats });
+                }
+                fetchMarketIntel();
             }
         }
 
@@ -39439,7 +39443,7 @@ async function splashGateStart() {
         const result = await resp.json();
 
         if (result.success) {
-            document.getElementById('splashGateStartingText').textContent = 'Splash node launched — checking P2P connection...';
+            document.getElementById('splashGateStartingText').textContent = 'Splash node start requested — checking P2P connection...';
             // Poll until node is confirmed running
             splashGatePollUntilRunning();
         } else {

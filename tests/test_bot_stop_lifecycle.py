@@ -92,7 +92,15 @@ def test_synchronous_stop_does_not_publish_stopped_while_cycle_is_alive(monkeypa
     loop._watcher_thread = None
     loop._coin_watcher_thread = None
     loop._startup_repost_thread = None
-    loop.splash_node = _NoOp()
+
+    class CooldownSplash(_NoOp):
+        _running = True
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    loop.splash_node = CooldownSplash()
     loop._clear_alert = lambda _alert_id: None
     loop._set_state = lambda **updates: states.append(updates)
 
@@ -117,3 +125,4 @@ def test_synchronous_stop_does_not_publish_stopped_while_cycle_is_alive(monkeypa
     assert {"running": False, "status": "stopped"} not in states
     assert states[-1] == {"running": False, "status": "stopping"}
     assert len(finalizers) == 1
+    assert loop.splash_node.stopped is True

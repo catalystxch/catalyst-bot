@@ -95,21 +95,34 @@ def api_splash_receive():
         node_action = "state_failed"
     else:
         try:
-            if node_running:
-                bot.splash_node.stop()
-                time.sleep(1)
-                if enabled or getattr(cfg, "SPLASH_ENABLED", False):
-                    restarted = bot.splash_node.start()
-                    node_action = "restarted" if restarted else "restart_failed"
+            # The manager can be waiting between crash-restart attempts while
+            # no child process is alive. Stop that manager too, or it can
+            # relaunch after the operator disables receive.
+            node_managed = getattr(bot.splash_node, "_running", False) is True
+            if node_running or node_managed:
+                stopped = bot.splash_node.stop()
+                if stopped is False:
+                    node_action = "stop_failed"
                 else:
-                    node_action = "stopped"
+                    time.sleep(1)
+                    if enabled or getattr(cfg, "SPLASH_ENABLED", False):
+                        restarted = bot.splash_node.start()
+                        node_action = "restarting" if restarted else "restart_failed"
+                    else:
+                        node_action = "stopped"
             elif enabled or getattr(cfg, "SPLASH_ENABLED", False):
                 started = bot.splash_node.start()
-                node_action = "started" if started else "start_failed"
+                node_action = "starting" if started else "start_failed"
         except Exception:
             node_action = "error"
 
-    node_failures = {"start_failed", "restart_failed", "state_failed", "error"}
+    node_failures = {
+        "start_failed",
+        "restart_failed",
+        "stop_failed",
+        "state_failed",
+        "error",
+    }
     if enabled and getattr(bot, "_running", False) and node_action not in node_failures:
         try:
             bot._start_splash_receive()
@@ -117,11 +130,18 @@ def api_splash_receive():
             node_action = "worker_failed"
 
     runtime_failed = node_action in node_failures or node_action == "worker_failed"
+    pending = node_action in {"starting", "restarting"}
     if runtime_failed:
         log_event(
             "warning",
             "splash_receive_apply_failed",
             f"Splash listening setting saved but runtime activation failed ({node_action})",
+        )
+    elif pending:
+        log_event(
+            "info",
+            "splash_receive_pending",
+            f"Splash listening setting saved; node {node_action}",
         )
     else:
         log_event(
@@ -142,16 +162,20 @@ def api_splash_receive():
     )
 
     response = {
-        "success": not runtime_failed,
+        "success": not runtime_failed and not pending,
+        "applied": not runtime_failed and not pending,
+        "pending": pending,
         "enabled": enabled,
         "node_action": node_action,
         "stats": api_server._serialize_dict(payload),
     }
     if runtime_failed:
         response["error"] = (
-            "Splash listening setting was saved, but listening could not be activated"
+            "Splash listening setting was saved, but the runtime change did not complete"
         )
         return jsonify(response), 503
+    if pending:
+        return jsonify(response), 202
     return jsonify(response)
 
 
@@ -181,12 +205,13 @@ def api_splash_node_start():
         return jsonify(
             {
                 "success": started,
-                "message": "Splash node started"
+                "pending": bool(started),
+                "message": "Splash node start scheduled"
                 if started
                 else "Failed to start Splash node",
                 "status": status,
             }
-        )
+        ), (202 if started else 503)
     except Exception:
         return api_server._api_exception(request.path)
 

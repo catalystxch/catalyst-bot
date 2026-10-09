@@ -216,6 +216,20 @@ class TestSplashReceive(_FlaskBase):
         self.assertIs(body["enabled"], True)
         self.assertEqual(body["node_action"], "start_failed")
 
+    def test_post_scheduled_node_start_reports_pending_not_applied(self):
+        bot = _make_bot()
+        bot.splash_node.start.return_value = True
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": True})
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 202)
+        self.assertIs(body["pending"], True)
+        self.assertIs(body["applied"], False)
+        self.assertEqual(body["node_action"], "starting")
+
     def test_post_reports_node_restart_failure_after_config_save(self):
         bot = _make_bot()
         bot.splash_node.is_running.return_value = True
@@ -247,6 +261,34 @@ class TestSplashReceive(_FlaskBase):
         bot.splash_node.start.assert_not_called()
         bot.splash_node.stop.assert_not_called()
 
+    def test_post_disable_stops_manager_waiting_to_restart(self):
+        bot = _make_bot()
+        bot.splash_node.is_running.return_value = False
+        bot.splash_node._running = True
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+            patch.object(api_server.cfg, "SPLASH_ENABLED", False),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": False})
+        self.assertEqual(resp.status_code, 200)
+        bot.splash_node.stop.assert_called_once_with()
+        bot.splash_node.start.assert_not_called()
+
+    def test_post_disable_reports_child_stop_failure(self):
+        bot = _make_bot()
+        bot.splash_node.is_running.return_value = True
+        bot.splash_node.stop.return_value = False
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+            patch.object(api_server.cfg, "SPLASH_ENABLED", False),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": False})
+        self.assertEqual(resp.status_code, 503)
+        self.assertIs(resp.get_json()["success"], False)
+        bot.splash_node.start.assert_not_called()
+
     def test_post_enabling_receive_starts_worker_for_running_bot(self):
         bot = _make_bot()
         bot._running = True
@@ -255,7 +297,8 @@ class TestSplashReceive(_FlaskBase):
             patch.object(api_server.cfg, "update", return_value=True),
         ):
             resp = self._post("/api/splash/receive", {"enabled": True})
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 202)
+        self.assertIs(resp.get_json()["pending"], True)
         bot._start_splash_receive.assert_called_once_with()
 
     def test_post_reports_receive_worker_start_failure(self):
@@ -309,7 +352,7 @@ class TestSplashNodeStart(_FlaskBase):
         ):
             resp = self._post("/api/splash/node/start")
 
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 202)
         bot.splash_node.start.assert_called_once_with()
         update.assert_not_called()
 
@@ -322,7 +365,7 @@ class TestSplashNodeStart(_FlaskBase):
             resp = self._post("/api/splash/node/start")
         self.assertEqual(resp.status_code, 500)
 
-    def test_returns_200_with_bot(self):
+    def test_returns_202_pending_with_bot(self):
         bot = _make_bot()
         with (
             patch.object(api_server, "bot", bot),
@@ -330,7 +373,7 @@ class TestSplashNodeStart(_FlaskBase):
             patch("api_server.log_event"),
         ):
             resp = self._post("/api/splash/node/start")
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 202)
 
     def test_response_has_success_key(self):
         bot = _make_bot()
@@ -341,6 +384,15 @@ class TestSplashNodeStart(_FlaskBase):
         ):
             resp = self._post("/api/splash/node/start")
         self.assertIn("success", resp.get_json())
+
+    def test_scheduled_node_start_is_pending_until_health_check(self):
+        bot = _make_bot()
+        bot.splash_node.start.return_value = True
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/splash/node/start")
+        self.assertEqual(resp.status_code, 202)
+        self.assertIs(resp.get_json()["pending"], True)
+        self.assertNotIn("node started", resp.get_json()["message"].lower())
 
 
 # ---------------------------------------------------------------------------

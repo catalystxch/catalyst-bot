@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import hashlib
 from pathlib import Path
@@ -55,6 +56,9 @@ def test_receive_only_splash_can_start_managed_node(monkeypatch):
         def start(self):
             self.started = True
 
+        def is_alive(self):
+            return False
+
     monkeypatch.setattr(cfg, "SPLASH_ENABLED", False, raising=False)
     monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
     monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
@@ -66,6 +70,134 @@ def test_receive_only_splash_can_start_managed_node(monkeypatch):
     assert node.start() is True
     assert node._thread.started is True
     node.stop()
+
+
+def test_splash_stop_preserves_live_child_when_termination_fails():
+    import splash_node
+
+    class UnstoppableProcess:
+        pid = 12345
+
+        def terminate(self):
+            raise OSError("termination denied")
+
+        def send_signal(self, _signal):
+            raise OSError("termination denied")
+
+        def poll(self):
+            return None
+
+    node = splash_node.SplashNode()
+    process = UnstoppableProcess()
+    node._running = True
+    node._process = process
+    node._pid = process.pid
+
+    assert node.stop() is False
+    assert node.is_running() is True
+    assert node._process is process
+    assert node._pid == process.pid
+
+
+def test_splash_stop_waits_for_inflight_child_launch(monkeypatch):
+    import splash_node
+
+    entered = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    class Process:
+        pid = 12345
+
+        def terminate(self):
+            exited.set()
+
+        def send_signal(self, _signal):
+            exited.set()
+
+        def wait(self, timeout=None):
+            assert exited.wait(timeout=timeout if timeout is not None else 3)
+            return 0
+
+        def poll(self):
+            return 0 if exited.is_set() else None
+
+    node = splash_node.SplashNode()
+    node._running = True
+    process = Process()
+
+    def delayed_launch():
+        entered.set()
+        assert release.wait(timeout=3)
+        node._process = process
+        node._pid = process.pid
+
+    monkeypatch.setattr(node, "_launch_process", delayed_launch)
+    manager = threading.Thread(target=node._run_loop)
+    manager.start()
+    assert entered.wait(timeout=3)
+
+    stop_result = []
+    stopper = threading.Thread(target=lambda: stop_result.append(node.stop()))
+    stopper.start()
+    release.set()
+    stopper.join(timeout=3)
+    if stopper.is_alive():
+        exited.set()
+        stopper.join(timeout=3)
+    if not exited.is_set():
+        exited.set()
+    manager.join(timeout=3)
+
+    assert not stopper.is_alive()
+    assert not manager.is_alive()
+    assert stop_result == [True]
+    assert node._process is None
+    assert node._pid is None
+
+
+def test_splash_start_refuses_existing_live_child_after_failed_stop(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class Process:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    node = splash_node.SplashNode()
+    node._running = False
+    node._process = Process()
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.start() is False
+    assert node._running is False
+
+
+def test_splash_stop_waits_for_prior_manager_before_restart():
+    import splash_node
+
+    class CooldownThread:
+        alive = True
+        joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.joined = True
+            self.alive = False
+
+    node = splash_node.SplashNode()
+    manager = CooldownThread()
+    node._running = True
+    node._thread = manager
+
+    assert node.stop() is True
+    assert manager.joined is True
+    assert manager.is_alive() is False
 
 
 def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):

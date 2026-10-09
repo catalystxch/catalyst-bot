@@ -13,6 +13,33 @@ def _open_gui(page):
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
 
+def test_splash_pending_start_does_not_claim_listening_enabled(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            const btn = document.getElementById('splashListenToggle');
+            btn.dataset.enabled = '0';
+            btn.textContent = 'Start Listening';
+            const toasts = [];
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: false, applied: false, pending: true,
+                node_action: 'starting',
+                stats: {enabled: true, active: false, node_metrics: {}}
+            }), {status: 202, headers: {'Content-Type': 'application/json'}});
+            window.fetchMarketIntel = async () => {};
+            window.showToast = (message, kind) => toasts.push({message, kind});
+            window.addLogEntry = () => {};
+            await window.toggleSplashListening();
+            return {text: btn.textContent, busy: btn.dataset.busy, toasts};
+        }"""
+    )
+
+    assert result["text"] == "Listening Enabled"
+    assert result["busy"] == "0"
+    assert not any(t["kind"] == "success" for t in result["toasts"])
+    assert any("starting" in t["message"].lower() for t in result["toasts"])
+
+
 @pytest.mark.parametrize("width", [390, 480])
 def test_dashboard_quick_start_remains_visible_in_small_window(page, width):
     """The pair selector and Refresh control must not be clipped by the guide."""
