@@ -2516,19 +2516,32 @@ def test_splash_http_200_temporary_send_failure_is_retryable_not_acknowledged(
     assert result["requeued"] == 1
     assert row["state"] == "retryable"
     assert row["acknowledgement_json"] is None
+    assert json.loads(row["last_error_json"]) == {
+        "code": "SPLASH_SEND_FAILED",
+        "provider": "splash",
+        "request_sha256": row["request_sha256"],
+        "response_sha256": _sha(response.content.decode()),
+        "status_code": 200,
+    }
+    manager._durable_now_provider = lambda: WITHIN_LEASE
+    manager.flush_queue()
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
-    "provider_error",
+    ("provider_error", "expected_code"),
     [
-        "Invalid offer format",
-        "Invalid offer format: not a valid bech32 string",
-        "Offer exceeds maximum size of 307200 bytes",
-        "Unexpected local node rejection",
+        ("Invalid offer format", "SPLASH_INVALID_OFFER"),
+        (
+            "Invalid offer format: not a valid bech32 string",
+            "SPLASH_INVALID_OFFER",
+        ),
+        ("Offer exceeds maximum size of 307200 bytes", "SPLASH_OFFER_TOO_LARGE"),
+        ("Unexpected local node rejection", "SPLASH_APPLICATION_REJECTED"),
     ],
 )
 def test_splash_permanent_or_unknown_rejection_requires_review_without_redispatch(
-    isolated_database, monkeypatch, provider_error
+    isolated_database, monkeypatch, provider_error, expected_code
 ):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
     _persist_offer_projection(
@@ -2542,10 +2555,11 @@ def test_splash_permanent_or_unknown_rejection_requires_review_without_redispatc
         lease_expires_provider=lambda _now: LEASE_END,
     )
     calls = []
+    response = _TransportResponse(200, {"success": False, "error": provider_error})
 
     def rejected_by_local_node(url, **kwargs):
         calls.append((url, kwargs))
-        return _TransportResponse(200, {"success": False, "error": provider_error})
+        return response
 
     monkeypatch.setattr(splash_manager.requests, "post", rejected_by_local_node)
     result = manager.flush_queue()
@@ -2556,6 +2570,13 @@ def test_splash_permanent_or_unknown_rejection_requires_review_without_redispatc
     assert result["requeued"] == 0
     assert row["state"] == "unresolved"
     assert row["acknowledgement_json"] is None
+    assert json.loads(row["last_error_json"]) == {
+        "code": expected_code,
+        "provider": "splash",
+        "request_sha256": row["request_sha256"],
+        "response_sha256": _sha(response.content.decode()),
+        "status_code": 200,
+    }
     manager.flush_queue()
     assert len(calls) == 1
 
