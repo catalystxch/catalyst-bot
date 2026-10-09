@@ -1,6 +1,7 @@
 import os
 import time
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -310,7 +311,10 @@ def test_failed_splash_update_preserves_existing_binary(monkeypatch, tmp_path, f
     assert list(tmp_path.glob(".splash.exe.*.tmp")) == []
 
 
-def test_verified_splash_update_replaces_existing_binary(monkeypatch, tmp_path):
+@pytest.mark.parametrize("probe_result", ["success", "nonzero", "oserror", "timeout"])
+def test_verified_splash_update_replaces_existing_binary(
+    monkeypatch, tmp_path, probe_result
+):
     import splash_setup
 
     installed = tmp_path / "splash.exe"
@@ -358,16 +362,30 @@ def test_verified_splash_update_replaces_existing_binary(monkeypatch, tmp_path):
         return SimpleNamespace(text=hashlib.sha256(downloaded).hexdigest())
 
     monkeypatch.setattr(splash_setup.requests, "get", fake_get)
-    monkeypatch.setattr(
-        "subprocess.run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="test"),
-    )
+
+    def fake_run(args, **_kwargs):
+        assert args[0].endswith(".exe")
+        assert (tmp_path / "splash.exe").read_bytes() == b"known-good-splash"
+        assert Path(args[0]).read_bytes() == downloaded
+        if probe_result == "nonzero":
+            return SimpleNamespace(returncode=1, stdout="", stderr="bad binary")
+        if probe_result == "oserror":
+            raise OSError("cannot execute")
+        if probe_result == "timeout":
+            raise TimeoutError("version probe timed out")
+        return SimpleNamespace(returncode=0, stdout="test", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
 
     result = splash_setup.download_splash()
 
-    assert result["success"] is True
-    assert installed.read_bytes() == downloaded
-    assert list(tmp_path.glob(".splash.exe.*.tmp")) == []
+    if probe_result == "success":
+        assert result["success"] is True
+        assert installed.read_bytes() == downloaded
+    else:
+        assert result["success"] is False
+        assert installed.read_bytes() == b"known-good-splash"
+    assert list(tmp_path.glob(".splash.exe.*")) == []
 
 
 @pytest.mark.parametrize("receive_enabled", [False, True])

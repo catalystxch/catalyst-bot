@@ -260,7 +260,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
         with tempfile.NamedTemporaryFile(
             mode="wb",
             prefix=f".{info['binary_name']}.",
-            suffix=".tmp",
+            suffix=".exe" if info["os"] == "windows" else ".tmp",
             dir=os.path.dirname(install_path),
             delete=False,
         ) as f:
@@ -329,6 +329,31 @@ def download_splash(progress_callback: Callable = None) -> Dict:
                 "debug", "splash_setup", f"chmod failed (may need manual fix): {e}"
             )
 
+    # A matching checksum proves integrity, not that this platform can run the
+    # release. Probe the stage while the installed node is still untouched.
+    _progress(95, "Testing binary...")
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            [staged_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **hidden_subprocess_kwargs(),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"version probe exited with code {proc.returncode}")
+        version = proc.stdout.strip() or release["tag"]
+    except Exception as e:
+        msg = f"Splash binary test failed: {e}"
+        log_event("error", "splash_setup", msg)
+        try:
+            os.remove(staged_path)
+        except Exception:
+            pass
+        return {"success": False, "message": msg, "path": ""}
+
     try:
         os.replace(staged_path, install_path)
     except Exception as e:
@@ -340,24 +365,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
             pass
         return {"success": False, "message": msg, "path": ""}
 
-    # Verify the binary runs
-    _progress(95, "Testing binary...")
-    try:
-        import subprocess
-
-        proc = subprocess.run(
-            [install_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            **hidden_subprocess_kwargs(),
-        )
-        version = proc.stdout.strip() if proc.returncode == 0 else "unknown"
-        _progress(98, f"Splash {version} ready!")
-    except Exception as e:
-        version = "unknown"
-        log_event("debug", "splash_setup", f"Version check failed: {e}")
-
+    _progress(98, f"Splash {version} ready!")
     _progress(100, "Installation complete!")
 
     file_size_mb = os.path.getsize(install_path) / 1024 / 1024
