@@ -497,7 +497,15 @@ class SplashNode:
         # and the bot rejects them all with 403 — flooding the terminal.
         display_hook = None
         if getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
-            bot_port = getattr(cfg, "PORT", 5000)
+            # Startup writes the reserved Flask port here before services start.
+            # Config has no PORT attribute, so that lookup silently used 5000
+            # even when Flask had bound a different port.
+            try:
+                bot_port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+            except (TypeError, ValueError):
+                bot_port = 5000
+            if not 1 <= bot_port <= 65535:
+                bot_port = 5000
             offer_hook = f"http://127.0.0.1:{bot_port}/api/splash/incoming"
             # No token in URL — the splash/incoming endpoint is token-exempt
             # (loopback-only). Use IPv4 explicitly because Flask is bound to

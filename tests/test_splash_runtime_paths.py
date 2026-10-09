@@ -242,7 +242,10 @@ def test_splash_download_refuses_release_without_checksum(monkeypatch):
 
 
 @pytest.mark.parametrize("receive_enabled", [False, True])
-def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch, receive_enabled):
+@pytest.mark.parametrize("flask_port", [5000, 5123])
+def test_splash_node_offer_hook_uses_actual_flask_port(
+    monkeypatch, receive_enabled, flask_port
+):
     import splash_node
     from config import cfg
 
@@ -271,6 +274,7 @@ def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch, receive_enabled)
 
     monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", receive_enabled, raising=False)
     monkeypatch.setattr(cfg, "PORT", 5000, raising=False)
+    monkeypatch.setenv("CATALYST_FLASK_PORT", str(flask_port))
     monkeypatch.setattr(
         cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
     )
@@ -287,8 +291,8 @@ def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch, receive_enabled)
 
     if receive_enabled:
         hook_index = captured["cmd"].index("--offer-hook") + 1
-        assert (
-            captured["cmd"][hook_index] == "http://127.0.0.1:5000/api/splash/incoming"
+        assert captured["cmd"][hook_index] == (
+            f"http://127.0.0.1:{flask_port}/api/splash/incoming"
         )
         assert "http://localhost:5000/api/splash/incoming" not in captured["cmd"]
     else:
