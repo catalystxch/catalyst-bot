@@ -1455,7 +1455,6 @@ class Config:
             getattr(self, "DEXIE_ONLY_BETA", False)
             and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
         ):
-            print(f"[CONFIG] Blocked {key}: v1.4 beta is Dexie-only")
             return False
 
         if key not in self._UPDATABLE_KEYS:
@@ -1557,7 +1556,6 @@ class Config:
             getattr(self, "DEXIE_ONLY_BETA", False)
             and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
         ):
-            print(f"[CONFIG] Blocked {key}: v1.4 beta is Dexie-only")
             return False
 
         if key not in self._UPDATABLE_KEYS:

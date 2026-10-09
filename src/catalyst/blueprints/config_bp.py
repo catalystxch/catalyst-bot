@@ -417,11 +417,15 @@ def api_config_update():
 
     if "key" in data and "value" in data:
         # --- Single key-value format ---
-        raw_key = str(data["key"])
-        key = _KEY_MAP.get(raw_key, raw_key.upper())
+        key = data["key"]
+        key_text = str(key)
+        effective_key = _KEY_MAP.get(key_text, key_text.upper())
         value = data["value"]
-        if getattr(cfg, "DEXIE_ONLY_BETA", False) and key in _DEXIE_ONLY_BETA_KEYS:
-            return _dexie_only_beta_response(key)
+        if (
+            getattr(cfg, "DEXIE_ONLY_BETA", False)
+            and effective_key in _DEXIE_ONLY_BETA_KEYS
+        ):
+            return _dexie_only_beta_response(effective_key)
         if key in _BLOCKED_KEYS:
             return jsonify(
                 {"success": False, "error": f"Cannot modify {key} via API"}

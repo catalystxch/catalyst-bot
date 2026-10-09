@@ -29,6 +29,24 @@ def test_existing_profile_cannot_restore_splash_flags(tmp_path, monkeypatch):
     assert candidate.update_persisted("SPLASH_RECEIVE_ENABLED", "true") is False
 
 
+def test_direct_release_lock_fails_silently(monkeypatch):
+    """The release lock must not bypass the structured logging convention."""
+    import config
+
+    candidate = object.__new__(config.Config)
+    candidate.DEXIE_ONLY_BETA = True
+    printed = MagicMock()
+    monkeypatch.setattr("builtins.print", printed)
+
+    assert config.Config.update(candidate, "SPLASH_ENABLED", "true") is False
+    assert (
+        config.Config.update_persisted(candidate, "SPLASH_RECEIVE_ENABLED", "true")
+        is False
+    )
+
+    printed.assert_not_called()
+
+
 def test_disabled_splash_manager_does_not_queue_or_flush(monkeypatch):
     """The publication manager must not retain offers while Splash is disabled."""
     import splash_manager
@@ -151,6 +169,34 @@ def test_beta_routes_reject_every_splash_mutation(monkeypatch):
     config_update.assert_not_called()
     bot.splash_node.start.assert_not_called()
     download.assert_not_called()
+
+
+def test_non_splash_single_config_key_keeps_original_spelling(monkeypatch):
+    """The beta check must not change existing single-key API semantics."""
+    import api_server
+
+    api_server.app.testing = True
+    client = api_server.app.test_client()
+    update = MagicMock(return_value=True)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server.cfg, "DEXIE_ONLY_BETA", True, raising=False)
+    monkeypatch.setattr(api_server.cfg, "update", update)
+
+    with api_mutations_permitted(api_server):
+        response = client.post(
+            "/api/config",
+            json={"key": "custom_setting", "value": "7"},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert response.status_code == 200
+    assert response.get_json()["key"] == "custom_setting"
+    update.assert_called_once_with(
+        "custom_setting",
+        "7",
+        source="api_settings_save",
+    )
 
 
 def test_beta_rejects_incoming_splash_even_if_stale_flag_is_true(monkeypatch):
