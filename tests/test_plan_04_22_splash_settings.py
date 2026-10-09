@@ -42,6 +42,7 @@ _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
 def _make_bot():
     bot = MagicMock()
+    bot._running = False
     bot.splash_manager.get_stats.return_value = {"total_sent": 0}
     bot.splash_manager.check_health.return_value = {"ok": True}
     bot.get_splash_receive_stats.return_value = {"enabled": False, "received": 0}
@@ -245,6 +246,31 @@ class TestSplashReceive(_FlaskBase):
         self.assertEqual(body["node_action"], "state_failed")
         bot.splash_node.start.assert_not_called()
         bot.splash_node.stop.assert_not_called()
+
+    def test_post_enabling_receive_starts_worker_for_running_bot(self):
+        bot = _make_bot()
+        bot._running = True
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": True})
+        self.assertEqual(resp.status_code, 200)
+        bot._start_splash_receive.assert_called_once_with()
+
+    def test_post_reports_receive_worker_start_failure(self):
+        bot = _make_bot()
+        bot._running = True
+        bot._start_splash_receive.side_effect = RuntimeError("worker unavailable")
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": True})
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 503)
+        self.assertIs(body["success"], False)
+        self.assertEqual(body["node_action"], "worker_failed")
 
 
 # ---------------------------------------------------------------------------

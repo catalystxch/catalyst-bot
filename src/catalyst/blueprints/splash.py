@@ -109,17 +109,19 @@ def api_splash_receive():
         except Exception:
             node_action = "error"
 
-    node_failed = node_action in {
-        "start_failed",
-        "restart_failed",
-        "state_failed",
-        "error",
-    }
-    if node_failed:
+    node_failures = {"start_failed", "restart_failed", "state_failed", "error"}
+    if enabled and getattr(bot, "_running", False) and node_action not in node_failures:
+        try:
+            bot._start_splash_receive()
+        except Exception:
+            node_action = "worker_failed"
+
+    runtime_failed = node_action in node_failures or node_action == "worker_failed"
+    if runtime_failed:
         log_event(
             "warning",
             "splash_receive_apply_failed",
-            f"Splash listening setting saved but node action failed ({node_action})",
+            f"Splash listening setting saved but runtime activation failed ({node_action})",
         )
     else:
         log_event(
@@ -140,14 +142,14 @@ def api_splash_receive():
     )
 
     response = {
-        "success": not node_failed,
+        "success": not runtime_failed,
         "enabled": enabled,
         "node_action": node_action,
         "stats": api_server._serialize_dict(payload),
     }
-    if node_failed:
+    if runtime_failed:
         response["error"] = (
-            "Splash listening setting was saved, but the node could not apply it"
+            "Splash listening setting was saved, but listening could not be activated"
         )
         return jsonify(response), 503
     return jsonify(response)
