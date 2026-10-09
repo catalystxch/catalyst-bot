@@ -92,29 +92,29 @@ def api_splash_receive():
     try:
         node_running = bool(bot.splash_node.is_running())
     except Exception:
-        node_running = False
+        node_action = "state_failed"
+    else:
+        try:
+            if node_running:
+                bot.splash_node.stop()
+                time.sleep(1)
+                if enabled or getattr(cfg, "SPLASH_ENABLED", False):
+                    restarted = bot.splash_node.start()
+                    node_action = "restarted" if restarted else "restart_failed"
+                else:
+                    node_action = "stopped"
+            elif enabled or getattr(cfg, "SPLASH_ENABLED", False):
+                started = bot.splash_node.start()
+                node_action = "started" if started else "start_failed"
+        except Exception:
+            node_action = "error"
 
-    try:
-        if node_running:
-            bot.splash_node.stop()
-            time.sleep(1)
-            if enabled or getattr(cfg, "SPLASH_ENABLED", False):
-                restarted = bot.splash_node.start()
-                node_action = "restarted" if restarted else "restart_failed"
-            else:
-                node_action = "stopped"
-        elif enabled or getattr(cfg, "SPLASH_ENABLED", False):
-            started = bot.splash_node.start()
-            node_action = "started" if started else "start_failed"
-    except Exception as e:
-        log_event(
-            "warning",
-            "splash_receive_toggle_failed",
-            f"Splash listener update failed: {e}",
-        )
-        node_action = "error"
-
-    node_failed = node_action in {"start_failed", "restart_failed", "error"}
+    node_failed = node_action in {
+        "start_failed",
+        "restart_failed",
+        "state_failed",
+        "error",
+    }
     if node_failed:
         log_event(
             "warning",

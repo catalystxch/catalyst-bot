@@ -6005,10 +6005,11 @@ class BotLoop:
         # inbound P2P offers while the bot happily kept quoting.
         self._start_splash_receive()
 
-        # V3: Auto-start Splash P2P node if enabled
-        if getattr(cfg, "SPLASH_ENABLED", False) and getattr(
-            cfg, "SPLASH_AUTO_START", True
-        ):
+        # Auto-start the managed node for outbound or inbound Splash.
+        if (
+            getattr(cfg, "SPLASH_ENABLED", False)
+            or getattr(cfg, "SPLASH_RECEIVE_ENABLED", False)
+        ) and getattr(cfg, "SPLASH_AUTO_START", True):
             try:
                 started = self.splash_node.start()
                 if started:

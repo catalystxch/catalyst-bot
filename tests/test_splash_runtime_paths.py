@@ -44,6 +44,30 @@ def test_splash_node_prefers_user_data_binary(monkeypatch):
     assert os.path.abspath(node.find_binary()) == os.path.abspath(binary_path)
 
 
+def test_receive_only_splash_can_start_managed_node(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", False, raising=False)
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.start() is True
+    assert node._thread.started is True
+    node.stop()
+
+
 def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):
     import splash_node
     from config import cfg

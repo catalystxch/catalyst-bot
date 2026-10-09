@@ -41,7 +41,7 @@ _BINARY_NAME = "splash.exe" if sys.platform == "win32" else "splash"
 class SplashNode:
     """Manages the Splash P2P binary as a subprocess.
 
-    The bot auto-starts Splash when SPLASH_ENABLED=true and a binary
+    The bot auto-starts Splash when outbound or receive is enabled and a binary
     is found. If the binary isn't found, it logs a helpful message
     and the bot continues without P2P (still posts to Dexie normally).
     """
@@ -137,9 +137,10 @@ class SplashNode:
 
         Returns True if started, False if binary not found or already running.
         """
-        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
-            cfg, "SPLASH_ENABLED", False
-        ):
+        splash_enabled = getattr(cfg, "SPLASH_ENABLED", False) or getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        )
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not splash_enabled:
             reason = (
                 "Splash node startup blocked: release is Dexie-only"
                 if getattr(cfg, "DEXIE_ONLY_BETA", False)
@@ -669,7 +670,10 @@ class SplashNode:
         # Avoid blocking every dashboard state snapshot on an unnecessary
         # network timeout.  Still probe when Splash is enabled or when a
         # manually-started managed process is actually running.
-        if not getattr(cfg, "SPLASH_ENABLED", False) and not process_running:
+        splash_enabled = getattr(cfg, "SPLASH_ENABLED", False) or getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        )
+        if not splash_enabled and not process_running:
             return result
 
         # A configured but stopped local node may be unreachable. A full HTTP

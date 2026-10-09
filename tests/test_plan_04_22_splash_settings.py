@@ -231,6 +231,21 @@ class TestSplashReceive(_FlaskBase):
         self.assertIs(body["success"], False)
         self.assertEqual(body["node_action"], "restart_failed")
 
+    def test_post_reports_unknown_node_state_after_config_save(self):
+        bot = _make_bot()
+        bot.splash_node.is_running.side_effect = OSError("process state unavailable")
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=True),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": False})
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 503)
+        self.assertIs(body["success"], False)
+        self.assertEqual(body["node_action"], "state_failed")
+        bot.splash_node.start.assert_not_called()
+        bot.splash_node.stop.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # GET /api/splash/node
