@@ -31,6 +31,17 @@ non-force fast-forward into draft PR #220's feature branch.
   `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\acceptance-8fb45649-py312-secondary-20261009\pytest-py312-full.log`,
   SHA-256 `9B8C4BF48E4B9397D2F18860E484D3D393D3BCC6871DF6F685370EE2A31C1AD1`.
   Its only warning is an unrelated existing pytest 10 deprecation.
+- The secondary PC independently streamed the pinned ZIP and installer over
+  HTTP and matched both SHA-256 hashes and byte lengths. It extracted the ZIP,
+  verified its 206 safe CRC-clean entries and embedded EXE/UI hashes, and
+  passed isolated packaged API, synthetic Sage RPC, publication recovery and
+  native clean/duplicate/persisted/safety smokes. Its existing production
+  registration made direct execution of the pinned installer unsafe, so that
+  machine checked installer identity and metadata only. Primary unique-AppId
+  install/API/Sage/uninstall covered the executable installer path. Secondary
+  report:
+  `C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\acceptance-8fb4564-primary-package-20261010T004410\acceptance-report.md`,
+  SHA-256 `13BB5E41AF871804DCFD37249E28290801C3FF5DA7A03D82B4A6462B8851F48E`.
 - Primary isolated Chromium: **260 passed**, exit 0. Log:
   `E:\catalyst-manual-coin-interlock-chromium.log`, SHA-256
   `D041CBCD07774E56D257C5B8937C99D8677C1BE4E30D18365006BD3596BAA4E4`.
@@ -74,9 +85,10 @@ expected SHA-256 hashes and byte lengths.
 
 ## Remaining gates
 
-The original TEST 7 profile still runs the prior exact `aba6667` executable
-in stopped, read-only safety monitoring. No real-wallet effect was made for
-this correction. Exact `b05a1cd` original-profile rollout, secondary
-original-profile acceptance, live active-offer lifecycle/recovery, real Splash
-peer receipt, complete native UI, both final-candidate 24-hour windows, and
-final review remain open. PR #220 stays draft; no public beta is deployed.
+The exact `b05a1cd` executable now runs the original TEST 7 profile in a
+stopped, read-only 25-hour window with a clean initial sample; see the
+[live rollover evidence](2026-10-10-b05a1cd-primary-live-stopped-window.md).
+No real-wallet effect was made for this correction. Secondary original-profile
+acceptance, live active-offer lifecycle/recovery, real Splash peer receipt,
+complete native UI, both final-candidate 24-hour audits, and final review
+remain open. PR #220 stays draft; no public beta is deployed.
