@@ -16171,6 +16171,7 @@ class BotLoop:
                             f"Error getting bech32 for {trade_id[:16]}...: {e}",
                         )
 
+            dexie_incomplete = False
             if count > 0:
                 if not self._enter_runtime_effect_phase("publication"):
                     log_event(
@@ -16181,8 +16182,17 @@ class BotLoop:
                         data={"reason": reason, "stage": "dexie_flush"},
                     )
                     return False
-                dexie_result = self.dexie_manager.flush_queue(flush_all=True)
+                try:
+                    dexie_result = self.dexie_manager.flush_queue(flush_all=True)
+                except Exception as e:
+                    dexie_result = None
+                    log_event(
+                        "warning",
+                        "dexie_repost_incomplete",
+                        f"Dexie repost raised during publication: {e}",
+                    )
                 required_counts = ("posted", "failed", "skipped")
+                dexie_result_valid = False
                 if (
                     type(dexie_result) is not dict
                     or any(
@@ -16197,38 +16207,42 @@ class BotLoop:
                         )
                     )
                 ):
-                    log_event(
-                        "warning",
-                        "dexie_repost_incomplete",
-                        "Dexie repost returned no trustworthy result",
+                    dexie_incomplete = True
+                    if dexie_result is not None:
+                        log_event(
+                            "warning",
+                            "dexie_repost_incomplete",
+                            "Dexie repost returned no trustworthy result",
+                        )
+                else:
+                    dexie_result_valid = True
+                    dexie_posted = dexie_result["posted"]
+                    dexie_skipped = dexie_result["skipped"]
+                    dexie_incomplete = (
+                        dexie_result["failed"] > 0
+                        or dexie_result.get("requeued", 0) > 0
+                        or dexie_result.get("disabled") is True
+                        or dexie_result.get("authorization_blocked") is True
+                        or dexie_result.get("budget_exhausted") is True
+                        or dexie_posted + dexie_skipped < count
                     )
-                    return False
-                dexie_posted = dexie_result["posted"]
-                dexie_skipped = dexie_result["skipped"]
-                if (
-                    dexie_result["failed"] > 0
-                    or dexie_result.get("requeued", 0) > 0
-                    or dexie_result.get("disabled") is True
-                    or dexie_result.get("authorization_blocked") is True
-                    or dexie_result.get("budget_exhausted") is True
-                    or dexie_posted + dexie_skipped < count
-                ):
+                if dexie_incomplete and dexie_result_valid:
                     log_event(
                         "warning",
                         "dexie_repost_incomplete",
                         "Dexie repost is incomplete",
                         data={"queued": count, **dexie_result},
                     )
-                    return False
-                log_event(
-                    "info",
-                    "dexie_repost_done",
-                    f"Posted {dexie_posted} offers to Dexie; "
-                    f"{dexie_skipped} skipped"
-                    + (" in the background " if background else " ")
-                    + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
-                    f"{skip_count} already live)",
-                )
+                elif not dexie_incomplete:
+                    log_event(
+                        "info",
+                        "dexie_repost_done",
+                        f"Posted {dexie_posted} offers to Dexie; "
+                        f"{dexie_skipped} skipped"
+                        + (" in the background " if background else " ")
+                        + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
+                        f"{skip_count} already live)",
+                    )
             if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
                 if not self._enter_runtime_effect_phase("publication"):
                     log_event(
@@ -16239,7 +16253,16 @@ class BotLoop:
                         data={"reason": reason, "stage": "splash_flush"},
                     )
                     return False
-                splash_result = self.splash_manager.flush_queue(flush_all=True)
+                try:
+                    splash_result = self.splash_manager.flush_queue(flush_all=True)
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        f"Splash local submission raised: {e}; "
+                        "peer delivery is unverified",
+                    )
+                    return False
                 required_counts = ("posted", "failed", "skipped", "requeued")
                 if type(splash_result) is not dict or any(
                     type(splash_result.get(key)) is not int or splash_result[key] < 0
@@ -16282,6 +16305,8 @@ class BotLoop:
                     "dexie_repost_done",
                     f"All {skip_count} offers already live on Dexie — nothing to repost",
                 )
+            if dexie_incomplete:
+                return False
 
         except Exception as e:
             log_event("error", "dexie_repost_failed", f"Dexie repost failed: {e}")
