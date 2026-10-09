@@ -34,4 +34,10 @@ The secondary original-profile 25-hour monitor is PID `13084`, bound to exact ap
 
 The primary exact-source monitor was still live and alert-free through sample 19 at **2026-10-09T19:29:02.050061Z**. All 11 checks on docs/evidence-only PR head `4895e8f475081410307eb10010c5a0059300f64d` completed successfully; PR #220 remained draft.
 
+## Secondary native UI attempt
+
+The secondary PC rechecked exact app PID `21196`, its path/hash and sole port-5000 ownership, Sage Harvestr identity/balances, zero pending/fillable offers and unresolved operations/fee holds, allowed safety, and both running monitors. Its original-profile monitor sample 16 at **2026-10-09T19:42:14.509776Z** and synthetic sample 26 had zero alerts; the synthetic sample had only its expected stale mock-wallet warning. The packaged `bot_gui.html` SHA-256 was `125FCB4CE9B68B4363C8E227ED29FDD6604CE6559A0950ABF16783AB03DBCA4B`.
+
+The Windows computer-control runtime failed twice before returning any window inventory with `failed to write kernel assets: The system cannot find the path specified. (os error 3)`. No screenshot, accessibility tree, click, keypress, disclosure acknowledgement, or other UI input occurred. Static elements and startup logs were present, but live rendering and interaction across the requested tabs were **not accepted**. Secondary evidence is `monitor-05341035-original-20261009T2025BST/NATIVE-UI-READONLY-ATTEMPT.md` (SHA-256 `F4FFFCD463319F585B92AF12220C31CC2F6CE085DD36F48530F23702784A385D`).
+
 The separate active-offer lifecycle and recovery, secondary original-profile acceptance, live Splash peer receipt, full native UI, and final review remain open. No new campaign or fee scope has been approved. PR #220 and website PR #89 remain draft; no merge, tag, release, or public-readiness claim was made.
