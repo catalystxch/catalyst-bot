@@ -23,6 +23,7 @@ import hashlib
 import platform
 import requests
 import threading
+import tempfile
 from typing import Dict, Optional, Callable
 
 from database import log_event
@@ -242,6 +243,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
     )
     install_path = info["install_path"]
     os.makedirs(os.path.dirname(install_path), exist_ok=True)
+    staged_path = None
 
     try:
         # (connect, read) — a 30s stall on the body is enough to declare the
@@ -253,7 +255,16 @@ def download_splash(progress_callback: Callable = None) -> Dict:
         total = int(r.headers.get("content-length", download_size))
         downloaded = 0
 
-        with open(install_path, "wb") as f:
+        # Verify a staged download before replacing an existing working node.
+        # Keeping it in the same directory makes the final rename atomic.
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{info['binary_name']}.",
+            suffix=".tmp",
+            dir=os.path.dirname(install_path),
+            delete=False,
+        ) as f:
+            staged_path = f.name
             for chunk in r.iter_content(chunk_size=65536):
                 f.write(chunk)
                 downloaded += len(chunk)
@@ -264,10 +275,10 @@ def download_splash(progress_callback: Callable = None) -> Dict:
     except Exception as e:
         msg = f"Download failed: {e}"
         log_event("error", "splash_setup", msg)
-        # Clean up partial download
-        if os.path.exists(install_path):
+        # A failed update must not delete the installed binary.
+        if staged_path and os.path.exists(staged_path):
             try:
-                os.remove(install_path)
+                os.remove(staged_path)
             except Exception:
                 pass
         return {"success": False, "message": msg, "path": ""}
@@ -280,7 +291,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
             sha_r = requests.get(sha256_url, timeout=10)
             expected_hash = sha_r.text.strip().split()[0].lower()
 
-            with open(install_path, "rb") as f:
+            with open(staged_path, "rb") as f:
                 actual_hash = hashlib.sha256(f.read()).hexdigest().lower()
 
             if actual_hash != expected_hash:
@@ -289,7 +300,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
                     f"Got: {actual_hash[:16]}... — download may be corrupted."
                 )
                 log_event("error", "splash_setup", msg)
-                os.remove(install_path)
+                os.remove(staged_path)
                 return {"success": False, "message": msg, "path": ""}
 
             _progress(90, "SHA256 verified OK")
@@ -300,7 +311,7 @@ def download_splash(progress_callback: Callable = None) -> Dict:
             msg = f"SHA256 verification failed: {e} — refusing to install unverified binary"
             log_event("error", "splash_setup", msg)
             try:
-                os.remove(install_path)
+                os.remove(staged_path)
             except Exception:
                 pass
             return {"success": False, "message": msg, "path": ""}
@@ -308,15 +319,26 @@ def download_splash(progress_callback: Callable = None) -> Dict:
     # Make executable on Unix
     if info["os"] != "windows":
         try:
-            st = os.stat(install_path)
+            st = os.stat(staged_path)
             os.chmod(
-                install_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+                staged_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
             )
             _progress(92, "Set executable permissions")
         except Exception as e:
             log_event(
                 "debug", "splash_setup", f"chmod failed (may need manual fix): {e}"
             )
+
+    try:
+        os.replace(staged_path, install_path)
+    except Exception as e:
+        msg = f"Splash install failed: {e}"
+        log_event("error", "splash_setup", msg)
+        try:
+            os.remove(staged_path)
+        except Exception:
+            pass
+        return {"success": False, "message": msg, "path": ""}
 
     # Verify the binary runs
     _progress(95, "Testing binary...")

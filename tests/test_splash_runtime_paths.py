@@ -1,5 +1,6 @@
 import os
 import time
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -240,6 +241,133 @@ def test_splash_download_refuses_release_without_checksum(monkeypatch):
     assert result["success"] is False
     assert "sha256" in result["message"].lower()
     assert requested_urls == []
+
+
+@pytest.mark.parametrize(
+    "failure", ["stream_interrupted", "checksum_mismatch", "replace_refused"]
+)
+def test_failed_splash_update_preserves_existing_binary(monkeypatch, tmp_path, failure):
+    import splash_setup
+
+    installed = tmp_path / "splash.exe"
+    installed.write_bytes(b"known-good-splash")
+    asset_url = "https://example.invalid/splash-amd64.exe"
+    checksum_url = asset_url + ".sha256"
+    monkeypatch.delenv("CATALYST_ALLOW_UNVERIFIED_SPLASH_DOWNLOAD", raising=False)
+    monkeypatch.setattr(
+        splash_setup,
+        "detect_platform",
+        lambda: {
+            "os": "windows",
+            "arch": "amd64",
+            "asset_name": "splash-amd64.exe",
+            "binary_name": "splash.exe",
+            "install_path": str(installed),
+        },
+    )
+    monkeypatch.setattr(
+        splash_setup,
+        "get_latest_release",
+        lambda: {
+            "tag": "v-test",
+            "assets": [
+                {"name": "splash-amd64.exe", "size": 7, "url": asset_url},
+                {"name": "splash-amd64.exe.sha256", "size": 64, "url": checksum_url},
+            ],
+        },
+    )
+
+    class BinaryResponse:
+        headers = {"content-length": "7"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield b"new-bad"
+            if failure == "stream_interrupted":
+                raise splash_setup.requests.ConnectionError("interrupted")
+
+    def fake_get(url, **kwargs):
+        if url == asset_url:
+            return BinaryResponse()
+        assert url == checksum_url
+        checksum_payload = b"new-bad" if failure == "replace_refused" else b"different"
+        return SimpleNamespace(text=hashlib.sha256(checksum_payload).hexdigest())
+
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+    if failure == "replace_refused":
+        monkeypatch.setattr(
+            splash_setup.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(PermissionError("binary in use")),
+        )
+
+    result = splash_setup.download_splash()
+
+    assert result["success"] is False
+    assert installed.read_bytes() == b"known-good-splash"
+    assert list(tmp_path.glob(".splash.exe.*.tmp")) == []
+
+
+def test_verified_splash_update_replaces_existing_binary(monkeypatch, tmp_path):
+    import splash_setup
+
+    installed = tmp_path / "splash.exe"
+    installed.write_bytes(b"known-good-splash")
+    downloaded = b"new-verified-splash"
+    asset_url = "https://example.invalid/splash-amd64.exe"
+    checksum_url = asset_url + ".sha256"
+    monkeypatch.delenv("CATALYST_ALLOW_UNVERIFIED_SPLASH_DOWNLOAD", raising=False)
+    monkeypatch.setattr(
+        splash_setup,
+        "detect_platform",
+        lambda: {
+            "os": "windows",
+            "arch": "amd64",
+            "asset_name": "splash-amd64.exe",
+            "binary_name": "splash.exe",
+            "install_path": str(installed),
+        },
+    )
+    monkeypatch.setattr(
+        splash_setup,
+        "get_latest_release",
+        lambda: {
+            "tag": "v-test",
+            "assets": [
+                {"name": "splash-amd64.exe", "size": len(downloaded), "url": asset_url},
+                {"name": "splash-amd64.exe.sha256", "size": 64, "url": checksum_url},
+            ],
+        },
+    )
+
+    class BinaryResponse:
+        headers = {"content-length": str(len(downloaded))}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield downloaded
+
+    def fake_get(url, **kwargs):
+        if url == asset_url:
+            return BinaryResponse()
+        assert url == checksum_url
+        return SimpleNamespace(text=hashlib.sha256(downloaded).hexdigest())
+
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="test"),
+    )
+
+    result = splash_setup.download_splash()
+
+    assert result["success"] is True
+    assert installed.read_bytes() == downloaded
+    assert list(tmp_path.glob(".splash.exe.*.tmp")) == []
 
 
 @pytest.mark.parametrize("receive_enabled", [False, True])
