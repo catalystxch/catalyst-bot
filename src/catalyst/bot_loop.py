@@ -6160,9 +6160,11 @@ class BotLoop:
 
         # V3: Stop Splash node
         splash_stop_failed = False
+        manager = getattr(self.splash_node, "_thread", None)
         if (
             self.splash_node.is_running()
             or getattr(self.splash_node, "_running", False) is True
+            or (manager is not None and manager.is_alive())
         ):
             try:
                 if self.splash_node.stop() is False:

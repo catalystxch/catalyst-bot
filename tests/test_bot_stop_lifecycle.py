@@ -204,3 +204,19 @@ def test_stop_retries_transient_splash_failure(monkeypatch):
     assert loop.stop(wait=True) is True
     assert attempts == [True, True]
     assert loop._bot_state["status"] == "stopped"
+
+
+def test_sync_stop_stays_incomplete_when_splash_manager_survives(monkeypatch):
+    loop, states, events = _loop_with_unstoppable_splash(monkeypatch)
+
+    class AliveManager:
+        def is_alive(self):
+            return True
+
+    loop.splash_node._running = False
+    loop.splash_node._thread = AliveManager()
+    loop.splash_node.is_running = lambda: False
+
+    assert loop.stop(wait=True) is False
+    assert states[-1]["status"] == "stopping"
+    assert "bot_stopped" not in events
