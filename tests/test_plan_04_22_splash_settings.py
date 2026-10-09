@@ -158,7 +158,7 @@ class TestSplashReceive(_FlaskBase):
         bot = _make_bot()
         with (
             patch.object(api_server, "bot", bot),
-            patch.object(api_server.cfg, "update"),
+            patch.object(api_server.cfg, "update", return_value=True),
             patch("api_server.log_event"),
         ):
             resp = self._post("/api/splash/receive", {"enabled": False})
@@ -169,11 +169,36 @@ class TestSplashReceive(_FlaskBase):
         bot = _make_bot()
         with (
             patch.object(api_server, "bot", bot),
-            patch.object(api_server.cfg, "update"),
+            patch.object(api_server.cfg, "update", return_value=True),
             patch("api_server.log_event"),
         ):
             resp = self._post("/api/splash/receive", {"enabled": True})
         self.assertIn("enabled", resp.get_json())
+
+    def test_post_rejects_non_boolean_enabled_without_starting_node(self):
+        bot = _make_bot()
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update") as update,
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": "false"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIs(resp.get_json()["success"], False)
+        update.assert_not_called()
+        bot.splash_node.start.assert_not_called()
+        bot.splash_node.stop.assert_not_called()
+
+    def test_post_reports_failed_config_write_without_starting_node(self):
+        bot = _make_bot()
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server.cfg, "update", return_value=False),
+        ):
+            resp = self._post("/api/splash/receive", {"enabled": True})
+        self.assertEqual(resp.status_code, 500)
+        self.assertIs(resp.get_json()["success"], False)
+        bot.splash_node.start.assert_not_called()
+        bot.splash_node.stop.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

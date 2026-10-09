@@ -79,9 +79,14 @@ def api_splash_receive():
     if request.method == "GET":
         return jsonify(api_server._serialize_dict(bot.get_splash_receive_stats()))
 
-    data = request.get_json(silent=True) or {}
-    enabled = bool(data.get("enabled", False))
-    cfg.update("SPLASH_RECEIVE_ENABLED", "true" if enabled else "false")
+    data = request.get_json(silent=True)
+    if type(data) is not dict or type(data.get("enabled")) is not bool:
+        return jsonify({"success": False, "error": "enabled must be a boolean"}), 400
+    enabled = data["enabled"]
+    if cfg.update("SPLASH_RECEIVE_ENABLED", "true" if enabled else "false") is not True:
+        return jsonify(
+            {"success": False, "error": "Failed to update Splash listening"}
+        ), 500
 
     node_action = "unchanged"
     try:
