@@ -299,6 +299,10 @@ def test_failed_splash_update_preserves_existing_binary(monkeypatch, tmp_path, f
     monkeypatch.setattr(splash_setup.requests, "get", fake_get)
     if failure == "replace_refused":
         monkeypatch.setattr(
+            "subprocess.run",
+            lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="test"),
+        )
+        monkeypatch.setattr(
             splash_setup.os,
             "replace",
             lambda *_args: (_ for _ in ()).throw(PermissionError("binary in use")),
@@ -307,8 +311,10 @@ def test_failed_splash_update_preserves_existing_binary(monkeypatch, tmp_path, f
     result = splash_setup.download_splash()
 
     assert result["success"] is False
+    if failure == "replace_refused":
+        assert "install failed" in result["message"].lower()
     assert installed.read_bytes() == b"known-good-splash"
-    assert list(tmp_path.glob(".splash.exe.*.tmp")) == []
+    assert list(tmp_path.glob(".splash.exe.*")) == []
 
 
 @pytest.mark.parametrize("probe_result", ["success", "nonzero", "oserror", "timeout"])
