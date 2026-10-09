@@ -70,3 +70,20 @@ must not retry cleanup by another method. The operator may remove these
 specific scratch directories directly after review, preferably after the
 historical monitor endpoint, then the agent can verify free space and stage
 the exact package. No deletion is recorded by this document.
+
+## Fresh exact-`32bfc52` staging calculation — 2026-10-09T09:28:57Z
+
+The secondary PC remeasured C: and the same seven reviewed directories
+read-only. All seven remain present and still total **959,346,377 bytes**;
+C: had **1,297,870,848 bytes** free before and after the scan. No cleanup or
+staging occurred. The independently verified exact ZIP is 36,514,935 bytes
+and its extracted content is 74,839,515 bytes. Keeping the ZIP on disk while
+extracting it and retaining the 2 GiB free-space floor requires
+**2,258,838,098 bytes** free before staging, a current shortfall of
+**960,967,250 bytes**. Keeping the separately pinned 38,429,357-byte
+installer as well requires **2,297,267,455 bytes**, a shortfall of
+**999,396,607 bytes**. Even hypothetical removal of all seven reviewed
+directories would leave **1,620,873 bytes** below the ZIP-plus-extraction
+threshold. This supersedes the earlier extraction-only projection above;
+the operator needs to free additional space before exact secondary package
+staging. The prior blocked cleanup decision remains in effect.
