@@ -16183,14 +16183,18 @@ class BotLoop:
                     return False
                 dexie_result = self.dexie_manager.flush_queue(flush_all=True)
                 required_counts = ("posted", "failed", "skipped")
-                if type(dexie_result) is not dict or any(
-                    type(dexie_result.get(key)) is not int or dexie_result[key] < 0
-                    for key in required_counts
-                ) or (
-                    "requeued" in dexie_result
-                    and (
-                        type(dexie_result["requeued"]) is not int
-                        or dexie_result["requeued"] < 0
+                if (
+                    type(dexie_result) is not dict
+                    or any(
+                        type(dexie_result.get(key)) is not int or dexie_result[key] < 0
+                        for key in required_counts
+                    )
+                    or (
+                        "requeued" in dexie_result
+                        and (
+                            type(dexie_result["requeued"]) is not int
+                            or dexie_result["requeued"] < 0
+                        )
                     )
                 ):
                     log_event(
