@@ -57,6 +57,11 @@ and isolated installer verified; original-profile live acceptance pending.
   `A47AB97E19A2724B1B38DE3C24D1C58BC70346CF16D7B886A2979F2A35624991`.
   Both package files report version 1.4.0; Defender custom scans returned
   no detections for the bundle and installer.
+- The exact ZIP, unsigned installer, and SHA manifest were pinned at artifact
+  commit `f880fecfce1caa2e0eb0998e27f1c8ebc9592c0a` on
+  `codex/coin-prep-fee-approval-artifacts`. Independent HTTP downloads of
+  both files matched the recorded hashes and byte counts. These are QA
+  artifacts, not a public beta release.
 - Full serial local Windows backend passed **7,521 tests, 259 skipped, and
   455 subtests** in 17m36s. Repository-wide Ruff and changed-file format
   checks passed. All 11 PR checks passed on the exact runtime/source commit.
@@ -72,5 +77,15 @@ and isolated installer verified; original-profile live acceptance pending.
   2026-10-09 approximately 12:27 UTC. Sample 76 observed the deliberate
   process exit and connection loss. It provides **no 24-hour credit** for
   `1affe7b`; retain the raw truncated trace as historical evidence.
+- The exact `1affe7b` EXE started against the original TEST 7 profile as
+  PID 70800 on 2026-10-09 at 12:34 UTC. The first read-only monitor sample
+  at 12:35:30 UTC bound that PID, executable path, SHA-256, and port 5000
+  owner; it reported a synced Sage fingerprint `736588221`, unchanged XCH
+  and MZ balances, zero pending/nonterminal offers, a stopped bot, zero DB
+  open offers/active campaigns/unresolved operations, and allowed safety with
+  an owned renewing lease. The authoritative trace is
+  `E:\catalyst-stability-monitor-1affe7b-primary\trace-60s.jsonl`.
+  The final-candidate stopped-profile 24-hour gate cannot be credited before
+  2026-10-10 12:35:30 UTC plus a complete trace and end-state audit.
 - A real second-peer exact-offer receipt, active-offer lifecycle, and both
   final-candidate 24-hour windows remain open. No wallet action was taken.
