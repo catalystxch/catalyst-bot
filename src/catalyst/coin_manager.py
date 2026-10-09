@@ -6281,7 +6281,7 @@ class CoinManager:
         bypass the emergency cooldown semantics.
         """
         with self._lock:
-            if self._topup_running:
+            if self._topup_running or self._prep_running:
                 return False
             self._topup_running = True
             self._topup_stop_requested = False

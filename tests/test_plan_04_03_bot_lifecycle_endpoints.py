@@ -106,6 +106,7 @@ class _FlaskBase(unittest.TestCase):
 def _make_bot(running=False, start_returns=True):
     bot = MagicMock()
     bot.is_running.return_value = running
+    bot.coin_manager.is_busy.return_value = False
     bot.start.return_value = start_returns
     bot.stop.return_value = None
     bot.get_state.return_value = {

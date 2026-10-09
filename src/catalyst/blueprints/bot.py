@@ -1130,6 +1130,15 @@ def api_bot_start():
     with server._bot_cancel_lifecycle_lock:
         if cancel_all_in_progress():
             return cancel_all_start_block()
+        if bot.coin_manager.is_busy():
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "COIN_MAINTENANCE_IN_PROGRESS",
+                    "error": "Wait for coin maintenance to finish before starting the bot",
+                }
+            ), 409
         # A stale flag would hide live-book recovery on restart. Fail before
         # bot.start(), since a failed cleanup after start would be too late.
         try:

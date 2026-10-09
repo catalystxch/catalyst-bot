@@ -1279,20 +1279,20 @@ def api_coin_topup():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    # Block if bot is live — topup splits coins and races with offer creation
-    if not bot.is_stopped():
-        return jsonify(
-            {
-                "error": "Stop the bot before manual top-up. "
-                "The bot handles top-up automatically while running.",
-                "requires_stop": True,
-            }
-        ), 409
+    # Serialize the stopped proof and worker reservation with bot start.
+    with api_server._bot_cancel_lifecycle_lock:
+        if not bot.is_stopped():
+            return jsonify(
+                {
+                    "error": "Stop the bot before manual top-up. "
+                    "The bot handles top-up automatically while running.",
+                    "requires_stop": True,
+                }
+            ), 409
 
-    open_buys = bot.offer_manager.get_open_offer_count("buy")
-    open_sells = bot.offer_manager.get_open_offer_count("sell")
-
-    started = bot.coin_manager.start_topup(open_buys, open_sells)
+        open_buys = bot.offer_manager.get_open_offer_count("buy")
+        open_sells = bot.offer_manager.get_open_offer_count("sell")
+        started = bot.coin_manager.start_topup(open_buys, open_sells)
     return jsonify({"status": "started" if started else "already_running"})
 
 
@@ -1303,34 +1303,34 @@ def api_coin_prep():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    # Block if bot is live — coin prep splits/combines and races with offer creation
-    if not bot.is_stopped():
-        return jsonify(
-            {
-                "error": "Stop the bot before manual coin prep. "
-                "Runtime top-up can refill prepared spares while running; "
-                "full coin prep cancels and rebuilds the wallet layout.",
-                "requires_stop": True,
-            }
-        ), 409
-
-    body = request.get_json(silent=True)
-    fee_approval_id = body.get("fee_approval_id") if type(body) is dict else None
-    if (
-        type(fee_approval_id) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
-    ):
-        return (
-            jsonify(
+    # Keep the stopped proof atomic with the worker's busy reservation.
+    with api_server._bot_cancel_lifecycle_lock:
+        if not bot.is_stopped():
+            return jsonify(
                 {
-                    "success": False,
-                    "reason": "FEE_APPROVAL_REQUIRED",
-                    "dispatch_authorized": False,
+                    "error": "Stop the bot before manual coin prep. "
+                    "Runtime top-up can refill prepared spares while running; "
+                    "full coin prep cancels and rebuilds the wallet layout.",
+                    "requires_stop": True,
                 }
-            ),
-            409,
-        )
-    started = bot.coin_manager.start_coin_prep(fee_approval_id=fee_approval_id)
+            ), 409
+        body = request.get_json(silent=True)
+        fee_approval_id = body.get("fee_approval_id") if type(body) is dict else None
+        if (
+            type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_REQUIRED",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        started = bot.coin_manager.start_coin_prep(fee_approval_id=fee_approval_id)
     return jsonify({"status": "started" if started else "already_running"})
 
 
