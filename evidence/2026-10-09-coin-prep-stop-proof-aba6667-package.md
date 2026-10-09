@@ -65,8 +65,21 @@ custom scans of the EXE, ZIP and installer completed without candidate-tied
 detections. Manifest `SHA256SUMS-aba6667.txt` SHA-256:
 `294C7A4FF37E0FD7A858D111CF1564BEAB71259347E8E6B5E8927A5BF9319AEA`.
 
-This package is not yet the PR #220 candidate. PR integration and CI,
-immutable artifact publication and HTTP hash audit remain open.
+The ZIP, versioned installer, and published manifest are pinned at artifact
+commit `c1fc63d565bded00947574ea0f08ac4c4d2eac1d`:
+
+- [Acceptance ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/c1fc63d565bded00947574ea0f08ac4c4d2eac1d/acceptance-artifacts/CATalyst-aba6667-primary-acceptance.zip)
+- [Unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/c1fc63d565bded00947574ea0f08ac4c4d2eac1d/acceptance-artifacts/Catalyst-Setup-aba6667-1.4.0.exe)
+- [Published manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/c1fc63d565bded00947574ea0f08ac4c4d2eac1d/acceptance-artifacts/SHA256SUMS-aba6667.txt)
+
+Independent HTTP downloads of both binaries matched their expected SHA-256
+hashes. The published manifest SHA-256 is
+`1370228390F9335302F367DC4058773016320986E8BFCDFAD569DCC511FC917B`;
+Git stores it with LF line endings, while the local PowerShell copy uses CRLF.
+The local source-build manifest hash above is a separate file with the
+unversioned installer name.
+
+This package is not yet the PR #220 candidate. PR integration and CI remain open.
 Original-profile live testing remains on prior source
 `0534103`; no wallet effect was made for this fix. No 24-hour credit transfers
 between source candidates. PR #220 stays draft.
