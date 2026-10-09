@@ -19,6 +19,8 @@
 
 Packaged API, synthetic Sage RPC, upgrade publication recovery, and native clean/duplicate/persisted/safety launch smokes passed. The extracted ZIP passed packaged API and synthetic Sage RPC smokes. A unique-AppId QA installer installed to an isolated directory, its installed EXE matched the clean build, its API and Sage smokes passed, and its uninstaller removed the directory and registration with exit zero. Defender custom scans of the bundle, ZIP, and installer completed without a matching detection.
 
+The secondary PC independently retrieved both commit-pinned artifacts over HTTPS without saving them to disk. Its ZIP and installer SHA-256 values matched this manifest. In memory, it verified all 192 ZIP entries are unique, case-fold unique, path-safe, unencrypted, and CRC-clean; the embedded EXE and UI hashes also matched. Its exact-source, package-independent review passed Git connectivity, whitespace, raw-blob Python syntax, and zero-cache Ruff checks. An in-memory stop-method regression reproduced the prior manager-alive false-stop result and the corrected fail-closed result on `60eed8c`. No secondary extraction, install, runtime launch, or original-profile acceptance is claimed. C: free space was 2.064 GiB after these checks, leaving only about 65 MiB over the required 2 GiB post-staging reserve.
+
 ## Live status and remaining gates
 
 At the package checkpoint the original TEST 7 profile still ran the prior `b10cfa3` binary. On 2026-10-09, the old stopped app was closed through its native window after verifying its path, hash, zero open offers and active campaigns, and allowed safety state. Its historical read-only monitor was ended for a planned candidate rollover and earns **no** 24-hour credit.
