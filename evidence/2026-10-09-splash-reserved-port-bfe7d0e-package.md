@@ -38,6 +38,15 @@ Independent HTTP downloads of the ZIP and installer matched local lengths
 and SHA-256 hashes. The downloaded manifest matched after normalizing Git
 line endings.
 
+The exact package also passed a separate same-AppId isolated update path:
+install the preceding `12e4cfc` package, upgrade to `bfe7d0e`, compare all
+192 installed bundle files byte-for-byte with the new build, run installed
+API and synthetic Sage smokes, roll back to the preceding package, restore
+`bfe7d0e`, and uninstall. The executable hashes changed in the expected
+old/new/old/new sequence, only one uninstaller pair remained after each
+transition, and the isolated uninstall key and directory were absent at
+the end. The original TEST 7 process remained untouched.
+
 | Artifact | SHA-256 |
 | --- | --- |
 | `E:\catalyst-splash-bfe7d0e-build\dist\Catalyst\Catalyst.exe` | `7C9A180E39E3D398377AD80C2F8AC490DB923D158E445779465DD0E35D478ACC` |
