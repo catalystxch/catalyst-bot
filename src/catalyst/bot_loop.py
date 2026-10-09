@@ -15952,7 +15952,7 @@ class BotLoop:
                 log_event(
                     "info",
                     "splash_repost_background",
-                    "Confirming existing offers over Splash in the background",
+                    "Checking local Splash submission for existing offers in the background",
                 )
 
             def _worker():
@@ -16190,25 +16190,7 @@ class BotLoop:
                     + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
                     f"{skip_count} already live)",
                 )
-                # Also broadcast to Splash if enabled (V3)
-                if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
-                    if not self._enter_runtime_effect_phase("publication"):
-                        log_event(
-                            "warning",
-                            "splash_repost_market_blocked",
-                            "Skipped queued Splash repost because market confidence "
-                            "expired before publication",
-                            data={"reason": reason, "stage": "splash_flush"},
-                        )
-                        return False
-                    self.splash_manager.flush_queue(flush_all=True)
-                    log_event(
-                        "info",
-                        "splash_repost_done",
-                        f"Confirmed {splash_count} offers over Splash"
-                        + (" in the background" if background else ""),
-                    )
-            elif getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+            if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
                 if not self._enter_runtime_effect_phase("publication"):
                     log_event(
                         "warning",
@@ -16218,14 +16200,44 @@ class BotLoop:
                         data={"reason": reason, "stage": "splash_flush"},
                     )
                     return False
-                self.splash_manager.flush_queue(flush_all=True)
+                splash_result = self.splash_manager.flush_queue(flush_all=True)
+                required_counts = ("posted", "failed", "skipped", "requeued")
+                if type(splash_result) is not dict or any(
+                    type(splash_result.get(key)) is not int or splash_result[key] < 0
+                    for key in required_counts
+                ):
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        "Splash local submission returned no trustworthy result; "
+                        "peer delivery is unverified",
+                    )
+                    return False
+                posted = splash_result["posted"]
+                skipped = splash_result["skipped"]
+                if (
+                    splash_result["failed"] > 0
+                    or splash_result["requeued"] > 0
+                    or splash_result.get("authorization_blocked") is True
+                    or splash_result.get("budget_exhausted") is True
+                    or posted + skipped < splash_count
+                ):
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        "Splash local submission is incomplete; peer delivery is "
+                        "unverified",
+                        data={"queued": splash_count, **splash_result},
+                    )
+                    return False
                 log_event(
                     "info",
                     "splash_repost_done",
-                    f"Confirmed {splash_count} offers over Splash"
+                    f"Submitted {posted} offers to local Splash node; "
+                    f"{skipped} skipped; peer delivery unverified"
                     + (" in the background" if background else ""),
                 )
-            else:
+            elif count == 0:
                 log_event(
                     "info",
                     "dexie_repost_done",
@@ -16234,6 +16246,7 @@ class BotLoop:
 
         except Exception as e:
             log_event("error", "dexie_repost_failed", f"Dexie repost failed: {e}")
+            return False
 
     # -------------------------------------------------------------------
     # Health Monitor Thread (V1 parity)
