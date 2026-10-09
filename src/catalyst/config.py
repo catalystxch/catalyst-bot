@@ -24,6 +24,12 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values, load_dotenv, set_key
 
 
+# v1.4 beta is intentionally Dexie-only. Keep this as a release invariant,
+# rather than a user setting, so legacy profiles cannot reactivate Splash.
+DEXIE_ONLY_BETA = True
+_DEXIE_ONLY_BETA_LOCKED_KEYS = frozenset({"SPLASH_ENABLED", "SPLASH_RECEIVE_ENABLED"})
+
+
 def _find_env_example_path(install_dir: str) -> str:
     """Find the bundled `.env.example` across source and frozen layouts."""
     roots = []
@@ -955,8 +961,11 @@ class Config:
         self.COMPETITOR_AWARE_ENABLED = _bool("COMPETITOR_AWARE_ENABLED", False)
         self.DBX_MAX_SPREAD_BPS = _decimal("DBX_MAX_SPREAD_BPS", "500")
 
-        # ----- Splash Network (V3 — decentralized offer broadcasting) -----
-        self.SPLASH_ENABLED = _bool("SPLASH_ENABLED", False)
+        # ----- Splash Network (disabled for the Dexie-only v1.4 beta) -----
+        self.DEXIE_ONLY_BETA = DEXIE_ONLY_BETA
+        self.SPLASH_ENABLED = (
+            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_ENABLED", False)
+        )
         self.SPLASH_SUBMIT_URL = _str("SPLASH_SUBMIT_URL", "http://localhost:4000")
         self.SPLASH_POST_RETRIES = _int("SPLASH_POST_RETRIES", 2)
         self.SPLASH_POST_TIMEOUT = _int("SPLASH_POST_TIMEOUT", 15)
@@ -964,7 +973,9 @@ class Config:
             self.SPLASH_POST_RETRY_SLEEP = float(_str("SPLASH_POST_RETRY_SLEEP", "1.5"))
         except (ValueError, TypeError):
             self.SPLASH_POST_RETRY_SLEEP = 1.5
-        self.SPLASH_RECEIVE_ENABLED = _bool("SPLASH_RECEIVE_ENABLED", True)
+        self.SPLASH_RECEIVE_ENABLED = (
+            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_RECEIVE_ENABLED", True)
+        )
         self.SPLASH_RECEIVE_POLL_SECS = _int("SPLASH_RECEIVE_POLL_SECS", 5)
         self.SPLASH_RECEIVE_BATCH_SIZE = _int("SPLASH_RECEIVE_BATCH_SIZE", 10)
         self.SPLASH_RECEIVE_VIEW_RETRIES = _int("SPLASH_RECEIVE_VIEW_RETRIES", 3)
@@ -1440,6 +1451,13 @@ class Config:
 
         Returns True if successful.
         """
+        if (
+            getattr(self, "DEXIE_ONLY_BETA", False)
+            and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
+        ):
+            print(f"[CONFIG] Blocked {key}: v1.4 beta is Dexie-only")
+            return False
+
         if key not in self._UPDATABLE_KEYS:
             print(f"[CONFIG] Blocked update of non-updatable key: {key}")
             return False
@@ -1535,6 +1553,13 @@ class Config:
         bot restart, leaving the current live book governed by the config it
         started with.
         """
+        if (
+            getattr(self, "DEXIE_ONLY_BETA", False)
+            and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
+        ):
+            print(f"[CONFIG] Blocked {key}: v1.4 beta is Dexie-only")
+            return False
+
         if key not in self._UPDATABLE_KEYS:
             print(f"[CONFIG] Blocked update of non-updatable key: {key}")
             return False

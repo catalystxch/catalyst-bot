@@ -1,6 +1,16 @@
 import os
 import time
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _exercise_dormant_splash_subsystem(monkeypatch):
+    """Keep legacy subsystem tests independent from the v1.4 release gate."""
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "DEXIE_ONLY_BETA", False, raising=False)
+
 
 def test_splash_install_path_lives_under_user_data():
     import splash_setup

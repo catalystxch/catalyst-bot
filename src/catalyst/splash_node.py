@@ -137,6 +137,16 @@ class SplashNode:
 
         Returns True if started, False if binary not found or already running.
         """
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
+            cfg, "SPLASH_ENABLED", False
+        ):
+            log_event(
+                "info",
+                "splash_node_disabled",
+                "Splash node startup blocked: v1.4 beta is Dexie-only",
+            )
+            return False
+
         if self._running:
             log_event("info", "splash_node", "Splash node already running")
             return False

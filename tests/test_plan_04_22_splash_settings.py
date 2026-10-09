@@ -56,6 +56,9 @@ class _FlaskBase(unittest.TestCase):
 
     def setUp(self):
         api_server.app.testing = True
+        beta_patch = patch.object(api_server.cfg, "DEXIE_ONLY_BETA", False, create=True)
+        beta_patch.start()
+        self.addCleanup(beta_patch.stop)
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
