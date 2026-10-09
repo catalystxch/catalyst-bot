@@ -47,8 +47,14 @@ line endings.
 
 The secondary PC independently verified the exact source and startup port
 flow, ran 20 focused tests, all 258 Chromium tests, and changed-file Ruff,
-and left its source checkout clean. Its limited C: space precluded
-extraction, package or live acceptance.
+and left its source checkout clean. It also downloaded the immutable ZIP,
+installer and manifest in memory over HTTP. The ZIP and installer hashes,
+embedded EXE/UI hashes and manifest matched. The ZIP contained 242 safe,
+unique entries, passed complete CRC testing, and had no symlink or encrypted
+entries. The installer had no embedded Authenticode certificate. Its limited
+C: space precluded extraction, installation or live acceptance; C: free
+remained 1,315,758,080 bytes (~1.225 GiB). The secondary original profile,
+wallet and Splash daemon were untouched.
 
 ## Live gates
 
