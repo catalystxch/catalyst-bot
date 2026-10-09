@@ -166,7 +166,12 @@ class SplashNode:
             return False
 
         with self._lifecycle_lock:
-            if self._stopping or self._running or self.is_running():
+            if (
+                self._stopping
+                or self._running
+                or self.is_running()
+                or (self._thread is not None and self._thread.is_alive())
+            ):
                 log_event("info", "splash_node", "Splash node already running")
                 return False
             stop_epoch = self._stop_epoch
@@ -231,6 +236,7 @@ class SplashNode:
                 or self._stop_epoch != stop_epoch
                 or self._running
                 or self.is_running()
+                or (self._thread is not None and self._thread.is_alive())
             ):
                 return False
             self._stop_event.clear()

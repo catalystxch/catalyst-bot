@@ -6056,13 +6056,27 @@ class BotLoop:
         Returns True if stopped, False if not running.
         """
         if not self._running:
-            if (
-                wait
-                and self._stop_finalize_thread
-                and self._stop_finalize_thread.is_alive()
-            ):
-                self._stop_finalize_thread.join(timeout=90)
-            return False
+            finalizer = self._stop_finalize_thread
+            if finalizer and finalizer.is_alive():
+                if wait:
+                    finalizer.join(timeout=90)
+                if finalizer.is_alive():
+                    return False
+            with self._state_lock:
+                stop_pending = self._bot_state.get("status") == "stopping"
+            if not stop_pending:
+                return False
+            if not wait:
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+                return True
+            self._finalize_stop()
+            with self._state_lock:
+                return self._bot_state.get("status") == "stopped"
 
         self._running = False
         self._set_state(running=False, status="stopping")
@@ -6280,7 +6294,12 @@ class BotLoop:
                 splash_running = bool(self.splash_node.is_running())
             except Exception:
                 splash_running = True
-            if splash_running or getattr(self.splash_node, "_running", False) is True:
+            manager = getattr(self.splash_node, "_thread", None)
+            if (
+                splash_running
+                or getattr(self.splash_node, "_running", False) is True
+                or (manager is not None and manager.is_alive())
+            ):
                 try:
                     if self.splash_node.stop() is False:
                         splash_stop_failed = True
@@ -6353,13 +6372,20 @@ class BotLoop:
             node_running = bool(self.splash_node.is_running())
         except Exception:
             node_running = False
-        stats["active"] = bool(
+        ready_candidate = bool(
             stats["enabled"]
             and getattr(self, "_running", False)
             and receive_thread is not None
             and receive_thread.is_alive()
             and node_running
         )
+        try:
+            listener_ready = bool(
+                ready_candidate and self.splash_node.check_health().get("api_reachable")
+            )
+        except Exception:
+            listener_ready = False
+        stats["active"] = listener_ready
         stats["pair_asset_id"] = asset_id
         stats["pair_label"] = self._current_splash_pair_label()
         stats["poll_secs"] = getattr(self, "_splash_receive_interval", 5)

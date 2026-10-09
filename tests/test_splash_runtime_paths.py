@@ -283,6 +283,30 @@ def test_splash_start_cannot_pass_stop_waiting_for_old_manager(monkeypatch):
         node.stop()
 
 
+def test_splash_start_rejects_manager_that_outlived_stop_timeout(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class HungManager:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            assert timeout == 5
+
+    node = splash_node.SplashNode()
+    node._running = True
+    node._thread = HungManager()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.stop() is False
+    assert node.start() is False
+    assert isinstance(node._thread, HungManager)
+
+
 def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):
     import splash_node
     from config import cfg
@@ -476,6 +500,40 @@ def test_receive_worker_without_splash_child_is_not_active(monkeypatch):
     loop._splash_receive_batch_size = 10
 
     assert loop.get_splash_receive_stats()["active"] is False
+
+
+def test_receive_worker_waits_for_splash_listener_before_active(monkeypatch):
+    import bot_loop
+    import database
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "CAT_ASSET_ID", "ab" * 32, raising=False)
+    monkeypatch.setattr(database, "get_splash_incoming_stats", lambda **_kw: {})
+
+    class LiveWorker:
+        def is_alive(self):
+            return True
+
+    class StartingNode:
+        def is_running(self):
+            return True
+
+        def check_health(self):
+            return {"api_reachable": False}
+
+        def get_metrics(self):
+            return {}
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._splash_receive_thread = LiveWorker()
+    loop.splash_node = StartingNode()
+    loop._splash_receive_interval = 5
+    loop._splash_receive_batch_size = 10
+    assert loop.get_splash_receive_stats()["active"] is False
+    loop.splash_node.check_health = lambda: {"api_reachable": True}
+    assert loop.get_splash_receive_stats()["active"] is True
 
 
 def test_splash_download_refuses_release_without_checksum(monkeypatch):

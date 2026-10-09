@@ -182,3 +182,25 @@ def test_async_stop_stays_incomplete_when_splash_child_survives(monkeypatch):
 
     assert states[-1]["status"] == "stopping"
     assert "bot_stopped" not in events
+
+
+def test_stop_retries_transient_splash_failure(monkeypatch):
+    loop, states, _events = _loop_with_unstoppable_splash(monkeypatch)
+    loop._state_lock = threading.Lock()
+    loop._bot_state = {"status": "running"}
+    loop._set_state = lambda **updates: (
+        loop._bot_state.update(updates),
+        states.append(updates),
+    )
+    attempts = []
+
+    def stop_splash():
+        attempts.append(True)
+        return len(attempts) > 1
+
+    loop.splash_node.stop = stop_splash
+    assert loop.stop(wait=True) is False
+    assert loop._bot_state["status"] == "stopping"
+    assert loop.stop(wait=True) is True
+    assert attempts == [True, True]
+    assert loop._bot_state["status"] == "stopped"
