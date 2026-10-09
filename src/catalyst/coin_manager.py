@@ -4188,8 +4188,7 @@ class CoinManager:
                         if c.get("wallet_type") == "cat" and c.get("status") == "free"
                     )
                     if _xch_free != self._xch_coins or _cat_free != self._cat_coins:
-                        self._xch_coins = _xch_free
-                        self._cat_coins = _cat_free
+                        self._xch_coins, self._cat_coins = _xch_free, _cat_free
             except Exception:
                 pass
             return (self._xch_coins, self._cat_coins)
@@ -4237,8 +4236,6 @@ class CoinManager:
                         f"Retry succeeded: {len(xch_records)} XCH coins found",
                     )
 
-            self._xch_coins = len(xch_records)
-
             # CAT — spendable coins
             # V3: uses Coinset fast path if available, falls back to wallet RPC
             cat_owned_snapshot = (
@@ -4279,8 +4276,6 @@ class CoinManager:
                         f"Retry succeeded: {len(cat_records)} CAT coins found",
                     )
 
-            self._cat_coins = len(cat_records)
-
             # ---- Step 1: Persist coins to database FIRST ----
             # This ensures DB rows exist so set_coin_designation() UPDATE works
             # during classification. Without this, new coins get designated in
@@ -4312,6 +4307,11 @@ class CoinManager:
                         "Sage owned-coin view is incomplete; skipping coin persistence",
                     )
                     return (self._xch_coins, self._cat_coins)
+
+            # Publish the wallet counts together only after both sides have
+            # supplied a complete view. A CAT read failure must not leave a
+            # fresh XCH count paired with a stale CAT count in stopped status.
+            self._xch_coins, self._cat_coins = len(xch_records), len(cat_records)
 
             self._persist_coins_to_db(xch_records, "xch", {}, xch_owned_ids)
             self._persist_coins_to_db(cat_records, "cat", {}, cat_owned_ids)
