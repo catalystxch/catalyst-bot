@@ -208,8 +208,7 @@ jobs:
             --json body --jq .body | Set-Content -Encoding utf8 release_notes.md
           python scripts/sanitize_release_notes.py `
             release_notes.md `
-            release_notes_sanitized.md `
-            --private-repo $env:SOURCE_REPOSITORY
+            release_notes_sanitized.md
           $sourceNotes = Get-Content -Raw -LiteralPath release_notes_sanitized.md
           $warning = @"
           ## Windows unsigned beta
