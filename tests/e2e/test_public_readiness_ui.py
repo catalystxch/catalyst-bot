@@ -161,6 +161,34 @@ def test_bootstrap_preview_shows_effective_one_sided_authority(
     assert f"{buy_count} buy / {sell_count} sell offers" in panel
 
 
+def test_bootstrap_review_sends_current_unsaved_liquidity_mode(page):
+    _open_gui(page)
+    mode = page.evaluate(
+        """() => {
+            _bootstrapSelectedPair = () => ({asset_id: 'ab'.repeat(32), ticker: 'MZ'});
+            setLiquidityMode('two_sided', {silent: true});
+            return _bootstrapBuildReviewBody().liquidity_mode;
+        }"""
+    )
+    assert mode == "two_sided"
+
+
+def test_bootstrap_preview_explains_unsaved_liquidity_mode(page):
+    _open_gui(page)
+    panel = page.evaluate(
+        """async () => {
+            _bootstrapBuildReviewBody = () => ({asset_id: 'ab'.repeat(32)});
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, code: 'bootstrap_liquidity_mode_unsaved'
+            }), {status: 409});
+            await bootstrapPreviewCampaign();
+            return document.getElementById('bootstrapStatusPanel').textContent;
+        }"""
+    )
+    assert "Save & Continue" in panel
+    assert "preview" in panel.lower()
+
+
 def test_stopped_bootstrap_clears_stale_authority_and_asset_confirmation(page):
     """A stopped campaign must not leave its old authority review armed in the UI."""
     _open_gui(page)
