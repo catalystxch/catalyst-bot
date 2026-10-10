@@ -31,3 +31,27 @@ single controlled run above. This synthetic window cannot earn a completed
 24-hour gate before **2026-10-10T23:53:01.125148Z** plus full-file and
 end-state audits. It does not replace secondary original-profile acceptance,
 which remains open after a policy-rejected exact-candidate launch.
+
+At **2026-10-10T00:02:03.000476Z**, the secondary PC verified ten
+sequential exact-PID/hash samples with zero alerts. CATalyst PID `5656`
+still alone owned port `55296`; monitor PID `22808` was alive. The bot was
+stopped, the lease owned and renewing, safety allowed, and all durable
+offer, Coin Prep, fee-reservation, publication, and worker-delegation counts
+were zero. The synthetic Sage server saw no mutating RPC. C: had **4.586 GiB**
+free after the operator made space. The 25-hour monitor was left running.
+
+Using a separate ephemeral profile and ports `56045`/`56044`, the secondary
+PC also ran an exact-EXE private-API probe. Nine protected GET/HEAD routes
+returned `401` without the local credential and `200` with it:
+`/api/status`, `/api/coin-prep/status`, `/api/bootstrap/status`,
+`/api/health/runtime`, `/api/sage/fingerprints`,
+`/api/sage/cert-candidates`, `/api/offers/diagnostic`,
+`/api/reservations`, and `/api/coins`. An authenticated repair query failed
+closed with `400` (`repair_requires_internal_cycle`), and a credentialed
+cross-site status request failed with `403` (`origin_not_allowed`). The
+separate app exited normally; the original profile, real Sage, port `5000`,
+and the running 25-hour monitor were untouched. The probe result is at
+`C:\Users\M920q\Documents\Codex\2026-09-14\catalyst-v1-4-0-secondary-pc\evidence\acceptance-b05-isolated-security-20261010T0105BST`,
+SHA-256 `BC211101959BD109135C69D04F1D44D59F4995D2D76CA13295F71B0CD4A2116A`;
+the probe harness SHA-256 is
+`4F26758E6EE2232B64C7CE05C1204B23D5CA11E3C9B2BCDD7FA5A2A8C63FA509`.
