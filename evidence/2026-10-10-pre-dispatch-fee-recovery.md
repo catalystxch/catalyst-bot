@@ -12,7 +12,7 @@ The 16:33:23 UTC quote was the UI consent preview. The worker generated a separa
 
 - A quote with less than ten seconds remaining is rejected before a wallet-effect claim is made.
 - On a fee validation failure before dispatch, the worker attempts a fresh read-only exact-cohort proof. No proof leaves the safety fence intact.
-- Startup recovery can terminally release an exact `PREPARED` no-dispatch claim only when the authoritative view is current, bound to the stored wallet identity, contains every source and fee coin as selectable, and has no pending transaction. The database atomically rechecks no constructed outputs, fee hold/outcome, or dispatch before recording `RELEASED_NO_EFFECT`, a failed no-effect operation, and latch resolution.
+- Startup recovery can terminally release an exact `PREPARED` no-dispatch claim, including one earlier marked `SUBMITTED_UNKNOWN` solely because observation was unavailable. The authoritative view must be current, bound to the stored wallet identity, contain every source and fee coin as selectable, and have no pending transaction. The database atomically rechecks no constructed outputs, fee hold/outcome, or dispatch before recording `RELEASED_NO_EFFECT`, a failed no-effect operation, and latch resolution.
 - The rejected quote is now logged with observed/expiry time and quoted versus validated cost and fee, without wallet secrets.
 
 ## Verification and limits

@@ -9745,7 +9745,7 @@ class CoinPrepWorker:
                         operation.get("effect_fee_coin_ids_json") or "[]"
                     )
                     if (
-                        operation.get("outcome") == "PREPARED"
+                        operation.get("outcome") in {"PREPARED", "SUBMITTED_UNKNOWN"}
                         and operation.get("effect_dispatch_token") is None
                     ):
                         from database import recover_coin_prep_predispatch_no_effect

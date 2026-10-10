@@ -2669,7 +2669,10 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                            NEW.evidence_json, '$.adapter_operation')
                      AND prep.effect_claim_token=NEW.claim_token
                      AND prep.effect_claim_generation=NEW.generation
-                     AND prep.outcome='PREPARED'
+                     AND prep.outcome IN ('PREPARED','SUBMITTED_UNKNOWN')
+                     AND (prep.outcome='PREPARED' OR
+                          json_extract(prep.outcome_evidence_json,
+                                       '$.dispatch_outcome')='PREPARED')
                      AND prep.constructed_outputs_json IS NULL
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
@@ -5361,7 +5364,10 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                            NEW.evidence_json, '$.adapter_operation')
                      AND prep.effect_claim_token=NEW.claim_token
                      AND prep.effect_claim_generation=NEW.generation
-                     AND prep.outcome='PREPARED'
+                     AND prep.outcome IN ('PREPARED','SUBMITTED_UNKNOWN')
+                     AND (prep.outcome='PREPARED' OR
+                          json_extract(prep.outcome_evidence_json,
+                                       '$.dispatch_outcome')='PREPARED')
                      AND prep.constructed_outputs_json IS NULL
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
@@ -11582,7 +11588,12 @@ def recover_coin_prep_predispatch_no_effect(
         exact = (
             decision.confirmed is True
             and observed <= now < expiry
-            and prep["outcome"] == "PREPARED"
+            and prep["outcome"] in {"PREPARED", "SUBMITTED_UNKNOWN"}
+            and (
+                prep["outcome"] == "PREPARED"
+                or json.loads(prep["outcome_evidence_json"])["dispatch_outcome"]
+                == "PREPARED"
+            )
             and prep["constructed_outputs_json"] is None
             and prep["resolved_claim"] is None
             and prep["dispatched_claim"] is None
@@ -11640,7 +11651,7 @@ def recover_coin_prep_predispatch_no_effect(
         conn.execute(
             "UPDATE coin_prep_operations SET outcome='FAILED', "
             "outcome_evidence_json=?, finalized_at=? "
-            "WHERE operation_id=? AND outcome='PREPARED'",
+            "WHERE operation_id=? AND outcome IN ('PREPARED','SUBMITTED_UNKNOWN')",
             (evidence, when, safe_operation_id),
         )
         _reconciliation_latch_update(

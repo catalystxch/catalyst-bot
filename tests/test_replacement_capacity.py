@@ -1064,8 +1064,9 @@ def test_submitted_coin_prep_can_resolve_no_effect_only_from_exact_selectable_co
     )
 
 
+@pytest.mark.parametrize("journal_outcome", ["PREPARED", "SUBMITTED_UNKNOWN"])
 def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect_view(
-    isolated_database, monkeypatch
+    isolated_database, monkeypatch, journal_outcome
 ):
     """A rejected pre-dispatch fee check must not permanently fence untouched coins."""
 
@@ -1109,6 +1110,17 @@ def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect
     database.close_connection()
     database._db_initialized_path = ""
     database.init_database()
+    if journal_outcome == "SUBMITTED_UNKNOWN":
+        database.record_coin_prep_operation_outcome(
+            operation["operation_id"],
+            outcome="SUBMITTED_UNKNOWN",
+            evidence_json={
+                "reason_code": "authoritative_observation_unavailable",
+                "effect_claim_token": claim["claim_token"],
+                "effect_claim_generation": claim["generation"],
+                "dispatch_outcome": "PREPARED",
+            },
+        )
     view = {
         "fresh": True,
         "complete": True,
