@@ -7068,6 +7068,7 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
         (dependent_trigger_name,),
     ).fetchone()
     drop_dependent_sql = ""
+    restore_wallet_guard_sql = ""
     canonical_db = _sqlite_connect(":memory:")
     try:
         canonical_db.executescript(FEE_SCHEMA_SQL)
@@ -7089,6 +7090,21 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
         ) != _normalized_schema_sql(str(expected_dependent[0])):
             raise RuntimeError("legacy fee ledger has unknown dependent trigger")
         drop_dependent_sql = f"DROP TRIGGER {dependent_trigger_name}; "
+    # The current wallet-effect resolution guard also reads the fee tables.
+    # The exact PR #218 fixture keeps that guard while replacing its fee
+    # tables, so preserve only our known definition across the DDL swap.
+    wallet_guard_name = "wallet_effect_claim_resolutions_guard"
+    wallet_guard = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+        (wallet_guard_name,),
+    ).fetchone()
+    if wallet_guard is not None:
+        if _normalized_schema_sql(str(wallet_guard[0])) != _normalized_schema_sql(
+            _WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL
+        ):
+            raise RuntimeError("legacy fee ledger has unknown wallet guard")
+        drop_dependent_sql += f"DROP TRIGGER {wallet_guard_name}; "
+        restore_wallet_guard_sql = _WALLET_EFFECT_CLAIM_RESOLUTIONS_GUARD_SQL + "; "
     approval_v2 = "fee_approvals_pr218_v2"
     reservation_v2 = "approved_fee_reservations_pr218_v2"
     approval_sql = str(canonical_tables["fee_approvals"]).replace(
@@ -7114,6 +7130,7 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
             + f"ALTER TABLE {approval_v2} RENAME TO fee_approvals; "
             + f"ALTER TABLE {reservation_v2} RENAME TO approved_fee_reservations; "
             + FEE_SCHEMA_SQL
+            + restore_wallet_guard_sql
         )
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError("legacy fee ledger upgrade broke foreign keys")
