@@ -252,6 +252,11 @@ def _campaign_inputs(
                 balances_raw[optional], optional, allow_zero=False
             )
     mode = getattr(cfg, "LIQUIDITY_MODE", None)
+    requested_mode = body.get("liquidity_mode")
+    if requested_mode is not None and (
+        type(requested_mode) is not str or requested_mode != mode
+    ):
+        raise BootstrapApiError("bootstrap_liquidity_mode_unsaved", 409)
     buy_enabled = bootstrap_side_enabled(cfg, "buy")
     sell_enabled = bootstrap_side_enabled(cfg, "sell")
     if not buy_enabled and not sell_enabled:

@@ -144,6 +144,30 @@ def test_preview_is_pure_and_returns_bounded_plan(
     assert len(payload["plan"]["sides"]["sell"]["levels"]) == 3
 
 
+def test_preview_rejects_unsaved_liquidity_mode(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    bootstrap, client, _identity = bootstrap_api
+    monkeypatch.setattr(
+        bootstrap,
+        "cfg",
+        SimpleNamespace(
+            XCH_RESERVE="0",
+            CAT_RESERVE="0",
+            LIQUIDITY_MODE="sell_only",
+            ENABLE_BUY=False,
+            ENABLE_SELL=True,
+        ),
+    )
+
+    response = client.post(
+        "/api/bootstrap/preview", json=_request(liquidity_mode="two_sided")
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "bootstrap_liquidity_mode_unsaved"
+
+
 def test_preview_rejects_full_wave_principal_that_consumes_reserve_and_fee_coins(
     isolated_db, bootstrap_api, monkeypatch
 ):

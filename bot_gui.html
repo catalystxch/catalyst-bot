@@ -39901,6 +39901,7 @@ function _bootstrapBuildReviewBody() {
     const feeCoinInput = document.getElementById('configFeeCoinSizeXch')?.value || '0.001';
     return {
         ...pair,
+        liquidity_mode: getLiquidityMode(),
         anchor_price: _bootstrapCanonicalDecimal(document.getElementById('bootstrapAnchorPrice')?.value),
         xch_budget: _bootstrapCanonicalDecimal(document.getElementById('bootstrapXchBudget')?.value, '0'),
         cat_budget: _bootstrapCanonicalDecimal(document.getElementById('bootstrapCatBudget')?.value, '0'),
@@ -40237,7 +40238,12 @@ async function bootstrapPreviewCampaign() {
             body: JSON.stringify(body)
         });
         const payload = await response.json();
-        if (!payload?.success) throw new Error(payload?.code || payload?.error || 'Bootstrap preview failed');
+        if (!payload?.success) {
+            const message = payload?.code === 'bootstrap_liquidity_mode_unsaved'
+                ? 'Save & Continue the selected liquidity mode, then preview again.'
+                : (payload?.code || payload?.error || 'Bootstrap preview failed');
+            throw new Error(message);
+        }
         _bootstrapPreviewDigest = payload.preview_digest;
         _bootstrapPreviewBody = body;
         const campaign = payload.campaign || {};
