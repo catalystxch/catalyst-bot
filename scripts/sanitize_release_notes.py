@@ -47,7 +47,11 @@ def main() -> int:
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--private-repo", required=True)
+    parser.add_argument(
+        "--private-repo",
+        default="",
+        help="repository whose links must be stripped; omit for public source releases",
+    )
     args = parser.parse_args()
 
     cleaned = sanitize_release_notes(

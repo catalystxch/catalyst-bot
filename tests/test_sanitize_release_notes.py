@@ -1,4 +1,6 @@
-from scripts.sanitize_release_notes import sanitize_release_notes
+import sys
+
+from scripts.sanitize_release_notes import main, sanitize_release_notes
 
 
 def test_sanitize_release_notes_removes_private_repo_links():
@@ -40,3 +42,16 @@ def test_sanitize_release_notes_keeps_label_for_repo_root_link():
     cleaned = sanitize_release_notes(notes, "catalystxch/catalyst-bot")
 
     assert cleaned == "Read source before testing."
+
+
+def test_public_release_notes_cli_preserves_public_issue_url(tmp_path, monkeypatch):
+    notes = "Report issues at https://github.com/catalystxch/catalyst-bot/issues/new/choose."
+    source = tmp_path / "source.md"
+    output = tmp_path / "cleaned.md"
+    source.write_text(notes, encoding="utf-8")
+    monkeypatch.setattr(
+        sys, "argv", ["sanitize_release_notes.py", str(source), str(output)]
+    )
+
+    assert main() == 0
+    assert output.read_text(encoding="utf-8").strip() == notes
