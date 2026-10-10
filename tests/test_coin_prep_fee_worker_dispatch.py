@@ -186,6 +186,90 @@ def test_provider_failure_cannot_use_worker_manual_fee(active_worker, monkeypatc
     assert utils._counts()["wallet_effect_claims"] == 0
 
 
+@pytest.mark.parametrize("clock", [1051, 1060])
+def test_quote_near_expiry_between_pricing_and_worker_claim_stops_without_claim(
+    active_worker, clock
+):
+    active_worker["now"] = clock
+    with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
+        active_worker["worker"]._submit_direct_batch_plan(
+            active_worker["priced"]["pricing"]["plan"],
+            utils.ADDRESS,
+            priced_batch=active_worker["priced"],
+        )
+    assert active_worker["adapter_attempts"] == []
+    assert utils._counts()["wallet_effect_claims"] == 0
+    assert utils._counts()["coin_prep_operations"] == 0
+
+
+def test_pre_dispatch_fee_failure_recovers_only_after_exact_no_effect_view(
+    active_worker, monkeypatch
+):
+    database = import_module("database")
+    service = import_module("coin_prep_fee_dispatch")
+    worker = active_worker["worker"]
+
+    def fail_before_fee_hold(**_kwargs):
+        raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+
+    monkeypatch.setattr(service, "reserve_approved_prep_dispatch", fail_before_fee_hold)
+
+    def observe(operation):
+        identity = json.loads(operation["wallet_identity_json"])
+        sources = json.loads(operation["source_coin_ids_json"])
+        fees = json.loads(operation["effect_fee_coin_ids_json"])
+        return {
+            "no_effect_view": {
+                "fresh": True,
+                "complete": True,
+                "wallet_identity": identity,
+                "observed_at": "2026-08-21T12:00:00.000000Z",
+                "expires_at": "2026-08-21T12:00:15.000000Z",
+                "selectable_coin_ids": sorted([*sources, *fees]),
+                "pending_transaction_ids": [],
+            }
+        }
+
+    worker._observe_recoverable_coin_prep_operation = observe
+    with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
+        worker._submit_direct_batch_plan(
+            active_worker["priced"]["pricing"]["plan"],
+            utils.ADDRESS,
+            priced_batch=active_worker["priced"],
+        )
+    assert active_worker["adapter_attempts"] == []
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert database.get_recoverable_coin_prep_operations() == []
+    approval = database.get_coin_prep_fee_approval_status(
+        active_worker["approval"]["approval_id"]
+    )
+    assert approval["unresolved_operation_count"] == 0
+    assert approval["spent_fee_mojos"] == 0
+
+
+def test_pre_dispatch_fee_failure_keeps_fence_without_wallet_proof(
+    active_worker, monkeypatch
+):
+    database = import_module("database")
+    service = import_module("coin_prep_fee_dispatch")
+    worker = active_worker["worker"]
+    monkeypatch.setattr(
+        service,
+        "reserve_approved_prep_dispatch",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("FEE_ESTIMATE_UNAVAILABLE")),
+    )
+    worker._observe_recoverable_coin_prep_operation = lambda _operation: None
+    with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
+        worker._submit_direct_batch_plan(
+            active_worker["priced"]["pricing"]["plan"],
+            utils.ADDRESS,
+            priced_batch=active_worker["priced"],
+        )
+    assert active_worker["adapter_attempts"] == []
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert len(database.get_recoverable_coin_prep_operations()) == 1
+
+
 def test_changed_settings_after_hold_stop_worker_before_signing(
     active_worker, monkeypatch
 ):
@@ -223,6 +307,7 @@ def test_expired_quote_after_hold_stops_worker_before_signing(
     with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
         _submit(active_worker)
     assert active_worker["adapter_attempts"] == []
+    assert import_module("database").get_runtime_safety_latch()["state"] == "tripped"
 
 
 def test_direct_runner_uses_frozen_pricing_without_worker_price_or_fee_floor(

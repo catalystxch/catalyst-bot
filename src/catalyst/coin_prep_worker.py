@@ -82,6 +82,7 @@ load_dotenv()
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN", "").strip()
 _API_LOG_POST_TIMEOUT_S = 0.15
 _API_LOG_QUEUE_MAX = 400
+_PRE_DISPATCH_QUOTE_MIN_REMAINING_SECONDS = 10
 _WORKER_DELEGATION_ENV_NAMES = (
     mutation_gate.DELEGATION_ID_ENV,
     mutation_gate.DELEGATION_TOKEN_ENV,
@@ -2446,6 +2447,21 @@ class CoinPrepWorker:
             target_contract=target,
         )
         target = canonical["target_contract"]
+        # Pricing can spend most of a short quote's lifetime in wallet/RPC
+        # reads.  Reject it before claiming any coin authority when there is
+        # too little time left to persist PREPARED and reserve its exact fee.
+        from coin_prep_fee_pricing import _now, is_current_fee_quote
+
+        quote = pricing["quote"]
+        cost = pricing["inspection"]["cost"]
+        target_seconds = priced_batch["recipe"]["economic_plan"]["target_seconds"]
+        if not is_current_fee_quote(
+            quote,
+            cost,
+            target_seconds,
+            now=_now() + _PRE_DISPATCH_QUOTE_MIN_REMAINING_SECONDS,
+        ):
+            raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
         claim = claim_wallet_effect(
             operation_id=canonical["operation_id"],
             source_coin_ids=list(plan.source_coin_ids),
@@ -2496,6 +2512,38 @@ class CoinPrepWorker:
                 claim["generation"],
                 reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED",
             )
+            # The reserve/recheck stage may fail before any output binding or
+            # adapter dispatch (for example, a quote aging out during an RPC).
+            # Keep the fence unless a new authoritative wallet view proves the
+            # exact source and fee cohort is still selectable with no pending
+            # transaction.  The database repeats every no-dispatch check in
+            # the same transaction that releases the claim.
+            try:
+                from database import (
+                    get_coin_prep_operation_for_observation,
+                    recover_coin_prep_predispatch_no_effect,
+                )
+
+                current = get_coin_prep_operation_for_observation(
+                    canonical["operation_id"]
+                )
+                observation = self._observe_recoverable_coin_prep_operation(current)
+                if (
+                    type(observation) is dict
+                    and type(observation.get("no_effect_view")) is dict
+                    and recover_coin_prep_predispatch_no_effect(
+                        canonical["operation_id"], observation["no_effect_view"]
+                    )
+                ):
+                    self.log(
+                        "Direct batch fee validation failed before dispatch; "
+                        "authoritative no-effect proof released its exact inputs"
+                    )
+            except Exception as recovery_exc:
+                self.log(
+                    "Direct batch pre-dispatch no-effect proof unavailable: "
+                    f"{recovery_exc}"
+                )
             raise
         if not wallet_effect_claim_is_current(
             claim["claim_token"],
@@ -9696,6 +9744,22 @@ class CoinPrepWorker:
                     fee_coin_ids = json.loads(
                         operation.get("effect_fee_coin_ids_json") or "[]"
                     )
+                    if (
+                        operation.get("outcome") == "PREPARED"
+                        and operation.get("effect_dispatch_token") is None
+                    ):
+                        from database import recover_coin_prep_predispatch_no_effect
+
+                        if recover_coin_prep_predispatch_no_effect(
+                            operation["operation_id"], no_effect_view
+                        ):
+                            self.log(
+                                "Coin prep recovery proved the pre-dispatch effect "
+                                "had no effect; exact inputs are selectable"
+                            )
+                            continue
+                        all_confirmed = False
+                        continue
                     record_coin_prep_operation_outcome(
                         operation["operation_id"],
                         outcome="FAILED",
@@ -9835,7 +9899,14 @@ class CoinPrepWorker:
                 else self._get_sage_selectable_coin_ids_for_recovery(self.xch_wallet_id)
             )
             if (
-                operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                (
+                    operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                    or (
+                        operation.get("outcome") == "PREPARED"
+                        and operation.get("effect_dispatch_token") is None
+                        and operation.get("constructed_outputs_json") is None
+                    )
+                )
                 and type(pending) is list
                 and not pending
                 and target_selectable is not None
