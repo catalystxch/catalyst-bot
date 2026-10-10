@@ -1,0 +1,28 @@
+# Exact 221399a heartbeat-stage diagnostics package
+
+Runtime/source is `221399a977f084ed1bd20fefb2fbaae6a288de03`. The subsequent `d60619e56b3b1e194adc096232b827184c608060` changes only pytest wallet-network isolation and evidence. The heartbeat-stage change adds bounded timing diagnostics; it does not extend a lease or change mutation-fencing behavior. The original TEST 7 app remains the older `f0e1e97` process in terminal read-only `HEARTBEAT_FAILED` after the Veeam-overlap stall. This candidate has not run against that profile.
+
+The first serial backend run was stopped when pytest was seen connected to the operator's real Sage RPC port. A direct Sage read-only snapshot afterward showed fingerprint `736588221`, the expected MZ asset, XCH `138470301476875` mojos, MZ `780212284` atomic units, zero pending transactions, and all 4,095 Sage offers terminal. The test harness was corrected in `d60619e`; the final serial Windows run passed **7,353 tests, 246 skipped, 447 subtests**. Concurrent socket monitors recorded 667 parent and 386 all-Python samples with zero connections to the real Sage port. See [pytest isolation evidence](2026-10-07-pytest-sage-network-isolation.md).
+
+The clean detached Windows EXE is `E:\catalyst-heartbeat-stage-clean-build\dist\Catalyst\Catalyst.exe`, SHA-256 `C29C33EF0DFE5E68674E9BB803D35FE959099C588A3847134F5764C49E43937A`; bundled UI SHA-256 is `A696815D885412C94E1B9B460D2976ED80288819A6E023C0DE60FC4AD0A32609`. Packaged API, synthetic Sage mTLS, interrupted-publication recovery, and isolated native clean/duplicate/persisted/safety smokes passed. The 192-entry ZIP passed CRC and embedded-EXE checks; the extracted EXE passed API and synthetic Sage smokes. ZIP SHA-256 is `9A5CB0C23CB8509961BB7FC8987A1F1F321FC976DF047993DFCC474BAC4BB3D2`. The unsigned installer SHA-256 is `6C0EB11E14C7F16A0E76FCFE1C073ADC429AE3783EC284FE672AB9D4C01E139B`. A unique-AppId QA installer clean-installed to E:, its EXE hash matched, installed API and synthetic Sage smokes passed, and silent uninstall removed its EXE and QA registry key. Defender real-time protection was enabled; custom EXE/ZIP/installer scans found no attributable detection.
+
+The ZIP, installer and [manifest](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/SHA256SUMS-221399a.txt) are pinned at artifact commit `896c7e8dd9f452550414f582c4e6c1856fb49d34`. Independent HTTP downloads matched both binary hashes. [ZIP](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/CATalyst-221399a-primary-acceptance.zip) and [unsigned installer](https://raw.githubusercontent.com/catalystxch/catalyst-bot/896c7e8dd9f452550414f582c4e6c1856fb49d34/acceptance-artifacts/Catalyst-Setup-221399a-1.4.0.exe) are acceptance artifacts, not a release.
+
+PR #220 remains draft. Exact-candidate original-profile rollover, Veeam-overlap reliability diagnosis, active-offer lifecycle/recovery, secondary original-profile acceptance, both 24-hour windows, and final review remain open. No new campaign or wallet effect was authorized or started.
+
+The later test-only diagnostic check injected isolated 20 ms delays into the
+lease transaction's begin, read, commit and close stages. All four appeared
+in their corresponding bounded `database_ms` fields. The complete
+`tests/test_mutation_gate.py` file passed **269 tests**; Ruff check, format
+and `git diff --check` passed. This verifies attribution when those
+database stages return; it does not identify the instruction delayed in the
+historical Veeam snapshot or make the failed 24-hour window pass.
+
+A subsequent isolated test-only check advanced the clock beyond the 30-second
+lease during each of the begin, read, update and close stages. Each heartbeat
+failed closed with `HEARTBEAT_FAILED`, and the timing record attributed the
+delayed stage. The focused four cases and complete mutation-gate file passed
+**273 tests**; Ruff check and format passed. This exercises the return paths
+around a host pause without performing a wallet effect. The historical Veeam
+stall remains unexplained; the exact `221399a` package still has not run on
+the original profile.

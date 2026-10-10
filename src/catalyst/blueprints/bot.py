@@ -51,6 +51,34 @@ except Exception:
 bp = Blueprint("bot", __name__)
 
 
+class _BootstrapAuthorityAmbiguous(Exception):
+    """More than one active campaign claims the selected asset."""
+
+
+class _BootstrapAuthorityMismatch(Exception):
+    """An active campaign belongs to a different wallet authority."""
+
+
+def _fresh_start_wallet_offer_book(bot) -> bool:
+    """Require a new Sage offer read before accepting any bot-start caller."""
+    manager = getattr(bot, "offer_manager", None)
+    sync_with_meta = getattr(manager, "sync_from_wallet_with_meta", None)
+    if not callable(sync_with_meta):
+        return False
+    try:
+        offers, meta = sync_with_meta()
+    except Exception:
+        return False
+    return (
+        type(offers) is tuple
+        and len(offers) == 3
+        and all(type(rows) is list for rows in offers)
+        and type(meta) is dict
+        and meta.get("fresh") is True
+        and meta.get("using_cache") is False
+    )
+
+
 def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     """Prove legacy open-offer ownership before the first v1.4 bot start.
 
@@ -93,6 +121,133 @@ def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
     )
 
 
+def _one_sided_open_offer_start_block(cfg_obj) -> dict[str, Any] | None:
+    """Keep an old opposite-side book from trading under a new one-sided mode."""
+    mode = str(getattr(cfg_obj, "LIQUIDITY_MODE", "two_sided") or "").lower()
+    if mode not in {"buy_only", "sell_only"}:
+        return None
+
+    disabled_side = "sell" if mode == "buy_only" else "buy"
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    from database import get_open_offers
+    from wallet import (
+        classify_offers_from_list,
+        get_authoritative_offer_history,
+        is_offer_time_expired,
+    )
+
+    try:
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
+        if type(history) is dict:
+            wallet_offers = history.get("offers")
+            complete = (
+                history.get("success") is True and history.get("end_of_history") is True
+            )
+        else:
+            # Chia returns one bounded page; a full page does not prove the end.
+            wallet_offers = history
+            complete = type(history) is list and len(history) < 500
+        if (
+            not complete
+            or type(wallet_offers) is not list
+            or any(type(offer) is not dict for offer in wallet_offers)
+        ):
+            raise ValueError("Wallet offer history is incomplete")
+        wallet_buys, wallet_sells, wallet_closed = classify_offers_from_list(
+            wallet_offers, asset_id
+        )
+        open_row_ids = {id(row) for row in [*wallet_buys, *wallet_sells]}
+        closed_row_ids = {id(row) for row in wallet_closed}
+        relevant_trade_ids = set()
+        observed_trade_ids = set()
+        for row in wallet_offers:
+            summary = row.get("summary")
+            offered = summary.get("offered") if type(summary) is dict else None
+            requested = summary.get("requested") if type(summary) is dict else None
+            if type(offered) is not dict or type(requested) is not dict:
+                raise ValueError("Wallet offer summary is malformed")
+            offered_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in offered
+            }
+            requested_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in requested
+            }
+            related = asset_id in offered_assets or asset_id in requested_assets
+            trade_id = str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            status = row.get("status")
+            terminal = status in (3, 4, 5) or (
+                isinstance(status, str)
+                and status.upper()
+                in {
+                    "CANCELLED",
+                    "CANCELED",
+                    "CONFIRMED",
+                    "COMPLETED",
+                    "FAILED",
+                    "EXPIRED",
+                    "SUCCESS",
+                }
+            )
+            if (
+                related
+                and id(row) in closed_row_ids
+                and (terminal or is_offer_time_expired(row))
+            ):
+                continue
+            if related and (
+                id(row) not in open_row_ids
+                or not trade_id
+                or trade_id in observed_trade_ids
+            ):
+                raise ValueError(
+                    "Current-pair wallet offer cannot be proven unique and classified"
+                )
+            if related:
+                relevant_trade_ids.add(trade_id)
+            elif not offered or not requested or trade_id in relevant_trade_ids:
+                raise ValueError("Wallet offer cannot be proven unrelated")
+            if trade_id:
+                observed_trade_ids.add(trade_id)
+        db_offers = get_open_offers(side=disabled_side, cat_asset_id=asset_id)
+        if type(db_offers) is not list:
+            raise ValueError("Database offer book is unavailable")
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "One-sided start blocked: opposite-side offer proof unavailable",
+            {"mode": mode, "error": str(exc)[:160]},
+            level="warning",
+        )
+        return {
+            "reason": "OFF_SIDE_OFFER_PROOF_UNAVAILABLE",
+            "error": "Could not verify that opposite-side offers are closed; retry after wallet and book reconciliation",
+            "disabled_side": disabled_side,
+            "offer_count": None,
+        }
+
+    wallet_rows = wallet_sells if disabled_side == "sell" else wallet_buys
+    offer_ids = {
+        str(row.get("trade_id") or row.get("offer_id") or "").strip()
+        for row in [*wallet_rows, *db_offers]
+    }
+    offer_ids.discard("")
+    count = max(len(offer_ids), len(wallet_rows), len(db_offers))
+    if count == 0:
+        return None
+    return {
+        "reason": "OFF_SIDE_OFFERS_OPEN",
+        "error": (
+            f"Cannot start {mode.replace('_', '-')} while {count} "
+            f"{disabled_side} offer(s) remain open. Stop and use protected Cancel All, "
+            "then wait for authoritative terminal reconciliation."
+        ),
+        "disabled_side": disabled_side,
+        "offer_count": count,
+    }
+
+
 def _api_server():
     """Return the currently loaded api_server module.
 
@@ -106,45 +261,45 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
-def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
+def _matching_active_bootstrap_campaign(cfg_obj) -> dict[str, Any] | None:
     """Prove one active Bootstrap authority matches the live Sage identity.
 
     Bootstrap offer sizes are derived from the immutable campaign plan, not
     from the mutable legacy Smart Settings tier sizes.  The legacy drift gate
     is therefore inapplicable only after this exact authority check succeeds.
-    Any missing, ambiguous, or stale evidence falls back to the legacy gate.
+    Only an empty active campaign set falls back to the legacy gate. An
+    unreadable, ambiguous, or mismatched campaign blocks ordinary startup.
     """
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     wallet_id = getattr(cfg_obj, "CAT_WALLET_ID", 0)
     if len(asset_id) != 64 or type(wallet_id) is not int or wallet_id <= 0:
-        return False
+        return None
 
-    try:
-        from database import list_active_bootstrap_campaigns_for_asset
-        from wallet import get_wallet_identity
+    from database import list_active_bootstrap_campaigns_for_asset
+    from wallet import get_wallet_identity
 
-        campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
-        if len(campaigns) != 1:
-            return False
-        campaign = campaigns[0]
-        identity = get_wallet_identity()
-    except Exception:
-        return False
+    campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+    if len(campaigns) > 1:
+        raise _BootstrapAuthorityAmbiguous
+    if len(campaigns) == 0:
+        return None
+    campaign = campaigns[0]
+    identity = get_wallet_identity()
 
     if type(identity) is not dict or identity.get("success") is not True:
-        return False
+        raise _BootstrapAuthorityMismatch
     if str(identity.get("backend") or "").strip().lower() != "sage":
-        return False
+        raise _BootstrapAuthorityMismatch
     if identity.get("has_secrets") is not True:
-        return False
+        raise _BootstrapAuthorityMismatch
 
     network = str(identity.get("network_id") or "").strip().lower()
     if network.startswith("testnet"):
         network = "testnet"
     elif network != "mainnet":
-        return False
+        raise _BootstrapAuthorityMismatch
 
-    return all(
+    if all(
         (
             str(campaign.get("asset_id") or "").strip().lower() == asset_id,
             str(campaign.get("network") or "").strip().lower() == network,
@@ -153,7 +308,282 @@ def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
             campaign.get("wallet_id") == wallet_id,
             str(campaign.get("status") or "").strip().lower() == "active",
         )
-    )
+    ):
+        return campaign
+    raise _BootstrapAuthorityMismatch
+
+
+def _active_bootstrap_campaign_matches_wallet(cfg_obj) -> bool:
+    return _matching_active_bootstrap_campaign(cfg_obj) is not None
+
+
+def _bootstrap_campaign_expired(campaign: dict[str, Any]) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(
+            str(campaign.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        # An unreadable active-campaign deadline cannot grant start authority.
+        return True
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        return True
+    return datetime.now(timezone.utc) >= expires_at.astimezone(timezone.utc)
+
+
+def _bootstrap_start_block(campaign: dict[str, Any] | None) -> dict[str, Any] | None:
+    if campaign is None or not _bootstrap_campaign_expired(campaign):
+        return None
+    return {
+        "reason": "bootstrap_campaign_expired",
+        "error": (
+            "Active Bootstrap campaign has expired — cancel campaign-owned "
+            "offers before starting or renewing"
+        ),
+        "campaign_id": campaign.get("campaign_id"),
+        "revision": campaign.get("revision"),
+    }
+
+
+def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
+    """Re-run exact active-campaign Coin Prep verification before start.
+
+    A historical worker completion is not current readiness authority.  This
+    calls the same read-only verifier used by the GUI with the exact durable
+    campaign identity, so browser state and the mutation boundary cannot drift.
+    """
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    try:
+        from blueprints.coin_prep import api_coin_prep_verify
+        from database import list_active_bootstrap_campaigns_for_asset
+
+        campaigns = list_active_bootstrap_campaigns_for_asset(asset_id)
+        if len(campaigns) != 1:
+            return {"ready": False, "reason": "bootstrap_campaign_authority_ambiguous"}
+        campaign = campaigns[0]
+        response = api_coin_prep_verify(
+            {
+                "tier_enabled": "true",
+                "liquidity_mode": "two_sided",
+                "bootstrap_campaign_id": campaign["campaign_id"],
+                "bootstrap_campaign_revision": str(campaign["revision"]),
+            }
+        )
+        if isinstance(response, tuple):
+            response = response[0]
+        payload = (
+            response.get_json(silent=True) if hasattr(response, "get_json") else None
+        )
+        ready = bool(
+            type(payload) is dict
+            and payload.get("success") is True
+            and payload.get("all_sufficient") is True
+            and payload.get("balance_sufficient") is not False
+            and payload.get("bootstrap_campaign_id") == campaign["campaign_id"]
+            and payload.get("bootstrap_campaign_revision") == campaign["revision"]
+        )
+        return {
+            "ready": ready,
+            "reason": "ready"
+            if ready
+            else str((payload or {}).get("reason") or "must_resize"),
+            "campaign_id": campaign["campaign_id"],
+            "campaign_revision": campaign["revision"],
+        }
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Bootstrap Coin Prep start verification failed closed",
+            {"error": str(exc)[:256]},
+            level="warning",
+        )
+        return {
+            "ready": False,
+            "reason": "bootstrap_coin_prep_verification_unavailable",
+        }
+
+
+def _bootstrap_existing_offer_resume_readiness(
+    cfg_obj, campaign: dict[str, Any]
+) -> dict[str, Any]:
+    """Prove a recovered campaign book exactly before resuming its manager.
+
+    Coin Prep correctly reports campaign coins unavailable while those coins
+    are locked by the campaign's already-live offers.  That is safe to bypass
+    only for an explicit resume request, and only when durable intent, local
+    open-book, and a fresh complete Sage snapshot agree on the exact nonempty
+    trade-id set for the current campaign revision.
+    """
+    asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
+    campaign_id = str(campaign.get("campaign_id") or "").strip()
+    revision = campaign.get("revision")
+    if (
+        len(asset_id) != 64
+        or not campaign_id
+        or type(revision) is not int
+        or revision < 0
+    ):
+        return {"ready": False, "reason": "campaign_identity_invalid"}
+
+    purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+    active_states = {"created", "visible"}
+    try:
+        from database import get_offer_intents_for_registry, get_open_offers
+        from wallet import (
+            classify_offers_from_list,
+            get_authoritative_offer_history,
+        )
+
+        intents = get_offer_intents_for_registry()
+        db_offers = get_open_offers(cat_asset_id=asset_id)
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
+        if type(intents) is not list or type(db_offers) is not list:
+            raise ValueError("Durable offer authority is unavailable")
+        if any(type(row) is not dict for row in [*intents, *db_offers]):
+            raise ValueError("Durable offer authority is malformed")
+
+        current_intents = [
+            row for row in intents if str(row.get("purpose") or "") == purpose
+        ]
+        if any(
+            str(row.get("asset_id") or "").strip().lower() != asset_id
+            for row in current_intents
+        ):
+            raise ValueError("Campaign intent asset identity disagrees")
+        if any(
+            str(row.get("lifecycle_state") or "").strip().lower()
+            not in active_states | {"terminal"}
+            for row in current_intents
+        ):
+            raise ValueError("Current campaign revision has unresolved offer intents")
+        active_intents = [
+            row
+            for row in current_intents
+            if str(row.get("lifecycle_state") or "").strip().lower() in active_states
+        ]
+        intent_ids = [
+            str(row.get("sage_trade_id") or "").strip() for row in active_intents
+        ]
+        db_ids = [
+            str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            for row in db_offers
+        ]
+        if (
+            not intent_ids
+            or any(not trade_id for trade_id in [*intent_ids, *db_ids])
+            or len(set(intent_ids)) != len(intent_ids)
+            or len(set(db_ids)) != len(db_ids)
+        ):
+            raise ValueError("Campaign offer identities are incomplete or duplicated")
+
+        if type(history) is dict:
+            wallet_offers = history.get("offers")
+            complete = (
+                history.get("success") is True and history.get("end_of_history") is True
+            )
+        else:
+            wallet_offers = history
+            complete = type(history) is list and len(history) < 500
+        if (
+            not complete
+            or type(wallet_offers) is not list
+            or any(type(row) is not dict for row in wallet_offers)
+        ):
+            raise ValueError("Wallet offer history is incomplete")
+
+        wallet_buys, wallet_sells, wallet_closed = classify_offers_from_list(
+            wallet_offers, asset_id
+        )
+        if (
+            type(wallet_buys) is not list
+            or type(wallet_sells) is not list
+            or type(wallet_closed) is not list
+        ):
+            raise ValueError("Wallet current-pair offer classification failed")
+        wallet_open = [*wallet_buys, *wallet_sells]
+        if any(type(row) is not dict for row in [*wallet_open, *wallet_closed]):
+            raise ValueError("Wallet current-pair offer authority is malformed")
+        open_row_ids = {id(row) for row in wallet_open}
+        closed_row_ids = {id(row) for row in wallet_closed}
+        for row in wallet_offers:
+            summary = row.get("summary")
+            offered = summary.get("offered") if type(summary) is dict else None
+            requested = summary.get("requested") if type(summary) is dict else None
+            if type(offered) is not dict or type(requested) is not dict:
+                raise ValueError("Wallet offer summary is malformed")
+            offered_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in offered
+            }
+            requested_assets = {
+                str(key).strip().lower().removeprefix("0x") for key in requested
+            }
+            related = asset_id in offered_assets or asset_id in requested_assets
+            if related and id(row) not in open_row_ids:
+                status = row.get("status")
+                explicitly_terminal = (type(status) is int and status in {3, 4, 5}) or (
+                    isinstance(status, str)
+                    and status.strip().upper()
+                    in {
+                        "CANCELLED",
+                        "CANCELED",
+                        "CONFIRMED",
+                        "COMPLETED",
+                        "FAILED",
+                        "EXPIRED",
+                        "SUCCESS",
+                    }
+                )
+                if id(row) not in closed_row_ids or not explicitly_terminal:
+                    raise ValueError(
+                        "Current-pair wallet offer is unresolved or cannot be "
+                        "authoritatively classified"
+                    )
+        wallet_ids = [
+            str(row.get("trade_id") or row.get("offer_id") or "").strip()
+            for row in wallet_open
+        ]
+        if any(not trade_id for trade_id in wallet_ids) or len(set(wallet_ids)) != len(
+            wallet_ids
+        ):
+            raise ValueError("Wallet offer identities are incomplete or duplicated")
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Recovered Bootstrap offer resume proof failed closed",
+            {"error": str(exc)[:256]},
+            level="warning",
+        )
+        return {
+            "ready": False,
+            "reason": "existing_offer_resume_proof_unavailable",
+        }
+
+    intent_set = set(intent_ids)
+    db_set = set(db_ids)
+    wallet_set = set(wallet_ids)
+    if intent_set != db_set or intent_set != wallet_set:
+        slog(
+            "SAFETY",
+            "Recovered Bootstrap offer authorities disagree",
+            {
+                "campaign_id": campaign_id,
+                "revision": revision,
+                "intent_count": len(intent_set),
+                "database_count": len(db_set),
+                "wallet_count": len(wallet_set),
+            },
+            level="warning",
+        )
+        return {"ready": False, "reason": "offer_authority_mismatch"}
+
+    return {
+        "ready": True,
+        "reason": "exact_live_book",
+        "campaign_id": campaign_id,
+        "campaign_revision": revision,
+        "offer_count": len(intent_set),
+    }
 
 
 def _live_wallet_reads_allowed(bot_obj=None, state: dict | None = None) -> bool:
@@ -243,8 +673,42 @@ def api_bot_start():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
+    def cancel_all_in_progress():
+        try:
+            with server._cancel_all_state_lock:
+                if server._cancel_all_state.get("running") is not False:
+                    return True
+            cancel_thread = server._cancel_all_thread
+            return cancel_thread is not None and cancel_thread.is_alive()
+        except Exception:
+            return True
+
+    def cancel_all_start_block():
+        error = (
+            "Wallet-wide Cancel All is still in progress; "
+            "wait for its result before starting the bot."
+        )
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "CANCEL_ALL_IN_PROGRESS",
+                "error": error,
+                "errors": [error],
+            }
+        ), 409
+
+    if cancel_all_in_progress():
+        return cancel_all_start_block()
+
     if bot.is_running():
         return jsonify({"success": True, "status": "already_running"})
+
+    request_payload = request.get_json(silent=True)
+    resume_existing_offers = bool(
+        type(request_payload) is dict
+        and request_payload.get("resume_existing_offers") is True
+    )
 
     try:
         has_pending_restart_changes = getattr(
@@ -257,12 +721,22 @@ def api_bot_start():
                 "config_reload",
                 "Config reloaded before bot start so pending Setup changes apply",
             )
-    except Exception as e:
+    except Exception:
+        error = "Pending Setup settings could not be loaded; bot start blocked"
         log_event(
-            "warning",
+            "error",
             "config_reload_failed",
-            f"Config reload before bot start failed: {e}",
+            error,
         )
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "CONFIG_RELOAD_FAILED",
+                "error": error,
+                "errors": [error],
+            }
+        ), 503
 
     # ---- Pre-start validation (V1 parity) ----
     warnings = []
@@ -338,20 +812,114 @@ def api_bot_start():
     # split TX confirms. Coin prep's reclassify pass should have caught
     # this — if drift survives that, something's wrong and the bot
     # shouldn't trade until it's fixed.
-    if _active_bootstrap_campaign_matches_wallet(cfg):
-        log_event(
-            "info",
-            "bootstrap_tier_drift_not_applicable",
-            "Active Bootstrap campaign uses exact campaign-bound coin sizes; "
-            "legacy Smart Settings tier-drift gate is not applicable",
+    try:
+        bootstrap_campaign = _matching_active_bootstrap_campaign(cfg)
+    except _BootstrapAuthorityAmbiguous:
+        error = (
+            "Multiple active Bootstrap campaigns claim this asset; bot start blocked"
         )
+        log_event("error", "bootstrap_authority_ambiguous", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_AMBIGUOUS",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 409
+    except _BootstrapAuthorityMismatch:
+        error = "Active Bootstrap campaign belongs to another wallet; bot start blocked"
+        log_event("error", "bootstrap_authority_mismatch", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_MISMATCH",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 409
+    except Exception:
+        error = "Bootstrap campaign authority could not be verified; bot start blocked"
+        log_event("error", "bootstrap_authority_unavailable", error)
+        return jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "reason": "BOOTSTRAP_AUTHORITY_UNAVAILABLE",
+                "error": error,
+                "errors": [error],
+                "warnings": warnings,
+            }
+        ), 503
+    bootstrap_start_block = _bootstrap_start_block(bootstrap_campaign)
+    if bootstrap_start_block is not None:
+        error = bootstrap_start_block["error"]
+        errors.append(error)
+        coin_prep_reason = bootstrap_start_block["reason"]
+        coin_prep_error = error
+        log_event(
+            "warning",
+            "bootstrap_expired_start_blocked",
+            error,
+            data={
+                "campaign_id": bootstrap_start_block.get("campaign_id"),
+                "revision": bootstrap_start_block.get("revision"),
+            },
+        )
+    elif bootstrap_campaign is not None:
+        bootstrap_readiness = _bootstrap_coin_prep_start_readiness(cfg)
+        if bootstrap_readiness.get("ready") is not True:
+            resume_readiness = (
+                _bootstrap_existing_offer_resume_readiness(cfg, bootstrap_campaign)
+                if resume_existing_offers
+                else {"ready": False, "reason": "resume_not_requested"}
+            )
+            if resume_readiness.get("ready") is True:
+                log_event(
+                    "info",
+                    "bootstrap_existing_offer_resume_ready",
+                    "Exact recovered Bootstrap offer book authoritatively proven; "
+                    "free-coin Coin Prep readiness is not applicable",
+                    data={
+                        "campaign_id": resume_readiness.get("campaign_id"),
+                        "revision": resume_readiness.get("campaign_revision"),
+                        "offer_count": resume_readiness.get("offer_count"),
+                    },
+                )
+            else:
+                needs_coin_prep = True
+                coin_prep_reason = "bootstrap_coin_prep_required"
+                coin_prep_error = (
+                    "Active Bootstrap campaign coin outputs require re-preparation "
+                    "before starting the bot"
+                )
+                errors.append(coin_prep_error)
+                log_event(
+                    "warning",
+                    "bootstrap_coin_prep_start_blocked",
+                    "Exact active-campaign Coin Prep verification blocked bot start: "
+                    + str(bootstrap_readiness.get("reason") or "not_ready")
+                    + "; recovered offer proof: "
+                    + str(resume_readiness.get("reason") or "not_requested"),
+                )
+        else:
+            log_event(
+                "info",
+                "bootstrap_tier_drift_not_applicable",
+                "Active Bootstrap campaign uses exact campaign-bound coin sizes; "
+                "legacy Smart Settings tier-drift gate is not applicable",
+            )
     else:
         try:
             from coin_manager import check_tier_size_drift_standalone
 
             _drift = (
                 check_tier_size_drift_standalone(
-                    low_ratio=0.50, high_ratio=2.00, min_sample=2
+                    low_ratio=0.50, high_ratio=2.00, min_sample=2, strict=True
                 )
                 or []
             )
@@ -368,13 +936,19 @@ def api_bot_start():
                     "re-run Coin Prep before starting. Drift: " + _summary
                 )
                 coin_prep_error = errors[-1]
-        except Exception as _drift_err:
-            log_event(
-                "warning",
-                "tier_drift_gate_failed",
-                f"Tier-drift gate skipped: {_drift_err}",
+        except Exception:
+            needs_coin_prep = True
+            coin_prep_reason = "tier_size_drift_check_failed"
+            coin_prep_error = (
+                "Coin tier sizes could not be verified — retry Coin Prep "
+                "before starting the bot"
             )
-            warnings.append("Tier-drift gate skipped - check logs before trading")
+            errors.append(coin_prep_error)
+            log_event(
+                "error",
+                "tier_drift_gate_failed",
+                "Coin tier-size verification failed; bot start blocked",
+            )
 
     if getattr(cfg, "ENABLE_COIN_PREP", False):
         try:
@@ -401,13 +975,18 @@ def api_bot_start():
                     "Coin Prep failed - rerun Coin Prep before starting the bot"
                 )
                 errors.append(coin_prep_error)
-        except Exception as _prep_gate_err:
-            log_event(
-                "warning",
-                "coin_prep_gate_check_failed",
-                f"Coin-prep gate check failed: {_prep_gate_err}",
+        except Exception:
+            needs_coin_prep = True
+            coin_prep_reason = "coin_prep_gate_check_failed"
+            coin_prep_error = (
+                "Coin Prep state could not be verified — retry before starting the bot"
             )
-            warnings.append("Coin-prep gate skipped - check logs before trading")
+            errors.append(coin_prep_error)
+            log_event(
+                "error",
+                "coin_prep_gate_check_failed",
+                "Coin Prep state verification failed; bot start blocked",
+            )
 
     # Give API/AppBridge callers an early, stable identity error after cheap
     # validation but before the bot starts orchestration. Every adapter effect
@@ -487,6 +1066,36 @@ def api_bot_start():
                 }
             ), 400
 
+    if not errors:
+        if not _fresh_start_wallet_offer_book(bot):
+            error = "Live wallet offers could not be verified; retry bot start"
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "WALLET_OFFER_QUERY_NOT_FRESH",
+                    "error": error,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 503
+
+    if not errors:
+        mode_block = _one_sided_open_offer_start_block(cfg)
+        if mode_block is not None:
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": mode_block["reason"],
+                    "error": mode_block["error"],
+                    "errors": [mode_block["error"]],
+                    "warnings": warnings,
+                    "disabled_side": mode_block["disabled_side"],
+                    "offer_count": mode_block["offer_count"],
+                }
+            ), 409
+
     # Block start on critical errors
     if errors:
         payload = {
@@ -495,6 +1104,14 @@ def api_bot_start():
             "errors": errors,
             "warnings": warnings,
         }
+        if coin_prep_reason == "bootstrap_campaign_expired":
+            payload.update(
+                {
+                    "reason": coin_prep_reason,
+                    "error": coin_prep_error or errors[-1],
+                    "message": coin_prep_error or errors[-1],
+                }
+            )
         if needs_coin_prep:
             payload.update(
                 {
@@ -507,10 +1124,42 @@ def api_bot_start():
             )
         return jsonify(payload), 400
 
-    server._reset_runtime_session_stats()
-
-    # Start with warnings
-    started = bot.start()
+    # Cancel All may have begun after the initial is_running() check while
+    # pre-start validation was reading Sage. Serialize this final transition
+    # with Cancel All's stopped-book check and worker reservation.
+    with server._bot_cancel_lifecycle_lock:
+        if cancel_all_in_progress():
+            return cancel_all_start_block()
+        if bot.coin_manager.is_busy():
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "COIN_MAINTENANCE_IN_PROGRESS",
+                    "error": "Wait for coin maintenance to finish before starting the bot",
+                }
+            ), 409
+        # A stale flag would hide live-book recovery on restart. Fail before
+        # bot.start(), since a failed cleanup after start would be too late.
+        try:
+            server._fresh_start_clear()
+        except OSError as exc:
+            slog(
+                "SESSION",
+                "Bot start blocked because the fresh-start choice could not be cleared",
+                {"error": str(exc)[:256]},
+                level="error",
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "SESSION_CHOICE_NOT_DURABLE",
+                    "error": "Fresh-start choice could not be cleared from the user data directory",
+                }
+            ), 500
+        server._reset_runtime_session_stats()
+        started = bot.start()
     if not started:
         state = {}
         try:
@@ -528,11 +1177,6 @@ def api_bot_start():
                 "bot_status": state.get("status") or "blocked",
             }
         ), 400
-    # Clear the fresh-start flag now that a real run has begun.
-    # This ensures the resume modal shows correctly on the NEXT restart —
-    # the flag was only meant to suppress the modal within a single session
-    # (so a hot-reload after choosing "Start Fresh" doesn't re-show it).
-    server._fresh_start_clear()
     server.events.emit("bot_control", {"action": "started"})
     result = {"success": True, "status": "started"}
     if warnings:
@@ -550,56 +1194,92 @@ def api_bot_stop():
         return jsonify({"error": "Bot not initialised"}), 500
 
     bot.stop(wait=False)
-    server.events.emit("bot_control", {"action": "stopped"})
-    return jsonify({"status": "stopped"})
+    try:
+        state = bot.get_state() or {}
+    except Exception:
+        state = {}
+    # stop(wait=False) only signals the loop. The finalizer may still be
+    # waiting for a wallet operation, so report completion only if the bot
+    # has already published its terminal state.
+    status = "stopped" if state.get("status") == "stopped" else "stopping"
+    server.events.emit("bot_control", {"action": status})
+    return jsonify({"status": status})
 
 
 @bp.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
-    """Full shutdown — stop bot, cancel offers, kill server.
+    """Full shutdown after any wallet-wide cancellation has completed.
 
     Called by the GUI 'Shutdown' button or when the user wants
     to cleanly exit everything.
     """
     bot = api_server.bot
-    try:
-        cancel_first = bool(
-            (request.get_json(silent=True) or {}).get("cancel_offers", False)
-        )
-    except Exception:
-        cancel_first = False
+    payload = request.get_json(silent=True)
+    if payload is not None and type(payload) is not dict:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    if type(payload) is dict and (
+        "cancel_offers" in payload and type(payload["cancel_offers"]) is not bool
+    ):
+        return jsonify({"success": False, "error": "invalid_cancel_offers"}), 400
+    cancel_first = type(payload) is dict and payload.get("cancel_offers") is True
+    if cancel_first:
+        # The desktop performs the wallet-wide, proof-gated Cancel All workflow
+        # while the server is still available, then calls this route with
+        # cancel_offers=false. This endpoint cannot safely submit a pair-scoped
+        # manager cancellation and exit before authoritative terminal proof.
+        return jsonify(
+            {
+                "success": False,
+                "reason": "WALLET_WIDE_CANCEL_REQUIRED",
+                "error": "Cancel all wallet offers and verify terminal proof before shutdown",
+            }
+        ), 409
+
+    # Keep the wallet-wide proof worker alive until it has reached Task 9
+    # terminal evidence. The lifecycle lock also serializes this check with
+    # reserving a new Cancel All worker or starting the bot.
+    with api_server._bot_cancel_lifecycle_lock:
+        try:
+            with api_server._cancel_all_state_lock:
+                cancel_active = api_server._cancel_all_state.get("running") is not False
+            cancel_thread = api_server._cancel_all_thread
+            cancel_active = cancel_active or (
+                cancel_thread is not None and cancel_thread.is_alive()
+            )
+        except Exception:
+            cancel_active = True
+        if cancel_active:
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CANCEL_ALL_IN_PROGRESS",
+                    "error": "Wait for authoritative Cancel All proof before shutdown",
+                }
+            ), 409
+        runtime = api_server.mutation_gate.current_runtime()
+        if runtime is not None:
+            try:
+                runtime.begin_quiesce()
+            except Exception:
+                return jsonify(
+                    {
+                        "success": False,
+                        "reason": "SHUTDOWN_QUIESCE_UNAVAILABLE",
+                        "error": "Could not reserve safe shutdown",
+                    }
+                ), 503
 
     def _do_shutdown():
         """Run shutdown sequence in background thread so the HTTP response returns first."""
         time.sleep(0.5)  # Let the response reach the browser
-        cancel_permit = None
-        perform_cancel = cancel_first
-        if perform_cancel:
-            try:
-                cancel_permit = api_server.mutation_gate.enter_mutation(
-                    "api:bot.api_shutdown.background_cancel"
-                )
-            except api_server.mutation_gate.MutationBlocked:
-                perform_cancel = False
-
         print("\n🛑 SHUTDOWN sequence starting...", flush=True)
 
-        # Stop offer creation/repost loops before wallet-wide cancellation.
         # Central cleanup repeats this stop and proves it before lease release.
         if bot is not None:
             try:
                 bot.stop(wait=True)
             except Exception:
-                perform_cancel = False
-            if perform_cancel:
-                for producer in api_server._shutdown_thread_refs(bot):
-                    try:
-                        if producer.is_alive():
-                            perform_cancel = False
-                            break
-                    except Exception:
-                        perform_cancel = False
-                        break
+                pass
 
         # 0. Kill coin prep subprocess if it's still running
         try:
@@ -625,32 +1305,7 @@ def api_shutdown():
         except Exception as e:
             print(f"   ⚠️ Coin prep cleanup: {e}", flush=True)
 
-        # 2. Cancel all offers if requested
-        if perform_cancel and bot and bot.offer_manager:
-            print("   Cancelling all offers...", flush=True)
-            cancelled = 0
-            try:
-                result = bot.offer_manager.cancel_all()
-                cancelled = sum(1 for r in result.values() if r and r.get("success"))
-                print(f"   ✅ Cancelled {cancelled} offers", flush=True)
-            except Exception as e:
-                print(f"   ⚠️ Cancel failed: {e}", flush=True)
-
-            # A wallet row disappearing after a submitted cancellation is not
-            # authoritative terminal evidence: it could also be a partial RPC
-            # response or a racing fill.  Keep the durable offer and coin lock
-            # intact until reconciliation proves the terminal outcome.
-            if cancelled:
-                print(
-                    f"   ⏳ {cancelled} cancellation request(s) submitted; "
-                    "authoritative terminal reconciliation remains pending",
-                    flush=True,
-                )
-
-        if cancel_permit is not None:
-            api_server.mutation_gate.exit_mutation(cancel_permit)
-
-        # 3. Stop Splash node (in case bot.stop() didn't cover it)
+        # 2. Stop Splash node (in case bot.stop() didn't cover it)
         try:
             if bot and hasattr(bot, "splash_node") and bot.splash_node.is_running():
                 bot.splash_node.stop()
@@ -690,7 +1345,24 @@ def api_shutdown():
         log_event("info", "server_shutdown", "Server shutting down via GUI")
 
         # 5. Release ownership only after every producer is proven quiescent.
-        api_server.quiesce_and_release_mutation_runtime(bot_instance=bot)
+        # The pristine wallet-setup shell has no mutation runtime to release.
+        # Use the same native shutdown authority so that exact no-runtime
+        # state can close while an unproven producer still fails closed.
+        from native_shutdown import native_close_readiness
+
+        release = native_close_readiness()
+        if type(release) is not dict or release.get("released") is not True:
+            slog(
+                "SHUTDOWN",
+                "Shutdown remains in safety fence because mutation quiescence is unproven",
+                {
+                    "reason": (release or {}).get("reason")
+                    if type(release) is dict
+                    else "invalid_result"
+                },
+                level="error",
+            )
+            return
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()
@@ -1847,8 +2519,8 @@ def api_status():
                 # get_inventory_state() already serializes Decimals to strings,
                 # but wrap in _serialize_dict for defence-in-depth.
                 risk_out = api_server._serialize_dict(dict(inv))
-        except Exception as _risk_err:
-            risk_out = {"error": f"risk_state_unavailable: {_risk_err}"}
+        except Exception:
+            risk_out = {"error": "risk_state_unavailable"}
 
         try:
             lifecycle_out = get_offer_lifecycle_summary(
@@ -1867,6 +2539,9 @@ def api_status():
         # --- Assemble response ---
         result = {
             "running": raw.get("running", False),
+            "status": raw.get("status")
+            or ("running" if raw.get("running", False) else "stopped"),
+            "stop_retry_available": raw.get("stop_retry_available") is True,
             "runtime_safety": _runtime_safety_for_status(),
             "stats": stats_out,
             "balances": balances_out,
@@ -2008,10 +2683,12 @@ def api_diagnostics_api_stats():
                 age_secs = get_market_analysis_cache_age_secs(asset_id, "spacescan")
                 if age_secs is not None:
                     payload["spacescan"]["token_context_cache_age_secs"] = int(age_secs)
-        except Exception as cache_err:
-            payload["spacescan"]["token_context_cache_error"] = str(cache_err)
-    except Exception as e:
-        payload["spacescan"]["error"] = str(e)
+        except Exception:
+            payload["spacescan"]["token_context_cache_error"] = (
+                "Spacescan cache status unavailable"
+            )
+    except Exception:
+        payload["spacescan"]["error"] = "Spacescan status unavailable"
 
     # Merge any spacescan calls recorded via the centralized tracker
     # (currently market_data_collector routes through spacescan.record_external_call,
@@ -2059,8 +2736,8 @@ def api_diagnostics_api_stats():
                     getattr(bot.coinset_client, "_rate_limited_until", 0.0) or 0
                 ),
             }
-    except Exception as e:
-        payload["coinset"]["error"] = str(e)
+    except Exception:
+        payload["coinset"]["error"] = "Coinset status unavailable"
 
     # Merge "direct" Coinset calls (tx_fees fee-estimate, anything not
     # going through coinset_client). These come from the centralized
@@ -2136,8 +2813,8 @@ def api_diagnostics_api_stats():
                     getattr(bot.dexie_manager, "_v3_pairs_cache", None)
                 ),
             }
-    except Exception as e:
-        payload["dexie"]["error"] = str(e)
+    except Exception:
+        payload["dexie"]["error"] = "Dexie status unavailable"
 
     # Merge "direct" Dexie calls (Smart Settings, market intel, deposit
     # advisor, fill verification, doctor, sage_node, etc.) — these
@@ -2193,8 +2870,8 @@ def api_diagnostics_api_stats():
             }
         else:
             payload["splash"] = {"available": False}
-    except Exception as e:
-        payload["splash"] = {"available": False, "error": str(e)}
+    except Exception:
+        payload["splash"] = {"available": False, "error": "Splash status unavailable"}
 
     # One-release compatibility marker. TibetSwap has shut down permanently;
     # historical counters are not promoted into live provider health.

@@ -13,6 +13,7 @@ def sanitize_release_notes(text: str, private_repo: str) -> str:
     repo = str(private_repo or "").strip().strip("/")
     if repo:
         escaped_repo = re.escape(repo)
+        repo_url = rf"https://github\.com/{escaped_repo}(?![A-Za-z0-9_.-])"
         notes = re.sub(
             rf"\s+in\s+https://github\.com/{escaped_repo}/pull/\d+",
             "",
@@ -20,7 +21,7 @@ def sanitize_release_notes(text: str, private_repo: str) -> str:
             flags=re.IGNORECASE,
         )
         notes = re.sub(
-            rf"\[([^\]]+)\]\(https://github\.com/{escaped_repo}/(?:pull|issues)/\d+\)",
+            rf"\[([^\]]+)\]\({repo_url}(?:/[^)\s]*)?\)",
             r"\1",
             notes,
             flags=re.IGNORECASE,
@@ -31,7 +32,7 @@ def sanitize_release_notes(text: str, private_repo: str) -> str:
             notes,
         )
         notes = re.sub(
-            rf"https://github\.com/{escaped_repo}/\S+",
+            rf"{repo_url}(?:/[^\s)]*)?",
             "",
             notes,
             flags=re.IGNORECASE,

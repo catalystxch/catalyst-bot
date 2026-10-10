@@ -1,7 +1,7 @@
 """Slice 04-14 — dashboard endpoint contract tests.
 
 Tests GET /api/dashboard:
-  - No auth required (read-only aggregator)
+  - Local browser authentication and same-origin provenance required
   - Returns 200 with all required top-level keys
   - bot=None returns safe empty shapes for bot-dependent fields
 """
@@ -66,6 +66,11 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self._LOOPBACK,
+        )
         api_server._rate_limit_log.clear()
         self._fiat_price_patcher = patch(
             "market_data_collector.get_cached_xch_usd_price",
@@ -113,6 +118,138 @@ class _FlaskBase(unittest.TestCase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestDashboard(_FlaskBase):
+    def test_stopped_spread_uses_readonly_quote_without_advancing_engine(self):
+        engine = MagicMock()
+        engine.get_last_price.return_value = None
+        engine.get_price.return_value = {"mid_price": "9"}
+        risk = MagicMock()
+        risk.get_inventory_state.return_value = {}
+        risk.get_circuit_breaker_blocked_side.return_value = ""
+        risk.get_market_health.return_value = {
+            "status": "green",
+            "message": "ok",
+            "conditions": [],
+            "metrics": {},
+        }
+        bot = types.SimpleNamespace(
+            is_running=lambda: False,
+            _bot_state={},
+            _current_mid_price=None,
+            _loop_count=0,
+            _start_time=0,
+            _probe_state={},
+            _last_live_offer_edges={
+                "our_best_bid": "0.00007",
+                "our_best_ask": "0.00009",
+            },
+            price_engine=engine,
+            risk_manager=risk,
+            market_intel=None,
+            offer_manager=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+        )
+        with (
+            patch("database.get_stats", return_value={}),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp, "_dashboard_wallet_reads_allowed", return_value=False
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(
+                api_server,
+                "_active_cat",
+                {"asset_id": "a" * 64, "ticker_id": "MZ_XCH", "decimals": 3},
+            ),
+            patch.object(api_server, "bot", bot),
+            patch(
+                "blueprints.market._get_startup_price_cached",
+                return_value={"mid": "0.00008"},
+            ) as quote,
+        ):
+            response = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["market_health"]["metrics"]["your_spread_bps"],
+            "2500.00",
+        )
+        engine.get_price.assert_not_called()
+        self.assertTrue(quote.called)
+        for recorded in quote.call_args_list:
+            self.assertEqual(recorded.args, ("a" * 64, "MZ_XCH", 3))
+
+    def test_stopped_spread_ignores_midpoint_left_by_previous_session(self):
+        bot = types.SimpleNamespace(
+            is_running=lambda: False,
+            _bot_state={"mid_price": "9"},
+            _current_mid_price=Decimal("9"),
+            _loop_count=0,
+            _start_time=0,
+            _probe_state={},
+            _last_live_offer_edges={
+                "our_best_bid": "0.00007",
+                "our_best_ask": "0.00009",
+            },
+            price_engine=None,
+            risk_manager=None,
+            market_intel=None,
+            offer_manager=None,
+            coin_manager=None,
+            sniper=None,
+            boost_manager=None,
+        )
+        with (
+            patch("database.get_stats", return_value={}),
+            patch("database.get_coin_summary", return_value={}),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_connection", return_value=_make_mock_db_conn()),
+            patch.object(
+                dashboard_bp, "_dashboard_wallet_reads_allowed", return_value=False
+            ),
+            patch.object(
+                api_server,
+                "_get_spacescan_market_context",
+                return_value=_empty_spacescan(),
+            ),
+            patch.object(
+                api_server,
+                "_active_cat",
+                {"asset_id": "a" * 64, "ticker_id": "MZ_XCH", "decimals": 3},
+            ),
+            patch.object(api_server, "bot", bot),
+            patch(
+                "blueprints.market._get_startup_price_cached",
+                return_value={"mid": "0.00008"},
+            ) as quote,
+        ):
+            response = self.client.get("/api/dashboard", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["market_health"]["metrics"]["your_spread_bps"],
+            "2500.00",
+        )
+        self.assertTrue(quote.called)
+        for recorded in quote.call_args_list:
+            self.assertEqual(recorded.args, ("a" * 64, "MZ_XCH", 3))
+
+    def test_stopped_live_read_guard_does_not_build_full_bot_state(self):
+        stopped_bot = types.SimpleNamespace(
+            is_running=lambda: False,
+            get_state=MagicMock(side_effect=AssertionError("full state is slow")),
+        )
+
+        self.assertFalse(dashboard_bp._live_wallet_reads_allowed(stopped_bot))
+        stopped_bot.get_state.assert_not_called()
+
     def test_returns_200(self):
         resp = self._get_dashboard()
         self.assertEqual(resp.status_code, 200)
@@ -775,6 +912,7 @@ class TestDashboard(_FlaskBase):
         stopped_bot = types.SimpleNamespace(
             get_state=lambda: {"running": False},
             is_running=lambda: False,
+            _get_effective_offer_targets=MagicMock(return_value={"buy": 3, "sell": 3}),
             offer_manager=types.SimpleNamespace(
                 get_wallet_sync_snapshot=lambda: {
                     "buy": [],
@@ -839,6 +977,10 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(performance["open_buys"], 0)
         self.assertEqual(performance["open_sells"], 0)
         self.assertEqual(performance["open_offers"], 0)
+        metrics = resp.get_json()["market_health"]["metrics"]
+        self.assertEqual(metrics["effective_buy_target"], 0)
+        self.assertEqual(metrics["effective_sell_target"], 0)
+        stopped_bot._get_effective_offer_targets.assert_not_called()
 
     def test_market_health_uses_live_offer_edges_for_inner_spread(self):
         risk_manager = MagicMock()
@@ -954,6 +1096,101 @@ class TestDashboard(_FlaskBase):
         self.assertEqual(result["source"], "db_open_offers")
         self.assertEqual(result["our_open_buys"], 0)
         self.assertEqual(result["our_open_sells"], 0)
+
+    def test_live_offer_edges_does_not_label_cached_wallet_book_as_live(self):
+        """A failed Sage read must not make cached offers appear live."""
+        stale_conn = MagicMock()
+        stale_conn.execute.return_value.fetchall.return_value = [
+            {
+                "side": "buy",
+                "min_price": Decimal("0.000064"),
+                "max_price": Decimal("0.000065"),
+                "cnt": 1,
+            }
+        ]
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=types.SimpleNamespace(
+                sync_from_wallet_with_meta=lambda: (
+                    ([{"trade_id": "cached-buy"}], [], []),
+                    {
+                        "fresh": False,
+                        "using_cache": True,
+                        "last_error": "Sage get_offers unavailable",
+                    },
+                ),
+            ),
+        )
+
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=stale_conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_unavailable")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_best_bid"], api_server.Decimal("0"))
+        stale_conn.execute.assert_not_called()
+
+    def test_live_offer_edges_keeps_offers_with_their_own_freshness(self):
+        """Another sync's fresh metadata cannot bless this read's cached offers."""
+        conn = MagicMock()
+        manager = types.SimpleNamespace(
+            sync_from_wallet=lambda: ([{"trade_id": "cached-buy"}], [], []),
+            get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+            sync_from_wallet_with_meta=lambda: (
+                ([{"trade_id": "cached-buy"}], [], []),
+                {"fresh": False, "using_cache": True},
+            ),
+        )
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=manager,
+        )
+
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_unavailable")
+        self.assertEqual(result["our_open_buys"], 0)
+        self.assertEqual(result["our_best_bid"], Decimal("0"))
+        conn.execute.assert_not_called()
+
+    def test_live_offer_edges_uses_fresh_running_wallet_book(self):
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = [
+            {
+                "side": "buy",
+                "min_price": Decimal("0.000064"),
+                "max_price": Decimal("0.000065"),
+                "cnt": 1,
+            }
+        ]
+        running_bot = types.SimpleNamespace(
+            get_state=lambda: {"running": True},
+            is_running=lambda: True,
+            offer_manager=types.SimpleNamespace(
+                sync_from_wallet_with_meta=lambda: (
+                    ([{"trade_id": "live-buy"}], [], []),
+                    {"fresh": True, "using_cache": False},
+                ),
+            ),
+        )
+        with (
+            patch.object(api_server, "bot", running_bot),
+            patch.object(api_server, "get_connection", return_value=conn),
+        ):
+            result = api_server._get_live_local_offer_edges("aa" * 32)
+
+        self.assertEqual(result["source"], "wallet_sync")
+        self.assertEqual(result["our_open_buys"], 1)
+        self.assertEqual(result["our_best_bid"], api_server.Decimal("0.000065"))
 
     def test_live_offer_edges_prefers_fresh_stopped_wallet_snapshot_over_stale_db(self):
         """A stopped app must not present stale DB rows as live offers."""

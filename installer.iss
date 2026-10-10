@@ -30,6 +30,12 @@
 #define MyAppExeName     "Catalyst.exe"
 #define MySourceDir      "dist\Catalyst"
 
+; Reject a mismatched bundle before creating an installer. A post-install
+; exception is too late to reliably give silent Setup a failing exit code.
+#if GetVersionNumbersString(AddBackslash(MySourceDir) + MyAppExeName) != MyAppVersion + ".0"
+  #error Bundled Catalyst.exe version does not match MyAppVersion.
+#endif
+
 [Setup]
 ; A fresh GUID per product. DO NOT re-use across unrelated products.
 ; Generate your own in Inno Setup: Tools -> Generate GUID.

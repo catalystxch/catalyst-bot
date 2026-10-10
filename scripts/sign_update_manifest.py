@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,6 +57,12 @@ def build_manifest(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(installer)
 
     tag = _version_tag(args.version)
+    channel = getattr(args, "channel", "stable")
+    source_commit = getattr(args, "source_commit", None)
+    if channel == "beta" and not re.fullmatch(
+        r"[a-f0-9]{40}", str(source_commit or "")
+    ):
+        raise ValueError("beta source commit must be a full lowercase Git SHA")
     version = tag.lstrip("vV")
     installer_name = installer.name
     expected_name = f"Catalyst-Setup-{tag}.exe"
@@ -81,10 +88,10 @@ def build_manifest(args: argparse.Namespace) -> dict:
     download_base = str(args.download_base_url).rstrip("/")
     release_url = str(args.release_url).strip()
 
-    return {
+    manifest = {
         "schema": 1,
         "app": "CATalyst",
-        "channel": "stable",
+        "channel": channel,
         "version": version,
         "tag": tag,
         "published_at": now.isoformat().replace("+00:00", "Z"),
@@ -102,6 +109,9 @@ def build_manifest(args: argparse.Namespace) -> dict:
             }
         },
     }
+    if channel == "beta":
+        manifest["source_commit"] = source_commit
+    return manifest
 
 
 def sign_manifest(manifest: dict, private_key_b64: str) -> str:
@@ -123,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--version", required=True, help="Release tag or version, e.g. v1.2.7"
     )
+    parser.add_argument("--channel", choices=("stable", "beta"), default="stable")
+    parser.add_argument("--source-commit", help="Exact source commit for beta builds")
     parser.add_argument(
         "--installer", required=True, help="Path to Catalyst-Setup-vX.Y.Z.exe"
     )

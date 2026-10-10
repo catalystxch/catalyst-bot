@@ -127,7 +127,8 @@ def _get_startup_price_cached(asset_id, ticker_id, decimals=3) -> dict:
                     row_asset = (
                         str(row.get("base_id") or "").strip().lower().removeprefix("0x")
                     )
-                    if row_asset and row_asset != asset:
+                    # A ticker symbol alone does not prove which CAT issued it.
+                    if row_asset != asset:
                         continue
                     bid = Decimal(str(row.get("bid") or row.get("best_bid") or 0))
                     ask = Decimal(str(row.get("ask") or row.get("best_ask") or 0))
@@ -219,7 +220,15 @@ def api_dexie_repost():
     bot = api_server.bot
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
-    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
+    (open_buys, open_sells, _), sync_meta = (
+        bot.offer_manager.sync_from_wallet_with_meta()
+    )
+    if (
+        type(sync_meta) is not dict
+        or sync_meta.get("fresh") is not True
+        or sync_meta.get("using_cache") is True
+    ):
+        return jsonify({"error": "wallet_offer_query_not_fresh"}), 503
     all_offers = open_buys + open_sells
     bot.dexie_manager.repost_active_offers(all_offers)
     return jsonify({"status": "queued", "count": len(all_offers)})
@@ -608,8 +617,7 @@ def api_coinset_stats():
 
 @bp.route("/api/price")
 def api_price():
-    """Get current price from all sources."""
-    bot = api_server.bot
+    """Read the current price without advancing trading state or writing history."""
     cfg = api_server.cfg
     asset_id = api_server._active_cat.get("asset_id") or (
         cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
@@ -619,20 +627,37 @@ def api_price():
         cfg.CAT_TICKER_ID if hasattr(cfg, "CAT_TICKER_ID") else ""
     )
 
-    if bot:
-        price_data = bot.price_engine.get_price(asset_id, decimals, ticker)
-        result = api_server._serialize_dict(price_data)
-        # GUI expects "mid" key — price_engine returns "mid_price"
-        if "mid" not in result and "mid_price" in result:
-            result["mid"] = result["mid_price"]
-        # Ensure "success" key exists for GUI fallback check
-        if "mid" not in result:
-            result["mid"] = 0
-        result["success"] = float(result.get("mid", 0) or 0) > 0
-        return jsonify(result)
-
-    # Bot not running — lightweight price lookup via api_server helper
-    return api_server._fetch_price_standalone(asset_id, decimals)
+    # PriceEngine.get_price() records price history and advances its risk
+    # reference. The legacy pre-bot fallback accepts the first Dexie ticker
+    # row without checking its asset. Both cases need the selected pair quote.
+    public_quote = _get_startup_price_cached(asset_id, ticker, decimals)
+    price_data = {}
+    if public_quote.get("mid"):
+        price_data = {
+            "mid_price": public_quote["mid"],
+            "dexie_price": public_quote["mid"],
+            "tibet_price": None,
+            "strategy_used": "dexie_offer_book",
+            "source": public_quote.get("source", "dexie_bid_ask"),
+            "liquidity": {},
+            "arb_opportunity": None,
+            "arb_gap_bps": "0",
+            "tibet_available": False,
+            "tibet_enabled": False,
+            "tibet_status": "retired",
+        }
+    result = api_server._serialize_dict(price_data)
+    # GUI expects "mid" key — price_engine returns "mid_price"
+    if "mid" not in result and "mid_price" in result:
+        result["mid"] = result["mid_price"]
+    # Ensure "success" key exists for GUI fallback check
+    if "mid" not in result:
+        result["mid"] = 0
+    try:
+        result["success"] = Decimal(str(result["mid"] or 0)) > 0
+    except (InvalidOperation, ValueError, TypeError):
+        result["success"] = False
+    return jsonify(result)
 
 
 def _utc_now() -> datetime:
@@ -1211,95 +1236,14 @@ def api_amm_price():
 
 @bp.route("/api/debug/coinprep")
 def api_debug_coinprep():
-    """Debug: shows coin prep worker status and any error output."""
-    bot = api_server.bot
-    result = {"_coin_prep_state": api_server._coin_prep_state}
-
-    try:
-        from user_paths import coin_prep_status_file, coin_prep_output_log_file
-
-        status_file = coin_prep_status_file()
-        log_file = coin_prep_output_log_file()
-    except Exception:
-        base_dir = os.path.dirname(os.path.abspath(api_server.__file__))
-        status_file = os.path.join(base_dir, "coin_prep_status.json")
-        log_file = os.path.join(base_dir, "coin_prep_output.log")
-
-    if os.path.exists(status_file):
-        try:
-            with open(status_file, "r") as f:
-                result["worker_status_file"] = json.load(f)
-        except Exception as e:
-            result["worker_status_file_error"] = str(e)
-    else:
-        result["worker_status_file"] = "NOT FOUND"
-
-    if os.path.exists(log_file):
-        try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                log_content = f.read()
-            result["worker_output_log"] = log_content[-2000:]
-        except Exception as e:
-            result["worker_output_log_error"] = str(e)
-    else:
-        result["worker_output_log"] = "NOT FOUND"
-
-    if bot:
-        try:
-            result["coin_manager_status"] = bot.coin_manager.check_coin_prep_status()
-        except Exception as e:
-            result["coin_manager_error"] = str(e)
-
-    try:
-        events = database.get_recent_events(limit=20)
-        prep_events = [e for e in events if "coin_prep" in str(e.get("event_type", ""))]
-        result["recent_coin_prep_events"] = prep_events[:10]
-    except Exception:
-        pass
-
-    return jsonify(result)
+    """Disabled diagnostic route retained for one-release compatibility."""
+    return jsonify({"error": "debug_routes_disabled"}), 404
 
 
 @bp.route("/api/debug/pricing")
 def api_debug_pricing():
-    """Debug: shows exactly what pricing the GUI sees."""
-    import requests as _req
-
-    bot = api_server.bot
-    result = {
-        "_active_cat": {
-            k: str(v)[:50] if v else None for k, v in api_server._active_cat.items()
-        }
-    }
-    result["bot_exists"] = bot is not None
-
-    asset_id = api_server._active_cat.get("asset_id") or ""
-    ticker_id = api_server._active_cat.get("ticker_id") or ""
-    result["asset_id"] = asset_id
-    result["ticker_id"] = ticker_id
-
-    try:
-        resp = _req.get("http://127.0.0.1:5000/api/status", timeout=15)
-        status_data = resp.json()
-        result["status_pricing"] = status_data.get("pricing", "MISSING")
-        result["status_current_cat"] = status_data.get("current_cat", "MISSING")
-    except Exception as e:
-        result["status_error"] = str(e)
-
-    try:
-        resp = _req.get("http://127.0.0.1:5000/api/price", timeout=15)
-        result["price_response"] = resp.json()
-    except Exception as e:
-        result["price_error"] = str(e)
-
-    result["tibet"] = {
-        "provider": "tibetswap",
-        "status": "retired",
-        "available": False,
-        "reason": "TIBETSWAP_SHUTDOWN",
-    }
-
-    return jsonify(result)
+    """Disabled diagnostic route retained for one-release compatibility."""
+    return jsonify({"error": "debug_routes_disabled"}), 404
 
 
 @bp.route("/api/debug/tibet-test")
@@ -1318,115 +1262,5 @@ def api_debug_tibet_test():
 
 @bp.route("/api/debug/sage-single-offer-test", methods=["POST"])
 def api_debug_sage_single_offer_test():
-    """Create one selected-coin XCH offer and one CAT offer, inspect, cancel."""
-    cfg = api_server.cfg
-    try:
-        from wallet import (
-            get_wallet_type,
-            create_offer,
-            cancel_offer,
-            get_owned_coins_detailed,
-        )
-
-        if get_wallet_type() != "sage":
-            return jsonify({"ok": False, "error": "sage_only_debug_route"}), 400
-
-        def _extract_trade_id(result: dict) -> str:
-            if not isinstance(result, dict):
-                return ""
-            trade_id = result.get("trade_id") or result.get("offer_id") or ""
-            if not trade_id:
-                tr = result.get("trade_record") or {}
-                if isinstance(tr, dict):
-                    trade_id = tr.get("trade_id") or tr.get("offer_id") or ""
-            if not trade_id:
-                offer_obj = result.get("offer") or {}
-                if isinstance(offer_obj, dict):
-                    trade_id = offer_obj.get("id") or offer_obj.get("offer_id") or ""
-            return str(trade_id or "")
-
-        def _run_case(
-            name: str, wallet_id: int, offer_dict: dict, selected_coin_id: str
-        ):
-            result = {
-                "name": name,
-                "selected_coin_id": selected_coin_id,
-                "offer_dict": offer_dict,
-            }
-            create_res = create_offer(
-                offer_dict,
-                validate_only=False,
-                max_time=int(time.time()) + 300,
-                coin_ids=[selected_coin_id],
-            )
-            result["create_result"] = create_res
-
-            trade_id = _extract_trade_id(create_res or {})
-            result["trade_id"] = trade_id
-            if not trade_id:
-                return result
-
-            time.sleep(2)
-            owned = get_owned_coins_detailed(wallet_id) or {}
-            locked_inputs = []
-            for coin_id, info in owned.items():
-                offer_id = str(info.get("offer_id") or "").lower()
-                if offer_id == trade_id.lower():
-                    locked_inputs.append(
-                        {
-                            "coin_id": coin_id,
-                            "amount": int(info.get("amount") or 0),
-                        }
-                    )
-            result["locked_inputs"] = locked_inputs
-
-            cancel_res = cancel_offer(trade_id, secure=False, timeout=30)
-            result["cancel_result"] = cancel_res
-            return result
-
-        xch_coin = database.get_smallest_free_tier_spare("xch")
-        cat_coin = database.get_smallest_free_tier_spare("cat")
-        if not xch_coin or not cat_coin:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "no_free_spare_coin",
-                    "xch_coin": xch_coin,
-                    "cat_coin": cat_coin,
-                }
-            ), 409
-
-        xch_case = _run_case(
-            name="xch_selected_manual",
-            wallet_id=int(cfg.WALLET_ID_XCH),
-            offer_dict={
-                str(int(cfg.WALLET_ID_XCH)): -1_000_000_000,
-                str(int(cfg.CAT_WALLET_ID)): 8_000,
-            },
-            selected_coin_id=xch_coin["coin_id"],
-        )
-
-        time.sleep(2)
-
-        cat_case = _run_case(
-            name="cat_selected_manual",
-            wallet_id=int(cfg.CAT_WALLET_ID),
-            offer_dict={
-                str(int(cfg.CAT_WALLET_ID)): -8_000,
-                str(int(cfg.WALLET_ID_XCH)): 1_000_000_000,
-            },
-            selected_coin_id=cat_coin["coin_id"],
-        )
-
-        payload = {
-            "ok": True,
-            "xch_coin": xch_coin,
-            "cat_coin": cat_coin,
-            "results": [xch_case, cat_case],
-        }
-        database.log_event(
-            "info", "sage_single_offer_test", json.dumps(payload, default=str)[:1500]
-        )
-        return jsonify(payload)
-    except Exception:
-        return api_server._api_exception(request.path)
+    """Disabled diagnostic route; no wallet effect is permitted here."""
+    return jsonify({"error": "debug_routes_disabled"}), 404

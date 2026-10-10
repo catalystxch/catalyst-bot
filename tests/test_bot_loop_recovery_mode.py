@@ -380,6 +380,98 @@ class RecoveryModeTests(unittest.TestCase):
     def _log_event(self, severity, event_type, message, data=None):
         self.logged.append((severity, event_type, message, data))
 
+    def test_graceful_config_change_does_not_use_stale_empty_offer_book(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop.offer_manager = types.SimpleNamespace(
+            sync_from_wallet=lambda: ([], [], []),
+            sync_from_wallet_with_meta=lambda: (
+                ([], [], []),
+                {"fresh": False, "using_cache": True},
+            ),
+        )
+
+        with patch.object(bot_loop.cfg, "reload", lambda: None, create=True):
+            result = loop.graceful_config_change()
+
+        self.assertEqual(result["status"], "partial")
+        self.assertFalse(loop._graceful_in_progress)
+
+    def test_graceful_config_change_accepts_fresh_empty_offer_book(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        loop.offer_manager = types.SimpleNamespace(
+            sync_from_wallet_with_meta=lambda: (
+                ([], [], []),
+                {"fresh": True, "using_cache": False},
+            ),
+        )
+
+        with patch.object(bot_loop.cfg, "reload", lambda: None, create=True):
+            result = loop.graceful_config_change()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(loop._graceful_in_progress)
+
+    def test_graceful_migration_retains_cancel_authority_after_stale_read(self):
+        loop = bot_loop.BotLoop()
+        loop._graceful_in_progress = True
+        loop._graceful_migration = {
+            "active": True,
+            "phase": "verifying",
+            "cancel_ids": ["still-open"],
+        }
+        loop.offer_manager = types.SimpleNamespace(
+            sync_from_wallet=lambda: ([], [], []),
+            sync_from_wallet_with_meta=lambda: (
+                ([], [], []),
+                {"fresh": False, "using_cache": True},
+            ),
+            _pending_cancel_retries={},
+        )
+
+        loop._maybe_finalize_graceful_migration()
+
+        self.assertTrue(loop._graceful_in_progress)
+        self.assertEqual(loop._graceful_migration["phase"], "verifying")
+
+    def test_graceful_migration_does_not_finish_on_stale_cycle_ids(self):
+        loop = bot_loop.BotLoop()
+        loop._graceful_in_progress = True
+        loop._wallet_sync_stale_cycle = True
+        loop._graceful_migration = {
+            "active": True,
+            "phase": "verifying",
+            "cancel_ids": ["still-open"],
+        }
+
+        loop._maybe_finalize_graceful_migration(
+            current_buy_ids=set(), current_sell_ids=set()
+        )
+
+        self.assertTrue(loop._graceful_in_progress)
+        self.assertEqual(loop._graceful_migration["phase"], "verifying")
+
+    def test_graceful_migration_finishes_on_fresh_empty_book(self):
+        loop = bot_loop.BotLoop()
+        loop._graceful_in_progress = True
+        loop._graceful_migration = {
+            "active": True,
+            "phase": "verifying",
+            "cancel_ids": ["gone"],
+        }
+        loop.offer_manager = types.SimpleNamespace(
+            sync_from_wallet_with_meta=lambda: (
+                ([], [], []),
+                {"fresh": True, "using_cache": False},
+            ),
+        )
+
+        loop._maybe_finalize_graceful_migration()
+
+        self.assertFalse(loop._graceful_in_progress)
+        self.assertEqual(loop._graceful_migration["phase"], "done")
+
     def test_coin_watcher_skips_unreliable_snapshot_without_poisoning_baseline(self):
         loop = bot_loop.BotLoop()
         previous_snapshot = {
@@ -441,6 +533,57 @@ class RecoveryModeTests(unittest.TestCase):
         self.assertFalse(
             loop._is_coin_watcher_snapshot_reliable(empty_result, empty_result)
         )
+
+    def test_coin_watcher_ignores_transient_empty_wallets_after_live_baseline(self):
+        """Sage's brief 200/empty restart response must not report mass spends."""
+        loop = bot_loop.BotLoop()
+        baseline = {
+            "xch-old": {
+                "amount": 2_000_000_000_000,
+                "wallet_type": "xch",
+                "source": "wallet",
+            },
+            "cat-old": {
+                "amount": 42_000,
+                "wallet_type": "cat",
+                "source": "wallet",
+            },
+        }
+        loop._coin_snapshot = dict(baseline)
+        empty_result = {"success": True, "records": [], "confirmed_records": []}
+
+        reliable = loop._is_coin_watcher_snapshot_reliable(empty_result, empty_result)
+        loop._handle_coin_watcher_snapshot({}, {}, snapshot_reliable=reliable)
+
+        self.assertFalse(reliable)
+        self.assertEqual(loop._coin_snapshot, baseline)
+        self.assertFalse(
+            any(
+                event in {"coin_watcher_gone", "coin_watcher_new"}
+                for _, event, _, _ in self.logged
+            )
+        )
+
+    def test_coin_watcher_ignores_one_empty_wallet_after_live_baseline(self):
+        """A partial Sage recovery must not report the other wallet spent."""
+        loop = bot_loop.BotLoop()
+        loop._coin_snapshot = {
+            "xch-old": {
+                "amount": 2_000_000_000_000,
+                "wallet_type": "xch",
+                "source": "wallet",
+            },
+            "cat-old": {"amount": 42_000, "wallet_type": "cat", "source": "wallet"},
+        }
+        xch_result = {
+            "success": True,
+            "records": [{"coin": {"amount": 2_000_000_000_000}}],
+        }
+        cat_result = {"success": True, "records": []}
+
+        reliable = loop._is_coin_watcher_snapshot_reliable(xch_result, cat_result)
+
+        self.assertFalse(reliable)
 
     def test_recovery_mode_enters_after_persistent_under_target(self):
         loop = bot_loop.BotLoop()

@@ -2,6 +2,7 @@
 
 import coin_manager
 import database
+import pytest
 from config import cfg
 
 
@@ -88,6 +89,26 @@ def test_standalone_drift_flags_above_configured_max_ratio(monkeypatch):
     assert findings[0]["side"] == "cat"
     assert findings[0]["tier"] == "mid"
     assert findings[0]["ratio"] == 1.51
+
+
+@pytest.mark.parametrize("failure", ["tier_sizes", "empty_sizes", "coins"])
+def test_strict_start_drift_check_rejects_unavailable_evidence(monkeypatch, failure):
+    _patch_drift_inputs(monkeypatch, {})
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("private-wallet-detail")
+
+    if failure == "tier_sizes":
+        monkeypatch.setattr(coin_manager, "get_tier_sizes_mojos_from_cfg", unavailable)
+    elif failure == "empty_sizes":
+        monkeypatch.setattr(
+            coin_manager, "get_tier_sizes_mojos_from_cfg", lambda **kwargs: {}
+        )
+    else:
+        monkeypatch.setattr(database, "get_coins_by_designation", unavailable)
+
+    with pytest.raises(RuntimeError):
+        coin_manager.check_tier_size_drift_standalone(strict=True)
 
 
 def test_instance_drift_uses_same_bounds(monkeypatch):

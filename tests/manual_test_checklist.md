@@ -11,7 +11,7 @@ run notes and internal planning outside the public repository.
 > **Setup preamble** (30 seconds)
 > * Make sure Sage wallet is open with RPC enabled (`Settings → Advanced → Start RPC Client`)
 > * Launch: `python desktop_app.py --flask` (or the desktop shortcut)
-> * Open `http://127.0.0.1:5000` in a browser, or point your browser automation
+> * In `--flask` mode, open the private browser URL printed at startup (it contains a per-run bootstrap credential), or point your browser automation
 >   tool at that URL
 > * Click through: **Continue** → **Connect to Sage** → pick your test wallet
 >   **by fingerprint** (see §0 gotcha 1) → **Skip** the Splash P2P prompt → **Use Free Tier**
@@ -54,7 +54,7 @@ Replicate this setup if you want to take over a session or reproduce a result.
 |---|---|---|
 | **Sage wallet** | User's machine, separate process | Manual — must be open with RPC on, port 9257 |
 | **Flask API server** | `python desktop_app.py --flask` (no PyWebView window) | Start from a terminal when testing in a browser |
-| **Browser** | Visible browser or browser automation | Open `http://127.0.0.1:5000` and use stable element IDs for automation |
+| **Browser** | Visible browser or browser automation | Open the private URL printed at startup and use stable element IDs for automation |
 | **Splash node** | Spawned by CATalyst on demand (`splash.exe` subprocess) | "Start Splash Node" button OR auto-spawn via env |
 
 ### 0.2 Browser automation notes
@@ -72,7 +72,7 @@ failure. For state inspection, prefer structured DOM/API reads over screenshots.
 
 ```
 1. Start `python desktop_app.py --flask`      → server up
-2. Navigate to http://127.0.0.1:5000
+2. Navigate to the private browser URL printed by `--flask`; after the bootstrap redirect, the address bar returns to `http://127.0.0.1:5000/`.
 3. Dismiss disclaimer and connect Sage
 4. Select wallet by fingerprint, not display name
 5. Walk through the startup gates

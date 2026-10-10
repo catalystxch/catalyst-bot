@@ -1,7 +1,7 @@
 """Slice 04-13 — logs endpoint contract tests.
 
 Tests GET /api/logs, POST /api/logs/clear, GET /api/logs/download:
-  - No auth required for reads
+  - Private log reads require a bootstrapped browser session
   - Response shapes and required keys
   - logs/clear sets _logs_cleared_at + success key
   - download returns a zip file (Content-Type check)
@@ -36,8 +36,13 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
         self.token = api_server._LOCAL_API_TOKEN
         self.auth = {"X-Bot-Local-Token": self.token}
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self._LOOPBACK,
+        )
         api_server._rate_limit_log.clear()
         permit_api_mutations(self, api_server)
 
@@ -46,7 +51,8 @@ class _FlaskBase(unittest.TestCase):
 
     def _post(self, path, body=None, auth=True):
         headers = dict(self.auth) if auth else {}
-        return self.client.post(
+        client = self.client if auth else api_server.app.test_client()
+        return client.post(
             path,
             json=body or {},
             headers=headers,

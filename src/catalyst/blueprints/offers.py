@@ -12,6 +12,7 @@ can still inspect it.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -177,10 +178,10 @@ def _classify_offer_diagnostic_sets(db_rows, wallet_ids):
             continue
         status = _norm_offer_state(row.get("status"))
         lifecycle = _norm_offer_state(row.get("lifecycle_state")) or status
-        if lifecycle in _CANCEL_PENDING_LIFECYCLES:
-            pending_cancel_ids.add(trade_id)
-        elif status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
+        if status in _TERMINAL_OFFER_STATES or lifecycle in _TERMINAL_OFFER_STATES:
             terminal_db_ids.add(trade_id)
+        elif lifecycle in _CANCEL_PENDING_LIFECYCLES:
+            pending_cancel_ids.add(trade_id)
         elif status == "open":
             active_db_ids.add(trade_id)
 
@@ -204,10 +205,16 @@ def _usd_string(amount, usd_price: Decimal | None) -> str:
 
 
 def _resolve_pnl_mid_price(bot, server) -> Decimal:
-    price = _decimal_or_none(getattr(bot, "_current_mid_price", None))
+    try:
+        running = bool(bot.is_running())
+    except Exception:
+        running = False
+    price = (
+        _decimal_or_none(getattr(bot, "_current_mid_price", None)) if running else None
+    )
     if price is None or price <= 0:
         try:
-            price = _decimal_or_none(server._get_live_mid_price_str())
+            price = _decimal_or_none(server._get_readonly_mid_price_str())
         except Exception:
             price = None
     return price if price is not None and price > 0 else Decimal("0")
@@ -435,7 +442,14 @@ def api_offers():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    open_buys, open_sells, _ = bot.offer_manager.sync_from_wallet()
+    (open_buys, open_sells, _), wallet_meta = (
+        bot.offer_manager.sync_from_wallet_with_meta()
+    )
+    if (
+        wallet_meta.get("fresh") is not True
+        or wallet_meta.get("using_cache") is not False
+    ):
+        return jsonify({"success": False, "error": "wallet_offer_sync_stale"}), 503
 
     return jsonify(
         {
@@ -476,8 +490,31 @@ def api_open_offer_count():
 
 @bp.route("/api/offers/cancel_all", methods=["POST"])
 def api_cancel_all():
+    # A concurrent bot start must not pass while this request is checking the
+    # stopped book or reserving its background cancellation worker.
+    with api_server._bot_cancel_lifecycle_lock:
+        return _api_cancel_all_locked()
+
+
+def _api_cancel_all_locked():
     """Cancel all open offers when the bot is not actively managing the book."""
     bot = api_server.bot
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if type(body) is not dict:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    fee_approval_id = body.get("fee_approval_id")
+    if fee_approval_id is None:
+        if body:
+            return jsonify({"success": False, "error": "invalid_request"}), 400
+    elif (
+        set(body) != {"source", "fee_approval_id"}
+        or body.get("source") != "coin_prep"
+        or type(fee_approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+    ):
+        return jsonify({"success": False, "error": "invalid_fee_approval"}), 400
     slog("GUI_ACTION", ">>> BUTTON: Cancel All Offers")
     cancelled = 0
     failed = 0
@@ -495,6 +532,37 @@ def api_cancel_all():
                 "requires_stop": True,
             }
         ), 409
+
+    # stop(wait=False) clears is_running before its finalizer has joined
+    # offer-producing threads.  Wallet-wide cancellation must wait for that
+    # durable stop boundary, including any thread whose state is unreadable.
+    if isinstance(bot, api_server.BotLoop):
+        try:
+            with bot._state_lock:
+                stop_settled = bot._bot_state.get("status") in {
+                    "stopped",
+                    "blocked",
+                    "error",
+                }
+            # RuntimeMonitor is a read-only health watcher and intentionally
+            # remains active after BotLoop.stop(); it cannot publish offers.
+            monitor = getattr(bot, "runtime_monitor", None)
+            read_only_monitor_thread = getattr(monitor, "_thread", None)
+            quiescent = stop_settled and all(
+                thread is read_only_monitor_thread or not thread.is_alive()
+                for thread in api_server._shutdown_thread_refs(bot)
+            )
+        except Exception:
+            quiescent = False
+        if not quiescent:
+            return jsonify(
+                {
+                    "success": False,
+                    "error": "Bot stop is still completing; retry Cancel All after it finishes.",
+                    "reason": "BOT_STOPPING",
+                    "retryable": True,
+                }
+            ), 409
 
     gate_status = api_server.mutation_gate.read_only_status()
     if getattr(gate_status, "allowed", False) is not True:
@@ -654,7 +722,10 @@ def api_cancel_all():
             def on_progress(payload):
                 _set_cancel_all_state(**payload)
 
-            result = bot.offer_manager.cancel_all(progress_callback=on_progress)
+            result = bot.offer_manager.cancel_all(
+                progress_callback=on_progress,
+                fee_approval_id=fee_approval_id,
+            )
             for tid, res in result.items():
                 if res and res.get("success"):
                     cancelled += 1
@@ -697,9 +768,41 @@ def api_cancel_all():
         # and the GUI can poll /api/offers/cancel_all/status for live progress
         # instead of hanging for 2-3 minutes with no feedback.
         try:
-            from wallet import get_all_offers
+            from offer_reconciliation import load_sage_offer_history
+            from wallet import get_authoritative_offer_history
 
-            all_offers = get_all_offers(include_completed=False, end=500)
+            def read_authoritative_page(**bounds):
+                page = get_authoritative_offer_history(**bounds)
+                if type(page) is dict and page.get("success") is False:
+                    return None
+                return page
+
+            # Cancel All is wallet-wide. A single bounded page can contain only
+            # terminal history while a still-live offer sits on a later page.
+            # Require a complete read before claiming that no offers remain or
+            # submitting a cancellation for only part of the wallet book.
+            offer_history = load_sage_offer_history(
+                get_all_offers=read_authoritative_page,
+                include_completed=False,
+                page_size=500,
+                max_pages=20,
+            )
+            if offer_history.get("complete") is not True or offer_history.get(
+                "read_error"
+            ):
+                error = (
+                    "Wallet offer history is incomplete; Cancel All was not started."
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=error,
+                    phase="error",
+                    message=error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify({"success": False, "error": error}), 503
+            all_offers = offer_history["records"]
             if not all_offers:
                 if bot and getattr(bot, "offer_manager", None):
                     bot.offer_manager.expect_empty_wallet_offer_book(
@@ -733,6 +836,7 @@ def api_cancel_all():
                 "1",
             }
             open_ids = []
+            unclassified_offer = False
             for o in all_offers if isinstance(all_offers, list) else []:
                 if not isinstance(o, dict):
                     continue
@@ -746,6 +850,28 @@ def api_cancel_all():
                     tid = o.get("trade_id", "") or o.get("offer_id", "")
                     if tid:
                         open_ids.append(tid)
+                    else:
+                        unclassified_offer = True
+                else:
+                    # The history loader removed proven terminal rows. A
+                    # remaining unknown or pending-cancel row may still be
+                    # fillable and cannot justify an empty-book claim.
+                    unclassified_offer = True
+
+            if unclassified_offer:
+                error = (
+                    "Wallet offer state needs authoritative reconciliation; "
+                    "Cancel All was not started."
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error=error,
+                    phase="error",
+                    message=error,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify({"success": False, "error": error}), 503
 
             if not open_ids:
                 if bot and getattr(bot, "offer_manager", None):
@@ -791,6 +917,48 @@ def api_cancel_all():
                     ),
                     503,
                 )
+
+            from offer_manager import OfferManager
+
+            try:
+                fee_scope_groups = OfferManager._cancel_fee_scope_groups(open_ids)
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "cancel_all_fee_scope_unavailable",
+                    f"Could not verify wallet offer fee scopes: {type(exc).__name__}",
+                )
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="Wallet offer fee scope could not be verified",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "Wallet offer fee scope could not be verified",
+                        "reason": "FEE_CANCELLATION_SCOPE_UNVERIFIED",
+                    }
+                ), 503
+            if fee_approval_id is not None and (
+                len(fee_scope_groups) != 1 or fee_scope_groups[0]["campaign_id"] is None
+            ):
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="The supplied approval cannot cover multiple fee scopes",
+                    phase="error",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": "The supplied approval cannot cover multiple fee scopes",
+                        "reason": "FEE_CANCELLATION_SCOPE_INVALID",
+                    }
+                ), 409
 
             # Set initial progress state — frontend polls this immediately.
             _set_cancel_all_state(
@@ -849,9 +1017,13 @@ def api_cancel_all():
                         and 1 <= raw_capacity <= len(_cancel_open_ids)
                         else len(_cancel_open_ids)
                     )
-                    _cancel_batches = _balanced_cancel_batches(
-                        _cancel_open_ids, _batch_capacity
-                    )
+                    _cancel_batches = [
+                        (batch, group["campaign_id"])
+                        for group in fee_scope_groups
+                        for batch in _balanced_cancel_batches(
+                            group["trade_ids"], _batch_capacity
+                        )
+                    ]
                     _deadline_seconds = _cancel_all_deadline_seconds(
                         len(_cancel_open_ids),
                         cfg.CANCEL_MAX_WAIT_SECS,
@@ -868,7 +1040,7 @@ def api_cancel_all():
                         current_batch=1,
                         pending=len(_cancel_open_ids) - len(_terminal_ids),
                     )
-                    for _batch_index, _cancel_batch in enumerate(
+                    for _batch_index, (_cancel_batch, _campaign_id) in enumerate(
                         _cancel_batches, start=1
                     ):
                         _batch_targets = [
@@ -896,9 +1068,15 @@ def api_cancel_all():
                             ),
                         )
                         _cancel_kwargs = {
-                            "reason": "manual_cancel_all",
+                            "reason": (
+                                "coin_prep_cancel_all"
+                                if _campaign_id is not None
+                                else "manual_cancel_all"
+                            ),
                             "force_storm": True,
                         }
+                        if fee_approval_id and _campaign_id is not None:
+                            _cancel_kwargs["fee_approval_id"] = fee_approval_id
                         _batch_retry_attempts = {
                             trade_id: _retry_failed_attempts[trade_id]
                             for trade_id in _batch_targets
@@ -960,6 +1138,29 @@ def api_cancel_all():
                         _terminal_ids = _authoritatively_terminal_offer_ids(
                             _cancel_open_ids
                         )
+                    # Task 9 proves the planned targets, not wallet-wide
+                    # emptiness. A new offer can appear while those cancels
+                    # are pending, and a bounded/cached refresh cannot prove
+                    # it absent. Require a fresh complete Sage history before
+                    # reporting Cancel All complete or allowing shutdown.
+                    _final_history = load_sage_offer_history(
+                        get_all_offers=read_authoritative_page,
+                        include_completed=False,
+                        page_size=500,
+                        max_pages=20,
+                    )
+                    if _final_history.get("complete") is not True or _final_history.get(
+                        "read_error"
+                    ):
+                        raise RuntimeError(
+                            "Final wallet offer history is incomplete; "
+                            "Cancel All remains unconfirmed."
+                        )
+                    if _final_history["records"]:
+                        raise RuntimeError(
+                            "New or unresolved wallet offers remain after "
+                            "cancellation; run Cancel All again."
+                        )
                     durable_manager.expect_empty_wallet_offer_book(
                         "manual_cancel_all_confirmed"
                     )
@@ -981,7 +1182,7 @@ def api_cancel_all():
                         batch_size=_batch_capacity,
                         total_batches=len(_cancel_batches),
                         current_batch=len(_cancel_batches),
-                        batch_cancelled=len(_cancel_batches[-1]),
+                        batch_cancelled=len(_cancel_batches[-1][0]),
                         batch_failed=0,
                         cancelled=len(_terminal_ids),
                         confirmed=len(_terminal_ids),
@@ -1007,10 +1208,24 @@ def api_cancel_all():
                         "authoritatively terminal offer(s)",
                     )
                 except Exception as _e:
+                    _fee_reason_codes = {
+                        "FEE_APPROVAL_STALE",
+                        "FEE_APPROVAL_LEGACY_UNSCOPED",
+                        "FEE_APPROVAL_RECOVERY_ONLY",
+                        "FEE_APPROVAL_RECOVERY_ACTION_MISMATCH",
+                        "FEE_BUDGET_APPROVAL_REQUIRED",
+                        "FEE_BUDGET_EXCEEDED",
+                        "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                    }
+                    _reason_code = next(
+                        (code for code in _fee_reason_codes if code in str(_e).upper()),
+                        None,
+                    )
                     _set_cancel_all_state(
                         running=False,
                         complete=False,
                         error=str(_e),
+                        reason_code=_reason_code,
                         phase="error",
                         finished_at=datetime.now(timezone.utc).isoformat(),
                         message=f"Cancel all failed: {_e}",
@@ -1702,7 +1917,12 @@ def _offer_diagnostic_assessment(
         and (len(wallet_cancel_pending) > 0 or len(wallet_cancelled_still_visible) > 0)
     )
 
-    if local_book_consistent:
+    if wallet_error is not None:
+        diagnosis = (
+            "Wallet offer read unavailable. A cached offer book cannot prove "
+            "agreement with the DB; retry after Sage recovers."
+        )
+    elif local_book_consistent:
         diagnosis = (
             "Wallet and DB agree on the open book, and each live offer has a "
             "unique non-reserve coin. This endpoint did not evaluate any Dexie "
@@ -1816,9 +2036,18 @@ def api_offers_diagnostic():
         wallet_open_sells = []
         try:
             if bot and getattr(bot, "offer_manager", None):
-                wallet_open_buys, wallet_open_sells, _ = (
-                    bot.offer_manager.sync_from_wallet()
+                (wallet_open_buys, wallet_open_sells, _), sync_meta = (
+                    bot.offer_manager.sync_from_wallet_with_meta()
                 )
+                if type(sync_meta) is not dict or sync_meta.get("fresh") is not True:
+                    wallet_error = (
+                        str(
+                            sync_meta.get("last_error")
+                            or "wallet_offer_query_not_fresh"
+                        )
+                        if type(sync_meta) is dict
+                        else "wallet_offer_query_not_fresh"
+                    )
             else:
                 from wallet import get_all_offers, classify_offers_from_list
 
@@ -2456,6 +2685,7 @@ def _new_cancel_all_state():
         "running": False,
         "complete": False,
         "error": None,
+        "reason_code": None,
         "phase": "idle",
         "message": "",
         "started_at": None,

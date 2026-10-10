@@ -247,6 +247,7 @@ class _TempDB(unittest.TestCase):
     def _make_bot(self):
         bot = MagicMock()
         bot.is_running.return_value = False
+        bot.is_stopped.return_value = True
         bot.stop = MagicMock()
         bot.coin_manager._prep_process = None
         bot.coin_manager._prep_running = False
@@ -288,6 +289,10 @@ class _TempDB(unittest.TestCase):
             patch("blueprints.coin_prep.threading.Thread") as mock_thread_cls,
             patch("blueprints.coin_prep.log_event"),
             patch(
+                "coin_prep_fee_dispatch.price_approved_prep_batch",
+                return_value={"available": True},
+            ),
+            patch(
                 "blueprints.coin_prep._wallet_open_offer_snapshot_before_prep",
                 create=True,
                 **snapshot_patch,
@@ -306,6 +311,7 @@ class _TempDB(unittest.TestCase):
                 json={
                     "full_reset": full_reset,
                     "reset_offer_history": reset_offer_history,
+                    "fee_approval_id": "a" * 64,
                 },
                 headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
@@ -328,6 +334,7 @@ class _TempDB(unittest.TestCase):
         ):
             return self.client.get(
                 "/api/coin-prep/status",
+                headers={"X-Bot-Local-Token": self.token},
                 environ_base=_LOOPBACK,
             )
 
@@ -372,6 +379,7 @@ class TestCoinPrepFullCycle(_TempDB):
     def test_trigger_rechecks_wallet_book_after_stopping_live_bot(self):
         bot = self._make_bot()
         bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = True
         appeared = {
             "complete": True,
             "open_offer_count": 1,

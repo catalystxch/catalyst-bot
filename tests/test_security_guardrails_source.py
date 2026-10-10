@@ -69,7 +69,8 @@ class SecurityGuardrailSourceTests(unittest.TestCase):
         self.assertNotIn("window.__BOT_LOCAL_TOKEN", gui_source)
         self.assertNotIn("_local_token", gui_source)
         self.assertIn("httponly=True", api_source)
-        self.assertIn('samesite="Strict"', api_source)
+        self.assertIn('samesite="Lax"', api_source)
+        self.assertIn("_request_origin_matches_app()", api_source)
 
 
 if __name__ == "__main__":

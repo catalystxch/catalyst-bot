@@ -31,6 +31,7 @@ import threading
 import secrets
 import webbrowser
 import hashlib
+import hmac
 
 # When run as the entry point (`python api_server.py`), Python loads this file
 # as the `__main__` module — `sys.modules` has no `api_server` key. Any
@@ -176,7 +177,10 @@ _SPACESCAN_PUBLIC_PLANS = {
 intercept_log_event()
 
 from bot_loop import BotLoop
-from wallet import get_wallet_adapter_authority, get_wallet_type
+import wallet
+
+get_wallet_adapter_authority = wallet.get_wallet_adapter_authority
+get_wallet_type = wallet.get_wallet_type
 
 # ---- Super Log: hook ALL module methods for complete visibility ----
 try:
@@ -211,6 +215,88 @@ _TOKEN_EXEMPT_WRITE_ROUTES = {
     "/api/splash/incoming",
 }
 
+# Wallet, trade, configuration, and operational data remain private even on
+# GET routes. Do not hand them to another loopback process merely because it
+# can connect to this TCP port. The route-inventory regression test requires
+# every new GET handler to be classified before release.
+_PRIVATE_READ_ROUTES = frozenset(
+    {
+        "/api/status",
+        "/api/dashboard",
+        "/api/stats",
+        "/api/inventory",
+        "/api/config",
+        "/api/config/validate",
+        "/api/fees/status",
+        "/api/fingerprint",
+        "/api/wallets/detect",
+        "/api/cats",
+        "/api/coin-prep/status",
+        "/api/coins",
+        "/api/coin-prep/verify",
+        "/api/bootstrap/status",
+        "/api/bootstrap/walletconnect/config",
+        "/api/bootstrap/partial-capability",
+        "/api/bootstrap/capabilities/partial-offers",
+        "/api/check-resume",
+        "/api/bot/state",
+        "/api/bot/price",
+        "/api/boost/state",
+        "/api/health/runtime",
+        "/api/diagnostics/runtime",
+        "/api/diagnostics/api-stats",
+        "/api/dbx/info",
+        "/api/full-node/status",
+        "/api/doctor",
+        "/api/self-test",
+        "/api/alerts",
+        "/api/token_overview",
+        "/api/risk/spreads",
+        "/api/settings/defaults",
+        "/api/smart-defaults",
+        "/api/console/status",
+        "/api/splash/node",
+        "/api/splash/node/output",
+        "/api/splash/receive",
+        "/api/splash/setup/check",
+        "/api/splash/setup/progress",
+        "/api/splash/setup/release",
+        "/api/splash/stats",
+        "/api/watchdog/shape-fix-status",
+        "/api/update/relaunch-intent",
+        "/api/update/status",
+        "/api/sage/fingerprints",
+        "/api/sage/startup-status",
+        "/api/wallet/sage-running",
+        "/api/sage/cert-candidates",
+        "/api/offers",
+        "/api/offers/open_count",
+        "/api/offers/cancel_all/status",
+        "/api/offers/diagnostic",
+        "/api/fills",
+        "/api/fills/classified",
+        "/api/fills/arb-wallets",
+        "/api/market/fill-intel",
+        "/api/market/intel",
+        "/api/market/confidence",
+        "/api/market/dbx",
+        "/api/pnl",
+        "/api/pnl/reset-preview",
+        "/api/dbx/pending",
+        "/api/splash/incoming/list",
+        "/api/reservations",
+        "/api/logs",
+        "/api/logs/download",
+        "/api/superlog/stats",
+        "/api/superlog/archive",
+        "/api/superlog/download",
+        "/api/crash-log",
+        "/api/config/history",
+        "/api/config/export-env",
+        "/api/fills/export",
+    }
+)
+
 # Generic control-plane throttling is too aggressive for local webhook bursts.
 # Those machine routes stay loopback-only and must implement their own validation.
 _RATE_LIMIT_EXEMPT_WRITE_ROUTES = {
@@ -234,6 +320,8 @@ _MUTATING_API_ENDPOINTS = {
     "cat.api_cat_select",
     "cat.api_deposit_advisory_allocate",
     "coin_prep.api_coin_prep",
+    "coin_prep.api_coin_prep_fee_approval",
+    "coin_prep.api_coin_prep_fee_preview",
     "coin_prep.api_coin_prep_reset",
     "coin_prep.api_coin_prep_trigger",
     "coin_prep.api_coin_topup",
@@ -712,6 +800,8 @@ _LOCAL_API_COOKIE = "catalyst_local_session"
 _LOCAL_API_TOKEN = os.environ.get("BOT_LOCAL_WRITE_TOKEN") or secrets.token_urlsafe(32)
 os.environ["BOT_LOCAL_WRITE_TOKEN"] = _LOCAL_API_TOKEN
 _LOCAL_API_COOKIE_VALUE = secrets.token_urlsafe(32)
+_LOCAL_API_BOOTSTRAP_TOKEN = secrets.token_urlsafe(32)
+_PUBLIC_SAFETY_ID_KEY = secrets.token_bytes(32)
 
 # ---------------------------------------------------------------------------
 # Security helpers
@@ -1292,6 +1382,33 @@ def _request_origin_matches_app() -> bool:
     )
 
 
+def _private_read_has_browser_provenance() -> bool:
+    """Require positive same-origin evidence for cookie-only private reads."""
+    fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().lower()
+    if fetch_site:
+        return fetch_site == "same-origin"
+
+    supplied = [
+        request.headers.get(name, "").strip()
+        for name in ("Origin", "Referer")
+        if request.headers.get(name, "").strip()
+    ]
+    if not supplied:
+        return False
+    for raw_url in supplied:
+        try:
+            parsed = urlparse(raw_url)
+        except Exception:
+            return False
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not _is_loopback_addr(parsed.hostname)
+            or parsed.netloc.lower() != (request.host or "").lower()
+        ):
+            return False
+    return True
+
+
 def _get_sage_signing_block_reason():
     """Return a message when the active Sage key is present but cannot sign."""
     try:
@@ -1301,9 +1418,7 @@ def _get_sage_signing_block_reason():
         return None
 
     try:
-        from wallet import get_wallet_identity
-
-        identity = get_wallet_identity()
+        identity = wallet.get_wallet_identity()
         if type(identity) is not dict or identity.get("success") is not True:
             return None
         if identity.get("has_secrets") is not True:
@@ -1318,25 +1433,32 @@ def _get_sage_signing_block_reason():
     return None
 
 
+def _bind_local_browser_cookie(response):
+    """Bind an already authorized browser to this local runtime."""
+    response.set_cookie(
+        _LOCAL_API_COOKIE,
+        _LOCAL_API_COOKIE_VALUE,
+        httponly=True,
+        # The native splash starts from file://, so Chromium withholds a
+        # Strict cookie on its first redirected top-level navigation.
+        # Explicit Lax still excludes cross-site POSTs; the Origin guard
+        # independently rejects foreign browser writes.
+        samesite="Lax",
+        secure=False,
+        path="/",
+    )
+    return response
+
+
 def _serve_bootstrapped_html(filename: str):
-    """Serve HTML and bind the local runtime token to an HttpOnly cookie."""
+    """Serve HTML to an already authorized local browser."""
     gui_dir = _APP_ROOT
     path = os.path.join(gui_dir, filename)
     with open(path, "r", encoding="utf-8") as f:
         html_doc = f.read()
 
     response = Response(html_doc, mimetype="text/html")
-    response.set_cookie(
-        _LOCAL_API_COOKIE,
-        # Per-process loopback browser session nonce. The worker/header token
-        # stays out of browser storage.
-        _LOCAL_API_COOKIE_VALUE,
-        httponly=True,
-        samesite="Strict",
-        secure=False,
-        path="/",
-    )
-    return response
+    return _bind_local_browser_cookie(response)
 
 
 class _QuietRequestFilter(logging.Filter):
@@ -1344,6 +1466,10 @@ class _QuietRequestFilter(logging.Filter):
 
     def filter(self, record):
         msg = record.getMessage()
+        # The first browser navigation carries a secret that must not enter
+        # access logs or exported diagnostics.
+        if "GET /?bootstrap=" in msg:
+            return False
         # Werkzeug log format: '127.0.0.1 - - [date] "GET /api/status HTTP/1.1" 200 -'
         for endpoint in _QUIET_ENDPOINTS:
             if endpoint in msg:
@@ -1423,8 +1549,8 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     """Get our current best live bid/ask from wallet-open offers.
 
     Uses wallet-open trade IDs when possible so stale DB rows do not distort the
-    Market Intel "best live" display. Falls back to DB-open rows only if wallet
-    sync is unavailable.
+    Market Intel "best live" display. A failed running-wallet read cannot prove
+    that cached wallet or DB rows remain live.
     """
     result = {
         "our_best_bid": Decimal("0"),
@@ -1440,17 +1566,27 @@ def _get_live_local_offer_edges(asset_id: str) -> dict:
     offer_manager = getattr(bot, "offer_manager", None)
     if _live_wallet_reads_allowed(bot) and offer_manager:
         try:
-            wallet_open_buys, wallet_open_sells, _ = offer_manager.sync_from_wallet()
-            trade_ids = [
-                o.get("trade_id", "")
-                for o in (wallet_open_buys + wallet_open_sells)
-                if o.get("trade_id")
-            ]
-            result["our_open_buys"] = len(wallet_open_buys)
-            result["our_open_sells"] = len(wallet_open_sells)
-            result["source"] = "wallet_sync"
+            (wallet_open_buys, wallet_open_sells, _), wallet_meta = (
+                offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                wallet_meta.get("fresh") is True
+                and wallet_meta.get("using_cache") is not True
+            ):
+                trade_ids = [
+                    o.get("trade_id", "")
+                    for o in (wallet_open_buys + wallet_open_sells)
+                    if o.get("trade_id")
+                ]
+                result["our_open_buys"] = len(wallet_open_buys)
+                result["our_open_sells"] = len(wallet_open_sells)
+                result["source"] = "wallet_sync"
+            else:
+                result["source"] = "wallet_unavailable"
+                return result
         except Exception:
-            trade_ids = None
+            result["source"] = "wallet_unavailable"
+            return result
     elif offer_manager:
         try:
             snapshot_getter = getattr(offer_manager, "get_wallet_sync_snapshot", None)
@@ -1642,6 +1778,14 @@ def _stability_recommended_action(reason_code: str, *, allowed: bool) -> str:
     return "REVIEW_SAFETY_DIAGNOSTICS"
 
 
+def _public_safety_wallet_label(wallet_hash: str) -> str:
+    """Correlate one run without exposing a reversible wallet hash prefix."""
+    digest = hmac.new(
+        _PUBLIC_SAFETY_ID_KEY, wallet_hash.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return f"run:{digest[:12]}…"
+
+
 def get_public_stability_status() -> dict:
     """Return the stable, redacted Task 10 diagnostics contract."""
 
@@ -1757,7 +1901,7 @@ def get_public_stability_status() -> dict:
         malformed = True
         redacted_fingerprint = None
     else:
-        redacted_fingerprint = f"sha256:{wallet_hash[:12]}…"
+        redacted_fingerprint = _public_safety_wallet_label(wallet_hash)
     if (
         type(network) is not str
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", network) is None
@@ -2321,10 +2465,8 @@ def _complete_runtime_recovery_epoch(
     wallet_hash, network = _configured_mutation_binding()
     binding = runtime.wallet_identity_binding
     try:
-        from wallet import get_wallet_identity
-
         first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
-            get_wallet_identity
+            wallet.get_wallet_identity
         )
     except Exception:
         first_identity = None
@@ -3465,10 +3607,9 @@ if not hasattr(cfg, "RUN_HISTORY_CUTOFF"):
 # resume modal doesn't reappear.  Uses a flag file rather than memory so
 # it survives the app being fully closed and reopened.
 import os as _os
+from user_paths import data_dir as _user_data_dir
 
-_FRESH_START_FLAG = _os.path.join(
-    _os.path.dirname(_os.path.abspath(__file__)), ".fresh_start_chosen"
-)
+_FRESH_START_FLAG = _os.path.join(_user_data_dir(), ".fresh_start_chosen")
 
 
 def _fresh_start_is_set() -> bool:
@@ -3476,18 +3617,13 @@ def _fresh_start_is_set() -> bool:
 
 
 def _fresh_start_set():
-    try:
-        open(_FRESH_START_FLAG, "w").close()
-    except Exception:
+    with open(_FRESH_START_FLAG, "w"):
         pass
 
 
 def _fresh_start_clear():
-    try:
-        if _os.path.exists(_FRESH_START_FLAG):
-            _os.remove(_FRESH_START_FLAG)
-    except Exception:
-        pass
+    if _os.path.exists(_FRESH_START_FLAG):
+        _os.remove(_FRESH_START_FLAG)
 
 
 # ---------------------------------------------------------------------------
@@ -3700,6 +3836,21 @@ def _get_live_mid_price_str() -> Optional[str]:
         return None
 
 
+def _get_readonly_mid_price_str() -> Optional[str]:
+    """Return an asset-bound display quote without advancing trading state."""
+    try:
+        from blueprints.market import _get_startup_price_cached
+
+        asset_id = _active_cat.get("asset_id") or getattr(cfg, "CAT_ASSET_ID", "")
+        ticker_id = _active_cat.get("ticker_id") or getattr(cfg, "CAT_TICKER_ID", "")
+        decimals = _active_cat.get("decimals") or getattr(cfg, "CAT_DECIMALS", 3)
+        quote = _get_startup_price_cached(asset_id, ticker_id, decimals)
+        price = Decimal(str(quote.get("mid") or 0))
+        return format(price, "f") if price.is_finite() and price > 0 else None
+    except Exception:
+        return None
+
+
 def create_bot() -> BotLoop:
     """Create and return the bot loop instance."""
     global bot
@@ -3771,7 +3922,12 @@ def promote_wallet_setup_bootstrap() -> dict:
             recovery = None
             try:
                 recovery = recover_legacy_startup_reservations()
-                if recovery.get("recovered", 0) > 0:
+                # Recovery may clear a proven cancellation latch while
+                # reporting zero newly recovered journal rows. Always recheck
+                # the authoritative gate before ending on zero remaining.
+                if isinstance(recovery, dict) and (
+                    recovery.get("recovered", 0) > 0 or recovery.get("remaining") == 0
+                ):
                     authorization = initialize_mutation_runtime()
             except Exception as recovery_error:
                 slog(
@@ -3888,6 +4044,31 @@ def enforce_local_runtime_guard():
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
+    # Flask dispatches HEAD to GET handlers. Guard both before any handler can
+    # read wallet data or perform status-maintenance work. Cookie-authenticated
+    # browser navigations from a different local origin must not trigger a GET
+    # with side effects (notably /api/coins) through SameSite=Lax cookies.
+    private_read = request.method in {"GET", "HEAD"} and (
+        path in _PRIVATE_READ_ROUTES or path.startswith("/api/safety/quarantine/")
+    )
+    if private_read:
+        if not _has_valid_local_token():
+            return jsonify({"error": "unauthorized"}), 401
+        if request.headers.get("Sec-Fetch-Site", "").strip().lower() in {
+            "cross-site",
+            "same-site",
+        }:
+            return jsonify({"error": "origin_not_allowed"}), 403
+        if not _private_read_has_browser_provenance() and not secrets.compare_digest(
+            str(request.headers.get(_LOCAL_API_TOKEN_HEADER, "") or ""),
+            _LOCAL_API_TOKEN,
+        ):
+            return jsonify({"error": "origin_not_allowed"}), 403
+        # Private GET handlers may refresh durable state while computing their
+        # response. HEAD must not dispatch any of them for a body it discards.
+        if request.method == "HEAD":
+            return Response(status=405)
+
     if request.method in {
         "POST",
         "PUT",
@@ -3957,6 +4138,15 @@ def release_local_runtime_guard(_error=None):
 @app.route("/")
 def serve_gui():
     """Serve the bot GUI HTML file."""
+    bootstrap = request.args.get("bootstrap", "")
+    if bootstrap and secrets.compare_digest(bootstrap, _LOCAL_API_BOOTSTRAP_TOKEN):
+        response = Response(status=302)
+        response.headers["Location"] = "/"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return _bind_local_browser_cookie(response)
+    if not _has_valid_local_token():
+        return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
 
 
@@ -4252,6 +4442,14 @@ def api_safety_quarantine_status(quarantine_id: str):
 def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     """Collect fresh Task 9 evidence through wallet.py-backed read-only loaders."""
 
+    backend = wallet.get_wallet_backend_authority()
+    if backend == "sage":
+        # An unavailable exact reader must not downgrade Sage to the older
+        # full-history proof. The Sage collector returns an incomplete proof.
+        return _collect_sage_quarantine_absence_proof(requirements, wallet)
+    if backend != "chia":
+        raise RuntimeError("wallet backend authority unavailable")
+
     from offer_reconciliation import (
         load_authoritative_evidence,
         load_sage_offer_history,
@@ -4265,7 +4463,9 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
     history_provenance = "wallet.get_all_offers"
     identity_provenance = "wallet.get_wallet_identity"
     for offer in requirements.get("offers", []):
-        evidence = load_authoritative_evidence(offer["intent"])
+        evidence = load_authoritative_evidence(
+            offer["intent"], offer_scope="wallet_full"
+        )
         authoritative_read_performed = True
         if (
             type(evidence) is not dict
@@ -4330,8 +4530,6 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         ):
             observed_at = candidate_observed
     if not requirements.get("offers"):
-        import wallet
-
         try:
             identity = wallet.get_wallet_identity()
         except Exception:
@@ -4395,6 +4593,178 @@ def _collect_quarantine_resolution_proof(requirements: dict) -> dict:
         "identity_provenance": identity_provenance,
         "absent_offer_ids": sorted(absent_offer_ids),
         "coins": [coins_by_id[key] for key in sorted(coins_by_id)],
+    }
+
+
+def _collect_sage_quarantine_absence_proof(requirements: dict, wallet_module) -> dict:
+    """Bind exact Sage MissingOffer reads to the quarantined IDs and coins."""
+
+    observed_at = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    offers = requirements.get("offers", [])
+    trade_ids = tuple(sorted(offer["trade_id"] for offer in offers))
+    # An empty quarantine still performs a real endpoint read. A normal Sage
+    # MissingOffer response for this sentinel verifies route availability.
+    query_ids = trade_ids or ("0" * 64,)
+    complete = False
+    read_performed = False
+    absent: list[str] = []
+    coins: list[dict] = []
+    try:
+        before = wallet_module.get_wallet_identity()
+        result = wallet_module.get_authoritative_offer_absence_by_ids(query_ids)
+        read_performed = True
+
+        def identity_hash(identity):
+            if type(identity) is not dict:
+                return None
+            value = identity.get("wallet_fingerprint_hash")
+            if value is None and type(identity.get("fingerprint")) is int:
+                value = hashlib.sha256(
+                    f"fingerprint:{identity['fingerprint']}".encode("utf-8")
+                ).hexdigest()
+            return value
+
+        def identity_ok(identity):
+            if type(identity) is not dict:
+                return False
+            network = identity.get("network_id")
+            if network is None:
+                network = identity.get("network")
+            return bool(
+                identity.get("success") is True
+                and identity.get("backend") == "sage"
+                and identity_hash(identity) == requirements["wallet_fingerprint_hash"]
+                and network == requirements["network"]
+                and type(identity.get("observed_at_utc")) is str
+                and identity["observed_at_utc"]
+            )
+
+        absence_ok = bool(
+            type(result) is dict
+            and result.get("complete") is True
+            and result.get("requested_ids") == list(query_ids)
+            and result.get("absent_offer_ids") == list(query_ids)
+        )
+        expected_coins = sorted(
+            {coin_id for offer in offers for coin_id in offer["selected_coin_ids"]}
+        )
+        raw_coins = (
+            wallet_module.get_coins_by_ids(expected_coins) if expected_coins else {}
+        )
+        # Sage's exact coin response may omit `owned`. In that case require
+        # positive membership in the wallet's owned-only XCH or CAT view;
+        # absence of an ownership field is not affirmative proof.
+        owned_rows: dict[str, dict | None] = {}
+        if type(raw_coins) is dict and any(
+            type(row) is dict and "owned" not in row for row in raw_coins.values()
+        ):
+            xch_id = getattr(wallet_module, "WALLET_ID_XCH", None)
+            cat_id = getattr(wallet_module, "SAGE_ACTIVE_CAT_WALLET_ID", None)
+            if (
+                type(xch_id) is int
+                and type(cat_id) is int
+                and xch_id > 0
+                and cat_id > 0
+                and xch_id != cat_id
+            ):
+                for wallet_id in (xch_id, cat_id):
+                    try:
+                        owned_view = wallet_module.get_owned_coins_detailed(wallet_id)
+                    except Exception:
+                        owned_view = None
+                    if type(owned_view) is dict:
+                        for raw_id, owned_row in owned_view.items():
+                            if type(raw_id) is not str:
+                                continue
+                            owned_id = raw_id.lower().removeprefix("0x")
+                            if owned_id in expected_coins:
+                                # A coin cannot appear in both asset views.
+                                owned_rows[owned_id] = (
+                                    owned_row if owned_id not in owned_rows else None
+                                )
+        after = wallet_module.get_wallet_identity()
+        normalized: dict[str, dict] = {}
+        if type(raw_coins) is dict and len(raw_coins) == len(expected_coins):
+            for raw_id, row in raw_coins.items():
+                coin_id = str(raw_id).lower().removeprefix("0x")
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", coin_id) is None
+                    or coin_id not in expected_coins
+                    or type(row) is not dict
+                    or (
+                        row.get("coin_id") is not None
+                        and str(row["coin_id"]).lower().removeprefix("0x") != coin_id
+                    )
+                ):
+                    break
+                owned_row = owned_rows.get(coin_id)
+                owned_view_ok = bool(
+                    type(owned_row) is dict
+                    and type(owned_row.get("amount")) is int
+                    and owned_row["amount"] > 0
+                    and owned_row["amount"] == row.get("amount")
+                )
+                owned_view_unlocked = bool(
+                    owned_view_ok
+                    and (
+                        owned_row.get("spent_height") is None
+                        or (
+                            type(owned_row.get("spent_height")) is int
+                            and owned_row["spent_height"] == 0
+                        )
+                    )
+                    and owned_row.get("offer_id") in (None, "")
+                    and owned_row.get("locked", False) is False
+                )
+                normalized[coin_id] = {
+                    "coin_id": coin_id,
+                    "owned": (
+                        row["owned"] is True if "owned" in row else owned_view_ok
+                    ),
+                    "unlocked": (
+                        (
+                            row.get("spent_height") is None
+                            or (
+                                type(row.get("spent_height")) is int
+                                and row["spent_height"] == 0
+                            )
+                        )
+                        and row.get("locked", False) is False
+                        and not row.get("offer_id")
+                        and ("owned" in row or owned_view_unlocked)
+                    ),
+                }
+        coins = [normalized[key] for key in sorted(normalized)]
+        complete = bool(
+            identity_ok(before)
+            and identity_ok(after)
+            and absence_ok
+            and set(normalized) == set(expected_coins)
+        )
+        if complete:
+            absent = list(trade_ids)
+    except Exception:
+        complete = False
+    return {
+        "version": 2,
+        "wallet_backend": "sage",
+        "quarantine_id": requirements["quarantine_id"],
+        "recovery_id": requirements["recovery_id"],
+        "latch_generation": requirements["latch_generation"],
+        "wallet_fingerprint_hash": requirements["wallet_fingerprint_hash"],
+        "network": requirements["network"],
+        "authority_digest": requirements["authority_digest"],
+        "observed_at": observed_at,
+        "history_complete": complete,
+        "authoritative_read_performed": read_performed,
+        "history_provenance": "wallet.get_authoritative_offer_absence_by_ids",
+        "identity_provenance": "wallet.get_wallet_identity",
+        "absent_offer_ids": absent,
+        "coins": coins,
     }
 
 
@@ -5033,10 +5403,9 @@ _walletconnect_signing_project_id = None
 def _read_walletconnect_identity():
     """Read the current Sage identity and receive address without mutation."""
 
-    from wallet import get_next_address, get_wallet_identity
     from walletconnect_signing import SigningError, WalletIdentity
 
-    snapshot = get_wallet_identity()
+    snapshot = wallet.get_wallet_identity()
     if type(snapshot) is not dict or snapshot.get("success") is not True:
         raise SigningError("wallet_identity_unavailable")
     if str(snapshot.get("backend") or "").strip().lower() != "sage":
@@ -5053,7 +5422,7 @@ def _read_walletconnect_identity():
         network = "testnet"
     else:
         raise SigningError("invalid_wallet_network")
-    address_result = get_next_address(
+    address_result = wallet.get_next_address(
         int(getattr(cfg, "WALLET_ID_XCH", 1)), new_address=False
     )
     if type(address_result) is not dict or address_result.get("success") is not True:
@@ -5482,17 +5851,15 @@ def _get_health_snapshot() -> dict:
     if not chia_node.is_startup_authorised():
         return {"status": "not_started", "consecutive_failures": 0}
     try:
-        from wallet import get_chia_health
-
-        h = get_chia_health()
-        wallet = h.get("wallet", {}) or {}
+        h = wallet.get_chia_health()
+        wallet_status = h.get("wallet", {}) or {}
         node = h.get("node", {}) or {}
         return {
             "status": h.get("status", "unknown"),
-            "wallet_reachable": wallet.get("reachable", False),
-            "wallet_synced": wallet.get("synced", False),
-            "wallet_syncing": wallet.get("syncing", False),
-            "wallet_sync_state": wallet.get("sync_state", "unknown"),
+            "wallet_reachable": wallet_status.get("reachable", False),
+            "wallet_synced": wallet_status.get("synced", False),
+            "wallet_syncing": wallet_status.get("syncing", False),
+            "wallet_sync_state": wallet_status.get("sync_state", "unknown"),
             "node_reachable": node.get("reachable", False),
             "node_synced": node.get("synced", False),
             "consecutive_failures": _health_consecutive_failures(h),
@@ -5995,6 +6362,9 @@ _cancel_all_state = {
     "failed": 0,
 }
 _cancel_all_state_lock = threading.Lock()
+# Serialize the bot-start transition with Cancel All's stopped-book check and
+# worker reservation. The long-running worker is tracked by _cancel_all_state.
+_bot_cancel_lifecycle_lock = threading.Lock()
 
 
 # _set_cancel_all_state moved to blueprint
@@ -6280,6 +6650,8 @@ from blueprints.coin_prep import (
     api_coin_prep_status,
     api_coin_prep_verify,
     api_coin_prep_trigger,
+    api_coin_prep_fee_approval,
+    api_coin_prep_fee_preview,
     api_coin_prep_reset,
     api_fills_export,
     api_logs_clear,
@@ -6392,7 +6764,6 @@ _validate_write_route_classification()
 from blueprints.market import _fetch_dbx_pair_status  # noqa: E402
 from blueprints.smart_defaults import (  # noqa: E402
     _calculate_smart_defaults,
-    _fetch_price_standalone,
     _fetch_dexie_orderbook_standalone,
 )
 from blueprints.offers import _build_fill_history_for_gui  # noqa: E402

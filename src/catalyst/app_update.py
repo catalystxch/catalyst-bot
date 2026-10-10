@@ -200,6 +200,8 @@ def _normalise_manifest(
         raise ValueError("update manifest schema is unsupported")
     if manifest.get("app") != "CATalyst":
         raise ValueError("update manifest is for a different app")
+    if manifest.get("channel") != "stable":
+        raise ValueError("update manifest channel is not stable")
 
     version = normalise_version(str(manifest.get("version") or ""))
     tag = _ensure_v_tag(str(manifest.get("tag") or version))

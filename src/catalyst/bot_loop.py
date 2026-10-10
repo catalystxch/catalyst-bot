@@ -65,6 +65,7 @@ except ImportError:
 
 from price_engine import PriceEngine
 from offer_manager import OfferManager
+from liquidity_side import bootstrap_side_enabled
 from fill_tracker import FillTracker
 from dexie_manager import DexieManager, get_offer_detail
 from splash_manager import SplashManager
@@ -108,6 +109,33 @@ DEXIE_STATUS_PENDING = 1
 DEXIE_STATUS_CANCELLED = 3
 DEXIE_STATUS_COMPLETED = 4
 DEXIE_STATUS_EXPIRED = 6
+
+
+class _IncompleteStartupCoinView(RuntimeError):
+    """The wallet did not provide a complete startup reconciliation view."""
+
+
+def _reconcile_startup_coin_views(
+    xch_owned, xch_selectable, cat_owned, cat_selectable, reconcile
+):
+    """Reconcile only after both wallet assets have complete coin views."""
+    if any(
+        not isinstance(view, dict)
+        for view in (xch_owned, xch_selectable, cat_owned, cat_selectable)
+    ):
+        raise _IncompleteStartupCoinView("Incomplete Sage startup coin view")
+    xch_stats = reconcile(
+        wallet_selectable=xch_selectable,
+        wallet_owned=xch_owned,
+        wallet_type="xch",
+    )
+    cat_stats = reconcile(
+        wallet_selectable=cat_selectable,
+        wallet_owned=cat_owned,
+        wallet_type="cat",
+    )
+    return xch_stats, cat_stats
+
 
 # One-release compatibility keeps the old BoostManager available for
 # authoritative cancellation of recovered offers, never for creation or
@@ -3194,7 +3222,7 @@ class BotLoop:
                     side_filter=blocked_side,
                 )
 
-            cancelled = sum(
+            submitted = sum(
                 1 for item in result.values() if item and item.get("success")
             )
             failed = sum(
@@ -3202,12 +3230,14 @@ class BotLoop:
             )
             log_event(
                 "warning",
-                "circuit_breaker_cancel_done",
-                f"CB safety cancel complete — cancelled {cancelled}, failed {failed}",
+                "circuit_breaker_cancel_progress",
+                f"CB safety cancel: submitted {submitted}, failed {failed}; "
+                "authoritative terminal proof remains required",
             )
-            # Only mark safed once cancel actually succeeded (or partially succeeded).
-            # If all cancels failed, leave _safed=False so next cycle retries.
-            if cancelled > 0 or failed == 0:
+            # A successful RPC is only a submitted mutation. cancel_all() can
+            # return an empty result only after a complete authoritative wallet
+            # inventory and the DB both contain no matching open offers.
+            if not result:
                 self._circuit_breaker_offer_safed = True
             try:
                 self.coin_manager.snapshot_coins("circuit_breaker_cancel")
@@ -5688,6 +5718,31 @@ class BotLoop:
         self._startup_complete.clear()
         log_event("debug", "runtime_state_reset", "Runtime state reset for new session")
 
+    def _fresh_wallet_offer_book_for_start(self) -> bool:
+        """Reject a cached or failed Sage offer read before spawning workers."""
+        try:
+            offers, meta = self.offer_manager.sync_from_wallet_with_meta()
+        except Exception:
+            return False
+        return (
+            type(offers) is tuple
+            and len(offers) == 3
+            and all(type(rows) is list for rows in offers)
+            and type(meta) is dict
+            and meta.get("fresh") is True
+            and meta.get("using_cache") is False
+        )
+
+    def _detect_fills_for_wallet_cycle(self, current_buy_ids, current_sell_ids):
+        """Only a fresh offer book can advance fill detection state."""
+        if self._wallet_sync_stale_cycle:
+            return {"buy_fills": [], "sell_fills": []}
+        return self.fill_tracker.detect_fills(
+            current_buy_ids,
+            current_sell_ids,
+            self.offer_manager._offer_details_cache,
+        )
+
     def start(self) -> bool:
         """Start the bot loop in a background thread.
 
@@ -5809,12 +5864,16 @@ class BotLoop:
                     running=False, status="blocked", preflight=preflight.to_dict()
                 )
                 return False
-        except Exception as e:
-            # Preflight failure should not block startup — fall through
-            # to the legacy watch-only check below.
+        except Exception:
             log_event(
-                "warning", "preflight_error", f"Preflight could not run: {str(e)[:160]}"
+                "error", "preflight_error", "Preflight could not run; bot start blocked"
             )
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Preflight could not run",
+            )
+            return False
 
         # Legacy watch-only guard — kept as fallback in case preflight
         # import fails or is incomplete. The preflight system checks this
@@ -5844,12 +5903,33 @@ class BotLoop:
                     )
                     self._set_state(running=False, status="blocked")
                     return False
-        except Exception as e:
+        except Exception:
             log_event(
-                "warning",
+                "error",
                 "bot_start_signing_check_failed",
-                f"Could not verify Sage signing capability before start: {str(e)[:160]}",
+                "Could not verify Sage signing capability; bot start blocked",
             )
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Could not verify wallet signing capability",
+            )
+            return False
+
+        # The API checked this earlier, but Sage can fail between that check
+        # and the final worker start. Keep direct BotLoop callers fail-closed.
+        if not self._fresh_wallet_offer_book_for_start():
+            self._set_state(
+                running=False,
+                status="blocked",
+                error="Live wallet offers could not be verified",
+            )
+            log_event(
+                "error",
+                "bot_start_wallet_offers_not_fresh",
+                "Bot start blocked because the live wallet offer book is not fresh",
+            )
+            return False
 
         self._watcher_stop_event.clear()
         self._running = True
@@ -5918,18 +5998,6 @@ class BotLoop:
             target=self._coin_watcher_thread_run, daemon=True, name="coin-watcher"
         )
         self._coin_watcher_thread.start()
-        # If outbound Splash broadcasting is enabled, keep inbound listening on
-        # as well so the listener stats and pair-specific intake stay live.
-        if getattr(cfg, "SPLASH_ENABLED", False) and not getattr(
-            cfg, "SPLASH_RECEIVE_ENABLED", False
-        ):
-            cfg.SPLASH_RECEIVE_ENABLED = True
-            log_event(
-                "info",
-                "splash_receive_auto",
-                "Splash incoming listener auto-enabled alongside outbound broadcast",
-            )
-
         # Splash incoming watcher thread (classifies inbound P2P offers).
         # Extracted into _start_splash_receive() so the liveness watchdog
         # can restart this daemon if it dies mid-session — without that,
@@ -5937,10 +6005,11 @@ class BotLoop:
         # inbound P2P offers while the bot happily kept quoting.
         self._start_splash_receive()
 
-        # V3: Auto-start Splash P2P node if enabled
-        if getattr(cfg, "SPLASH_ENABLED", False) and getattr(
-            cfg, "SPLASH_AUTO_START", True
-        ):
+        # Auto-start the managed node for outbound or inbound Splash.
+        if (
+            getattr(cfg, "SPLASH_ENABLED", False)
+            or getattr(cfg, "SPLASH_RECEIVE_ENABLED", False)
+        ) and getattr(cfg, "SPLASH_AUTO_START", True):
             try:
                 started = self.splash_node.start()
                 if started:
@@ -5987,13 +6056,27 @@ class BotLoop:
         Returns True if stopped, False if not running.
         """
         if not self._running:
-            if (
-                wait
-                and self._stop_finalize_thread
-                and self._stop_finalize_thread.is_alive()
-            ):
-                self._stop_finalize_thread.join(timeout=90)
-            return False
+            finalizer = self._stop_finalize_thread
+            if finalizer and finalizer.is_alive():
+                if wait:
+                    finalizer.join(timeout=90)
+                if finalizer.is_alive():
+                    return False
+            with self._state_lock:
+                stop_pending = self._bot_state.get("status") == "stopping"
+            if not stop_pending:
+                return False
+            if not wait:
+                self._stop_finalize_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    daemon=True,
+                    name="bot-stop-finalizer",
+                )
+                self._stop_finalize_thread.start()
+                return True
+            self._finalize_stop()
+            with self._state_lock:
+                return self._bot_state.get("status") == "stopped"
 
         self._running = False
         self._set_state(running=False, status="stopping")
@@ -6076,12 +6159,25 @@ class BotLoop:
                     )
 
         # V3: Stop Splash node
-        if self.splash_node.is_running():
+        splash_stop_failed = False
+        manager = getattr(self.splash_node, "_thread", None)
+        if (
+            self.splash_node.is_running()
+            or getattr(self.splash_node, "_running", False) is True
+            or (manager is not None and manager.is_alive())
+        ):
             try:
-                self.splash_node.stop()
+                if self.splash_node.stop() is False:
+                    splash_stop_failed = True
+                    log_event(
+                        "warning",
+                        "splash_node_stop_failed",
+                        "Splash child remained active after bot stop",
+                    )
             except Exception as e:
+                splash_stop_failed = True
                 log_event(
-                    "debug",
+                    "warning",
                     "splash_node_stop_failed",
                     f"Splash node stop raised during shutdown: {e}",
                 )
@@ -6103,6 +6199,10 @@ class BotLoop:
                     name="bot-stop-finalizer",
                 )
                 self._stop_finalize_thread.start()
+            return False
+
+        if splash_stop_failed:
+            self._set_state(running=False, status="stopping")
             return False
 
         self._set_state(status="stopped")
@@ -6191,19 +6291,36 @@ class BotLoop:
                             f"{_t_name} thread did not exit within 10s",
                         )
 
+            splash_stop_failed = False
             try:
                 splash_running = bool(self.splash_node.is_running())
             except Exception:
-                splash_running = False
-            if splash_running:
+                splash_running = True
+            manager = getattr(self.splash_node, "_thread", None)
+            if (
+                splash_running
+                or getattr(self.splash_node, "_running", False) is True
+                or (manager is not None and manager.is_alive())
+            ):
                 try:
-                    self.splash_node.stop()
+                    if self.splash_node.stop() is False:
+                        splash_stop_failed = True
+                        log_event(
+                            "warning",
+                            "splash_node_stop_failed",
+                            "Splash child remained active after bot stop",
+                        )
                 except Exception as e:
+                    splash_stop_failed = True
                     log_event(
-                        "debug",
+                        "warning",
                         "splash_node_stop_failed",
                         f"Splash node stop raised during shutdown: {e}",
                     )
+
+            if splash_stop_failed:
+                self._set_state(running=False, status="stopping")
+                return
 
             self._set_state(running=False, status="stopped")
 
@@ -6221,6 +6338,11 @@ class BotLoop:
     def is_running(self) -> bool:
         """Check if the bot loop is running."""
         return self._running
+
+    def is_stopped(self) -> bool:
+        """Prove the bot reached its terminal stop state without GUI stat reads."""
+        with self._state_lock:
+            return not self._running and self._bot_state.get("status") == "stopped"
 
     def _current_splash_pair_label(self) -> str:
         ticker = (
@@ -6253,12 +6375,24 @@ class BotLoop:
 
         stats["enabled"] = bool(getattr(cfg, "SPLASH_RECEIVE_ENABLED", False))
         receive_thread = getattr(self, "_splash_receive_thread", None)
-        stats["active"] = bool(
+        try:
+            node_running = bool(self.splash_node.is_running())
+        except Exception:
+            node_running = False
+        ready_candidate = bool(
             stats["enabled"]
             and getattr(self, "_running", False)
             and receive_thread is not None
             and receive_thread.is_alive()
+            and node_running
         )
+        try:
+            listener_ready = bool(
+                ready_candidate and self.splash_node.check_health().get("api_reachable")
+            )
+        except Exception:
+            listener_ready = False
+        stats["active"] = listener_ready
         stats["pair_asset_id"] = asset_id
         stats["pair_label"] = self._current_splash_pair_label()
         stats["poll_secs"] = getattr(self, "_splash_receive_interval", 5)
@@ -6277,7 +6411,7 @@ class BotLoop:
                 # but never present them as a live peer snapshot after the
                 # managed process has stopped.  SplashNode.get_status() applies
                 # the same mask; this receive-stat path previously bypassed it.
-                if not self.splash_node.is_running():
+                if not node_running:
                     metrics["reachable"] = False
                 stats["node_metrics"] = metrics
             else:
@@ -6443,6 +6577,12 @@ class BotLoop:
         re-invoke this if the daemon dies. Safe to call multiple times:
         if the current thread is still alive it is left alone.
         """
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        ):
+            self._splash_receive_thread = None
+            return
+
         existing = getattr(self, "_splash_receive_thread", None)
         if existing is not None and existing.is_alive():
             return
@@ -6533,6 +6673,9 @@ class BotLoop:
         # Startup: sync state from wallet
         # Background threads wait for this to finish before writing to DB.
         startup_state = self._startup_sync() or {}
+        if not self._running:
+            self._startup_complete.set()  # Wake workers so they can exit.
+            return
         if "open_buys" in startup_state and "open_sells" in startup_state:
             self._set_state(
                 open_buys=int(startup_state["open_buys"]),
@@ -8294,7 +8437,19 @@ class BotLoop:
             log_event(
                 "info", "startup_wallet_sync", "Fetching offers from wallet RPC..."
             )
-            open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
+            startup_offers, startup_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                type(startup_offers) is not tuple
+                or len(startup_offers) != 3
+                or any(type(rows) is not list for rows in startup_offers)
+                or type(startup_meta) is not dict
+                or startup_meta.get("fresh") is not True
+                or startup_meta.get("using_cache") is not False
+            ):
+                raise RuntimeError("Wallet offer book is stale during startup sync")
+            open_buys, open_sells, closed = startup_offers
             log_event(
                 "info",
                 "startup_wallet_result",
@@ -8712,22 +8867,17 @@ class BotLoop:
                     )
 
                 if not _startup_detailed:
-                    xch_owned = get_owned_coins(xch_wid) or {}
-                    xch_selectable = get_selectable_coins_map(xch_wid) or {}
-                    cat_owned = get_owned_coins(cat_wid) or {}
-                    cat_selectable = get_selectable_coins_map(cat_wid) or {}
+                    xch_owned = get_owned_coins(xch_wid)
+                    xch_selectable = get_selectable_coins_map(xch_wid)
+                    cat_owned = get_owned_coins(cat_wid)
+                    cat_selectable = get_selectable_coins_map(cat_wid)
 
-                # Reconcile XCH coins
-                xch_stats = reconcile_coins_with_wallet(
-                    wallet_selectable=xch_selectable,
-                    wallet_owned=xch_owned,
-                    wallet_type="xch",
-                )
-                # Reconcile CAT coins
-                cat_stats = reconcile_coins_with_wallet(
-                    wallet_selectable=cat_selectable,
-                    wallet_owned=cat_owned,
-                    wallet_type="cat",
+                xch_stats, cat_stats = _reconcile_startup_coin_views(
+                    xch_owned,
+                    xch_selectable,
+                    cat_owned,
+                    cat_selectable,
+                    reconcile_coins_with_wallet,
                 )
                 log_event(
                     "info",
@@ -8744,6 +8894,11 @@ class BotLoop:
                     "info", "startup_offer_linking", f"Offer-coin linking: {link_stats}"
                 )
 
+            except _IncompleteStartupCoinView as e:
+                log_event("error", "startup_coin_view_incomplete", str(e))
+                self._running = False
+                self._set_state(status="error", error=str(e))
+                return
             except Exception as e:
                 log_event(
                     "warning",
@@ -9036,7 +9191,7 @@ class BotLoop:
             total_offers = len(buy_ids) + len(sell_ids)
             if (
                 total_offers > 0
-                and cfg.DEXIE_AUTO_POST
+                and (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False))
                 and not self._startup_repost_done
             ):
                 self._startup_repost_done = True
@@ -9858,8 +10013,9 @@ class BotLoop:
         self._set_cycle_step("step3_wallet_sync")
         print("   [3] Syncing offers from wallet...", end="", flush=True)
         # step3_sync log removed — console print covers this
-        open_buys, open_sells, closed = self.offer_manager.sync_from_wallet()
-        wallet_sync_meta = self.offer_manager.get_wallet_sync_meta()
+        (open_buys, open_sells, closed), wallet_sync_meta = (
+            self.offer_manager.sync_from_wallet_with_meta()
+        )
         self._wallet_sync_stale_cycle = not bool(wallet_sync_meta.get("fresh", True))
         # Local expiry is display/planning context only. The wallet book stays
         # intact until authoritative reconciliation proves terminal state.
@@ -10183,8 +10339,8 @@ class BotLoop:
             arb_gap,
         )
         print("   [4] Checking fills...", end="", flush=True)
-        fill_result = self.fill_tracker.detect_fills(
-            current_buy_ids, current_sell_ids, self.offer_manager._offer_details_cache
+        fill_result = self._detect_fills_for_wallet_cycle(
+            current_buy_ids, current_sell_ids
         )
 
         buy_fills = fill_result.get("buy_fills", [])
@@ -11969,9 +12125,23 @@ class BotLoop:
             self._graceful_in_progress = False
             return
 
+        if (
+            current_buy_ids is not None
+            and current_sell_ids is not None
+            and self._wallet_sync_stale_cycle
+        ):
+            return
+
         if current_buy_ids is None or current_sell_ids is None:
             try:
-                open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
+                (open_buys, open_sells, _), sync_meta = (
+                    self.offer_manager.sync_from_wallet_with_meta()
+                )
+                if (
+                    sync_meta.get("fresh") is not True
+                    or sync_meta.get("using_cache") is not False
+                ):
+                    return
                 current_buy_ids = {
                     o.get("trade_id") for o in open_buys if o.get("trade_id")
                 }
@@ -13082,17 +13252,42 @@ class BotLoop:
             )
             return empty
 
+        allowed_sides = {
+            side for side in ("buy", "sell") if bootstrap_side_enabled(cfg, side)
+        }
+        if not allowed_sides:
+            log_event(
+                "warning",
+                "bootstrap_creation_sides_disabled",
+                "Market Bootstrap has no enabled liquidity side for offer creation",
+            )
+            return empty
+        plan = {
+            **runtime["plan"],
+            "sides": {
+                side: (
+                    runtime["plan"]["sides"][side]
+                    if side in allowed_sides
+                    else {
+                        **runtime["plan"]["sides"][side],
+                        "levels": [],
+                        "paused": True,
+                    }
+                )
+                for side in ("buy", "sell")
+            },
+        }
         existing = active_bootstrap_levels(
             intents,
             campaign_id=campaign["campaign_id"],
             revision=campaign["revision"],
         )
-        if len(existing) >= sum(
-            len(runtime["plan"]["sides"][side]["levels"]) for side in ("buy", "sell")
+        if len({item for item in existing if item[0] in allowed_sides}) >= sum(
+            len(plan["sides"][side]["levels"]) for side in allowed_sides
         ):
             return empty
         created = self.offer_manager.create_bootstrap_plan(
-            runtime["plan"],
+            plan,
             campaign_authority=campaign,
             xch_wallet_id=int(getattr(cfg, "WALLET_ID_XCH", 1)),
             cat_wallet_id=int(getattr(cfg, "CAT_WALLET_ID", 0)),
@@ -14743,9 +14938,11 @@ class BotLoop:
         # Splash incoming watcher classifies inbound P2P offers. Previously
         # the watchdog named it in the docstring but never actually checked
         # it, so a crash left Splash receive silently dead while the bot
-        # kept quoting. Include it here — only when Splash is enabled, so
-        # we don't "restart" a thread that was intentionally not started.
-        if getattr(cfg, "SPLASH_ENABLED", False):
+        # kept quoting. Follow the worker's own receive-mode startup gate;
+        # outbound-only Splash has no classifier thread to restart.
+        if getattr(cfg, "SPLASH_RECEIVE_ENABLED", False) and not getattr(
+            cfg, "DEXIE_ONLY_BETA", False
+        ):
             critical_threads.append(
                 ("splash-receive", "_splash_receive_thread", self._start_splash_receive)
             )
@@ -15801,29 +15998,36 @@ class BotLoop:
         total_offers: Optional[int] = None,
     ) -> bool:
         """Run Dexie/Splash visibility confirmation in a background thread."""
-        if not cfg.DEXIE_AUTO_POST:
+        if not (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False)):
             return False
 
         with self._startup_repost_lock:
             if self._startup_repost_thread and self._startup_repost_thread.is_alive():
                 return False
 
+            publisher = (
+                "Dexie and Splash"
+                if cfg.DEXIE_AUTO_POST and getattr(cfg, "SPLASH_ENABLED", False)
+                else "Dexie"
+                if cfg.DEXIE_AUTO_POST
+                else "Splash"
+            )
             if reason == "startup_resume":
                 msg = (
-                    f"Checking {int(total_offers or 0)} existing offers on Dexie in the background "
+                    f"Checking {int(total_offers or 0)} existing offers on {publisher} in the background "
                     "while the bot resumes"
                 )
             elif reason == "connectivity_recovery":
-                msg = "Pricing recovered — checking existing offers on Dexie in the background"
+                msg = f"Pricing recovered — checking existing offers on {publisher} in the background"
             else:
-                msg = "Checking existing offers on Dexie in the background"
+                msg = f"Checking existing offers on {publisher} in the background"
             log_event("info", "dexie_repost_background", msg)
 
             if getattr(cfg, "SPLASH_ENABLED", False):
                 log_event(
                     "info",
                     "splash_repost_background",
-                    "Confirming existing offers over Splash in the background",
+                    "Checking local Splash submission for existing offers in the background",
                 )
 
             def _worker():
@@ -15866,7 +16070,7 @@ class BotLoop:
 
         Called on startup and after connectivity recovery.
         """
-        if not cfg.DEXIE_AUTO_POST:
+        if not (cfg.DEXIE_AUTO_POST or getattr(cfg, "SPLASH_ENABLED", False)):
             return
         if not self._running:
             return
@@ -15892,31 +16096,61 @@ class BotLoop:
         try:
             from database import PublicationSuppressedError, get_offers_for_repost
 
+            (open_buys, open_sells, _), sync_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                type(sync_meta) is not dict
+                or sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is True
+            ):
+                log_event(
+                    "warning",
+                    "dexie_repost_wallet_unavailable",
+                    "Skipped repost because the wallet offer book is not fresh",
+                )
+                return False
+            all_open = open_buys + open_sells
+            wallet_open_ids = {
+                str(offer.get("trade_id") or offer.get("offer_id"))
+                for offer in all_open
+                if offer.get("trade_id") or offer.get("offer_id")
+            }
+
             # Get open offers with their stored bech32 strings from DB
             cat_id = cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
-            db_offers = get_offers_for_repost(cat_asset_id=cat_id)
+            db_offers = [
+                offer
+                for offer in get_offers_for_repost(cat_asset_id=cat_id)
+                if str(offer.get("trade_id") or "") in wallet_open_ids
+            ]
 
-            if not db_offers:
-                # Fallback: sync from wallet (first run or empty DB)
-                open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
-                all_open = open_buys + open_sells
-                if not all_open:
-                    return
-                # Use legacy path for offers without DB bech32
-                db_offers = [
+            # The DB may cover only part of the fresh wallet-open book. Add
+            # every missing wallet offer to the RPC slow path, even when some
+            # other offers have stored bech32 strings in the DB.
+            db_offer_ids = {str(o.get("trade_id") or "") for o in db_offers}
+            for wallet_offer in all_open:
+                trade_id = str(
+                    wallet_offer.get("trade_id") or wallet_offer.get("offer_id") or ""
+                )
+                if not trade_id or trade_id in db_offer_ids:
+                    continue
+                db_offers.append(
                     {
-                        "trade_id": o.get("trade_id", ""),
+                        "trade_id": trade_id,
                         "offer_bech32": None,
                         "dexie_id": None,
-                        "side": o.get("side", ""),
+                        "side": wallet_offer.get("side", ""),
                     }
-                    for o in all_open
-                ]
+                )
+                db_offer_ids.add(trade_id)
 
             # Split into: already posted (skip), have bech32 (fast), need RPC (slow)
             skip_count = 0
             fast_queue = []  # Have bech32 in DB, just need to post to Dexie
             slow_queue = []  # Missing bech32, need wallet RPC
+            splash_only_fast = []  # Already on Dexie, still eligible for Splash
+            splash_only_slow = []
 
             for offer in db_offers:
                 trade_id = offer.get("trade_id", "")
@@ -15935,6 +16169,11 @@ class BotLoop:
                             self.dexie_manager._posted_fingerprints.add(
                                 self.dexie_manager._fingerprint(bech32)
                             )
+                    if getattr(cfg, "SPLASH_ENABLED", False):
+                        if bech32:
+                            splash_only_fast.append((trade_id, bech32))
+                        else:
+                            splash_only_slow.append(trade_id)
                     continue
 
                 if bech32:
@@ -15974,26 +16213,35 @@ class BotLoop:
                     return False
 
             for trade_id, bech32 in fast_queue:
-                if queue_visibility(self.dexie_manager, bech32, trade_id, "dexie"):
-                    count += 1
+                if cfg.DEXIE_AUTO_POST:
+                    if queue_visibility(self.dexie_manager, bech32, trade_id, "dexie"):
+                        count += 1
                 if getattr(cfg, "SPLASH_ENABLED", False):
                     if queue_visibility(
                         self.splash_manager, bech32, trade_id, "splash"
                     ):
                         splash_count += 1
 
+            for trade_id, bech32 in splash_only_fast:
+                if queue_visibility(self.splash_manager, bech32, trade_id, "splash"):
+                    splash_count += 1
+
             # Slow path: fetch bech32 from wallet RPC for offers without it
-            if slow_queue:
+            if slow_queue or splash_only_slow:
                 from wallet import get_offer_bech32
 
-                for trade_id in slow_queue:
+                for trade_id, dexie_needed in [
+                    *((trade_id, True) for trade_id in slow_queue),
+                    *((trade_id, False) for trade_id in splash_only_slow),
+                ]:
                     try:
                         bech32 = get_offer_bech32(trade_id)
                         if bech32:
-                            if queue_visibility(
-                                self.dexie_manager, bech32, trade_id, "dexie"
-                            ):
-                                count += 1
+                            if dexie_needed and cfg.DEXIE_AUTO_POST:
+                                if queue_visibility(
+                                    self.dexie_manager, bech32, trade_id, "dexie"
+                                ):
+                                    count += 1
                             if getattr(cfg, "SPLASH_ENABLED", False):
                                 if queue_visibility(
                                     self.splash_manager, bech32, trade_id, "splash"
@@ -16014,6 +16262,7 @@ class BotLoop:
                             f"Error getting bech32 for {trade_id[:16]}...: {e}",
                         )
 
+            dexie_incomplete = False
             if count > 0:
                 if not self._enter_runtime_effect_phase("publication"):
                     log_event(
@@ -16024,34 +16273,68 @@ class BotLoop:
                         data={"reason": reason, "stage": "dexie_flush"},
                     )
                     return False
-                self.dexie_manager.flush_queue(flush_all=True)
-                log_event(
-                    "info",
-                    "dexie_repost_done",
-                    f"Re-posted {count} offers to Dexie"
-                    + (" in the background " if background else " ")
-                    + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
-                    f"{skip_count} already live)",
-                )
-                # Also broadcast to Splash if enabled (V3)
-                if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
-                    if not self._enter_runtime_effect_phase("publication"):
+                try:
+                    dexie_result = self.dexie_manager.flush_queue(flush_all=True)
+                except Exception as e:
+                    dexie_result = None
+                    log_event(
+                        "warning",
+                        "dexie_repost_incomplete",
+                        f"Dexie repost raised during publication: {e}",
+                    )
+                required_counts = ("posted", "failed", "skipped")
+                dexie_result_valid = False
+                if (
+                    type(dexie_result) is not dict
+                    or any(
+                        type(dexie_result.get(key)) is not int or dexie_result[key] < 0
+                        for key in required_counts
+                    )
+                    or (
+                        "requeued" in dexie_result
+                        and (
+                            type(dexie_result["requeued"]) is not int
+                            or dexie_result["requeued"] < 0
+                        )
+                    )
+                ):
+                    dexie_incomplete = True
+                    if dexie_result is not None:
                         log_event(
                             "warning",
-                            "splash_repost_market_blocked",
-                            "Skipped queued Splash repost because market confidence "
-                            "expired before publication",
-                            data={"reason": reason, "stage": "splash_flush"},
+                            "dexie_repost_incomplete",
+                            "Dexie repost returned no trustworthy result",
                         )
-                        return False
-                    self.splash_manager.flush_queue(flush_all=True)
+                else:
+                    dexie_result_valid = True
+                    dexie_posted = dexie_result["posted"]
+                    dexie_skipped = dexie_result["skipped"]
+                    dexie_incomplete = (
+                        dexie_result["failed"] > 0
+                        or dexie_result.get("requeued", 0) > 0
+                        or dexie_result.get("disabled") is True
+                        or dexie_result.get("authorization_blocked") is True
+                        or dexie_result.get("budget_exhausted") is True
+                        or dexie_posted + dexie_skipped < count
+                    )
+                if dexie_incomplete and dexie_result_valid:
+                    log_event(
+                        "warning",
+                        "dexie_repost_incomplete",
+                        "Dexie repost is incomplete",
+                        data={"queued": count, **dexie_result},
+                    )
+                elif not dexie_incomplete:
                     log_event(
                         "info",
-                        "splash_repost_done",
-                        f"Confirmed {splash_count} offers over Splash"
-                        + (" in the background" if background else ""),
+                        "dexie_repost_done",
+                        f"Posted {dexie_posted} offers to Dexie; "
+                        f"{dexie_skipped} skipped"
+                        + (" in the background " if background else " ")
+                        + f"({len(fast_queue)} fast + {len(slow_queue)} via RPC, "
+                        f"{skip_count} already live)",
                     )
-            elif getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
+            if getattr(cfg, "SPLASH_ENABLED", False) and splash_count > 0:
                 if not self._enter_runtime_effect_phase("publication"):
                     log_event(
                         "warning",
@@ -16061,22 +16344,64 @@ class BotLoop:
                         data={"reason": reason, "stage": "splash_flush"},
                     )
                     return False
-                self.splash_manager.flush_queue(flush_all=True)
+                try:
+                    splash_result = self.splash_manager.flush_queue(flush_all=True)
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        f"Splash local submission raised: {e}; "
+                        "peer delivery is unverified",
+                    )
+                    return False
+                required_counts = ("posted", "failed", "skipped", "requeued")
+                if type(splash_result) is not dict or any(
+                    type(splash_result.get(key)) is not int or splash_result[key] < 0
+                    for key in required_counts
+                ):
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        "Splash local submission returned no trustworthy result; "
+                        "peer delivery is unverified",
+                    )
+                    return False
+                posted = splash_result["posted"]
+                skipped = splash_result["skipped"]
+                if (
+                    splash_result["failed"] > 0
+                    or splash_result["requeued"] > 0
+                    or splash_result.get("authorization_blocked") is True
+                    or splash_result.get("budget_exhausted") is True
+                    or posted + skipped < splash_count
+                ):
+                    log_event(
+                        "warning",
+                        "splash_repost_failed",
+                        "Splash local submission is incomplete; peer delivery is "
+                        "unverified",
+                        data={"queued": splash_count, **splash_result},
+                    )
+                    return False
                 log_event(
                     "info",
                     "splash_repost_done",
-                    f"Confirmed {splash_count} offers over Splash"
+                    f"Submitted {posted} offers to local Splash node; "
+                    f"{skipped} skipped; peer delivery unverified"
                     + (" in the background" if background else ""),
                 )
-            else:
+            elif count == 0 and splash_count == 0 and cfg.DEXIE_AUTO_POST:
                 log_event(
                     "info",
                     "dexie_repost_done",
                     f"All {skip_count} offers already live on Dexie — nothing to repost",
                 )
+            if dexie_incomplete:
+                return False
 
         except Exception as e:
             log_event("error", "dexie_repost_failed", f"Dexie repost failed: {e}")
+            return False
 
     # -------------------------------------------------------------------
     # Health Monitor Thread (V1 parity)
@@ -16616,6 +16941,17 @@ class BotLoop:
             if result.get("error") or result.get("success") is False:
                 return False
 
+        # During a Sage restart either coin endpoint can briefly return HTTP
+        # 200 with an empty list after a run of 401s. That is not evidence
+        # that the wallet's previously tracked coins were all spent.
+        for wallet_type, result in (("xch", xch_result), ("cat", cat_result)):
+            if not (result.get("confirmed_records") or result.get("records")) and any(
+                coin.get("source") == "wallet"
+                and coin.get("wallet_type") == wallet_type
+                for coin in self._coin_snapshot.values()
+            ):
+                return False
+
         return True
 
     def _handle_coin_watcher_snapshot(
@@ -16992,7 +17328,14 @@ class BotLoop:
             )
 
             # ── Step 2: Sync current offers ──
-            open_buys, open_sells, _ = self.offer_manager.sync_from_wallet()
+            (open_buys, open_sells, _), sync_meta = (
+                self.offer_manager.sync_from_wallet_with_meta()
+            )
+            if (
+                sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is not False
+            ):
+                raise RuntimeError("Wallet offer sync is stale; migration not planned")
             total = len(open_buys) + len(open_sells)
 
             if total == 0:
@@ -17295,6 +17638,21 @@ class BotLoop:
     # State queries (for API/GUI)
     # -------------------------------------------------------------------
 
+    def stop_retry_available(self) -> bool:
+        """Allow another stop request only after an incomplete finalizer exits."""
+        with self._state_lock:
+            stopping = self._bot_state.get("status") == "stopping"
+        if not stopping or self._running:
+            return False
+        finalizer = getattr(self, "_stop_finalize_thread", None)
+        if finalizer is not None:
+            try:
+                if finalizer.is_alive():
+                    return False
+            except Exception:
+                return False
+        return True
+
     def get_state(self) -> Dict:
         """Get full bot state for the GUI/API."""
         # Guard: if __init__ hasn't finished, return minimal state to avoid
@@ -17304,6 +17662,7 @@ class BotLoop:
                 return dict(self._bot_state)
         with self._state_lock:
             state = dict(self._bot_state)
+        state["stop_retry_available"] = self.stop_retry_available()
         state["loop_duration"] = round(self._last_loop_duration, 2)
         state["loop_seconds"] = cfg.LOOP_SECONDS
         state["dry_run"] = cfg.DRY_RUN

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import api_server
 from api_test_support import api_mutations_permitted
@@ -12,7 +13,77 @@ import sage_node
 from blueprints import bot as bot_routes
 from blueprints import coin_prep as coin_prep_routes
 from blueprints import config_bp
+from blueprints import market as market_routes
 import coin_prep_worker
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_gui_does_not_reinterpret_confirmation_text_as_html():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "msgEl.innerHTML = message" not in source
+    assert "msgEl.innerHTML = String(message)" not in source
+    assert "allowHtml: true" not in source
+
+
+def test_gui_external_links_use_protocol_allowlist_not_scheme_denylist():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "startsWith('javascript:')" not in source
+    assert "!/^https?:$/i.test(parsed.protocol)" in source
+
+
+def test_gui_token_icons_are_validated_before_dom_assignment():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "function getSafeTokenIconUrl(" in source
+    assert "titleIcon.setAttribute('src', iconUrl)" not in source
+    assert "img.setAttribute('src', url)" not in source
+    assert "iconEl.src = url" not in source
+    assert "titleIcon.src =" not in source
+
+
+def test_confirmation_text_uses_no_custom_tag_stripping_sanitizer():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert ".replace(/<[^>]*>/g" not in source
+    assert ".confirm-modal-message" in source
+    assert "white-space: pre-line" in source
+
+
+def test_smart_settings_result_does_not_reinterpret_dynamic_markup():
+    source = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+
+    assert "resultBody.innerHTML =" not in source
+
+
+def test_fee_reason_translation_never_returns_arbitrary_exception_text():
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_APPROVAL_STALE"), "FEE_APPROVAL_UNAVAILABLE"
+        )
+        == "FEE_APPROVAL_STALE"
+    )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_SECRET_LOCAL_PATH"), "FEE_APPROVAL_UNAVAILABLE"
+        )
+        == "FEE_APPROVAL_UNAVAILABLE"
+    )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE"), "FEE_PREVIEW_UNAVAILABLE"
+        )
+        == "FEE_PREP_CAMPAIGN_UNAVAILABLE"
+    )
+    assert (
+        coin_prep_routes._public_fee_reason(
+            ValueError("FEE_WALLET_IDENTITY_UNAVAILABLE"), "FEE_PREVIEW_UNAVAILABLE"
+        )
+        == "FEE_WALLET_IDENTITY_UNAVAILABLE"
+    )
 
 
 def test_coin_prep_cli_rejects_unsafe_args_without_spawning(monkeypatch):
@@ -38,7 +109,10 @@ def test_open_data_folder_error_does_not_expose_exception_details():
     api_server.app.testing = True
     client = api_server.app.test_client()
     loopback = {"REMOTE_ADDR": "127.0.0.1"}
-    client.get("/", environ_base=loopback)
+    client.get(
+        f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+        environ_base=loopback,
+    )
 
     with patch(
         "user_paths.data_dir", side_effect=RuntimeError("secret local path leaked")
@@ -156,9 +230,70 @@ def test_sage_cert_pair_rejects_unknown_custom_root(tmp_path):
     assert "detected Sage data folder" in reason
 
 
+def test_sage_cert_pair_rejects_network_path_before_resolution():
+    with patch.object(
+        sage_node.os.path,
+        "realpath",
+        side_effect=AssertionError("network path was resolved"),
+    ) as resolve:
+        ok, reason, _, _ = sage_node.validate_sage_cert_pair(
+            r"\\attacker\share\ssl\wallet.crt"
+        )
+
+    assert ok is False
+    assert reason == "Network certificate paths are not allowed."
+    resolve.assert_not_called()
+
+
+def test_sage_cert_candidates_rejects_unconfigured_data_dir(tmp_path):
+    client, loopback = _api_client()
+
+    resp = client.get(
+        "/api/sage/cert-candidates",
+        query_string={"data_dir": str(tmp_path / "UnconfiguredSage")},
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base=loopback,
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["success"] is False
+
+
+def test_sage_cert_candidates_accepts_configured_data_dir(tmp_path):
+    data_dir = tmp_path / "PortableSage"
+    ssl_dir = data_dir / "ssl"
+    ssl_dir.mkdir(parents=True)
+    (ssl_dir / "wallet.crt").write_text("cert", encoding="utf-8")
+    (ssl_dir / "wallet.key").write_text("key", encoding="utf-8")
+    client, loopback = _api_client()
+
+    with patch.dict("os.environ", {"SAGE_ALLOWED_CERT_ROOTS": str(data_dir)}):
+        resp = client.get(
+            "/api/sage/cert-candidates",
+            query_string={"data_dir": str(data_dir)},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base=loopback,
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["detected_cert_path"] == str(ssl_dir / "wallet.crt")
+
+
 class _StartableBot:
     def __init__(self):
         self.started = False
+        self.coin_manager = MagicMock()
+        self.coin_manager.is_busy.return_value = False
+        self.offer_manager = MagicMock()
+        self.offer_manager.sync_from_wallet.return_value = ([], [], [])
+        self.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
+        self.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            self.offer_manager.sync_from_wallet(),
+            self.offer_manager.get_wallet_sync_meta(),
+        )
 
     def is_running(self):
         return False
@@ -184,6 +319,7 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
 
     with (
         api_mutations_permitted(api_server),
+        patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch.object(
             bot_routes,
             "_enforce_post_tibet_start_migration",
@@ -228,6 +364,7 @@ def test_bot_start_coin_prep_gate_hides_worker_exception_details(monkeypatch):
     }
     with (
         api_mutations_permitted(api_server),
+        patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch(
             "wallet.get_wallet_sync_status",
             return_value={"reachable": True, "sync_state": "synced"},
@@ -272,7 +409,11 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
         "chia_node.get_startup_status",
         return_value={"phase": "error", "error": "secret startup traceback"},
     ):
-        resp = client.get("/api/sage/startup-status", environ_base=loopback)
+        resp = client.get(
+            "/api/sage/startup-status",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base=loopback,
+        )
     assert resp.status_code == 200
     assert "secret startup traceback" not in resp.get_data(as_text=True).lower()
 
@@ -322,6 +463,404 @@ def test_sage_route_payloads_hide_exception_derived_details(monkeypatch):
         )
     assert resp.status_code == 400
     assert "secret persist traceback" not in resp.get_data(as_text=True).lower()
+
+
+def test_full_node_status_hides_watcher_exception_details(monkeypatch):
+    class BrokenWatcher:
+        @property
+        def _full_node_active(self):
+            raise RuntimeError("secret watcher traceback at C:\\private\\wallet.key")
+
+    client, loopback = _api_client()
+    monkeypatch.setattr("mempool_watcher._watcher_instance", BrokenWatcher())
+
+    resp = client.get(
+        "/api/full-node/status",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base=loopback,
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["success"] is True
+    assert body["watcher_error"] == "Watcher status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_provider_stats_hide_exception_details():
+    client, loopback = _api_client()
+
+    with patch(
+        "spacescan.get_api_stats",
+        side_effect=RuntimeError("secret Spacescan traceback at C:\\private"),
+    ):
+        resp = client.get(
+            "/api/diagnostics/api-stats",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base=loopback,
+        )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["spacescan"]["available"] is False
+    assert body["spacescan"]["error"] == "Spacescan status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_coin_prep_status_hides_drift_exception_details():
+    client, loopback = _api_client()
+
+    with (
+        patch.dict(api_server._coin_prep_state, {"running": False}),
+        patch(
+            "blueprints.coin_prep._tier_size_drift_findings",
+            side_effect=RuntimeError("secret tier traceback at C:\\private"),
+        ),
+    ):
+        resp = client.get(
+            "/api/coin-prep/status",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["tier_size_drift_error"] == "Tier status unavailable"
+    assert "private" not in resp.get_data(as_text=True).lower()
+
+
+def test_coin_prep_status_requires_local_api_credential():
+    client, loopback = _api_client()
+
+    unauthorized = client.get("/api/coin-prep/status", environ_base=loopback)
+    assert unauthorized.status_code == 401
+    assert unauthorized.get_json() == {"error": "unauthorized"}
+
+    authorized = client.get(
+        "/api/coin-prep/status",
+        environ_base=loopback,
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+    )
+    assert authorized.status_code == 200
+    assert authorized.get_json()["success"] is True
+
+
+def test_bootstrap_status_requires_local_api_credential():
+    client, loopback = _api_client()
+
+    unauthorized = client.get("/api/bootstrap/status", environ_base=loopback)
+    assert unauthorized.status_code == 401
+    assert unauthorized.get_json() == {"error": "unauthorized"}
+
+    authorized = client.get(
+        "/api/bootstrap/status",
+        environ_base=loopback,
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+    )
+    assert authorized.status_code == 200
+
+
+def test_private_wallet_diagnostic_reads_require_local_api_credential():
+    client, loopback = _api_client()
+    for path in (
+        "/api/health/runtime",
+        "/api/sage/fingerprints",
+        "/api/sage/cert-candidates",
+        "/api/offers/diagnostic",
+        "/api/reservations",
+    ):
+        response = client.get(path, environ_base=loopback)
+        assert response.status_code == 401, path
+        assert response.get_json() == {"error": "unauthorized"}, path
+        assert client.head(path, environ_base=loopback).status_code == 401, path
+
+
+def test_coin_inventory_get_requires_local_credential_before_worker_status_checks():
+    client, loopback = _api_client()
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    bot.coin_manager.get_status.return_value = {"success": True, "coins": []}
+    with patch.object(api_server, "bot", bot):
+        unauthorized = client.get("/api/coins", environ_base=loopback)
+        assert unauthorized.status_code == 401
+        assert unauthorized.get_json() == {"error": "unauthorized"}
+        bot.coin_manager.check_coin_prep_status.assert_not_called()
+        bot.coin_manager.update_coin_counts.assert_not_called()
+
+        unauthorized_head = client.head("/api/coins", environ_base=loopback)
+        assert unauthorized_head.status_code == 401
+        bot.coin_manager.check_coin_prep_status.assert_not_called()
+        bot.coin_manager.update_coin_counts.assert_not_called()
+
+        authorized = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert authorized.status_code == 200
+        bot.coin_manager.check_coin_prep_status.assert_called_once()
+
+        authorized_head = client.head(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert authorized_head.status_code == 405
+        bot.coin_manager.check_coin_prep_status.assert_called_once()
+
+        client.set_cookie(
+            api_server._LOCAL_API_COOKIE, api_server._LOCAL_API_COOKIE_VALUE
+        )
+        cross_site = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        assert cross_site.status_code == 403
+        bot.coin_manager.check_coin_prep_status.assert_called_once()
+
+        missing_provenance = client.get("/api/coins", environ_base=loopback)
+        assert missing_provenance.status_code == 403
+        bot.coin_manager.check_coin_prep_status.assert_called_once()
+
+        same_origin = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert same_origin.status_code == 200
+
+        same_origin_referer = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Referer": "http://localhost/console"},
+        )
+        assert same_origin_referer.status_code == 200
+
+        foreign_referer = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"Referer": "https://example.invalid/"},
+        )
+        assert foreign_referer.status_code == 403
+
+        header_client = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert header_client.status_code == 200
+
+        foreign_header_client = client.get(
+            "/api/coins",
+            environ_base=loopback,
+            headers={
+                "X-Bot-Local-Token": api_server._LOCAL_API_TOKEN,
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        assert foreign_header_client.status_code == 403
+
+
+def test_wallet_and_trade_read_routes_require_local_credential():
+    client, loopback = _api_client()
+    paths = (
+        "/api/fingerprint",
+        "/api/cats",
+        "/api/coin-prep/verify",
+        "/api/offers",
+        "/api/fills",
+        "/api/fills/classified",
+        "/api/fills/arb-wallets",
+        "/api/pnl",
+        "/api/pnl/reset-preview",
+        "/api/inventory",
+        "/api/stats",
+        "/api/config",
+        "/api/config/validate",
+        "/api/fees/status",
+        "/api/wallets/detect",
+        "/api/check-resume",
+        "/api/diagnostics/runtime",
+        "/api/diagnostics/api-stats",
+        "/api/doctor",
+        "/api/self-test",
+        "/api/alerts",
+        "/api/token_overview",
+        "/api/risk/spreads",
+        "/api/settings/defaults",
+        "/api/smart-defaults",
+        "/api/console/status",
+        "/api/splash/node",
+        "/api/splash/node/output",
+        "/api/splash/receive",
+        "/api/splash/setup/check",
+        "/api/splash/setup/progress",
+        "/api/splash/setup/release",
+        "/api/splash/stats",
+        "/api/watchdog/shape-fix-status",
+        "/api/update/relaunch-intent",
+        "/api/update/status",
+        "/api/offers/cancel_all/status",
+        "/api/offers/open_count",
+        "/api/market/fill-intel",
+        "/api/market/intel",
+        "/api/market/confidence",
+        "/api/market/dbx",
+        "/api/dbx/pending",
+        "/api/boost/state",
+        "/api/splash/incoming/list",
+        "/api/bootstrap/walletconnect/config",
+        "/api/bootstrap/partial-capability",
+        "/api/bootstrap/capabilities/partial-offers",
+        "/api/bot/state",
+        "/api/bot/price",
+        "/api/dbx/info",
+        "/api/full-node/status",
+        "/api/sage/startup-status",
+        "/api/wallet/sage-running",
+    )
+    for path in paths:
+        route = next(
+            rule
+            for rule in api_server.app.url_map.iter_rules()
+            if rule.rule == path and "GET" in rule.methods
+        )
+        handler = MagicMock(return_value={"probe": True})
+        with patch.dict(api_server.app.view_functions, {route.endpoint: handler}):
+            unauthorized = client.get(path, environ_base=loopback)
+            assert unauthorized.status_code == 401, path
+            assert unauthorized.get_json() == {"error": "unauthorized"}, path
+            assert client.head(path, environ_base=loopback).status_code == 401, path
+            handler.assert_not_called()
+
+            authorized = client.get(
+                path,
+                environ_base=loopback,
+                headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            )
+            assert authorized.status_code == 200, path
+            assert authorized.get_json() == {"probe": True}, path
+            authorized_head = client.head(
+                path,
+                environ_base=loopback,
+                headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            )
+            assert authorized_head.status_code == 405, path
+            handler.assert_called_once()
+
+
+def test_every_get_api_route_has_an_explicit_privacy_classification():
+    # A new GET handler must be reviewed before another local process can
+    # read it merely by connecting to the Flask port. Debug routes and SSE
+    # have their own earlier guards; quarantine has a parameterized path.
+    # The bounded, redacted safety status stays public so a failed desktop
+    # startup and external stability monitor can report a fail-closed reason.
+    public_or_separately_guarded = {
+        "/api/amm/price",
+        "/api/check-update",
+        "/api/coinset/stats",
+        "/api/debug/coinprep",
+        "/api/debug/pricing",
+        "/api/debug/tibet-test",
+        "/api/dexie/stats",
+        "/api/dexie/v3-pairs",
+        "/api/events",
+        "/api/health",
+        "/api/market/orderbook",
+        "/api/market/price-history",
+        "/api/market/slippage",
+        "/api/market/summary",
+        "/api/price",
+        "/api/price/tibet",
+        "/api/safety/quarantine/<quarantine_id>",
+        "/api/safety/status",
+        "/api/sage/latest-release",
+        "/api/spacescan/status",
+    }
+    registered = {
+        rule.rule
+        for rule in api_server.app.url_map.iter_rules()
+        if rule.rule.startswith("/api/") and "GET" in rule.methods
+    }
+    assert not (
+        registered - api_server._PRIVATE_READ_ROUTES - public_or_separately_guarded
+    )
+    assert api_server._PRIVATE_READ_ROUTES.isdisjoint(public_or_separately_guarded)
+
+
+def test_parameterized_safety_record_requires_local_credential():
+    client, loopback = _api_client()
+    rule = next(
+        rule
+        for rule in api_server.app.url_map.iter_rules()
+        if rule.rule == "/api/safety/quarantine/<quarantine_id>"
+    )
+    handler = MagicMock(return_value={"probe": True})
+    path = "/api/safety/quarantine/probe-id"
+    with patch.dict(api_server.app.view_functions, {rule.endpoint: handler}):
+        assert client.get(path, environ_base=loopback).status_code == 401
+        assert client.head(path, environ_base=loopback).status_code == 401
+        handler.assert_not_called()
+        allowed = client.get(
+            path,
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert allowed.status_code == 200
+        handler.assert_called_once()
+
+
+def test_runtime_health_get_cannot_trigger_auto_repair():
+    client, loopback = _api_client()
+    auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
+    with patch("bot_health.run_runtime_checks") as checks:
+        response = client.get(
+            "/api/health/runtime?repair=true&force=true",
+            headers=auth,
+            environ_base=loopback,
+        )
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "repair_requires_internal_cycle"}
+    checks.assert_not_called()
+
+    with patch(
+        "bot_health.run_runtime_checks",
+        return_value=SimpleNamespace(to_dict=lambda: {"healthy": True}),
+    ) as checks:
+        response = client.get(
+            "/api/health/runtime?repair=false&force=true",
+            headers=auth,
+            environ_base=loopback,
+        )
+    assert response.status_code == 200
+    checks.assert_called_once_with(auto_repair=False, force=True)
+
+
+def test_disabled_debug_handlers_fail_closed_without_request_guard():
+    handlers = (
+        ("/api/debug/coinprep", market_routes.api_debug_coinprep, "GET"),
+        ("/api/debug/pricing", market_routes.api_debug_pricing, "GET"),
+        (
+            "/api/debug/sage-single-offer-test",
+            market_routes.api_debug_sage_single_offer_test,
+            "POST",
+        ),
+    )
+    with (
+        patch.object(api_server, "bot", None),
+        patch("requests.get", side_effect=RuntimeError("unexpected network access")),
+        patch(
+            "wallet.get_wallet_type",
+            side_effect=AssertionError("debug handler touched wallet"),
+        ),
+    ):
+        for path, handler, method in handlers:
+            with api_server.app.test_request_context(path, method=method):
+                result = handler()
+            response, status = result if isinstance(result, tuple) else (result, 200)
+            assert status == 404, path
+            assert response.get_json()["error"] == "debug_routes_disabled"
 
 
 def test_config_change_address_result_hides_wallet_exception_details(monkeypatch):
@@ -384,7 +923,8 @@ def test_splash_receive_node_action_hides_exception_details(monkeypatch):
             environ_base=loopback,
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert resp.get_json()["success"] is False
     assert "secret splash traceback" not in resp.get_data(as_text=True).lower()
 
 
@@ -432,7 +972,11 @@ def test_status_prebot_response_hides_traceback_shaped_cached_values(monkeypatch
         patch("wallet.get_spendable_coin_count", return_value=0),
         patch("chia_node.is_startup_authorised", return_value=False),
     ):
-        resp = client.get("/api/status", environ_base=loopback)
+        resp = client.get(
+            "/api/status",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base=loopback,
+        )
 
     body = resp.get_data(as_text=True).lower()
     assert resp.status_code == 200
@@ -463,6 +1007,7 @@ def test_coin_prep_verify_response_hides_traceback_shaped_drift_details(monkeypa
     ):
         resp = client.get(
             "/api/coin-prep/verify",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
             query_string={
                 "tier_enabled": "true",
                 "inner_xch": "1",
@@ -509,6 +1054,7 @@ def test_coin_prep_flat_verify_response_hides_traceback_shaped_values(monkeypatc
     ):
         resp = client.get(
             "/api/coin-prep/verify",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
             query_string={
                 "tier_enabled": "false",
                 "liquidity_mode": (

@@ -2,8 +2,8 @@
 
 The bot's single logging facade. INFO and above are written to the active
 log file; TRACE and DEBUG stay in an in-memory ring buffer and only get
-flushed to disk when an ERROR fires, so crashes arrive with full context
-while normal runs stay quiet. `slog(category, message, data=None,
+flushed to disk when an ERROR or CRITICAL event fires, so crashes arrive with
+full context while normal runs stay quiet. `slog(category, message, data=None,
 level="info")` is the one entry point every other module should use — never
 `print()` and never stdlib `logging`.
 
@@ -14,7 +14,8 @@ Key responsibilities:
     - Manage thread lifecycle markers, log rotation, and archive digesting
 
 The file singleton is created on the first `init_super_log(log_dir, ...)`
-call; later imports reuse it. Levels map: trace < debug < info < warn < error.
+call; later imports reuse it. Levels map: trace < debug < info < warn < error
+< critical.
 """
 
 import os
@@ -30,13 +31,14 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 # Log levels (lower number = more verbose)
 # ---------------------------------------------------------------------------
-LEVELS = {"trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4}
+LEVELS = {"trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4, "critical": 5}
 LEVEL_TAGS = {
     "trace": "TRACE",
     "debug": "DEBUG",
     "INFO": "INFO",
     "warn": " WARN",
     "error": "ERROR",
+    "critical": "CRITI",
 }
 
 # ---------------------------------------------------------------------------
@@ -103,7 +105,8 @@ def init_super_log(
 
     Args:
         log_dir: Directory for log files (default: script directory)
-        file_level: Minimum level written to file ("trace"/"debug"/"info"/"warn"/"error")
+        file_level: Minimum level written to file
+            ("trace"/"debug"/"info"/"warn"/"error"/"critical")
         terminal_level: Minimum level printed to terminal
     """
     global _log_file, _log_path, _log_dir, _initialized, _start_time
@@ -497,7 +500,7 @@ def slog(category: str, message: str, data: dict = None, level: str = "info"):
         category: Short tag like "DB", "LOOP", "STARTUP", "DEXIE"
         message: Human-readable description
         data: Optional dict with structured data
-        level: "trace", "debug", "info", "warn", "error"
+        level: "trace", "debug", "info", "warn", "error", "critical"
     """
     global _error_dump_count, _bytes_written
 

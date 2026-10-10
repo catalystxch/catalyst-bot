@@ -288,8 +288,8 @@ def api_full_node_status():
             status["pending_fill_warns"] = len(
                 getattr(w, "_fill_warned_coin_ids", {}) or {}
             )
-    except Exception as _err:
-        status["watcher_error"] = str(_err)
+    except Exception:
+        status["watcher_error"] = "Watcher status unavailable"
     return jsonify(status)
 
 
@@ -640,7 +640,23 @@ def api_sage_cert_candidates():
         import sage_node
 
         data_dir = str(request.args.get("data_dir", "") or "").strip()
-        extra_dirs = [data_dir] if data_dir else None
+        matched_root = None
+        if data_dir:
+            selected = os.path.normcase(os.path.normpath(data_dir))
+            if not data_dir.startswith(("\\\\", "//")):
+                matched_root = next(
+                    (
+                        root
+                        for root in sage_node._candidate_sage_data_dirs()
+                        if os.path.normcase(os.path.normpath(root)) == selected
+                    ),
+                    None,
+                )
+            if matched_root is None:
+                return jsonify(
+                    {"success": False, "error": "Unconfigured Sage data folder"}
+                ), 400
+        extra_dirs = [matched_root] if matched_root else None
         candidates = sage_node.get_sage_cert_candidates(extra_dirs)
         detected = sage_node.detect_sage_cert_path(extra_dirs)
         suggested = detected or (candidates[0] if candidates else "")

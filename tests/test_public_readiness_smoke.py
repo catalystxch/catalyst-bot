@@ -100,7 +100,9 @@ class PublicReadinessSmokeTests(unittest.TestCase):
             side_effect=RuntimeError("secret wallet rpc traceback"),
         ):
             resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+                "/api/sage/fingerprints",
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
             )
 
         self.assertEqual(resp.status_code, 500)
@@ -122,16 +124,23 @@ class PublicReadinessSmokeTests(unittest.TestCase):
         self.assertIn("Key stored locally by CATalyst", html)
         self.assertNotIn("Key stored locally in <code", html)
 
-    def test_splash_setup_check_handles_unavailable_binary_without_token(self):
+    def test_splash_setup_check_requires_token_and_handles_unavailable_binary(self):
         unavailable = {
             "installed": False,
             "version": None,
             "path": "",
             "platform": {"supported": True},
         }
-        with patch("splash_setup.check_installed", return_value=unavailable):
-            resp = self.client.get(
+        with patch("splash_setup.check_installed", return_value=unavailable) as check:
+            unauthorized = self.client.get(
                 "/api/splash/setup/check", environ_base=self._LOOPBACK
+            )
+            self.assertEqual(unauthorized.status_code, 401)
+            check.assert_not_called()
+            resp = self.client.get(
+                "/api/splash/setup/check",
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
             )
 
         self.assertEqual(resp.status_code, 200)

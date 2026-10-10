@@ -284,8 +284,18 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     api_server._rate_limit_log.clear()
 
     fake_bot = MagicMock()
+    fake_bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+    fake_bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+    }
+    fake_bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        fake_bot.offer_manager.sync_from_wallet(),
+        fake_bot.offer_manager.get_wallet_sync_meta(),
+    )
     fake_bot.is_running.return_value = False
     fake_bot.start.return_value = True
+    fake_bot.coin_manager.is_busy.return_value = False
 
     fake_cfg = types.SimpleNamespace(
         reload=MagicMock(),
@@ -332,6 +342,76 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
     assert resp.status_code == 200
     assert resp.get_json()["status"] == "started"
     fake_cfg.reload.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_point", ["pending_check", "reload"])
+def test_bot_start_blocks_when_pending_setup_config_cannot_be_loaded(failure_point):
+    """A failed Setup reload must never start trading with previous limits."""
+    sys.path.insert(0, str(ROOT))
+    api_server = pytest.importorskip("api_server")
+
+    api_server.app.testing = True
+    client = api_server.app.test_client()
+    api_server._rate_limit_log.clear()
+
+    fake_bot = MagicMock()
+    fake_bot.is_running.return_value = False
+    fake_bot.start.return_value = True
+    fake_cfg = types.SimpleNamespace(
+        reload=MagicMock(),
+        has_pending_restart_changes=MagicMock(return_value=True),
+        CAT_ASSET_ID="abc123",
+        SPREAD_BPS=Decimal("200"),
+        HARD_MIN_PRICE_XCH=Decimal("0.00001"),
+        HARD_MAX_PRICE_XCH=Decimal("1"),
+        DYNAMIC_LIMIT_PCT=Decimal("0"),
+        ENABLE_COIN_PREP=False,
+        MAX_ACTIVE_BUY_OFFERS=1,
+        MAX_ACTIVE_SELL_OFFERS=1,
+    )
+    sensitive_error = RuntimeError("private-token-not-for-logs")
+    if failure_point == "pending_check":
+        fake_cfg.has_pending_restart_changes.side_effect = sensitive_error
+    else:
+        fake_cfg.reload.side_effect = sensitive_error
+
+    with (
+        api_mutations_permitted(api_server),
+        patch.object(api_server, "bot", fake_bot),
+        patch.object(api_server, "cfg", fake_cfg),
+        patch("blueprints.bot.log_event") as emitted,
+        patch(
+            "blueprints.bot._enforce_post_tibet_start_migration",
+            return_value={
+                "can_start": True,
+                "reason_code": "POST_TIBET_MIGRATION_READY",
+            },
+        ),
+        patch.object(api_server, "_get_sage_signing_block_reason", return_value=None),
+        patch(
+            "wallet.get_wallet_sync_status",
+            return_value={"reachable": True, "sync_state": "synced"},
+        ),
+        patch(
+            "wallet.preflight_wallet_identity",
+            return_value={"success": True, "reason": "identity_verified"},
+        ),
+        patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
+    ):
+        resp = client.post(
+            "/api/bot/start",
+            json={},
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert body["success"] is False
+    assert body["reason"] == "CONFIG_RELOAD_FAILED"
+    assert "private-token-not-for-logs" not in str(body)
+    assert "private-token-not-for-logs" not in str(emitted.call_args_list)
+    fake_bot.start.assert_not_called()
 
 
 def test_sniper_live_toggle_uses_live_config_endpoint():

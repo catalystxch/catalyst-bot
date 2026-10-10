@@ -983,6 +983,10 @@ def test_bot_cycle_resumes_refresh_lineages_before_fill_detection():
 
     source = inspect.getsource(BotLoop._run_one_cycle)
     assert source.index("resume_pending_refresh_lineages(") < source.index(
+        "self._detect_fills_for_wallet_cycle("
+    )
+    fill_source = inspect.getsource(BotLoop._detect_fills_for_wallet_cycle)
+    assert fill_source.index("if self._wallet_sync_stale_cycle:") < fill_source.index(
         "self.fill_tracker.detect_fills("
     )
 

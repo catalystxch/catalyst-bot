@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -146,6 +147,150 @@ class WalletSyncFailClosedTests(unittest.TestCase):
         self.assertEqual(meta["consecutive_failures"], 1)
         self.assertIn("timed out", meta["last_error"])
         self.assertTrue(any(evt == "wallet_sync_cache" for _, evt, _, _ in self.logged))
+
+    def test_wallet_sync_result_carries_its_own_freshness(self):
+        manager = self.offer_manager.OfferManager()
+        responses = [None, [{"trade_id": "fresh"}]]
+
+        with (
+            patch.object(
+                self.offer_manager,
+                "get_all_offers",
+                side_effect=lambda **kwargs: responses.pop(0),
+            ),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                return_value=([{"trade_id": "fresh"}], [], []),
+            ),
+        ):
+            failed_offers, failed_meta = manager.sync_from_wallet_with_meta()
+            fresh_offers, fresh_meta = manager.sync_from_wallet_with_meta()
+
+        self.assertEqual(failed_offers, ([], [], []))
+        self.assertIs(failed_meta["fresh"], False)
+        self.assertEqual(fresh_offers[0][0]["trade_id"], "fresh")
+        self.assertIs(fresh_meta["fresh"], True)
+        self.assertIs(failed_meta["fresh"], False)
+
+    def test_unclassifiable_offer_book_marks_wallet_sync_stale(self):
+        manager = self.offer_manager.OfferManager()
+        with (
+            patch.object(
+                self.offer_manager,
+                "get_all_offers",
+                return_value=[{"trade_id": "unknown-status"}],
+            ),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                side_effect=ValueError("unknown offer status"),
+            ),
+        ):
+            offers, meta = manager.sync_from_wallet_with_meta()
+
+        self.assertEqual(offers, ([], [], []))
+        self.assertIs(meta["fresh"], False)
+        self.assertIs(meta["using_cache"], False)
+        self.assertIn("unknown offer status", meta["last_error"])
+
+    def test_malformed_sage_offer_response_marks_wallet_sync_stale(self):
+        manager = self.offer_manager.OfferManager()
+        with patch.object(
+            self.offer_manager,
+            "get_all_offers",
+            side_effect=ValueError("malformed Sage summary"),
+        ):
+            offers, meta = manager.sync_from_wallet_with_meta()
+
+        self.assertEqual(offers, ([], [], []))
+        self.assertIs(meta["fresh"], False)
+        self.assertIs(meta["using_cache"], False)
+        self.assertIn("wallet offer read failed", meta["last_error"])
+
+    def test_concurrent_wallet_syncs_do_not_mix_offer_results_and_freshness(self):
+        manager = self.offer_manager.OfferManager()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        calls = 0
+        results = []
+
+        def fake_get_all_offers(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                release_first.wait(timeout=2)
+                return None
+            return [{"trade_id": "fresh"}]
+
+        def read():
+            results.append(manager.sync_from_wallet_with_meta())
+
+        with (
+            patch.object(self.offer_manager, "get_all_offers", new=fake_get_all_offers),
+            patch.object(
+                self.offer_manager,
+                "classify_offers_from_list",
+                return_value=([{"trade_id": "fresh"}], [], []),
+            ),
+        ):
+            first = threading.Thread(target=read)
+            second = threading.Thread(target=read)
+            first.start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            second.start()
+            self.assertEqual(calls, 1)
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0][0], ([], [], []))
+        self.assertIs(results[0][1]["fresh"], False)
+        self.assertEqual(results[1][0][0][0]["trade_id"], "fresh")
+        self.assertIs(results[1][1]["fresh"], True)
+
+    def test_stopped_dashboard_snapshot_never_exposes_partial_wallet_sync(self):
+        manager = self.offer_manager.OfferManager()
+        manager._wallet_sync_cache = {
+            "buy": [{"trade_id": "old-buy"}],
+            "sell": [{"trade_id": "old-sell"}],
+            "closed": [],
+        }
+        manager._wallet_sync_meta.update({"fresh": True, "last_success_at": 1})
+        reader_entered = threading.Event()
+        reader_done = threading.Event()
+        snapshots = []
+
+        def read_snapshot():
+            reader_entered.set()
+            snapshots.append(manager.get_wallet_sync_snapshot())
+            reader_done.set()
+
+        with manager._wallet_sync_lock:
+            # Model the writer's real buy/sell/meta updates while its sync lock
+            # protects a partially replaced offer book.
+            manager._wallet_sync_cache["buy"] = [{"trade_id": "new-buy"}]
+            reader = threading.Thread(target=read_snapshot)
+            reader.start()
+            self.assertTrue(reader_entered.wait(timeout=2))
+            self.assertFalse(reader_done.wait(timeout=0.25))
+            manager._wallet_sync_cache["sell"] = [{"trade_id": "new-sell"}]
+            manager._wallet_sync_meta["last_success_at"] = 2
+
+        reader.join(timeout=2)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(
+            [offer["trade_id"] for offer in snapshots[0]["buy"]], ["new-buy"]
+        )
+        self.assertEqual(
+            [offer["trade_id"] for offer in snapshots[0]["sell"]], ["new-sell"]
+        )
+        self.assertEqual(snapshots[0]["meta"]["last_success_at"], 2)
 
     def test_expected_empty_wallet_book_after_cancel_all_bypasses_cache(self):
         manager = self.offer_manager.OfferManager()

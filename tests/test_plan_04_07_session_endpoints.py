@@ -41,6 +41,10 @@ _FAKE_SESSION_SUMMARY = {
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -163,7 +167,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_can_resume_key(self):
@@ -173,7 +177,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         self.assertIn("can_resume", resp.get_json())
 
     def test_bot_running_returns_cannot_resume(self):
@@ -181,7 +185,7 @@ class TestCheckResume(_FlaskBase):
         bot._loop_count = 5
         bot.is_running.return_value = True
         with patch.object(api_server, "bot", bot):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
         self.assertEqual(body.get("reason"), "bot_already_running")
@@ -196,10 +200,18 @@ class TestCheckResume(_FlaskBase):
         }
         offer_manager = MagicMock()
         offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
         bot = MagicMock()
         bot._loop_count = 46
         bot.is_running.return_value = False
         bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
 
         with (
             patch("chia_node.is_startup_authorised", return_value=True),
@@ -209,7 +221,7 @@ class TestCheckResume(_FlaskBase):
             patch("database.get_connection", return_value=MagicMock()),
             patch("database.get_open_offers", return_value=[]),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertTrue(body["can_resume"])
@@ -217,12 +229,44 @@ class TestCheckResume(_FlaskBase):
         self.assertEqual(body["sell_count"], 1)
         offer_manager.sync_from_wallet.assert_called_once_with()
 
+    def test_cached_wallet_offers_do_not_authorize_resume_prompt(self):
+        """A failed Sage read must not present cached offers as live."""
+        offer_manager = MagicMock()
+        offer_manager.sync_from_wallet.return_value = (
+            [{"trade_id": "cached-buy", "status": "active", "side": "buy"}],
+            [],
+            [],
+        )
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": False,
+            "using_cache": True,
+            "last_error": "Sage get_offers unavailable",
+        }
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
+        with (
+            patch("chia_node.is_startup_authorised", return_value=True),
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "_fresh_start_is_set", return_value=False),
+        ):
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
+
+        body = resp.get_json()
+        self.assertFalse(body["can_resume"])
+        self.assertEqual(body["buy_count"], 0)
+        self.assertEqual(body["reason"], "wallet_offer_query_not_fresh")
+
     def test_fresh_start_set_returns_cannot_resume(self):
         with (
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=True),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
         self.assertEqual(body.get("reason"), "fresh_start_chosen")
@@ -234,7 +278,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["can_resume"])
 
@@ -252,7 +296,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", None),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["can_resume"])
         self.assertIn("buy_count", body)
@@ -268,10 +312,18 @@ class TestCheckResume(_FlaskBase):
         }
         offer_manager = MagicMock()
         offer_manager.sync_from_wallet.return_value = ([fake_buy], [fake_sell], [])
+        offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
         bot = MagicMock()
         bot._loop_count = 0
         bot.is_running.return_value = False
         bot.offer_manager = offer_manager
+        offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            offer_manager.sync_from_wallet(),
+            offer_manager.get_wallet_sync_meta(),
+        )
 
         with (
             patch("chia_node.is_startup_authorised", return_value=True),
@@ -282,7 +334,7 @@ class TestCheckResume(_FlaskBase):
             patch.object(api_server, "bot", bot),
             patch.object(api_server, "_fresh_start_is_set", return_value=False),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -298,7 +350,7 @@ class TestCheckResume(_FlaskBase):
             patch("chia_node.is_startup_authorised", return_value=False),
             patch("wallet.get_all_offers") as get_all_offers,
         ):
-            resp = self.client.get("/api/check-resume", environ_base=self._LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertFalse(body["can_resume"])

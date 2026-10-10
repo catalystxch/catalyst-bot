@@ -39,6 +39,10 @@ _VALID_BODY = {
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -72,7 +76,7 @@ class TestCatsGet(_FlaskBase):
             patch("wallet.get_wallets", return_value={"success": True, "wallets": []}),
             patch("wallet.get_wallet_type", return_value="sage"),
         ):
-            resp = self.client.get("/api/cats", environ_base=self._LOOPBACK)
+            resp = self._get("/api/cats", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_cats_list(self):
@@ -80,7 +84,7 @@ class TestCatsGet(_FlaskBase):
             patch("wallet.get_wallets", return_value={"success": True, "wallets": []}),
             patch("wallet.get_wallet_type", return_value="sage"),
         ):
-            resp = self.client.get("/api/cats", environ_base=self._LOOPBACK)
+            resp = self._get("/api/cats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("cats", body)
         self.assertIsInstance(body["cats"], list)
@@ -92,7 +96,7 @@ class TestCatsGet(_FlaskBase):
             patch("wallet.get_wallets", return_value={"success": True, "wallets": []}),
             patch("wallet.get_wallet_type", return_value="sage"),
         ):
-            resp = self.client.get("/api/cats", environ_base=self._LOOPBACK)
+            resp = self._get("/api/cats", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json()["cats"], list)
 
 
@@ -338,8 +342,10 @@ class TestBalanceRefresh(_FlaskBase):
                 patch("wallet.notify_cat_asset_id_changed"),
             ):
                 refresh_resp = self._post("/api/balances/refresh")
-                status_resp = self.client.get(
-                    "/api/status", environ_base=self._LOOPBACK
+                status_resp = self._get(
+                    "/api/status",
+                    headers=self.auth,
+                    environ_base=self._LOOPBACK,
                 )
 
             self.assertEqual(refresh_resp.status_code, 200)

@@ -203,7 +203,7 @@ def test_sage_initialize_rechecks_identity_immediately_before_initialize(monkeyp
     monkeypatch.setattr(
         wallet_sage,
         "rpc",
-        lambda endpoint, payload, timeout=10: (
+        lambda endpoint, payload, timeout=10, _identity_recheck=None: (
             events.append(f"effect:{endpoint}") or {"success": True}
         ),
     )
@@ -232,7 +232,7 @@ def test_sage_login_forwards_recheck_through_nested_initialize(monkeypatch):
         lambda: events.append("readiness") or True,
     )
 
-    def rpc(endpoint, payload, timeout=10):
+    def rpc(endpoint, payload, timeout=10, _identity_recheck=None):
         events.append(f"effect:{endpoint}")
         if endpoint == "get_version":
             return {"success": True, "version": "1.2.3"}

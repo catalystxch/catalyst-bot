@@ -299,16 +299,11 @@ class AppBridge:
     @_safe
     def stop_bot(self, _body=None):
         """Stop the bot loop. Maps to POST /api/bot/stop."""
-        api = self.api
-        bot = api.bot
-        if bot is None:
-            return {"success": False, "error": "Bot not initialized"}
-        bot.stop(wait=False)
-        try:
-            api.events.emit("bot_control", {"action": "stopped"})
-        except Exception:
-            pass
-        return {"status": "stopped"}
+        import api_server
+
+        with api_server.app.test_request_context("/api/bot/stop", method="POST"):
+            resp = api_server.api_bot_stop()
+        return _unwrap_flask_response(resp)
 
     @_safe
     def get_bot_state(self):
@@ -675,7 +670,7 @@ class AppBridge:
 
     @_safe
     @_mutation_guard("app_bridge:cancel_all_offers")
-    def cancel_all_offers(self, _body=None):
+    def cancel_all_offers(self, body=None):
         """Cancel all offers. Maps to POST /api/offers/cancel_all."""
         import api_server
 
@@ -683,7 +678,7 @@ class AppBridge:
             "/api/offers/cancel_all",
             method="POST",
             content_type="application/json",
-            data="{}",
+            data=json.dumps(body or {}),
         ):
             resp = api_server.api_cancel_all()
         return _unwrap_flask_response(resp)
@@ -918,6 +913,36 @@ class AppBridge:
 
         with api_server.app.test_request_context("/api/coin-prep/status"):
             resp = api_server.api_coin_prep_status()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:preview_coin_prep_fees")
+    def preview_coin_prep_fees(self, body=None):
+        """Read-only staged estimate via the same guarded HTTP handler."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/coin-prep/fee-preview",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_coin_prep_fee_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:approve_coin_prep_fees")
+    def approve_coin_prep_fees(self, body=None):
+        """Record consent through the shared HTTP handler, without prep launch."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/coin-prep/fee-approval",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_coin_prep_fee_approval()
         return _unwrap_flask_response(resp)
 
     @_safe
@@ -1749,6 +1774,16 @@ class AppBridge:
 
             import desktop_app as _da
 
+            readiness = _da._cleanup()
+            if type(readiness) is not dict or readiness.get("released") is not True:
+                return {
+                    "success": False,
+                    "error": "Native shutdown is waiting for wallet mutation proof.",
+                    "reason": readiness.get("reason", "native_close_unproven")
+                    if type(readiness) is dict
+                    else "native_close_unproven",
+                }
+
             if hasattr(_da, "_state"):
                 _da._state["confirmed_close"] = True
                 # Persist window geometry now — destroy() may bypass the
@@ -1851,6 +1886,18 @@ class AppBridge:
     def close_window(self):
         """Close the window."""
         try:
+            import desktop_app as _da
+
+            readiness = _da._cleanup()
+            if type(readiness) is not dict or readiness.get("released") is not True:
+                return {
+                    "success": False,
+                    "error": "Native shutdown is waiting for wallet mutation proof.",
+                    "reason": readiness.get("reason", "native_close_unproven")
+                    if type(readiness) is dict
+                    else "native_close_unproven",
+                }
+
             import webview
 
             if webview.windows:
@@ -1883,6 +1930,7 @@ _APP_BRIDGE_API_PROPERTY = vars(AppBridge)["api"]
 _APP_BRIDGE_API_SLOT = vars(AppBridge)["_api"]
 _APP_BRIDGE_MUTATION_METHODS = {
     "activate_boost",
+    "approve_coin_prep_fees",
     "apply_config",
     "begin_startup",
     "cancel_all_offers",
@@ -1894,6 +1942,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "download_splash_setup",
     "fresh_start",
     "live_config",
+    "preview_coin_prep_fees",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

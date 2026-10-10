@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,6 +34,10 @@ except (ModuleNotFoundError, ImportError) as exc:
 
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
+
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        return self.client.get(path, **kwargs)
 
     def setUp(self):
         api_server.app.testing = True
@@ -71,10 +75,20 @@ class _FlaskBase(unittest.TestCase):
 
     def _post(self, path, body=None, auth=True):
         headers = dict(self.auth) if auth else {}
+        if path == "/api/coin-prep/trigger":
+            body = dict(body or {})
+            body.setdefault("fee_approval_id", "a" * 64)
         return self.client.post(
             path,
             json=body or {},
             headers=headers,
+            environ_base=self._LOOPBACK,
+        )
+
+    def _get_status(self):
+        return self._get(
+            "/api/coin-prep/status",
+            headers=self.auth,
             environ_base=self._LOOPBACK,
         )
 
@@ -99,17 +113,17 @@ class TestCoinPrepStatus(_FlaskBase):
 
     def test_returns_200(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         self.assertEqual(resp.status_code, 200)
 
     def test_success_key_true(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         self.assertTrue(resp.get_json().get("success"))
 
     def test_response_has_running_complete_keys(self):
         with patch("database.get_coin_summary", return_value={}):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         body = resp.get_json()
         self.assertIn("running", body)
         self.assertIn("complete", body)
@@ -119,9 +133,7 @@ class TestCoinPrepStatus(_FlaskBase):
         api_server._coin_prep_state["running"] = False
         try:
             with patch("database.get_coin_summary", return_value={}):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
             self.assertFalse(resp.get_json()["running"])
         finally:
             api_server._coin_prep_state["running"] = orig
@@ -137,7 +149,7 @@ class TestCoinPrepStatus(_FlaskBase):
             patch("database.get_coin_summary", return_value=summary),
             patch.object(api_server, "bot", None),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
         body = resp.get_json()
         self.assertEqual(body.get("xch_free_coins"), 5)
         self.assertEqual(body.get("cat_free_coins"), 10)
@@ -186,9 +198,7 @@ class TestCoinPrepStatus(_FlaskBase):
                 ),
                 patch("database.get_coin_summary", return_value={}),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         for key in (
@@ -203,6 +213,295 @@ class TestCoinPrepStatus(_FlaskBase):
             "compatibility_reason",
         ):
             self.assertEqual(body.get(key), worker_status[key], key)
+
+    def test_restarted_status_restores_lossless_durable_fee_accounting(self):
+        approval_id = "b" * 64
+        worker_status = {
+            "phase": "splitting",
+            "progress": 0.5,
+            "message": "Waiting for confirmation",
+            "xch_coins_current": 2,
+            "xch_coins_target": 4,
+            "cat_coins_current": 1,
+            "cat_coins_target": 4,
+            "run_id": "fee-recovery-run",
+            "fee_approval_id": approval_id,
+        }
+        durable = {
+            "approval_id": approval_id,
+            "state": "submitted_awaiting_confirmation",
+            "held_fee_mojos": 9007199254740993,
+            "spent_fee_mojos": 7,
+            "remaining_fee_mojos": 9007199254741999,
+            "remaining_preparation_fee_mojos": 9007199254740999,
+            "cancellation_reserve_mojos": 1000,
+            "unresolved_operation_count": 1,
+            "dispatch_authorized": False,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            api_server._coin_prep_state.update(
+                {
+                    "running": False,
+                    "complete": False,
+                    "error": None,
+                    "run_id": None,
+                }
+            )
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=durable,
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertEqual(body["fee_approval_id"], approval_id)
+        self.assertEqual(
+            body["fee_approval"]["state"], "submitted_awaiting_confirmation"
+        )
+        self.assertEqual(body["fee_approval"]["held_fee_mojos"], "9007199254740993")
+        self.assertEqual(body["fee_approval"]["spent_fee_mojos"], "7")
+        self.assertFalse(body["fee_approval"]["dispatch_authorized"])
+        self.assertTrue(body["overlapping_coin_prep_blocked"])
+        self.assertTrue(body["fee_resume_required"])
+        self.assertFalse(body["running"])
+        read_status.assert_called_once_with(approval_id)
+
+    def test_bootstrap_status_uses_newer_campaign_fee_renewal(self):
+        """Cancellation-only renewal must replace the stale worker approval view."""
+
+        worker_approval_id = "b" * 64
+        renewed_approval_id = "c" * 64
+        campaign_id = "campaign-fee-renewal"
+        worker_status = {
+            "phase": "complete",
+            "run_id": "old-prep-run",
+            "fee_approval_id": worker_approval_id,
+        }
+        renewed = {
+            "approval_id": renewed_approval_id,
+            "state": "approved",
+            "total_fee_mojos": 1_746_988_850,
+            "spent_fee_mojos": 1_736_965_715,
+            "held_fee_mojos": 0,
+            "remaining_fee_mojos": 10_023_135,
+            "remaining_preparation_fee_mojos": 10_023_135,
+            "cancellation_reserve_mojos": 11_111_490,
+            "unresolved_operation_count": 0,
+            "dispatch_authorized": False,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": campaign_id, "revision": 1}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=renewed_approval_id,
+                ) as latest,
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=renewed,
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertEqual(body["fee_approval_id"], renewed_approval_id)
+        self.assertEqual(body["fee_approval"]["remaining_fee_mojos"], "10023135")
+        latest.assert_called_once_with(campaign_id)
+        read_status.assert_called_once_with(renewed_approval_id)
+
+    def test_active_bootstrap_status_ignores_prior_campaign_worker_approval(self):
+        """A new campaign must not inherit recovery from a completed worker."""
+
+        old_approval_id = "b" * 64
+        active_campaign_id = "active-campaign-without-fee-approval"
+        worker_status = {
+            "phase": "splitting",
+            "run_id": "prior-campaign-run",
+            "fee_approval_id": old_approval_id,
+        }
+        prior_approval = {
+            "approval_id": old_approval_id,
+            "campaign_id": "expired-prior-campaign",
+            "state": "approved",
+            "held_fee_mojos": 0,
+            "spent_fee_mojos": 62703765,
+            "unresolved_operation_count": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            api_server._coin_prep_state.update(
+                {"running": False, "complete": False, "error": None, "run_id": None}
+            )
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": active_campaign_id, "revision": 0}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=None,
+                ) as latest,
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=prior_approval,
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertEqual(body["bootstrap_campaign_id"], active_campaign_id)
+        self.assertNotIn("fee_approval_id", body)
+        self.assertNotIn("fee_approval", body)
+        self.assertFalse(body.get("overlapping_coin_prep_blocked", False))
+        self.assertFalse(body.get("fee_resume_required", False))
+        latest.assert_called_once_with(active_campaign_id)
+        read_status.assert_not_called()
+
+    def test_active_bootstrap_status_blocks_when_fee_approval_lookup_fails(self):
+        """A lookup outage must not make a stale worker approval look usable."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump({"fee_approval_id": "b" * 64}, handle)
+            api_server._coin_prep_state.update(
+                {"running": False, "complete": False, "error": None, "run_id": None}
+            )
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[{"campaign_id": "current-campaign", "revision": 0}],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    side_effect=RuntimeError("database unavailable"),
+                ),
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertNotIn("fee_approval_id", body)
+        self.assertTrue(body["overlapping_coin_prep_blocked"])
+        self.assertTrue(body["fee_approval_lookup_unavailable"])
+
+    def test_completed_bootstrap_status_keeps_latest_fee_renewal_after_campaign_closes(
+        self,
+    ):
+        """A terminal campaign must not make status fall back to the worker cap."""
+
+        worker_approval_id = "d" * 64
+        renewed_approval_id = "e" * 64
+        campaign_id = "completed-campaign-fee-renewal"
+        worker_status = {
+            "phase": "complete",
+            "run_id": "completed-prep-run",
+            "fee_approval_id": worker_approval_id,
+        }
+        old = {
+            "approval_id": worker_approval_id,
+            "campaign_id": campaign_id,
+            "state": "stale",
+            "total_fee_mojos": 19_674_859,
+            "spent_fee_mojos": 1_736_965_715,
+            "held_fee_mojos": 0,
+            "remaining_fee_mojos": -1_717_290_856,
+            "unresolved_operation_count": 0,
+            "dispatch_authorized": False,
+        }
+        renewed = {
+            "approval_id": renewed_approval_id,
+            "campaign_id": campaign_id,
+            "state": "approved",
+            "total_fee_mojos": 1_746_988_850,
+            "spent_fee_mojos": 1_736_965_715,
+            "held_fee_mojos": 0,
+            "remaining_fee_mojos": 10_023_135,
+            "unresolved_operation_count": 0,
+            "dispatch_authorized": False,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "a" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=renewed_approval_id,
+                ) as latest,
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    side_effect=[old, renewed],
+                ) as read_status,
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertEqual(body["fee_approval_id"], renewed_approval_id)
+        self.assertEqual(body["fee_approval"]["remaining_fee_mojos"], "10023135")
+        latest.assert_called_once_with(campaign_id)
+        self.assertEqual(
+            read_status.call_args_list,
+            [call(worker_approval_id), call(renewed_approval_id)],
+        )
 
     def test_tier_size_drift_marks_status_as_needing_prep(self):
         summary = {
@@ -219,7 +518,7 @@ class TestCoinPrepStatus(_FlaskBase):
             ),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
 
         body = resp.get_json()
         self.assertTrue(body.get("needs_coin_prep"))
@@ -247,7 +546,7 @@ class TestCoinPrepStatus(_FlaskBase):
             ) as legacy_drift,
             patch("database.get_coin_summary", return_value={}),
         ):
-            resp = self.client.get("/api/coin-prep/status", environ_base=self._LOOPBACK)
+            resp = self._get_status()
 
         body = resp.get_json()
         self.assertEqual(body["coin_prep_mode"], "bootstrap_exact")
@@ -327,9 +626,7 @@ class TestCoinPrepStatus(_FlaskBase):
                     return_value=[],
                 ),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertTrue(body["complete"])
@@ -339,6 +636,89 @@ class TestCoinPrepStatus(_FlaskBase):
         self.assertEqual(body["cat_target"], 1)
         self.assertEqual(body["xch_coins"], 3)
         self.assertEqual(body["cat_coins"], 1)
+
+    def test_completed_standard_prep_rehydrates_using_prepared_coin_sizes(self):
+        """Standard prep recovery must validate the larger prepared coin shape."""
+
+        approval_id = "b" * 64
+        xch_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 1_130_000_000_000}}],
+        }
+        cat_records = {
+            "success": True,
+            "records": [{"coin": {"amount": 10_000}}],
+        }
+        last_prep = {
+            "tier_enabled": True,
+            "tier_counts_xch": {"inner": 1},
+            "tier_counts_cat": {"inner": 1},
+            "tier_sizes_xch": {"inner": "1.13"},
+            "offer_tier_sizes_xch": {"inner": "1"},
+            "tier_sizes_cat": {"inner": "10"},
+        }
+        standard_approval = {
+            "approval_id": approval_id,
+            "campaign_id": None,
+            "request_options": {
+                "coin_multiplier": "1",
+                "target_seconds": 300,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            last_path = os.path.join(temp_dir, "coin_prep_last.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "phase": "complete",
+                        "run_id": "old-run",
+                        "fee_approval_id": approval_id,
+                    },
+                    handle,
+                )
+            with open(last_path, "w", encoding="utf-8") as handle:
+                json.dump(last_prep, handle)
+
+            def spendable(wallet_id):
+                return xch_records if int(wallet_id) == 1 else cat_records
+
+            with (
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_last_file",
+                    return_value=last_path,
+                ),
+                patch("wallet.get_spendable_coins_rpc", side_effect=spendable),
+                patch("wallet.WALLET_ID_XCH", 1),
+                patch.object(
+                    api_server, "_active_cat", {"wallet_id": 2, "decimals": 3}
+                ),
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=standard_approval,
+                ),
+                patch("database.get_coin_summary", return_value={}),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_tier_size_drift_findings",
+                    return_value=[],
+                ),
+            ):
+                resp = self._get_status()
+
+        body = resp.get_json()
+        self.assertTrue(body["complete"])
+        self.assertTrue(body["previously_complete"])
+        self.assertEqual(body["phase"], "complete")
+        self.assertEqual(body["xch_target"], 1)
+        self.assertEqual(body["cat_target"], 1)
 
     def test_completed_tier_prep_does_not_rehydrate_undersized_offer_coin(self):
         """A restart must not call an offer coin ready when it cannot fund the spend."""
@@ -394,9 +774,7 @@ class TestCoinPrepStatus(_FlaskBase):
                     return_value=[],
                 ),
             ):
-                resp = self.client.get(
-                    "/api/coin-prep/status", environ_base=self._LOOPBACK
-                )
+                resp = self._get_status()
 
         body = resp.get_json()
         self.assertFalse(body["complete"])
@@ -491,7 +869,7 @@ class TestCoinPrepVerify(_FlaskBase):
                 "_tier_size_drift_findings",
             ) as legacy_drift,
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4"
                 "&inner_xch=999&inner_cat=999999&inner_count=50"
@@ -552,7 +930,7 @@ class TestCoinPrepVerify(_FlaskBase):
             ),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
                 environ_base=self._LOOPBACK,
@@ -570,12 +948,33 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&prepared_xch_size=0.5&prepared_cat_size=500&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
             )
         self.assertEqual(resp.status_code, 200)
+
+    def test_tier_verify_ignores_retired_sniper_query_even_when_stale_settings_enable_it(
+        self,
+    ):
+        with (
+            patch("wallet.get_spendable_coins_rpc", return_value=self._EMPTY_COINS),
+            patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self._get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&sniper_xch=0.33&sniper_cat=4400"
+                "&sniper_xch_count=20&sniper_cat_count=20",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("sniper", body["tiers"])
+        self.assertTrue(body["all_sufficient"])
+        self.assertFalse(body["needs_coin_prep"])
 
     def test_flat_mode_response_has_required_keys(self):
         with (
@@ -583,7 +982,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
@@ -611,7 +1010,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=six_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4",
                 environ_base=self._LOOPBACK,
@@ -633,7 +1032,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=ten_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4&xch_reserve=3",
                 environ_base=self._LOOPBACK,
@@ -656,7 +1055,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=pending_outgoing),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&liquidity_mode=buy_only"
                 "&prepared_xch_size=1&max_buy=4",
                 environ_base=self._LOOPBACK,
@@ -681,7 +1080,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", side_effect=balance),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&inner_xch=4&inner_cat=4"
                 "&inner_count=2&xch_reserve=1&cat_reserve=1"
                 "&topup_pool_xch=2&topup_pool_cat=2",
@@ -707,7 +1106,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=nine_xch),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4&topup_pool_xch=2",
                 environ_base=self._LOOPBACK,
@@ -723,7 +1122,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&inner_xch=2&inner_cat=1"
                 "&inner_xch_count=17&inner_cat_count=8",
                 environ_base=self._LOOPBACK,
@@ -750,7 +1149,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&prepared_xch_size=1"
                 "&prepared_cat_size=1&max_buy=4&max_sell=4",
                 environ_base=self._LOOPBACK,
@@ -773,7 +1172,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=one_mojo),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false"
                 "&xch_reserve=0.0000000000006&cat_reserve=0.0006"
                 "&topup_pool_xch=0.0000000000006&topup_pool_cat=0.0006"
@@ -793,7 +1192,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false",
                 environ_base=self._LOOPBACK,
             )
@@ -805,7 +1204,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("wallet.get_wallet_balance", return_value=self._ZERO_BALANCE),
             patch("wallet.WALLET_ID_XCH", 1),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=false&trade_size=0.5"
                 "&max_buy=10&max_sell=10",
                 environ_base=self._LOOPBACK,
@@ -839,7 +1238,7 @@ class TestCoinPrepVerify(_FlaskBase):
             ),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true"
                 "&inner_xch=1&inner_cat=10&inner_count=2",
                 environ_base=self._LOOPBACK,
@@ -870,7 +1269,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&liquidity_mode=sell_only"
                 "&inner_cat=10&inner_count=2",
                 environ_base=self._LOOPBACK,
@@ -899,7 +1298,7 @@ class TestCoinPrepVerify(_FlaskBase):
             patch("coin_manager.check_tier_size_drift_standalone", return_value=[]),
             patch.object(coin_prep_blueprint.cfg, "TIER_ENABLED", True),
         ):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/coin-prep/verify?tier_enabled=true&liquidity_mode=sell_only"
                 "&inner_cat=10&inner_count=1&fees_xch=0.0005&fees_count=1",
                 environ_base=self._LOOPBACK,
@@ -966,10 +1365,46 @@ class TestCoinPrepTrigger(_FlaskBase):
         )
         self._legacy_recovery.start()
         self.addCleanup(self._legacy_recovery.stop)
+        self._fee_dispatch = patch(
+            "coin_prep_fee_dispatch.price_approved_prep_batch",
+            return_value={"available": True},
+        )
+        self._fee_dispatch.start()
+        self.addCleanup(self._fee_dispatch.stop)
 
     def test_requires_token(self):
         resp = self._post("/api/coin-prep/trigger", auth=False)
         self.assertEqual(resp.status_code, 401)
+
+    def test_missing_fee_approval_is_rejected_before_background_start(self):
+        with patch("threading.Thread") as mock_thread:
+            resp = self.client.post(
+                "/api/coin-prep/trigger",
+                json={},
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
+            )
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FEE_APPROVAL_REQUIRED")
+        mock_thread.assert_not_called()
+
+    def test_stale_fee_approval_is_rejected_before_background_start(self):
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch(
+                "coin_prep_fee_dispatch.price_approved_prep_batch",
+                return_value={
+                    "available": False,
+                    "reason": "FEE_APPROVAL_STALE",
+                },
+            ),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FEE_APPROVAL_STALE")
+        mock_thread.assert_not_called()
 
     def test_bootstrap_trigger_does_not_expose_internal_exception_detail(self):
         with patch.object(
@@ -1030,6 +1465,8 @@ class TestCoinPrepTrigger(_FlaskBase):
     def test_stops_bot_if_running(self):
         bot = MagicMock()
         bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = True
+        bot.is_stopped.return_value = True
         with (
             patch("threading.Thread") as mock_thread,
             patch.object(
@@ -1040,6 +1477,101 @@ class TestCoinPrepTrigger(_FlaskBase):
             mock_thread.return_value.start = MagicMock()
             self._post("/api/coin-prep/trigger")
         bot.stop.assert_called_once_with(wait=True)
+
+    def test_incomplete_bot_stop_blocks_coin_prep_worker(self):
+        bot = MagicMock()
+        bot.is_running.side_effect = [True, False]
+        bot.stop.return_value = False
+        bot.is_stopped.return_value = False
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ) as mock_reset,
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "coin_prep_bot_stop_incomplete")
+        bot.stop.assert_called_once_with(wait=True)
+        mock_reset.assert_not_called()
+        mock_thread.assert_not_called()
+
+    def test_already_stopping_bot_blocks_coin_prep_worker(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.is_stopped.return_value = False
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ) as mock_reset,
+            patch.object(api_server, "bot", bot),
+        ):
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "coin_prep_bot_stop_incomplete")
+        bot.stop.assert_not_called()
+        mock_reset.assert_not_called()
+        mock_thread.assert_not_called()
+
+    def test_manual_topup_blocks_while_bot_is_stopping(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.is_stopped.return_value = False
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/coins/topup")
+
+        self.assertEqual(resp.status_code, 409)
+        bot.coin_manager.start_topup.assert_not_called()
+
+    def test_manual_coin_prep_blocks_while_bot_is_stopping(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.is_stopped.return_value = False
+        with patch.object(api_server, "bot", bot):
+            resp = self._post("/api/coins/prep", {"fee_approval_id": "a" * 64})
+
+        self.assertEqual(resp.status_code, 409)
+        bot.coin_manager.start_coin_prep.assert_not_called()
+
+    def test_stopped_bot_proof_does_not_collect_unrelated_gui_stats(self):
+        bot = MagicMock()
+        bot.is_running.return_value = False
+        bot.is_stopped.return_value = True
+        bot.get_state.side_effect = RuntimeError("unrelated dashboard stats failed")
+        with (
+            patch("threading.Thread") as mock_thread,
+            patch.object(
+                api_server, "_reset_fresh_run_session", return_value=self._FAKE_SUMMARY
+            ),
+            patch.object(api_server, "bot", bot),
+        ):
+            mock_thread.return_value.start = MagicMock()
+            resp = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(resp.status_code, 200)
+        bot.get_state.assert_not_called()
+
+    def test_manual_coin_routes_use_terminal_stop_proof_without_gui_stats(self):
+        for path, body, method_name in (
+            ("/api/coins/topup", None, "start_topup"),
+            ("/api/coins/prep", {"fee_approval_id": "a" * 64}, "start_coin_prep"),
+        ):
+            with self.subTest(path=path):
+                bot = MagicMock()
+                bot.is_stopped.return_value = True
+                bot.get_state.side_effect = RuntimeError(
+                    "unrelated dashboard stats failed"
+                )
+                with patch.object(api_server, "bot", bot):
+                    resp = self._post(path, body)
+
+                self.assertEqual(resp.status_code, 200)
+                getattr(bot.coin_manager, method_name).assert_called_once()
+                bot.get_state.assert_not_called()
 
     def test_duplicate_trigger_does_not_start_second_worker(self):
         with (
@@ -1134,6 +1666,105 @@ class TestCoinPrepTrigger(_FlaskBase):
         self.assertIn("--cat-wallet", captured["cmd"])
         index = captured["cmd"].index("--cat-wallet")
         self.assertEqual(captured["cmd"][index + 1], "2")
+        self.assertIn("--fee-approval-id", captured["cmd"])
+        approval_index = captured["cmd"].index("--fee-approval-id")
+        self.assertEqual(captured["cmd"][approval_index + 1], "a" * 64)
+
+    def test_tier_trigger_passes_live_cat_counts_separately_from_spares(self):
+        captured = {}
+
+        class ImmediateThread:
+            def __init__(self, target, *args, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class DoneProcess:
+            pid = 12345
+            returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return DoneProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "coin_prep_output.log")
+            config_values = {
+                "TIER_ENABLED": True,
+                "LIQUIDITY_MODE": "two_sided",
+                "BUY_LADDER_REVERSED": False,
+                "BUY_INNER_TIER_COUNT": 1,
+                "BUY_INNER_TIER_SPARE_COUNT": 0,
+                "SELL_INNER_TIER_COUNT": 1,
+                "SELL_INNER_TIER_SPARE_COUNT": 2,
+            }
+            zero_count_names = [
+                f"{side}_{tier.upper()}_TIER_{suffix}"
+                for side in ("BUY", "SELL")
+                for tier in ("mid", "outer", "extreme")
+                for suffix in ("COUNT", "SPARE_COUNT")
+            ]
+            config_values.update({name: 0 for name in zero_count_names})
+            config_patchers = [
+                patch.object(coin_prep_blueprint.cfg, name, value)
+                for name, value in config_values.items()
+            ]
+            for patcher in config_patchers:
+                patcher.start()
+                self.addCleanup(patcher.stop)
+
+            with (
+                patch.object(
+                    api_server,
+                    "_reset_fresh_run_session",
+                    return_value=self._FAKE_SUMMARY,
+                ),
+                patch.object(api_server, "bot", None),
+                patch.object(coin_prep_blueprint.threading, "Thread", ImmediateThread),
+                patch(
+                    "coin_manager._coin_prep_worker_command", return_value=["worker"]
+                ),
+                patch("coin_manager._coin_prep_worker_environment", return_value={}),
+                patch(
+                    "coin_manager._issue_coin_prep_worker_delegation",
+                    return_value=MagicMock(to_environment=lambda: {}),
+                ),
+                patch(
+                    "coin_manager._revoke_coin_prep_worker_delegation",
+                    return_value={"revoked": True},
+                ),
+                patch("subprocess.Popen", side_effect=fake_popen),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_runtime_dir",
+                    return_value=temp_dir,
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_output_log_file",
+                    return_value=log_path,
+                ),
+                patch.object(api_server, "_get_live_mid_price_str", return_value=None),
+                patch.object(
+                    api_server,
+                    "get_fee_settings_snapshot",
+                    return_value={"fee_pool_enabled": False},
+                ),
+            ):
+                response = self._post("/api/coin-prep/trigger")
+
+        self.assertEqual(response.status_code, 200)
+        total_index = captured["cmd"].index("--tier-counts-cat")
+        live_index = captured["cmd"].index("--live-tier-counts-cat")
+        self.assertEqual(captured["cmd"][total_index + 1], "inner=3")
+        self.assertEqual(
+            captured["cmd"][live_index + 1],
+            "inner=1,mid=0,outer=0,extreme=0",
+        )
 
     def test_trigger_delegation_outlives_legitimate_chain_confirmation_waits(self):
         """The worker must not lose mutation authority during normal mainnet waits."""

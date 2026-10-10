@@ -324,24 +324,24 @@ def validate_config(cfg) -> ValidationReport:
     if wallet_type == "sage":
         sage_url = getattr(cfg, "SAGE_RPC_URL", "")
         if sage_url and not _is_valid_url(sage_url):
-            err("SAGE_RPC_URL", f"SAGE_RPC_URL is not a valid URL: {sage_url}")
+            err("SAGE_RPC_URL", "SAGE_RPC_URL is not a valid URL")
     elif wallet_type == "chia":
         chia_url = getattr(cfg, "CHIA_WALLET_RPC_URL", "")
         if chia_url and not _is_valid_url(chia_url):
             err(
                 "CHIA_WALLET_RPC_URL",
-                f"CHIA_WALLET_RPC_URL is not a valid URL: {chia_url}",
+                "CHIA_WALLET_RPC_URL is not a valid URL",
             )
 
     # ---- Dexie URL ----
     dexie_url = getattr(cfg, "DEXIE_API_BASE", "")
     if dexie_url and not _is_valid_url(dexie_url):
-        warn("DEXIE_API_BASE", f"DEXIE_API_BASE is not a valid URL: {dexie_url}")
+        warn("DEXIE_API_BASE", "DEXIE_API_BASE is not a valid URL")
 
     # ---- Tibet URL ----
     tibet_url = getattr(cfg, "TIBET_API_BASE", "")
     if tibet_url and not _is_valid_url(tibet_url):
-        warn("TIBET_API_BASE", f"TIBET_API_BASE is not a valid URL: {tibet_url}")
+        warn("TIBET_API_BASE", "TIBET_API_BASE is not a valid URL")
 
     # ---- Sniper sanity ----
     if getattr(cfg, "SNIPER_ENABLED", False):

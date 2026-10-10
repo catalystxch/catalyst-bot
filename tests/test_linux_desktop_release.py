@@ -166,7 +166,43 @@ def test_linux_initial_desktop_url_uses_loopback(monkeypatch):
     monkeypatch.setenv("CATALYST_FLASK_PORT", "5000")
     desktop_app = importlib.import_module("desktop_app")
 
-    assert desktop_app._initial_desktop_url() == "http://127.0.0.1:5000/"
+    import api_server
+
+    assert desktop_app._initial_desktop_url() == (
+        "http://127.0.0.1:5000/?bootstrap=" + api_server._LOCAL_API_BOOTSTRAP_TOKEN
+    )
+
+
+def test_windows_splash_url_carries_local_bootstrap(monkeypatch):
+    import api_server
+    import desktop_app
+
+    monkeypatch.setattr(desktop_app.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_app, "FLASK_PORT", 5000)
+    monkeypatch.setattr(desktop_app, "_bundle_path", lambda name: str(ROOT / name))
+
+    assert desktop_app._initial_desktop_url() == (
+        (ROOT / "splash.html").as_uri()
+        + "#bootstrap="
+        + api_server._LOCAL_API_BOOTSTRAP_TOKEN
+    )
+
+
+def test_desktop_startup_log_omits_private_bootstrap_credential():
+    import desktop_app
+
+    assert (
+        desktop_app._redacted_desktop_url(
+            "file:///E:/Catalyst/splash.html#bootstrap=private-token"
+        )
+        == "file:///E:/Catalyst/splash.html"
+    )
+    assert (
+        desktop_app._redacted_desktop_url(
+            "http://127.0.0.1:5000/?bootstrap=private-token"
+        )
+        == "http://127.0.0.1:5000/"
+    )
 
 
 def test_linux_desktop_window_wires_loopback_initial_url():

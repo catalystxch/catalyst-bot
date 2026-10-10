@@ -24,6 +24,12 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values, load_dotenv, set_key
 
 
+# Splash remains an optional publication path in this beta. The release fence
+# can still be enabled to fail closed if a future package excludes that path.
+DEXIE_ONLY_BETA = False
+_DEXIE_ONLY_BETA_LOCKED_KEYS = frozenset({"SPLASH_ENABLED", "SPLASH_RECEIVE_ENABLED"})
+
+
 def _find_env_example_path(install_dir: str) -> str:
     """Find the bundled `.env.example` across source and frozen layouts."""
     roots = []
@@ -72,45 +78,36 @@ def _restrict_env_file_permissions(path: str) -> None:
 # first-launch migration from the legacy install-dir location, so
 # existing dev installs keep working transparently.
 # ---------------------------------------------------------------------------
-try:
-    from user_paths import env_file as _env_file, install_dir as _install_dir
+from user_paths import env_file as _env_file, install_dir as _install_dir
 
-    _ENV_PATH = _env_file()
-    # If the user data .env doesn't exist yet but a template does in the
-    # install dir, seed the data-dir .env from .env.example so first-run
-    # users start with sensible defaults.
-    if not os.path.exists(_ENV_PATH):
-        _example = _find_env_example_path(_install_dir())
-        if _example:
+_ENV_PATH = _env_file()
+# If the user data .env doesn't exist yet but a template does in the
+# install dir, seed the data-dir .env from .env.example so first-run
+# users start with sensible defaults.
+if not os.path.exists(_ENV_PATH):
+    _example = _find_env_example_path(_install_dir())
+    if _example:
+        try:
+            import shutil as _shutil
+
+            _tmp_env = f"{_ENV_PATH}.{os.getpid()}.tmp"
+            _shutil.copy2(_example, _tmp_env)
             try:
-                import shutil as _shutil
-
-                _tmp_env = f"{_ENV_PATH}.{os.getpid()}.tmp"
-                _shutil.copy2(_example, _tmp_env)
+                os.replace(_tmp_env, _ENV_PATH)
+            except OSError:
+                # Another process may have won the first-run seed race.
+                if not os.path.exists(_ENV_PATH):
+                    raise
                 try:
-                    os.replace(_tmp_env, _ENV_PATH)
+                    os.unlink(_tmp_env)
                 except OSError:
-                    # Another process may have won the first-run seed race.
-                    if not os.path.exists(_ENV_PATH):
-                        raise
-                    try:
-                        os.unlink(_tmp_env)
-                    except OSError:
-                        pass
-            except Exception as _copy_err:
-                print(
-                    f"[config] Could not seed .env from .env.example: {_copy_err}",
-                    flush=True,
-                )
-    _restrict_env_file_permissions(_ENV_PATH)
-except Exception as _e:
-    # Fallback: legacy behaviour if user_paths import fails during an
-    # unusual dev setup.  Should never happen in a packaged build.
-    print(
-        f"[config] user_paths unavailable ({_e}); falling back to install dir",
-        flush=True,
-    )
-    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                    pass
+        except Exception as _copy_err:
+            print(
+                f"[config] Could not seed .env from .env.example: {_copy_err}",
+                flush=True,
+            )
+_restrict_env_file_permissions(_ENV_PATH)
 
 load_dotenv(_ENV_PATH)
 
@@ -193,9 +190,7 @@ def _safe_url(key: str, default: str) -> str:
     if val:
         parsed = urlparse(val)
         if parsed.scheme not in ("http", "https"):
-            print(
-                f"[CONFIG] WARNING: {key} has invalid scheme '{parsed.scheme}' — using default"
-            )
+            print(f"[CONFIG] WARNING: {key} has an invalid URL scheme — using default")
             return default
     return val
 
@@ -966,8 +961,11 @@ class Config:
         self.COMPETITOR_AWARE_ENABLED = _bool("COMPETITOR_AWARE_ENABLED", False)
         self.DBX_MAX_SPREAD_BPS = _decimal("DBX_MAX_SPREAD_BPS", "500")
 
-        # ----- Splash Network (V3 — decentralized offer broadcasting) -----
-        self.SPLASH_ENABLED = _bool("SPLASH_ENABLED", False)
+        # ----- Splash Network (optional decentralized offer broadcasting) -----
+        self.DEXIE_ONLY_BETA = DEXIE_ONLY_BETA
+        self.SPLASH_ENABLED = (
+            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_ENABLED", False)
+        )
         self.SPLASH_SUBMIT_URL = _str("SPLASH_SUBMIT_URL", "http://localhost:4000")
         self.SPLASH_POST_RETRIES = _int("SPLASH_POST_RETRIES", 2)
         self.SPLASH_POST_TIMEOUT = _int("SPLASH_POST_TIMEOUT", 15)
@@ -975,7 +973,9 @@ class Config:
             self.SPLASH_POST_RETRY_SLEEP = float(_str("SPLASH_POST_RETRY_SLEEP", "1.5"))
         except (ValueError, TypeError):
             self.SPLASH_POST_RETRY_SLEEP = 1.5
-        self.SPLASH_RECEIVE_ENABLED = _bool("SPLASH_RECEIVE_ENABLED", True)
+        self.SPLASH_RECEIVE_ENABLED = (
+            False if self.DEXIE_ONLY_BETA else _bool("SPLASH_RECEIVE_ENABLED", False)
+        )
         self.SPLASH_RECEIVE_POLL_SECS = _int("SPLASH_RECEIVE_POLL_SECS", 5)
         self.SPLASH_RECEIVE_BATCH_SIZE = _int("SPLASH_RECEIVE_BATCH_SIZE", 10)
         self.SPLASH_RECEIVE_VIEW_RETRIES = _int("SPLASH_RECEIVE_VIEW_RETRIES", 3)
@@ -1451,6 +1451,12 @@ class Config:
 
         Returns True if successful.
         """
+        if (
+            getattr(self, "DEXIE_ONLY_BETA", False)
+            and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
+        ):
+            return False
+
         if key not in self._UPDATABLE_KEYS:
             print(f"[CONFIG] Blocked update of non-updatable key: {key}")
             return False
@@ -1546,6 +1552,12 @@ class Config:
         bot restart, leaving the current live book governed by the config it
         started with.
         """
+        if (
+            getattr(self, "DEXIE_ONLY_BETA", False)
+            and key in _DEXIE_ONLY_BETA_LOCKED_KEYS
+        ):
+            return False
+
         if key not in self._UPDATABLE_KEYS:
             print(f"[CONFIG] Blocked update of non-updatable key: {key}")
             return False

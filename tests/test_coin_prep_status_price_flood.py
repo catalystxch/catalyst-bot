@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import api_server
 import coin_manager
@@ -199,6 +200,7 @@ def test_explicit_coin_prep_verify_fetches_fresh_price_when_cache_empty(monkeypa
     response = client.get(
         "/api/coin-prep/verify?tier_enabled=true"
         "&inner_xch=0.1&inner_cat=100&inner_count=2",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     )
 
@@ -215,6 +217,18 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         def __init__(self):
             self.price_engine = price_engine
             self.started = False
+            self.coin_manager = MagicMock()
+            self.coin_manager.is_busy.return_value = False
+            self.offer_manager = MagicMock()
+            self.offer_manager.sync_from_wallet.return_value = ([], [], [])
+            self.offer_manager.get_wallet_sync_meta.return_value = {
+                "fresh": True,
+                "using_cache": False,
+            }
+            self.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+                self.offer_manager.sync_from_wallet(),
+                self.offer_manager.get_wallet_sync_meta(),
+            )
 
         def is_running(self):
             return False
@@ -228,6 +242,7 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
 
     bot = Bot()
     _patch_tier_price_inputs(monkeypatch, price_engine)
+    monkeypatch.setattr(coin_manager.cfg, "BUY_LADDER_REVERSED", False)
     monkeypatch.setattr(api_server, "bot", bot)
     start_cfg = SimpleNamespace(
         CAT_ASSET_ID="asset-id",
@@ -267,6 +282,10 @@ def test_start_bot_gate_fetches_fresh_price_when_cache_empty(monkeypatch):
         "_enforce_post_tibet_start_migration",
         lambda _asset_id: {"can_start": True, "reason_code": "MIGRATION_COMPLETE"},
     )
+
+    assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=False)
+    assert coin_manager.get_tier_sizes_mojos_from_cfg(is_cat=True)
+    price_engine.fresh_calls = 0
 
     client = api_server.app.test_client()
     response = client.post(

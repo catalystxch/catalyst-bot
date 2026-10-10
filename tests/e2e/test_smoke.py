@@ -108,6 +108,32 @@ def test_running_session_reload_never_shows_risk_disclosure(flask_server, page):
     assert page.evaluate("window.__riskDisclosureEverVisible") is False
 
 
+def test_startup_skips_change_address_prompt_when_saved_setting_is_enabled(
+    flask_server, page
+):
+    """The startup prompt must honor the canonical uppercase config key."""
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"SAGE_SET_CHANGE_ADDRESS": True}),
+        ),
+    )
+    page.goto(flask_server, wait_until="domcontentloaded")
+    prompted = page.evaluate(
+        """async () => {
+            _startupWalletType = 'sage';
+            _startupChangeAddressPromptShown = false;
+            localStorage.removeItem('sage_change_address_declined');
+            return await startupMaybeShowChangeAddressPrompt();
+        }"""
+    )
+
+    assert prompted is False
+    expect(page.locator("#startupChangeAddressSection")).to_be_hidden()
+
+
 def test_dismissing_disclaimer_reveals_wallet_gate(app_page):
     """Continuing past the disclaimer should land on a Sage startup gate."""
     assert dismiss_disclaimer(app_page) is True
@@ -397,17 +423,49 @@ def test_resolved_market_confidence_is_not_shown_as_still_gathering(page):
     )
 
 
-def test_market_intel_explains_tibetswap_retirement(page):
-    """Market Intel must explain that TibetSwap is historical-only in v1.4."""
+def test_stale_market_confidence_shows_evidence_date_and_time(page):
+    """An old safety snapshot must not look current because only its clock is shown."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
-    expect(page.locator("#intelTibetContext")).to_have_text(
-        "TibetSwap shut down; historical TibetSwap data is retained as read-only "
-        "history and never drives a live decision."
+    page.evaluate(
+        """() => window.renderMarketConfidence({
+            confidence: {state: 'RED', reason_codes: ['market_evidence_expired']},
+            evidence: {derived_at: '2026-09-28T14:29:15.775248Z', source_ids: []},
+            providers: {dexie: {
+                status: 'expired',
+                observed_at: '2026-09-28T14:29:15.775248Z',
+                reason_codes: ['provider_evidence_expired'],
+            }},
+            metrics: {},
+        })"""
     )
+
+    evidence_time = page.locator("#marketConfidenceDerivedAt")
+    expect(evidence_time).to_contain_text("2026")
+    expect(evidence_time).to_contain_text(":")
+    provider_health = page.locator("#marketProviderHealth")
+    expect(provider_health).to_contain_text("2026")
+    expect(provider_health).to_contain_text(":")
+
+
+def test_current_operator_ui_omits_retired_tibetswap_brand(page):
+    """Current Market Intel, About, and Help surfaces omit the retired venue."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate("window.v4SwitchView('intel')")
+    expect(page.locator("#v4View-intel")).not_to_contain_text("TibetSwap")
+    assert page.locator("#intelTibetContext").count() == 0
     expect(page.locator("#intelSlippage")).to_be_hidden()
     expect(page.locator("#intelPoolRatio")).to_be_hidden()
+
+    page.evaluate("window.openAboutModal()")
+    expect(page.locator("#aboutModal")).not_to_contain_text("TibetSwap")
+    page.evaluate("window.closeAboutModal()")
+
+    page.evaluate("window.openHelpModal(); window.switchHelpTab('sniper')")
+    expect(page.locator("#help_sniper")).not_to_contain_text("TibetSwap")
 
 
 def test_dashboard_confidence_does_not_invent_tradable_depth(page):
@@ -660,7 +718,7 @@ def test_dashboard_fiat_label_uses_cat_ticker_not_pair_id(page, has_price):
 def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_block(
     page,
 ):
-    """RED blocks Follow exposure without claiming Bootstrap was withdrawn."""
+    """RED blocks Follow without claiming an empty Bootstrap book has offers."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
 
@@ -670,6 +728,7 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
                 campaign_id: 'campaign-1',
                 revision: 4,
                 stage: 'bootstrap',
+                open_offer_count: 0,
             };
             window.renderMarketConfidence({
                 confidence: {
@@ -698,8 +757,536 @@ def test_dashboard_red_confidence_distinguishes_active_bootstrap_from_follow_blo
         "Bounded Bootstrap active — Follow mode is blocked by RED confidence"
     )
     expect(page.locator("#marketConfidenceCountdown")).to_have_text(
-        "Follow exposure withdrawn; bounded Bootstrap offers remain active"
+        "Follow exposure withdrawn; bounded Bootstrap campaign remains authorized"
     )
+
+
+def test_expired_bootstrap_restored_session_explains_cancellation_before_resume(page):
+    """A restored live book must not claim readiness after its campaign expires."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {
+                asset_id: 'mz', name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH',
+            };
+            _resumeSessionSummary = {
+                pair_name: 'Monkeyzoo Token',
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+            };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            bot_state = {
+                running: false,
+                offers: { buy: [{ trade_id: 'buy-1' }], sell: [{ trade_id: 'sell-1' }] },
+            };
+            updateDashboardStartupLayout(bot_state);
+            return {
+                guide: document.getElementById('startupGuideTitle').textContent,
+                summary: document.getElementById('startupResumeTitle').textContent,
+                detail: document.getElementById('startupResumeCopy').textContent,
+                resumeDisabled: document.getElementById('startupResumeContinueBtn').disabled,
+                resumeText: document.getElementById('startupResumeContinueBtn').textContent,
+            };
+        }"""
+    )
+
+    assert result["resumeDisabled"] is True
+    for label in (result["guide"], result["summary"], result["detail"]):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+    assert "resume" not in result["resumeText"].lower()
+    assert "cancel" in result["resumeText"].lower()
+
+
+def test_expired_bootstrap_market_health_calls_for_cancellation(page):
+    """An expired campaign with live offers cannot be labelled active."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            window.renderMarketConfidence({
+                confidence: {
+                    state: 'RED',
+                    reason_codes: ['insufficient_ask_depth'],
+                    withdrawal_stage: 'ALL',
+                },
+                degraded: {
+                    withdrawal_stage: 'ALL',
+                    timeline: { current_stage: 'ALL' },
+                },
+                metrics: {},
+                evidence: { source_ids: ['dexie'] },
+                providers: {},
+            });
+            window.updateMarketHealth({
+                status: 'green',
+                message: 'Market conditions healthy',
+                conditions: [],
+                metrics: {},
+            });
+        }"""
+    )
+
+    for label in (
+        page.locator("#ccHealthMsg").inner_text(),
+        page.locator("#marketConfidenceCountdown").inner_text(),
+    ):
+        assert "expired" in label.lower()
+        assert "cancel" in label.lower()
+
+
+def test_expired_bootstrap_recovery_modal_does_not_offer_start(page):
+    """Restoring an expired campaign must lead to cancellation, not Start Bot."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105',
+                wallet_id: 2,
+                decimals: 3,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            currentCAT = { ...cat };
+            _bootstrapActiveCampaign = {
+                campaign_id: 'expired-campaign',
+                expired: true,
+                cancel_required: true,
+                open_offer_count: 6,
+            };
+            setResumeSessionSummary({
+                can_resume: true,
+                buy_count: 3,
+                sell_count: 3,
+                offer_count: 6,
+                active_cat: cat,
+            });
+            document.getElementById('startupOverlay').style.display = 'none';
+            document.getElementById('resumeSessionModal').classList.add('active');
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            checkSettingsReviewed = () => {};
+            fetchStatus = async () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => new Response(JSON.stringify(
+                String(path).includes('/check-resume')
+                    ? { can_resume: true, buy_count: 3, sell_count: 3,
+                        offer_count: 6, active_cat: cat }
+                    : { success: true }
+            ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+            const restored = await resumeSession();
+            if (!restored) throw new Error('Test session did not restore');
+            const modal = document.querySelector('#resumeSessionModal > div');
+            return {
+                text: modal.innerText,
+                startButtons: modal.querySelectorAll('button[onclick="resumeStartNow()"]')
+                    .length,
+                closeButtons: modal.querySelectorAll('button[onclick="closeResumeAfterLoad()"]')
+                    .length,
+            };
+        }"""
+    )
+
+    assert "expired" in result["text"].lower()
+    assert "cancel" in result["text"].lower()
+    assert result["startButtons"] == 0
+    assert result["closeButtons"] == 1
+    page.locator('#resumeSessionModal button[onclick="closeResumeAfterLoad()"]').click()
+    assert "active" not in page.locator("#resumeSessionModal").get_attribute("class")
+
+
+def test_skipping_incomplete_resume_does_not_enable_start(page):
+    """A stalled live-book recheck must not leave a ready-looking Start button."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            const cat = {
+                asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                ticker_id: 'TEST_XCH', decimals: 3,
+            };
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            const selector = document.getElementById('catSelector');
+            const option = document.createElement('option');
+            option.value = cat.asset_id;
+            option.textContent = cat.name;
+            selector.appendChild(option);
+            selector.value = cat.asset_id;
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: cat,
+            });
+            settingsReviewed = false;
+            coinPrepStatus = 'none';
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkSettingsReviewed = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            fetchStatus = async () => {};
+            window.__resumeCheckCalled = false;
+            apiFetch = async path => {
+                if (String(path).includes('/check-resume')) {
+                    window.__resumeCheckCalled = true;
+                    return new Promise(resolve => { window.__resolveResumeCheck = resolve; });
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            document.getElementById('resumeSessionModal').classList.add('active');
+            window.__pendingResume = resumeSession();
+        }"""
+    )
+    page.wait_for_function("window.__resumeCheckCalled === true")
+    result = page.evaluate(
+        """async () => {
+            resumeSkip();
+            const immediate = {
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+            };
+            window.__resolveResumeCheck(new Response(JSON.stringify({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {
+                    asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                    ticker_id: 'TEST_XCH', decimals: 3,
+                },
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+            const restored = await window.__pendingResume;
+            setSettingsReviewedState(true);
+            setCoinPrepStatus('done');
+            return {
+                immediate,
+                restored,
+                modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+            };
+        }"""
+    )
+
+    assert result == {
+        "immediate": {"disabled": True, "canAttempt": False},
+        "restored": False,
+        "modalActive": False,
+        "disabled": True,
+        "canAttempt": False,
+    }
+
+
+def test_verified_resume_enables_start_after_live_book_check(page):
+    """A completed recheck should still make the recovered-book start available."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const cat = {
+                asset_id: 'asset-a', wallet_id: 2, name: 'Test CAT',
+                ticker_id: 'TEST_XCH', decimals: 3,
+            };
+            currentCAT = { ...cat };
+            _pairSelectedByUser = true;
+            const selector = document.getElementById('catSelector');
+            const option = document.createElement('option');
+            option.value = cat.asset_id;
+            option.textContent = cat.name;
+            selector.appendChild(option);
+            selector.value = cat.asset_id;
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: cat,
+            });
+            settingsReviewed = false;
+            coinPrepStatus = 'none';
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkSettingsReviewed = () => {};
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            fetchStatus = async () => {};
+            updateResumeOverview = () => {};
+            apiFetch = async path => new Response(JSON.stringify(
+                String(path).includes('/check-resume')
+                    ? { can_resume: true, offer_count: 1, buy_count: 1,
+                        sell_count: 0, active_cat: cat }
+                    : { success: true }
+            ), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const restored = await resumeSession();
+            return {
+                restored,
+                disabled: document.getElementById('startBtn').disabled,
+                canAttempt: canAttemptBotStart(),
+                startChoice: !!document.querySelector('#resumeSessionModal button[onclick="resumeStartNow()"]'),
+            };
+        }"""
+    )
+
+    assert result == {
+        "restored": True,
+        "disabled": False,
+        "canAttempt": True,
+        "startChoice": True,
+    }
+
+
+@pytest.mark.parametrize("trigger", ["dismissResumeFresh", "dismissResumeAfterLoad"])
+def test_failed_fresh_start_choice_keeps_recovery_prompt_open(page, trigger):
+    """A rejected durable choice must not claim that a fresh run began."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            let resetCalled = false;
+            let dashboardCalled = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => { dashboardCalled = true; };
+            const toasts = [];
+            showToast = (message) => { toasts.push(message); };
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, error: 'profile is read-only'
+            }), {status: 500, headers: {'Content-Type': 'application/json'}});
+            try {
+                const outcome = await window[trigger]();
+                return {
+                    outcome,
+                    modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                    startDisabled: startButton.disabled,
+                    resumedBook: hasResumedLiveBook(),
+                    resumeHandled: _resumeHandled,
+                    resetCalled,
+                    dashboardCalled,
+                    successToast: toasts.some(text => text.includes('Fresh run started')),
+                };
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": False,
+        "modalActive": True,
+        "startDisabled": True,
+        "resumedBook": True,
+        "resumeHandled": False,
+        "resetCalled": False,
+        "dashboardCalled": False,
+        "successToast": False,
+    }
+
+
+def test_successful_fresh_start_choice_closes_recovery_prompt(page):
+    """The post-load Start Fresh action still advances after server success."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('resumeSessionModal').classList.add('active');
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {
+                status: 200, headers: {'Content-Type': 'application/json'}
+            });
+            fetchDashboard = () => {};
+            showToast = () => {};
+            const outcome = await dismissResumeAfterLoad();
+            return {
+                outcome,
+                modalActive: document.getElementById('resumeSessionModal').classList.contains('active'),
+                startDisabled: startButton.disabled,
+            };
+        }"""
+    )
+
+    assert result == {"outcome": True, "modalActive": False, "startDisabled": True}
+
+
+@pytest.mark.parametrize(
+    "trigger", ["clearResumeModeForFreshSetup", "handleResumeSettingsChangeRequest"]
+)
+def test_failed_settings_fresh_start_preserves_resumed_book(page, trigger):
+    """A rejected durable choice must not discard resume authority or open editable setup."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
+            const startButton = document.getElementById('startBtn');
+            startButton.disabled = true;
+            let resetCalled = false;
+            let dashboardCalled = false;
+            let settingsOpened = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            const originalSwitch = v4SwitchView;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => { dashboardCalled = true; };
+            v4SwitchView = () => { settingsOpened = true; };
+            showStyledConfirm = async () => true;
+            const toasts = [];
+            showToast = message => { toasts.push(message); };
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, error: 'profile is read-only'
+            }), {status: 500, headers: {'Content-Type': 'application/json'}});
+            try {
+                const outcome = await window[trigger]({openSettings: true});
+                return {
+                    outcome,
+                    resumedBook: hasResumedLiveBook(),
+                    startDisabled: startButton.disabled,
+                    resetCalled,
+                    dashboardCalled,
+                    settingsOpened,
+                    successToast: toasts.some(text => text.includes('Resume mode cleared')),
+                };
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+                v4SwitchView = originalSwitch;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": False,
+        "resumedBook": True,
+        "startDisabled": True,
+        "resetCalled": False,
+        "dashboardCalled": False,
+        "settingsOpened": False,
+        "successToast": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "trigger", ["clearResumeModeForFreshSetup", "handleResumeSettingsChangeRequest"]
+)
+def test_successful_settings_fresh_start_opens_setup(page, trigger):
+    """The settings route still advances after a durable fresh-start choice."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async trigger => {
+            setResumeSessionSummary({
+                can_resume: true, offer_count: 1, buy_count: 1, sell_count: 0,
+                active_cat: {asset_id: 'asset-a', wallet_id: 2, name: 'MZ'},
+            });
+            let resetCalled = false;
+            let settingsOpened = false;
+            const originalReset = resetPairSelectionState;
+            const originalDashboard = fetchDashboard;
+            const originalSwitch = v4SwitchView;
+            resetPairSelectionState = () => { resetCalled = true; };
+            fetchDashboard = () => {};
+            v4SwitchView = () => { settingsOpened = true; };
+            showStyledConfirm = async () => true;
+            showToast = () => {};
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {
+                status: 200, headers: {'Content-Type': 'application/json'}
+            });
+            try {
+                const outcome = await window[trigger]({openSettings: true});
+                return {outcome, resumedBook: hasResumedLiveBook(), resetCalled, settingsOpened};
+            } finally {
+                resetPairSelectionState = originalReset;
+                fetchDashboard = originalDashboard;
+                v4SwitchView = originalSwitch;
+            }
+        }""",
+        trigger,
+    )
+
+    assert result == {
+        "outcome": True,
+        "resumedBook": False,
+        "resetCalled": True,
+        "settingsOpened": True,
+    }
+
+
+def test_resume_start_sends_explicit_existing_offer_authority_request(page):
+    """Only the recovered-book CTA may request the exact live-offer start path."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            settingsReviewed = true;
+            currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            coinPrepStatus = 'skipped-safe';
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            getStartSafetyState = () => ({ allowed: true, message: '' });
+            checkForResume = async () => false;
+            updateStartupChecklist = () => {};
+            updateDashboardStartupLayout = () => {};
+            window.__capturedStartRequest = null;
+            apiFetch = async (path, options = {}) => {
+                if (String(path).includes('/bot/start')) {
+                    window.__capturedStartRequest = {
+                        path: String(path),
+                        method: options.method,
+                        contentType: options.headers?.['Content-Type'],
+                        body: options.body,
+                    };
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            await resumeStartNow();
+            return window.__capturedStartRequest;
+        }"""
+    )
+
+    assert result["path"].endswith("/bot/start")
+    assert result["method"] == "POST"
+    assert result["contentType"] == "application/json"
+    assert result["body"] == '{"resume_existing_offers":true}'
 
 
 def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
@@ -739,6 +1326,174 @@ def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     expect(page.locator("#heroMidPriceTooltip")).to_contain_text(
         "approved campaign anchor"
     )
+
+
+def test_follow_price_provenance_tracks_confidence_and_status_updates(page):
+    """An indicative poll must never overwrite a trusted price or gain its label."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null,
+            reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+    expect(page.locator("#heroMidPriceTooltip")).to_contain_text("display only")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00007500")
+
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'RED', data_valid: false, trusted_midpoint: '0.00008'
+    }})""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Indicative Mid Price")
+
+
+def test_bootstrap_price_provenance_uses_canonical_trusted_midpoint(page):
+    """The actual trusted_midpoint API field takes precedence over an anchor."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        currentCAT = {asset_id: 'a'.repeat(64), decimals: 3};
+        _bootstrapActiveCampaign = {anchor_price: '0.0001'};
+        renderMarketConfidence({confidence: {
+            state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+        }});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Trusted Mid Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00008000")
+    page.evaluate("""() => {
+        renderMarketConfidence({confidence: {
+            state: 'RED', data_valid: false, trusted_midpoint: null
+        }});
+        v4UpdateHeroStrip({pricing: {mid: '0.000075'}});
+    }""")
+    expect(page.locator("#heroMidPriceLabel")).to_contain_text("Bootstrap Anchor Price")
+    expect(page.locator("#heroMidPrice")).to_have_text("0.00010000")
+
+
+def test_empty_offers_explains_running_follow_block_and_clears_on_recovery(page):
+    """Running RED Follow explains the blocker; recovery removes that message."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = true;
+        updateUI(bot_state);
+        renderMarketConfidence({confidence: {
+            state: 'RED', reason_codes: ['insufficient_ask_depth']
+        }});
+    }""")
+    empty = page.locator("#offersEmptyState")
+    expect(empty).to_contain_text("insufficient ask depth")
+    expect(empty).not_to_contain_text("Start the bot")
+    page.evaluate("""() => renderMarketConfidence({confidence: {
+        state: 'GREEN', data_valid: true, trusted_midpoint: '0.00008'
+    }})""")
+    expect(empty).not_to_contain_text("insufficient ask depth")
+    expect(empty).to_contain_text("Bot is running")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        updateUI(bot_state);
+    }""")
+    expect(empty).to_contain_text("Start the bot")
+
+
+def test_stopping_cycle_is_not_rendered_as_stopped_or_restartable(page):
+    """An in-flight stop keeps the visible state and controls nonterminal."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        updateUI(bot_state);
+    }""")
+
+    expect(page.locator("#statusBadge")).to_contain_text("Stopping")
+    expect(page.locator("#startBtn")).to_be_disabled()
+    expect(page.locator("#stopBtn")).to_be_disabled()
+    expect(page.locator("#startupGuide")).to_have_class(
+        re.compile("dashboard-section-hidden")
+    )
+
+
+def test_failed_stop_can_be_retried_from_dashboard_without_enabling_start(page):
+    """A terminal stop finalizer failure must leave a usable retry control."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("""() => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        bot_state.stop_retry_available = true;
+        updateUI(bot_state);
+    }""")
+
+    expect(page.locator("#startBtn")).to_be_disabled()
+    expect(page.locator("#stopBtn")).to_be_enabled()
+    expect(page.locator("#stopBtn")).to_contain_text("Retry")
+    called = page.evaluate("""async () => {
+        const calls = [];
+        apiFetch = async path => {
+            calls.push(path);
+            return new Response(JSON.stringify({status: 'stopping'}));
+        };
+        await stopBot();
+        return calls;
+    }""")
+    assert called == ["/api/bot/stop"]
+
+
+def test_stop_fallback_does_not_reenable_button_while_cycle_is_stopping(page):
+    """A slow finalizer must not make Stop look available again at 30 seconds."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate("""async () => {
+        bot_state.running = false;
+        bot_state.status = 'stopping';
+        const originalSetTimeout = window.setTimeout;
+        let restore;
+        window.setTimeout = (callback, delay, ...args) => {
+            if (delay === 30000) {
+                restore = callback;
+                return 12345;
+            }
+            return originalSetTimeout(callback, delay, ...args);
+        };
+        apiFetch = async () => new Response(JSON.stringify({status: 'stopping'}));
+        try {
+            await stopBot();
+            restore();
+            const button = document.getElementById('stopBtn');
+            return {disabled: button.disabled, text: button.textContent};
+        } finally {
+            window.setTimeout = originalSetTimeout;
+        }
+    }""")
+    assert result["disabled"] is True
+    assert "Stopping" in result["text"]
+
+
+def test_stop_control_event_reports_nonterminal_state(page):
+    """The event log must reflect an in-progress stop, not silently drop it."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate("""() => {
+        const entries = [];
+        addLogEntry = (level, message) => entries.push({level, message});
+        handleSSEEvent({type: 'bot_control', data: {action: 'stopping'}});
+        return entries;
+    }""")
+    assert len(result) == 1
+    assert "stopping" in result[0]["message"].lower()
 
 
 def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
@@ -804,6 +1559,168 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
 
 
+def test_bootstrap_mode_change_refreshes_inactive_authority_banner(page):
+    """The global mode banner follows the local selector without a page change."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const mode = document.getElementById('bootstrapModeSelect');
+            const banner = document.getElementById('bootstrapGlobalStatus');
+            const status = {
+                success: true, active: false, campaign: null,
+                identity: { ticker: 'MZ_XCH' }, stopped_cancellation: null,
+            };
+            let statusRequests = 0;
+            apiFetch = async (path) => {
+                if (path === '/api/bootstrap/status') statusRequests += 1;
+                return new Response(JSON.stringify(status), {
+                    status: 200, headers: { 'Content-Type': 'application/json' },
+                });
+            };
+            mode.value = 'follow';
+            _bootstrapRenderStatus(status);
+            const initial = banner.textContent;
+            mode.value = 'bootstrap';
+            await bootstrapModeChanged();
+            const selected = banner.textContent;
+            mode.value = 'follow';
+            await bootstrapModeChanged();
+            return {initial, selected, restored: banner.textContent, statusRequests};
+        }"""
+    )
+
+    assert result["initial"].startswith("Follow mode")
+    assert result["selected"].startswith("Bootstrap selected")
+    assert result["restored"].startswith("Follow mode")
+    assert result["statusRequests"] == 2
+
+
+def test_bootstrap_banner_shows_minutes_near_expiry(page):
+    """A campaign with minutes left must not look like it has an hour left."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    label = page.evaluate(
+        """() => {
+            const now = Date.parse('2030-01-01T12:00:00Z');
+            const originalNow = Date.now;
+            Date.now = () => now;
+            try {
+                currentCAT = { ticker_id: 'MZ_XCH' };
+                bot_state = {};
+                _bootstrapRenderStatus({
+                    active: true,
+                    identity: { ticker: 'MZ_XCH' },
+                    campaign: {
+                        campaign_id: 'near-expiry',
+                        asset_id: 'b8'.repeat(32),
+                        stage: 'bootstrap',
+                        deployment_fraction: '0.1',
+                        expires_at: '2030-01-01T12:14:00Z',
+                        revision: 0,
+                        minimum_price: '0.0000375',
+                        maximum_price: '0.00015',
+                        xch_budget: '0.9',
+                        cat_budget: '12000',
+                        fee_budget_xch: '0.001',
+                    },
+                });
+                return document.getElementById('bootstrapGlobalStatus').textContent;
+            } finally {
+                Date.now = originalNow;
+            }
+        }"""
+    )
+
+    assert "14m remaining" in label
+    assert "1h remaining" not in label
+
+
+def test_expired_bootstrap_banner_blocks_start_and_surfaces_cancel_action(page):
+    """Expired active Bootstrap authority must be visibly fail-closed."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'b8'.repeat(32);
+            const observed = new Date().toISOString();
+            const selector = document.getElementById('catSelector');
+            selector.innerHTML = `<option value="${assetId}" data-ticker="MZ_XCH" data-name="Monkeyzoo Token">MZ</option>`;
+            selector.value = assetId;
+            _pairSelectedByUser = true;
+            currentCAT = {
+                asset_id: assetId,
+                wallet_id: 2,
+                ticker_id: 'MZ_XCH',
+                name: 'Monkeyzoo Token',
+            };
+            settingsReviewed = true;
+            coinPrepStatus = 'done';
+            bot_state = {
+                running: false,
+                runtime_safety: {
+                    allowed: true,
+                    reason_code: '',
+                    lease: {active: true, owned_by_this_run: true},
+                    recovery: {
+                        freshness: {
+                            valid: true,
+                            age_seconds: 0,
+                            max_age_seconds: SAFETY_DIAGNOSTICS_MAX_AGE_SECONDS,
+                            provenance: 'live_gate_and_durable_snapshot',
+                            observed_at_utc: observed,
+                        },
+                    },
+                },
+            };
+            _bootstrapRenderStatus({
+                success: true,
+                active: true,
+                needs_attention: true,
+                identity: { ticker: 'MZ_XCH' },
+                campaign: {
+                    campaign_id: 'expired-campaign',
+                    asset_id: assetId,
+                    stage: 'bootstrap',
+                    deployment_fraction: '0.1',
+                    expires_at: '2000-01-01T00:00:00Z',
+                    revision: 4,
+                    minimum_price: '0.0000375',
+                    maximum_price: '0.00015',
+                    xch_budget: '0.9',
+                    cat_budget: '12000',
+                    fee_budget_xch: '0.01',
+                    expired: true,
+                    cancel_required: true,
+                    cancel_reason: 'bootstrap_expired',
+                    manual_restart_required: true,
+                    open_offer_count: 6,
+                    active_authority_retained: true,
+                },
+            });
+            checkSettingsReviewed();
+            return {
+                globalStatus: document.getElementById('bootstrapGlobalStatus').textContent,
+                dashboardStatus: document.getElementById('bootstrapDashboardStatus').textContent,
+                canStart: canAttemptBotStart(),
+                safety: getStartSafetyState(),
+                startDisabled: document.getElementById('startBtn').disabled,
+            };
+        }"""
+    )
+
+    assert result["startDisabled"] is True
+    assert result["canStart"] is False
+    assert result["safety"]["allowed"] is False
+    assert "expired" in result["globalStatus"].lower()
+    assert "cancel" in result["globalStatus"].lower()
+    assert "6" in result["globalStatus"]
+    assert "requires cancellation" in result["dashboardStatus"].lower()
+
+
 def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(page):
     """Confidence arriving after dashboard data must immediately reconcile the card."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -843,7 +1760,8 @@ def test_late_red_confidence_refreshes_an_already_rendered_green_health_card(pag
 def test_market_intel_refreshes_splash_node_after_supervisor_restart(
     flask_server, page
 ):
-    """A visible Market Intel tab must replace a dead Splash PID without reload."""
+    """Visible Splash status refreshes its PID after a supervisor restart."""
+
     page.goto(flask_server, wait_until="domcontentloaded")
     reveal_app_shell_for_nav(page)
     page.evaluate(
@@ -1131,7 +2049,20 @@ def test_coin_prep_open_offer_conflict_prompts_for_confirmed_cancellation(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: false, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 if (!String(path).includes('/coin-prep/trigger')) {
                     throw new Error(`Unexpected test request: ${path}`);
                 }
@@ -1185,7 +2116,21 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
                 action: 'proceed',
                 resets: { pnl: true, offers: false, counters: false },
             });
-            apiFetch = async () => new Response(JSON.stringify({
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify({
                 success: false,
                 error: 'coin_prep_requires_offer_cancellation',
                 reason: 'OPEN_OFFERS_REQUIRE_CANCELLATION',
@@ -1198,7 +2143,8 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
             }), {
                 status: 409,
                 headers: { 'Content-Type': 'application/json' },
-            });
+                });
+            };
             await startCoinPrepFromModal();
         }"""
     )
@@ -1223,8 +2169,21 @@ def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
                 action: 'proceed',
                 resets: { pnl: false, offers: true, counters: false },
             });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
             window.__submittedPrepPayload = null;
             apiFetch = async (_path, options) => {
+                if (String(_path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
                 window.__submittedPrepPayload = JSON.parse(options.body);
                 return new Response(JSON.stringify({
                     success: false,
@@ -1291,9 +2250,24 @@ def test_coin_prep_rejected_start_shows_persistent_error_not_checking(
             askPrepHistoryChoice = async () => ({
                 action: 'proceed', resets: { pnl: false, offers: true, counters: true },
             });
-            apiFetch = async () => new Response(JSON.stringify(failure), {
-                status: 423, headers: { 'Content-Type': 'application/json' },
-            });
+            _coinPrepFeePreview = {
+                preview_id: 'a'.repeat(64), funded: true,
+                estimated_cancellation_fee_mojos: '20',
+                estimated_total_fee_mojos: '40',
+                observed_at: Date.now() / 1000,
+                expires_at: Date.now() / 1000 + 60,
+            };
+            document.getElementById('cpFeeMaximumInput').value = '0.000000000080';
+            apiFetch = async (path) => {
+                if (String(path).includes('/coin-prep/fee-approval')) {
+                    return new Response(JSON.stringify({
+                        success: true, approval_id: 'd'.repeat(64), dispatch_authorized: false,
+                    }), {status: 200});
+                }
+                return new Response(JSON.stringify(failure), {
+                    status: 423, headers: { 'Content-Type': 'application/json' },
+                });
+            };
             await startCoinPrepFromModal();
         }""",
         failure,
@@ -1562,6 +2536,370 @@ def test_generic_cancel_all_explicitly_covers_every_live_sage_offer(page):
     )
 
 
+def test_shutdown_cancel_consent_names_wallet_wide_untracked_scope(page):
+    """Shutdown consent must describe wallet-wide scope without naming one backend."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate("showShutdownModal()")
+    page.locator("#shutdownCancelOffers").check()
+
+    checkbox_label = page.locator("label").filter(
+        has=page.locator("#shutdownCancelOffers")
+    )
+    expect(checkbox_label).to_contain_text("wallet offers")
+    expect(checkbox_label).not_to_contain_text("Sage")
+    expect(page.locator("#shutdownCancelWarning")).to_contain_text(
+        "all currently active offers in the connected wallet"
+    )
+    expect(page.locator("#shutdownCancelWarning")).to_contain_text(
+        "including offers created manually or not tracked by CATalyst"
+    )
+    expect(page.locator("#shutdownCancelWarning")).not_to_contain_text("on Dexie")
+    expect(page.locator("#shutdownCancelWarning")).not_to_contain_text("Sage")
+
+    confirm_source = page.evaluate("confirmShutdown.toString()")
+    assert "Sending cancel request to wallet..." in confirm_source
+    assert "Sending cancel request to Sage..." not in confirm_source
+
+
+def test_shutdown_stop_step_reports_only_observed_bot_state(page):
+    """The client poll must not claim it proved every background worker stopped."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    html = gui.read_text(encoding="utf-8")
+
+    assert "Bot reports stop complete." in html
+    assert "Server shutdown will separately verify remaining cleanup." in html
+    assert "Bot loop and background workers stopped." not in html
+    assert "Bot stop completed authoritatively" not in html
+
+
+def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping(page):
+    """Shutdown must observe the reported stop state before cancellation."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const calls = [];
+            const steps = [];
+            const progress = [];
+            let stateReads = 0;
+            let cancelAttempts = 0;
+
+            document.getElementById('shutdownCancelOffers').checked = true;
+            document.getElementById('shutdownCancelConfirmed').value = 'yes';
+            setShutdownStep = (name, status, detail) => {
+                steps.push({name, status, detail, callCount: calls.length});
+            };
+            updateShutdownProgress = (title, detail) => progress.push({title, detail});
+            addLogEntry = () => {};
+            startShutdownCancelAllPoll = () => {};
+            stopShutdownCancelAllPoll = () => {};
+            startupWaitForBackendShutdown = async () => true;
+            closeDesktopWindowAfterShutdown = async () => true;
+
+            apiFetch = async (path) => {
+                calls.push(path);
+                if (path.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({status: 'stopping'}), {status: 202});
+                }
+                if (path.endsWith('/bot/state')) {
+                    stateReads += 1;
+                    return new Response(JSON.stringify({
+                        status: stateReads < 2 ? 'stopping' : 'blocked',
+                        running: false,
+                        error: stateReads < 2 ? null : 'Startup preflight was blocked.'
+                    }), {status: 200});
+                }
+                if (path.endsWith('/offers/cancel_all')) {
+                    cancelAttempts += 1;
+                    if (cancelAttempts === 1) {
+                        return new Response(JSON.stringify({
+                            success: false,
+                            error: 'Bot stop is still completing; retry Cancel All after it finishes.',
+                            reason: 'BOT_STOPPING',
+                            retryable: true
+                        }), {status: 409});
+                    }
+                    return new Response(JSON.stringify({
+                        success: true,
+                        async: false,
+                        cancelled: 0
+                    }), {status: 200});
+                }
+                if (path.endsWith('/shutdown')) {
+                    return new Response(JSON.stringify({success: true}), {status: 200});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+
+            await confirmShutdown();
+            return {calls, steps, progress, stateReads, cancelAttempts};
+        }"""
+    )
+
+    shutdown_calls = [
+        path
+        for path in result["calls"]
+        if path
+        in {
+            "/api/bot/stop",
+            "/api/bot/state",
+            "/api/offers/cancel_all",
+            "/api/shutdown",
+        }
+    ]
+    assert shutdown_calls[:5] == [
+        "/api/bot/stop",
+        "/api/bot/state",
+        "/api/bot/state",
+        "/api/offers/cancel_all",
+        "/api/offers/cancel_all",
+    ]
+    assert result["stateReads"] == 2
+    assert result["cancelAttempts"] == 2
+    stop_done = next(
+        step
+        for step in result["steps"]
+        if step["name"] == "Stop" and step["status"] == "done"
+    )
+    assert stop_done["callCount"] >= 3
+    assert any(
+        "finishing" in str(item["detail"]).lower() for item in result["progress"]
+    )
+    assert any("retry" in str(item["detail"]).lower() for item in result["progress"])
+
+
+def test_shutdown_does_not_close_native_window_while_backend_is_alive(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let closeCalls = 0;
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            window.pywebview = {
+                api: {confirm_close_window: async () => {
+                    closeCalls += 1;
+                    return {success: true};
+                }}
+            };
+            try {
+                const closed = await closeDesktopWindowAfterShutdown({backendStopped: false});
+                return {closed, closeCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result == {"closed": False, "closeCalls": 0}
+
+
+def test_shutdown_rejection_keeps_native_window_open(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let closeCalls = 0;
+            const steps = [];
+            document.getElementById('shutdownCancelOffers').checked = false;
+            addLogEntry = () => {};
+            waitForShutdownBotStop = async () => true;
+            startupWaitForBackendShutdown = async () => {
+                throw new Error('A rejected shutdown must not wait for backend death.');
+            };
+            closeDesktopWindowAfterShutdown = async () => {
+                closeCalls += 1;
+                return true;
+            };
+            setShutdownStep = (name, status, detail) => steps.push({name, status, detail});
+            apiFetch = async (path) => {
+                if (path.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({success: true}), {status: 200});
+                }
+                if (path.endsWith('/shutdown')) {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        reason: 'CANCEL_ALL_IN_PROGRESS',
+                        error: 'Wait for authoritative Cancel All proof before shutdown'
+                    }), {status: 409});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+            await confirmShutdown();
+            return {closeCalls, steps};
+        }"""
+    )
+    assert result["closeCalls"] == 0
+    assert any(
+        step["name"] == "Server" and step["status"] == "error"
+        for step in result["steps"]
+    )
+
+
+def test_shutdown_health_error_is_not_process_exit(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalFetch = window.fetch;
+            let probes = 0;
+            window.fetch = async () => {
+                probes += 1;
+                return new Response('{}', {status: 503});
+            };
+            try {
+                return {stopped: await startupWaitForBackendShutdown(650), probes};
+            } finally {
+                window.fetch = originalFetch;
+            }
+        }"""
+    )
+    assert result["stopped"] is False
+    assert result["probes"] >= 2
+
+
+def test_native_close_refusal_does_not_use_fallback(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            let fallbackCalls = 0;
+            window.pywebview = {api: {
+                confirm_close_window: async () => ({success: false, reason: 'mutations_in_flight'}),
+                close_window: async () => {fallbackCalls += 1; return {success: true};}
+            }};
+            try {
+                const closed = await closeDesktopWindowAfterShutdown({backendStopped: true});
+                return {closed, fallbackCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result == {"closed": False, "fallbackCalls": 0}
+
+
+def test_first_launch_close_uses_native_proof_if_backend_stays_alive(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const originalDesktop = window.pywebview;
+            const wasDesktop = IS_DESKTOP;
+            IS_DESKTOP = true;
+            let proofCalls = 0;
+            window.pywebview = {api: {
+                confirm_close_window: async () => {
+                    proofCalls += 1;
+                    return {success: true};
+                }
+            }};
+            apiFetch = async () => new Response(JSON.stringify({success: true}), {status: 200});
+            startupWaitForBackendShutdown = async () => false;
+            try {
+                await startupCloseFromRiskDisclosure();
+                return {proofCalls};
+            } finally {
+                window.pywebview = originalDesktop;
+                IS_DESKTOP = wasDesktop;
+            }
+        }"""
+    )
+    assert result["proofCalls"] == 1
+
+
+def test_shutdown_stop_poll_times_out_fail_closed(page):
+    """A stop that never becomes authoritative must not proceed to cancellation."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            let calls = 0;
+            apiFetch = async () => {
+                calls += 1;
+                return new Response(JSON.stringify({
+                    status: 'stopping',
+                    running: false
+                }), {status: 200});
+            };
+            updateShutdownProgress = () => {};
+            try {
+                await waitForShutdownBotStop(15, 1);
+                return {resolved: true, calls};
+            } catch (error) {
+                return {resolved: false, calls, message: error.message};
+            }
+        }"""
+    )
+    assert result["resolved"] is False
+    assert result["calls"] >= 1
+    assert "timed out" in result["message"].lower()
+
+
+def test_shutdown_cancel_retry_is_bounded_and_rejects_other_errors(page):
+    """Only retryable BOT_STOPPING conflicts may retry, and never forever."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            updateShutdownProgress = () => {};
+            let mode = 'other';
+            let calls = 0;
+            apiFetch = async () => {
+                calls += 1;
+                if (mode === 'other') {
+                    return new Response(JSON.stringify({
+                        success: false,
+                        error: 'Wallet unavailable',
+                        reason: 'WALLET_UNAVAILABLE',
+                        retryable: false
+                    }), {status: 503});
+                }
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'Bot stop is still completing; retry Cancel All after it finishes.',
+                    reason: 'BOT_STOPPING',
+                    retryable: true
+                }), {status: 409});
+            };
+
+            let otherMessage = '';
+            try {
+                await requestShutdownCancelAllAfterStop(15, 1);
+            } catch (error) {
+                otherMessage = error.message;
+            }
+            const otherCalls = calls;
+
+            mode = 'stopping';
+            calls = 0;
+            let timeoutMessage = '';
+            try {
+                await requestShutdownCancelAllAfterStop(15, 1);
+            } catch (error) {
+                timeoutMessage = error.message;
+            }
+            return {otherMessage, otherCalls, timeoutMessage, timeoutCalls: calls};
+        }"""
+    )
+    assert result["otherMessage"] == "Wallet unavailable"
+    assert result["otherCalls"] == 1
+    assert "timed out" in result["timeoutMessage"].lower()
+    assert result["timeoutCalls"] >= 1
+
+
 def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
     """Submitted cancels must be proven terminal before prep starts automatically."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -1599,6 +2937,7 @@ def test_coin_prep_waits_for_authoritative_cancel_then_starts(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,
@@ -1807,6 +3146,7 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
                 source: 'coin_prep',
                 prepPayload: {
                     coin_multiplier: 1,
+                    fee_approval_id: 'd'.repeat(64),
                     reset_pnl: false,
                     reset_offer_history: false,
                     reset_counters: false,

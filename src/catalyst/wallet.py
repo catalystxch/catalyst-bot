@@ -161,6 +161,7 @@ else:
     from wallet_sage import (  # noqa: F401
         # Constants
         WALLET_ID_XCH,
+        SAGE_ACTIVE_CAT_WALLET_ID,
         WALLET_URL,
         CERT_PATH,
         KEY_PATH,
@@ -203,6 +204,8 @@ else:
         cleanup_expired_offers,
         get_all_offers,
         get_authoritative_offer_history,
+        get_authoritative_offers_by_ids,
+        get_authoritative_offer_absence_by_ids,
         get_offer_bech32,
         classify_offers_from_list,
         classify_open_offers_for_pair,
@@ -1251,6 +1254,13 @@ def get_wallet_balance(wallet_id: int):
     return _wallet_adapter.get_wallet_balance(wallet_id)
 
 
+def get_cat_metadata_snapshot():
+    """Read actual Sage CAT metadata without configured discovery fallbacks."""
+    if WALLET_TYPE != "sage":
+        return {"success": False, "reason": "WALLET_BACKEND_UNSUPPORTED"}
+    return _wallet_adapter.rpc("get_cats", {}, timeout=10)
+
+
 def get_current_key():
     """Return the active key through the backend-neutral read-only facade."""
 
@@ -1507,6 +1517,7 @@ def cancel_offers_batch(
     *,
     source_coin_ids: list = None,
     fee_coin_id: str = None,
+    _validated_unsigned: dict = None,
     _cancel_continuation=None,
     _cancel_operation_id: str = None,
     _cancel_intent_id: str = None,
@@ -1542,6 +1553,12 @@ def cancel_offers_batch(
     if any(value is not None for value in continuation_arguments):
         if not all(value is not None for value in continuation_arguments):
             return blocked_batch()
+        callback_kwargs = {
+            "source_coin_ids": source_coin_ids,
+            "fee_coin_id": fee_coin_id,
+        }
+        if _validated_unsigned is not None:
+            callback_kwargs["_validated_unsigned"] = _validated_unsigned
         return _run_offer_operation_continuation(
             _cancel_continuation,
             _cancel_operation_id,
@@ -1556,10 +1573,7 @@ def cancel_offers_batch(
                 fee_mojos,
                 skip_confirmation,
             ),
-            callback_kwargs={
-                "source_coin_ids": source_coin_ids,
-                "fee_coin_id": fee_coin_id,
-            },
+            callback_kwargs=callback_kwargs,
             target_trade_id=_cancel_trade_id,
         )
     return {
@@ -1626,6 +1640,51 @@ def build_transaction_rpc(selected_coin_ids: list, actions: list):
         return _blocked_mutation("WALLET_MUTATION_FAILED")
 
 
+def build_cancel_offers_batch_unsigned(
+    trade_ids: list,
+    *,
+    fee_mojos: int,
+    source_coin_ids: list,
+    fee_coin_id: str,
+):
+    """Build and exactly cost a Sage cancel cohort without signing it."""
+
+    callback = getattr(_wallet_adapter, "build_cancel_offers_batch_unsigned", None)
+    if WALLET_TYPE != "sage" or not callable(callback):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    try:
+        binding, adapter = _expected_identity_authority()
+
+        def identity_recheck(step: str) -> None:
+            with _wallet_identity_observation_lock:
+                _revalidate_adapter_authority(
+                    adapter, f"wallet:unsigned_cancel_build:{step}"
+                )
+                mutation_gate.require_fresh_wallet_identity(
+                    binding,
+                    _identity_from_adapter(adapter),
+                    f"wallet:unsigned_cancel_build:{step}",
+                )
+
+        identity_recheck("identity")
+        result = callback(
+            trade_ids,
+            fee_mojos=fee_mojos,
+            source_coin_ids=source_coin_ids,
+            fee_coin_id=fee_coin_id,
+            _identity_recheck=identity_recheck,
+        )
+        return (
+            result
+            if type(result) is dict
+            else _blocked_mutation("WALLET_MUTATION_FAILED")
+        )
+    except mutation_gate.MutationBlocked as exc:
+        return _blocked_mutation(exc.reason_code)
+    except Exception:
+        return _blocked_mutation("WALLET_MUTATION_FAILED")
+
+
 def validate_unsigned_transaction_effect(result: dict, contract: dict):
     callback = getattr(_wallet_adapter, "validate_unsigned_transaction_effect", None)
     if WALLET_TYPE != "sage" or not callable(callback):
@@ -1638,6 +1697,13 @@ def estimate_unsigned_transaction_cost(result: dict):
     if WALLET_TYPE != "sage" or not callable(callback):
         return None
     return callback(result)
+
+
+def inspect_unsigned_transaction_effect(result: dict, contract: dict):
+    callback = getattr(_wallet_adapter, "inspect_unsigned_transaction_effect", None)
+    if WALLET_TYPE != "sage" or not callable(callback):
+        return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+    return callback(result, contract)
 
 
 def submit_built_transaction_rpc(validated_result: dict):

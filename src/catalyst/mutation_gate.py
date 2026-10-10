@@ -137,10 +137,11 @@ _TERMINAL_PROCESS_FENCES = frozenset(
 )
 
 # SQLite's configured busy timeout can consume roughly five seconds per lease
-# write.  Four bounded attempts fit inside the remaining lease window when the
-# normal heartbeat starts one third into a 30-second lease, while letting a
-# short burst of bot shutdown writes drain without permanently fencing the run.
+# write. Four bounded attempts can drain a short burst of bot shutdown writes
+# within the 90-second process lease. The normal heartbeat cadence stays at
+# 10 seconds; worker authority retains a 30-second heartbeat-freshness limit.
 _HEARTBEAT_MAX_ATTEMPTS = 4
+_WORKER_PARENT_HEARTBEAT_MAX_AGE_SECONDS = 30
 
 
 def _market_authority_failure(reason_code: str) -> dict[str, Any]:
@@ -692,7 +693,7 @@ def _is_exact_cancel_wallet_effect(
         or value["timeout"] != 60
         or type(fee_mojos) is not int
         or isinstance(fee_mojos, bool)
-        or fee_mojos <= 0
+        or fee_mojos < 0
         or type(batch) is not dict
         or set(batch)
         != {
@@ -710,7 +711,7 @@ def _is_exact_cancel_wallet_effect(
     if (
         type(trade_ids) is not list
         or type(source_coin_ids) is not list
-        or len(trade_ids) < 2
+        or len(trade_ids) < 1
         or len(trade_ids) != len(source_coin_ids)
         or len(set(trade_ids)) != len(trade_ids)
         or len(set(source_coin_ids)) != len(source_coin_ids)
@@ -956,7 +957,7 @@ def _is_exact_prepared_operation_blocker(
                 or attempt < 1
                 or type(cohort_size) is not int
                 or isinstance(cohort_size, bool)
-                or cohort_size < 2
+                or cohort_size < 1
                 or evidence["operation_id"] != event["operation_id"]
                 or evidence["intent_id"] != event["intent_id"]
                 or event["operation_id"] != f"cancel:{trade_id}"
@@ -1181,8 +1182,10 @@ def pid_liveness(pid: int, owner_host: str) -> Optional[bool]:
         safe_host = _exact_text(owner_host, "owner_host")
     except ValueError:
         return None
-    local_names = {socket.gethostname().casefold(), socket.getfqdn().casefold()}
-    if safe_host.casefold() not in local_names:
+    from local_host_identity import is_local_host
+
+    if not is_local_host(safe_host):
+        # Missing local identity is uncertainty, never evidence of a dead owner.
         return None
     if safe_pid == os.getpid():
         return True
@@ -1281,7 +1284,7 @@ class MutationGate:
         owner_host: str,
         wallet_fingerprint_hash: str,
         network: str,
-        lease_seconds: int = 30,
+        lease_seconds: int = 90,
         clock: Callable[[], datetime] = _utc_now,
         pid_liveness: Callable[[int, str], Optional[bool]] = pid_liveness,
         read_only: bool = False,
@@ -1576,11 +1579,21 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=expiry,
+                    lease_duration_seconds=self.lease_seconds,
                     now=now,
                     allow_expired_takeover=allow_takeover,
                     expected_lease_version=expected_version,
                 )
                 result = _lease_public_result(result)
+                if (
+                    result.get("acquired")
+                    and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                ):
+                    result = result | {
+                        "acquired": False,
+                        "reason": "lease_expired",
+                    }
+                    self._set_local_block("LEASE_EXPIRED")
                 if result.get("acquired"):
                     lease = result["lease"]
                     self._lease_version = int(lease["lease_version"])
@@ -1667,6 +1680,7 @@ class MutationGate:
                     wallet_fingerprint_hash=self.wallet_fingerprint_hash,
                     network=self.network,
                     lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    lease_duration_seconds=self.lease_seconds,
                     expected_lease_version=int(current["lease_version"]),
                     prior_owner_liveness_proven_dead=prior_dead,
                     now=now,
@@ -1677,6 +1691,13 @@ class MutationGate:
                     "lease": adopted.get("lease"),
                     "recovery_takeover": adopted.get("record"),
                 }
+                if (
+                    result["acquired"]
+                    and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                ):
+                    result["acquired"] = False
+                    result["reason"] = "lease_expired"
+                    self._set_local_block("LEASE_EXPIRED")
                 if result["acquired"]:
                     lease = result["lease"]
                     self._lease_version = int(lease["lease_version"])
@@ -1815,24 +1836,29 @@ class MutationGate:
         Mutation boundaries continue to use :meth:`status`, which mirrors any
         durable stop into process memory and invokes the stop handler.  A GET
         diagnostics request must not create that state transition merely by
-        sampling a short-lived worker reconciliation latch.
+        sampling a short-lived worker reconciliation latch. Keep durable reads
+        outside the gate lock so a slow diagnostic cannot starve the heartbeat.
         """
 
-        with self._lock:
-            try:
+        try:
+            for attempt in range(2):
                 authorization = self._authorization_snapshot()
-                return self._status_from_rows(
+                current = self._status_from_rows(
                     authorization["latch"],
                     authorization["lease"],
                     authorization["unresolved"],
                     mirror_process_fence=False,
                 )
-            except Exception:
-                return GateStatus(
-                    allowed=False,
-                    reason_code="DURABLE_STATE_UNAVAILABLE",
-                    source="durable_read",
-                )
+                # A concurrent heartbeat may advance the version after the
+                # snapshot. Retry once instead of reporting a false lease loss.
+                if current.reason_code != "LEASE_LOST" or attempt:
+                    return current
+        except Exception:
+            return GateStatus(
+                allowed=False,
+                reason_code="DURABLE_STATE_UNAVAILABLE",
+                source="durable_read",
+            )
 
     def require_allowed(self, operation: str) -> GateStatus:
         current = self.status()
@@ -2231,35 +2257,130 @@ class MutationGate:
 
     @_stop_callback_boundary
     def heartbeat(self) -> dict[str, Any]:
-        with self._lock:
-            version = self._lease_version
-            if version is None:
+        started = time.monotonic()
+        lock_acquired = started
+        attempts: list[dict[str, Any]] = []
+        outcome = "unexpected_exception"
+        try:
+            with self._lock:
+                lock_acquired = time.monotonic()
+                version = self._lease_version
+                if version is None:
+                    self._set_local_block("HEARTBEAT_FAILED")
+                    outcome = "not_owned"
+                    return {"heartbeat": False, "reason": outcome}
+                result = {"heartbeat": False, "reason": "durable_state_unavailable"}
+                for attempt in range(_HEARTBEAT_MAX_ATTEMPTS):
+                    now = self._now()
+                    attempt_started = time.monotonic()
+                    try:
+                        result = database.heartbeat_runtime_mutation_lease(
+                            owner_run_id=self.run_id,
+                            expected_lease_version=version,
+                            heartbeat_at=now,
+                            lease_expires_at=now
+                            + timedelta(seconds=self.lease_seconds),
+                            lease_duration_seconds=self.lease_seconds,
+                        )
+                        result = _lease_public_result(result)
+                        database_ms = result.pop("database_ms", None)
+                        if (
+                            result.get("heartbeat")
+                            and _as_utc(result["lease"]["expires_at"]) <= self._now()
+                        ):
+                            # The process may have been suspended after the
+                            # durable commit but before this thread resumed.
+                            result = result | {
+                                "heartbeat": False,
+                                "reason": "lease_expired",
+                            }
+                        attempt_record = {
+                            "elapsed_ms": round(
+                                (time.monotonic() - attempt_started) * 1000, 1
+                            ),
+                            "outcome": str(result.get("reason") or "unknown"),
+                        }
+                        if type(database_ms) is dict and all(
+                            type(database_ms.get(stage)) is int
+                            and database_ms[stage] >= 0
+                            for stage in (
+                                "connection",
+                                "begin",
+                                "read",
+                                "update",
+                                "readback",
+                                "commit",
+                                "finish",
+                                "close",
+                            )
+                        ):
+                            attempt_record["database_ms"] = {
+                                stage: database_ms[stage]
+                                for stage in (
+                                    "connection",
+                                    "begin",
+                                    "read",
+                                    "update",
+                                    "readback",
+                                    "commit",
+                                    "finish",
+                                    "close",
+                                )
+                            }
+                        attempts.append(attempt_record)
+                    except Exception as exc:
+                        failure = {
+                            "elapsed_ms": round(
+                                (time.monotonic() - attempt_started) * 1000, 1
+                            ),
+                            "exception_type": type(exc).__name__,
+                        }
+                        sqlite_errorcode = getattr(exc, "sqlite_errorcode", None)
+                        if type(sqlite_errorcode) is int:
+                            failure["sqlite_errorcode"] = sqlite_errorcode
+                        attempts.append(failure)
+                        if attempt + 1 < _HEARTBEAT_MAX_ATTEMPTS:
+                            continue
+                        result = {
+                            "heartbeat": False,
+                            "reason": "durable_state_unavailable",
+                        }
+                    if result.get("heartbeat"):
+                        self._lease_version = int(result["lease"]["lease_version"])
+                        outcome = "heartbeat"
+                        return result
+                    break
                 self._set_local_block("HEARTBEAT_FAILED")
-                return {"heartbeat": False, "reason": "not_owned"}
-            result = {"heartbeat": False, "reason": "durable_state_unavailable"}
-            for attempt in range(_HEARTBEAT_MAX_ATTEMPTS):
-                now = self._now()
-                try:
-                    result = database.heartbeat_runtime_mutation_lease(
-                        owner_run_id=self.run_id,
-                        expected_lease_version=version,
-                        heartbeat_at=now,
-                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
-                    )
-                    result = _lease_public_result(result)
-                except Exception:
-                    if attempt + 1 < _HEARTBEAT_MAX_ATTEMPTS:
-                        continue
-                    result = {
-                        "heartbeat": False,
-                        "reason": "durable_state_unavailable",
-                    }
-                if result.get("heartbeat"):
-                    self._lease_version = int(result["lease"]["lease_version"])
-                    return result
-                break
-            self._set_local_block("HEARTBEAT_FAILED")
-            return result
+                outcome = str(result.get("reason") or "unknown")
+                return result
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            if outcome != "heartbeat":
+                # A slow logging sink must not delay the emergency stop.
+                # The boundary wrapper's later flush is harmlessly empty.
+                self._flush_stop_handler()
+            # The failure log must distinguish a delayed thread, local lock
+            # contention, and a slow/failed SQLite attempt. Keep exception
+            # messages out of durable logs because they can contain paths.
+            level = (
+                "error"
+                if outcome != "heartbeat"
+                else ("warn" if elapsed_ms >= 5000 else "debug")
+            )
+            try:
+                slog(
+                    "SAFETY",
+                    "Mutation lease heartbeat timing",
+                    {
+                        "outcome": outcome,
+                        "lock_wait_ms": round((lock_acquired - started) * 1000, 1),
+                        "elapsed_ms": elapsed_ms,
+                        "attempts": attempts,
+                    },
+                    level=level,
+                )
+            except Exception:
+                pass  # Diagnostics must not change the fail-closed result.
 
     def start_heartbeat(self, interval_seconds: Optional[float] = None) -> bool:
         with self._lock:
@@ -2268,7 +2389,7 @@ class MutationGate:
             interval = (
                 float(interval_seconds)
                 if interval_seconds is not None
-                else max(1.0, self.lease_seconds / 3)
+                else min(10.0, max(1.0, self.lease_seconds / 3))
             )
             if interval <= 0 or interval >= self.lease_seconds:
                 raise ValueError("heartbeat interval must be within the lease duration")
@@ -2276,7 +2397,24 @@ class MutationGate:
 
             def run() -> None:
                 while not self._heartbeat_stop.wait(interval):
-                    if not self.heartbeat().get("heartbeat"):
+                    try:
+                        renewed = self.heartbeat().get("heartbeat")
+                    except BaseException as exc:
+                        # An unexpected worker exception must not leave an
+                        # apparently authorized process with no renewer.
+                        self._set_local_block("HEARTBEAT_FAILED")
+                        self._flush_stop_handler()
+                        try:
+                            slog(
+                                "SAFETY",
+                                "Mutation lease heartbeat worker failed",
+                                {"exception_type": type(exc).__name__},
+                                level="error",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if not renewed:
                         return
 
             self._heartbeat_thread = threading.Thread(
@@ -2457,12 +2595,15 @@ class MutationGate:
             else self.wallet_fingerprint_hash,
             network=network if network is not None else self.network,
             now=self._now(),
+            now_after_read=self._now,
         )
 
     def validate_worker_environment(
         self, environment: Mapping[str, str]
     ) -> dict[str, Any]:
-        return validate_worker_environment(environment, now=self._now())
+        return _validate_worker_environment(
+            environment, now=self._now(), now_after_read=self._now
+        )
 
     def revoke_worker_delegation(self, delegation: WorkerDelegation) -> dict[str, Any]:
         if type(delegation) is not WorkerDelegation:
@@ -2490,6 +2631,7 @@ def _validate_worker_delegation(
     wallet_fingerprint_hash: Any,
     network: Any,
     now: datetime,
+    now_after_read: Optional[Callable[[], datetime]] = None,
     wallet_identity_payload: Any = None,
     wallet_identity_digest: Any = None,
     parent_lease_epoch: Any = None,
@@ -2523,6 +2665,13 @@ def _validate_worker_delegation(
         )
         row = authorization["delegation"]
         if row is None:
+            return _invalid_worker()
+        # A read can stall across a host snapshot. Authorize against the time
+        # after it returns, not only the time captured before SQLite opened.
+        verified_now = max(
+            now, _as_utc(now_after_read()) if now_after_read is not None else now
+        )
+        if _as_utc(row.get("expires_at")) <= verified_now:
             return _invalid_worker()
         if not hmac.compare_digest(
             str(row.get("worker_id") or ""), values["worker_id"]
@@ -2616,7 +2765,15 @@ def _validate_worker_delegation(
         )
         if actual != expected:
             return _invalid_worker("parent_lease_invalid")
-        if _as_utc(lease.get("expires_at")) <= now:
+        if _as_utc(lease.get("expires_at")) <= verified_now:
+            return _invalid_worker("parent_lease_invalid")
+        # The parent may hold a longer process lease to survive a snapshot,
+        # but a delegated worker must not gain a longer orphan-effect window.
+        if (
+            _as_utc(lease.get("heartbeat_at"))
+            + timedelta(seconds=_WORKER_PARENT_HEARTBEAT_MAX_AGE_SECONDS)
+            <= verified_now
+        ):
             return _invalid_worker("parent_lease_invalid")
         return {
             "allowed": True,
@@ -2637,6 +2794,7 @@ def _validate_worker_environment(
     environment: Mapping[str, str],
     *,
     now: Optional[datetime] = None,
+    now_after_read: Optional[Callable[[], datetime]] = None,
     allowed_blocking_operation_id: Optional[str] = None,
     allowed_blocking_intent_id: Optional[str] = None,
     allowed_blocking_wallet_operation: str = "wallet:create_offer",
@@ -2645,6 +2803,7 @@ def _validate_worker_environment(
         return _invalid_worker()
     try:
         values = {name: environment.get(name) for name in _DELEGATION_ENV_NAMES}
+        clock = now_after_read or (_utc_now if now is None else lambda: _as_utc(now))
         return _validate_worker_delegation(
             delegation_id=values[DELEGATION_ID_ENV],
             raw_token=values[DELEGATION_TOKEN_ENV],
@@ -2657,7 +2816,8 @@ def _validate_worker_environment(
             wallet_identity_payload=values[DELEGATION_IDENTITY_ENV],
             wallet_identity_digest=values[DELEGATION_IDENTITY_DIGEST_ENV],
             parent_lease_epoch=values[DELEGATION_PARENT_EPOCH_ENV],
-            now=_as_utc(now or _utc_now()),
+            now=_as_utc(clock()),
+            now_after_read=clock,
             allowed_blocking_operation_id=allowed_blocking_operation_id,
             allowed_blocking_intent_id=allowed_blocking_intent_id,
             allowed_blocking_wallet_operation=allowed_blocking_wallet_operation,
@@ -3330,7 +3490,7 @@ def initialize(
     run_id: Optional[str] = None,
     owner_pid: Optional[int] = None,
     owner_host: Optional[str] = None,
-    lease_seconds: int = 30,
+    lease_seconds: int = 90,
     start_heartbeat: bool = True,
     acquire_lease: bool = True,
     wallet_identity_binding: Optional[WalletIdentityBinding] = None,

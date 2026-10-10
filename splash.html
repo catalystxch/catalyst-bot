@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
 <title>CATalyst</title>
 <style>
     html, body {
@@ -116,7 +117,12 @@
         // Flask is already accepting connections by the time desktop_app.py
         // creates this window, so a short delay (just long enough for the
         // splash to be visible and not feel jarring) is all we need.
-        const FLASK_URL = "http://127.0.0.1:5000/";
+        // The desktop process supplies a per-run credential in this file URL.
+        // Flask consumes it and redirects to a clean URL before rendering UI.
+        const bootstrap = new URLSearchParams(window.location.hash.slice(1)).get("bootstrap");
+        const FLASK_URL = bootstrap
+            ? `http://127.0.0.1:5000/?bootstrap=${encodeURIComponent(bootstrap)}`
+            : "http://127.0.0.1:5000/";
         const MIN_VISIBLE_MS = 3500;
         const start = Date.now();
         function go() {

@@ -1,10 +1,16 @@
+import hashlib
+from argparse import Namespace
 from pathlib import Path
 
+import pytest
 import yaml
+
+from scripts.sign_update_manifest import build_manifest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "publish-unsigned-windows-beta.yml"
+SIGNED_WORKFLOW = ROOT / ".github" / "workflows" / "build-release.yml"
 
 
 def load_workflow() -> dict:
@@ -39,10 +45,16 @@ def test_unsigned_beta_release_is_manual_and_uses_fixed_repositories():
     )
 
 
+def test_v140_beta_tag_cannot_trigger_stable_signed_release_workflow():
+    workflow = yaml.safe_load(SIGNED_WORKFLOW.read_text(encoding="utf-8"))
+    for job in ("build", "publish-release"):
+        assert "github.ref_name != 'v1.4.0'" in workflow["jobs"][job]["if"]
+
+
 def test_unsigned_bytes_are_proven_and_smoked_before_manifest_signing():
     ordered = [
         "Validate release tag",
-        "Download official Windows release assets",
+        "Build unsigned Windows installer from exact release tag",
         "Prove installer identity and unsigned status",
         "Install and smoke test the downloaded release",
         "Generate signed update metadata",
@@ -50,6 +62,14 @@ def test_unsigned_bytes_are_proven_and_smoked_before_manifest_signing():
     ]
     positions = [step_index(name) for name in ordered]
     assert positions == sorted(positions)
+
+    build = named_step("Build unsigned Windows installer from exact release tag")["run"]
+    assert "git checkout --detach" in build
+    assert "git rev-parse HEAD" in build
+    assert "python build.py" in build
+    assert "ISCC.exe" in build
+    assert "Get-FileHash" in build
+    assert "gh release download" not in WORKFLOW.read_text(encoding="utf-8")
 
     proof = named_step("Prove installer identity and unsigned status")["run"]
     assert "Get-FileHash" in proof
@@ -95,13 +115,16 @@ def test_unsigned_beta_keeps_signed_updater_metadata_without_fake_signature_evid
     assert "unsigned Windows beta" in script
 
 
-def test_publication_is_immutable_and_staged_before_becoming_latest():
+def test_publication_is_immutable_and_staged_as_prerelease():
     script = named_step("Publish unsigned beta update channel")["run"]
     assert "Release channel tag already exists" in script
     assert "--clobber" not in script
     assert "--draft" in script
     assert "gh release upload" in script
     assert "--draft=false" in script
+    assert "--prerelease" in script
+    assert "--latest=false" in script
+    assert "--latest\n" not in script
 
     existing_check = script.index("gh release view")
     draft_create = script.index("gh release create")
@@ -115,3 +138,39 @@ def test_release_tag_is_validated_as_an_immutable_main_ancestor():
     assert "refs/tags/$($env:RELEASE_REF)" in validation
     assert "merge-base --is-ancestor" in validation
     assert "git fetch" in validation
+    assert "isPrerelease" in validation
+
+
+def test_unsigned_beta_manifest_marks_beta_channel(tmp_path):
+    installer = tmp_path / "Catalyst-Setup-v1.4.0.exe"
+    installer.write_bytes(b"unsigned beta installer fixture")
+    digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+    sidecar = tmp_path / f"{installer.name}.sha256"
+    sidecar.write_text(f"{digest}  {installer.name}\n", encoding="utf-8")
+    args = Namespace(
+        version="v1.4.0",
+        channel="beta",
+        installer=installer,
+        sha256_file=sidecar,
+        download_base_url="https://github.com/Lowestofttim/catalyst-releases/releases/download/v1.4.0",
+        release_url="https://github.com/Lowestofttim/catalyst-releases/releases/tag/v1.4.0",
+        release_notes_file=None,
+        expires_days=90,
+        source_commit="a" * 40,
+    )
+
+    manifest = build_manifest(args)
+
+    assert manifest["channel"] == "beta"
+    assert manifest["source_commit"] == "a" * 40
+    assert manifest["platforms"]["windows-x64"]["installer"]["sha256"] == digest
+
+    args.source_commit = "b" * 39
+    with pytest.raises(ValueError, match="source commit"):
+        build_manifest(args)
+
+
+def test_unsigned_beta_workflow_signs_beta_channel():
+    metadata = named_step("Generate signed update metadata")["run"]
+    assert "--channel beta" in metadata
+    assert "--source-commit" in metadata

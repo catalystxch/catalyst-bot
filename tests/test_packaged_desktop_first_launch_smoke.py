@@ -32,12 +32,17 @@ def test_first_launch_waits_for_visible_native_catalyst_window(monkeypatch):
     html = '<main id="startupOverlay">Risk Disclosure CATalyst</main>'
     safety = json.dumps({"safety": {"allowed": False}})
     native_checks = []
+    unauthenticated_checks = []
 
     def fake_urlopen(url, timeout):
         del timeout
+        if isinstance(url, smoke.urllib.request.Request):
+            assert url.get_header("X-bot-local-token") == "test-local-token"
+            return _Response(html, "text/html; charset=utf-8")
         if url.endswith("/api/safety/status"):
             return _Response(safety, "application/json")
-        return _Response(html, "text/html; charset=utf-8")
+        unauthenticated_checks.append(url)
+        raise smoke.urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
 
     def visible_window(process_id):
         native_checks.append(process_id)
@@ -49,9 +54,22 @@ def test_first_launch_waits_for_visible_native_catalyst_window(monkeypatch):
     )
     monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
 
-    smoke._wait_for_first_launch(51345, process)
+    smoke._wait_for_first_launch(51345, process, "test-local-token")
 
     assert native_checks == [7365, 7365]
+    assert unauthenticated_checks == ["http://127.0.0.1:51345/"] * 2
+
+
+def test_first_launch_rejects_uncredentialed_dashboard(monkeypatch):
+    process = SimpleNamespace(pid=7365, returncode=None, poll=lambda: None)
+    monkeypatch.setattr(
+        smoke.urllib.request,
+        "urlopen",
+        lambda _url, timeout: _Response("dashboard", "text/html"),
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="uncredentialed root exposed"):
+        smoke._wait_for_first_launch(51345, process, "test-local-token")
 
 
 def test_duplicate_launch_must_exit_instead_of_serving_raw_diagnostics():

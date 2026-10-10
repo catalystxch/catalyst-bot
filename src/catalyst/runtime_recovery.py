@@ -142,7 +142,7 @@ def validate_quarantine_resolution_proof(
     now: Any,
     maximum_age_seconds: Any,
 ) -> dict[str, Any]:
-    """Validate an internally collected full-history proof, without I/O."""
+    """Validate internally collected full-history or exact Sage absence proof."""
 
     try:
         if type(requirements) is not dict or type(proof) is not dict:
@@ -157,15 +157,26 @@ def validate_quarantine_resolution_proof(
         )
         if any(proof.get(field) != requirements.get(field) for field in binding_fields):
             return _proof_denied("QUARANTINE_PROOF_BINDING_MISMATCH")
-        if proof.get("version") != 1 or type(proof.get("latch_generation")) is not int:
+        version = proof.get("version")
+        if (
+            type(version) is not int
+            or version not in (1, 2)
+            or type(proof.get("latch_generation")) is not int
+        ):
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
         if type(proof.get("history_complete")) is not bool:
             return _proof_denied("QUARANTINE_PROOF_MALFORMED")
+        expected_provenance = (
+            "wallet.get_all_offers"
+            if version == 1
+            else "wallet.get_authoritative_offer_absence_by_ids"
+        )
         if (
             type(proof.get("authoritative_read_performed")) is not bool
             or proof["authoritative_read_performed"] is not True
-            or proof.get("history_provenance") != "wallet.get_all_offers"
+            or proof.get("history_provenance") != expected_provenance
             or proof.get("identity_provenance") != "wallet.get_wallet_identity"
+            or (version == 2 and proof.get("wallet_backend") != "sage")
         ):
             return _proof_denied("QUARANTINE_FULL_HISTORY_INCOMPLETE")
         if proof["history_complete"] is not True:

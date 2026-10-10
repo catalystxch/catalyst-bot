@@ -28,7 +28,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """sage_login should call get_version -> initialize -> login -> get_current_key."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             if method == "get_version":
                 return {"version": "0.12.10"}
@@ -58,7 +58,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """sage_login with force_resync=True should call resync between initialize and login."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             if method == "get_version":
                 return {"version": "0.12.10"}
@@ -90,7 +90,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """If initialize returns a structured error, sage_login should return False."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             if method == "get_version":
                 return {"version": "0.12.10"}
@@ -162,7 +162,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """If get_version returns None, sage_login should return False immediately."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             return None  # Sage not responding
 
@@ -177,7 +177,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """If get_version returns a structured error dict, sage_login should return False."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             if method == "get_version":
                 return {"success": False, "error": "Connection refused"}
@@ -193,7 +193,7 @@ class TestWalletSageLogin(unittest.TestCase):
     def test_login_returns_false_on_fingerprint_mismatch(self):
         """sage_login returns False when active key fingerprint differs."""
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             if method == "get_version":
                 return {"version": "0.12.10"}
             if method == "initialize":
@@ -222,7 +222,7 @@ class TestWalletSageLogin(unittest.TestCase):
         """If login RPC returns structured error, sage_login should return False."""
         calls = []
 
-        def fake_rpc(method, payload, timeout=0):
+        def fake_rpc(method, payload, timeout=0, _identity_recheck=None):
             calls.append(method)
             if method == "get_version":
                 return {"version": "0.12.10"}

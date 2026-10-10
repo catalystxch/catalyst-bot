@@ -286,34 +286,53 @@ def derive_bootstrap_plan(
     for side in (CampaignSide.BUY, CampaignSide.SELL):
         if side not in active_sides:
             continue
-        levels: list[dict[str, Any]] = []
-        for level_name, shape, amount in zip(
-            level_names, price_shapes[side], amounts[side], strict=True
-        ):
-            raw_price = decision.anchor_price * (shape - inventory_skew)
-            price = min(
-                decision.maximum_price,
-                max(decision.minimum_price, raw_price),
+        raw_prices = tuple(
+            decision.anchor_price * (shape - inventory_skew)
+            for shape in price_shapes[side]
+        )
+        if side is CampaignSide.BUY:
+            if trusted_bid is not None and trusted_bid < decision.minimum_price:
+                reasons.append("buy_trusted_range_outside_corridor")
+                continue
+            near_price = min(raw_prices[0], decision.anchor_price)
+            if trusted_bid is not None:
+                near_price = min(near_price, trusted_bid)
+            available_span = near_price - decision.minimum_price
+            shaped_span = raw_prices[0] - raw_prices[-1]
+            if available_span <= 0:
+                reasons.append("buy_trusted_range_insufficient_corridor")
+                continue
+            scale = min(Decimal("1"), available_span / shaped_span)
+            prices = tuple(
+                near_price - ((raw_prices[0] - raw_price) * scale)
+                for raw_price in raw_prices
             )
+        else:
+            if trusted_ask is not None and trusted_ask > decision.maximum_price:
+                reasons.append("sell_trusted_range_outside_corridor")
+                continue
+            near_price = max(raw_prices[0], decision.anchor_price)
+            if trusted_ask is not None:
+                near_price = max(near_price, trusted_ask)
+            available_span = decision.maximum_price - near_price
+            shaped_span = raw_prices[-1] - raw_prices[0]
+            if available_span <= 0:
+                reasons.append("sell_trusted_range_insufficient_corridor")
+                continue
+            scale = min(Decimal("1"), available_span / shaped_span)
+            prices = tuple(
+                near_price + ((raw_price - raw_prices[0]) * scale)
+                for raw_price in raw_prices
+            )
+        levels: list[dict[str, Any]] = []
+        for level_name, price, amount in zip(
+            level_names, prices, amounts[side], strict=True
+        ):
             if side is CampaignSide.BUY:
-                price = min(price, decision.anchor_price)
-                if trusted_bid is not None:
-                    if trusted_bid < decision.minimum_price:
-                        levels = []
-                        reasons.append("buy_trusted_range_outside_corridor")
-                        break
-                    price = min(price, trusted_bid)
                 xch_amount = amount
                 cat_amount = xch_amount / price
                 expected_gross = cat_amount * (decision.anchor_price - price)
             else:
-                price = max(price, decision.anchor_price)
-                if trusted_ask is not None:
-                    if trusted_ask > decision.maximum_price:
-                        levels = []
-                        reasons.append("sell_trusted_range_outside_corridor")
-                        break
-                    price = max(price, trusted_ask)
                 cat_amount = amount
                 xch_amount = cat_amount * price
                 expected_gross = cat_amount * (price - decision.anchor_price)
@@ -327,7 +346,7 @@ def derive_bootstrap_plan(
                 "subsidy_xch": Decimal("0"),
             }
             levels.append(level)
-            all_levels.append(level)
+        all_levels.extend(levels)
         plan["sides"][side.value] = {
             "paused": not bool(levels),
             "levels": levels,

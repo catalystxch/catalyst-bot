@@ -31,6 +31,20 @@ def _api_server():
         return sys.modules.get("api_server", api_server)
 
 
+def _dexie_only_beta_response(status: int = 409):
+    """Return the stable fail-closed response for disabled Splash mutations."""
+    return (
+        jsonify(
+            {
+                "success": False,
+                "reason": "DEXIE_ONLY_BETA",
+                "error": "Splash P2P is unavailable in the Dexie-only v1.4 beta",
+            }
+        ),
+        status,
+    )
+
+
 @bp.route("/api/splash/stats")
 def api_splash_stats():
     """Get Splash P2P broadcasting statistics."""
@@ -57,49 +71,88 @@ def api_splash_receive():
     """Get or update inbound Splash listening state."""
     bot = api_server.bot
     cfg = api_server.cfg
+    if request.method == "POST" and getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
     if request.method == "GET":
         return jsonify(api_server._serialize_dict(bot.get_splash_receive_stats()))
 
-    data = request.get_json(silent=True) or {}
-    enabled = bool(data.get("enabled", False))
-    cfg.update("SPLASH_RECEIVE_ENABLED", "true" if enabled else "false")
+    data = request.get_json(silent=True)
+    if type(data) is not dict or type(data.get("enabled")) is not bool:
+        return jsonify({"success": False, "error": "enabled must be a boolean"}), 400
+    enabled = data["enabled"]
+    if cfg.update("SPLASH_RECEIVE_ENABLED", "true" if enabled else "false") is not True:
+        return jsonify(
+            {"success": False, "error": "Failed to update Splash listening"}
+        ), 500
 
     node_action = "unchanged"
     try:
         node_running = bool(bot.splash_node.is_running())
     except Exception:
-        node_running = False
+        node_action = "state_failed"
+    else:
+        try:
+            # The manager can be waiting between crash-restart attempts while
+            # no child process is alive. Stop that manager too, or it can
+            # relaunch after the operator disables receive.
+            node_managed = getattr(bot.splash_node, "_running", False) is True
+            if node_running or node_managed:
+                stopped = bot.splash_node.stop()
+                if stopped is False:
+                    node_action = "stop_failed"
+                else:
+                    time.sleep(1)
+                    if enabled or getattr(cfg, "SPLASH_ENABLED", False):
+                        restarted = bot.splash_node.start()
+                        node_action = "restarting" if restarted else "restart_failed"
+                    else:
+                        node_action = "stopped"
+            elif enabled or getattr(cfg, "SPLASH_ENABLED", False):
+                started = bot.splash_node.start()
+                node_action = "starting" if started else "start_failed"
+        except Exception:
+            node_action = "error"
 
-    try:
-        if node_running:
-            bot.splash_node.stop()
-            time.sleep(1)
-            if enabled or getattr(cfg, "SPLASH_ENABLED", False):
-                restarted = bot.splash_node.start()
-                node_action = "restarted" if restarted else "restart_failed"
-            else:
-                node_action = "stopped"
-        elif enabled or getattr(cfg, "SPLASH_ENABLED", False):
-            started = bot.splash_node.start()
-            node_action = "started" if started else "start_failed"
-    except Exception as e:
+    node_failures = {
+        "start_failed",
+        "restart_failed",
+        "stop_failed",
+        "state_failed",
+        "error",
+    }
+    if enabled and getattr(bot, "_running", False) and node_action not in node_failures:
+        try:
+            bot._start_splash_receive()
+        except Exception:
+            node_action = "worker_failed"
+
+    runtime_failed = node_action in node_failures or node_action == "worker_failed"
+    pending = node_action in {"starting", "restarting"}
+    if runtime_failed:
         log_event(
             "warning",
-            "splash_receive_toggle_failed",
-            f"Splash listener update failed: {e}",
+            "splash_receive_apply_failed",
+            f"Splash listening setting saved but runtime activation failed ({node_action})",
         )
-        node_action = "error"
-
-    log_event(
-        "info",
-        "splash_receive_toggled",
-        f"Splash listening {'enabled' if enabled else 'disabled'} ({node_action})",
-    )
+    elif pending:
+        log_event(
+            "info",
+            "splash_receive_pending",
+            f"Splash listening setting saved; node {node_action}",
+        )
+    else:
+        log_event(
+            "info",
+            "splash_receive_toggled",
+            f"Splash listening {'enabled' if enabled else 'disabled'} ({node_action})",
+        )
 
     payload = bot.get_splash_receive_stats()
+    if pending:
+        payload["active"] = False
     api_server.events.emit("splash_incoming", payload)
     api_server.events.emit(
         "config_changed",
@@ -110,14 +163,22 @@ def api_splash_receive():
         },
     )
 
-    return jsonify(
-        {
-            "success": True,
-            "enabled": enabled,
-            "node_action": node_action,
-            "stats": api_server._serialize_dict(payload),
-        }
-    )
+    response = {
+        "success": not runtime_failed and not pending,
+        "applied": not runtime_failed and not pending,
+        "pending": pending,
+        "enabled": enabled,
+        "node_action": node_action,
+        "stats": api_server._serialize_dict(payload),
+    }
+    if runtime_failed:
+        response["error"] = (
+            "Splash listening setting was saved, but the runtime change did not complete"
+        )
+        return jsonify(response), 503
+    if pending:
+        return jsonify(response), 202
+    return jsonify(response)
 
 
 @bp.route("/api/splash/node")
@@ -135,28 +196,30 @@ def api_splash_node_start():
     """Start the Splash P2P node process (used by startup gate)."""
     bot = api_server.bot
     cfg = api_server.cfg
+    if getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
     try:
-        if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
-            cfg.update("SPLASH_RECEIVE_ENABLED", "true")
-            log_event(
-                "info",
-                "splash_receive_startup_default",
-                "Splash incoming listener enabled by default for node startup",
-            )
         started = bot.splash_node.start()
         status = bot.splash_node.get_status()
+        if started:
+            message, pending, http_status = "Splash node start scheduled", True, 202
+        elif bot.splash_node.is_running():
+            message, pending, http_status = "Splash node already running", False, 200
+        elif getattr(bot.splash_node, "_running", False) is True:
+            message, pending, http_status = "Splash node already starting", True, 202
+        else:
+            message, pending, http_status = "Failed to start Splash node", False, 503
         return jsonify(
             {
-                "success": started,
-                "message": "Splash node started"
-                if started
-                else "Failed to start Splash node",
+                "success": http_status != 503,
+                "pending": pending,
+                "message": message,
                 "status": status,
             }
-        )
+        ), http_status
     except Exception:
         return api_server._api_exception(request.path)
 
@@ -186,6 +249,8 @@ def api_splash_setup_check():
 @bp.route("/api/splash/setup/download", methods=["POST"])
 def api_splash_setup_download():
     """Start downloading the Splash binary (non-blocking)."""
+    if getattr(_api_server().cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response()
     try:
         from splash_setup import start_background_download
 
@@ -236,6 +301,8 @@ def api_splash_incoming():
     """
     server = _api_server()
     cfg = server.cfg
+    if getattr(cfg, "DEXIE_ONLY_BETA", False):
+        return _dexie_only_beta_response(status=403)
     if not getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
         return jsonify({"error": "Splash receive disabled"}), 403
 

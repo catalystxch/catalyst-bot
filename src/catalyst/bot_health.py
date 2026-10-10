@@ -1376,8 +1376,11 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
             message="Splash management not active.",
         )
 
-    # SPLASH_RECEIVE_ENABLED off → user opted out of inbound, don't nag.
-    if not bool(getattr(cfg, "SPLASH_RECEIVE_ENABLED", False)):
+    outbound_enabled = bool(getattr(cfg, "SPLASH_ENABLED", False))
+    receive_enabled = bool(getattr(cfg, "SPLASH_RECEIVE_ENABLED", False))
+
+    # No Splash path is enabled, so daemon health is out of scope.
+    if not outbound_enabled and not receive_enabled:
         for aid in ("splash_unreachable", "splash_no_peers", "splash_hook_broken"):
             _clear_alert(aid)
         return HealthCheck(
@@ -1385,7 +1388,7 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
             category="wallet",
             status="pass",
             severity="info",
-            message="Splash inbound listening disabled.",
+            message="Splash disabled.",
         )
 
     metrics = {}
@@ -1441,9 +1444,10 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
             title="Splash daemon has no peers",
             message=(
                 "Splash is running but not connected to any P2P peers. "
-                "Check that your firewall/router allows inbound TCP on "
-                f"port {getattr(cfg, 'SPLASH_P2P_PORT', 11511)}. Without "
-                "peers the bot can't receive offers from the Splash network."
+                "Check network connectivity, peer discovery, and firewall "
+                "settings for the Splash P2P port "
+                f"{getattr(cfg, 'SPLASH_P2P_PORT', 11511)}. Without peers "
+                "the bot can't relay offers over the Splash network."
             ),
             severity="warning",
         )
@@ -1454,7 +1458,8 @@ def check_splash_daemon(auto_repair: bool = True) -> HealthCheck:
     # Case C: daemon has seen plenty of offers but the webhook has zero —
     # the --offer-hook path is broken (version mismatch, bind issue, etc).
     if (
-        reachable
+        receive_enabled
+        and reachable
         and peers > 0
         and offers_seen >= _SPLASH_HOOK_MIN_SEEN
         and delivered_total < _SPLASH_HOOK_MIN_DELIVERED

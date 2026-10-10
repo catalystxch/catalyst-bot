@@ -39,6 +39,17 @@ class TestCoinPrepWorkerCli(unittest.TestCase):
 
         self.assertTrue(args.sage_rpc_smoke)
 
+    def test_fee_approval_id_is_available_to_the_worker(self):
+        approval_id = "a" * 64
+        with patch.object(
+            sys,
+            "argv",
+            ["coin_prep_worker.py", "--fee-approval-id", approval_id],
+        ):
+            args = parse_arguments()
+
+        self.assertEqual(args.fee_approval_id, approval_id)
+
 
 class TestSageRpcSmoke(unittest.TestCase):
     def test_returns_success_when_read_only_version_and_key_succeed(self):

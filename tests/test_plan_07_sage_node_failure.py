@@ -280,6 +280,68 @@ class TestNodeSyncLoss(unittest.TestCase):
             status = wallet_sage.get_wallet_sync_status()
         self.assertFalse(status.get("synced"))
 
+    def test_sync_status_treats_string_counts_as_unknown(self):
+        with patch(
+            "wallet_sage.rpc",
+            return_value={
+                "success": True,
+                "synced_coins": "9",
+                "total_coins": "10",
+            },
+        ):
+            status = wallet_sage.get_wallet_sync_status()
+
+        self.assertEqual(status["sync_state"], "unknown")
+        self.assertFalse(status["synced"])
+
+    def test_sync_status_does_not_accept_inconsistent_or_malformed_counts(self):
+        for synced_coins, total_coins in ((11, 10), (True, 10), (9.5, 10), (-1, 10)):
+            with self.subTest(synced_coins=synced_coins, total_coins=total_coins):
+                with patch(
+                    "wallet_sage.rpc",
+                    return_value={
+                        "success": True,
+                        "synced_coins": synced_coins,
+                        "total_coins": total_coins,
+                    },
+                ):
+                    status = wallet_sage.get_wallet_sync_status()
+
+                self.assertEqual(status["sync_state"], "unknown")
+                self.assertFalse(status["synced"])
+
+    def test_sync_status_explicit_true_cannot_override_conflicting_counts(self):
+        for counts in (
+            {"synced_coins": 9, "total_coins": 10},
+            {"synced_coins": 11, "total_coins": 10},
+            {"synced_coins": "10", "total_coins": 10},
+            {"synced_coins": 10},
+        ):
+            with self.subTest(counts=counts):
+                with patch(
+                    "wallet_sage.rpc",
+                    return_value={"success": True, "synced": True, **counts},
+                ):
+                    status = wallet_sage.get_wallet_sync_status()
+
+                self.assertEqual(status["sync_state"], "unknown")
+                self.assertFalse(status["synced"])
+
+    def test_sync_status_does_not_infer_sync_from_malformed_explicit_flag(self):
+        with patch(
+            "wallet_sage.rpc",
+            return_value={
+                "success": True,
+                "synced": "false",
+                "synced_coins": 10,
+                "total_coins": 10,
+            },
+        ):
+            status = wallet_sage.get_wallet_sync_status()
+
+        self.assertEqual(status["sync_state"], "unknown")
+        self.assertFalse(status["synced"])
+
     def test_combined_sync_status_healthy_false_when_not_synced(self):
         """get_chia_health() healthy=False when wallet not synced."""
         not_synced = {

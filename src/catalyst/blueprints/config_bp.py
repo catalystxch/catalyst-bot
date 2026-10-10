@@ -156,6 +156,22 @@ _BLOCKED_KEYS = {
 }
 
 
+_DEXIE_ONLY_BETA_KEYS = frozenset({"SPLASH_ENABLED", "SPLASH_RECEIVE_ENABLED"})
+
+
+def _dexie_only_beta_response(key: str):
+    return (
+        jsonify(
+            {
+                "success": False,
+                "reason": "DEXIE_ONLY_BETA",
+                "error": f"Cannot modify {key}: v1.4 beta is Dexie-only",
+            }
+        ),
+        409,
+    )
+
+
 _KEY_MAP = {
     "spread_bps": "SPREAD_BPS",
     "loop_seconds": "LOOP_SECONDS",
@@ -402,7 +418,14 @@ def api_config_update():
     if "key" in data and "value" in data:
         # --- Single key-value format ---
         key = data["key"]
+        key_text = str(key)
+        effective_key = _KEY_MAP.get(key_text, key_text.upper())
         value = data["value"]
+        if (
+            getattr(cfg, "DEXIE_ONLY_BETA", False)
+            and effective_key in _DEXIE_ONLY_BETA_KEYS
+        ):
+            return _dexie_only_beta_response(effective_key)
         if key in _BLOCKED_KEYS:
             return jsonify(
                 {"success": False, "error": f"Cannot modify {key} via API"}
@@ -504,6 +527,11 @@ def api_config_update():
         return jsonify({"success": False, "error": f"Failed to update {key}"}), 500
 
     # --- Bulk format ---
+    if getattr(cfg, "DEXIE_ONLY_BETA", False):
+        for gui_key in data:
+            env_key = _KEY_MAP.get(gui_key, gui_key.upper())
+            if env_key in _DEXIE_ONLY_BETA_KEYS:
+                return _dexie_only_beta_response(env_key)
     data = _with_coherent_trade_bounds(data, cfg)
     updated = []
     errors = []
@@ -695,6 +723,9 @@ def api_config_live():
         return jsonify(
             {"success": False, "error": f"Cannot modify {key} via live controls"}
         ), 403
+
+    if getattr(cfg, "DEXIE_ONLY_BETA", False) and key in _DEXIE_ONLY_BETA_KEYS:
+        return _dexie_only_beta_response(key)
 
     if key == "LIQUIDITY_MODE":
         _allowed = ("two_sided", "buy_only", "sell_only")
@@ -1145,12 +1176,26 @@ def api_check_resume():
             cfg.CAT_ASSET_ID if hasattr(cfg, "CAT_ASSET_ID") else ""
         )
         offer_manager = getattr(bot, "offer_manager", None) if bot else None
-        sync_from_wallet = getattr(offer_manager, "sync_from_wallet", None)
-        if callable(sync_from_wallet):
+        sync_with_meta = getattr(offer_manager, "sync_from_wallet_with_meta", None)
+        if callable(sync_with_meta):
             # Share this explicit live read with /api/status so the stopped
             # dashboard cannot overwrite the verified resume count with stale
             # database rows on its next poll.
-            open_buy, open_sell, _ = sync_from_wallet()
+            (open_buy, open_sell, _), sync_meta = sync_with_meta()
+            if (
+                type(sync_meta) is not dict
+                or sync_meta.get("fresh") is not True
+                or sync_meta.get("using_cache") is True
+            ):
+                return jsonify(
+                    {
+                        "can_resume": False,
+                        "has_session": False,
+                        "buy_count": 0,
+                        "sell_count": 0,
+                        "reason": "wallet_offer_query_not_fresh",
+                    }
+                )
         else:
             from wallet import get_all_offers, classify_offers_from_list
 

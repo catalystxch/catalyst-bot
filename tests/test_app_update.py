@@ -160,6 +160,17 @@ class TestAppUpdateSecurity(unittest.TestCase):
                 manifest, signature, public_b64=public_b64
             )
 
+    def test_stable_updater_rejects_signed_beta_manifest(self):
+        private, public_b64 = self._keypair()
+        manifest = self._manifest(version="1.4.0")
+        manifest["channel"] = "beta"
+        signature = self._signature(private, manifest)
+
+        with self.assertRaisesRegex(ValueError, "channel is not stable"):
+            app_update.verify_signed_manifest(
+                manifest, signature, public_b64=public_b64
+            )
+
     def test_manifest_rejects_download_url_outside_release_channel(self):
         private, public_b64 = self._keypair()
         manifest = self._manifest(

@@ -1,8 +1,7 @@
 """Health, doctor, runtime, self-test, config validation and export routes.
 
 Seven read-only routes that report on system health and config state.
-Pure diagnostic surface; no mutations beyond the optional auto-repair
-inside `run_runtime_checks` which is gated behind a query param.
+Pure diagnostic surface. Runtime auto-repair runs only from the internal bot cycle.
 """
 
 from __future__ import annotations
@@ -142,15 +141,17 @@ def api_health_runtime():
     still in sync with reality?). Cross-checks DB vs Dexie/Sage/Spacescan.
 
     Query params:
-        repair=true   — also execute auto-repair actions (default: read-only)
         force=true    — bypass the 60s cache and re-run now
     """
+    repair = request.args.get("repair", "").strip().lower()
+    if repair not in {"", "0", "false", "no"}:
+        return jsonify({"error": "repair_requires_internal_cycle"}), 400
+
     try:
         from bot_health import run_runtime_checks
 
-        auto_repair = request.args.get("repair", "").lower() in ("1", "true", "yes")
         force = request.args.get("force", "").lower() in ("1", "true", "yes")
-        report = run_runtime_checks(auto_repair=auto_repair, force=force)
+        report = run_runtime_checks(auto_repair=False, force=force)
         return jsonify(report.to_dict())
     except Exception as e:
         log_event(

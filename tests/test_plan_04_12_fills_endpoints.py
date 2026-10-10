@@ -47,6 +47,10 @@ def _make_mock_conn(rows=None):
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN})
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
@@ -65,7 +69,7 @@ class _FlaskBase(unittest.TestCase):
 class TestFillsGet(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/fills", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_bot_set_returns_200(self):
@@ -73,7 +77,7 @@ class TestFillsGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("database.get_fills", return_value=[]),
         ):
-            resp = self.client.get("/api/fills", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_fills_key(self):
@@ -81,7 +85,7 @@ class TestFillsGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("database.get_fills", return_value=[]),
         ):
-            resp = self.client.get("/api/fills", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("fills", body)
         self.assertIsInstance(body["fills"], list)
@@ -97,7 +101,7 @@ class TestFillsGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("database.get_fills", side_effect=capture_get_fills),
         ):
-            self.client.get("/api/fills", environ_base=self._LOOPBACK)
+            self._get("/api/fills", environ_base=self._LOOPBACK)
         self.assertEqual(captured.get("limit"), 20)
 
     def test_custom_limit_forwarded(self):
@@ -111,7 +115,7 @@ class TestFillsGet(_FlaskBase):
             patch.object(api_server, "bot", _make_bot()),
             patch("database.get_fills", side_effect=capture),
         ):
-            self.client.get("/api/fills?limit=50", environ_base=self._LOOPBACK)
+            self._get("/api/fills?limit=50", environ_base=self._LOOPBACK)
         self.assertEqual(captured.get("limit"), 50)
 
 
@@ -125,13 +129,13 @@ class TestFillsClassified(_FlaskBase):
     def test_returns_200(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get("/api/fills/classified", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills/classified", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_fills_key(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get("/api/fills/classified", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills/classified", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("fills", body)
         self.assertIsInstance(body["fills"], list)
@@ -139,7 +143,7 @@ class TestFillsClassified(_FlaskBase):
     def test_response_has_pagination_metadata(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get("/api/fills/classified", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fills/classified", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in ("limit", "offset"):
             self.assertIn(key, body)
@@ -147,7 +151,7 @@ class TestFillsClassified(_FlaskBase):
     def test_limit_capped_at_200(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/fills/classified?limit=999", environ_base=self._LOOPBACK
             )
         body = resp.get_json()
@@ -156,7 +160,7 @@ class TestFillsClassified(_FlaskBase):
     def test_type_filter_does_not_crash(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/fills/classified?type=retail", environ_base=self._LOOPBACK
             )
         self.assertEqual(resp.status_code, 200)
@@ -164,7 +168,7 @@ class TestFillsClassified(_FlaskBase):
     def test_side_filter_buy_does_not_crash(self):
         conn = _make_mock_conn()
         with patch("database.get_connection", return_value=conn):
-            resp = self.client.get(
+            resp = self._get(
                 "/api/fills/classified?side=buy", environ_base=self._LOOPBACK
             )
         self.assertEqual(resp.status_code, 200)

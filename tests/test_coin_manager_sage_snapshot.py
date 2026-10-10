@@ -177,6 +177,47 @@ class CoinManagerSageSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(self.calls["upserts"], [])
 
+    def test_update_coin_counts_does_not_persist_partial_sage_view(self):
+        """A selectable page cannot stand in for a failed owned-coin view."""
+        self.manager._xch_coins = 7
+        self.manager._cat_coins = 9
+        selectable = [{"coin_id": "0x" + "11" * 32, "coin": {"amount": 111}}]
+        with (
+            patch.object(
+                self.coin_manager, "get_owned_coins_detailed", return_value=None
+            ),
+            patch.object(self.coin_manager, "get_owned_coins", return_value=None),
+            patch.object(
+                self.manager,
+                "_get_coins_fast",
+                return_value={"confirmed_records": selectable},
+            ),
+        ):
+            self.manager.update_coin_counts()
+
+        self.assertEqual(self.calls["batches"], [])
+        self.assertEqual(self.calls["upserts"], [])
+        self.assertEqual((self.manager._xch_coins, self.manager._cat_coins), (7, 9))
+
+    def test_cat_snapshot_failure_does_not_publish_new_xch_count_alone(self):
+        """A failed paired wallet read must preserve the previous count pair."""
+        self.manager._xch_coins = 7
+        self.manager._cat_coins = 9
+        xch = {
+            "selectable_records": [{"coin_id": "0x" + "11" * 32}],
+            "owned_ids": {"0x" + "11" * 32},
+        }
+        with patch.object(
+            self.manager,
+            "_get_sage_owned_coin_snapshot",
+            side_effect=[xch, RuntimeError("CAT wallet unavailable")],
+        ):
+            counts = self.manager.update_coin_counts()
+
+        self.assertEqual(counts, (7, 9))
+        self.assertEqual((self.manager._xch_coins, self.manager._cat_coins), (7, 9))
+        self.assertEqual(self.calls["batches"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

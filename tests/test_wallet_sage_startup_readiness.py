@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import ast
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,12 +74,66 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
         )
 
     def test_get_all_offers_rejects_missing_or_malformed_offer_collection(self):
-        for response in ({"success": True}, {"success": True, "offers": {}}, [1, 2]):
+        for response in (
+            {"success": True},
+            {"success": True, "offers": {}},
+            {"success": False, "offers": []},
+            [1, 2],
+        ):
             with (
                 self.subTest(response=response),
                 patch.object(wallet_sage, "rpc", return_value=response),
             ):
                 self.assertIsNone(wallet_sage.get_all_offers(include_completed=True))
+
+    def test_get_all_offers_rejects_open_offer_without_id(self):
+        row = {
+            "status": "OPEN",
+            "summary": {"offered": {"xch": 1000}, "requested": {"a" * 64: 1}},
+        }
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": [row]}
+        ):
+            self.assertIsNone(wallet_sage.get_all_offers(include_completed=False))
+
+    def test_get_all_offers_rejects_duplicate_open_offer_ids(self):
+        rows = [
+            {"trade_id": "b" * 64, "status": "OPEN"},
+            {"trade_id": "b" * 64, "status": "OPEN"},
+        ]
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": rows}
+        ):
+            self.assertIsNone(wallet_sage.get_all_offers(include_completed=False))
+
+    def test_get_all_offers_rejects_ambiguous_open_offer_identity(self):
+        cases = (
+            [{"trade_id": "not-an-offer-id", "status": "OPEN"}],
+            [{"trade_id": "a" * 64, "offer_id": "b" * 64, "status": "OPEN"}],
+            [
+                {"trade_id": "A" * 64, "status": "OPEN"},
+                {"offer_id": "0x" + "a" * 64, "status": "OPEN"},
+            ],
+        )
+        for rows in cases:
+            with (
+                self.subTest(rows=rows),
+                patch.object(
+                    wallet_sage, "rpc", return_value={"success": True, "offers": rows}
+                ),
+            ):
+                self.assertIsNone(wallet_sage.get_all_offers(include_completed=False))
+
+    def test_get_all_offers_accepts_matching_identity_encodings(self):
+        row = {
+            "trade_id": "A" * 64,
+            "offer_id": "0x" + "a" * 64,
+            "status": "OPEN",
+        }
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": True, "offers": [row]}
+        ):
+            self.assertEqual(wallet_sage.get_all_offers(include_completed=False), [row])
 
     def test_get_all_offers_keeps_unknown_statuses_when_filtering_open_book(self):
         rows = [
@@ -96,6 +151,83 @@ class TestWalletSageStartupReadiness(unittest.TestCase):
             [row["trade_id"] for row in result],
             ["a" * 64, "b" * 64],
         )
+
+    def test_matching_offer_with_unknown_status_cannot_prove_closed_book(self):
+        asset_id = "a" * 64
+        row = {
+            "trade_id": "b" * 64,
+            "status": "SAGE_FUTURE_ACTIVE",
+            "summary": {
+                "offered": {"xch": 1000},
+                "requested": {asset_id: 1},
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown offer status"):
+            wallet_sage.classify_offers_from_list([row], asset_id)
+
+    def test_open_offer_without_pair_summary_cannot_prove_empty_book(self):
+        row = {"trade_id": "b" * 64, "status": "OPEN", "summary": {}}
+
+        with self.assertRaisesRegex(ValueError, "unclassifiable open offer"):
+            wallet_sage.classify_offers_from_list([row], "a" * 64)
+
+    def test_unknown_status_without_pair_summary_cannot_prove_empty_book(self):
+        row = {
+            "trade_id": "b" * 64,
+            "status": "SAGE_FUTURE_ACTIVE",
+            "summary": {},
+        }
+
+        with self.assertRaisesRegex(ValueError, "unknown offer status"):
+            wallet_sage.classify_offers_from_list([row], "a" * 64)
+
+    def test_pending_cancel_remains_wallet_open_exposure_until_confirmed(self):
+        asset_id = "a" * 64
+        for status in (2, "PENDING_CANCEL"):
+            with self.subTest(status=status):
+                row = {
+                    "trade_id": "b" * 64,
+                    "status": status,
+                    "summary": {
+                        "offered": {"xch": 1000},
+                        "requested": {asset_id: 1},
+                    },
+                }
+
+                buys, sells, closed = wallet_sage.classify_offers_from_list(
+                    [row], asset_id
+                )
+                self.assertEqual(buys, [row])
+                self.assertEqual(sells, [])
+                self.assertEqual(closed, [])
+
+    def test_expired_pending_cancel_is_not_fillable_wallet_exposure(self):
+        asset_id = "a" * 64
+        row = {
+            "trade_id": "b" * 64,
+            "status": "PENDING_CANCEL",
+            "valid_times": {"max_time": int(time.time()) - 3600},
+            "summary": {
+                "offered": {"xch": 1000},
+                "requested": {asset_id: 1},
+            },
+        }
+
+        buys, sells, closed = wallet_sage.classify_offers_from_list([row], asset_id)
+        self.assertEqual((buys, sells), ([], []))
+        self.assertEqual(closed, [row])
+
+    def test_failed_sage_offer_response_cannot_prove_empty_book(self):
+        with patch.object(
+            wallet_sage, "rpc", return_value={"success": False, "offers": []}
+        ):
+            result = wallet_sage.get_authoritative_offer_history(
+                include_completed=False
+            )
+
+        self.assertEqual(result["success"], False)
+        self.assertEqual(result["end_of_history"], False)
 
     def test_reload_connection_settings_uses_canonical_cfg_values(self):
         old_cert = wallet_sage.CERT_PATH

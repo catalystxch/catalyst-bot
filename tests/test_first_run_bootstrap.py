@@ -178,6 +178,114 @@ def test_startup_initialization_exception_is_not_reported_as_lease_unavailable(
     }
 
 
+def test_unreadable_database_preserves_original_and_blocks_startup(
+    monkeypatch, tmp_path
+):
+    import database
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    db_path = tmp_path / "bot.db"
+    original = b"not a SQLite database"
+    db_path.write_bytes(original)
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    events = []
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: events.append("initialized") or {"allowed": True},
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert db_path.read_bytes() == original
+    assert events == ["arbiter_release"]
+    assert desktop_app._startup_diagnostics_status == {
+        "allowed": False,
+        "reason_code": "DATABASE_RECOVERY_REQUIRED",
+        "source": "database_integrity",
+        "recovery": {
+            "failed_check": "database_integrity",
+            "blocker_counts": {},
+        },
+    }
+
+
+def test_missing_database_for_prior_profile_blocks_before_startup_ownership(
+    monkeypatch, tmp_path
+):
+    import database
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    db_path = tmp_path / "bot.db"
+    (tmp_path / ".env").write_text(
+        "WALLET_TYPE=sage\nSAGE_FINGERPRINT='736588221'\n", encoding="utf-8"
+    )
+    (tmp_path / ".window_state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(database, "DB_PATH", str(db_path))
+    events = []
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+
+    monkeypatch.setattr(read_only_diagnostics, "acquire_startup_arbiter", Arbiter)
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(
+        desktop_app,
+        "_initialize_startup_ownership",
+        lambda: events.append("initialized") or {"allowed": True},
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert events == ["arbiter_release"]
+    assert not db_path.exists()
+    assert desktop_app._startup_diagnostics_status["reason_code"] == (
+        "DATABASE_RECOVERY_REQUIRED"
+    )
+
+
+def test_main_does_not_repeat_database_recovery_after_authorization(monkeypatch):
+    import database
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    events = []
+    monkeypatch.setattr(desktop_app, "_authorize_desktop_startup", lambda: True)
+    monkeypatch.setattr(desktop_app, "_enable_pythonw_startup_log", lambda: None)
+    monkeypatch.setattr(desktop_app, "_attach_to_kill_on_close_job", lambda: None)
+    monkeypatch.setattr(desktop_app, "_cleanup", lambda: None)
+    monkeypatch.setattr(
+        database,
+        "attempt_db_recovery",
+        lambda: events.append("late_recovery") or {"action": "ok"},
+    )
+    monkeypatch.setattr(
+        desktop_app,
+        "run_desktop_mode",
+        lambda **_kwargs: events.append("run"),
+    )
+
+    assert desktop_app.main(["--show-console"]) == 0
+    assert events == ["run"]
+
+
 def test_bootstrap_candidate_requires_unconfigured_identity_and_clean_durable_state(
     monkeypatch,
 ):
@@ -495,6 +603,47 @@ def test_bootstrap_promotion_resumes_interrupted_legacy_recovery(
         ("services", True),
     ]
     assert api_server.wallet_setup_bootstrap_active() is False
+
+
+@pytest.mark.parametrize("clears_latch", [True, False])
+def test_bootstrap_promotion_refreshes_after_zero_count_latch_recovery(
+    monkeypatch, clears_latch
+):
+    import api_server
+
+    latch = {"cleared": False}
+    calls = []
+
+    def authorize():
+        calls.append("authorize")
+        return {
+            "allowed": latch["cleared"],
+            "reason_code": "" if latch["cleared"] else "UNRESOLVED_OPERATIONS",
+        }
+
+    def recover():
+        calls.append("recover")
+        latch["cleared"] = clears_latch
+        return {"examined": 0, "recovered": 0, "remaining": 0}
+
+    monkeypatch.setattr(api_server, "_wallet_setup_bootstrap_active", True)
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setattr(api_server, "recover_legacy_startup_reservations", recover)
+    monkeypatch.setattr(api_server, "create_bot", lambda: calls.append("bot"))
+    monkeypatch.setattr(
+        api_server,
+        "_start_owned_runtime_services",
+        lambda authorization: calls.append(("services", authorization["allowed"])),
+    )
+    monkeypatch.setattr(api_server, "slog", lambda *_args, **_kwargs: None)
+
+    result = api_server.promote_wallet_setup_bootstrap()
+
+    assert result["allowed"] is clears_latch
+    expected = ["authorize", "recover", "authorize"]
+    if clears_latch:
+        expected.extend(["bot", ("services", True)])
+    assert calls == expected
 
 
 def test_bootstrap_promotion_retries_legacy_recovery_while_sage_restarts(

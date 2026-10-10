@@ -109,6 +109,11 @@ class _TempDB(unittest.TestCase):
 
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=_LOOPBACK,
+        )
         self.token = api_server._LOCAL_API_TOKEN
         api_server._rate_limit_log.clear()
         api_server._fresh_start_clear()
@@ -443,8 +448,18 @@ class TestStartupPhase6BotStartValidation(_TempDB):
     def _try_start(self, asset_id="", spread_bps=50, bot=None):
         if bot is None:
             bot = MagicMock()
+            bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+            bot.offer_manager.get_wallet_sync_meta.return_value = {
+                "fresh": True,
+                "using_cache": False,
+            }
+            bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+                bot.offer_manager.sync_from_wallet(),
+                bot.offer_manager.get_wallet_sync_meta(),
+            )
             bot.is_running.return_value = False
             bot.start.return_value = True
+            bot.coin_manager.is_busy.return_value = False
             bot.market_intel.reset_session_stats = MagicMock()
             bot.splash_manager.reset_session_stats = MagicMock()
             bot.get_splash_receive_stats.return_value = {}

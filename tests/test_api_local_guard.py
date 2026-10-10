@@ -1,5 +1,6 @@
 import unittest
 import sys
+import logging
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,9 @@ except ModuleNotFoundError as exc:
 class TestApiLocalGuard(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
+        beta_patch = patch.object(api_server.cfg, "DEXIE_ONLY_BETA", False, create=True)
+        beta_patch.start()
+        self.addCleanup(beta_patch.stop)
         self.client = api_server.app.test_client()
         self.loopback = {"REMOTE_ADDR": "127.0.0.1"}
         api_server._rate_limit_log.clear()
@@ -32,16 +36,75 @@ class TestApiLocalGuard(unittest.TestCase):
         permit_api_mutations(self, api_server)
 
     def test_root_sets_http_only_local_session_cookie_without_injecting_token(self):
+        resp = self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self.loopback,
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.headers.get("Location"), "/")
+        self.assertIn("no-store", resp.headers.get("Cache-Control", ""))
+        self.assertEqual(resp.headers.get("Referrer-Policy"), "no-referrer")
+        cookie_header = resp.headers.get("Set-Cookie", "")
+        self.assertIn("catalyst_local_session=", cookie_header)
+        self.assertNotIn(api_server._LOCAL_API_TOKEN, cookie_header)
+        self.assertIn("HttpOnly", cookie_header)
+        self.assertIn("SameSite=Lax", cookie_header)
+
         resp = self.client.get("/", environ_base=self.loopback)
         body = resp.get_data(as_text=True)
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn("window.__BOT_LOCAL_TOKEN", body)
         self.assertNotIn("BOT_LOCAL_WRITE_TOKEN", body)
-        cookie_header = resp.headers.get("Set-Cookie", "")
-        self.assertIn("catalyst_local_session=", cookie_header)
-        self.assertNotIn(api_server._LOCAL_API_TOKEN, cookie_header)
-        self.assertIn("HttpOnly", cookie_header)
-        self.assertIn("SameSite=Strict", cookie_header)
+
+    def test_uncredentialed_loopback_client_cannot_get_write_cookie(self):
+        resp = self.client.get("/", environ_base=self.loopback)
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn("catalyst_local_session=", resp.headers.get("Set-Cookie", ""))
+        write = self.client.post("/api/bot/stop", environ_base=self.loopback)
+        self.assertEqual(write.status_code, 401)
+
+    def test_invalid_bootstrap_credential_does_not_issue_cookie(self):
+        resp = self.client.get("/?bootstrap=wrong", environ_base=self.loopback)
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn("catalyst_local_session=", resp.headers.get("Set-Cookie", ""))
+
+    def test_bootstrap_credential_is_suppressed_from_access_log(self):
+        record = logging.LogRecord(
+            "werkzeug",
+            logging.INFO,
+            __file__,
+            1,
+            '127.0.0.1 - - "GET /?bootstrap=secret HTTP/1.1" 302 -',
+            (),
+            None,
+        )
+        self.assertFalse(api_server._QuietRequestFilter().filter(record))
+
+    def test_private_diagnostic_reads_require_browser_session(self):
+        for path in (
+            "/api/status",
+            "/api/dashboard",
+            "/api/logs",
+            "/api/logs/download",
+            "/api/superlog/stats",
+            "/api/superlog/archive",
+            "/api/superlog/download",
+            "/api/crash-log",
+            "/api/config/history",
+            "/api/config/export-env",
+            "/api/fills/export",
+        ):
+            with self.subTest(path=path):
+                resp = self.client.get(path, environ_base=self.loopback)
+                self.assertEqual(resp.status_code, 401)
+
+    def test_private_diagnostic_read_accepts_bootstrapped_browser(self):
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self.loopback,
+        )
+        resp = self.client.get("/api/superlog/stats", environ_base=self.loopback)
+        self.assertNotEqual(resp.status_code, 401)
 
     def test_debug_routes_are_disabled(self):
         resp = self.client.get("/api/debug/pricing", environ_base=self.loopback)
@@ -56,12 +119,18 @@ class TestApiLocalGuard(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
 
     def test_cookie_auth_reaches_write_handler(self):
-        self.client.get("/", environ_base=self.loopback)
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self.loopback,
+        )
         resp = self.client.post("/api/bot/stop", environ_base=self.loopback)
         self.assertNotEqual(resp.status_code, 401)
 
     def test_cross_origin_write_is_rejected_even_with_cookie(self):
-        self.client.get("/", environ_base=self.loopback)
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self.loopback,
+        )
         resp = self.client.post(
             "/api/bot/stop",
             headers={"Origin": "http://127.0.0.1:9999"},
@@ -75,6 +144,10 @@ class TestApiLocalGuard(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
     def test_gui_contains_direct_external_links_not_open_external_get_proxy(self):
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self.loopback,
+        )
         resp = self.client.get("/", environ_base=self.loopback)
         body = resp.get_data(as_text=True)
         self.assertEqual(resp.status_code, 200)

@@ -494,6 +494,75 @@ def test_quarantine_resolution_accepts_only_fresh_exact_complete_proof():
 
     assert decision["allowed"] is True
     assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
+
+
+def test_quarantine_accepts_exact_sage_absence_provenance_only_for_v2():
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    requirements = {
+        "quarantine_id": "quarantine:" + "a" * 64,
+        "recovery_id": "recovery:" + "b" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "c" * 64,
+        "offers": [
+            {
+                "intent_id": "intent-1",
+                "trade_id": "2" * 64,
+                "selected_coin_ids": ["1" * 64],
+            }
+        ],
+    }
+    proof = {
+        **{
+            key: requirements[key]
+            for key in (
+                "quarantine_id",
+                "recovery_id",
+                "latch_generation",
+                "wallet_fingerprint_hash",
+                "network",
+                "authority_digest",
+            )
+        },
+        "version": 2,
+        "wallet_backend": "sage",
+        "observed_at": "2026-08-21T12:02:00.000000Z",
+        "history_complete": True,
+        "authoritative_read_performed": True,
+        "history_provenance": "wallet.get_authoritative_offer_absence_by_ids",
+        "identity_provenance": "wallet.get_wallet_identity",
+        "absent_offer_ids": ["2" * 64],
+        "coins": [{"coin_id": "1" * 64, "owned": True, "unlocked": True}],
+    }
+
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert decision["allowed"] is True
+
+    proof["absent_offer_ids"] = []
+    denied = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert denied["reason_code"] == "QUARANTINED_OFFER_ABSENCE_INCOMPLETE"
+
+    proof["absent_offer_ids"] = ["2" * 64]
+    proof["history_provenance"] = "wallet.get_all_offers"
+    denied = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=NOW + timedelta(minutes=2, seconds=5),
+        maximum_age_seconds=10,
+    )
+    assert denied["reason_code"] == "QUARANTINE_FULL_HISTORY_INCOMPLETE"
     assert len(decision["proof_sha256"]) == 64
 
 
@@ -1239,6 +1308,265 @@ def test_released_recovery_epoch_can_be_adopted_by_exact_successor_and_promoted(
     assert len(rows) == 1
 
 
+def test_recovery_successor_keeps_full_lease_after_database_lock_wait(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "e" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "delayed-successor"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    post_lock = requested + timedelta(seconds=15)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is True
+    successor = adopted["lease"]
+    acquired_at = datetime.fromisoformat(
+        successor["acquired_at"].replace("Z", "+00:00")
+    )
+    expires_at = datetime.fromisoformat(successor["expires_at"].replace("Z", "+00:00"))
+    assert acquired_at == post_lock
+    assert expires_at - acquired_at == timedelta(seconds=30)
+
+
+def test_recovery_successor_does_not_report_adoption_after_commit_expiry(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "f" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-commit"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    open_connection = db._stability_connection
+
+    class PausedCommit:
+        def __init__(self):
+            self.connection = open_connection()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def commit(self):
+            self.connection.commit()
+            monkeypatch.setattr(
+                db,
+                "_stability_wall_clock",
+                lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            )
+
+    monkeypatch.setattr(db, "_stability_connection", PausedCommit)
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is False
+    assert adopted["reason"] == "lease_expired"
+
+
+def test_recovery_successor_rolls_back_if_transaction_outlives_lease(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "0" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-transaction"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    original_snapshot = db._runtime_recovery_lease_snapshot
+
+    def delayed_snapshot(successor):
+        result = original_snapshot(successor)
+        monkeypatch.setattr(
+            db,
+            "_stability_wall_clock",
+            lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        )
+        return result
+
+    monkeypatch.setattr(db, "_runtime_recovery_lease_snapshot", delayed_snapshot)
+    adopted = db.adopt_runtime_recovery_epoch(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_expires_at=requested + timedelta(seconds=30),
+        lease_duration_seconds=30,
+        expected_lease_version=released["lease"]["lease_version"],
+        prior_owner_liveness_proven_dead=False,
+        now=requested,
+    )
+
+    assert adopted["adopted"] is False
+    assert adopted["reason"] == "lease_expired"
+    assert (
+        db.get_runtime_mutation_lease()["lease_version"]
+        == released["lease"]["lease_version"]
+    )
+    assert (
+        db.get_connection()
+        .execute(
+            "SELECT COUNT(*) FROM runtime_recovery_takeovers WHERE recovery_id=?",
+            (epoch["recovery_id"],),
+        )
+        .fetchone()[0]
+        == 0
+    )
+
+
+def test_idempotent_recovery_adoption_rechecks_expiry_after_commit(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "2" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-idempotent-commit"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    released = db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: requested.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    successor = dict(
+        recovery_id=epoch["recovery_id"],
+        successor_owner_run_id="run-successor",
+        successor_owner_pid=4343,
+        successor_owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_duration_seconds=30,
+        prior_owner_liveness_proven_dead=False,
+    )
+    first = db.adopt_runtime_recovery_epoch(
+        **successor,
+        lease_expires_at=requested + timedelta(seconds=30),
+        expected_lease_version=released["lease"]["lease_version"],
+        now=requested,
+    )
+    assert first["adopted"] is True
+    late = requested + timedelta(seconds=50)
+    monkeypatch.setattr(
+        db,
+        "_stability_wall_clock",
+        lambda: (
+            (requested + timedelta(seconds=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        ),
+    )
+    open_connection = db._stability_connection
+
+    class PausedCommit:
+        def __init__(self):
+            self.connection = open_connection()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def commit(self):
+            self.connection.commit()
+            monkeypatch.setattr(
+                db,
+                "_stability_wall_clock",
+                lambda: late.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            )
+
+    monkeypatch.setattr(db, "_stability_connection", PausedCommit)
+    repeated = db.adopt_runtime_recovery_epoch(
+        **successor,
+        lease_expires_at=requested + timedelta(seconds=31),
+        expected_lease_version=first["lease"]["lease_version"],
+        now=requested + timedelta(seconds=1),
+    )
+
+    assert repeated["adopted"] is False
+    assert repeated["reason"] == "lease_expired"
+
+
 def test_active_expired_recovery_epoch_requires_dead_owner_proof_for_adoption(
     isolated_database, monkeypatch
 ):
@@ -1329,6 +1657,50 @@ def test_mutation_gate_acquires_exact_recovery_successor_authority(
     assert result["reason"] == "recovery_epoch_adopted"
     assert gate.last_acquire_result["lease"]["owner_run_id"] == "run-successor"
     assert gate.status().reason_code == "RUNTIME_DISCONTINUITY"
+
+
+def test_mutation_gate_rejects_recovery_adoption_returned_after_lease_expiry(
+    isolated_database, monkeypatch
+):
+    db = isolated_database
+    lease = _acquire_runtime_lease(db)
+    epoch = db.begin_runtime_recovery_epoch(
+        recovery_id="recovery:" + "1" * 64,
+        reason_code="MONOTONIC_GAP",
+        clock_evidence={"phase": "late-adoption-return"},
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        owner_run_id="run-gap",
+        started_at="2026-08-21T12:00:40.000000Z",
+    )["record"]
+    db.release_runtime_mutation_lease(
+        owner_run_id="run-gap",
+        expected_lease_version=lease["lease_version"],
+    )
+    requested = datetime.now(timezone.utc)
+    observed = [requested]
+    gate = mutation_gate.MutationGate(
+        run_id="run-successor",
+        owner_pid=4343,
+        owner_host="task14-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network=NETWORK,
+        lease_seconds=30,
+        clock=lambda: observed[0],
+    )
+    durable_adopt = db.adopt_runtime_recovery_epoch
+
+    def delayed_return(**kwargs):
+        result = durable_adopt(**kwargs)
+        assert result["adopted"] is True
+        observed[0] = requested + timedelta(seconds=50)
+        return result
+
+    monkeypatch.setattr(db, "adopt_runtime_recovery_epoch", delayed_return)
+    result = gate.acquire_recovery_successor(epoch)
+
+    assert result["acquired"] is False
+    assert result["reason"] == "lease_expired"
 
 
 def test_ordered_startup_resumes_released_frozen_recovery_epoch(
@@ -1619,6 +1991,7 @@ def test_empty_quarantine_proof_requires_actual_authoritative_history_read(monke
     import wallet
     from runtime_recovery import validate_quarantine_resolution_proof
 
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "chia")
     calls = []
     monkeypatch.setattr(
         wallet,
@@ -1664,6 +2037,7 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
     import wallet
     from runtime_recovery import validate_quarantine_resolution_proof
 
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "chia")
     observed = datetime.now(timezone.utc)
     monkeypatch.setattr(
         wallet,
@@ -1698,6 +2072,367 @@ def test_fresh_authoritative_empty_history_proves_truly_empty_quarantine(monkeyp
 
     assert decision["allowed"] is True
     assert decision["reason_code"] == "QUARANTINE_PROOF_COMPLETE"
+
+
+@pytest.mark.parametrize("reader_unavailable", ["missing", "raising"])
+def test_sage_quarantine_does_not_fall_back_to_full_history_when_exact_reader_unavailable(
+    monkeypatch, reader_unavailable
+):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = datetime.now(timezone.utc)
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+
+    def raising_reader(_ids):
+        raise RuntimeError("exact Sage offer endpoint unavailable")
+
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_absence_by_ids",
+        None if reader_unavailable == "missing" else raising_reader,
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": NETWORK,
+            "observed_at_utc": observed.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+        },
+    )
+    history_calls = []
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_kwargs: history_calls.append(True) or [],
+    )
+    requirements = {
+        "quarantine_id": "quarantine:" + "9" * 64,
+        "recovery_id": "recovery:" + "9" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "f" * 64,
+        "offers": [],
+    }
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+
+    assert decision["allowed"] is False
+    assert proof["version"] == 2
+    assert history_calls == []
+
+
+def test_sage_quarantine_exact_absence_survives_large_terminal_history(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    trade_id = "2" * 64
+    coin_id = "1" * 64
+    requirements = {
+        "quarantine_id": "quarantine:" + "8" * 64,
+        "recovery_id": "recovery:" + "8" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "e" * 64,
+        "offers": [{"trade_id": trade_id, "selected_coin_ids": [coin_id]}],
+    }
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network_id": NETWORK,
+            "observed_at_utc": observed,
+        },
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded history is not an absence proof")
+        ),
+    )
+    calls = []
+
+    def absence(ids):
+        calls.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "absent_offer_ids": list(ids),
+        }
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", absence)
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
+    )
+
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    decision = validate_quarantine_resolution_proof(
+        requirements,
+        proof,
+        now=datetime.now(timezone.utc),
+        maximum_age_seconds=30,
+    )
+    assert calls == [(trade_id,)]
+    assert proof["version"] == 2
+    assert decision["allowed"] is True
+
+    # The later owned-only view includes offer-locked coins. A later lock
+    # contradicts the earlier exact coin read and must block release.
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000, "offer_id": trade_id}}
+            if wallet_id == 1
+            else {}
+        ),
+    )
+    later_locked = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            later_locked,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: (
+            {"0x" + coin_id: {"amount": 1000, "spent_height": 123}}
+            if wallet_id == 1
+            else {}
+        ),
+    )
+    later_spent = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            later_spent,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
+    )
+
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {
+            "0x" + ids[0]: {
+                "amount": 1000,
+                "spent_height": None,
+                "owned": False,
+            }
+        },
+    )
+    explicitly_unowned = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            explicitly_unowned,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_NOT_OWNED"
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+
+    # The exact coin endpoint may omit `owned`. A missing owned-wallet view
+    # cannot be converted into affirmative ownership proof.
+    monkeypatch.setattr(wallet, "get_owned_coins_detailed", lambda _wallet_id: None)
+    missing_ownership = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            missing_ownership,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_owned_coins_detailed",
+        lambda wallet_id: {"0x" + coin_id: {"amount": 1000}} if wallet_id == 1 else {},
+    )
+
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_absence_by_ids",
+        lambda ids: {
+            "complete": False,
+            "requested_ids": list(ids),
+            "absent_offer_ids": [],
+        },
+    )
+    denied = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            denied,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", absence)
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {
+            "0x" + ids[0]: {
+                "amount": 1000,
+                "spent_height": None,
+                "locked": "false",
+            }
+        },
+    )
+    malformed_coin = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            malformed_coin,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["reason_code"]
+        == "QUARANTINED_INPUT_LOCKED"
+    )
+
+    identities = iter(
+        [
+            {
+                "success": True,
+                "backend": "sage",
+                "wallet_fingerprint_hash": WALLET_HASH,
+                "network_id": NETWORK,
+                "observed_at_utc": observed,
+            },
+            {
+                "success": True,
+                "backend": "sage",
+                "wallet_fingerprint_hash": "0" * 64,
+                "network_id": NETWORK,
+                "observed_at_utc": observed,
+            },
+        ]
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: next(identities))
+    monkeypatch.setattr(
+        wallet,
+        "get_coins_by_ids",
+        lambda ids: {"0x" + ids[0]: {"amount": 1000, "spent_height": None}},
+    )
+    drifted = api_server._collect_quarantine_resolution_proof(requirements)
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            drifted,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is False
+    )
+
+
+def test_sage_empty_quarantine_uses_exact_missing_offer_probe(monkeypatch):
+    import api_server
+    import wallet
+    from runtime_recovery import validate_quarantine_resolution_proof
+
+    observed = (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    requirements = {
+        "quarantine_id": "quarantine:" + "9" * 64,
+        "recovery_id": "recovery:" + "9" * 64,
+        "latch_generation": 1,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": NETWORK,
+        "authority_digest": "f" * 64,
+        "offers": [],
+    }
+    monkeypatch.setattr(wallet, "get_wallet_backend_authority", lambda: "sage")
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network_id": NETWORK,
+            "observed_at_utc": observed,
+        },
+    )
+    requested = []
+
+    def probe(ids):
+        requested.append(ids)
+        return {
+            "complete": True,
+            "requested_ids": list(ids),
+            "absent_offer_ids": list(ids),
+        }
+
+    monkeypatch.setattr(wallet, "get_authoritative_offer_absence_by_ids", probe)
+    proof = api_server._collect_quarantine_resolution_proof(requirements)
+    assert requested == [("0" * 64,)]
+    assert proof["version"] == 2
+    assert proof["absent_offer_ids"] == []
+    assert (
+        validate_quarantine_resolution_proof(
+            requirements,
+            proof,
+            now=datetime.now(timezone.utc),
+            maximum_age_seconds=30,
+        )["allowed"]
+        is True
+    )
 
 
 def test_quarantine_api_rejects_oversized_body_before_json_allocation():

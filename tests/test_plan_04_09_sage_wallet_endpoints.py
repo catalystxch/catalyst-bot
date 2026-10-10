@@ -51,6 +51,11 @@ class _FlaskBase(unittest.TestCase):
             environ_base=self._LOOPBACK,
         )
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # 1. GET /api/wallet/sage-running
@@ -64,9 +69,7 @@ class TestWalletSageRunning(_FlaskBase):
             patch("sage_node._is_sage_rpc_available", return_value=False),
             patch("sage_node._is_sage_rpc_port_listening", return_value=False),
         ):
-            resp = self.client.get(
-                "/api/wallet/sage-running", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/wallet/sage-running", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_running_key(self):
@@ -74,16 +77,12 @@ class TestWalletSageRunning(_FlaskBase):
             patch("sage_node._is_sage_rpc_available", return_value=False),
             patch("sage_node._is_sage_rpc_port_listening", return_value=False),
         ):
-            resp = self.client.get(
-                "/api/wallet/sage-running", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/wallet/sage-running", environ_base=self._LOOPBACK)
         self.assertIn("running", resp.get_json())
 
     def test_running_true_when_available(self):
         with patch("sage_node._is_sage_rpc_available", return_value=True):
-            resp = self.client.get(
-                "/api/wallet/sage-running", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/wallet/sage-running", environ_base=self._LOOPBACK)
         self.assertTrue(resp.get_json()["running"])
 
     def test_running_false_when_unavailable(self):
@@ -91,9 +90,7 @@ class TestWalletSageRunning(_FlaskBase):
             patch("sage_node._is_sage_rpc_available", return_value=False),
             patch("sage_node._is_sage_rpc_port_listening", return_value=False),
         ):
-            resp = self.client.get(
-                "/api/wallet/sage-running", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/wallet/sage-running", environ_base=self._LOOPBACK)
         self.assertFalse(resp.get_json()["running"])
 
 
@@ -175,7 +172,7 @@ class TestFingerprintEndpoint(_FlaskBase):
             patch("chia_node.is_startup_authorised", return_value=False),
             patch("wallet.get_current_key") as current_key,
         ):
-            resp = self.client.get("/api/fingerprint", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fingerprint", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json(), {"fingerprint": "", "source": "not_started"})
@@ -205,7 +202,7 @@ class TestFingerprintEndpoint(_FlaskBase):
             patch.object(mutation_gate, "current_runtime", return_value=runtime),
             patch("wallet.get_current_key") as current_key,
         ):
-            resp = self.client.get("/api/fingerprint", environ_base=self._LOOPBACK)
+            resp = self._get("/api/fingerprint", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -231,9 +228,7 @@ class TestFingerprintEndpoint(_FlaskBase):
 class TestSageStartupStatus(_FlaskBase):
     def test_returns_200(self):
         with patch("chia_node.get_startup_status", return_value={"phase": "idle"}):
-            resp = self.client.get(
-                "/api/sage/startup-status", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/sage/startup-status", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_is_dict(self):
@@ -241,9 +236,7 @@ class TestSageStartupStatus(_FlaskBase):
             "chia_node.get_startup_status",
             return_value={"phase": "idle", "message": "waiting"},
         ):
-            resp = self.client.get(
-                "/api/sage/startup-status", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/sage/startup-status", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json(), dict)
 
     def test_response_keeps_safe_startup_fields(self):
@@ -280,9 +273,7 @@ class TestSageStartupStatus(_FlaskBase):
             ),
             patch("sage_node.get_sage_version_requirement", return_value=version_gate),
         ):
-            resp = self.client.get(
-                "/api/sage/startup-status", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/sage/startup-status", environ_base=self._LOOPBACK)
 
         body = resp.get_json()
         self.assertEqual(resp.status_code, 200, body)
@@ -306,15 +297,15 @@ class TestSageStartupStatus(_FlaskBase):
 class TestSageFingerprints(_FlaskBase):
     def test_returns_200(self):
         with patch("chia_node.get_available_fingerprints", return_value=[]):
-            resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+            resp = self._get(
+                "/api/sage/fingerprints", headers=self.auth, environ_base=self._LOOPBACK
             )
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_fingerprints_list(self):
         with patch("chia_node.get_available_fingerprints", return_value=["12345678"]):
-            resp = self.client.get(
-                "/api/sage/fingerprints", environ_base=self._LOOPBACK
+            resp = self._get(
+                "/api/sage/fingerprints", headers=self.auth, environ_base=self._LOOPBACK
             )
         body = resp.get_json()
         self.assertTrue(body.get("success"))
@@ -758,8 +749,10 @@ class TestSageCertCandidates(_FlaskBase):
             ),
             patch("sage_node.detect_sage_cert_path", return_value=None),
         ):
-            resp = self.client.get(
-                "/api/sage/cert-candidates", environ_base=self._LOOPBACK
+            resp = self._get(
+                "/api/sage/cert-candidates",
+                headers=self.auth,
+                environ_base=self._LOOPBACK,
             )
 
         body = resp.get_json()
@@ -813,19 +806,19 @@ class TestSageCertCandidates(_FlaskBase):
 class TestWalletsDetect(_FlaskBase):
     def test_returns_200(self):
         with patch("wallet_chia.rpc", side_effect=Exception("not available")):
-            resp = self.client.get("/api/wallets/detect", environ_base=self._LOOPBACK)
+            resp = self._get("/api/wallets/detect", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_success_and_detected(self):
         with patch("wallet_chia.rpc", side_effect=Exception("not available")):
-            resp = self.client.get("/api/wallets/detect", environ_base=self._LOOPBACK)
+            resp = self._get("/api/wallets/detect", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body.get("success"))
         self.assertIsInstance(body.get("detected"), list)
 
     def test_response_has_current_wallet_type(self):
         with patch("wallet_chia.rpc", side_effect=Exception("not available")):
-            resp = self.client.get("/api/wallets/detect", environ_base=self._LOOPBACK)
+            resp = self._get("/api/wallets/detect", environ_base=self._LOOPBACK)
         self.assertIn("current", resp.get_json())
 
 

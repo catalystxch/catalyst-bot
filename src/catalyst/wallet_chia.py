@@ -1114,8 +1114,7 @@ def cleanup_expired_offers(log_fn=None, *, _identity_recheck=None) -> int:
     return 0
 
 
-def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50):
-    """Get all offers"""
+def _read_chia_offer_page(include_completed: bool, start: int, end: int):
     payload = {
         "include_completed": include_completed,
         "start": start,
@@ -1123,38 +1122,89 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
         "reverse": True,
     }
     res = rpc("get_all_offers", payload, timeout=8)
-    if not res or not res.get("success"):
+    if type(res) is not dict or res.get("success") is not True:
         return None
 
-    # Handle different response formats
-    offers_list = res.get("trades")
-    if offers_list is None:
-        offers_list = res.get("offers")
-    if offers_list is None:
-        offers_list = res.get("trade_records")
-    if offers_list is None:
-        maybe = res.get("data") or {}
-        offers_list = maybe.get("trades") or maybe.get("offers") or []
+    # A successful RPC without an explicit, well-formed collection is an
+    # unreadable wallet snapshot, not proof that the offer book is empty.
+    containers = [res]
+    if type(res.get("data")) is dict:
+        containers.append(res["data"])
+    pages = [
+        container[key]
+        for container in containers
+        for key in ("trades", "offers", "trade_records")
+        if key in container
+    ]
+    if len(pages) != 1 or type(pages[0]) is not list:
+        return None
+    if any(type(offer) is not dict for offer in pages[0]):
+        return None
+    return pages[0]
 
-    if offers_list is None:
-        offers_list = []
 
-    if not isinstance(offers_list, list):
-        return []
+def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50):
+    """Read offers, completing the open book before safety callers use it."""
+    offers = _read_chia_offer_page(include_completed, start, end)
+    if offers is None or include_completed or start != 0 or end <= start:
+        return offers
 
-    return offers_list
+    # Safety callers need the complete open book. A full Chia page is not
+    # proof that the book ends there: older offers can belong to this asset.
+    # Verify a multi-page read with a second traversal because offset pages
+    # can shift while the wallet's open book changes.
+    page_size = end - start
+
+    def complete_book(first_page):
+        rows = list(first_page)
+        seen_ids = set()
+        page_count = 1
+        page = first_page
+        while True:
+            if len(page) > page_size:
+                return None
+            page_ids = [
+                str(row.get("trade_id") or row.get("offer_id") or "").strip()
+                for row in page
+            ]
+            if any(not trade_id or trade_id in seen_ids for trade_id in page_ids):
+                return None
+            if len(set(page_ids)) != len(page_ids):
+                return None
+            seen_ids.update(page_ids)
+            if len(page) < page_size:
+                return rows
+            if page_count >= 40:
+                return None
+            next_start = page_count * page_size
+            page = _read_chia_offer_page(
+                include_completed, next_start, next_start + page_size
+            )
+            if page is None:
+                return None
+            rows.extend(page)
+            page_count += 1
+
+    first_book = complete_book(offers)
+    if first_book is None:
+        return None
+    if len(offers) < page_size:
+        return first_book
+    second_page = _read_chia_offer_page(include_completed, 0, page_size)
+    if second_page is None:
+        return None
+    second_book = complete_book(second_page)
+    if second_book is None:
+        return None
+    return second_book if first_book == second_book else None
 
 
 def get_authoritative_offer_history(
     include_completed: bool = True, start: int = 0, end: int = 50
 ):
-    """Use Chia's bounded offer page through the shared history-loader contract."""
+    """Read one strict Chia page for authoritative reconciliation."""
 
-    return get_all_offers(
-        include_completed=include_completed,
-        start=start,
-        end=end,
-    )
+    return _read_chia_offer_page(include_completed, start, end)
 
 
 def get_offer_bech32(trade_id: str) -> str:

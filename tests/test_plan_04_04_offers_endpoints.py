@@ -27,10 +27,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 try:
     import api_server
+    import app_bridge
 
     _SKIP = None
 except (ModuleNotFoundError, ImportError) as exc:
     api_server = None
+    app_bridge = None
     _SKIP = str(exc)
 
 
@@ -62,15 +64,57 @@ class _FlaskBase(unittest.TestCase):
             environ_base=self._LOOPBACK,
         )
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
+
 
 def _make_bot(offers=([], [], [])):
     bot = MagicMock()
     bot.is_running.return_value = True
     bot.offer_manager.sync_from_wallet.return_value = offers
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+    }
+    bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+        bot.offer_manager.sync_from_wallet(),
+        bot.offer_manager.get_wallet_sync_meta(),
+    )
     bot.offer_manager.cancel_all.return_value = {"cancelled": [], "failed": []}
     bot.offer_manager.cancel_offers.return_value = {"success": True}
     bot.coin_manager.is_busy.return_value = False
     return bot
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_native_cancel_all_forwards_coin_prep_fee_approval_body(monkeypatch):
+    from flask import request
+
+    approval_id = "a" * 64
+    captured = {}
+
+    def fake_cancel_all():
+        captured["body"] = request.get_json(silent=True)
+        return {"success": True}
+
+    monkeypatch.setattr(api_server, "api_cancel_all", fake_cancel_all)
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(
+        api_server.mutation_gate, "enter_mutation", lambda _operation: object()
+    )
+    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: None)
+
+    result = app_bridge.AppBridge().cancel_all_offers(
+        {"source": "coin_prep", "fee_approval_id": approval_id}
+    )
+
+    assert result["success"] is True
+    assert captured["body"] == {
+        "source": "coin_prep",
+        "fee_approval_id": approval_id,
+    }
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
@@ -241,8 +285,8 @@ def test_cancel_all_gui_timeout_honours_backend_authoritative_deadline():
     assert "}, 300000);" not in confirm_source
 
 
-def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
-    """A clean empty wallet must be described as empty at shutdown."""
+def test_shutdown_offer_disposition_qualifies_catalyst_tracked_visibility():
+    """Tracked rows must not be presented as an authoritative wallet snapshot."""
 
     node = shutil.which("node")
     if node is None:
@@ -268,11 +312,20 @@ def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
     empty, active, terminal_after_stale_view = json.loads(completed.stdout)
 
     assert empty["count"] == 0
-    assert empty["copy"] == "No open offers were left behind."
+    assert empty["copy"] == (
+        "CATalyst shows no tracked open offers. "
+        "Untracked wallet offers, if any, will remain active."
+    )
     assert active["count"] == 3
-    assert active["copy"] == "3 open offers left active."
+    assert active["copy"] == (
+        "3 CATalyst-tracked open offers will remain active. "
+        "Untracked wallet offers, if any, will also remain active."
+    )
     assert terminal_after_stale_view["count"] == 0
-    assert terminal_after_stale_view["copy"] == "No open offers were left behind."
+    assert terminal_after_stale_view["copy"] == (
+        "CATalyst shows no tracked open offers. "
+        "Untracked wallet offers, if any, will remain active."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,17 +337,17 @@ def test_shutdown_offer_disposition_does_not_claim_zero_offers_were_left_open():
 class TestOffersGet(_FlaskBase):
     def test_bot_none_returns_500(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 500)
 
     def test_bot_set_returns_200(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_buys_sells_counts(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("buys", body)
         self.assertIn("sells", body)
@@ -303,10 +356,21 @@ class TestOffersGet(_FlaskBase):
 
     def test_empty_offers_returns_zero_counts(self):
         with patch.object(api_server, "bot", _make_bot(offers=([], [], []))):
-            resp = self.client.get("/api/offers", environ_base=self._LOOPBACK)
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertEqual(body["buy_count"], 0)
         self.assertEqual(body["sell_count"], 0)
+
+    def test_cached_empty_wallet_book_is_not_reported_as_current(self):
+        bot = _make_bot(offers=([], [], []))
+        bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            ([], [], []),
+            {"fresh": False, "using_cache": False},
+        )
+        with patch.object(api_server, "bot", bot):
+            resp = self._get("/api/offers", environ_base=self._LOOPBACK)
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.get_json()["error"], "wallet_offer_sync_stale")
 
 
 # ---------------------------------------------------------------------------
@@ -317,15 +381,11 @@ class TestOffersGet(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllStatus(_FlaskBase):
     def test_returns_200_always(self):
-        resp = self.client.get(
-            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/offers/cancel_all/status", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_success_key(self):
-        resp = self.client.get(
-            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/offers/cancel_all/status", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body.get("success"))
 
@@ -355,17 +415,17 @@ class TestOpenOfferCount(_FlaskBase):
         super().tearDown()
 
     def test_returns_200(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_open_count(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertIn("open_count", body)
         self.assertIsInstance(body["open_count"], int)
 
     def test_success_key_true_on_success(self):
-        resp = self.client.get("/api/offers/open_count", environ_base=self._LOOPBACK)
+        resp = self._get("/api/offers/open_count", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body.get("success"))
 
@@ -549,6 +609,34 @@ class TestCancelOffer(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCancelAllPost(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        import wallet
+
+        history_patch = patch(
+            "wallet.get_authoritative_offer_history",
+            side_effect=lambda **kwargs: wallet.get_all_offers(**kwargs),
+        )
+        history_patch.start()
+        self.addCleanup(history_patch.stop)
+        intent_patch = patch("database.get_offer_intent_by_trade_id", return_value=None)
+        intent_patch.start()
+        self.addCleanup(intent_patch.stop)
+
+    def test_coin_prep_cancel_requires_exact_approval_shape(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with patch.object(api_server, "bot", stopped):
+            missing = self._post("/api/offers/cancel_all", {"source": "coin_prep"})
+            malformed = self._post(
+                "/api/offers/cancel_all",
+                {"source": "coin_prep", "fee_approval_id": "not-a-digest"},
+            )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(malformed.status_code, 400)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
     def test_unresolved_cancel_all_runs_proof_only_reconciliation(self):
         """The recovery button must remain useful without authorizing a second spend."""
 
@@ -629,6 +717,74 @@ class TestCancelAllPost(_FlaskBase):
             resp = self._post("/api/offers/cancel_all")
         self.assertIn(resp.status_code, (200, 202))
 
+    def test_stopped_cancel_all_exposes_structured_fee_budget_failure(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        approval_id = "b" * 64
+        stopped.offer_manager.cancel_offers.side_effect = ValueError(
+            "FEE_CAMPAIGN_BUDGET_EXCEEDED"
+        )
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                return_value={"purpose": f"bootstrap:{'c' * 64}:revision:1"},
+            ),
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post(
+                "/api/offers/cancel_all",
+                {"source": "coin_prep", "fee_approval_id": approval_id},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(status["reason_code"], "FEE_CAMPAIGN_BUDGET_EXCEEDED")
+
+    def test_stopped_cancel_all_exposes_stale_fee_approval_for_recovery(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.side_effect = ValueError(
+            "FEE_APPROVAL_STALE"
+        )
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(status["reason_code"], "FEE_APPROVAL_STALE")
+
     def test_stopped_bot_routes_active_offer_through_durable_manager(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False
@@ -659,7 +815,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if stopped.offer_manager.cancel_offers.call_count
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch("wallet.cancel_offers_batch") as direct_batch,
             patch("wallet.is_offer_time_expired", return_value=False),
@@ -694,7 +854,7 @@ class TestCancelAllPost(_FlaskBase):
         stopped.coin_manager.refresh_fee_pool_from_wallet.assert_called_once_with()
         direct_batch.assert_not_called()
 
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(
@@ -770,9 +930,14 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
+                side_effect=lambda **_bounds: (
+                    []
+                    if reconciled["done"]
+                    else [
+                        {"trade_id": trade_id, "status": "ACTIVE"}
+                        for trade_id in trade_ids
+                    ]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -784,7 +949,7 @@ class TestCancelAllPost(_FlaskBase):
 
         self.assertEqual(response.status_code, 200)
         stopped.offer_manager.retry_failed_cancels.assert_called_once_with(trade_ids)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(
@@ -826,7 +991,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if stopped.offer_manager.cancel_offers.call_count
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -846,6 +1015,89 @@ class TestCancelAllPost(_FlaskBase):
             "manual_cancel_all_confirmed"
         )
         stopped.offer_manager.sync_from_wallet.assert_called_once_with()
+
+    def test_cancel_all_does_not_complete_when_new_wallet_offer_appears(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        initial_id = "a" * 64
+        late_id = "b" * 64
+
+        def read_page(**_bounds):
+            trade_id = (
+                late_id
+                if stopped.offer_manager.cancel_offers.call_count
+                else initial_id
+            )
+            return {
+                "success": True,
+                "offers": [{"trade_id": trade_id, "status": "ACTIVE"}],
+                "end_of_history": True,
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    initial_id: {
+                        "sage_trade_id": initial_id,
+                        "outcome": "CANCELLED_PROVEN",
+                    }
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            self._post("/api/offers/cancel_all")
+
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
+
+    def test_cancel_all_does_not_complete_when_final_wallet_read_fails(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+
+        def read_page(**_bounds):
+            if stopped.offer_manager.cancel_offers.call_count:
+                return {"success": False, "offers": [], "end_of_history": False}
+            return {
+                "success": True,
+                "offers": [{"trade_id": trade_id, "status": "ACTIVE"}],
+                "end_of_history": True,
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    trade_id: {"sage_trade_id": trade_id, "outcome": "CANCELLED_PROVEN"}
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            self._post("/api/offers/cancel_all")
+
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertFalse(status["complete"])
+        self.assertEqual(status["phase"], "error")
+        stopped.offer_manager.expect_empty_wallet_offer_book.assert_not_called()
 
     def test_cancel_all_completed_at_deadline_is_not_reported_as_zero_pending_error(
         self,
@@ -888,7 +1140,11 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+                side_effect=lambda **_bounds: (
+                    []
+                    if reconciled["done"]
+                    else [{"trade_id": trade_id, "status": "ACTIVE"}]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -900,7 +1156,7 @@ class TestCancelAllPost(_FlaskBase):
             response = self._post("/api/offers/cancel_all")
 
         self.assertEqual(response.status_code, 200)
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["phase"], "complete")
@@ -963,7 +1219,7 @@ class TestCancelAllPost(_FlaskBase):
 
         def poll():
             snapshots.append(
-                self.client.get(
+                self._get(
                     "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
                 ).get_json()
             )
@@ -1015,9 +1271,20 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
+                side_effect=lambda **_bounds: (
+                    []
+                    if len(records) == len(trade_ids)
+                    and all(
+                        records[trade_id]["sage_trade_id"] == trade_id
+                        and records[trade_id]["outcome"]
+                        in {"CANCELLED_PROVEN", "EXPIRED_PROVEN"}
+                        for trade_id in trade_ids
+                    )
+                    else [
+                        {"trade_id": trade_id, "status": "ACTIVE"}
+                        for trade_id in trade_ids
+                    ]
+                ),
             ),
             patch(
                 "database.get_authoritative_terminal_records",
@@ -1042,7 +1309,7 @@ class TestCancelAllPost(_FlaskBase):
             )
             self.assertNotIn("_target_trade_ids", snapshot)
         # Only the worker may declare completion, after the retry call returns.
-        final = self.client.get(
+        final = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertTrue(final["complete"])
@@ -1118,7 +1385,7 @@ class TestCancelAllPost(_FlaskBase):
         assert "cancelResult.timeout_seconds" in shutdown_source
         assert "await waitForShutdownCancelAllCompletion" in shutdown_source
         cancel_response_window = shutdown_source.split(
-            "const cancelResult = await cancelResp.json();", 1
+            "const cancelResult = await requestShutdownCancelAllAfterStop();", 1
         )[1].split("const isAsyncCancel = cancelResult.async === true;", 1)[0]
         assert "stopShutdownCancelAllPoll();" not in cancel_response_window
         assert "cancelled + pending + failed !== count" in shutdown_source
@@ -1143,14 +1410,17 @@ class TestCancelAllPost(_FlaskBase):
             target()
             return object()
 
+        def read_page(*, include_completed, start=0, end=50):
+            if stopped.offer_manager.cancel_offers.call_count:
+                return []
+            return [
+                {"trade_id": trade_id, "status": "ACTIVE"}
+                for trade_id in trade_ids[start:end]
+            ]
+
         with (
             patch.object(api_server, "bot", stopped),
-            patch(
-                "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
-                ],
-            ),
+            patch("wallet.get_all_offers", side_effect=read_page),
             patch(
                 "database.get_authoritative_terminal_records",
                 side_effect=lambda candidates: {
@@ -1172,7 +1442,7 @@ class TestCancelAllPost(_FlaskBase):
             reason="manual_cancel_all",
             force_storm=True,
         )
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["total"], 500)
@@ -1181,6 +1451,104 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["cancelled"], 500)
         self.assertEqual(status["pending"], 0)
         self.assertEqual(status["failed"], 0)
+
+    def test_stopped_cancel_all_finds_active_offer_after_full_terminal_page(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        active_id = "f" * 64
+        history = [
+            {"trade_id": f"{index:064x}", "status": "CANCELLED"}
+            for index in range(1, 501)
+        ] + [{"trade_id": active_id, "status": "ACTIVE"}]
+        stopped.offer_manager.cancel_offers.return_value = {
+            active_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED", "success": True}
+        }
+
+        def read_page(*, include_completed, start=0, end=50):
+            # A wallet may honor pagination while ignoring include_completed.
+            return history[start:end]
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_all_offers", side_effect=read_page),
+            patch("wallet.get_authoritative_offer_history", side_effect=read_page),
+            patch(
+                "database.get_authoritative_terminal_records",
+                return_value={
+                    active_id: {
+                        "sage_trade_id": active_id,
+                        "outcome": "CANCELLED_PROVEN",
+                    }
+                },
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_called_once_with(
+            [active_id], reason="manual_cancel_all", force_storm=True
+        )
+
+    def test_stopped_cancel_all_rejects_failed_authoritative_history_read(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": False,
+                    "offers": [],
+                    "end_of_history": False,
+                },
+            ),
+            patch("wallet.get_all_offers", return_value=[]),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
+    def test_stopped_cancel_all_does_not_claim_empty_for_pending_cancel(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": [{"trade_id": "a" * 64, "status": "PENDING_CANCEL"}],
+                    "end_of_history": True,
+                },
+            ),
+            patch("wallet.get_all_offers", return_value=[]),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
+    def test_stopped_cancel_all_rejects_repeated_unbounded_page(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        page = [
+            {"trade_id": f"{index:064x}", "status": "ACTIVE"} for index in range(1, 501)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch("wallet.get_authoritative_offer_history", return_value=page),
+            patch("wallet.get_all_offers", return_value=page),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 503)
+        stopped.offer_manager.cancel_offers.assert_not_called()
 
     def test_stopped_cancel_all_sequences_balanced_fee_safe_sage_batches(self):
         stopped = _make_bot()
@@ -1222,8 +1590,10 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                side_effect=lambda **_bounds: [
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                    if trade_id not in terminal_ids
                 ],
             ),
             patch(
@@ -1240,13 +1610,118 @@ class TestCancelAllPost(_FlaskBase):
             [trade_id for batch in submitted_batches for trade_id in batch],
             trade_ids,
         )
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["batch_size"], 4)
         self.assertEqual(status["total_batches"], 3)
         self.assertEqual(status["current_batch"], 3)
         self.assertEqual(status["cancelled"], 10)
+
+    def test_stopped_cancel_all_separates_bootstrap_and_orphan_fee_scopes(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        bootstrap_id, orphan_id, campaign_id = "a" * 64, "b" * 64, "c" * 64
+        terminal_ids = set()
+        submitted = []
+
+        def cancel_batch(trade_ids, **kwargs):
+            submitted.append((tuple(trade_ids), kwargs))
+            terminal_ids.update(trade_ids)
+            return {trade_id: {"success": True} for trade_id in trade_ids}
+
+        def terminal_records(candidates):
+            return {
+                trade_id: {
+                    "intent_id": f"intent:{trade_id}",
+                    "sage_trade_id": trade_id,
+                    "outcome": "CANCELLED_PROVEN",
+                }
+                for trade_id in candidates
+                if trade_id in terminal_ids
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        stopped.offer_manager.cancel_offers.side_effect = cancel_batch
+        rows = [
+            {"trade_id": trade_id, "status": "ACTIVE"}
+            for trade_id in (bootstrap_id, orphan_id)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": rows,
+                    "total": 2,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                side_effect=lambda trade_id: (
+                    {"purpose": f"bootstrap:{campaign_id}:revision:1"}
+                    if trade_id == bootstrap_id
+                    else None
+                ),
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                side_effect=terminal_records,
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item[0] for item in submitted], [(orphan_id,), (bootstrap_id,)]
+        )
+        self.assertEqual(submitted[0][1]["reason"], "manual_cancel_all")
+        self.assertEqual(submitted[1][1]["reason"], "coin_prep_cancel_all")
+
+    def test_stopped_cancel_all_rejects_one_approval_for_mixed_fee_scopes(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        bootstrap_id, orphan_id, campaign_id = "a" * 64, "b" * 64, "c" * 64
+        rows = [
+            {"trade_id": trade_id, "status": "ACTIVE"}
+            for trade_id in (bootstrap_id, orphan_id)
+        ]
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": rows,
+                    "total": 2,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                side_effect=lambda trade_id: (
+                    {"purpose": f"bootstrap:{campaign_id}:revision:1"}
+                    if trade_id == bootstrap_id
+                    else None
+                ),
+            ),
+        ):
+            response = self._post(
+                "/api/offers/cancel_all",
+                {"source": "coin_prep", "fee_approval_id": "d" * 64},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.get_json()["reason"], "FEE_CANCELLATION_SCOPE_INVALID"
+        )
+        stopped.offer_manager.cancel_offers.assert_not_called()
 
     def test_stopped_cancel_all_retries_only_the_current_fee_safe_batch(self):
         """An older failed cancel outside the batch must never steal its retry slot."""
@@ -1292,8 +1767,10 @@ class TestCancelAllPost(_FlaskBase):
             patch.object(api_server, "bot", stopped),
             patch(
                 "wallet.get_all_offers",
-                return_value=[
-                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                side_effect=lambda **_bounds: [
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                    if trade_id not in terminal_ids
                 ],
             ),
             patch(
@@ -1306,7 +1783,7 @@ class TestCancelAllPost(_FlaskBase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(retried_batches, [trade_ids[:2], trade_ids[2:]])
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertTrue(status["complete"])
@@ -1360,7 +1837,7 @@ class TestCancelAllPost(_FlaskBase):
         direct_batch.assert_not_called()
         start_thread.assert_not_called()
 
-        status = self.client.get(
+        status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertFalse(status["running"])
@@ -1417,6 +1894,63 @@ def test_offer_diagnostic_does_not_invent_dexie_staleness_from_local_agreement()
     assert result["dexie_rows_evaluated"] is False
     assert result["likely_stale_dexie_rows"] is None
     assert "cannot determine" in result["diagnosis"]
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_offer_diagnostic_rejects_cached_wallet_book_after_sage_read_failure():
+    bot = _make_bot()
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": False,
+        "using_cache": True,
+        "last_error": "sage_get_offers_unavailable",
+    }
+
+    with (
+        patch.object(api_server, "bot", bot),
+        patch("database.get_connection", return_value=conn),
+    ):
+        result = api_server.app.test_client().get(
+            "/api/offers/diagnostic",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert result.status_code == 200
+    body = result.get_json()
+    assert body["success"] is True
+    assert body["local_book_consistent"] is False
+    assert body["wallet_error"] == "sage_get_offers_unavailable"
+    assert "unavailable" in body["diagnosis"].lower()
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_offer_diagnostic_accepts_fresh_empty_wallet_book():
+    bot = _make_bot()
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    bot.offer_manager.get_wallet_sync_meta.return_value = {
+        "fresh": True,
+        "using_cache": False,
+        "last_error": "",
+    }
+
+    with (
+        patch.object(api_server, "bot", bot),
+        patch("database.get_connection", return_value=conn),
+    ):
+        result = api_server.app.test_client().get(
+            "/api/offers/diagnostic",
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+    assert result.status_code == 200
+    body = result.get_json()
+    assert body["success"] is True
+    assert body["local_book_consistent"] is True
+    assert body["wallet_error"] is None
 
 
 if __name__ == "__main__":

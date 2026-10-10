@@ -12,7 +12,7 @@ Tests the full bot start → stop cycle at the DB + endpoint level:
     - events.emit("bot_control", ...) fires on start and stop.
 
   Bot stop:
-    - /api/bot/stop transitions bot to stopped state.
+    - /api/bot/stop reports the asynchronous stopping phase.
     - DB fills are unaffected by stop.
     - Stopping an already-stopped bot is safe (no crash).
 
@@ -116,8 +116,18 @@ class _TempDB(unittest.TestCase):
 
     def _make_bot(self, running=False):
         bot = MagicMock()
+        bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
+        bot.offer_manager.get_wallet_sync_meta.return_value = {
+            "fresh": True,
+            "using_cache": False,
+        }
+        bot.offer_manager.sync_from_wallet_with_meta.side_effect = lambda: (
+            bot.offer_manager.sync_from_wallet(),
+            bot.offer_manager.get_wallet_sync_meta(),
+        )
         bot.is_running.return_value = running
         bot.start.return_value = True
+        bot.coin_manager.is_busy.return_value = False
         bot.get_state.return_value = {"status": "running"}
         bot.market_intel.reset_session_stats = MagicMock()
         bot.splash_manager.reset_session_stats = MagicMock()
@@ -214,6 +224,18 @@ class TestBotStartContract(_TempDB):
         self._start(self._make_bot(running=False))
         self.assertFalse(api_server._fresh_start_is_set())
 
+    def test_start_blocks_before_bot_runs_when_flag_cleanup_fails(self):
+        bot = self._make_bot(running=False)
+        with patch.object(
+            api_server,
+            "_fresh_start_clear",
+            side_effect=PermissionError("profile is read-only"),
+        ):
+            resp, _ = self._start(bot)
+        self.assertEqual(resp.status_code, 500)
+        self.assertFalse(resp.get_json().get("success"))
+        bot.start.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # DB state survives bot start
@@ -256,14 +278,14 @@ class TestBotStopPreservesFills(_TempDB):
         resp, _ = self._stop(self._make_bot(running=True))
         self.assertEqual(resp.status_code, 200)
 
-    def test_stop_response_has_status_stopped(self):
+    def test_stop_response_has_status_stopping(self):
         resp, _ = self._stop(self._make_bot(running=True))
         body = resp.get_json()
-        self.assertEqual(body.get("status"), "stopped")
+        self.assertEqual(body.get("status"), "stopping")
 
     def test_stop_emits_bot_control_event(self):
         _, mock_events = self._stop(self._make_bot(running=True))
-        mock_events.emit.assert_called_with("bot_control", {"action": "stopped"})
+        mock_events.emit.assert_called_with("bot_control", {"action": "stopping"})
 
     def test_fills_survive_bot_stop(self):
         """Fills inserted before stop are still present after stop."""

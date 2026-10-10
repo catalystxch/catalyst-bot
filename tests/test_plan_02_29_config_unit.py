@@ -123,6 +123,25 @@ class TestBool(unittest.TestCase):
         self.assertTrue(self._call('"true"'))
 
 
+@unittest.skipIf(_SKIP_CFG is not None, f"config unavailable: {_SKIP_CFG}")
+class TestSafeUrlDiagnostics(unittest.TestCase):
+    def test_invalid_url_falls_back_without_logging_configured_value(self):
+        configured = "private-token://internal-host/path?key=secret"
+        with (
+            patch.dict(os.environ, {"DEXIE_API_BASE": configured}),
+            patch("builtins.print") as mock_print,
+        ):
+            result = _cfg_mod._safe_url("DEXIE_API_BASE", "https://api.dexie.space")
+
+        self.assertEqual(result, "https://api.dexie.space")
+        output = " ".join(
+            str(arg) for call in mock_print.call_args_list for arg in call.args
+        )
+        self.assertIn("DEXIE_API_BASE", output)
+        for private_part in ("private-token", "internal-host", "/path", "secret"):
+            self.assertNotIn(private_part, output)
+
+
 # ===========================================================================
 # Config computed methods (bare instances, no reload)
 # ===========================================================================

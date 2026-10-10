@@ -18,6 +18,7 @@ import glob
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -59,7 +60,175 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 bp = Blueprint("coin_prep", __name__)
 
+
+def _public_fee_reason(exc: ValueError, fallback: str) -> str:
+    """Translate internal exceptions to fixed public reason-code literals."""
+    value = str(exc)
+    if value == "FEE_PREP_OPTIONS_INVALID":
+        return "FEE_PREP_OPTIONS_INVALID"
+    if value == "FEE_APPROVAL_STALE":
+        return "FEE_APPROVAL_STALE"
+    if value == "FEE_BUDGET_INSUFFICIENT":
+        return "FEE_BUDGET_INSUFFICIENT"
+    if value == "FEE_ESTIMATE_UNAVAILABLE":
+        return "FEE_ESTIMATE_UNAVAILABLE"
+    if value == "FEE_WALLET_CONTEXT_CHANGED":
+        return "FEE_WALLET_CONTEXT_CHANGED"
+    if value == "FEE_WALLET_IDENTITY_UNAVAILABLE":
+        return "FEE_WALLET_IDENTITY_UNAVAILABLE"
+    if value == "FEE_WALLET_INVENTORY_UNAVAILABLE":
+        return "FEE_WALLET_INVENTORY_UNAVAILABLE"
+    if value == "FEE_WALLET_ASSET_UNAVAILABLE":
+        return "FEE_WALLET_ASSET_UNAVAILABLE"
+    if value == "FEE_WALLET_ADDRESS_UNAVAILABLE":
+        return "FEE_WALLET_ADDRESS_UNAVAILABLE"
+    if value == "FEE_PREP_CAMPAIGN_UNAVAILABLE":
+        return "FEE_PREP_CAMPAIGN_UNAVAILABLE"
+    if value == "FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED":
+        return "FEE_PREP_CAMPAIGN_MULTIPLIER_UNSUPPORTED"
+    if value == "FEE_PREP_CONFIGURATION_INVALID":
+        return "FEE_PREP_CONFIGURATION_INVALID"
+    if value == "FEE_PREP_PRICE_UNAVAILABLE":
+        return "FEE_PREP_PRICE_UNAVAILABLE"
+    if value == "FEE_BUDGET_EXCEEDED":
+        return "FEE_BUDGET_EXCEEDED"
+    if value == "FEE_DISPATCH_PLAN_MISMATCH":
+        return "FEE_DISPATCH_PLAN_MISMATCH"
+    if value == "FEE_EFFECT_NOT_DISPATCHABLE":
+        return "FEE_EFFECT_NOT_DISPATCHABLE"
+    if value == "FEE_EFFECT_RECOVERY_REQUIRED":
+        return "FEE_EFFECT_RECOVERY_REQUIRED"
+    if value == "FEE_PREP_FUNDING_INSUFFICIENT":
+        return "FEE_PREP_FUNDING_INSUFFICIENT"
+    if value == "FEE_PREP_PRINCIPAL_UNFUNDED":
+        return "FEE_PREP_PRINCIPAL_UNFUNDED"
+    if value == "FEE_UNSIGNED_COST_UNAVAILABLE":
+        return "FEE_UNSIGNED_COST_UNAVAILABLE"
+    return fallback
+
+
 _coin_prep_trigger_lock = threading.Lock()
+
+
+def _fee_json_amounts(value):
+    """Preserve atomic amounts even inside staged quotes at JS boundaries."""
+    if type(value) is dict:
+        return {
+            key: str(item)
+            if key.endswith("_mojos") and type(item) is int
+            else _fee_json_amounts(item)
+            for key, item in value.items()
+        }
+    if type(value) is list:
+        return [_fee_json_amounts(item) for item in value]
+    return value
+
+
+@bp.route("/api/coin-prep/fee-preview", methods=["POST"])
+def api_coin_prep_fee_preview():
+    """Estimate a server-owned staged plan without consent or wallet effects."""
+    from coin_prep_fee_approval import preview_coin_prep_fees
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if type(body) is not dict:
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FEE_PREP_OPTIONS_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
+    try:
+        result = preview_coin_prep_fees(body)
+        return jsonify(
+            _fee_json_amounts({**result, "success": result["available"] is True})
+        )
+    except ValueError as exc:
+        reason = _public_fee_reason(exc, "FEE_PREVIEW_UNAVAILABLE")
+        if reason != "FEE_PREVIEW_UNAVAILABLE":
+            status = 400 if reason == "FEE_PREP_OPTIONS_INVALID" else 409
+            return jsonify(
+                {"success": False, "reason": reason, "dispatch_authorized": False}
+            ), status
+        slog(
+            "COIN_PREP", "Fee preview rejected invalid server context", level="warning"
+        )
+    except Exception:
+        slog(
+            "COIN_PREP",
+            "Fee preview could not read current server context",
+            level="error",
+        )
+    return jsonify(
+        {
+            "success": False,
+            "available": False,
+            "reason": "FEE_PREVIEW_UNAVAILABLE",
+            "dispatch_authorized": False,
+        }
+    ), 503
+
+
+@bp.route("/api/coin-prep/fee-approval", methods=["POST"])
+def api_coin_prep_fee_approval():
+    """Record explicit fee consent, never launch or dispatch Coin Prep."""
+    from coin_prep_fee_approval import MAX_ATOMIC_AMOUNT, approve_coin_prep_fees
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    keys = {"preview_id", "maximum_fee_mojos", "cancellation_reserve_mojos"}
+    invalid = {
+        "success": False,
+        "reason": "FEE_APPROVAL_REQUEST_INVALID",
+        "dispatch_authorized": False,
+    }
+    if (
+        type(body) is not dict
+        or set(body) != keys
+        or type(body["preview_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None
+    ):
+        return jsonify(invalid), 400
+    amounts = {}
+    for key in ("maximum_fee_mojos", "cancellation_reserve_mojos"):
+        value = body[key]
+        # Canonical atomic strings are lossless across JavaScript's JSON
+        # boundary. No float/bool/scientific/whitespace/leading-zero coercion.
+        if type(value) is str and re.fullmatch(r"0|[1-9][0-9]{0,18}", value):
+            value = int(value)
+        if type(value) is not int or not 0 <= value <= MAX_ATOMIC_AMOUNT:
+            return jsonify(invalid), 400
+        amounts[key] = value
+    try:
+        result = approve_coin_prep_fees(preview_id=body["preview_id"], **amounts)
+        # Keep atomic accounting lossless through HTTP and PyWebView JSON;
+        # JavaScript numbers cannot represent the full supported mojo range.
+        return jsonify(_fee_json_amounts({**result, "success": True}))
+    except ValueError as exc:
+        reason = _public_fee_reason(exc, "FEE_APPROVAL_UNAVAILABLE")
+        if reason != "FEE_APPROVAL_UNAVAILABLE":
+            return jsonify(
+                {"success": False, "reason": reason, "dispatch_authorized": False}
+            ), 409
+        slog(
+            "COIN_PREP",
+            "Fee confirmation rejected invalid server context",
+            level="warning",
+        )
+    except Exception:
+        slog(
+            "COIN_PREP",
+            "Fee confirmation could not read current server context",
+            level="error",
+        )
+    return jsonify(
+        {
+            "success": False,
+            "reason": "FEE_APPROVAL_UNAVAILABLE",
+            "dispatch_authorized": False,
+        }
+    ), 503
 
 
 def _coin_prep_wallet_snapshot(
@@ -167,7 +336,7 @@ def bootstrap_coin_prep_worker_args(
     for side, count in replacement_waves.items():
         if type(count) is not int or count < 0:
             raise ValueError(f"Bootstrap {side} replacement wave count is invalid")
-    if xch_sizes and replacement_waves["buy"] == 0:
+    if any(tier != "fees" for tier in xch_sizes) and replacement_waves["buy"] == 0:
         raise ValueError("Bootstrap buy replacement capacity is exhausted")
     if cat_sizes and replacement_waves["sell"] == 0:
         raise ValueError("Bootstrap sell replacement capacity is exhausted")
@@ -341,9 +510,12 @@ def _wallet_open_offer_snapshot_before_prep() -> dict:
             "open_sell_count": 0,
             "open_trade_ids": [],
         }
+    # This gate needs the complete live book, not terminal history. Sage may
+    # ignore its RPC filter, so the wallet adapter removes proven terminal
+    # rows only after reading the complete response.
     snapshot = offer_reconciliation.load_sage_offer_history(
         get_all_offers=reader,
-        include_completed=True,
+        include_completed=False,
         page_size=500,
         max_pages=9,
         max_records=4096,
@@ -1107,20 +1279,20 @@ def api_coin_topup():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    # Block if bot is live — topup splits coins and races with offer creation
-    if bot.is_running():
-        return jsonify(
-            {
-                "error": "Stop the bot before manual top-up. "
-                "The bot handles top-up automatically while running.",
-                "requires_stop": True,
-            }
-        ), 409
+    # Serialize the stopped proof and worker reservation with bot start.
+    with api_server._bot_cancel_lifecycle_lock:
+        if not bot.is_stopped():
+            return jsonify(
+                {
+                    "error": "Stop the bot before manual top-up. "
+                    "The bot handles top-up automatically while running.",
+                    "requires_stop": True,
+                }
+            ), 409
 
-    open_buys = bot.offer_manager.get_open_offer_count("buy")
-    open_sells = bot.offer_manager.get_open_offer_count("sell")
-
-    started = bot.coin_manager.start_topup(open_buys, open_sells)
+        open_buys = bot.offer_manager.get_open_offer_count("buy")
+        open_sells = bot.offer_manager.get_open_offer_count("sell")
+        started = bot.coin_manager.start_topup(open_buys, open_sells)
     return jsonify({"status": "started" if started else "already_running"})
 
 
@@ -1131,18 +1303,34 @@ def api_coin_prep():
     if not bot:
         return jsonify({"error": "Bot not initialised"}), 500
 
-    # Block if bot is live — coin prep splits/combines and races with offer creation
-    if bot.is_running():
-        return jsonify(
-            {
-                "error": "Stop the bot before manual coin prep. "
-                "Runtime top-up can refill prepared spares while running; "
-                "full coin prep cancels and rebuilds the wallet layout.",
-                "requires_stop": True,
-            }
-        ), 409
-
-    started = bot.coin_manager.start_coin_prep()
+    # Keep the stopped proof atomic with the worker's busy reservation.
+    with api_server._bot_cancel_lifecycle_lock:
+        if not bot.is_stopped():
+            return jsonify(
+                {
+                    "error": "Stop the bot before manual coin prep. "
+                    "Runtime top-up can refill prepared spares while running; "
+                    "full coin prep cancels and rebuilds the wallet layout.",
+                    "requires_stop": True,
+                }
+            ), 409
+        body = request.get_json(silent=True)
+        fee_approval_id = body.get("fee_approval_id") if type(body) is dict else None
+        if (
+            type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_REQUIRED",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        started = bot.coin_manager.start_coin_prep(fee_approval_id=fee_approval_id)
     return jsonify({"status": "started" if started else "already_running"})
 
 
@@ -1262,6 +1450,8 @@ def api_coin_prep_status():
     bot = api_server.bot
     try:
         result = {"success": True, **api_server._coin_prep_state}
+        worker_fee_approval_id = None
+        durable_fee = None
         bootstrap_campaign = None
         asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
         if len(asset_id) == 64:
@@ -1349,6 +1539,20 @@ def api_coin_prep_status():
             try:
                 with open(status_file, "r") as f:
                     worker_status = json.load(f)
+                candidate_approval_id = worker_status.get("fee_approval_id")
+                if type(candidate_approval_id) is str and re.fullmatch(
+                    r"[0-9a-f]{64}", candidate_approval_id
+                ):
+                    worker_fee_approval_id = candidate_approval_id
+                    if bootstrap_campaign is None:
+                        try:
+                            from database import get_coin_prep_fee_approval_status
+
+                            durable_fee = get_coin_prep_fee_approval_status(
+                                worker_fee_approval_id
+                            )
+                        except Exception:
+                            durable_fee = None
 
                 # Check if this status file belongs to the CURRENT run.
                 # If it has a different run_id (or none), it's stale from
@@ -1389,6 +1593,7 @@ def api_coin_prep_status():
                         "paid_fee_mojos",
                         "confirmation_elapsed_seconds",
                         "compatibility_reason",
+                        "fee_approval_id",
                     ):
                         if detail_key in worker_status:
                             result[detail_key] = worker_status[detail_key]
@@ -1509,10 +1714,36 @@ def api_coin_prep_status():
                                 _all_ok = True
                                 if _last.get("tier_enabled"):
                                     _offer_tsxch = _last.get("offer_tier_sizes_xch")
+                                    _approval_options = (
+                                        durable_fee.get("request_options") or {}
+                                        if isinstance(durable_fee, dict)
+                                        else {}
+                                    )
+                                    _approval_is_bootstrap = bool(
+                                        isinstance(durable_fee, dict)
+                                        and (
+                                            durable_fee.get("campaign_id")
+                                            or _approval_options.get(
+                                                "bootstrap_campaign_id"
+                                            )
+                                        )
+                                    )
+                                    # An authoritative standard fee approval
+                                    # distinguishes normal prep from Bootstrap.
+                                    # If approval provenance is unavailable,
+                                    # retain the conservative legacy inference.
+                                    _strict_bootstrap = bool(
+                                        isinstance(_offer_tsxch, dict)
+                                        and _offer_tsxch
+                                        and (
+                                            bootstrap_campaign is not None
+                                            or durable_fee is None
+                                            or _approval_is_bootstrap
+                                        )
+                                    )
                                     _tsxch = (
                                         _offer_tsxch
-                                        if isinstance(_offer_tsxch, dict)
-                                        and _offer_tsxch
+                                        if _strict_bootstrap
                                         else _last.get("tier_sizes_xch", {})
                                     )
                                     _tscat = _last.get("tier_sizes_cat", {})
@@ -1555,9 +1786,6 @@ def api_coin_prep_status():
                                     # coin below that exact spend is unusable,
                                     # even when it lies within the historical
                                     # five-percent reuse tolerance.
-                                    _strict_bootstrap = bool(
-                                        isinstance(_offer_tsxch, dict) and _offer_tsxch
-                                    )
                                     _xa = _alloc_match(
                                         _xch_coins,
                                         _xreqs,
@@ -1660,6 +1888,81 @@ def api_coin_prep_status():
 
         _refresh_finished_prep_coin_counts(result)
 
+        # A worker may disappear from memory during a browser/app/PC restart,
+        # but its consent and accounting do not. Recover only the approval ID
+        # written by the worker itself and expose a read-only, lossless view.
+        # Bootstrap cancellation recovery may deliberately renew that consent
+        # after the worker completed.  Prefer the campaign's latest immutable
+        # approval so status never reports a superseded ceiling with cumulative
+        # scope spend (which can otherwise render a misleading negative balance).
+        campaign_id = (
+            bootstrap_campaign.get("campaign_id")
+            if bootstrap_campaign is not None
+            else None
+        )
+        if campaign_id is None and worker_fee_approval_id is not None:
+            if durable_fee is None:
+                try:
+                    from database import get_coin_prep_fee_approval_status
+
+                    durable_fee = get_coin_prep_fee_approval_status(
+                        worker_fee_approval_id
+                    )
+                except Exception:
+                    durable_fee = None
+            if isinstance(durable_fee, dict):
+                campaign_id = durable_fee.get("campaign_id") or (
+                    durable_fee.get("request_options") or {}
+                ).get("bootstrap_campaign_id")
+        if bootstrap_campaign is not None:
+            # The worker file may belong to a previous campaign. Only the
+            # active campaign's durable consent can authorize recovery.
+            worker_fee_approval_id = None
+            durable_fee = None
+        if campaign_id is not None:
+            try:
+                from database import get_latest_coin_prep_fee_approval_for_campaign
+
+                latest_campaign_approval_id = (
+                    get_latest_coin_prep_fee_approval_for_campaign(campaign_id)
+                )
+                if latest_campaign_approval_id is not None:
+                    if latest_campaign_approval_id != worker_fee_approval_id:
+                        durable_fee = None
+                    worker_fee_approval_id = latest_campaign_approval_id
+            except Exception:
+                if bootstrap_campaign is not None:
+                    result["overlapping_coin_prep_blocked"] = True
+                    result["fee_approval_lookup_unavailable"] = True
+        if worker_fee_approval_id is not None:
+            result["fee_approval_id"] = worker_fee_approval_id
+            try:
+                from database import get_coin_prep_fee_approval_status
+
+                if durable_fee is None:
+                    durable_fee = get_coin_prep_fee_approval_status(
+                        worker_fee_approval_id
+                    )
+                result["fee_approval"] = _fee_json_amounts(durable_fee)
+                active_fee_states = {
+                    "approved",
+                    "held_before_submission",
+                    "submitted_awaiting_confirmation",
+                    "paused_budget",
+                }
+                if durable_fee.get("state") in active_fee_states:
+                    result["overlapping_coin_prep_blocked"] = True
+                    if not result.get("running"):
+                        result["fee_resume_required"] = True
+            except Exception:
+                result["fee_approval"] = {
+                    "approval_id": worker_fee_approval_id,
+                    "state": "unavailable",
+                    "reason": "FEE_APPROVAL_STATUS_UNAVAILABLE",
+                    "dispatch_authorized": False,
+                }
+                result["overlapping_coin_prep_blocked"] = True
+
         # Optionally refresh live coin counts (when not actively prepping)
         refresh = request.args.get("refresh", "false").lower() == "true"
         if refresh and bot and not api_server._coin_prep_state["running"]:
@@ -1694,8 +1997,8 @@ def api_coin_prep_status():
                 _drift = _tier_size_drift_findings(allow_fresh_price=False)
                 result["tier_size_drift"] = _drift
                 _mark_payload_needs_coin_prep_for_drift(result, _drift)
-            except Exception as _drift_err:
-                result["tier_size_drift_error"] = str(_drift_err)[:200]
+            except Exception:
+                result["tier_size_drift_error"] = "Tier status unavailable"
 
         # Include the recent coin prep transcript for the inline console.
         # We prefer DB-backed events because that captures both structured
@@ -1733,7 +2036,7 @@ def api_coin_prep_status():
 
 
 @bp.route("/api/coin-prep/verify")
-def api_coin_prep_verify():
+def api_coin_prep_verify(_args=None):
     """Verify if the wallet already has the right coins for the requested prep.
 
     Fetches spendable coins from the wallet and groups them by amount,
@@ -1749,6 +2052,7 @@ def api_coin_prep_verify():
       tier_enabled=false
       trade_size=0.7&prepared_xch_size=0.77&prepared_cat_size=7654&max_buy=25&max_sell=25
     """
+    args = request.args if _args is None else _args
     bot = api_server.bot
     try:
         from wallet import get_spendable_coins_rpc, get_wallet_balance, WALLET_ID_XCH
@@ -1759,21 +2063,17 @@ def api_coin_prep_verify():
             or getattr(cfg, "CAT_WALLET_ID", 2)
             or 2
         )
-        tier_enabled = request.args.get("tier_enabled", "false").lower() == "true"
+        tier_enabled = args.get("tier_enabled", "false").lower() == "true"
         liquidity_mode = _safe_liquidity_mode(
-            request.args.get("liquidity_mode")
+            args.get("liquidity_mode")
             or getattr(cfg, "LIQUIDITY_MODE", "two_sided")
             or "two_sided"
         )
         bootstrap_context = None
-        bootstrap_campaign_id = str(
-            request.args.get("bootstrap_campaign_id") or ""
-        ).strip()
+        bootstrap_campaign_id = str(args.get("bootstrap_campaign_id") or "").strip()
         if bootstrap_campaign_id:
             try:
-                bootstrap_revision = int(
-                    request.args.get("bootstrap_campaign_revision", "")
-                )
+                bootstrap_revision = int(args.get("bootstrap_campaign_revision", ""))
             except (TypeError, ValueError) as exc:
                 raise ValueError("bootstrap_coin_prep_confirmation_required") from exc
             bootstrap_context = _active_bootstrap_coin_prep_context(
@@ -1897,18 +2197,16 @@ def api_coin_prep_verify():
             topup_pool_xch_mojos = 0
             topup_pool_cat_mojos = 0
         else:
-            xch_reserve_mojos = _xch_display_to_mojos_ceil(
-                request.args.get("xch_reserve", "0")
-            )
+            xch_reserve_mojos = _xch_display_to_mojos_ceil(args.get("xch_reserve", "0"))
             cat_reserve_mojos = cat_display_amount_to_mojos_ceil(
-                _safe_non_negative_decimal(request.args.get("cat_reserve", "0")),
+                _safe_non_negative_decimal(args.get("cat_reserve", "0")),
                 cat_decimals,
             )
             topup_pool_xch_mojos = _xch_display_to_mojos_ceil(
-                request.args.get("topup_pool_xch", "0")
+                args.get("topup_pool_xch", "0")
             )
             topup_pool_cat_mojos = cat_display_amount_to_mojos_ceil(
-                _safe_non_negative_decimal(request.args.get("topup_pool_cat", "0")),
+                _safe_non_negative_decimal(args.get("topup_pool_cat", "0")),
                 cat_decimals,
             )
         xch_available_mojos = max(0, xch_balance_mojos - xch_reserve_mojos)
@@ -2006,10 +2304,12 @@ def api_coin_prep_verify():
                         "fees",
                     ]
                     if any(
-                        request.args.get(f"{tier}_{suffix}") is not None
+                        args.get(f"{tier}_{suffix}") is not None
                         for suffix in ("xch", "cat", "count", "xch_count", "cat_count")
                     )
                 ]
+            if bootstrap_context is None:
+                tiers = [tier for tier in tiers if tier != "sniper"]
             if not tiers:
                 tiers = ["inner", "mid", "outer", "extreme"]
             result_tiers = {}
@@ -2027,19 +2327,19 @@ def api_coin_prep_verify():
                     cat_needed = exact_spec["cat_needed"]
                 else:
                     xch_amount = _safe_non_negative_decimal(
-                        request.args.get(f"{tier}_xch", "0")
+                        args.get(f"{tier}_xch", "0")
                     )
                     cat_amount = _safe_non_negative_decimal(
-                        request.args.get(f"{tier}_cat", "0")
+                        args.get(f"{tier}_cat", "0")
                     )
                     common_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_count", "0")
+                        args.get(f"{tier}_count", "0")
                     )
                     xch_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_xch_count", common_needed)
+                        args.get(f"{tier}_xch_count", common_needed)
                     )
                     cat_needed = _safe_non_negative_int(
-                        request.args.get(f"{tier}_cat_count", common_needed)
+                        args.get(f"{tier}_cat_count", common_needed)
                     )
                 needed = max(xch_needed, cat_needed)
                 is_xch_only_tier = tier == "fees" or cat_amount <= 0
@@ -2199,15 +2499,15 @@ def api_coin_prep_verify():
             return jsonify(api_server._client_safe_payload(response))
         else:
             # Flat mode
-            trade_size = _safe_non_negative_decimal(request.args.get("trade_size", "0"))
+            trade_size = _safe_non_negative_decimal(args.get("trade_size", "0"))
             prepared_xch_size = _safe_non_negative_decimal(
-                request.args.get("prepared_xch_size", str(trade_size or 0))
+                args.get("prepared_xch_size", str(trade_size or 0))
             )
             prepared_cat_size = _safe_non_negative_decimal(
-                request.args.get("prepared_cat_size", "0")
+                args.get("prepared_cat_size", "0")
             )
-            max_buy = _safe_non_negative_int(request.args.get("max_buy", "0"))
-            max_sell = _safe_non_negative_int(request.args.get("max_sell", "0"))
+            max_buy = _safe_non_negative_int(args.get("max_buy", "0"))
+            max_sell = _safe_non_negative_int(args.get("max_sell", "0"))
             if liquidity_mode == "buy_only":
                 max_sell = 0
             elif liquidity_mode == "sell_only":
@@ -2308,6 +2608,62 @@ def _api_coin_prep_trigger_locked():
         except Exception:
             _prep_req_data = {}
             _prep_coin_multiplier = 1.0
+        _fee_approval_id = _prep_req_data.get("fee_approval_id")
+        if (
+            type(_fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", _fee_approval_id) is None
+        ):
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_REQUIRED",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        try:
+            from coin_prep_fee_dispatch import price_approved_prep_batch
+
+            _approved_dispatch = price_approved_prep_batch(_fee_approval_id)
+        except ValueError as exc:
+            reason = _public_fee_reason(exc, "FEE_APPROVAL_UNAVAILABLE")
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": reason,
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
+        except Exception:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": "FEE_APPROVAL_UNAVAILABLE",
+                        "dispatch_authorized": False,
+                    }
+                ),
+                503,
+            )
+        if _approved_dispatch.get("available") is not True:
+            reason = _approved_dispatch.get("reason")
+            if type(reason) is not str or re.fullmatch(r"FEE_[A-Z_]+", reason) is None:
+                reason = "FEE_APPROVAL_UNAVAILABLE"
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "reason": reason,
+                        "dispatch_authorized": False,
+                    }
+                ),
+                409,
+            )
         try:
             _bootstrap_worker_args = _active_bootstrap_coin_prep_worker_args(
                 _prep_req_data
@@ -2373,9 +2729,11 @@ def _api_coin_prep_trigger_locked():
                 423,
             )
 
-        if bot and bot.is_running():
-            bot.stop(wait=True)
-            if bot.is_running():
+        if bot:
+            was_running = bot.is_running()
+            stop_completed = bot.stop(wait=True) is True if was_running else True
+            bot_stopped = stop_completed and bot.is_stopped()
+            if not bot_stopped:
                 return (
                     jsonify(
                         {
@@ -2390,14 +2748,15 @@ def _api_coin_prep_trigger_locked():
                     ),
                     503,
                 )
-            log_event(
-                "info",
-                "coin_prep_bot_stopped",
-                "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
-            )
-            api_server.events.emit(
-                "bot_control", {"action": "stopped", "reason": "coin_prep"}
-            )
+            if was_running:
+                log_event(
+                    "info",
+                    "coin_prep_bot_stopped",
+                    "Bot loop STOPPED for coin prep — press Start Bot after prep completes",
+                )
+                api_server.events.emit(
+                    "bot_control", {"action": "stopped", "reason": "coin_prep"}
+                )
 
         # If a previous worker is still running, kill it first.
         # Two workers operating on the same wallet simultaneously causes
@@ -2904,6 +3263,15 @@ def _api_coin_prep_trigger_locked():
                         "outer": _tier_count("SELL", "outer"),
                         "extreme": _tier_count("SELL", "extreme"),
                     }
+                    sell_live_position_counts = {
+                        tier: max(
+                            0,
+                            int(
+                                getattr(cfg, f"SELL_{tier.upper()}_TIER_COUNT", 0) or 0
+                            ),
+                        )
+                        for tier in ("inner", "mid", "outer", "extreme")
+                    }
 
                     # ── Translate slot positions → coin SIZE counts ─────────
                     # The coin prep allocates coins by SIZE, not by position.
@@ -2919,11 +3287,15 @@ def _api_coin_prep_trigger_locked():
 
                     xch_tier_counts = _flip_tiers(buy_position_counts, side="buy")
                     cat_tier_counts = _flip_tiers(sell_position_counts, side="sell")
+                    cat_live_tier_counts = _flip_tiers(
+                        sell_live_position_counts, side="sell"
+                    )
                     _liquidity_mode = (
                         getattr(cfg, "LIQUIDITY_MODE", "two_sided") or "two_sided"
                     ).lower()
                     if _liquidity_mode == "buy_only":
                         cat_tier_counts = {}
+                        cat_live_tier_counts = {}
                     elif _liquidity_mode == "sell_only":
                         xch_tier_counts = {}
 
@@ -2975,6 +3347,9 @@ def _api_coin_prep_trigger_locked():
                     cat_counts_str = ",".join(
                         f"{k}={v}" for k, v in cat_tier_counts.items()
                     )
+                    cat_live_counts_str = ",".join(
+                        f"{k}={v}" for k, v in cat_live_tier_counts.items()
+                    )
                     # F62 (2026-04-09): also build per-side size strings.
                     # Sniper/fees stay in the combined `tier_sizes` dict;
                     # only the four trading tiers differ between buy and sell.
@@ -3016,6 +3391,8 @@ def _api_coin_prep_trigger_locked():
                         xch_counts_str,
                         "--tier-counts-cat",
                         cat_counts_str,
+                        "--live-tier-counts-cat",
+                        cat_live_counts_str,
                         "--prep-headroom-pct",
                         str(getattr(cfg, "COIN_PREP_HEADROOM_PCT", Decimal("10"))),
                         "--run-id",
@@ -3061,6 +3438,7 @@ def _api_coin_prep_trigger_locked():
                     )
 
                 cmd += ["--cat-wallet", str(cat_wallet_id)]
+                cmd += ["--fee-approval-id", _fee_approval_id]
 
                 operation_id = f"coin-prep:{run_id}"
                 worker_id = f"coin-prep-worker:{run_id}"
@@ -3532,7 +3910,6 @@ def api_logs_download():
         import glob
         import io
         import platform as _platform
-        import re
         import sys as _sys
         import zipfile
         from pathlib import Path

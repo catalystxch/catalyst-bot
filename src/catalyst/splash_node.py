@@ -1,14 +1,14 @@
 """Auto-launch and monitor the Splash P2P binary as a managed subprocess
 
 Owns the lifecycle of the Splash P2P node that broadcasts and receives
-offers across the Chia ecosystem. Discovers the executable, clears any
-stale processes holding the target port, starts Splash with the correct
+offers across the Chia ecosystem. Discovers the executable, refuses
+unowned listeners on the target port, starts Splash with the correct
 CLI flags, captures stdout for status, and restarts on crash up to a
 configured maximum.
 
 Key responsibilities:
     - Locate splash.exe (configured path, user data dir, bundled path, or PATH)
-    - Clean stale listeners on the submission port (default 4000)
+    - Require a free loopback submission port (default 4000)
     - Launch as a hidden subprocess and pipe stdout into logs
     - Health/status reporting and crash-restart up to a max count
 
@@ -25,6 +25,7 @@ import socket
 import threading
 import subprocess
 import requests
+from urllib.parse import urlsplit
 from typing import Dict, Optional
 
 from config import cfg
@@ -40,13 +41,20 @@ _BINARY_NAME = "splash.exe" if sys.platform == "win32" else "splash"
 class SplashNode:
     """Manages the Splash P2P binary as a subprocess.
 
-    The bot auto-starts Splash when SPLASH_ENABLED=true and a binary
+    The bot auto-starts Splash when outbound or receive is enabled and a binary
     is found. If the binary isn't found, it logs a helpful message
     and the bot continues without P2P (still posts to Dexie normally).
     """
 
     def __init__(self):
         self._process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop_epoch = 0
+        self._stopping = False
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running: bool = False
         self._restart_count: int = 0
@@ -132,13 +140,41 @@ class SplashNode:
     # -------------------------------------------------------------------
 
     def start(self) -> bool:
+        """Admit one managed start at a time."""
+        with self._start_lock:
+            return self._start_serialized()
+
+    def _start_serialized(self) -> bool:
         """Launch the Splash binary in a background thread.
 
         Returns True if started, False if binary not found or already running.
         """
-        if self._running:
-            log_event("info", "splash_node", "Splash node already running")
+        splash_enabled = getattr(cfg, "SPLASH_ENABLED", False) or getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        )
+        if getattr(cfg, "DEXIE_ONLY_BETA", False) or not splash_enabled:
+            reason = (
+                "Splash node startup blocked: release is Dexie-only"
+                if getattr(cfg, "DEXIE_ONLY_BETA", False)
+                else "Splash node startup skipped: Splash is disabled in Settings"
+            )
+            log_event(
+                "info",
+                "splash_node_disabled",
+                reason,
+            )
             return False
+
+        with self._lifecycle_lock:
+            if (
+                self._stopping
+                or self._running
+                or self.is_running()
+                or (self._thread is not None and self._thread.is_alive())
+            ):
+                log_event("info", "splash_node", "Splash node already running")
+                return False
+            stop_epoch = self._stop_epoch
 
         binary = self.find_binary()
         if not binary:
@@ -185,13 +221,40 @@ class SplashNode:
             )
             return False
 
-        self._running = True
-        self._restart_count = 0
+        try:
+            submit_port = self._managed_submit_port()
+            self._require_free_submit_port(submit_port)
+        except ValueError as exc:
+            log_event("warning", "splash_node_invalid_submit_url", str(exc))
+            return False
+        except RuntimeError:
+            return False
 
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="splash-node"
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if (
+                self._stopping
+                or self._stop_epoch != stop_epoch
+                or self._running
+                or self.is_running()
+                or (self._thread is not None and self._thread.is_alive())
+            ):
+                return False
+            self._stop_event.clear()
+            self._running = True
+            self._restart_count = 0
+            self._thread = threading.Thread(
+                target=self._run_loop, daemon=True, name="splash-node"
+            )
+            try:
+                self._thread.start()
+            except Exception as exc:
+                self._running = False
+                self._stop_event.set()
+                self._thread = None
+                log_event(
+                    "warning", "splash_node_start_error", f"Manager start failed: {exc}"
+                )
+                return False
 
         log_event(
             "info",
@@ -200,30 +263,75 @@ class SplashNode:
         )
         return True
 
-    def stop(self):
-        """Stop the Splash node."""
-        self._running = False
-
-        if self._process:
+    def stop(self) -> bool:
+        """Stop the managed node; report whether its child has exited."""
+        with self._stop_lock:
+            with self._lifecycle_lock:
+                self._stopping = True
+                self._stop_epoch += 1
+                self._running = False
+                self._stop_event.set()
             try:
-                if sys.platform == "win32":
-                    self._process.terminate()
-                else:
-                    self._process.send_signal(signal.SIGTERM)
-
-                # Wait up to 5 seconds for clean exit
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            except Exception as e:
-                log_event(
-                    "debug", "splash_node_stop_error", f"Error stopping Splash: {e}"
-                )
+                return self._stop_serialized()
             finally:
+                with self._lifecycle_lock:
+                    self._stopping = False
+
+    def _stop_serialized(self) -> bool:
+        # A manager thread may be inside Popen when stop arrives. Wait for
+        # that launch to finish so a child cannot appear after we report stop.
+        with self._process_lock:
+            if self._process:
+                process = self._process
+                try:
+                    if sys.platform == "win32":
+                        process.terminate()
+                    else:
+                        process.send_signal(signal.SIGTERM)
+
+                    # Wait up to 5 seconds for clean exit
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                        process.wait(timeout=5)
+                    except Exception as e:
+                        log_event(
+                            "warning",
+                            "splash_node_stop_error",
+                            f"Error killing Splash: {e}",
+                        )
+                        return False
+                except Exception as e:
+                    log_event(
+                        "warning",
+                        "splash_node_stop_error",
+                        f"Error stopping Splash: {e}",
+                    )
+                    return False
+                if process.poll() is None:
+                    log_event(
+                        "warning",
+                        "splash_node_stop_error",
+                        "Splash child is still running",
+                    )
+                    return False
                 self._process = None
                 self._pid = None
 
+        manager = self._thread
+        if manager and manager is not threading.current_thread() and manager.is_alive():
+            manager.join(timeout=5)
+            if manager.is_alive():
+                log_event(
+                    "warning",
+                    "splash_node_stop_error",
+                    "Splash manager did not exit after stop",
+                )
+                return False
+
         log_event("info", "splash_node_stopped", "Splash node stopped")
+        return True
 
     # -------------------------------------------------------------------
     # Run loop (background thread)
@@ -244,12 +352,16 @@ class SplashNode:
 
             # Cooldown between restarts
             if self._restart_count > 0:
-                time.sleep(self._restart_cooldown)
+                self._stop_event.wait(self._restart_cooldown)
                 if not self._running:
                     break
 
             try:
-                self._launch_process()
+                with self._process_lock:
+                    if not self._running:
+                        break
+                    self._launch_process()
+                    process = self._process
             except Exception as e:
                 log_event(
                     "error", "splash_node_launch_error", f"Failed to launch Splash: {e}"
@@ -258,8 +370,8 @@ class SplashNode:
                 continue
 
             # Wait for process to exit
-            if self._process:
-                returncode = self._process.wait()
+            if process:
+                returncode = process.wait()
 
                 if self._running:
                     # Unexpected exit — will restart
@@ -288,149 +400,38 @@ class SplashNode:
         except Exception:
             return False
 
-    def _kill_stale_process(self, port: int):
-        """Kill any stale Splash process holding our port.
+    @staticmethod
+    def _managed_submit_port() -> int:
+        """Accept only an explicit loopback HTTP endpoint for the managed node."""
+        submit_url = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+        parsed = urlsplit(str(submit_url))
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "Managed Splash submission URL needs a valid loopback port"
+            ) from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"localhost", "127.0.0.1"}
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "Managed Splash submission URL must be loopback HTTP with an explicit port"
+            )
+        return port
 
-        On Windows, uses netstat + taskkill to find and kill the process
-        bound to the given port. This handles orphan Splash instances
-        left behind from a previous bot run.
-        """
-        if not self._is_port_in_use(port):
-            return  # Port is free, nothing to do
-
-        log_event(
-            "warning",
-            "splash_node_stale",
-            f"Port {port} already in use — killing stale process",
-        )
-
-        if sys.platform == "win32":
-            try:
-                # Find PID using the port via netstat
-                result = subprocess.run(
-                    ["netstat", "-ano"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    **hidden_subprocess_kwargs(),
-                )
-                stale_pid = None
-                for line in result.stdout.splitlines():
-                    # Look for LISTENING on our port
-                    if f":{port}" in line and "LISTENING" in line:
-                        parts = line.split()
-                        if parts:
-                            stale_pid = parts[-1]
-                            break
-
-                if stale_pid and stale_pid.isdigit():
-                    # Verify the process is actually a Splash binary before killing
-                    is_splash = False
-                    try:
-                        name_result = subprocess.run(
-                            [
-                                "wmic",
-                                "process",
-                                "where",
-                                f"ProcessId={stale_pid}",
-                                "get",
-                                "Name",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                            **hidden_subprocess_kwargs(),
-                        )
-                        proc_name = name_result.stdout.lower()
-                        is_splash = "splash" in proc_name
-                    except Exception:
-                        pass  # If we can't verify, don't kill
-                    if not is_splash:
-                        log_event(
-                            "warning",
-                            "splash_node_stale",
-                            f"PID {stale_pid} on port {port} is not a Splash process — skipping kill",
-                        )
-                    else:
-                        log_event(
-                            "info",
-                            "splash_node_stale",
-                            f"Found stale Splash PID {stale_pid} on port {port} — killing",
-                        )
-                        subprocess.run(
-                            ["taskkill", "/F", "/PID", stale_pid],
-                            capture_output=True,
-                            timeout=5,
-                            **hidden_subprocess_kwargs(),
-                        )
-                    # Give the OS a moment to release the port
-                    time.sleep(1.5)
-                else:
-                    log_event(
-                        "warning",
-                        "splash_node_stale",
-                        f"Port {port} in use but could not identify PID",
-                    )
-            except Exception as e:
-                log_event(
-                    "warning", "splash_node_stale", f"Failed to kill stale process: {e}"
-                )
-        else:
-            # Unix: use lsof + kill, but verify process name before killing
-            try:
-                result = subprocess.run(
-                    ["lsof", "-ti", f":{port}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                pids = result.stdout.strip().split()
-                killed_any = False
-                for pid in pids:
-                    if not pid.isdigit():
-                        continue
-                    # Verify this is a splash process before killing — /proc
-                    # on Linux, ps fallback elsewhere.
-                    is_splash = False
-                    try:
-                        proc_cmd_path = f"/proc/{pid}/cmdline"
-                        if os.path.exists(proc_cmd_path):
-                            with open(proc_cmd_path, "rb") as _pf:
-                                cmdline = _pf.read().decode("utf-8", errors="replace")
-                            is_splash = "splash" in cmdline.lower()
-                        else:
-                            ps_res = subprocess.run(
-                                ["ps", "-p", pid, "-o", "comm="],
-                                capture_output=True,
-                                text=True,
-                                timeout=3,
-                            )
-                            is_splash = "splash" in (ps_res.stdout or "").lower()
-                    except Exception:
-                        is_splash = False
-
-                    if not is_splash:
-                        log_event(
-                            "warning",
-                            "splash_node_stale",
-                            f"Refusing to kill PID {pid} on port {port} — "
-                            f"not a splash process",
-                        )
-                        continue
-
-                    log_event(
-                        "info",
-                        "splash_node_stale",
-                        f"Killing stale PID {pid} on port {port}",
-                    )
-                    os.kill(int(pid), signal.SIGTERM)
-                    killed_any = True
-                if killed_any:
-                    time.sleep(1.5)
-            except Exception as e:
-                log_event(
-                    "warning", "splash_node_stale", f"Failed to kill stale process: {e}"
-                )
+    def _require_free_submit_port(self, port: int) -> None:
+        """Refuse to replace a listener whose ownership cannot be proven."""
+        if self._is_port_in_use(port):
+            message = f"Splash submission port {port} is already in use"
+            log_event("warning", "splash_node_port_in_use", message)
+            raise RuntimeError(message)
 
     def _launch_process(self):
         """Launch the Splash binary with the correct flags."""
@@ -438,21 +439,13 @@ class SplashNode:
         if not binary:
             raise FileNotFoundError("Splash binary path not set")
 
-        # Kill any stale Splash process from a previous run
-        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
-        port_str = submit_host.rstrip("/").split(":")[-1]
-        stale_port = int(port_str) if port_str.isdigit() else 4000
-        self._kill_stale_process(stale_port)
+        # Another listener may be an operator-managed Splash node. Never
+        # terminate a process based only on its name and listening port.
+        submit_port = self._managed_submit_port()
+        self._require_free_submit_port(submit_port)
 
         # Build command line
-        submit_host = getattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
-        # Extract host:port from URL (e.g., "http://localhost:4000" → "127.0.0.1:4000")
-        submit_bind = submit_host.replace("http://", "").replace("https://", "")
-        # Bind to loopback only — never expose offer submission to the network
-        if submit_bind.startswith("localhost"):
-            submit_bind = submit_bind.replace("localhost", "127.0.0.1")
-        elif submit_bind.startswith("0.0.0.0"):
-            submit_bind = submit_bind.replace("0.0.0.0", "127.0.0.1")
+        submit_bind = f"127.0.0.1:{submit_port}"
 
         # P2P listen port (optional)
         p2p_port = getattr(cfg, "SPLASH_P2P_PORT", 11511)
@@ -481,7 +474,15 @@ class SplashNode:
         # and the bot rejects them all with 403 — flooding the terminal.
         display_hook = None
         if getattr(cfg, "SPLASH_RECEIVE_ENABLED", False):
-            bot_port = getattr(cfg, "PORT", 5000)
+            # Startup writes the reserved Flask port here before services start.
+            # Config has no PORT attribute, so that lookup silently used 5000
+            # even when Flask had bound a different port.
+            try:
+                bot_port = int(os.environ.get("CATALYST_FLASK_PORT", "5000"))
+            except (TypeError, ValueError):
+                bot_port = 5000
+            if not 1 <= bot_port <= 65535:
+                bot_port = 5000
             offer_hook = f"http://127.0.0.1:{bot_port}/api/splash/incoming"
             # No token in URL — the splash/incoming endpoint is token-exempt
             # (loopback-only). Use IPv4 explicitly because Flask is bound to
@@ -755,8 +756,28 @@ class SplashNode:
         # Avoid blocking every dashboard state snapshot on an unnecessary
         # network timeout.  Still probe when Splash is enabled or when a
         # manually-started managed process is actually running.
-        if not getattr(cfg, "SPLASH_ENABLED", False) and not process_running:
+        splash_enabled = getattr(cfg, "SPLASH_ENABLED", False) or getattr(
+            cfg, "SPLASH_RECEIVE_ENABLED", False
+        )
+        if not splash_enabled and not process_running:
             return result
+
+        # A configured but stopped local node may be unreachable. A full HTTP
+        # connect timeout can take several seconds on Windows and get_status()
+        # is called by every /api/status poll. Probe the loopback port briefly
+        # before making the HTTP request; still detect a node started outside
+        # this manager when the listener is present.
+        if not process_running:
+            try:
+                parsed = urlsplit(submit_url)
+                if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    probe = socket.create_connection(
+                        (parsed.hostname, port), timeout=0.25
+                    )
+                    probe.close()
+            except (OSError, ValueError):
+                return result
 
         # Quick connectivity check
         try:

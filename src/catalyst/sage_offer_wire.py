@@ -190,7 +190,7 @@ def _bech32_hrp_expand(hrp: str) -> list[int]:
     )
 
 
-def _decode_offer_bech32(value: str) -> bytes:
+def _decode_offer_bech32(value: str, *, expected_hrp: str = "offer") -> bytes:
     if (
         not value
         or value != value.lower()
@@ -201,7 +201,7 @@ def _decode_offer_bech32(value: str) -> bytes:
     if separator < 1 or separator + 7 > len(value):
         raise ValueError("Sage Offer text has an invalid Bech32m separator")
     hrp = value[:separator]
-    if hrp != "offer":
+    if hrp != expected_hrp:
         raise ValueError("Sage Offer text has an unexpected HRP")
     encoded = value[separator + 1 :]
     if any(character not in _CHARSET for character in encoded):
@@ -215,14 +215,42 @@ def _decode_offer_bech32(value: str) -> bytes:
     return bytes(_convertbits(data_with_checksum[:-6], 5, 8, pad=False))
 
 
-def _encode_offer_bech32(value: bytes) -> str:
+def decode_wallet_puzzle_hash(address: str) -> bytes:
+    """Decode only canonical Chia wallet addresses with a valid checksum."""
+    if type(address) is not str or len(address) > 90:
+        raise ValueError("invalid wallet address")
+    hrp = address.split("1", 1)[0]
+    if hrp not in {"xch", "txch"}:
+        raise ValueError("unexpected wallet address prefix")
+    value = _decode_offer_bech32(address, expected_hrp=hrp)
+    if len(value) != 32:
+        raise ValueError("wallet puzzle hash must contain 32 bytes")
+    return value
+
+
+def _encode_bech32m(value: bytes, *, hrp: str) -> str:
     data = _convertbits(value, 8, 5, pad=True)
     checksum_value = (
-        _bech32_polymod(_bech32_hrp_expand("offer") + data + [0] * 6)
-        ^ _BECH32M_CONSTANT
+        _bech32_polymod(_bech32_hrp_expand(hrp) + data + [0] * 6) ^ _BECH32M_CONSTANT
     )
     checksum = [(checksum_value >> (5 * (5 - index))) & 31 for index in range(6)]
-    return "offer1" + "".join(_CHARSET[item] for item in data + checksum)
+    return hrp + "1" + "".join(_CHARSET[item] for item in data + checksum)
+
+
+def encode_wallet_puzzle_hash(puzzle_hash: bytes, prefix: str) -> str:
+    """Encode an exact 32-byte Chia puzzle hash as a canonical wallet address."""
+    if not isinstance(puzzle_hash, (bytes, bytearray, memoryview)):
+        raise ValueError("wallet puzzle hash must be bytes")
+    value = bytes(puzzle_hash)
+    if len(value) != 32:
+        raise ValueError("wallet puzzle hash must contain 32 bytes")
+    if prefix not in {"xch", "txch"}:
+        raise ValueError("unexpected wallet address prefix")
+    return _encode_bech32m(value, hrp=prefix)
+
+
+def _encode_offer_bech32(value: bytes) -> str:
+    return _encode_bech32m(value, hrp="offer")
 
 
 def _convertbits(

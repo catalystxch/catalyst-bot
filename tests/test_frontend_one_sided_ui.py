@@ -55,6 +55,18 @@ def test_offer_tab_has_visible_parked_side_state_hooks():
     assert html.index('id="intelSellDepthPanel"') > orderbook_depth
 
 
+def test_mode_switch_copy_warns_that_old_offers_remain_live_until_cancelled():
+    html = _html()
+
+    assert (
+        "Existing opposite-side offers remain live until you use protected Cancel All"
+        in html
+    )
+    assert "Start is blocked while any remain open" in html
+    assert "Existing offers on the opposite side will be cancelled" not in html
+    assert "XCH is reserved separately for fees" in html
+
+
 def test_save_and_coin_prep_paths_sanitize_inactive_side_from_liquidity_mode():
     html = _html()
 
@@ -178,19 +190,14 @@ def test_dashboard_price_limits_use_guard_price_formatter():
     assert "sa.hard_min_price + ' - ' + sa.hard_max_price" not in body
 
 
-def test_close_gap_observation_note_is_info_until_action_is_ready():
+def test_retired_amm_gap_observation_cannot_reappear_in_current_advice():
     html = _html()
 
-    waiting_block = re.search(
-        r"if\s*\(\s*arbGapBps\s*>=\s*100\s*&&\s*!closeGapReady\s*\)\s*\{(?P<body>[\s\S]*?)\n\s*\}\n\s*\n\s*// Smart action",
-        html,
-    )
-    assert waiting_block, "Close-the-gap waiting advisory block not found"
-    body = waiting_block.group("body")
-
-    assert "Waiting for the gap to hold" in body
-    assert "type: 'info'" in body
-    assert "arbGapBps >= 200 ? 'warning' : 'info'" not in body
+    advisor = html[html.index("function saUpdateAdvisor") :]
+    advisor = advisor[: advisor.index("function runAdvisorAction")]
+    assert "arbGapBps" not in advisor
+    assert "Waiting for the gap to hold" not in advisor
+    assert "Close the Gap" not in advisor
 
 
 def test_live_activity_filters_routine_topup_breadcrumbs_from_dashboard_feed():

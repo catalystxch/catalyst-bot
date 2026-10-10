@@ -31,6 +31,7 @@ def _complete_requests_test_interface(monkeypatch):
             ConnectionError,
             raising=False,
         )
+    monkeypatch.setattr(splash_manager.cfg, "DEXIE_ONLY_BETA", False, raising=False)
 
 
 def _block_socket(*args, **kwargs):
@@ -309,6 +310,24 @@ def test_provider_result_policy_retries_only_explicit_no_effect(result, expected
         expected_request_sha256=_sha("request"),
     )
     assert decision.state is expected_state
+
+
+def test_splash_http_400_invalid_offer_does_not_retry_the_same_payload():
+    decision = publication_policy.classify_provider_result(
+        publisher="splash",
+        result={
+            "outcome": "no_effect",
+            "provider": "splash",
+            "reason_code": "INVALID_OFFER",
+            "request_sha256": _sha("request"),
+            "response_sha256": _sha("response"),
+            "status_code": 400,
+            "acceptance": False,
+        },
+        expected_idempotency_key="expected-key",
+        expected_request_sha256=_sha("request"),
+    )
+    assert decision.state is PublicationState.UNRESOLVED
 
 
 def test_confirmation_transactionally_enqueues_both_destinations_by_reference(
@@ -1999,6 +2018,18 @@ def test_startup_repost_skips_suppressed_offer_and_continues_batch(
     loop = object.__new__(bot_loop.BotLoop)
     loop._running = True
     loop._enter_runtime_effect_phase = lambda phase: phase == "publication"
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [{"trade_id": "suppressed-trade"}],
+            [{"trade_id": "ordinary-trade"}],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     events = []
@@ -2064,6 +2095,252 @@ def test_startup_repost_is_blocked_when_market_publication_gate_is_closed(monkey
     assert loop._repost_active_offers_to_dexie(reason="startup_resume") is False
 
 
+def test_startup_repost_splash_only_uses_fresh_wallet_book_without_dexie(monkeypatch):
+    """Splash-only recovery must broadcast fresh active offers, including Dexie-mapped ones."""
+    import wallet
+
+    splash_calls = []
+    splash_flushes = []
+    dexie_calls = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet_with_meta=lambda: (
+            (
+                [{"trade_id": "mapped", "side": "buy"}],
+                [{"trade_id": "unmapped", "side": "sell"}],
+                [],
+            ),
+            {"fresh": True, "using_cache": False},
+        )
+    )
+    loop.dexie_manager = SimpleNamespace(
+        _lock=__import__("threading").Lock(),
+        _posted_fingerprints=set(),
+        _fingerprint=lambda offer: offer,
+        queue_post=lambda *_args, **_kwargs: dexie_calls.append("queue"),
+        flush_queue=lambda **_kwargs: dexie_calls.append("flush"),
+    )
+
+    def flush_splash(**kwargs):
+        splash_flushes.append(kwargs)
+        return {"posted": 2, "failed": 0, "skipped": 0, "requeued": 0}
+
+    loop.splash_manager = SimpleNamespace(
+        queue_post=lambda offer, trade_id, force=False: splash_calls.append(
+            (trade_id, offer, force)
+        ),
+        flush_queue=flush_splash,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(bot_loop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "mapped",
+                "offer_bech32": "offer1mapped",
+                "dexie_id": "dexie-1",
+            },
+            {"trade_id": "unmapped", "offer_bech32": None, "dexie_id": None},
+        ],
+    )
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda _trade_id: "offer1unmapped")
+    monkeypatch.setattr(database, "update_offer_bech32", lambda *_args: None)
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+
+    assert splash_calls == [
+        ("mapped", "offer1mapped", True),
+        ("unmapped", "offer1unmapped", True),
+    ]
+    assert splash_flushes == [{"flush_all": True}]
+    assert dexie_calls == []
+
+
+def test_startup_repost_schedules_splash_only_background_worker(monkeypatch):
+    import threading
+
+    calls = []
+    done = threading.Event()
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._startup_repost_lock = threading.Lock()
+    loop._startup_repost_thread = None
+    loop._startup_complete = SimpleNamespace(
+        wait=lambda timeout: calls.append(("wait", timeout))
+    )
+
+    def repost(**kwargs):
+        calls.append(kwargs)
+        done.set()
+
+    loop._repost_active_offers_to_dexie = repost
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", False)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", True)
+
+    assert loop._schedule_repost_active_offers_to_dexie(total_offers=2) is True
+    assert done.wait(timeout=5)
+    assert calls == [
+        ("wait", 120),
+        {"reason": "startup_resume", "background": True, "total_offers": 2},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dexie_enabled", "splash_enabled"),
+    [(True, False), (False, True)],
+    ids=["dexie", "splash_only"],
+)
+def test_startup_repost_does_not_publish_cached_wallet_offers(
+    monkeypatch, dexie_enabled, splash_enabled
+):
+    """An empty DB and failed Sage read cannot justify public reposting."""
+    import wallet
+
+    queued = []
+    flushed = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [
+                {
+                    "trade_id": "cached-buy",
+                    "side": "buy",
+                    "offer_bech32": "offer1stale",
+                }
+            ],
+            [],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {
+            "fresh": False,
+            "using_cache": True,
+            "last_error": "Sage get_offers unavailable",
+        },
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: queued.append(_args),
+        flush_queue=lambda *_args, **_kwargs: flushed.append(_args),
+    )
+    loop.splash_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: queued.append(_args),
+        flush_queue=lambda *_args, **_kwargs: flushed.append(_args),
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", dexie_enabled)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", splash_enabled)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(database, "get_offers_for_repost", lambda **_kwargs: [])
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda _trade_id: "offer1stale")
+
+    result = loop._repost_active_offers_to_dexie(reason="startup_resume")
+    assert queued == []
+    assert flushed == []
+    assert result is False
+
+
+def test_startup_repost_does_not_publish_db_only_offer(monkeypatch):
+    """An open DB row is not proof that its offer remains live in Sage."""
+    queued = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: ([], [], []),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda *_args, **_kwargs: queued.append(_args),
+        flush_queue=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "db-only-buy",
+                "side": "buy",
+                "offer_bech32": "offer1stale",
+                "dexie_id": None,
+            }
+        ],
+    )
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+    assert queued == []
+
+
+def test_startup_repost_includes_wallet_offer_missing_from_partial_db(monkeypatch):
+    """A DB hit for one offer must not hide another live wallet offer."""
+    import wallet
+
+    queued = []
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._enter_runtime_effect_phase = lambda _phase: True
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: (
+            [{"trade_id": "wallet-a", "side": "buy"}],
+            [{"trade_id": "wallet-b", "side": "sell"}],
+            [],
+        ),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
+    loop.dexie_manager = SimpleNamespace(
+        queue_post=lambda offer, trade_id, force=False: queued.append(
+            (trade_id, offer, force)
+        ),
+        flush_queue=lambda **_kwargs: None,
+    )
+    loop.splash_manager = object()
+    monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
+    monkeypatch.setattr(bot_loop.cfg, "SPLASH_ENABLED", False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", _sha("asset"))
+    monkeypatch.setattr(bot_loop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        database,
+        "get_offers_for_repost",
+        lambda **_kwargs: [
+            {
+                "trade_id": "wallet-a",
+                "offer_bech32": "offer1a",
+                "dexie_id": None,
+                "side": "buy",
+            }
+        ],
+    )
+    monkeypatch.setattr(wallet, "get_offer_bech32", lambda trade_id: "offer1b")
+    monkeypatch.setattr(database, "update_offer_bech32", lambda *_args: None)
+
+    loop._repost_active_offers_to_dexie(reason="startup_resume")
+
+    assert queued == [
+        ("wallet-a", "offer1a", True),
+        ("wallet-b", "offer1b", True),
+    ]
+
+
 def test_background_startup_repost_defers_stale_confidence_without_global_failure(
     monkeypatch,
 ):
@@ -2116,6 +2393,14 @@ def test_startup_repost_rechecks_market_gate_after_slow_wallet_reads(monkeypatch
     loop._running = True
     gate_results = iter((True, False))
     loop._enter_runtime_effect_phase = lambda phase: next(gate_results)
+    loop.offer_manager = SimpleNamespace(
+        sync_from_wallet=lambda: ([{"trade_id": "slow-trade"}], [], []),
+        get_wallet_sync_meta=lambda: {"fresh": True, "using_cache": False},
+    )
+    loop.offer_manager.sync_from_wallet_with_meta = lambda: (
+        loop.offer_manager.sync_from_wallet(),
+        loop.offer_manager.get_wallet_sync_meta(),
+    )
     loop.dexie_manager = RepostDexie()
     loop.splash_manager = object()
     monkeypatch.setattr(bot_loop.cfg, "DEXIE_AUTO_POST", True)
@@ -2233,9 +2518,12 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     def fake_post(url, **kwargs):
         calls.append((url, kwargs))
         key = kwargs["headers"]["idempotency-key"]
+        payload = {"id": provider_id, "idempotency_key": key}
+        if publisher == "splash":
+            payload["success"] = True
         return _TransportResponse(
             201,
-            {"id": provider_id, "idempotency_key": key},
+            payload,
         )
 
     monkeypatch.setattr(module.requests, "post", fake_post)
@@ -2253,11 +2541,11 @@ def test_actual_transport_binds_request_header_bytes_and_provider_acknowledgemen
     acknowledgement = __import__("json").loads(row["acknowledgement_json"])
     assert acknowledgement["provider_response_id"] == provider_id
     assert acknowledgement["request_sha256"] == row["request_sha256"]
+    expected_payload = {"id": provider_id, "idempotency_key": row["idempotency_key"]}
+    if publisher == "splash":
+        expected_payload["success"] = True
     assert acknowledgement["response_sha256"] == _sha(
-        calls[0][0]
-        and _TransportResponse(
-            201, {"id": provider_id, "idempotency_key": row["idempotency_key"]}
-        ).content.decode()
+        calls[0][0] and _TransportResponse(201, expected_payload).content.decode()
     )
 
 
@@ -2298,6 +2586,125 @@ def test_splash_http_2xx_without_remote_id_is_a_durable_acknowledgement(
     assert acknowledgement["provider_response_id"] == (
         f"splash-http-200:{_sha(response.content.decode())}"
     )
+
+
+def test_splash_http_200_temporary_send_failure_is_retryable_not_acknowledged(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash-rejected",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    response = _TransportResponse(
+        200, {"success": False, "error": "Failed to send offer to network"}
+    )
+    calls = []
+
+    def rejected_by_local_node(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(splash_manager.requests, "post", rejected_by_local_node)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+
+    assert len(calls) == 1
+    assert result["posted"] == 0
+    assert result["failed"] == 1
+    assert result["requeued"] == 1
+    assert row["state"] == "retryable"
+    assert row["acknowledgement_json"] is None
+    assert json.loads(row["last_error_json"]) == {
+        "code": "SPLASH_SEND_FAILED",
+        "provider": "splash",
+        "request_sha256": row["request_sha256"],
+        "response_sha256": _sha(response.content.decode()),
+        "status_code": 200,
+    }
+    manager._durable_now_provider = lambda: WITHIN_LEASE
+    manager.flush_queue()
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_code"),
+    [
+        ("Invalid offer format", "SPLASH_INVALID_OFFER"),
+        (
+            "Invalid offer format: not a valid bech32 string",
+            "SPLASH_INVALID_OFFER",
+        ),
+        ("Offer exceeds maximum size of 307200 bytes", "SPLASH_OFFER_TOO_LARGE"),
+        ("Unexpected local node rejection", "SPLASH_APPLICATION_REJECTED"),
+    ],
+)
+def test_splash_permanent_or_unknown_rejection_requires_review_without_redispatch(
+    isolated_database, monkeypatch, provider_error, expected_code
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    _persist_offer_projection(
+        isolated_database, trade_id, _offer_text(intent["intent_id"])
+    )
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash-invalid",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    calls = []
+    response = _TransportResponse(200, {"success": False, "error": provider_error})
+
+    def rejected_by_local_node(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(splash_manager.requests, "post", rejected_by_local_node)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+    assert result["posted"] == 0
+    assert result["requeued"] == 0
+    assert row["state"] == "unresolved"
+    assert row["acknowledgement_json"] is None
+    assert json.loads(row["last_error_json"]) == {
+        "code": expected_code,
+        "provider": "splash",
+        "request_sha256": row["request_sha256"],
+        "response_sha256": _sha(response.content.decode()),
+        "status_code": 200,
+    }
+    manager.flush_queue()
+    assert len(calls) == 1
+
+
+def test_splash_legacy_post_does_not_accept_http_200_application_rejection(
+    monkeypatch,
+):
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_POST_RETRIES", 0, raising=False)
+    monkeypatch.setattr(
+        splash_manager.requests,
+        "post",
+        lambda *_args, **_kwargs: _TransportResponse(
+            200, {"success": False, "error": "Failed to send offer to network"}
+        ),
+    )
+
+    result = manager._post_single("offer1test", "trade-rejected")
+
+    assert result["success"] is False
+    assert manager.get_stats()["total_posted"] == 0
 
 
 def test_legacy_splash_missing_id_blocker_recovers_without_redispatch(
@@ -2815,12 +3222,15 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
             events.append("startup_gate")
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
-    loop._running = False
+    loop._running = True
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: events.append("startup_recovery")
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
     loop._background_publication_snapshot_ready = lambda: True
-    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._flush_public_offer_queues = lambda: (
+        events.append("drain_outbox"),
+        setattr(loop, "_running", False),
+    )
     loop._set_state = lambda **kwargs: None
 
     loop._run_loop()
@@ -2831,6 +3241,25 @@ def test_startup_enables_durable_workers_before_gate_and_drains_after_gate():
         "startup_gate",
         "drain_outbox",
     ]
+
+
+def test_failed_startup_does_not_enable_workers_or_publish_offers():
+    events = []
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._startup_sync = lambda: (setattr(loop, "_running", False), None)[1]
+    loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
+    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._startup_complete = type(
+        "Gate", (), {"set": lambda self: events.append("gate")}
+    )()
+    loop._set_state = lambda **kwargs: events.append(kwargs.get("status"))
+
+    loop._run_loop()
+
+    assert events == ["gate"]
 
 
 def test_startup_defers_durable_publication_drain_until_fresh_cycle():
@@ -2909,14 +3338,18 @@ def test_startup_publishes_reconciled_offer_counts_before_runtime_gate():
             events.append("startup_gate")
 
     loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
-    loop._running = False
+    loop._running = True
     loop._startup_complete = Gate()
     loop._startup_sync = lambda: {
         "open_buys": 36,
         "open_sells": 36,
     }
     loop._enable_durable_publication_outbox = lambda: events.append("enable_outbox")
-    loop._flush_public_offer_queues = lambda: events.append("drain_outbox")
+    loop._background_publication_snapshot_ready = lambda: True
+    loop._flush_public_offer_queues = lambda: (
+        events.append("drain_outbox"),
+        setattr(loop, "_running", False),
+    )
 
     def record_state(**updates):
         if "open_buys" in updates or "open_sells" in updates:

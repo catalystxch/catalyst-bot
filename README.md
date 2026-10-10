@@ -247,8 +247,10 @@ python -m pip install -r requirements.txt
 python desktop_app.py --flask
 ```
 
-Then open `http://127.0.0.1:5000/` in a browser on that same PC. To use the
-native desktop window instead, run:
+Then open the private browser URL printed at startup on that same PC. It
+authorizes the browser for this run and redirects to `http://127.0.0.1:5000/`.
+Keep the printed URL private; it grants access to this running app.
+To use the native desktop window instead, run:
 
 ```powershell
 python desktop_app.py
@@ -266,7 +268,7 @@ python -m pip install -r requirements.txt
 python desktop_app.py --flask
 ```
 
-Then open `http://127.0.0.1:5000/` in a browser on that same machine.
+Then open the private browser URL printed at startup on that same machine.
 
 On macOS, port `5000` might already be used by Control Center. If startup says
 the port is in use, choose another port:
@@ -306,7 +308,7 @@ macOS/Linux:
 CATALYST_FLASK_PORT=5010 python desktop_app.py --flask
 ```
 
-Then open `http://127.0.0.1:5010/` instead.
+Then open the private browser URL printed at startup for port `5010`.
 
 ### Access Denied or Loopback-Only Messages
 
@@ -314,8 +316,9 @@ CATalyst only accepts local browser/API requests by default. If you see an
 access warning, check that:
 
 - CATalyst is running on the computer opening the browser.
-- You are using `http://127.0.0.1:5000/`, not another PC's IP address, a
-  browser-preview URL, or a forwarded port.
+- You first opened the private browser URL printed by CATalyst for this run,
+  using the same PC rather than another PC's IP address, a browser-preview URL,
+  or a forwarded port.
 - Sage wallet RPC is enabled locally in Sage Settings -> Advanced.
 - If Sage certificate auto-detection fails, paste Sage's `ssl\wallet.crt` in
   the in-app setup prompt. For portable installs, set `SAGE_DATA_DIR` in the
@@ -430,7 +433,7 @@ fields afterwards.
 | Mode | Command | Use case |
 |------|---------|----------|
 | Desktop | `python desktop_app.py` | Native window and system tray. |
-| Browser | `python desktop_app.py --flask` | Server-only mode for `http://127.0.0.1:5000/`. |
+| Browser | `python desktop_app.py --flask` | Server-only mode; open the private URL printed at startup. |
 | Dev | `python desktop_app.py --dev` | Desktop window and browser access together. |
 
 ---

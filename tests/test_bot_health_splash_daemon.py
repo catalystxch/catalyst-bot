@@ -125,7 +125,14 @@ class SplashDaemonTests(unittest.TestCase):
             sys.modules.pop(name, None)
         sys.modules.pop("api_server", None)
 
-    def _install(self, *, splash_node, receive_enabled=True, delivered_total=0):
+    def _install(
+        self,
+        *,
+        splash_node,
+        outbound_enabled=False,
+        receive_enabled=True,
+        delivered_total=0,
+    ):
         """Install fake api_server + patch splash-incoming DB stats.
 
         Returns (bus, cleanup_callable). Cleanup resets module state.
@@ -138,6 +145,7 @@ class SplashDaemonTests(unittest.TestCase):
 
         cfg = bot_health.cfg
         patchers = [
+            patch.object(cfg, "SPLASH_ENABLED", outbound_enabled),
             patch.object(cfg, "SPLASH_RECEIVE_ENABLED", receive_enabled),
             patch.object(cfg, "CAT_ASSET_ID", "abc123"),
             patch(
@@ -274,10 +282,10 @@ class SplashDaemonTests(unittest.TestCase):
         self.assertNotIn("splash_hook_broken", bus.alerts)
 
     # ------------------------------------------------------------------
-    # Scope: receive disabled → no noise
+    # Scope: fully disabled → no noise; outbound-only still needs relay health
     # ------------------------------------------------------------------
 
-    def test_receive_disabled_skips_all_checks(self):
+    def test_splash_disabled_skips_all_checks(self):
         node = _FakeSplashNode(
             {
                 "reachable": False,
@@ -286,7 +294,11 @@ class SplashDaemonTests(unittest.TestCase):
                 "offers_broadcasted": 0,
             }
         )
-        bus, cleanup = self._install(splash_node=node, receive_enabled=False)
+        bus, cleanup = self._install(
+            splash_node=node,
+            outbound_enabled=False,
+            receive_enabled=False,
+        )
         try:
             check = bot_health.check_splash_daemon(auto_repair=True)
         finally:
@@ -294,6 +306,77 @@ class SplashDaemonTests(unittest.TestCase):
 
         self.assertEqual(check.status, "pass")
         self.assertEqual(bus.alerts, {})
+
+    def test_outbound_only_unreachable_metrics_raises_alert(self):
+        node = _FakeSplashNode(
+            {
+                "reachable": False,
+                "last_error": "connection refused",
+                "metrics_url": "http://127.0.0.1:4001/metrics",
+                "peers": 0,
+                "offers_received": 0,
+                "offers_broadcasted": 0,
+            }
+        )
+        bus, cleanup = self._install(
+            splash_node=node,
+            outbound_enabled=True,
+            receive_enabled=False,
+        )
+        try:
+            check = bot_health.check_splash_daemon(auto_repair=True)
+        finally:
+            cleanup()
+
+        self.assertEqual(check.status, "warn")
+        self.assertIn("splash_unreachable", bus.alerts)
+        self.assertNotIn("splash_hook_broken", bus.alerts)
+
+    def test_outbound_only_zero_peers_raises_alert(self):
+        node = _FakeSplashNode(
+            {
+                "reachable": True,
+                "peers": 0,
+                "offers_received": 0,
+                "offers_broadcasted": 0,
+            }
+        )
+        bus, cleanup = self._install(
+            splash_node=node,
+            outbound_enabled=True,
+            receive_enabled=False,
+        )
+        try:
+            check = bot_health.check_splash_daemon(auto_repair=True)
+        finally:
+            cleanup()
+
+        self.assertEqual(check.status, "warn")
+        self.assertIn("splash_no_peers", bus.alerts)
+        self.assertNotIn("splash_hook_broken", bus.alerts)
+
+    def test_outbound_only_does_not_require_inbound_hook_delivery(self):
+        node = _FakeSplashNode(
+            {
+                "reachable": True,
+                "peers": 5,
+                "offers_received": 100,
+                "offers_broadcasted": 46,
+            }
+        )
+        bus, cleanup = self._install(
+            splash_node=node,
+            outbound_enabled=True,
+            receive_enabled=False,
+            delivered_total=0,
+        )
+        try:
+            check = bot_health.check_splash_daemon(auto_repair=True)
+        finally:
+            cleanup()
+
+        self.assertEqual(check.status, "pass")
+        self.assertNotIn("splash_hook_broken", bus.alerts)
 
     # ------------------------------------------------------------------
     # Recovery: once delivered > 0, the hook_broken alert clears

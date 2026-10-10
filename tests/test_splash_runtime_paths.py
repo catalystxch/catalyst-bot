@@ -1,5 +1,19 @@
 import os
+import threading
 import time
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _exercise_dormant_splash_subsystem(monkeypatch):
+    """Keep legacy subsystem tests independent from the v1.4 release gate."""
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "DEXIE_ONLY_BETA", False, raising=False)
 
 
 def test_splash_install_path_lives_under_user_data():
@@ -31,6 +45,268 @@ def test_splash_node_prefers_user_data_binary(monkeypatch):
     assert os.path.abspath(node.find_binary()) == os.path.abspath(binary_path)
 
 
+def test_receive_only_splash_can_start_managed_node(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", False, raising=False)
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.start() is True
+    assert node._thread.started is True
+    node.stop()
+
+
+def test_splash_stop_preserves_live_child_when_termination_fails():
+    import splash_node
+
+    class UnstoppableProcess:
+        pid = 12345
+
+        def terminate(self):
+            raise OSError("termination denied")
+
+        def send_signal(self, _signal):
+            raise OSError("termination denied")
+
+        def poll(self):
+            return None
+
+    node = splash_node.SplashNode()
+    process = UnstoppableProcess()
+    node._running = True
+    node._process = process
+    node._pid = process.pid
+
+    assert node.stop() is False
+    assert node.is_running() is True
+    assert node._process is process
+    assert node._pid == process.pid
+
+
+def test_splash_stop_waits_for_inflight_child_launch(monkeypatch):
+    import splash_node
+
+    entered = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    class Process:
+        pid = 12345
+
+        def terminate(self):
+            exited.set()
+
+        def send_signal(self, _signal):
+            exited.set()
+
+        def wait(self, timeout=None):
+            assert exited.wait(timeout=timeout if timeout is not None else 3)
+            return 0
+
+        def poll(self):
+            return 0 if exited.is_set() else None
+
+    node = splash_node.SplashNode()
+    node._running = True
+    process = Process()
+
+    def delayed_launch():
+        entered.set()
+        assert release.wait(timeout=3)
+        node._process = process
+        node._pid = process.pid
+
+    monkeypatch.setattr(node, "_launch_process", delayed_launch)
+    manager = threading.Thread(target=node._run_loop)
+    manager.start()
+    assert entered.wait(timeout=3)
+
+    stop_result = []
+    stopper = threading.Thread(target=lambda: stop_result.append(node.stop()))
+    stopper.start()
+    release.set()
+    stopper.join(timeout=3)
+    if stopper.is_alive():
+        exited.set()
+        stopper.join(timeout=3)
+    if not exited.is_set():
+        exited.set()
+    manager.join(timeout=3)
+
+    assert not stopper.is_alive()
+    assert not manager.is_alive()
+    assert stop_result == [True]
+    assert node._process is None
+    assert node._pid is None
+
+
+def test_splash_start_refuses_existing_live_child_after_failed_stop(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class Process:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    node = splash_node.SplashNode()
+    node._running = False
+    node._process = Process()
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.start() is False
+    assert node._running is False
+
+
+def test_splash_stop_waits_for_prior_manager_before_restart():
+    import splash_node
+
+    class CooldownThread:
+        alive = True
+        joined = False
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.joined = True
+            self.alive = False
+
+    node = splash_node.SplashNode()
+    manager = CooldownThread()
+    node._running = True
+    node._thread = manager
+
+    assert node.stop() is True
+    assert manager.joined is True
+    assert manager.is_alive() is False
+
+
+def test_concurrent_splash_starts_admit_only_one_manager(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    entered = threading.Event()
+    release = threading.Event()
+    manager_done = threading.Event()
+    manager_calls = []
+    results = []
+    node = splash_node.SplashNode()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+
+    def slow_binary_lookup():
+        entered.set()
+        assert release.wait(timeout=3)
+        return "splash.exe"
+
+    def manager_loop():
+        manager_calls.append(1)
+        manager_done.wait(timeout=3)
+
+    monkeypatch.setattr(node, "find_binary", slow_binary_lookup)
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+    monkeypatch.setattr(node, "_run_loop", manager_loop)
+
+    first = threading.Thread(target=lambda: results.append(node.start()))
+    second = threading.Thread(target=lambda: results.append(node.start()))
+    try:
+        first.start()
+        assert entered.wait(timeout=3)
+        second.start()
+        time.sleep(0.1)
+        release.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        assert not first.is_alive() and not second.is_alive()
+        assert results.count(True) == 1
+        assert manager_calls == [1]
+    finally:
+        release.set()
+        manager_done.set()
+        first.join(timeout=3)
+        second.join(timeout=3)
+        node.stop()
+
+
+def test_splash_start_cannot_pass_stop_waiting_for_old_manager(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    joining = threading.Event()
+    release = threading.Event()
+
+    class OldManager:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            joining.set()
+            assert release.wait(timeout=3)
+            self.alive = False
+
+    node = splash_node.SplashNode()
+    node._running = True
+    node._thread = OldManager()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+    stopper = threading.Thread(target=node.stop)
+    try:
+        stopper.start()
+        assert joining.wait(timeout=3)
+        assert node.start() is False
+    finally:
+        release.set()
+        stopper.join(timeout=3)
+        node.stop()
+
+
+def test_splash_start_rejects_manager_that_outlived_stop_timeout(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class HungManager:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            assert timeout == 5
+
+    node = splash_node.SplashNode()
+    node._running = True
+    node._thread = HungManager()
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda _port: None)
+
+    assert node.stop() is False
+    assert node.start() is False
+    assert isinstance(node._thread, HungManager)
+
+
 def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypatch):
     import splash_node
     from config import cfg
@@ -50,6 +326,76 @@ def test_disabled_stopped_splash_health_does_not_probe_submit_endpoint(monkeypat
     assert result["process_running"] is False
     assert result["api_reachable"] is False
     assert submit_calls == []
+
+
+def test_enabled_stopped_splash_skips_http_when_local_port_is_unreachable(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    socket_calls = []
+    http_calls = []
+
+    def unavailable_socket(address, timeout):
+        socket_calls.append((address, timeout))
+        raise TimeoutError("local Splash port is unreachable")
+
+    def unexpected_get(*args, **kwargs):
+        http_calls.append((args, kwargs))
+        raise AssertionError("unreachable Splash must not incur the HTTP timeout")
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
+    )
+    monkeypatch.setattr(splash_node.socket, "create_connection", unavailable_socket)
+    monkeypatch.setattr(splash_node.requests, "get", unexpected_get)
+
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    result = node.check_health()
+
+    assert result["process_running"] is False
+    assert result["api_reachable"] is False
+    assert socket_calls == [(("localhost", 4000), 0.25)]
+    assert http_calls == []
+
+
+def test_enabled_stopped_splash_detects_external_local_listener(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    class FakeSocket:
+        def close(self):
+            pass
+
+    class FakeResponse:
+        status_code = 405
+
+    socket_calls = []
+    http_calls = []
+
+    def reachable_socket(address, timeout):
+        socket_calls.append((address, timeout))
+        return FakeSocket()
+
+    def reachable_get(url, timeout):
+        http_calls.append((url, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
+    )
+    monkeypatch.setattr(splash_node.socket, "create_connection", reachable_socket)
+    monkeypatch.setattr(splash_node.requests, "get", reachable_get)
+
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    result = node.check_health()
+
+    assert result["api_reachable"] is True
+    assert socket_calls == [(("localhost", 4000), 0.25)]
+    assert http_calls == [("http://localhost:4000", 2)]
 
 
 def test_stopped_splash_status_marks_cached_metrics_unreachable(monkeypatch):
@@ -126,6 +472,70 @@ def test_stopped_splash_receive_stats_do_not_publish_cached_metrics_as_live(
     assert stats["node_metrics"]["offers_received"] == 3619
 
 
+def test_receive_worker_without_splash_child_is_not_active(monkeypatch):
+    import bot_loop
+    import database
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "CAT_ASSET_ID", "ab" * 32, raising=False)
+    monkeypatch.setattr(database, "get_splash_incoming_stats", lambda **_kw: {})
+
+    class LiveWorker:
+        def is_alive(self):
+            return True
+
+    class NoChild:
+        def is_running(self):
+            return False
+
+        def get_metrics(self):
+            return {"reachable": False}
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._splash_receive_thread = LiveWorker()
+    loop.splash_node = NoChild()
+    loop._splash_receive_interval = 5
+    loop._splash_receive_batch_size = 10
+
+    assert loop.get_splash_receive_stats()["active"] is False
+
+
+def test_receive_worker_waits_for_splash_listener_before_active(monkeypatch):
+    import bot_loop
+    import database
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "CAT_ASSET_ID", "ab" * 32, raising=False)
+    monkeypatch.setattr(database, "get_splash_incoming_stats", lambda **_kw: {})
+
+    class LiveWorker:
+        def is_alive(self):
+            return True
+
+    class StartingNode:
+        def is_running(self):
+            return True
+
+        def check_health(self):
+            return {"api_reachable": False}
+
+        def get_metrics(self):
+            return {}
+
+    loop = object.__new__(bot_loop.BotLoop)
+    loop._running = True
+    loop._splash_receive_thread = LiveWorker()
+    loop.splash_node = StartingNode()
+    loop._splash_receive_interval = 5
+    loop._splash_receive_batch_size = 10
+    assert loop.get_splash_receive_stats()["active"] is False
+    loop.splash_node.check_health = lambda: {"api_reachable": True}
+    assert loop.get_splash_receive_stats()["active"] is True
+
+
 def test_splash_download_refuses_release_without_checksum(monkeypatch):
     import splash_setup
 
@@ -161,7 +571,161 @@ def test_splash_download_refuses_release_without_checksum(monkeypatch):
     assert requested_urls == []
 
 
-def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch):
+@pytest.mark.parametrize(
+    "failure", ["stream_interrupted", "checksum_mismatch", "replace_refused"]
+)
+def test_failed_splash_update_preserves_existing_binary(monkeypatch, tmp_path, failure):
+    import splash_setup
+
+    installed = tmp_path / "splash.exe"
+    installed.write_bytes(b"known-good-splash")
+    asset_url = "https://example.invalid/splash-amd64.exe"
+    checksum_url = asset_url + ".sha256"
+    monkeypatch.delenv("CATALYST_ALLOW_UNVERIFIED_SPLASH_DOWNLOAD", raising=False)
+    monkeypatch.setattr(
+        splash_setup,
+        "detect_platform",
+        lambda: {
+            "os": "windows",
+            "arch": "amd64",
+            "asset_name": "splash-amd64.exe",
+            "binary_name": "splash.exe",
+            "install_path": str(installed),
+        },
+    )
+    monkeypatch.setattr(
+        splash_setup,
+        "get_latest_release",
+        lambda: {
+            "tag": "v-test",
+            "assets": [
+                {"name": "splash-amd64.exe", "size": 7, "url": asset_url},
+                {"name": "splash-amd64.exe.sha256", "size": 64, "url": checksum_url},
+            ],
+        },
+    )
+
+    class BinaryResponse:
+        headers = {"content-length": "7"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield b"new-bad"
+            if failure == "stream_interrupted":
+                raise splash_setup.requests.ConnectionError("interrupted")
+
+    def fake_get(url, **kwargs):
+        if url == asset_url:
+            return BinaryResponse()
+        assert url == checksum_url
+        checksum_payload = b"new-bad" if failure == "replace_refused" else b"different"
+        return SimpleNamespace(text=hashlib.sha256(checksum_payload).hexdigest())
+
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+    if failure == "replace_refused":
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="test"),
+        )
+        monkeypatch.setattr(
+            splash_setup.os,
+            "replace",
+            lambda *_args: (_ for _ in ()).throw(PermissionError("binary in use")),
+        )
+
+    result = splash_setup.download_splash()
+
+    assert result["success"] is False
+    if failure == "replace_refused":
+        assert "install failed" in result["message"].lower()
+    assert installed.read_bytes() == b"known-good-splash"
+    assert list(tmp_path.glob(".splash.exe.*")) == []
+
+
+@pytest.mark.parametrize("probe_result", ["success", "nonzero", "oserror", "timeout"])
+def test_verified_splash_update_replaces_existing_binary(
+    monkeypatch, tmp_path, probe_result
+):
+    import splash_setup
+
+    installed = tmp_path / "splash.exe"
+    installed.write_bytes(b"known-good-splash")
+    downloaded = b"new-verified-splash"
+    asset_url = "https://example.invalid/splash-amd64.exe"
+    checksum_url = asset_url + ".sha256"
+    monkeypatch.delenv("CATALYST_ALLOW_UNVERIFIED_SPLASH_DOWNLOAD", raising=False)
+    monkeypatch.setattr(
+        splash_setup,
+        "detect_platform",
+        lambda: {
+            "os": "windows",
+            "arch": "amd64",
+            "asset_name": "splash-amd64.exe",
+            "binary_name": "splash.exe",
+            "install_path": str(installed),
+        },
+    )
+    monkeypatch.setattr(
+        splash_setup,
+        "get_latest_release",
+        lambda: {
+            "tag": "v-test",
+            "assets": [
+                {"name": "splash-amd64.exe", "size": len(downloaded), "url": asset_url},
+                {"name": "splash-amd64.exe.sha256", "size": 64, "url": checksum_url},
+            ],
+        },
+    )
+
+    class BinaryResponse:
+        headers = {"content-length": str(len(downloaded))}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield downloaded
+
+    def fake_get(url, **kwargs):
+        if url == asset_url:
+            return BinaryResponse()
+        assert url == checksum_url
+        return SimpleNamespace(text=hashlib.sha256(downloaded).hexdigest())
+
+    monkeypatch.setattr(splash_setup.requests, "get", fake_get)
+
+    def fake_run(args, **_kwargs):
+        assert args[0].endswith(".exe")
+        assert (tmp_path / "splash.exe").read_bytes() == b"known-good-splash"
+        assert Path(args[0]).read_bytes() == downloaded
+        if probe_result == "nonzero":
+            return SimpleNamespace(returncode=1, stdout="", stderr="bad binary")
+        if probe_result == "oserror":
+            raise OSError("cannot execute")
+        if probe_result == "timeout":
+            raise TimeoutError("version probe timed out")
+        return SimpleNamespace(returncode=0, stdout="test", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = splash_setup.download_splash()
+
+    if probe_result == "success":
+        assert result["success"] is True
+        assert installed.read_bytes() == downloaded
+    else:
+        assert result["success"] is False
+        assert installed.read_bytes() == b"known-good-splash"
+    assert list(tmp_path.glob(".splash.exe.*")) == []
+
+
+@pytest.mark.parametrize("receive_enabled", [False, True])
+@pytest.mark.parametrize("flask_port", [5000, 5123])
+def test_splash_node_offer_hook_uses_actual_flask_port(
+    monkeypatch, receive_enabled, flask_port
+):
     import splash_node
     from config import cfg
 
@@ -188,8 +752,9 @@ def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch):
         captured["cmd"] = cmd
         return FakeProcess()
 
-    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "SPLASH_RECEIVE_ENABLED", receive_enabled, raising=False)
     monkeypatch.setattr(cfg, "PORT", 5000, raising=False)
+    monkeypatch.setenv("CATALYST_FLASK_PORT", str(flask_port))
     monkeypatch.setattr(
         cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000", raising=False
     )
@@ -200,13 +765,160 @@ def test_splash_node_offer_hook_uses_ipv4_loopback(monkeypatch):
 
     node = splash_node.SplashNode()
     node._binary_path = "splash.exe"
-    node._kill_stale_process = lambda port: None
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
 
     node._launch_process()
 
-    hook_index = captured["cmd"].index("--offer-hook") + 1
-    assert captured["cmd"][hook_index] == "http://127.0.0.1:5000/api/splash/incoming"
-    assert "http://localhost:5000/api/splash/incoming" not in captured["cmd"]
+    if receive_enabled:
+        hook_index = captured["cmd"].index("--offer-hook") + 1
+        assert captured["cmd"][hook_index] == (
+            f"http://127.0.0.1:{flask_port}/api/splash/incoming"
+        )
+        assert "http://localhost:5000/api/splash/incoming" not in captured["cmd"]
+    else:
+        assert "--offer-hook" not in captured["cmd"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process ownership regression")
+def test_splash_start_does_not_terminate_unowned_listener(monkeypatch):
+    """An occupied submit port is not proof that CATalyst owns its listener."""
+    import splash_node
+    from config import cfg
+
+    commands = []
+    launched = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command[0])
+        if command[0] == "netstat":
+            return SimpleNamespace(
+                stdout="TCP 127.0.0.1:4000 0.0.0.0:0 LISTENING 8888\n"
+            )
+        if command[0] == "wmic":
+            return SimpleNamespace(stdout="Name\nsplash.exe\n")
+        return SimpleNamespace(stdout="")
+
+    class FakeProcess:
+        pid = 9999
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    def fake_popen(command, **_kwargs):
+        launched.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+    monkeypatch.setattr(splash_node.subprocess, "run", fake_run)
+    monkeypatch.setattr(splash_node.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_is_port_in_use", lambda port: port == 4000)
+
+    with pytest.raises(RuntimeError, match="4000"):
+        node._launch_process()
+
+    assert "taskkill" not in commands
+    assert launched == []
+
+
+def test_splash_start_reports_occupied_submit_port_before_starting_thread(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            started_threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://localhost:4000")
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_is_port_in_use", lambda port: port == 4000)
+
+    assert node.start() is False
+    assert node.is_running() is False
+    assert started_threads == []
+
+
+@pytest.mark.parametrize("submit_url", ["http://192.0.2.9:4000", "http://0.0.0.0:4000"])
+def test_managed_splash_refuses_non_loopback_submit_bind(monkeypatch, submit_url):
+    import splash_node
+    from config import cfg
+
+    launched = []
+
+    class FakeProcess:
+        pid = 9999
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    def fake_popen(command, **_kwargs):
+        launched.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", submit_url)
+    monkeypatch.setattr(splash_node.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
+
+    with pytest.raises(ValueError, match="loopback"):
+        node._launch_process()
+
+    assert launched == []
+
+
+def test_splash_start_reports_non_loopback_submit_url_without_thread(monkeypatch):
+    import splash_node
+    from config import cfg
+
+    started_threads = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            started_threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cfg, "SPLASH_ENABLED", True)
+    monkeypatch.setattr(cfg, "SPLASH_SUBMIT_URL", "http://192.0.2.9:4000")
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "find_binary", lambda: "splash.exe")
+    monkeypatch.setattr(node, "_is_port_in_use", lambda _port: False)
+
+    assert node.start() is False
+    assert node.is_running() is False
+    assert started_threads == []
 
 
 def test_splash_output_reader_keeps_reading_lines(monkeypatch):

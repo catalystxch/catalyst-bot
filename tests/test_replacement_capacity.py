@@ -591,9 +591,50 @@ def test_batch_constructed_outputs_bind_once_before_dispatch(
         )
 
 
-def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
+def test_uncertain_split_submission_keeps_source_claimed_against_retry(
     isolated_database, monkeypatch
 ):
+    """An unknown dispatch keeps its source reserved against split retries."""
+    database.init_database()
+    _activate_wallet_authority(monkeypatch, run_id="split-response-lost")
+    source = hashlib.sha256(b"split-response-lost-source").hexdigest()
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+
+    first = database.claim_wallet_effect(
+        operation_id="coin-prep-split-first",
+        source_coin_ids=[source],
+    )
+    assert first is not None
+    dispatch = database.begin_wallet_effect_dispatch(
+        first["claim_token"],
+        first["generation"],
+        operation_id="coin-prep-split-first",
+        source_coin_ids=[source],
+    )
+    assert dispatch is not None
+    assert (
+        database.complete_wallet_effect_dispatch(
+            dispatch, exception=ConnectionError("response lost after Sage accepted")
+        )
+        == "UNKNOWN"
+    )
+
+    for operation_id in ("coin-prep-split-first", "coin-prep-split-retry"):
+        assert (
+            database.claim_wallet_effect(
+                operation_id=operation_id,
+                source_coin_ids=[source],
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("protected_history", [False, True])
+def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
+    isolated_database, monkeypatch, protected_history
+):
+    import coin_prep_worker
+
     database.init_database()
     binding = _activate_wallet_authority(monkeypatch, run_id="batch-confirm")
     identity = mutation_gate.wallet_identity_binding_payload(binding)
@@ -648,6 +689,20 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
             "coin_id": output_change,
         },
     ]
+    if protected_history:
+        assert database.upsert_coin(output_cat, "cat", 90, purpose="replacement")
+        assert database.lock_coin(output_cat, "terminal-trade")
+        assert database.mark_coin_spent(output_cat)
+        original_terminal_guard = database._coin_terminal_mutation_is_protected
+        monkeypatch.setattr(
+            database,
+            "_coin_terminal_mutation_is_protected",
+            lambda conn, coin_id: (
+                True
+                if database.norm_coin_id(coin_id) == database.norm_coin_id(output_cat)
+                else original_terminal_guard(conn, coin_id)
+            ),
+        )
     database.bind_coin_prep_constructed_outputs(
         operation_id,
         plan_hash=target["plan_hash"],
@@ -676,6 +731,7 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
             "coin_id": item["coin_id"],
             "amount_mojos": item["amount_mojos"],
             "purpose": item["purpose"],
+            **({"spent_height": 950} if item["coin_id"] == output_cat else {}),
         }
         for item in constructed
     ]
@@ -688,26 +744,88 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
         "expires_at": "2026-08-21T12:00:16.000000Z",
         "coins": expected_outputs,
     }
-    confirmed = database.record_coin_prep_operation_outcome(
-        operation_id,
-        outcome="CONFIRMED",
-        evidence_json={
-            "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
-            "effect_claim_token": claim["claim_token"],
-            "effect_claim_generation": claim["generation"],
-            "source_coin_ids": [source],
-            "expected_outputs": expected_outputs,
-            "authoritative_view": authoritative_view,
-            "expected_wallet_identity": identity,
+    spent_state_mismatch = replacement_capacity.verify_coin_prep_post_view(
+        source_coin_ids=[source],
+        expected_outputs=expected_outputs,
+        authoritative_view={
+            **authoritative_view,
+            "coins": [
+                {key: value for key, value in output.items() if key != "spent_height"}
+                for output in expected_outputs
+            ],
+        },
+        expected_wallet_identity=identity,
+    )
+    assert spent_state_mismatch.confirmed is False
+    assert spent_state_mismatch.reason == "expected_output_contradiction"
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.xch_wallet_id = 1
+    worker.cat_wallet_id = 2
+    recovery_logs = []
+    worker.log = lambda message, *_args, **_kwargs: recovery_logs.append(message)
+    worker.update_status = lambda *_args, **_kwargs: None
+    worker._get_confirmed_owned_coins_via_rpc = lambda wallet_id, *_args: (
+        [{"coin_id": output_change, "amount_mojos": 20}]
+        if wallet_id == worker.xch_wallet_id
+        else []
+    )
+    worker._get_sage_selectable_coin_ids_for_recovery = lambda _wallet_id: set()
+    monkeypatch.setattr(coin_prep_worker, "get_pending_transactions", lambda: [])
+    recovery_observed_at = "2026-08-21T12:00:00.000000Z"
+    monkeypatch.setattr(
+        coin_prep_worker,
+        "get_wallet_identity",
+        lambda: {
+            **identity,
+            "success": True,
+            "observed_at_utc": recovery_observed_at,
         },
     )
-    assert confirmed["operation"]["outcome"] == "CONFIRMED"
-    assert {coin["coin_id"] for coin in database.get_free_coins("cat")} == {
-        "0x" + output_cat
-    }
+
+    def historical_records(coin_ids, **kwargs):
+        assert kwargs == {}
+        assert set(coin_ids) == {output_cat, output_change}
+        return {
+            output_cat: {
+                "amount": 90,
+                "created_height": 900,
+                "spent_height": 950,
+            },
+            output_change: {
+                "amount": 20,
+                "created_height": 900,
+                "spent_height": None,
+            },
+        }
+
+    monkeypatch.setattr(coin_prep_worker, "get_coins_by_ids", historical_records)
+
+    recovered = worker._recover_coin_prep_operations_read_only(
+        worker._observe_recoverable_coin_prep_operation
+    )
+
+    assert recovered is True, recovery_logs
+    confirmed = database.get_coin_prep_operation_for_observation(operation_id)
+    assert confirmed["outcome"] == "CONFIRMED"
+    assert database.get_free_coins("cat") == []
     assert {coin["coin_id"] for coin in database.get_free_coins("xch")} == {
         "0x" + output_change
     }
+    spent_row = database.get_coin_state(output_cat)
+    assert spent_row["status"] == "spent"
+    assert spent_row["purpose"] is None
+    assert spent_row["trade_id"] == ("terminal-trade" if protected_history else None)
+    assert database.get_authoritative_replacement_capacity_count(wallet_type="cat") == 0
+
+    assert (
+        worker._recover_coin_prep_operations_read_only(
+            worker._observe_recoverable_coin_prep_operation
+        )
+        is True
+    )
+    replay_row = database.get_coin_state(output_cat)
+    assert replay_row["status"] == "spent"
+    assert replay_row["purpose"] is None
 
 
 def test_database_prepare_is_idempotent_and_restart_lists_effect_unknown(

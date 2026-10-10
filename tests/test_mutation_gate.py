@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
 from pathlib import Path
@@ -427,6 +428,76 @@ def test_read_only_status_does_not_install_a_transient_durable_latch_fence(
     assert gate.status().allowed is True
 
 
+def test_slow_diagnostic_snapshot_does_not_starve_lease_heartbeat(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+
+    snapshot_entered = threading.Event()
+    release_snapshot = threading.Event()
+    heartbeat_done = threading.Event()
+    observed = {}
+    real_snapshot = gate._authorization_snapshot
+
+    def slow_diagnostic_snapshot():
+        snapshot = real_snapshot()
+        snapshot_entered.set()
+        if not release_snapshot.wait(timeout=5):
+            raise TimeoutError("diagnostic snapshot was not released")
+        return snapshot
+
+    monkeypatch.setattr(gate, "_authorization_snapshot", slow_diagnostic_snapshot)
+
+    def read_diagnostics():
+        observed["diagnostic"] = gate.read_only_status()
+
+    def renew_lease():
+        observed["heartbeat"] = gate.heartbeat()
+        heartbeat_done.set()
+
+    diagnostic_thread = threading.Thread(target=read_diagnostics)
+    heartbeat_thread = threading.Thread(target=renew_lease)
+    diagnostic_thread.start()
+    try:
+        assert snapshot_entered.wait(timeout=1)
+        heartbeat_thread.start()
+        assert heartbeat_done.wait(timeout=2), (
+            "a slow read-only diagnostic must not hold the heartbeat lock"
+        )
+    finally:
+        release_snapshot.set()
+        diagnostic_thread.join(timeout=5)
+        if heartbeat_thread.ident is not None:
+            heartbeat_thread.join(timeout=5)
+
+    assert not diagnostic_thread.is_alive()
+    assert not heartbeat_thread.is_alive()
+    assert observed["heartbeat"]["heartbeat"] is True
+    assert observed["diagnostic"].allowed is True
+    assert gate.status().allowed is True
+
+
+def test_read_only_diagnostic_never_allows_persistently_stale_lease_snapshot(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    stale_snapshot = gate._authorization_snapshot()
+    clock.advance(10)
+    assert gate.heartbeat()["heartbeat"] is True
+    monkeypatch.setattr(gate, "_authorization_snapshot", lambda: stale_snapshot)
+
+    observed = gate.read_only_status()
+
+    assert observed.allowed is False
+    assert observed.reason_code == "LEASE_LOST"
+    assert gate._local_reason_code == ""
+
+
 def test_release_resolved_serializes_heartbeat_through_post_resolve_status(
     isolated_gate_database, monkeypatch
 ):
@@ -831,6 +902,306 @@ def test_expired_heartbeat_cannot_resurrect_lease(isolated_gate_database):
         gate.require_allowed("offer.create")
 
 
+def test_heartbeat_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is True
+    lease = result["lease"]
+    heartbeat_at = datetime.fromisoformat(lease["heartbeat_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert heartbeat_at == post_lock
+    assert expires_at - heartbeat_at == timedelta(seconds=30)
+
+
+def test_default_lease_survives_snapshot_length_pause_and_still_fences_expiry(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if sql.lstrip().startswith("UPDATE runtime_mutation_lease"):
+                clock.advance(45)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+
+    renewed = gate.heartbeat()
+
+    assert renewed["heartbeat"] is True
+    assert gate.require_allowed("offer.create").allowed is True
+    clock.advance(91)
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_allowed("offer.create")
+    contender = mutation_gate.MutationGate(
+        run_id="run-b",
+        owner_pid=222,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda pid, host: (pid, host) == (111, "test-host"),
+    )
+    assert contender.acquire()["reason"] == "prior_owner_alive"
+
+
+def test_long_lease_keeps_ten_second_heartbeat_cadence(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    observed = []
+    monkeypatch.setattr(
+        gate._heartbeat_stop,
+        "wait",
+        lambda interval: observed.append(interval) or True,
+    )
+
+    assert gate.start_heartbeat() is True
+    gate._heartbeat_thread.join(timeout=1)
+    assert observed == [10.0]
+
+
+@pytest.mark.parametrize(
+    ("pause_seconds", "paused_stage", "expected_heartbeat", "expected_mutation"),
+    [
+        (45, "update", True, "allowed"),
+        (85, "update", False, "HEARTBEAT_FAILED"),
+        (85, "commit", False, "HEARTBEAT_FAILED"),
+    ],
+)
+def test_long_lease_blocks_mutation_while_heartbeat_write_is_stalled(
+    isolated_gate_database,
+    monkeypatch,
+    pause_seconds,
+    paused_stage,
+    expected_heartbeat,
+    expected_mutation,
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    entered = threading.Event()
+    release = threading.Event()
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                entered.set()
+                assert release.wait(timeout=5)
+                clock.advance(pause_seconds)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if paused_stage == "commit":
+                entered.set()
+                assert release.wait(timeout=5)
+                clock.advance(pause_seconds)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+    heartbeat_results = []
+    heartbeat_thread = threading.Thread(
+        target=lambda: heartbeat_results.append(gate.heartbeat())
+    )
+    heartbeat_thread.start()
+    assert entered.wait(timeout=5)
+    mutation_results = []
+
+    def require_mutation():
+        try:
+            gate.require_allowed("offer.create")
+            mutation_results.append("allowed")
+        except mutation_gate.MutationBlocked as exc:
+            mutation_results.append(exc.reason_code)
+
+    mutation_thread = threading.Thread(target=require_mutation)
+    mutation_thread.start()
+    mutation_thread.join(timeout=0.05)
+    assert mutation_thread.is_alive()
+    assert mutation_results == []
+    release.set()
+    heartbeat_thread.join(timeout=5)
+    mutation_thread.join(timeout=5)
+
+    assert not heartbeat_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert heartbeat_results[0]["heartbeat"] is expected_heartbeat
+    assert mutation_results == [expected_mutation]
+
+
+@pytest.mark.parametrize("paused_stage", ["update", "commit"])
+def test_same_run_acquire_cannot_renew_after_prior_lease_expires_during_write(
+    isolated_gate_database, monkeypatch, paused_stage
+):
+    _path, clock = isolated_gate_database
+    gate = mutation_gate.MutationGate(
+        run_id="run-a",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+    )
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                clock.advance(85)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if paused_stage == "commit":
+                clock.advance(85)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+
+    renewed = gate.acquire()
+
+    assert renewed["acquired"] is False
+    assert renewed["reason"] == "lease_expired"
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_allowed("offer.create")
+
+
+def test_acquire_keeps_full_lease_after_database_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    post_lock = clock() + timedelta(seconds=15)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+    gate = _gate(clock)
+
+    result = gate.acquire()
+
+    assert result["acquired"] is True
+    lease = result["lease"]
+    acquired_at = datetime.fromisoformat(lease["acquired_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00"))
+    assert acquired_at == post_lock
+    assert expires_at - acquired_at == timedelta(seconds=30)
+
+
+def test_heartbeat_lock_wait_cannot_extend_already_expired_lease(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    post_lock = clock() + timedelta(seconds=21)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: post_lock.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+    )
+
+    result = gate.heartbeat()
+
+    assert result["heartbeat"] is False
+    assert result["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
 def test_concurrent_require_observes_process_fence_after_release(
     isolated_gate_database, monkeypatch
 ):
@@ -903,6 +1274,460 @@ def test_database_write_lock_during_heartbeat_fails_closed(
     with pytest.raises(mutation_gate.MutationBlocked) as exc_info:
         gate.require_allowed("coin.split")
     assert exc_info.value.reason_code == "HEARTBEAT_FAILED"
+
+
+def test_failed_heartbeat_records_bounded_timing_without_exception_details(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    records = []
+    events = []
+    gate.register_stop_handler(lambda _reason: events.append("stop"))
+
+    def capture_log(category, message, data=None, level="info"):
+        events.append("log")
+        records.append((category, message, data, level))
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        capture_log,
+    )
+
+    def blocked_heartbeat(**_kwargs):
+        failure = sqlite3.OperationalError("database locked; private diagnostic detail")
+        failure.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise failure
+
+    monkeypatch.setattr(database, "heartbeat_runtime_mutation_lease", blocked_heartbeat)
+    assert gate.heartbeat() == {
+        "heartbeat": False,
+        "reason": "durable_state_unavailable",
+    }
+
+    diagnostics = [
+        item for item in records if item[1] == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostics) == 1
+    assert events == ["stop", "log"]
+    category, _message, data, level = diagnostics[0]
+    assert category == "SAFETY"
+    assert level == "error"
+    assert data["outcome"] == "durable_state_unavailable"
+    assert data["lock_wait_ms"] >= 0
+    assert data["elapsed_ms"] >= data["lock_wait_ms"]
+    assert len(data["attempts"]) == 4
+    assert all(
+        attempt["exception_type"] == "OperationalError" for attempt in data["attempts"]
+    )
+    assert all(
+        attempt["sqlite_errorcode"] == sqlite3.SQLITE_BUSY
+        for attempt in data["attempts"]
+    )
+    assert "private diagnostic detail" not in repr(data)
+
+
+def test_slow_heartbeat_connection_reports_database_stage_without_wallet_data(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def delayed_connection():
+        time.sleep(0.02)
+        return open_connection()
+
+    monkeypatch.setattr(database, "_stability_connection", delayed_connection)
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (category, message, data, level)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    diagnostics = [
+        data
+        for _category, message, data, _level in records
+        if message == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostics) == 1
+    stages = diagnostics[0]["attempts"][0]["database_ms"]
+    assert stages["connection"] >= 15
+    assert set(stages) == {
+        "connection",
+        "begin",
+        "read",
+        "update",
+        "readback",
+        "commit",
+        "finish",
+        "close",
+    }
+    assert all(type(value) is int and value >= 0 for value in stages.values())
+    assert "wallet" not in repr(stages).lower()
+
+
+@pytest.mark.parametrize("slow_stage", ["update", "readback", "commit"])
+def test_slow_heartbeat_finish_identifies_durable_step(
+    isolated_gate_database, monkeypatch, slow_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    class DelayedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if slow_stage == "update" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                time.sleep(0.02)
+            elif slow_stage == "readback" and sql == (
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                # The first SELECT reads the pre-update lease.
+                self.read_count = getattr(self, "read_count", 0) + 1
+                if self.read_count == 2:
+                    time.sleep(0.02)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if slow_stage == "commit":
+                time.sleep(0.02)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: DelayedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    stages = timing["attempts"][0]["database_ms"]
+    assert stages[slow_stage] >= 15
+    assert stages["finish"] >= stages[slow_stage]
+
+
+@pytest.mark.parametrize("delayed_stage", ["begin", "read", "finish", "close"])
+def test_slow_heartbeat_database_stage_is_attributed(
+    isolated_gate_database, monkeypatch, delayed_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    class DelayedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if delayed_stage == "begin" and sql == "BEGIN IMMEDIATE":
+                time.sleep(0.02)
+            elif (
+                delayed_stage == "read"
+                and sql == "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                time.sleep(0.02)
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            if delayed_stage == "finish":
+                time.sleep(0.02)
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            if delayed_stage == "close":
+                time.sleep(0.02)
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: DelayedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    assert gate.heartbeat()["heartbeat"] is True
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    stages = timing["attempts"][0]["database_ms"]
+    assert stages[delayed_stage] >= 15
+    assert set(stages) == {
+        "connection",
+        "begin",
+        "read",
+        "update",
+        "readback",
+        "commit",
+        "finish",
+        "close",
+    }
+
+
+@pytest.mark.parametrize("paused_stage", ["begin", "read", "finish", "close"])
+def test_expired_heartbeat_after_database_stage_pause_is_fenced_and_attributed(
+    isolated_gate_database, monkeypatch, paused_stage
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def pause():
+        time.sleep(0.02)
+        clock.advance(35)
+
+    class PausedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args):
+            if paused_stage == "begin" and sql == "BEGIN IMMEDIATE":
+                pause()
+            elif (
+                paused_stage == "read"
+                and sql == "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ):
+                pause()
+            elif paused_stage == "finish" and sql.lstrip().startswith(
+                "UPDATE runtime_mutation_lease"
+            ):
+                pause()
+            return self.inner.execute(sql, *args)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def rollback(self):
+            return self.inner.rollback()
+
+        def close(self):
+            if paused_stage == "close":
+                pause()
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: PausedConnection(open_connection()),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    result = gate.heartbeat()
+    assert result["heartbeat"] is False
+    assert result["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    assert timing["attempts"][0]["database_ms"][paused_stage] >= 15
+
+
+def test_expired_heartbeat_logs_where_delayed_connection_spent_time(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    open_connection = database._stability_connection
+    records = []
+
+    def delayed_connection():
+        time.sleep(0.02)
+        clock.advance(25)
+        return open_connection()
+
+    monkeypatch.setattr(database, "_stability_connection", delayed_connection)
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data)
+        ),
+    )
+
+    renewed = gate.heartbeat()
+    assert renewed["heartbeat"] is False
+    assert renewed["reason"] == "lease_expired"
+    assert "database_ms" not in renewed
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+    timing = next(
+        data
+        for message, data in records
+        if message == "Mutation lease heartbeat timing"
+    )
+    assert timing["attempts"][0]["database_ms"]["connection"] >= 15
+
+
+def test_background_heartbeat_exception_fences_and_stops_immediately(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    stopped = threading.Event()
+    reasons = []
+    gate.register_stop_handler(lambda reason: (reasons.append(reason), stopped.set()))
+
+    def unexpected_heartbeat_failure():
+        raise RuntimeError("private heartbeat diagnostic detail")
+
+    monkeypatch.setattr(gate, "heartbeat", unexpected_heartbeat_failure)
+    assert gate.start_heartbeat(interval_seconds=0.01) is True
+    try:
+        assert stopped.wait(timeout=1), "heartbeat worker exited without fencing"
+        assert gate.status().reason_code == "HEARTBEAT_FAILED"
+        assert reasons == ["HEARTBEAT_FAILED"]
+    finally:
+        gate.stop_heartbeat()
+
+
+def test_heartbeat_rechecks_expiry_after_delayed_database_return(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    durable_heartbeat = database.heartbeat_runtime_mutation_lease
+
+    def delayed_return(**kwargs):
+        result = durable_heartbeat(**kwargs)
+        assert result["heartbeat"] is True
+        clock.advance(50)
+        return result
+
+    monkeypatch.setattr(database, "heartbeat_runtime_mutation_lease", delayed_return)
+    renewed = gate.heartbeat()
+
+    assert renewed["heartbeat"] is False
+    assert renewed["reason"] == "lease_expired"
+    assert gate.status().reason_code == "HEARTBEAT_FAILED"
+
+
+def test_acquire_does_not_report_success_after_delayed_database_return(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    durable_acquire = database.acquire_runtime_mutation_lease
+
+    def delayed_return(**kwargs):
+        result = durable_acquire(**kwargs)
+        assert result["acquired"] is True
+        clock.advance(50)
+        return result
+
+    monkeypatch.setattr(database, "acquire_runtime_mutation_lease", delayed_return)
+    acquired = gate.acquire()
+
+    assert acquired["acquired"] is False
+    assert acquired["reason"] == "lease_expired"
+    assert gate.status().reason_code == "LEASE_EXPIRED"
+
+
+def test_heartbeat_timing_separates_local_gate_lock_wait(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    clock.advance(10)
+    records = []
+    monkeypatch.setattr(
+        mutation_gate,
+        "slog",
+        lambda category, message, data=None, level="info": records.append(
+            (message, data, level)
+        ),
+    )
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_gate_lock():
+        with gate._lock:
+            holding.set()
+            assert release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_gate_lock)
+    holder.start()
+    assert holding.wait(timeout=5)
+    timer = threading.Timer(0.08, release.set)
+    timer.start()
+    try:
+        assert gate.heartbeat()["heartbeat"] is True
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        timer.join(timeout=5)
+
+    diagnostic = [
+        item for item in records if item[0] == "Mutation lease heartbeat timing"
+    ]
+    assert len(diagnostic) == 1
+    data = diagnostic[0][1]
+    assert diagnostic[0][2] == "debug"
+    assert data["outcome"] == "heartbeat"
+    assert data["lock_wait_ms"] >= 20
+    assert data["elapsed_ms"] >= data["lock_wait_ms"]
+    assert len(data["attempts"]) == 1
 
 
 def test_transient_durable_heartbeat_failure_retries_before_process_fence(
@@ -1907,6 +2732,78 @@ def test_parent_heartbeat_keeps_delegation_valid_but_new_lease_epoch_does_not(
     )
 
 
+def test_long_parent_lease_does_not_extend_worker_authority_without_heartbeat(
+    isolated_gate_database,
+):
+    _path, clock = isolated_gate_database
+    parent = mutation_gate.MutationGate(
+        run_id="long-lease-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:stale-parent",
+        purpose="coin_prep",
+        worker_id="worker-stale-parent",
+        ttl_seconds=120,
+    )
+    environment = handoff.to_environment()
+    assert parent.validate_worker_environment(environment)["allowed"] is True
+
+    clock.advance(31)
+    assert parent.status().allowed is True
+    assert parent.validate_worker_environment(environment) == {
+        "allowed": False,
+        "reason": "parent_lease_invalid",
+    }
+
+    assert parent.heartbeat()["heartbeat"] is True
+    assert parent.validate_worker_environment(environment)["allowed"] is True
+
+
+def test_worker_rechecks_parent_freshness_after_delayed_authorization_read(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    parent = mutation_gate.MutationGate(
+        run_id="delayed-worker-parent",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        lease_seconds=90,
+        clock=clock,
+        pid_liveness=lambda _pid, _host: False,
+    )
+    assert parent.acquire()["acquired"] is True
+    handoff = parent.issue_worker_delegation(
+        operation_id="coin-prep:delayed-read",
+        purpose="coin_prep",
+        worker_id="worker-delayed-read",
+        ttl_seconds=120,
+    )
+    original_snapshot = database.get_mutation_authorization_snapshot
+
+    def delayed_snapshot(**kwargs):
+        snapshot = original_snapshot(**kwargs)
+        clock.advance(31)
+        return snapshot
+
+    monkeypatch.setattr(
+        database, "get_mutation_authorization_snapshot", delayed_snapshot
+    )
+    assert parent.validate_worker_environment(handoff.to_environment()) == {
+        "allowed": False,
+        "reason": "parent_lease_invalid",
+    }
+
+
 def test_os_pid_liveness_is_fail_closed_for_remote_host_and_current_process():
     local_host = socket.gethostname()
     assert mutation_gate.pid_liveness(os.getpid(), local_host) is True
@@ -2593,6 +3490,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     """Desktop prep must reach wallet preflight, not lose its permit in Flask g."""
     import api_server
     import app_bridge
+    import coin_prep_fee_dispatch
     from blueprints import coin_prep
 
     _, clock = isolated_gate_database
@@ -2605,6 +3503,11 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
     monkeypatch.setattr(api_server, "_coin_prep_proc", None)
     monkeypatch.setattr(api_server, "_coin_prep_thread", None)
     monkeypatch.setattr(api_server, "_coin_prep_state", {"running": False})
+    monkeypatch.setattr(
+        coin_prep_fee_dispatch,
+        "price_approved_prep_batch",
+        lambda _approval_id: {"available": True},
+    )
     # Stop at the external wallet boundary: no wallet calls, resets or worker.
     monkeypatch.setattr(
         coin_prep,
@@ -2612,7 +3515,7 @@ def test_desktop_coin_prep_passes_guarded_permit_to_real_route(
         lambda: {"complete": False, "open_offer_count": 0, "open_trade_ids": []},
     )
 
-    result = app_bridge.AppBridge().trigger_coin_prep()
+    result = app_bridge.AppBridge().trigger_coin_prep({"fee_approval_id": "a" * 64})
 
     assert result["error"] == "coin_prep_wallet_offer_check_unavailable"
     assert result["reason"] == "WALLET_OFFER_BOOK_UNAVAILABLE"
@@ -4264,6 +5167,10 @@ def test_desktop_cleanup_uses_central_quiescence_and_never_releases_directly(
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     calls = []
+    runtime = SimpleNamespace(begin_quiesce=lambda: calls.append("begin"))
+    monkeypatch.setattr(api_server.mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    monkeypatch.setattr(api_server, "_cancel_all_thread", None)
     monkeypatch.setattr(
         api_server,
         "release_mutation_runtime",
@@ -4279,197 +5186,10 @@ def test_desktop_cleanup_uses_central_quiescence_and_never_releases_directly(
     )
     monkeypatch.setattr(database, "log_event", lambda *_args, **_kwargs: None)
 
-    desktop_app._cleanup()
+    result = desktop_app._cleanup()
 
-    assert calls == ["central"]
-
-
-def test_gui_shutdown_stops_bot_before_cancelling_wallet_offers(monkeypatch):
-    import api_server
-    from blueprints import bot as bot_blueprint
-
-    order = []
-    captured = {}
-
-    class DeferredThread:
-        def __init__(self, target, **_kwargs):
-            captured["target"] = target
-
-        def start(self):
-            return None
-
-    class OfferManager:
-        def cancel_all(self):
-            order.append("cancel")
-            return {}
-
-        def sync_from_wallet(self):
-            return [], [], {}
-
-    fake_bot = SimpleNamespace(
-        offer_manager=OfferManager(),
-        coin_manager=SimpleNamespace(_prep_running=False),
-        runtime_monitor=SimpleNamespace(stop=lambda: None),
-        splash_node=SimpleNamespace(is_running=lambda: False),
-        stop=lambda wait=True: order.append("stop"),
-    )
-    monkeypatch.setattr(api_server, "bot", fake_bot)
-    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
-    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
-    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
-    monkeypatch.setattr(
-        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
-    )
-    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
-    monkeypatch.setattr(
-        api_server,
-        "quiesce_and_release_mutation_runtime",
-        lambda **_kwargs: order.append("central") or {"released": True},
-    )
-    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
-    monkeypatch.setattr(database, "get_open_offers", lambda: [])
-    monkeypatch.setattr(database, "update_offer_status", lambda *_args: None)
-    monkeypatch.setattr(
-        database,
-        "get_connection",
-        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
-    )
-
-    with api_server.app.test_request_context(
-        "/api/shutdown", method="POST", json={"cancel_offers": True}
-    ):
-        response = bot_blueprint.api_shutdown()
-    assert response.get_json()["success"] is True
-    captured["target"]()
-
-    assert order.index("stop") < order.index("cancel") < order.index("central")
-
-
-def test_gui_shutdown_wallet_absence_never_terminalizes_submitted_cancel(monkeypatch):
-    import api_server
-    from blueprints import bot as bot_blueprint
-
-    captured = {}
-    status_updates = []
-
-    class DeferredThread:
-        def __init__(self, target, **_kwargs):
-            captured["target"] = target
-
-        def start(self):
-            return None
-
-    class OfferManager:
-        def cancel_all(self):
-            return {"shutdown-trade": {"success": True}}
-
-        def sync_from_wallet(self):
-            return [], [], {}
-
-    fake_bot = SimpleNamespace(
-        offer_manager=OfferManager(),
-        coin_manager=SimpleNamespace(_prep_running=False),
-        runtime_monitor=SimpleNamespace(stop=lambda: None),
-        splash_node=SimpleNamespace(is_running=lambda: False),
-        stop=lambda wait=True: None,
-    )
-    monkeypatch.setattr(api_server, "bot", fake_bot)
-    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
-    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
-    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
-    monkeypatch.setattr(
-        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
-    )
-    monkeypatch.setattr(api_server.mutation_gate, "exit_mutation", lambda _permit: True)
-    monkeypatch.setattr(
-        api_server,
-        "quiesce_and_release_mutation_runtime",
-        lambda **_kwargs: {"released": True},
-    )
-    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
-    monkeypatch.setattr(
-        database,
-        "update_offer_status",
-        lambda trade_id, status: status_updates.append((trade_id, status)),
-    )
-    monkeypatch.setattr(
-        database,
-        "get_connection",
-        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
-    )
-
-    with api_server.app.test_request_context(
-        "/api/shutdown", method="POST", json={"cancel_offers": True}
-    ):
-        response = bot_blueprint.api_shutdown()
-    assert response.get_json()["success"] is True
-
-    captured["target"]()
-
-    assert status_updates == []
-
-
-def test_gui_shutdown_cancel_failure_still_releases_permit_and_quiesces(monkeypatch):
-    import api_server
-    from blueprints import bot as bot_blueprint
-
-    captured = {}
-    order = []
-
-    class DeferredThread:
-        def __init__(self, target, **_kwargs):
-            captured["target"] = target
-
-        def start(self):
-            return None
-
-    class OfferManager:
-        def cancel_all(self):
-            raise RuntimeError("cancel unavailable")
-
-    fake_bot = SimpleNamespace(
-        offer_manager=OfferManager(),
-        coin_manager=SimpleNamespace(_prep_running=False),
-        runtime_monitor=SimpleNamespace(stop=lambda: None),
-        splash_node=SimpleNamespace(is_running=lambda: False),
-        stop=lambda wait=True: None,
-    )
-    monkeypatch.setattr(api_server, "bot", fake_bot)
-    monkeypatch.setattr(bot_blueprint.threading, "Thread", DeferredThread)
-    monkeypatch.setattr(bot_blueprint.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(bot_blueprint, "backup_database", lambda: None)
-    monkeypatch.setattr(api_server, "_coin_prep_proc", None)
-    monkeypatch.setattr(
-        api_server.mutation_gate, "enter_mutation", lambda _operation: "permit"
-    )
-    monkeypatch.setattr(
-        api_server.mutation_gate,
-        "exit_mutation",
-        lambda permit: order.append(("exit", permit)) or True,
-    )
-    monkeypatch.setattr(
-        api_server,
-        "quiesce_and_release_mutation_runtime",
-        lambda **_kwargs: order.append(("quiesce", None)) or {"released": True},
-    )
-    monkeypatch.setattr(bot_blueprint.os, "_exit", lambda _code: None)
-    monkeypatch.setattr(
-        database,
-        "get_connection",
-        lambda: SimpleNamespace(execute=lambda *_args: None, commit=lambda: None),
-    )
-
-    with api_server.app.test_request_context(
-        "/api/shutdown", method="POST", json={"cancel_offers": True}
-    ):
-        response = bot_blueprint.api_shutdown()
-    assert response.get_json()["success"] is True
-
-    captured["target"]()
-
-    assert order == [("exit", "permit"), ("quiesce", None)]
+    assert result == {"released": False}
+    assert calls == ["begin", "central"]
 
 
 def test_inflight_mutation_quiescence_blocks_new_work_and_lease_release(
@@ -5557,6 +6277,154 @@ def test_windows_existing_window_handoff_fails_when_foreground_is_denied(monkeyp
     )
 
 
+def test_windows_existing_window_handoff_attaches_to_foreground_input_thread(
+    monkeypatch,
+):
+    """A duplicate launcher must recover from Windows' foreground denial."""
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.attached = False
+            self.attachments = []
+            self.foreground = 303
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            if owner_pid is not None:
+                owner_pid._obj.value = 4567
+            return {101: 222, 303: 333}.get(handle, 0)
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return True
+
+        def SetForegroundWindow(self, handle):
+            if not self.attached:
+                return False
+            self.foreground = handle
+            return True
+
+        def GetForegroundWindow(self):
+            return self.foreground
+
+        def AttachThreadInput(self, attach, attach_to, enabled):
+            self.attachments.append((attach, attach_to, bool(enabled)))
+            self.attached = bool(enabled)
+            return True
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 444
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert desktop_app._focus_catalyst_window_with_user32(
+        user32,
+        lambda callback: callback,
+        owner_pid=4567,
+        kernel32=Kernel32(),
+    )
+    assert user32.attachments == [
+        (444, 333, True),
+        (444, 222, True),
+        (444, 222, False),
+        (444, 333, False),
+    ]
+
+
+def test_windows_existing_window_handoff_detaches_after_partial_attach_failure(
+    monkeypatch,
+):
+    """A failed owner-thread join must release the foreground-thread join."""
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+
+    class User32:
+        def __init__(self):
+            self.attachments = []
+
+        @staticmethod
+        def EnumWindows(callback, _context):
+            callback(101, 0)
+            return True
+
+        @staticmethod
+        def GetWindowThreadProcessId(handle, owner_pid):
+            if owner_pid is not None:
+                owner_pid._obj.value = 4567
+            return {101: 222, 303: 333}.get(handle, 0)
+
+        @staticmethod
+        def GetWindowTextLengthW(_handle):
+            return len("CATalyst")
+
+        @staticmethod
+        def GetWindowTextW(_handle, buffer, _length):
+            buffer.value = "CATalyst"
+            return len(buffer.value)
+
+        @staticmethod
+        def ShowWindow(_handle, _command):
+            return True
+
+        @staticmethod
+        def BringWindowToTop(_handle):
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(_handle):
+            return False
+
+        @staticmethod
+        def GetForegroundWindow():
+            return 303
+
+        def AttachThreadInput(self, attach, attach_to, enabled):
+            call = (attach, attach_to, bool(enabled))
+            self.attachments.append(call)
+            return not (attach_to == 222 and enabled)
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 444
+
+    user32 = User32()
+    monkeypatch.setattr(desktop_app.os, "getpid", lambda: 9999)
+
+    assert not desktop_app._focus_catalyst_window_with_user32(
+        user32,
+        lambda callback: callback,
+        owner_pid=4567,
+        kernel32=Kernel32(),
+    )
+    assert user32.attachments == [
+        (444, 333, True),
+        (444, 222, True),
+        (444, 333, False),
+    ]
+
+
 def test_windows_window_handoff_rejects_same_title_from_wrong_process(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
 
@@ -6632,7 +7500,27 @@ def test_authorized_desktop_mode_uses_alternate_reserved_port_for_server_and_win
         desktop_app.run_desktop_mode()
 
     assert events[:3] == ["reserve", "services", ("serve", reservation)]
-    assert ("window", f"http://127.0.0.1:{selected_port}/") in events
+    window_urls = [
+        event[1]
+        for event in events
+        if isinstance(event, tuple) and event[0] == "window"
+    ]
+    assert len(window_urls) == 1
+    window_url = urlsplit(window_urls[0])
+    assert (
+        window_url.scheme,
+        window_url.hostname,
+        window_url.port,
+        window_url.path,
+    ) == (
+        "http",
+        "127.0.0.1",
+        selected_port,
+        "/",
+    )
+    assert parse_qs(window_url.query).get("bootstrap") == [
+        desktop_app._browser_bootstrap_url().split("bootstrap=", 1)[1]
+    ]
 
 
 def test_desktop_thread_construction_failure_releases_port_and_lease(monkeypatch):
@@ -6721,7 +7609,7 @@ def test_authorized_desktop_startup_exception_runs_central_lease_cleanup(
     monkeypatch.setattr(desktop_app, "_cleanup", lambda: events.append("cleanup"))
     monkeypatch.setattr(desktop_app, "_CONSOLE_HIDDEN", True)
     monkeypatch.setattr(desktop_app, "_show_fatal_error_dialog", lambda _msg: None)
-    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
 
     assert desktop_app.main(["--show-console"]) == 1
     assert events == ["cleanup"]
@@ -6809,6 +7697,116 @@ def test_desktop_retries_startup_after_exact_coin_prep_recovery(
         "authorize",
         "coin_prep_recovery",
         "authorize",
+    ]
+
+
+def test_desktop_rechecks_authority_after_coin_prep_recovery_attempt(monkeypatch):
+    """A completed recovery must not leave the initial blocked snapshot onscreen."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    recovery_state = {"complete": False}
+
+    def authorize():
+        events.append("authorize")
+        if recovery_state["complete"]:
+            return {"allowed": True, "reason_code": "", "failed_check": None}
+        return {
+            "allowed": False,
+            "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+            "failed_check": "unresolved_operations",
+        }
+
+    def recover():
+        events.append("coin_prep_recovery")
+        recovery_state["complete"] = True
+        # The recovery helper's boolean is not an authorization decision. For
+        # example, a separately checked legacy recovery may remain false even
+        # after durable coin-prep evidence becomes terminal.
+        return False
+
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(recover_coin_prep_operations_at_startup=recover),
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is True
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+    ]
+
+
+def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
+    """An unresolved fresh decision must still route startup to diagnostics."""
+
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "COIN_PREP_RECOVERY_REQUIRED",
+        "failed_check": "unresolved_operations",
+    }
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+            return True
+
+    monkeypatch.setattr(
+        read_only_diagnostics, "acquire_startup_arbiter", lambda: Arbiter()
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
+    monkeypatch.setattr(database, "init_database", lambda: events.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: events.append("authorize") or dict(blocked),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_wallet_setup_bootstrap",
+        lambda _authorization: events.append("bootstrap_denied") or False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "coin_prep_worker",
+        SimpleNamespace(
+            recover_coin_prep_operations_at_startup=lambda: (
+                events.append("coin_prep_recovery") or False
+            )
+        ),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is False
+    assert desktop_app._startup_diagnostics_status["reason_code"] == (
+        "COIN_PREP_RECOVERY_REQUIRED"
+    )
+    assert events == [
+        "database",
+        "authorize",
+        "coin_prep_recovery",
+        "authorize",
+        "bootstrap_denied",
+        "arbiter_release",
     ]
 
 
@@ -7158,6 +8156,43 @@ def test_desktop_resumes_interrupted_legacy_reservation_recovery(
     ]
 
 
+@pytest.mark.parametrize("clears_latch", [True, False])
+def test_desktop_refreshes_authorization_after_zero_count_latch_recovery(
+    monkeypatch, clears_latch
+):
+    """A cleared cancellation latch must not leave startup in stale diagnostics."""
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    blocked = {
+        "allowed": False,
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "failed_check": "unresolved_operations",
+    }
+    latch = {"cleared": False}
+    calls = []
+
+    def authorize():
+        calls.append("authorize")
+        if latch["cleared"]:
+            return {"allowed": True, "reason_code": "", "failed_check": None}
+        return blocked
+
+    def recover():
+        calls.append("recover")
+        latch["cleared"] = clears_latch
+        return {"examined": 0, "recovered": 0, "remaining": 0}
+
+    monkeypatch.setattr(database, "init_database", lambda: None)
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", authorize)
+    monkeypatch.setattr(api_server, "recover_legacy_startup_reservations", recover)
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result["allowed"] is clears_latch
+    assert calls == ["authorize", "recover", "authorize"]
+
+
 def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
     monkeypatch,
 ):
@@ -7493,7 +8528,7 @@ def test_desktop_holds_startup_arbiter_until_gate_lease_is_allowed(monkeypatch):
         "run_flask_mode",
         lambda: events.append(("run", arbiter.released)),
     )
-    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {})
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
 
     assert desktop_app.main(["--flask", "--show-console"]) == 0
     assert events == [
@@ -7970,7 +9005,10 @@ def _bounded_loopback_candidates(
 
 
 def _wait_for_diagnostics_status(process, port: int) -> dict:
-    deadline = time.monotonic() + 10
+    # A first read-only SQLite snapshot can be delayed by Windows Defender's
+    # initial scan on a fresh test database.  Keep the assertion bounded while
+    # allowing the same cold-start margin used by the browser/server helpers.
+    deadline = time.monotonic() + 30
     url = f"http://127.0.0.1:{port}/api/safety/status"
     while time.monotonic() < deadline:
         if process.poll() is not None:

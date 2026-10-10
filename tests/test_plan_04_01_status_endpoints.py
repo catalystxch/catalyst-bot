@@ -13,6 +13,8 @@ import types
 import unittest
 from unittest.mock import patch
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
@@ -123,9 +125,25 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.client.environ_base["HTTP_SEC_FETCH_SITE"] = "same-origin"
+        self.client.get(
+            f"/?bootstrap={api_server._LOCAL_API_BOOTSTRAP_TOKEN}",
+            environ_base=self._LOOPBACK,
+        )
         api_server._rate_limit_log.clear()
+        # Contract tests must not inherit the machine's network availability.
+        # Individual startup-price tests install their own nested requests.get
+        # mock, which temporarily overrides this fail-fast default.
+        self._network_guard = patch(
+            "requests.get",
+            side_effect=requests.RequestException(
+                "unexpected external GET in status contract test"
+            ),
+        )
+        self._network_guard.start()
 
     def tearDown(self):
+        self._network_guard.stop()
         api_server._rate_limit_log.clear()
 
 
@@ -272,6 +290,24 @@ class TestBotPriceContract(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestStatusEndpointSmoke(_FlaskBase):
+    def test_status_hides_risk_inventory_exception_details(self):
+        bot = _fake_bot_stopped()
+
+        def unavailable_inventory():
+            raise RuntimeError("secret risk traceback C:/wallet/private.key")
+
+        bot.risk_manager = types.SimpleNamespace(
+            get_inventory_state=unavailable_inventory
+        )
+        with patch.object(api_server, "bot", bot):
+            response = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        body = response.get_data(as_text=True).lower()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("risk_state_unavailable", body)
+        self.assertNotIn("secret risk traceback", body)
+        self.assertNotIn("private.key", body)
+
     def test_status_includes_runtime_safety_for_prebot_and_stopped_bot(self):
         for bot in (None, _fake_bot_stopped()):
             with (
@@ -412,6 +448,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
                 patch("database.get_coin_summary", return_value={}),
                 patch("database.get_offer_lifecycle_summary", return_value={}),
                 patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+                patch("blueprints.market._get_startup_price_cached", return_value={}),
             ):
                 resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
         finally:
@@ -470,6 +507,25 @@ class TestStatusEndpointSmoke(_FlaskBase):
         get_spendable_coin_count.assert_not_called()
         get_wallet_balance.assert_not_called()
 
+    def test_status_poll_preserves_incomplete_stop_and_retry_authority(self):
+        """Dashboard polling must not turn a failed stop into Stopped."""
+        stopping_bot = _fake_bot_stopped()
+        state = stopping_bot.get_state()
+        state.update(status="stopping", stop_retry_available=True)
+        stopping_bot.get_state = lambda: state
+
+        with (
+            patch.object(api_server, "bot", stopping_bot),
+            patch("database.get_open_offers", return_value=[]),
+            patch("database.get_recent_events", return_value=[]),
+            patch("database.get_events_since", return_value=[]),
+        ):
+            resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "stopping")
+        self.assertIs(resp.get_json()["stop_retry_available"], True)
+
     def test_stopped_status_reuses_one_bot_state_snapshot(self):
         stopped_bot = _fake_bot_stopped()
         original_get_state = stopped_bot.get_state
@@ -490,6 +546,7 @@ class TestStatusEndpointSmoke(_FlaskBase):
                 return_value={"status": "healthy"},
             ),
             patch("blueprints.market._get_tibet_pairs_cached", return_value=[]),
+            patch("blueprints.market._get_startup_price_cached", return_value={}),
         ):
             resp = self.client.get("/api/status", environ_base=self._LOOPBACK)
 
@@ -874,7 +931,12 @@ class TestStatusEndpointSmoke(_FlaskBase):
         )
         response = Mock(status_code=200)
         response.json.return_value = [
-            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+            {
+                "ticker_id": "MZ_XCH",
+                "base_id": "cold-start-cat",
+                "bid": "0.00007",
+                "ask": "0.00009",
+            }
         ]
         with (
             patch.object(api_server, "bot", stopped_bot),
@@ -910,7 +972,12 @@ class TestStatusEndpointSmoke(_FlaskBase):
         )
         response = Mock(status_code=200)
         response.json.return_value = [
-            {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+            {
+                "ticker_id": "MZ_XCH",
+                "base_id": "stale-cat",
+                "bid": "0.00007",
+                "ask": "0.00009",
+            }
         ]
         with (
             patch.object(api_server, "bot", stopped_bot),
@@ -935,15 +1002,21 @@ class TestStatusEndpointWriteGuards(_FlaskBase):
     and returns 401 — before Flask can return 405 for a GET-only route."""
 
     def test_bot_state_post_no_token_returns_401(self):
-        resp = self.client.post("/api/bot/state", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/bot/state", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_bot_price_post_no_token_returns_401(self):
-        resp = self.client.post("/api/bot/price", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/bot/price", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_status_post_no_token_returns_401(self):
-        resp = self.client.post("/api/status", environ_base=self._LOOPBACK)
+        resp = api_server.app.test_client().post(
+            "/api/status", environ_base=self._LOOPBACK
+        )
         self.assertEqual(resp.status_code, 401)
 
     def test_bot_state_post_with_token_returns_405(self):

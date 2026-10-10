@@ -56,6 +56,10 @@ _FAKE_TRADE_ID = "test-shutdown-001"
 class _TempDB(unittest.TestCase):
     """Base: redirect database module to a fresh temp SQLite file."""
 
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", {"X-Bot-Local-Token": self.token})
+        return self.client.get(path, **kwargs)
+
     def setUp(self):
         self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self._tmp.close()
@@ -148,7 +152,7 @@ class TestCheckResume(_TempDB):
                 return_value=(classified_buy, classified_sell, []),
             ),
         ):
-            return self.client.get("/api/check-resume", environ_base=_LOOPBACK)
+            return self._get("/api/check-resume", environ_base=_LOOPBACK)
 
     def test_open_offers_returns_can_resume_true(self):
         """Wallet has open offers → can_resume=True."""
@@ -188,7 +192,7 @@ class TestCheckResume(_TempDB):
                 return_value=([{"trade_id": "b1"}], [], []),
             ),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=_LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=_LOOPBACK)
         self.assertFalse(resp.get_json().get("can_resume"))
 
 
@@ -277,7 +281,7 @@ class TestFreshStartPath(_TempDB):
                 return_value=([{"trade_id": "b1"}], [], []),
             ),
         ):
-            resp = self.client.get("/api/check-resume", environ_base=_LOOPBACK)
+            resp = self._get("/api/check-resume", environ_base=_LOOPBACK)
         self.assertFalse(resp.get_json().get("can_resume"))
 
     def test_response_reports_no_authoritative_fills_cleared(self):

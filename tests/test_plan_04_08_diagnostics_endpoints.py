@@ -69,10 +69,16 @@ class _FlaskBase(unittest.TestCase):
     def setUp(self):
         api_server.app.testing = True
         self.client = api_server.app.test_client()
+        self.auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}
         api_server._rate_limit_log.clear()
 
     def tearDown(self):
         api_server._rate_limit_log.clear()
+
+    def _get(self, path, **kwargs):
+        kwargs.setdefault("headers", self.auth)
+        kwargs.setdefault("environ_base", self._LOOPBACK)
+        return self.client.get(path, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +110,7 @@ class TestHealthEndpointStartupAuthorisation(_FlaskBase):
             patch("chia_node.is_startup_authorised", return_value=False),
             patch.object(api_server, "bot", bot),
         ):
-            resp = self.client.get("/api/health", environ_base=self._LOOPBACK)
+            resp = self._get("/api/health", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -132,7 +138,7 @@ class TestHealthEndpointStartupAuthorisation(_FlaskBase):
             patch("wallet.get_chia_health", return_value=raw_health),
             patch.object(api_server, "bot", None),
         ):
-            resp = self.client.get("/api/health", environ_base=self._LOOPBACK)
+            resp = self._get("/api/health", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -148,14 +154,12 @@ class TestHealthEndpointStartupAuthorisation(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestDiagnosticsRuntime(_FlaskBase):
     def test_returns_200(self):
-        resp = self.client.get("/api/diagnostics/runtime", environ_base=self._LOOPBACK)
+        resp = self._get("/api/diagnostics/runtime", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_bot_none_returns_safe_shape(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get(
-                "/api/diagnostics/runtime", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/runtime", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body.get("enabled"))
         self.assertEqual(body.get("status"), "idle")
@@ -163,18 +167,14 @@ class TestDiagnosticsRuntime(_FlaskBase):
 
     def test_bot_set_returns_diagnostics_payload(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get(
-                "/api/diagnostics/runtime", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/runtime", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertIsInstance(body, dict)
 
     def test_response_is_dict(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get(
-                "/api/diagnostics/runtime", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/runtime", environ_base=self._LOOPBACK)
         self.assertIsInstance(resp.get_json(), dict)
 
 
@@ -203,7 +203,7 @@ class TestHealthEndpoint(_FlaskBase):
             patch("wallet.get_chia_health", return_value=raw_health),
             patch.object(api_server, "bot", None),
         ):
-            resp = self.client.get("/api/health", environ_base=self._LOOPBACK)
+            resp = self._get("/api/health", environ_base=self._LOOPBACK)
 
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -219,48 +219,36 @@ class TestHealthEndpoint(_FlaskBase):
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestDiagnosticsApiStats(_FlaskBase):
     def test_returns_200(self):
-        resp = self.client.get(
-            "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         self.assertEqual(resp.status_code, 200)
 
     def test_response_has_top_level_keys(self):
-        resp = self.client.get(
-            "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-        )
+        resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in ("spacescan", "coinset", "dexie"):
             self.assertIn(key, body)
 
     def test_bot_none_coinset_not_available(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get(
-                "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["coinset"].get("available"))
 
     def test_bot_none_dexie_not_available(self):
         with patch.object(api_server, "bot", None):
-            resp = self.client.get(
-                "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertFalse(body["dexie"].get("available"))
 
     def test_bot_set_coinset_available(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get(
-                "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["coinset"].get("available"))
 
     def test_bot_set_dexie_available(self):
         with patch.object(api_server, "bot", _make_bot()):
-            resp = self.client.get(
-                "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["dexie"].get("available"))
 
@@ -285,9 +273,7 @@ class TestDiagnosticsApiStats(_FlaskBase):
             ),
             patch("database.get_market_analysis_cache_age_secs", return_value=123),
         ):
-            resp = self.client.get(
-                "/api/diagnostics/api-stats", environ_base=self._LOOPBACK
-            )
+            resp = self._get("/api/diagnostics/api-stats", environ_base=self._LOOPBACK)
         body = resp.get_json()
         self.assertTrue(body["spacescan"].get("token_context_cached"))
         self.assertEqual(body["spacescan"].get("token_context_cache_age_secs"), 123)

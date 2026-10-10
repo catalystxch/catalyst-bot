@@ -27,6 +27,7 @@ import argparse
 import subprocess
 import importlib.util
 from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit
 
 # ---------------------------------------------------------------------------
 # Fix Windows cp1252 terminal encoding so emoji in log messages don't crash.
@@ -153,9 +154,17 @@ def _configure_linux_webengine_env() -> None:
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = existing
 
 
+def _browser_bootstrap_url() -> str:
+    """Return the private first-navigation URL for this process's browser."""
+    import api_server
+
+    token = quote(api_server._LOCAL_API_BOOTSTRAP_TOKEN, safe="")
+    return f"http://{FLASK_HOST}:{FLASK_PORT}/?bootstrap={token}"
+
+
 def _initial_desktop_url() -> str:
     """Return the first URL shown in the native desktop window."""
-    flask_url = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+    flask_url = _browser_bootstrap_url()
     if sys.platform.startswith("linux") or FLASK_PORT != 5000:
         return flask_url
 
@@ -163,8 +172,16 @@ def _initial_desktop_url() -> str:
     if os.path.exists(splash_path):
         import pathlib
 
-        return pathlib.Path(splash_path).as_uri()
+        token = quote(flask_url.split("bootstrap=", 1)[1], safe="")
+        # Edge WebView2 treats a query on file:// as part of the filename.
+        # A fragment survives native file navigation and remains local.
+        return f"{pathlib.Path(splash_path).as_uri()}#bootstrap={token}"
     return flask_url
+
+
+def _redacted_desktop_url(url: str) -> str:
+    """Keep the startup log free of the private browser credential."""
+    return urlsplit(url)._replace(query="", fragment="").geturl()
 
 
 # True when the app is running without a visible console (pythonw.exe or
@@ -658,7 +675,7 @@ def _current_profile_owner_pid() -> int | None:
 
 
 def _focus_catalyst_window_with_user32(
-    user32, callback_factory, *, owner_pid: int
+    user32, callback_factory, *, owner_pid: int, kernel32=None
 ) -> bool:
     """Restore the exact native CATalyst window exposed by another process."""
 
@@ -692,9 +709,48 @@ def _focus_catalyst_window_with_user32(
     handle = target[0]
     user32.ShowWindow(handle, 9)  # SW_RESTORE
     user32.BringWindowToTop(handle)
-    if not user32.SetForegroundWindow(handle):
+    activated = bool(user32.SetForegroundWindow(handle))
+    if activated and int(user32.GetForegroundWindow() or 0) == int(handle):
+        return True
+
+    # Windows may deny SetForegroundWindow when CATalyst is launched by a
+    # background process (for example an updater or automated smoke test).
+    # Temporarily join the foreground thread's input queue, perform the same
+    # activation, and always detach again.  This is limited to the HWND whose
+    # PID was proven by the current profile's lease/instance lock above.
+    attached_threads = []
+    current_thread = 0
+    try:
+        foreground_handle = int(user32.GetForegroundWindow() or 0)
+        if foreground_handle <= 0:
+            return False
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        current_thread = int(kernel32.GetCurrentThreadId() or 0)
+        foreground_thread = int(
+            user32.GetWindowThreadProcessId(foreground_handle, None) or 0
+        )
+        target_thread = int(user32.GetWindowThreadProcessId(handle, None) or 0)
+        if current_thread <= 0 or foreground_thread <= 0 or target_thread <= 0:
+            return False
+        for thread_id in dict.fromkeys((foreground_thread, target_thread)):
+            if thread_id == current_thread:
+                continue
+            if not user32.AttachThreadInput(current_thread, thread_id, True):
+                return False
+            attached_threads.append(thread_id)
+        user32.ShowWindow(handle, 9)  # SW_RESTORE
+        user32.BringWindowToTop(handle)
+        activated = bool(user32.SetForegroundWindow(handle))
+    except Exception:
         return False
-    return int(user32.GetForegroundWindow() or 0) == int(handle)
+    finally:
+        for thread_id in reversed(attached_threads):
+            try:
+                user32.AttachThreadInput(current_thread, thread_id, False)
+            except Exception:
+                pass
+    return activated and int(user32.GetForegroundWindow() or 0) == int(handle)
 
 
 def _focus_existing_catalyst_window(
@@ -1107,7 +1163,7 @@ def run_desktop_mode(dev_mode: bool = False):
 
     print("\n  Launching desktop window...")
     if dev_mode:
-        print(f"  Dev mode: also accessible at http://{FLASK_HOST}:{FLASK_PORT}/")
+        print(f"  Dev mode browser URL: {_browser_bootstrap_url()}")
 
     # Create JS bridge for window.pywebview.api calls
     try:
@@ -1131,7 +1187,7 @@ def run_desktop_mode(dev_mode: bool = False):
         _win_y = None
 
     _initial_url = _initial_desktop_url()
-    print(f"  Desktop window URL: {_initial_url}", flush=True)
+    print(f"  Desktop window URL: {_redacted_desktop_url(_initial_url)}", flush=True)
 
     _create_window_kwargs = dict(
         title=APP_NAME,
@@ -1185,11 +1241,14 @@ def run_desktop_mode(dev_mode: bool = False):
     def on_closing():
         # If the user already confirmed via the modal, let it through.
         if _state.get("confirmed_close"):
+            readiness = _cleanup()
+            if readiness.get("released") is not True:
+                _state["confirmed_close"] = False
+                return False
             try:
                 _save_window_state(window)
             except Exception:
                 pass
-            _cleanup()
             if tray:
                 try:
                     tray.stop()
@@ -1209,12 +1268,14 @@ def run_desktop_mode(dev_mode: bool = False):
             pass
 
         if not bot_running:
-            # Safe path — save state and close.
+            # A stopped bot may still have an active Cancel All proof worker.
+            readiness = _cleanup()
+            if readiness.get("released") is not True:
+                return False
             try:
                 _save_window_state(window)
             except Exception:
                 pass
-            _cleanup()
             if tray:
                 try:
                     tray.stop()
@@ -1232,13 +1293,7 @@ def run_desktop_mode(dev_mode: bool = False):
             print("\n  Alt+F4 intercepted — showing shutdown confirmation.", flush=True)
         except Exception as e:
             print(f"  [CLOSE] Could not show shutdown modal: {e}", flush=True)
-            # Fall back to hard close so the user isn't trapped
-            try:
-                _save_window_state(window)
-            except Exception:
-                pass
-            _cleanup()
-            return True
+            return False
         # Cancel this close event — the modal will set confirmed_close
         # and re-invoke the close when it finishes the graceful sequence.
         return False
@@ -1270,7 +1325,10 @@ def run_desktop_mode(dev_mode: bool = False):
     # If we get here, all windows are closed
     print("\n  Desktop window closed.")
     print("  Stopping bot...", flush=True)
-    _cleanup()
+    # Some window backends can bypass on_closing(). Never take their window
+    # disappearance as proof that a wallet mutation has drained.
+    while _cleanup().get("released") is not True:
+        time.sleep(1)
     print("  Shutdown complete. Goodbye!", flush=True)
     time.sleep(0.5)  # Brief pause so user can see the shutdown messages
     os._exit(0)  # Force exit - daemon threads (Flask, tray) won't block
@@ -1290,7 +1348,7 @@ def run_flask_mode():
 
     print(f"\n  {APP_NAME} v{APP_VERSION} - Flask Mode")
     print(f"  {'=' * 40}")
-    print(f"  Open http://{FLASK_HOST}:{FLASK_PORT}/ in your browser")
+    print(f"  Open {_browser_bootstrap_url()} in your browser")
     print("  Press Ctrl+C to stop\n")
 
     # Register signal handlers — must call sys.exit() so Werkzeug's
@@ -1438,7 +1496,8 @@ def _show_window(webview_module):
 
 def _quit_app(webview_module, tray):
     """Clean shutdown from tray quit action (fallback for non-graceful paths)."""
-    _cleanup()
+    if _cleanup().get("released") is not True:
+        return
     try:
         # Destroy all webview windows
         for win in webview_module.windows:
@@ -1482,20 +1541,23 @@ def _tray_graceful_quit(webview_module, tray):
 
 
 def _cleanup():
-    """Clean shutdown of bot and modules."""
+    """Release wallet mutation ownership before a native hard exit."""
+    try:
+        from native_shutdown import native_close_readiness
+
+        readiness = native_close_readiness()
+    except Exception:
+        return {"released": False, "reason": "native_close_preflight_unavailable"}
+    if readiness.get("released") is not True:
+        return readiness
+
     try:
         from database import log_event
 
         log_event("info", "app_shutdown", f"Desktop app v{APP_VERSION} shutting down")
     except Exception:
         pass
-
-    try:
-        import api_server
-
-        api_server.quiesce_and_release_mutation_runtime()
-    except Exception:
-        pass
+    return readiness
 
 
 def _poll_tray_status(tray, interval: float = 3.0):
@@ -1518,7 +1580,10 @@ def _poll_tray_status(tray, interval: float = 3.0):
         try:
             req = urllib.request.Request(
                 f"http://{FLASK_HOST}:{FLASK_PORT}/api/status",
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "X-Bot-Local-Token": os.environ.get("BOT_LOCAL_WRITE_TOKEN", ""),
+                },
             )
             with urllib.request.urlopen(req, timeout=4) as resp:
                 data = _json.loads(resp.read().decode())
@@ -1835,8 +1900,14 @@ def _initialize_startup_ownership() -> dict:
         try:
             from coin_prep_worker import recover_coin_prep_operations_at_startup
 
-            if recover_coin_prep_operations_at_startup() is True:
-                authorization = api_server.initialize_mutation_runtime()
+            recover_coin_prep_operations_at_startup()
+            # Recovery's return value summarizes its own observations; it is
+            # not the durable startup authorization decision. Always refresh
+            # that decision after a completed recovery attempt so a terminal
+            # operation cannot leave the launcher displaying its stale,
+            # pre-recovery blocker. Any remaining ambiguity still fails closed
+            # in initialize_mutation_runtime().
+            authorization = api_server.initialize_mutation_runtime()
         except Exception:
             # Recovery is fail-closed. The original authorization keeps the
             # app in diagnostics mode with its durable reason intact.
@@ -1878,7 +1949,13 @@ def _initialize_startup_ownership() -> dict:
             recovery = None
             try:
                 recovery = api_server.recover_legacy_startup_reservations()
-                if recovery.get("recovered", 0) > 0:
+                # The proof pass can clear a durable cancellation latch even
+                # when it creates no new journal recovery row. Its count is
+                # not the authority; recheck the gate before a zero-remaining
+                # result ends this bounded retry loop.
+                if isinstance(recovery, dict) and (
+                    recovery.get("recovered", 0) > 0 or recovery.get("remaining") == 0
+                ):
                     authorization = api_server.initialize_mutation_runtime()
                     authorization = _recover_startup_publication_claims(
                         api_server, authorization
@@ -1924,9 +2001,19 @@ def _authorize_desktop_startup() -> bool:
         try:
             from database import attempt_db_recovery
 
-            attempt_db_recovery()
+            recovery = attempt_db_recovery()
         except Exception:
-            pass
+            recovery = None
+        if not isinstance(recovery, dict) or recovery.get("action") != "ok":
+            _startup_diagnostics_status = _diagnostics_status_from_authorization(
+                {
+                    "allowed": False,
+                    "reason_code": "DATABASE_RECOVERY_REQUIRED",
+                    "failed_check": "database_integrity",
+                    "blocker_counts": {},
+                }
+            )
+            return False
         authorization = _initialize_startup_ownership()
         if authorization.get("allowed") is True:
             return True
@@ -2056,35 +2143,6 @@ def main(argv=None):
     # workers, helper commands, etc.) die when this parent dies, even on
     # Task Manager force-kill. External apps can opt into breakaway.
     _attach_to_kill_on_close_job()
-
-    # Auto-recover the SQLite DB if the previous run left it corrupt.
-    # The singleton lock guarantees no other process holds bot.db open,
-    # which is the precondition for safely swapping in a recovered file.
-    # Without this, a once-corrupt DB persists across restarts and bleeds
-    # "database disk image is malformed" errors mid-trade until the user
-    # manually runs scripts/recover_db.py.
-    try:
-        from database import attempt_db_recovery
-
-        _rec = attempt_db_recovery() or {}
-        _action = _rec.get("action")
-        if _action == "recovered":
-            print(
-                f"\n  [DB] Auto-recovered corrupt bot.db — backed up as "
-                f"{_rec.get('corrupt_backup')}, "
-                f"{_rec.get('skipped_statements', 0)} unreadable statement(s) skipped",
-                flush=True,
-            )
-        elif _action == "failed":
-            print(
-                f"\n  [DB] WARNING: bot.db is corrupt and auto-recovery "
-                f"failed: {_rec.get('error')}\n"
-                f"  Original: {_rec.get('result')}\n"
-                f"  Run: python scripts/recover_db.py",
-                flush=True,
-            )
-    except Exception as _rec_err:
-        print(f"\n  [DB] Auto-recovery skipped: {_rec_err}", flush=True)
 
     if not args.flask and not args.dev and not args.show_console:
         _hide_windows_console()

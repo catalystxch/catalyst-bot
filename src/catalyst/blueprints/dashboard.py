@@ -2,7 +2,7 @@
 
 Read-only aggregator routes that compose information from multiple
 bot subsystems for the GUI dashboard view. Depend heavily on helpers
-still living in api_server (_get_health_snapshot, _get_live_mid_price_str,
+still living in api_server (_get_health_snapshot, _get_readonly_mid_price_str,
 _get_live_local_offer_edges, _get_spacescan_market_context, etc.).
 """
 
@@ -26,18 +26,21 @@ def _live_wallet_reads_allowed(bot_obj=None) -> bool:
     """Dashboard live RPC is only allowed during an active bot run."""
     if bot_obj is None:
         return False
-    state_running = False
-    try:
-        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
-        state_running = bool((state or {}).get("running", False))
-    except Exception:
-        state_running = False
     try:
         method_running = (
             bool(bot_obj.is_running()) if hasattr(bot_obj, "is_running") else False
         )
     except Exception:
         method_running = False
+    if not method_running:
+        # get_state() assembles a full diagnostics snapshot, including Splash
+        # connectivity checks. Stopped dashboard polling needs no such probe.
+        return False
+    try:
+        state = bot_obj.get_state() if hasattr(bot_obj, "get_state") else {}
+        state_running = bool((state or {}).get("running", False))
+    except Exception:
+        state_running = False
     return bool(state_running and method_running)
 
 
@@ -307,6 +310,10 @@ def api_dashboard():
             or getattr(cfg, "CAT_DECIMALS", 3)
             or 3
         )
+        try:
+            pricing_running = bool(bot and bot.is_running())
+        except Exception:
+            pricing_running = False
 
         # --- Market Health ---
         market_summary = {}
@@ -422,9 +429,13 @@ def api_dashboard():
                 try:
                     mid = Decimal(
                         str(
-                            live_state.get("mid_price")
-                            or getattr(bot, "_current_mid_price", None)
-                            or api_server._get_live_mid_price_str()
+                            (live_state.get("mid_price") if pricing_running else None)
+                            or (
+                                getattr(bot, "_current_mid_price", None)
+                                if pricing_running
+                                else None
+                            )
+                            or api_server._get_readonly_mid_price_str()
                             or 0
                         )
                     )
@@ -441,11 +452,18 @@ def api_dashboard():
 
         executable_mid = Decimal("0")
         try:
-            if bot and getattr(bot, "price_engine", None):
+            if pricing_running and getattr(bot, "price_engine", None):
                 _lp = bot.price_engine.get_last_price()
                 executable_mid = Decimal(str(_lp)) if _lp else Decimal("0")
         except Exception:
             executable_mid = Decimal("0")
+        if executable_mid <= 0:
+            try:
+                executable_mid = Decimal(
+                    str(api_server._get_readonly_mid_price_str() or 0)
+                )
+            except (InvalidOperation, ValueError, TypeError):
+                executable_mid = Decimal("0")
         if executable_mid <= 0:
             try:
                 public_bid = Decimal(
@@ -816,11 +834,13 @@ def api_dashboard():
                 # same effective targets used by the bot so the dashboard does
                 # not falsely report a healthy confidence-capped book as still
                 # building toward the configured ceiling.
-                effective_targets = bot._get_effective_offer_targets(
-                    executable_mid,
-                    current_buy_count=live_open_buys,
-                    current_sell_count=live_open_sells,
-                )
+                effective_targets = {"buy": 0, "sell": 0}
+                if _live_wallet_reads_allowed(bot):
+                    effective_targets = bot._get_effective_offer_targets(
+                        executable_mid,
+                        current_buy_count=live_open_buys,
+                        current_sell_count=live_open_sells,
+                    )
                 metrics = market_health.setdefault("metrics", {})
                 metrics["effective_buy_target"] = max(
                     0, int(effective_targets.get("buy", 0) or 0)

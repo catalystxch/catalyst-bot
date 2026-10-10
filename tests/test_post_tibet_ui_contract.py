@@ -507,7 +507,7 @@ def test_dashboard_and_market_intel_render_offer_book_confidence_contract():
     assert "Source · TibetSwap" not in html
     assert "Dexie vs Tibet" not in html
     assert "Arb Sniper" not in html
-    assert "TibetSwap shut down" in html
+    assert 'id="intelTibetContext"' not in html
     assert 'id="mktAskDepth"' in html
     assert 'id="mktTibetDepth"' not in html
     assert "function renderMarketSummaryVenueState" not in html
@@ -579,7 +579,16 @@ def test_post_tibet_help_and_about_describe_provider_authority_truthfully():
     assert "Dexie is the primary attributable offer book" in html
     assert "Splash provides peer discovery and publication evidence" in html
     assert "Coinset and Spacescan provide corroborating chain evidence" in html
-    assert "historical TibetSwap data is retained as read-only history" in html
+    assert "TibetSwap · retired" not in html
+    assert "historical TibetSwap data is retained as read-only history" not in html
+    assert "TibetSwap" not in html
+    assert "activateGapCloser" not in html
+    assert 'onclick="toggleGapCloser()"' not in html
+
+    advisor = html[html.index("function saUpdateAdvisor") :]
+    advisor = advisor[: advisor.index("function runAdvisorAction")]
+    assert "arb_gap_bps" not in advisor
+    assert "activateGapCloser" not in advisor
 
 
 def test_pnl_explains_v14_sage_only_fill_authority_truthfully():
@@ -659,7 +668,12 @@ def test_active_offers_expose_durable_publication_and_discovery_authority(monkey
         "bot",
         SimpleNamespace(
             offer_manager=SimpleNamespace(
-                sync_from_wallet=Mock(return_value=([wallet_offer], [], None))
+                sync_from_wallet_with_meta=Mock(
+                    return_value=(
+                        ([wallet_offer], [], []),
+                        {"fresh": True, "using_cache": False},
+                    )
+                )
             )
         ),
     )

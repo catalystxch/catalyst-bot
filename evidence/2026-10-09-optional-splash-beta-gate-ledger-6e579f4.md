@@ -1,0 +1,27 @@
+# Optional-Splash beta gate ledger — exact `6e579f4`
+
+This ledger applies only to runtime/source
+`6e579f4ec62857e6b7051ee94ec733def74a02bf` on draft bot PR #220.
+Splash remains an optional offer broadcaster. Website
+[PR #89](https://github.com/Lowestofttim/catalystxch/pull/89) remains draft;
+no beta has been deployed.
+
+| Gate | Exact-candidate evidence | Status |
+| --- | --- | --- |
+| Source and regression | HTTP 200 application rejection reproduced red/green. Primary and independent secondary nine-file focused suites each passed 262 tests and four subtests; secondary 12-case transport matrix passed. Full serial local Windows backend passed 7,516 tests, 259 skipped, 455 subtests; repository-wide Ruff and all 11 PR checks passed. | Passed |
+| Browser UI | No frontend bytes changed from the preceding `32bfc52` candidate, whose complete isolated Chromium suite passed 258 tests. | Passed for unchanged UI |
+| Windows package | Clean detached EXE, ZIP and unsigned installer; package API, synthetic Sage, publication recovery, native, ZIP CRC/extracted API, unique-AppId QA installer clean install, installed API/Sage, update/rollback/restore/uninstall, Defender and independent primary/secondary pinned HTTP hashes passed. Secondary verified 206 safe ZIP entries, full CRC, embedded EXE/UI hashes, and the separate pinned manifest. Artifacts pinned at `0cc901931342798eef67f2876b58b2a20a249014`. | Passed |
+| Splash local semantics | Only exact JSON boolean `success: true` acknowledges the local Splash submission. Exact `success: false` is retryable no-effect; malformed response is unresolved. | Passed in isolated tests |
+| Splash remote peer receipt | No separate peer has received a byte-identical signed offer from this candidate. Local HTTP acknowledgement alone does not prove peer delivery. | Open |
+| Primary original TEST 7 profile | Exact `6e579f4` clean EXE is sole PID 136324 on the original profile, owns port 5000, and passed the initial stopped-profile identity/safety/Sage/DB preflight. [Live start evidence](2026-10-09-primary-6e579f4-live-stopped-window.md). Active-offer lifecycle is still open. | In progress |
+| Primary exact 24-hour window | Historical `515b41c` trace was invalid. The exact `6e579f4` monitor started at 2026-10-09T11:12:28Z with a clean first sample; terminal continuity and end-state review remain open. | In progress |
+| Secondary original Harvestr profile | [Fresh read-only checkpoint](2026-10-09-secondary-6e579f4-readonly-checkpoint.md): an additional 103 exact-source publication tests passed; the sole app is still historical `196caa8`, with no pending/fillable offers. [Read-only capacity inventory](2026-10-09-secondary-manual-capacity-plan.md) found 0.907 GiB free and no alternate local volume, with concrete operator-only recovery targets. Exact live package and native acceptance remain open; the historical monitor finished with 755 alert-bearing samples and a 123.162-second gap. | Open |
+| Live wallet lifecycle/recovery | No new campaign/fee scope has specific approval. No exact-candidate active-offer publish, fill, requote, cancellation or restart/recovery evidence. | Open |
+| Full original-profile UI and final review | Neither profile has completed all required exact-candidate native acceptance. | Open |
+
+Before any mainnet wallet action, recheck exact process path/hash, Sage
+network/fingerprint, wallet ID and asset, balances, pending and open offers,
+safety, campaign and fee ledger. The stopped prior campaign and old approval
+do not authorize a new campaign. Consequential actions require the final
+operator UI handoff. No merge, tag, release, website deployment, or
+public-readiness claim has occurred.

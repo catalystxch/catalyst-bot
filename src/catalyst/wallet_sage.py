@@ -1377,7 +1377,12 @@ def ensure_initialized(force_retry: bool = False, *, _identity_recheck=None) -> 
         if _identity_recheck is not None:
             _identity_recheck("sage_initialize")
         try:
-            result = rpc("initialize", {}, timeout=_INIT_RPC_TIMEOUT)
+            result = rpc(
+                "initialize",
+                {},
+                timeout=_INIT_RPC_TIMEOUT,
+                _identity_recheck=_identity_recheck,
+            )
             if _rpc_succeeded(result):
                 _console("  [Sage] initialize OK")
             elif isinstance(result, dict) and result.get("http_status") == 404:
@@ -1393,6 +1398,8 @@ def ensure_initialized(force_retry: bool = False, *, _identity_recheck=None) -> 
                 return False
             _init_ok = True
             return True
+        except mutation_gate.MutationBlocked:
+            raise
         except Exception as e:
             _console(f"  [Sage] INIT FAILED: initialize error: {e}")
             _init_last_attempt = _time.time()
@@ -1468,12 +1475,39 @@ def _raise_sage_response_failure(
     raise SageHTTPError(**failure_args)
 
 
+# A response can disappear after Sage has accepted a POST. Only endpoints
+# whose replay cannot create a wallet effect may retry an ambiguous transport
+# failure. Unknown endpoints fail closed until they are classified.
+_RETRYABLE_SAGE_READ_ENDPOINTS = frozenset(
+    {
+        "get_are_coins_spendable",
+        "get_cats",
+        "get_coins",
+        "get_coins_by_ids",
+        "get_derivations",
+        "get_key",
+        "get_keys",
+        "get_offer",
+        "get_offers",
+        "get_peers",
+        "get_pending_transactions",
+        "get_spendable_coin_count",
+        "get_sync_status",
+        "get_transaction",
+        "get_transactions",
+        "get_version",
+        "view_offer",
+    }
+)
+
+
 def _sage_post(
     path: str,
     payload: dict,
     timeout: int = 10,
     *,
-    retry_transport_error: bool = True,
+    retry_transport_error: Optional[bool] = None,
+    _identity_recheck=None,
 ):
     """Low-level HTTPS POST to Sage, bypassing requests library entirely.
 
@@ -1483,15 +1517,26 @@ def _sage_post(
     """
     body = _json.dumps(payload).encode("utf-8")
     headers_dict = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    if retry_transport_error is None:
+        retry_transport_error = path.strip("/") in _RETRYABLE_SAGE_READ_ENDPOINTS
 
     try:
         conn = _get_sage_connection(timeout)
         try:
+            if _identity_recheck is not None:
+                # HTTPConnection.request() connects lazily. Finish the TLS
+                # handshake before the final lease check and request send.
+                connect = getattr(conn, "connect", None)
+                if getattr(conn, "sock", None) is None and callable(connect):
+                    connect()
+                _identity_recheck(f"rpc:{path}:send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
             )
             resp = conn.getresponse()
             data = resp.read().decode("utf-8")
+        except mutation_gate.MutationBlocked:
+            raise
         except Exception:
             # Connection was stale — recreate and retry once.
             _conn_local.conn = None
@@ -1504,11 +1549,18 @@ def _sage_post(
                 _SAGE_HOST, _SAGE_PORT, timeout=timeout, context=ctx
             )
             _conn_local.conn = conn
+            if _identity_recheck is not None:
+                connect = getattr(conn, "connect", None)
+                if getattr(conn, "sock", None) is None and callable(connect):
+                    connect()
+                _identity_recheck(f"rpc:{path}:retry_send")
             conn.request(
                 "POST", "/" + path.lstrip("/"), body=body, headers=headers_dict
             )
             resp = conn.getresponse()
             data = resp.read().decode("utf-8")
+    except mutation_gate.MutationBlocked:
+        raise
     except _SageRPCFailure:
         raise
     except Exception:
@@ -1536,6 +1588,16 @@ def _sage_post(
                 response_summary=response_summary,
             )
         return parsed
+
+    if (
+        path.strip("/") == "get_offer"
+        and resp.status == 404
+        and type(payload.get("offer_id")) is str
+        and len(payload["offer_id"]) == 64
+        and all(char in "0123456789abcdef" for char in payload["offer_id"])
+        and data == f"Missing offer: {payload['offer_id']}"
+    ):
+        raise SageOperationalError(status=404, error_code="SAGE_OFFER_NOT_FOUND")
 
     try:
         parsed = _json.loads(data)
@@ -1590,6 +1652,7 @@ _SAGE_FIXED_MESSAGES = {
     "NO_SPENDABLE_COINS": "Sage reports that no spendable coins are available.",
     "SAGE_CONNECTION_ERROR": "The Sage RPC service could not be reached.",
     "SAGE_HTTP_ERROR": "The Sage RPC service returned an HTTP error.",
+    "SAGE_OFFER_NOT_FOUND": "Sage has no offer with that exact ID.",
     "SAGE_RPC_ERROR": "The Sage RPC request failed.",
     "UNKNOWN_UNSPENT": "Sage reports that an input coin is not unspent.",
 }
@@ -1709,7 +1772,15 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10, *, _identity_recheck=No
     if _identity_recheck is not None:
         _identity_recheck(f"rpc:{endpoint}")
     try:
-        result = _sage_post(endpoint, payload, timeout=timeout)
+        if _identity_recheck is None:
+            result = _sage_post(endpoint, payload, timeout=timeout)
+        else:
+            result = _sage_post(
+                endpoint,
+                payload,
+                timeout=timeout,
+                _identity_recheck=_identity_recheck,
+            )
 
         if WALLET_DEBUG:
             elapsed = time.time() - start
@@ -1719,6 +1790,8 @@ def rpc(endpoint: str, payload: dict, timeout: int = 10, *, _identity_recheck=No
                 )
 
         return result
+    except mutation_gate.MutationBlocked:
+        raise
     except _SageRPCFailure as error:
         diagnostic = _build_sage_diagnostic(
             endpoint=endpoint,
@@ -2003,7 +2076,12 @@ def sage_login(
     if force_resync:
         if _identity_recheck is not None:
             _identity_recheck("sage_login:resync")
-        result = rpc("resync", {"fingerprint": fingerprint}, timeout=30)
+        result = rpc(
+            "resync",
+            {"fingerprint": fingerprint},
+            timeout=30,
+            _identity_recheck=_identity_recheck,
+        )
         if not _rpc_succeeded(result):
             _console(f"  [Sage] resync failed: {result}")
             return False
@@ -2014,7 +2092,12 @@ def sage_login(
     # Step 3: login — activates the key
     if _identity_recheck is not None:
         _identity_recheck("sage_login:login")
-    result = rpc("login", {"fingerprint": fingerprint}, timeout=30)
+    result = rpc(
+        "login",
+        {"fingerprint": fingerprint},
+        timeout=30,
+        _identity_recheck=_identity_recheck,
+    )
     if not _rpc_succeeded(result):
         _console(f"  [Sage] login failed: {result}")
         return False
@@ -2070,10 +2153,22 @@ def get_wallet_sync_status() -> dict:
         result = rpc("get_sync_status", {}, timeout=5)
         if _rpc_succeeded(result):
             raw_synced = result.get("synced")
-            synced_coins = result.get("synced_coins", 0) or 0
-            total_coins = result.get("total_coins", 0) or 0
+            synced_coins = result.get("synced_coins", 0)
+            total_coins = result.get("total_coins", 0)
+            valid_counts = (
+                type(synced_coins) is int
+                and type(total_coins) is int
+                and 0 <= synced_coins <= total_coins
+            )
+            counts_present = "synced_coins" in result or "total_coins" in result
+            counts_confirm_synced = not counts_present or (
+                "synced_coins" in result
+                and "total_coins" in result
+                and valid_counts
+                and synced_coins == total_coins
+            )
 
-            if raw_synced is True:
+            if raw_synced is True and counts_confirm_synced:
                 sync_state = "synced"
                 synced = True
                 syncing = False
@@ -2081,13 +2176,23 @@ def get_wallet_sync_status() -> dict:
                 sync_state = "not_synced"
                 synced = False
                 syncing = True
-            elif total_coins > 0 and synced_coins >= total_coins:
+            elif (
+                raw_synced is None
+                and valid_counts
+                and total_coins > 0
+                and synced_coins == total_coins
+            ):
                 # Current Sage versions omit the boolean field and use
                 # synced_coins == total_coins to indicate a fully synced wallet.
                 sync_state = "synced"
                 synced = True
                 syncing = False
-            elif total_coins > 0 and synced_coins < total_coins:
+            elif (
+                raw_synced is None
+                and valid_counts
+                and total_coins > 0
+                and synced_coins < total_coins
+            ):
                 sync_state = "not_synced"
                 synced = False
                 syncing = True
@@ -2331,39 +2436,19 @@ def _query_coin_records(
     if not supported:
         return None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "sort_mode": "amount",
-            "filter_mode": filter_mode,
-            "ascending": False,
-        },
-        timeout=15,
+    coins = _get_complete_sage_coin_rows(
+        asset_id,
+        filter_mode,
+        sort_mode="coin_id",
+        ascending=True,
+        preserve_error=True,
     )
-
-    if not result or not isinstance(result, dict):
+    if isinstance(coins, dict):
+        # Keep Sage's structured failure for callers that surface its code.
+        # A later-page failure is still never treated as a partial success.
+        return coins
+    if coins is None:
         return None
-    if not _rpc_succeeded(result):
-        # Preserve the structured Sage failure so coin watchers and other
-        # callers fail closed instead of diffing an invented empty wallet.
-        # This remains independent of external market-provider degradation,
-        # including the current TibetSwap outage.
-        return result
-
-    coins = _extract_sage_coin_list(result)
-    if not coins:
-        result_keys = [k for k in result.keys() if k not in ("success", "error")]
-        if result_keys:
-            total = result.get("total")
-            total_suffix = f", total={total}" if total is not None else ""
-            _console(
-                f"⚠️  [Sage] get_coins({filter_mode}) returned 0 coins "
-                f"(keys: {result_keys}{total_suffix})",
-                flush=True,
-            )
 
     if WALLET_DEBUG and coins:
         _console(
@@ -2376,6 +2461,9 @@ def _query_coin_records(
         min_amount_mojos=min_amount_mojos,
         max_amount_mojos=max_amount_mojos,
     )
+    # The previous Sage query sorted by amount. Keep that caller contract
+    # after coin-ID pagination proves the full selectable view.
+    records.sort(key=lambda record: record["coin"]["amount"], reverse=True)
     return {
         "success": True,
         "records": records,
@@ -2646,6 +2734,87 @@ def count_suitable_coins(
     return len(records)
 
 
+def _get_complete_sage_coin_rows(
+    asset_id,
+    filter_mode,
+    *,
+    sort_mode=None,
+    ascending=None,
+    timeout=15,
+    preserve_error=False,
+) -> Optional[List[Dict] | Dict]:
+    """Read a whole Sage coin view, optionally preserving structured RPC errors."""
+    page_size = 500
+    rows = []
+    seen_ids = set()
+    expected_total = None
+    for page in range(40):
+        offset = page * page_size
+        payload = {
+            "asset_id": asset_id,
+            "offset": offset,
+            "limit": page_size,
+            "filter_mode": filter_mode,
+        }
+        if sort_mode is not None:
+            payload["sort_mode"] = sort_mode
+        if ascending is not None:
+            payload["ascending"] = ascending
+        result = rpc("get_coins", payload, timeout=timeout)
+        if not _rpc_succeeded(result):
+            if preserve_error and isinstance(result, dict):
+                return result
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
+                return None
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
+        for coin in coins:
+            if not isinstance(coin, dict):
+                return None
+            coin_id = (
+                coin.get("coin_id")
+                or coin.get("id")
+                or coin.get("coinId")
+                or coin.get("name")
+            )
+            if not isinstance(coin_id, str) or not coin_id:
+                return None
+            normalized_id = coin_id.lower().removeprefix("0x")
+            if normalized_id in seen_ids:
+                return None
+            seen_ids.add(normalized_id)
+            raw_amount = coin.get("amount")
+            if raw_amount is None:
+                raw_amount = coin.get("amt", coin.get("value"))
+            amount = _exact_positive_atomic_amount(raw_amount)
+            if amount is None:
+                return None
+            rows.append({**coin, "amount": amount})
+        if len(coins) < page_size:
+            if expected_total is not None and len(rows) != expected_total:
+                return None
+            return rows
+    return None
+
+
 def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
     """Get ONLY selectable (on-chain confirmed) coins — NO workaround.
 
@@ -2663,36 +2832,18 @@ def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
     else:
         asset_id = None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "sort_mode": "amount",
-            "filter_mode": "selectable",
-            "ascending": False,
-        },
-        timeout=15,
+    found = _get_complete_sage_coin_rows(
+        asset_id,
+        "selectable",
+        sort_mode="coin_id",
+        ascending=True,
     )
-
-    if not result or not isinstance(result, dict):
+    if found is None:
         return None
-
-    # Extract coins from response
-    found = result.get("coins") or result.get("records") or result.get("data") or []
-    if not found:
-        for k in result.keys():
-            v = result.get(k)
-            if isinstance(v, list) and len(v) > 0:
-                found = v
-                break
 
     # Convert to Chia-compatible format
     records = []
     for coin in found:
-        if not isinstance(coin, dict):
-            continue
         raw_amount = coin.get("amount") or coin.get("amt") or coin.get("value") or "0"
         amount = int(raw_amount)
         parent = (
@@ -2726,6 +2877,10 @@ def get_selectable_coins_only(wallet_id: int) -> Optional[Dict]:
                 "coin_id": coin_id,
             }
         )
+
+    # Stable coin-id pagination avoids duplicate/missing rows among equal-sized
+    # tier coins; restore the descending amount order expected by callers.
+    records.sort(key=lambda record: record["coin"]["amount"], reverse=True)
 
     return {
         "success": True,
@@ -2899,7 +3054,7 @@ def split_coins_rpc(
     )
     if _identity_recheck is not None:
         _identity_recheck("split_coins_rpc")
-    result = rpc("split", payload, timeout=60)
+    result = rpc("split", payload, timeout=60, _identity_recheck=_identity_recheck)
     if WALLET_DEBUG:
         _console(f"  [Sage] split result: {result}")
     return result
@@ -2926,7 +3081,12 @@ def build_transaction_rpc(
     )
     if _identity_recheck is not None:
         _identity_recheck("create_transaction")
-    result = rpc("create_transaction", payload, timeout=60)
+    result = rpc(
+        "create_transaction",
+        payload,
+        timeout=60,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] create_transaction result: {result}")
     return result
@@ -3125,8 +3285,8 @@ def validate_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
     return sealed
 
 
-def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
-    """Return the exact mainnet mempool cost of a Sage unsigned transaction."""
+def _unsigned_bundle_conditions(result: Dict):
+    """Parse and execute an unsigned bundle without signing or RPC effects."""
 
     if type(result) is not dict or type(result.get("coin_spends")) is not list:
         return None
@@ -3168,10 +3328,35 @@ def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
             constants,
             uint32(0xFFFFFFFF),
         )
-        cost = int(conditions.cost)
-        return cost if cost > 0 else None
+        return (spends, conditions) if int(conditions.cost) > 0 else None
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def estimate_unsigned_transaction_cost(result: Dict) -> Optional[int]:
+    """Return executable cost only; this alone does not prove effect identity."""
+    execution = _unsigned_bundle_conditions(result)
+    return int(execution[1].cost) if execution is not None else None
+
+
+def inspect_unsigned_transaction_effect(result: Dict, contract: Dict) -> Dict:
+    """Validate summary and executable effects before trusting exact cost."""
+    validated = validate_unsigned_transaction_effect(result, contract)
+    if validated.get("_catalyst_validated_unsigned") is not True:
+        return validated
+    execution = _unsigned_bundle_conditions(validated)
+    if execution is None:
+        return _unsigned_effect_refusal("FEE_UNSIGNED_COST_UNAVAILABLE")
+    from unsigned_effect_binding import executable_matches_summary
+
+    spends, conditions = execution
+    if not executable_matches_summary(
+        spends, conditions, validated["summary"], _exact_summary_mojos
+    ):
+        return _unsigned_effect_refusal("UNSIGNED_EXECUTABLE_EFFECT_MISMATCH")
+    validated["_catalyst_executable_effect_bound"] = True
+    validated["_catalyst_exact_unsigned_cost"] = int(conditions.cost)
+    return validated
 
 
 def submit_built_transaction_rpc(
@@ -3372,7 +3557,10 @@ def _submit_coin_spends_if_needed(
                 "partial": False,
             },
             timeout=30,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as exc:
         return {
             "success": False,
@@ -3408,7 +3596,10 @@ def _submit_coin_spends_if_needed(
                 "spend_bundle": spend_bundle,
             },
             timeout=30,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as exc:
         return {
             "success": False,
@@ -3575,7 +3766,7 @@ def combine_coins(
     _console(f"   [Sage] Combining {len(bare_ids)} coins via /combine")
     if _identity_recheck is not None:
         _identity_recheck("combine")
-    result = rpc("combine", payload, timeout=120)
+    result = rpc("combine", payload, timeout=120, _identity_recheck=_identity_recheck)
     if WALLET_DEBUG:
         _console(f"  [Sage] combine result: {result}")
     return _submit_coin_spends_if_needed(
@@ -3801,52 +3992,21 @@ def get_wallet_balance(wallet_id: int):
 
         # CAT balance: "selectable" = spendable, "owned" = total (free + locked)
         # Valid Sage filter_mode values: all, selectable, owned, spent, clawback
-        # "all" includes spent coins and hits 500-limit. "owned" = currently held only.
-        # IMPORTANT: reject structured error results — don't silently turn them into zero balance.
-        sel_result = rpc(
-            "get_coins",
-            {
-                "asset_id": asset_id,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "selectable",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(sel_result):
+        # "all" includes spent coins. Both current views must be complete.
+        sel_coins = _get_complete_sage_coin_rows(asset_id, "selectable", timeout=10)
+        if sel_coins is None:
             return {
                 "success": False,
-                "error": f"CAT selectable balance query failed for wallet {wallet_id}: {sel_result}",
+                "error": f"CAT selectable balance view incomplete for wallet {wallet_id}",
             }
-        sel_coins = (
-            sel_result.get("coins")
-            or sel_result.get("records")
-            or sel_result.get("data")
-            or []
-        )
         spendable = sum(int(c.get("amount", "0")) for c in sel_coins)
 
-        owned_result = rpc(
-            "get_coins",
-            {
-                "asset_id": asset_id,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "owned",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(owned_result):
+        owned_coins = _get_complete_sage_coin_rows(asset_id, "owned", timeout=10)
+        if owned_coins is None:
             return {
                 "success": False,
-                "error": f"CAT owned balance query failed for wallet {wallet_id}: {owned_result}",
+                "error": f"CAT owned balance view incomplete for wallet {wallet_id}",
             }
-        owned_coins = (
-            owned_result.get("coins")
-            or owned_result.get("records")
-            or owned_result.get("data")
-            or []
-        )
         total = sum(int(c.get("amount", "0")) for c in owned_coins)
 
         if not hasattr(get_wallet_balance, "_cat_diag_logged"):
@@ -3884,30 +4044,21 @@ def get_wallet_balance(wallet_id: int):
         if _rpc_succeeded(sync):
             sel_val = sync.get("selectable_balance")
             if sel_val is not None:
-                spendable = int(sel_val)
+                exact_balance = _exact_nonnegative_atomic_amount(sel_val)
+                if exact_balance is None:
+                    return {
+                        "success": False,
+                        "error": "XCH selectable balance is not an exact atomic amount",
+                    }
+                spendable = exact_balance
 
         # Step 2: get ALL owned XCH coins (free + offer-locked) for total
-        owned_result = rpc(
-            "get_coins",
-            {
-                "asset_id": None,
-                "offset": 0,
-                "limit": 500,
-                "filter_mode": "owned",
-            },
-            timeout=10,
-        )
-        if not _rpc_succeeded(owned_result):
+        owned_coins = _get_complete_sage_coin_rows(None, "owned", timeout=10)
+        if owned_coins is None:
             return {
                 "success": False,
-                "error": f"XCH owned balance query failed: {owned_result}",
+                "error": "XCH owned balance view incomplete",
             }
-        owned_coins = (
-            owned_result.get("coins")
-            or owned_result.get("records")
-            or owned_result.get("data")
-            or []
-        )
         total = sum(int(c.get("amount", "0")) for c in owned_coins)
 
         if not hasattr(get_wallet_balance, "_xch_diag_logged"):
@@ -4250,7 +4401,10 @@ def sign_message_by_address(
                 "message": message,
             },
             timeout=15,
+            _identity_recheck=_identity_recheck,
         )
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as e:
         return {"success": False, "error": f"rpc_exception: {e}"}
 
@@ -4299,6 +4453,7 @@ def set_change_address(
                 "change_address": address,
             },
             timeout=10,
+            _identity_recheck=_identity_recheck,
         )
         # Sage v0.12.10 documents this mutation as EmptyResponse, serialized
         # as exactly {}.  Retain the exact legacy success object as well, but
@@ -4313,6 +4468,8 @@ def set_change_address(
             return {"success": False, "error": "set_change_address_failed"}
 
         return {"success": True, "fingerprint": fingerprint, "address": address}
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception:
         return {"success": False, "error": "set_change_address_failed"}
 
@@ -4359,7 +4516,7 @@ def send_transaction(
             payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
         if _identity_recheck is not None:
             _identity_recheck("send_transaction:send_cat")
-        return rpc("send_cat", payload, timeout=30)
+        return rpc("send_cat", payload, timeout=30, _identity_recheck=_identity_recheck)
     else:
         payload = {
             "address": str(address),
@@ -4371,7 +4528,7 @@ def send_transaction(
             payload["coin_ids"] = [cid.replace("0x", "") for cid in source_coin_ids]
         if _identity_recheck is not None:
             _identity_recheck("send_transaction:send_xch")
-        return rpc("send_xch", payload, timeout=30)
+        return rpc("send_xch", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 def send_transaction_multi(
@@ -4402,7 +4559,7 @@ def send_transaction_multi(
     }
     if _identity_recheck is not None:
         _identity_recheck("send_transaction_multi:submit")
-    return rpc("multi_send", payload, timeout=30)
+    return rpc("multi_send", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 def send_cat_multi(payments: list, fee_mojos: int = 0, *, _identity_recheck=None):
@@ -4446,7 +4603,7 @@ def send_cat_multi(payments: list, fee_mojos: int = 0, *, _identity_recheck=None
     }
     if _identity_recheck is not None:
         _identity_recheck("send_cat_multi")
-    return rpc("multi_send", payload, timeout=30)
+    return rpc("multi_send", payload, timeout=30, _identity_recheck=_identity_recheck)
 
 
 # ============================================================================
@@ -4603,7 +4760,7 @@ def create_offer(
 
     if _identity_recheck is not None:
         _identity_recheck("create_offer")
-    result = rpc("make_offer", payload, timeout=15)
+    result = rpc("make_offer", payload, timeout=15, _identity_recheck=_identity_recheck)
 
     if result and isinstance(result, dict):
         # ALWAYS log response keys so we can debug format issues
@@ -4733,6 +4890,7 @@ def cancel_offer(
             payload,
             timeout=timeout,
             retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
         )
         result = _submit_coin_spends_if_needed(
             result,
@@ -4869,7 +5027,7 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
     if not isinstance(res, dict):
         get_all_offers._last_error = "get_offers response is not an object"
         return None
-    if res.get("success") is False and res.get("error"):
+    if res.get("success") is False:
         get_all_offers._last_error = str(res.get("error") or "wallet get_offers failed")
         _console(f"  ⚠️  [Sage] get_offers failed: {get_all_offers._last_error}")
         return None
@@ -5028,6 +5186,26 @@ def get_all_offers(include_completed: bool = True, start: int = 0, end: int = 50
                 )
         normalized = filtered
 
+        seen_ids = set()
+        for offer in normalized:
+            wire_ids = [
+                _normalize_offer_lock_id(offer[key])
+                for key in ("trade_id", "offer_id")
+                if key in offer
+            ]
+            if (
+                not wire_ids
+                or any(
+                    offer_id is None or re.fullmatch(r"[0-9a-f]{64}", offer_id) is None
+                    for offer_id in wire_ids
+                )
+                or len(set(wire_ids)) != 1
+                or wire_ids[0] in seen_ids
+            ):
+                get_all_offers._last_error = "get_offers open offer IDs are missing, malformed, conflicting or duplicated"
+                return None
+            seen_ids.add(wire_ids[0])
+
     return normalized
 
 
@@ -5074,6 +5252,118 @@ def get_authoritative_offer_history(
         "offers": bounded_offers,
         "total": len(bounded_offers),
         "end_of_history": True,
+    }
+
+
+def _require_exact_offer_ids(offer_ids: tuple[str, ...]) -> None:
+    valid = (
+        type(offer_ids) is tuple
+        and 0 < len(offer_ids) <= 256
+        and len(set(offer_ids)) == len(offer_ids)
+        and all(
+            type(offer_id) is str
+            and len(offer_id) == 64
+            and all(char in "0123456789abcdef" for char in offer_id)
+            for offer_id in offer_ids
+        )
+    )
+    if not valid:
+        raise ValueError("exact offer IDs must be distinct bounded hex IDs")
+
+
+def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
+    """Read one exact Sage DB row per requested offer, without listing history.
+
+    Sage's ``get_offers`` ignores pagination and grows with the wallet's
+    lifetime. Its native ``get_offer`` endpoint instead indexes one offer ID.
+    A missing, mismatched, or malformed row invalidates the whole set; callers
+    cannot mistake a partial cohort for complete cancellation evidence.
+    """
+
+    _require_exact_offer_ids(offer_ids)
+
+    records = []
+    for offer_id in offer_ids:
+        try:
+            result = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+            if (
+                type(result) is not dict
+                or (
+                    result.get("success") is not None
+                    and result.get("success") is not True
+                )
+                or type(result.get("offer")) is not dict
+            ):
+                raise ValueError("exact offer read failed")
+            row = result["offer"]
+            if (
+                len(row) > 128
+                or row.get("offer_id") != offer_id
+                or row.get("trade_id", offer_id) != offer_id
+                or type(row.get("status")) not in (str, int)
+                or type(row.get("summary")) is not dict
+            ):
+                raise ValueError("exact offer identity or shape mismatch")
+            bounded_row = {
+                key: value
+                for key, value in row.items()
+                if key not in {"offer", "offer_bech32"}
+            }
+            bounded_row["trade_id"] = offer_id
+            summary = bounded_row["summary"]
+            if "maker" in summary or "taker" in summary:
+                bounded_row["summary"] = _normalize_sage_summary(summary)
+            records.append(bounded_row)
+        except Exception:
+            return {
+                "complete": False,
+                "requested_ids": list(offer_ids),
+                "offers": [],
+                "read_error": "exact_offer_read_incomplete",
+            }
+
+    return {
+        "complete": True,
+        "requested_ids": list(offer_ids),
+        "offers": records,
+        "read_error": None,
+    }
+
+
+def get_authoritative_offer_absence_by_ids(offer_ids: tuple[str, ...]) -> dict:
+    """Prove exact Sage DB absence only from its offer-specific 404 response.
+
+    A generic 404 can mean the RPC route is unavailable. The transport emits
+    ``SAGE_OFFER_NOT_FOUND`` only for the native MissingOffer text containing
+    the exact requested ID; every other response leaves this proof incomplete.
+    """
+
+    _require_exact_offer_ids(offer_ids)
+    absent: list[str] = []
+    for offer_id in offer_ids:
+        try:
+            result = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+        except Exception:
+            result = None
+        if not (
+            type(result) is dict
+            and result.get("success") is False
+            and result.get("error_code") == "SAGE_OFFER_NOT_FOUND"
+            and result.get("endpoint") == "get_offer"
+            and result.get("http_status") == 404
+        ):
+            return {
+                "complete": False,
+                "requested_ids": list(offer_ids),
+                "absent_offer_ids": [],
+                "read_error": "exact_offer_absence_incomplete",
+            }
+        absent.append(offer_id)
+    return {
+        "complete": True,
+        "requested_ids": list(offer_ids),
+        "absent_offer_ids": absent,
+        "read_error": None,
     }
 
 
@@ -5219,7 +5509,7 @@ def _is_still_fillable(status_val, offer_record=None) -> bool:
     return status in FILLABLE
 
 
-def _is_open_status(status_val, offer_record=None) -> bool:
+def _is_open_status(status_val, offer_record=None, *, strict_unknown=False) -> bool:
     """Determine if an offer status represents an open/active offer.
 
     Chia TradeStatus integer enum:
@@ -5234,10 +5524,18 @@ def _is_open_status(status_val, offer_record=None) -> bool:
         return False
 
     if status_val is None:
+        if strict_unknown:
+            raise ValueError("unknown offer status")
         return False
-    if isinstance(status_val, int):
+    if type(status_val) is int:
         # Only 0 (PENDING_ACCEPT) and 1 (PENDING_CONFIRM) are truly open
-        return status_val <= 1
+        if status_val in (0, 1):
+            return True
+        if status_val in (2, 3, 4, 5):
+            return False
+        if strict_unknown:
+            raise ValueError("unknown offer status")
+        return False
 
     status = str(status_val).upper()
     OPEN_STATUSES = {
@@ -5257,12 +5555,17 @@ def _is_open_status(status_val, offer_record=None) -> bool:
         "EXPIRED",
         "COMPLETED",
         "SUCCESS",
+        "TAKEN",
+        "FILLED",
     }
 
     if status in CLOSED_STATUSES:
         return False
     if status in OPEN_STATUSES:
         return True
+
+    if strict_unknown:
+        raise ValueError("unknown offer status")
 
     # Unknown status — log it once so we can add it to the right set
     if not hasattr(_is_open_status, "_unknown_logged"):
@@ -5315,10 +5618,24 @@ def classify_offers_from_list(offers_list: list, asset_id_mz: str):
         offered = summary.get("offered") or {}
         requested = summary.get("requested") or {}
 
-        is_open = _is_open_status(status_val, offer_record=tr)
-
         is_buy = "xch" in offered and asset_id_mz in requested
         is_sell = asset_id_mz in offered and "xch" in requested
+        is_open = _is_open_status(
+            status_val,
+            offer_record=tr,
+            strict_unknown=is_buy or is_sell or not offered or not requested,
+        )
+        if not is_open and (
+            (type(status_val) is int and status_val == 2)
+            or (
+                type(status_val) is str
+                and status_val.strip().upper() == "PENDING_CANCEL"
+            )
+        ):
+            # Sage keeps this state fillable until the cancellation confirms.
+            is_open = _is_still_fillable(status_val, offer_record=tr)
+        if is_open and not (is_buy or is_sell) and (not offered or not requested):
+            raise ValueError("unclassifiable open offer")
 
         # Debug: log first few offers on first call only
         if _first_classify and i < 3:
@@ -5362,6 +5679,211 @@ def classify_open_offers_for_pair(asset_id_mz: str):
     return open_buy, open_sell
 
 
+def _validate_cancel_unsigned_component(result, expected_fee, expected_root_ids=None):
+    """Bind cancellation summaries to executable effects before any signing."""
+
+    refusal = {
+        "success": False,
+        "error_code": "REJECTED",
+        "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+    }
+    if type(result) is not dict or not result.get("coin_spends"):
+        return result
+    summary = result.get("summary")
+    inputs = summary.get("inputs") if type(summary) is dict else None
+    try:
+        if type(inputs) is not list or not inputs:
+            raise ValueError("missing inputs")
+        if _exact_summary_mojos(summary.get("fee")) != expected_fee:
+            raise ValueError("fee mismatch")
+        input_ids = set()
+        output_ids = set()
+        input_total = 0
+        output_total = 0
+        for item in inputs:
+            if type(item) is not dict or type(item.get("outputs")) is not list:
+                raise ValueError("malformed input")
+            coin_id = _canonical_hex(item.get("coin_id"))
+            if not re.fullmatch(r"[0-9a-f]{64}", coin_id) or coin_id in input_ids:
+                raise ValueError("duplicate or malformed input")
+            input_ids.add(coin_id)
+            input_total += _exact_summary_mojos(item.get("amount"))
+            for output in item["outputs"]:
+                if type(output) is not dict:
+                    raise ValueError("malformed output")
+                output_id = _canonical_hex(output.get("coin_id"))
+                if (
+                    not re.fullmatch(r"[0-9a-f]{64}", output_id)
+                    or output_id in output_ids
+                ):
+                    raise ValueError("duplicate or malformed output")
+                if output.get("receiving") is not True or output.get("burning") is True:
+                    raise ValueError("non-receiving output")
+                output_ids.add(output_id)
+                output_total += _exact_summary_mojos(output.get("amount"))
+        if input_total - output_total != expected_fee:
+            raise ValueError("value mismatch")
+
+        root_ids = input_ids - output_ids
+        if expected_root_ids is not None and root_ids != set(expected_root_ids):
+            raise ValueError("root mismatch")
+
+        from chia_rs import Coin
+
+        spend_ids = []
+        for raw_spend in result["coin_spends"]:
+            if type(raw_spend) is not dict or type(raw_spend.get("coin")) is not dict:
+                raise ValueError("malformed coin spend")
+            raw_coin = dict(raw_spend["coin"])
+            for field in ("parent_coin_info", "puzzle_hash"):
+                value = raw_coin.get(field)
+                if isinstance(value, str) and not value.startswith("0x"):
+                    raw_coin[field] = f"0x{value}"
+            spend_ids.append(Coin.from_json_dict(raw_coin).name().hex())
+        if len(spend_ids) != len(set(spend_ids)) or set(spend_ids) != input_ids:
+            raise ValueError("coin spend mismatch")
+        # A matching summary/root list does not prove the actual fee or return
+        # destinations. Execute the same bundle whose cost will be quoted and
+        # bind every addition/removal/asset/fee, including zero-fee components.
+        execution = _unsigned_bundle_conditions(result)
+        if execution is None:
+            raise ValueError("uninspectable cancellation effects")
+        from unsigned_effect_binding import executable_matches_summary
+
+        if not executable_matches_summary(
+            execution[0], execution[1], summary, _exact_summary_mojos
+        ):
+            raise ValueError("cancellation executable effect mismatch")
+    except (TypeError, ValueError, AttributeError):
+        return refusal
+    return result
+
+
+def build_cancel_offers_batch_unsigned(
+    trade_ids: list,
+    *,
+    fee_mojos: int,
+    source_coin_ids: list,
+    fee_coin_id: str,
+    _identity_recheck=None,
+):
+    """Build and exactly cost one cancellation cohort without signing it."""
+
+    if not _require_signing_capability():
+        return {"success": False, "reason": "SIGNING_CAPABILITY_UNAVAILABLE"}
+    unique_trade_ids = list(dict.fromkeys(trade_ids or []))
+    normalized_source_ids = [_canonical_hex(value) for value in (source_coin_ids or [])]
+    normalized_fee_coin_id = _canonical_hex(fee_coin_id)
+    if (
+        not unique_trade_ids
+        or type(fee_mojos) is not int
+        or isinstance(fee_mojos, bool)
+        or fee_mojos < 0
+        or len(normalized_source_ids) != len(unique_trade_ids)
+        or len(set(normalized_source_ids)) != len(normalized_source_ids)
+        or any(
+            not re.fullmatch(r"[0-9a-f]{64}", value) for value in normalized_source_ids
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", normalized_fee_coin_id)
+        or normalized_fee_coin_id in set(normalized_source_ids)
+    ):
+        return {
+            "success": False,
+            "error_code": "REJECTED",
+            "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+        }
+
+    rpc_timeout = 120 if len(unique_trade_ids) > 10 else 60
+    if _identity_recheck is not None:
+        _identity_recheck("cancel_offers:build")
+    cancel_result = _sage_post(
+        "cancel_offers",
+        {"offer_ids": unique_trade_ids, "fee": "0", "auto_submit": False},
+        timeout=rpc_timeout,
+        retry_transport_error=False,
+        _identity_recheck=_identity_recheck,
+    )
+    cancel_result = _validate_cancel_unsigned_component(
+        cancel_result, 0, normalized_source_ids
+    )
+    if not (
+        type(cancel_result) is dict
+        and cancel_result.get("success") is not False
+        and not cancel_result.get("error")
+        and cancel_result.get("coin_spends")
+    ):
+        return cancel_result
+
+    def _seal_unsigned(result):
+        cost = estimate_unsigned_transaction_cost(result)
+        if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
+            return {"success": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+        sealed_result = dict(result)
+        sealed_result["_catalyst_validated_cancel_unsigned"] = True
+        sealed_result["_catalyst_exact_unsigned_cost"] = cost
+        sealed_result["_catalyst_cancel_unsigned_digest"] = hashlib.sha256(
+            _json.dumps(
+                {
+                    "summary": result["summary"],
+                    "coin_spends": result["coin_spends"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return sealed_result
+
+    # The first fixed-point pricing pass deliberately uses a zero fee.  Do not
+    # manufacture an empty fee transaction or consume the protected fee coin
+    # merely to discover the cancellation bundle's exact CLVM cost.
+    if fee_mojos == 0:
+        return _seal_unsigned(cancel_result)
+
+    if _identity_recheck is not None:
+        _identity_recheck("cancel_offers:fee_build")
+    fee_result = _sage_post(
+        "create_transaction",
+        {
+            "selected_coin_ids": [normalized_fee_coin_id],
+            "actions": (
+                [{"type": "fee", "amount": str(fee_mojos)}] if fee_mojos else []
+            ),
+            "auto_submit": False,
+        },
+        timeout=60,
+        retry_transport_error=False,
+        _identity_recheck=_identity_recheck,
+    )
+    fee_result = _validate_cancel_unsigned_component(
+        fee_result, fee_mojos, [normalized_fee_coin_id]
+    )
+    if not (
+        type(fee_result) is dict
+        and fee_result.get("success") is not False
+        and not fee_result.get("error")
+        and fee_result.get("coin_spends")
+    ):
+        return fee_result
+
+    combined = {
+        "summary": {
+            "fee": fee_mojos,
+            "inputs": list(cancel_result["summary"]["inputs"])
+            + list(fee_result["summary"]["inputs"]),
+        },
+        "coin_spends": list(cancel_result["coin_spends"])
+        + list(fee_result["coin_spends"]),
+    }
+    combined = _validate_cancel_unsigned_component(
+        combined,
+        fee_mojos,
+        [*normalized_source_ids, normalized_fee_coin_id],
+    )
+    if type(combined) is not dict or combined.get("success") is False:
+        return combined
+    return _seal_unsigned(combined)
+
+
 def cancel_offers_batch(
     trade_ids: list,
     secure: bool = True,
@@ -5371,6 +5893,7 @@ def cancel_offers_batch(
     *,
     source_coin_ids: Optional[list] = None,
     fee_coin_id: Optional[str] = None,
+    _validated_unsigned: Optional[dict] = None,
     _identity_recheck=None,
 ):
     """Cancel multiple Sage offers in one native ``cancel_offers`` transaction.
@@ -5405,79 +5928,10 @@ def cancel_offers_batch(
         }
 
     def _validate_unsigned_component(result, expected_fee, expected_root_ids=None):
-        """Reject unsafe Sage unsigned summaries before signing.
-
-        Sage 0.13 applies the request fee separately while constructing each
-        member cancel, then concatenates the spends.  For CAT offers this can
-        select the same XCH fee coin more than once.  Never pass that unsigned
-        bundle to signing.  Each component must prove its exact fee, roots,
-        value conservation, receiving-only outputs, and one-to-one agreement
-        between the public summary and the unsigned coin spends.
-        """
-        if type(result) is not dict or not result.get("coin_spends"):
-            return result
-        summary = result.get("summary")
-        inputs = summary.get("inputs") if type(summary) is dict else None
-        try:
-            if type(inputs) is not list or not inputs:
-                raise ValueError("missing inputs")
-            if _exact_summary_mojos(summary.get("fee")) != expected_fee:
-                raise ValueError("fee mismatch")
-            input_ids = set()
-            output_ids = set()
-            input_total = 0
-            output_total = 0
-            for item in inputs:
-                if type(item) is not dict or type(item.get("outputs")) is not list:
-                    raise ValueError("malformed input")
-                coin_id = _canonical_hex(item.get("coin_id"))
-                if not re.fullmatch(r"[0-9a-f]{64}", coin_id) or coin_id in input_ids:
-                    raise ValueError("duplicate or malformed input")
-                input_ids.add(coin_id)
-                input_total += _exact_summary_mojos(item.get("amount"))
-                for output in item["outputs"]:
-                    if type(output) is not dict:
-                        raise ValueError("malformed output")
-                    output_id = _canonical_hex(output.get("coin_id"))
-                    if (
-                        not re.fullmatch(r"[0-9a-f]{64}", output_id)
-                        or output_id in output_ids
-                    ):
-                        raise ValueError("duplicate or malformed output")
-                    if (
-                        output.get("receiving") is not True
-                        or output.get("burning") is True
-                    ):
-                        raise ValueError("non-receiving output")
-                    output_ids.add(output_id)
-                    output_total += _exact_summary_mojos(output.get("amount"))
-            if input_total - output_total != expected_fee:
-                raise ValueError("value mismatch")
-
-            root_ids = input_ids - output_ids
-            if expected_root_ids is not None and root_ids != set(expected_root_ids):
-                raise ValueError("root mismatch")
-
-            from chia_rs import Coin
-
-            spend_ids = []
-            for raw_spend in result["coin_spends"]:
-                if (
-                    type(raw_spend) is not dict
-                    or type(raw_spend.get("coin")) is not dict
-                ):
-                    raise ValueError("malformed coin spend")
-                raw_coin = dict(raw_spend["coin"])
-                for field in ("parent_coin_info", "puzzle_hash"):
-                    value = raw_coin.get(field)
-                    if isinstance(value, str) and not value.startswith("0x"):
-                        raw_coin[field] = f"0x{value}"
-                spend_ids.append(Coin.from_json_dict(raw_coin).name().hex())
-            if len(spend_ids) != len(set(spend_ids)) or set(spend_ids) != input_ids:
-                raise ValueError("coin spend mismatch")
-        except (TypeError, ValueError, AttributeError):
-            return _unsigned_refusal()
-        return result
+        """Use the same executable boundary for priced and ordinary cohorts."""
+        return _validate_cancel_unsigned_component(
+            result, expected_fee, expected_root_ids
+        )
 
     if not _require_signing_capability():
         return _for_every_member(
@@ -5536,11 +5990,77 @@ def cancel_offers_batch(
     if _identity_recheck is not None:
         _identity_recheck("cancel_offers")
     try:
+        if _validated_unsigned is not None:
+            expected_root_ids = list(normalized_source_ids or [])
+            if resolved_fee:
+                if normalized_fee_coin_id is None:
+                    return _for_every_member(_unsigned_refusal())
+                expected_root_ids.append(normalized_fee_coin_id)
+            core = (
+                {
+                    "summary": _validated_unsigned.get("summary"),
+                    "coin_spends": _validated_unsigned.get("coin_spends"),
+                }
+                if type(_validated_unsigned) is dict
+                else None
+            )
+            expected_digest = (
+                hashlib.sha256(
+                    _json.dumps(
+                        core,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if core is not None
+                else None
+            )
+            exact_cost = (
+                _validated_unsigned.get("_catalyst_exact_unsigned_cost")
+                if type(_validated_unsigned) is dict
+                else None
+            )
+            if (
+                type(_validated_unsigned) is not dict
+                or _validated_unsigned.get("_catalyst_validated_cancel_unsigned")
+                is not True
+                or type(exact_cost) is not int
+                or isinstance(exact_cost, bool)
+                or exact_cost <= 0
+                or _validated_unsigned.get("_catalyst_cancel_unsigned_digest")
+                != expected_digest
+                or not expected_root_ids
+            ):
+                return _for_every_member(_unsigned_refusal())
+            checked = _validate_cancel_unsigned_component(
+                core,
+                resolved_fee,
+                expected_root_ids,
+            )
+            if (
+                type(checked) is not dict
+                or checked.get("success") is False
+                or checked.get("error")
+                or not checked.get("coin_spends")
+            ):
+                return _for_every_member(_unsigned_refusal())
+            if _identity_recheck is not None:
+                _identity_recheck("cancel_offers:sealed_submit")
+            result = _submit_coin_spends_if_needed(
+                _validated_unsigned,
+                "cancel_offers",
+                _identity_recheck=_identity_recheck,
+                _track_pending_identity=True,
+            )
+            return _for_every_member(
+                normalize_cancel_response(result, method="bulk_rpc")
+            )
         result = _sage_post(
             "cancel_offers",
             payload,
             timeout=rpc_timeout,
             retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
         )
         result = _validate_unsigned_component(
             result,
@@ -5568,6 +6088,7 @@ def cancel_offers_batch(
                 },
                 timeout=60,
                 retry_transport_error=False,
+                _identity_recheck=_identity_recheck,
             )
             fee_result = _validate_unsigned_component(
                 fee_result,
@@ -5870,40 +6391,10 @@ def get_owned_coins(wallet_id: int) -> Optional[Dict]:
 
     Returns dict: {normalized_coin_id: amount_mojos}
     """
-    if _is_cat_wallet(wallet_id):
-        asset_id = _get_cat_asset_id()
-        if not asset_id:
-            return None
-    else:
-        asset_id = None
-
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "filter_mode": "owned",
-        },
-        timeout=15,
-    )
-
-    if not result:
+    detailed = get_owned_coins_detailed(wallet_id)
+    if detailed is None:
         return None
-
-    coins = result.get("coins") or result.get("records") or result.get("data") or []
-    # Return {coin_id: amount_mojos} with normalized IDs (0x prefix)
-    coin_map = {}
-    for c in coins:
-        cid = c.get("coin_id", "")
-        if cid:
-            # Normalize: add 0x prefix if missing
-            if not cid.startswith("0x"):
-                cid = "0x" + cid.lower()
-            else:
-                cid = cid.lower()
-            coin_map[cid] = int(c.get("amount", "0"))
-    return coin_map
+    return {coin_id: info["amount"] for coin_id, info in detailed.items()}
 
 
 def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
@@ -5939,6 +6430,7 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
     page_size = 500
     max_pages = 40  # 20k coins ceiling
     coin_map: Dict[str, Dict] = {}
+    expected_total = None
     for page in range(max_pages):
         offset = page * page_size
         result = rpc(
@@ -5951,35 +6443,59 @@ def get_owned_coins_detailed(wallet_id: int) -> Optional[Dict]:
             },
             timeout=15,
         )
-        if not result:
-            if page == 0:
+        if not _rpc_succeeded(result):
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
                 return None
-            break
-        coins = result.get("coins") or result.get("records") or result.get("data") or []
-        if not coins:
-            break
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
         for c in coins:
-            cid = c.get("coin_id", "")
-            if cid:
-                if not cid.startswith("0x"):
-                    cid = "0x" + cid.lower()
-                else:
-                    cid = cid.lower()
-                # Extract offer_id — this is the offer_hash from Sage's DB
-                # If set, this coin is locked by an offer
-                offer_id = c.get("offer_id") or c.get("offer_hash") or None
-                if offer_id and isinstance(offer_id, str):
-                    offer_id = offer_id.lower()
-                coin_map[cid] = {
-                    "amount": int(c.get("amount", "0")),
-                    "offer_id": offer_id,
-                    "created_height": c.get("created_height"),
-                    "spent_height": c.get("spent_height"),
-                    "transaction_id": c.get("transaction_id"),
-                }
+            if not isinstance(c, dict) or not isinstance(c.get("coin_id"), str):
+                return None
+            cid = c["coin_id"].lower()
+            if not cid:
+                return None
+            if not cid.startswith("0x"):
+                cid = "0x" + cid
+            if cid in coin_map:
+                return None
+            amount = _exact_positive_atomic_amount(c.get("amount"))
+            if amount is None:
+                return None
+            # Extract offer_id — this is the offer_hash from Sage's DB.
+            offer_id = c.get("offer_id") or c.get("offer_hash") or None
+            if offer_id and isinstance(offer_id, str):
+                offer_id = offer_id.lower()
+            coin_map[cid] = {
+                "amount": amount,
+                "offer_id": offer_id,
+                "created_height": c.get("created_height"),
+                "spent_height": c.get("spent_height"),
+                "transaction_id": c.get("transaction_id"),
+            }
         if len(coins) < page_size:
-            break
-    return coin_map
+            if expected_total is not None and len(coin_map) != expected_total:
+                return None
+            return coin_map
+    # A full final page cannot prove that there is no next page.
+    return None
 
 
 _MAX_EXACT_ATOMIC_DIGITS = 128
@@ -6072,6 +6588,16 @@ def _exact_positive_atomic_amount(value) -> Optional[int]:
     return None
 
 
+def _exact_nonnegative_atomic_amount(value) -> Optional[int]:
+    """Return an exact nonnegative mojo amount, including a zero balance."""
+
+    if type(value) is int and value == 0:
+        return 0
+    if type(value) is str and value == "0":
+        return 0
+    return _exact_positive_atomic_amount(value)
+
+
 _MAX_GET_COINS_BY_IDS = 4096
 
 
@@ -6103,17 +6629,32 @@ def _exact_authoritative_offer_asset_ids(offer_ids: set[str]) -> Dict[str, str]:
         return {}
 
     matches: Dict[str, list] = {offer_id: [] for offer_id in offer_ids}
+    ambiguous_ids: set[str] = set()
     for offer in history["offers"]:
         if type(offer) is not dict:
             return {}
-        raw_offer_id = offer.get("trade_id") or offer.get("offer_id")
-        normalized_offer_id = _normalize_offer_lock_id(raw_offer_id)
-        if normalized_offer_id in matches:
-            matches[normalized_offer_id].append(offer)
+        wire_ids = [
+            _normalize_offer_lock_id(offer[key])
+            for key in ("trade_id", "offer_id")
+            if key in offer
+        ]
+        targeted_ids = {offer_id for offer_id in wire_ids if offer_id in matches}
+        if not targeted_ids:
+            continue
+        if (
+            any(
+                offer_id is None or re.fullmatch(r"[0-9a-f]{64}", offer_id) is None
+                for offer_id in wire_ids
+            )
+            or len(set(wire_ids)) != 1
+        ):
+            ambiguous_ids.update(targeted_ids)
+            continue
+        matches[wire_ids[0]].append(offer)
 
     resolved: Dict[str, str] = {}
     for offer_id, rows in matches.items():
-        if len(rows) != 1:
+        if offer_id in ambiguous_ids or len(rows) != 1:
             continue
         summary = rows[0].get("summary")
         offered = summary.get("offered") if type(summary) is dict else None
@@ -6327,31 +6868,63 @@ def get_selectable_coins_map(wallet_id: int) -> Optional[Dict]:
     else:
         asset_id = None
 
-    result = rpc(
-        "get_coins",
-        {
-            "asset_id": asset_id,
-            "offset": 0,
-            "limit": 500,
-            "filter_mode": "selectable",
-        },
-        timeout=15,
-    )
-
-    if not result:
-        return None
-
-    coins = result.get("coins") or result.get("records") or result.get("data") or []
     coin_map = {}
-    for c in coins:
-        cid = c.get("coin_id", "")
-        if cid:
+    page_size = 500
+    expected_total = None
+    for page in range(40):
+        offset = page * page_size
+        result = rpc(
+            "get_coins",
+            {
+                "asset_id": asset_id,
+                "offset": offset,
+                "limit": page_size,
+                "filter_mode": "selectable",
+            },
+            timeout=15,
+        )
+        if not _rpc_succeeded(result):
+            return None
+        coins = next(
+            (result[key] for key in ("coins", "records", "data") if key in result),
+            None,
+        )
+        if type(coins) is not list or len(coins) > page_size:
+            return None
+        reported_total = result.get("total")
+        if reported_total is not None:
+            if isinstance(reported_total, bool):
+                return None
+            try:
+                reported_total = int(reported_total)
+            except (TypeError, ValueError):
+                return None
+            if reported_total < offset + len(coins) or (
+                expected_total is not None and reported_total != expected_total
+            ):
+                return None
+            expected_total = reported_total
+        elif expected_total is not None:
+            return None
+        for c in coins:
+            if not isinstance(c, dict) or not isinstance(c.get("coin_id"), str):
+                return None
+            cid = c["coin_id"].lower()
+            if not cid:
+                return None
             if not cid.startswith("0x"):
-                cid = "0x" + cid.lower()
-            else:
-                cid = cid.lower()
-            coin_map[cid] = int(c.get("amount", "0"))
-    return coin_map
+                cid = "0x" + cid
+            if cid in coin_map:
+                return None
+            amount = _exact_positive_atomic_amount(c.get("amount"))
+            if amount is None:
+                return None
+            coin_map[cid] = amount
+        if len(coins) < page_size:
+            if expected_total is not None and len(coin_map) != expected_total:
+                return None
+            return coin_map
+    return None
 
 
 # ============================================================================
@@ -6378,7 +6951,12 @@ def auto_combine_xch(
     }
     if _identity_recheck is not None:
         _identity_recheck("auto_combine_xch")
-    result = rpc("auto_combine_xch", payload, timeout=120)
+    result = rpc(
+        "auto_combine_xch",
+        payload,
+        timeout=120,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] auto_combine_xch result: {result}")
     return result
@@ -6414,7 +6992,12 @@ def auto_combine_cat(
     }
     if _identity_recheck is not None:
         _identity_recheck("auto_combine_cat")
-    result = rpc("auto_combine_cat", payload, timeout=120)
+    result = rpc(
+        "auto_combine_cat",
+        payload,
+        timeout=120,
+        _identity_recheck=_identity_recheck,
+    )
     if WALLET_DEBUG:
         _console(f"  [Sage] auto_combine_cat result: {result}")
     return result
@@ -6441,7 +7024,8 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
 
     Walks Sage's get_derivations endpoint (both unhardened and hardened
     keys) and decodes each bech32 address to a 32-byte puzzle hash via
-    chia.util.bech32m. Results are cached for 10 minutes so repeated
+    CATalyst's dependency-light canonical codec. Results are cached for 10
+    minutes so repeated
     calls during fill verification are cheap.
 
     Returns a set of lowercase hex strings WITHOUT the '0x' prefix so
@@ -6463,16 +7047,7 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
     ):
         return _puzzle_hash_cache
 
-    try:
-        from chia.util.bech32m import decode_puzzle_hash
-    except ImportError:
-        log_event(
-            "warning",
-            "puzzle_hash_cache_no_bech32m",
-            "chia.util.bech32m not available — wallet PH cache disabled. "
-            "Install chia-blockchain to enable fill-vs-cancel disambiguation.",
-        )
-        return set()
+    from sage_offer_wire import decode_wallet_puzzle_hash
 
     collected: set = set()
     page_size = 200
@@ -6508,7 +7083,7 @@ def get_wallet_puzzle_hashes(force: bool = False, max_derivations: int = 5000) -
                 if not addr:
                     continue
                 try:
-                    ph_bytes = decode_puzzle_hash(addr)
+                    ph_bytes = decode_wallet_puzzle_hash(addr)
                     collected.add(ph_bytes.hex().lower())
                 except Exception:
                     # Unknown address format — skip, don't raise
@@ -6556,7 +7131,12 @@ def delete_offer(offer_id: str, *, _identity_recheck=None) -> bool:
     if _identity_recheck is not None:
         _identity_recheck("delete_offer")
     try:
-        result = _sage_post("delete_offer", {"offer_id": bare_id}, timeout=10)
+        result = _sage_post(
+            "delete_offer",
+            {"offer_id": bare_id},
+            timeout=10,
+            _identity_recheck=_identity_recheck,
+        )
         if WALLET_DEBUG:
             _console(f"   [Sage] delete_offer {bare_id[:16]}... → {result}")
         if result is None:
@@ -6577,6 +7157,8 @@ def delete_offer(offer_id: str, *, _identity_recheck=None) -> bool:
                 )
             return False
         return True
+    except mutation_gate.MutationBlocked:
+        raise
     except Exception as e:
         if not _quiet_mode:
             _console(f"   ⚠️ [Sage] delete_offer {bare_id[:16]}... failed: {e}")

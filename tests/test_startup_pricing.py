@@ -18,7 +18,12 @@ def prices(monkeypatch):
     monkeypatch.setattr(market, "_get_tibet_pairs_cached", Mock(return_value=[]))
     response = Mock(status_code=200)
     response.json.return_value = [
-        {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+        {
+            "ticker_id": "MZ_XCH",
+            "base_id": "aa",
+            "bid": "0.00007",
+            "ask": "0.00009",
+        }
     ]
     fetch = Mock(return_value=response)
     monkeypatch.setattr("requests.get", fetch)
@@ -58,6 +63,30 @@ def test_tibetswap_outage_accepts_real_dexie_ticker_response_shape(prices):
         "tibet_available": False,
         "tibet_status": "retired",
     }
+
+
+def test_startup_quote_rejects_matching_ticker_without_asset_identity(prices):
+    response, _ = prices
+    response.json.return_value = [
+        {"ticker_id": "MZ_XCH", "bid": "8", "ask": "10"},
+        {
+            "ticker_id": "MZ_XCH",
+            "base_id": "aa",
+            "bid": "0.00007",
+            "ask": "0.00009",
+        },
+    ]
+
+    assert market._get_startup_price_cached("aa", "MZ_XCH")["mid"] == "0.00008"
+
+
+def test_startup_quote_without_asset_identity_fails_closed(prices):
+    response, _ = prices
+    response.json.return_value = [
+        {"ticker_id": "MZ_XCH", "bid": "0.00007", "ask": "0.00009"}
+    ]
+
+    assert market._get_startup_price_cached("aa", "MZ_XCH") == {}
 
 
 @pytest.mark.parametrize(
