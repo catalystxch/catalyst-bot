@@ -1895,6 +1895,7 @@ def _initialize_startup_ownership() -> dict:
             "COIN_PREP_RECOVERY_REQUIRED",
             "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
             "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+            "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED",
         }
     ):
         try:

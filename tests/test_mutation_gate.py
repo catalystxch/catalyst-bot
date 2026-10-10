@@ -7652,6 +7652,7 @@ def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
         "COIN_PREP_EFFECT_UNKNOWN",
         "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
         "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+        "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED",
     ],
 )
 def test_desktop_retries_startup_after_exact_coin_prep_recovery(
