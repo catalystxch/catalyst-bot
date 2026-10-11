@@ -1,0 +1,32 @@
+# TEST 7 live-offer acceptance — 2026-10-11
+
+## Candidate and authorization
+
+The native CATalyst v1.4.1 process was PID 173740 from `C:\Users\t_you\.codex\worktrees\coin-prep-predispatch-quote\catalyst\dist\Catalyst\Catalyst.exe`, SHA-256 `512E7514E5D66522B0F6FDA17849DD3CC972E8FD5C731BBF65A9BF50C55221C9`, and sole owner of loopback port 5000. The human operator explicitly directed: “Start bot now.” The final action was taken through the native GUI after a fresh preflight.
+
+## Action-time preflight
+
+- Sage mainnet selected fingerprint `736588221`; selected CAT wallet ID 2 and exact MZ asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- Direct Sage read: synced XCH `138470287376832` selectable mojos, MZ `780212284` selectable atomic units, zero pending transactions, complete 4,095-offer history with zero active offers.
+- Database read: active identity-bound Bootstrap campaign `37750a860f3d26b005d3d894228e011366ad5dabaf1f04b3acd0b04a43a5a790`, revision 0, 10 XCH/100,000 MZ budgets, 0.05 XCH fee ceiling, authoritative Coin Prep fee spend `14100043` mojos, zero open offers and unresolved offer-operation blockers.
+- Loopback health and safety: bot stopped, wallet synced, `ALLOWED`, this-run lease owned, zero blockers, fresh recovery evidence.
+
+## Live observations
+
+The GUI Start Bot control passed all 10 startup checks and the backend reported `bot_running=true`. Cycle 0 created three XCH buy offers totalling 1 XCH and three MZ sell offers totalling 10,000 MZ. The native dashboard showed the same six offers and locked balances; Sage's complete history rose from 4,095 to 4,101 with exactly three active buys and three active sells. The database held exactly six open offers. All six database Dexie IDs returned live detail records whose exact trade IDs matched the local offers; all six also produced `dexie_posted=1` and were rediscovered in the application log. There were zero pending transactions and zero unresolved offer-operation blockers at that check.
+
+The bot completed at least six cycles with 3 buy and 3 sell offers still active, zero newly confirmed fills and zero bot errors in the dashboard. The Offers tab showed six live rows and exact Dexie discovery. P&L retained three historical confirmed buy fills, zero new session fills and zero realized P&L. Market Intelligence showed Dexie ready, Sage ready, Splash degraded, and RED confidence; the approved bounded Bootstrap campaign remained active. Settings showed the applied 25.2% dynamic base spread, 0.30 inventory skew and live controls. Logs showed cycles 0–5 completing with 3b/3s and all six offers rediscovered by Dexie. Data Reset actions were disabled while the bot ran. Help and About described Dexie as the primary offer book and Splash as optional peer broadcasting.
+
+Splash logged `InsufficientPeers`. Its local submit was acknowledged but independent peer receipt remains unverified. Cancellation, recovery and other Smart Settings configurations are not yet evidenced here. The bot was still running with six active offers at the last observation for this note; do not treat this note as a cancellation or full lifecycle pass.
+
+At `2026-10-11T10:09:30Z`, the same PID, path, hash and port owner remained live. Health reported bot running and wallet synced; safety was `ALLOWED` with an owned lease, fresh recovery evidence and zero blockers. Sage still had exactly three active MZ buys and three active MZ sells in a complete 4,101-offer history. The database still had six open offers; the campaign remained active, the authoritative fee ledger remained `14100043` mojos, and there were zero pending transactions or unresolved offer-operation blockers. Sage fingerprint, XCH/MZ balances and asset identity matched the expected post-offer locked state. This is a one-hour observation, not a 24-hour gate.
+
+## Stop and native cancellation failure
+
+The operator explicitly approved stopping the bot and using native **Cancel All** for the six live offers, within the existing campaign fee cap. The same exact native app was rechecked as the sole port 5000 owner. Sage still showed exactly three active buys and three active sells, zero pending transactions and unchanged wallet identity. The bot was stopped through the Dashboard, then native Cancel All was confirmed for six offers. No API mutation was used.
+
+CATalyst submitted a first native Sage bulk cancellation for three offers. The wallet reported transaction `fb9c6ee58fbbe4a4efd5c5e814f72f7e2d600ee9e7bf21ba660de814d49b5e79` with fee `20998664` mojos. Once wallet pending transactions cleared, Sage showed those three offers cancelled and the other three still active. CATalyst durably reconciled only one member of the confirmed bulk transaction. Two members remained `CANCEL_SUBMITTED_UNCONFIRMED`, so the runtime safety gate closed with `UNRESOLVED_OPERATIONS` and two blocking operations. The native UI ended with “Cancellation stopped” and said five offers still awaited proof. The bot stayed stopped. Do not retry cancellation or restart trading from this build.
+
+Read-only diagnosis found that `_settle_submitted_sage_bulk_cancel` reused the representative offer's wallet evidence for all three cohort members. Sage's transaction evidence is scoped to each selected coin. The other two members therefore classified as `EVIDENCE_SCOPE_MISMATCH`, although querying each member's own authoritative evidence with the shared confirmed cohort context classified both as `CANCELLED_PROVEN`. A regression using the real Task 7/8 journal reproduced the failure before a source fix and passed after a per-member evidence fix. No live database row was changed by the diagnosis. The replacement source, package and proof-only recovery still require validation before touching this live safety fence.
+
+An additional partial-recovery regression caught a second necessary correction: once the first manifest member was durably reconciled, the remaining blocker became the loader's representative, while cohort proof still validates against the immutable first member. The recovery path now loads cohort proof from that immutable first member and per-member scoped evidence for each unresolved peer. Four isolated cases passed: complete and partially reconciled cohorts, each with valid evidence and with a deliberately wrong peer coin scope. The wrong-scope cases retained the safety latch and did not mark that peer cancelled. The live safety latch remains intact while full tests and a clean replacement package are pending.
