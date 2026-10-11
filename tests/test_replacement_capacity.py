@@ -1082,8 +1082,11 @@ def test_submitted_coin_prep_can_resolve_no_effect_only_from_exact_selectable_co
 @pytest.mark.parametrize("persist_failure", [
     "COIN_PREP_PREPARED_PERSIST_FAILED", "DIRECT_BATCH_PREPARED_PERSIST_FAILED"
 ])
+@pytest.mark.parametrize("intervening_startup", [False, True])
+@pytest.mark.parametrize("recovery_fault", [None, "prior_effect", "identity", "reason"])
 def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect_view(
-    isolated_database, monkeypatch, journal_outcome, persist_failure
+    isolated_database, monkeypatch, journal_outcome, persist_failure, intervening_startup,
+    recovery_fault,
 ):
     """A rejected pre-dispatch fee check must not permanently fence untouched coins."""
 
@@ -1200,7 +1203,47 @@ def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect
         retry["generation"],
         reason_code=persist_failure,
     )
-    assert database.recover_coin_prep_predispatch_retry_collisions() == 1
+    if intervening_startup:
+        database._reassert_unresolved_wallet_effect_claims(database.get_connection())
+        assert database.get_runtime_safety_latch()["reason_code"] == (
+            "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED"
+        )
+    conn = database.get_connection()
+    if recovery_fault == "prior_effect":
+        conn.execute(
+            "UPDATE coin_prep_operations SET outcome_evidence_json="
+            "json_set(outcome_evidence_json, '$.effect_attempted', json('true')) "
+            "WHERE operation_id=?", (contract["operation_id"],),
+        )
+    elif recovery_fault == "identity":
+        conn.execute(
+            "UPDATE coin_prep_operations SET wallet_identity_json="
+            "json_set(wallet_identity_json, '$.network_id', 'testnet11') "
+            "WHERE operation_id=?", (contract["operation_id"],),
+        )
+    elif recovery_fault == "reason":
+        conn.execute("UPDATE runtime_safety_latch SET reason='unrelated failure'")
+    conn.commit()
+    if recovery_fault is not None:
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 0
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (retry["claim_token"],),
+        ).fetchone()[0] == 0
+        return
+    if intervening_startup:
+        database.close_connection()
+        database._db_initialized_path = ""
+        database.init_database()
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 0
+    else:
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 1
+    resolution = database.get_connection().execute(
+        "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+        (retry["claim_token"],),
+    ).fetchone()
+    assert resolution[0] == "RELEASED_NO_EFFECT"
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
