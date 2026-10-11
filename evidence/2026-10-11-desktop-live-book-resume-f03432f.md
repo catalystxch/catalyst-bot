@@ -18,4 +18,6 @@ After **Start Bot Now** in the native restored-session dialog, the exact app log
 
 All 11 pull-request checks passed on runtime commit `f03432f`.
 
+The native GUI was traversed while the bot ran. Offers rendered `Active 6`, three buys and three sells, matching Sage; each visible row showed Dexie publication and explicitly marked Splash peer broadcast unverified. P&L showed three historical confirmed buy fills, zero realized round trips, and the open-leg inventory mark. Market Intelligence showed Dexie ready, Sage ready, RED confidence, and Splash degraded with zero peers. Settings displayed running live controls; Data Reset actions were disabled while running; Logs showed successive completed cycles; Help and About opened and described Dexie as the primary offer book and Splash as optional. No settings or reset action was applied during this traversal.
+
 Harvestr on the other PC remains separately safety-fenced after its confirmed Coin Prep transactions and a heartbeat SQLite lock failure. This TEST 7 bridge fix does not address that failure.
