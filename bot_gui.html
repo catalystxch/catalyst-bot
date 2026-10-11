@@ -18431,12 +18431,18 @@
                     ? (getSettingsSelectedCAT()?.asset_id ? getSettingsSelectedCAT() : (currentCAT?.asset_id ? currentCAT : {}))
                     : {});
             const hasPair = !!(effectiveCat && effectiveCat.asset_id);
+            const explicitPair = getDashboardSelectedPair({ requireExplicit: true });
+            const pairConfirmed = hasPair && explicitPair.selected
+                && explicitPair.asset_id === effectiveCat.asset_id;
             const pairReady = hasPair ? isPairDataReadyFor(effectiveCat.asset_id) : false;
             const pairName = effectiveCat?.name || effectiveCat?.ticker_id || 'Selected Pair';
             const locked = !!(bot_state && bot_state.running);
 
             if (selector) {
-                selector.value = hasPair ? effectiveCat.asset_id : '';
+                // Keep a deliberate picker interaction unselected even when a
+                // queued settings/balance refresh restores the saved CAT value.
+                selector.value = selector.classList.contains('v4-settings-hidden-select')
+                    && hasPair ? effectiveCat.asset_id : '';
             }
             if (card) {
                 card.classList.remove('is-empty', 'is-loading', 'is-ready');
@@ -18448,6 +18454,8 @@
             if (metaEl) {
                 if (!hasPair) {
                     metaEl.textContent = 'Choose the CAT token on the dashboard first. Settings, balances, pricing, and coin prep will then prepare for that token.';
+                } else if (!pairConfirmed) {
+                    metaEl.textContent = `Confirm ${pairName} for this run before previewing or saving settings.`;
                 } else if (!pairReady) {
                     metaEl.textContent = `${pairName} has been selected for this run. Waiting for fresh balances and market data before settings can be saved.`;
                 } else {
@@ -18457,13 +18465,14 @@
             if (statusEl) {
                 statusEl.textContent = !hasPair
                     ? 'Waiting for pair selection'
-                    : (pairReady ? 'App-wide trading pair confirmed' : 'Refreshing pair data');
+                    : (!pairConfirmed ? 'Confirm trading pair for this run'
+                        : (pairReady ? 'App-wide trading pair confirmed' : 'Refreshing pair data'));
             }
             if (btn) {
                 btn.disabled = locked;
                 btn.textContent = locked
                     ? 'Stop Bot to Change Pair'
-                    : (hasPair ? 'Change Trading Pair' : 'Choose Trading Pair');
+                    : (hasPair ? (pairConfirmed ? 'Change Trading Pair' : 'Confirm Trading Pair') : 'Choose Trading Pair');
                 btn.title = locked
                     ? 'Stop the bot before changing the trading pair for this run.'
                     : 'Trading pair is chosen once for the whole app.';
@@ -18520,8 +18529,17 @@
                 select.setAttribute('aria-hidden', 'true');
                 select.setAttribute('tabindex', '-1');
                 if (trigger) trigger.style.display = '';
+                // Re-render only after closing the interaction. While open,
+                // label refreshes deliberately keep the choice empty; after
+                // server acceptance Settings must retain the committed CAT.
+                updateSettingsPairControl(currentCAT);
+                validateSettingsForm();
             };
             select.addEventListener('change', onPick);
+            // A restored/stopped pair may already be selected without explicit
+            // authority for this run. Choosing the same option must fire change
+            // and pass through selectCAT(), not silently inherit that authority.
+            select.value = '';
             select.focus();
         }
 
@@ -36745,24 +36763,20 @@ function closeCtgErrorModal() {
                 btn.textContent = 'Checking history…';
             }
 
-            // Pre-prep: show the tri-checkbox history modal. Returns
-            // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
-            // When there's no data worth preserving it short-circuits to
-            // 'proceed' with all resets false so first-run UX is frictionless.
-            const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
-                .includes(String(recoveryIntent?.action || ''));
-            const historyChoice = cancellationOnlyRecovery
-                ? {action: 'proceed', resets: {}}
-                : await askPrepHistoryChoice();
-            if (!historyChoice || historyChoice.action === 'cancel') {
-                _coinPrepFeeConfirmBusy = false;
-                validateCoinPrepFeeMaximum();
-                return;
-            }
-            const resets = historyChoice.resets || {};
-            if (btn) btn.textContent = 'Starting...';
-
             try {
+                // Pre-prep: show the tri-checkbox history modal. Returns
+                // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
+                // When there's no data worth preserving it short-circuits to
+                // 'proceed' with all resets false so first-run UX is frictionless.
+                const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
+                    .includes(String(recoveryIntent?.action || ''));
+                const historyChoice = cancellationOnlyRecovery
+                    ? {action: 'proceed', resets: {}}
+                    : await askPrepHistoryChoice();
+                if (!historyChoice || historyChoice.action === 'cancel') return;
+                const resets = historyChoice.resets || {};
+                if (btn) btn.textContent = 'Starting...';
+
                 if (confirmedPreview !== _coinPrepFeePreview) {
                     throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
                 }
@@ -36899,7 +36913,11 @@ function closeCtgErrorModal() {
             } finally {
                 _coinPrepFeeConfirmBusy = false;
                 const confirmView = document.getElementById('coinPrepConfirmView');
-                if (confirmView && confirmView.style.display !== 'none' && _coinPrepFeePreview) {
+                if (confirmView && confirmView.style.display !== 'none') {
+                    // A failed pre-start is a review state, not an active worker.
+                    // Restore the label even when expiry/provider failure keeps
+                    // the action disabled until a new quote is reviewed.
+                    if (btn) btn.textContent = _coinPrepConfirmReadyText;
                     validateCoinPrepFeeMaximum();
                 }
             }
