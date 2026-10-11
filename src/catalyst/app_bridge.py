@@ -283,15 +283,20 @@ class AppBridge:
 
     @_safe
     @_mutation_guard("app_bridge:start_bot")
-    def start_bot(self, _body=None):
+    def start_bot(self, body=None):
         """Start the bot loop. Maps to POST /api/bot/start.
         Delegates fully to api_server.api_bot_start() which runs all pre-start
         validation (CAT_ASSET_ID, wallet sync, spread sanity, etc.).
         """
         import api_server
 
+        payload = (
+            {"resume_existing_offers": True}
+            if type(body) is dict and body.get("resume_existing_offers") is True
+            else {}
+        )
         with api_server.app.test_request_context(
-            "/api/bot/start", method="POST", content_type="application/json", data="{}"
+            "/api/bot/start", method="POST", json=payload
         ):
             resp = api_server.api_bot_start()
         return _unwrap_flask_response(resp)
