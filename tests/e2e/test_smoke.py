@@ -1985,6 +1985,82 @@ def test_blank_spread_cannot_submit_partial_settings_save(page):
     assert "Saving" not in result["saveLabel"]
 
 
+def test_blank_loop_interval_cannot_submit_partial_settings_save(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    api_calls = page.evaluate(
+        """async () => {
+            document.getElementById('configSpreadBps').value = '7';
+            document.getElementById('configLoopSeconds').value = '';
+            let calls = 0;
+            window.apiFetch = async () => { calls++; throw Error('unexpected save'); };
+            await saveConfig();
+            return calls;
+        }"""
+    )
+
+    assert api_calls == 0
+
+
+def test_active_bootstrap_pair_loads_saved_settings_for_review(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {asset_id: 'asset-a'};
+            settingsReviewed = false;
+            _freshStartBlankTierTemplates = true;
+            _resumeSessionSummary = null;
+            _bootstrapActiveCampaign = null;
+            const fresh = shouldUseFreshStartBlankTierTemplates();
+            _bootstrapActiveCampaign = {asset_id: 'asset-b', status: 'active'};
+            const otherPair = shouldUseFreshStartBlankTierTemplates();
+            _bootstrapActiveCampaign = {asset_id: 'asset-a', status: 'active'};
+            const campaignPair = shouldUseFreshStartBlankTierTemplates();
+            return {fresh, otherPair, campaignPair};
+        }"""
+    )
+
+    assert result == {"fresh": True, "otherPair": True, "campaignPair": False}
+
+
+def test_inactive_blank_settings_are_omitted_without_hiding_required_blanks(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const dbx = document.getElementById('configDbxMaxSpreadBps');
+            dbx.value = '';
+            dbx.closest('.form-group').style.display = 'none';
+            const config = {
+                loop_seconds: NaN,
+                dbx_max_spread_bps: NaN,
+                tier_enabled: false,
+                inner_size_xch: NaN,
+                auto_requote: false,
+                requote_bps: NaN,
+                dynamic_spread_enabled: false,
+                base_spread_bps: NaN,
+                inventory_enabled: false,
+                skew_intensity: NaN,
+            };
+            omitInactiveBlankSettings(config);
+            return Object.keys(config).sort();
+        }"""
+    )
+
+    assert result == [
+        "auto_requote",
+        "dynamic_spread_enabled",
+        "inventory_enabled",
+        "loop_seconds",
+        "tier_enabled",
+    ]
+
+
 def test_bulk_settings_error_shows_specific_rejected_field(page):
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")

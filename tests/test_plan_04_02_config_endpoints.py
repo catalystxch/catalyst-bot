@@ -192,6 +192,25 @@ class TestConfigPost(_FlaskBase):
         )
         fake_cfg.update.assert_not_called()
 
+    def test_bulk_null_numeric_field_does_not_partially_apply_other_settings(self):
+        """Smart Settings blanks must never persist Python 'None' to .env."""
+        fake_cfg = MagicMock()
+        fake_cfg.update.return_value = True
+        fake_cfg.to_dict.return_value = {}
+        fake_cfg.LIQUIDITY_MODE = "two_sided"
+        fake_cfg.SNIPER_ENABLED = False
+        fake_cfg.MAX_ACTIVE_BUY_OFFERS = 3
+        fake_cfg.MAX_ACTIVE_SELL_OFFERS = 3
+
+        with patch.object(api_server, "cfg", fake_cfg):
+            resp = self._post_json(
+                "/api/config", {"default_trade_xch": 0.25, "loop_seconds": None}
+            )
+
+        self.assertFalse(resp.get_json()["success"])
+        self.assertTrue(any("LOOP_SECONDS" in e for e in resp.get_json()["errors"]))
+        fake_cfg.update.assert_not_called()
+
     def test_bulk_toxicity_settings_map_to_env_keys(self):
         fake_cfg = MagicMock()
         fake_cfg.update.return_value = True

@@ -14,6 +14,7 @@ Named `config_bp` (not `config`) to avoid shadowing the top-level
 from __future__ import annotations
 
 import json as _json
+import math
 import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -532,10 +533,27 @@ def api_config_update():
             env_key = _KEY_MAP.get(gui_key, gui_key.upper())
             if env_key in _DEXIE_ONLY_BETA_KEYS:
                 return _dexie_only_beta_response(env_key)
-    # A blank Smart Settings spread serializes as JSON null. Reject the whole
-    # bulk request before writing any other setting, including trade bounds.
+    # Blank Smart Settings numeric inputs serialize as JSON null. Validate
+    # the whole payload before writing any setting or derived trade bound.
     for gui_key, value in data.items():
-        if _KEY_MAP.get(gui_key, gui_key.upper()) != "SPREAD_BPS":
+        env_key = _KEY_MAP.get(gui_key, gui_key.upper())
+        if value is None or (isinstance(value, float) and not math.isfinite(value)):
+            message = (
+                "SPREAD_BPS must be a positive integer"
+                if env_key == "SPREAD_BPS"
+                else f"{env_key} must not be empty or non-finite"
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "invalid",
+                    "updated": [],
+                    "errors": [message],
+                    "warnings": None,
+                    "change_address_result": None,
+                }
+            )
+        if env_key != "SPREAD_BPS":
             continue
         try:
             spread_bps = int(float(value))
