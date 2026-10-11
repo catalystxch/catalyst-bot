@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -361,6 +362,149 @@ def _target_contract():
             },
         ],
     }
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "claimed_output", "wrong_amount", "authority_failure"]
+)
+def test_confirmation_batch_bounds_writer_work_and_preserves_fences(
+    isolated_database, monkeypatch, fault
+):
+    """Repeated global scans starve writers; batching must not weaken fences."""
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="bounded-confirmation")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"bounded-source").hexdigest()
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+    outputs = [
+        {
+            "coin_id": hashlib.sha256(f"bounded-output-{i}".encode()).hexdigest(),
+            "amount_mojos": 3,
+            "purpose": "replacement",
+        }
+        for i in range(30)
+    ]
+    outputs.append(
+        {
+            "coin_id": hashlib.sha256(b"bounded-fee-output").hexdigest(),
+            "amount_mojos": 10,
+            "purpose": "fee_reserve",
+        }
+    )
+    target = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": i,
+                "amount_mojos": item["amount_mojos"],
+                "purpose": item["purpose"],
+            }
+            for i, item in enumerate(outputs)
+        ],
+    }
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"], source_coin_ids=[source]
+    )
+    database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    if fault in {"claimed_output", "wrong_amount"}:
+        assert database.upsert_coin(
+            outputs[-1]["coin_id"],
+            "xch",
+            11 if fault == "wrong_amount" else 10,
+            purpose="fee_reserve",
+        )
+    if fault == "claimed_output":
+        assert database.claim_wallet_effect(
+            operation_id="a" * 64, source_coin_ids=[outputs[-1]["coin_id"]]
+        )
+    evidence = {
+        "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+        "effect_claim_token": claim["claim_token"],
+        "effect_claim_generation": claim["generation"],
+        "source_coin_ids": [source],
+        "expected_outputs": outputs,
+        "expected_wallet_identity": identity,
+        "authoritative_view": {
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": identity,
+            "observed_at": "2026-08-21T12:00:01.000000Z",
+            "expires_at": "2026-08-21T12:00:16.000000Z",
+            "coins": outputs,
+        },
+    }
+    original_scan = database._nonterminal_registry_coin_ids
+    scans = []
+
+    def costly_real_scan(conn):
+        assert conn.in_transaction
+        scans.append(1)
+        if fault == "authority_failure":
+            raise RuntimeError("synthetic authority unavailable")
+        if fault is None:
+            time.sleep(
+                0.1
+            )  # Controlled slow authority, not a changed protection decision.
+        return original_scan(conn)
+
+    monkeypatch.setattr(database, "_nonterminal_registry_coin_ids", costly_real_scan)
+    before = time.monotonic()
+    if fault is None:
+        result = database.record_coin_prep_operation_outcome(
+            contract["operation_id"], outcome="CONFIRMED", evidence_json=evidence
+        )
+        elapsed = time.monotonic() - before
+        assert result["operation"]["outcome"] == "CONFIRMED"
+        assert elapsed < 2.5, f"writer transaction occupied {elapsed:.3f}s"
+        assert len(scans) == 1
+    else:
+        expected_error, expected_reason = {
+            "claimed_output": (ValueError, "protected permanent history"),
+            "wrong_amount": (ValueError, "contradicts durable coin state"),
+            "authority_failure": (RuntimeError, "synthetic authority unavailable"),
+        }[fault]
+        with pytest.raises(expected_error, match=expected_reason):
+            database.record_coin_prep_operation_outcome(
+                contract["operation_id"], outcome="CONFIRMED", evidence_json=evidence
+            )
+        assert len(scans) == 1
+        conn = database.get_connection()
+        assert (
+            conn.execute(
+                "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+                (contract["operation_id"],),
+            ).fetchone()[0]
+            == "PREPARED"
+        )
+        assert (
+            conn.execute(
+                "SELECT status FROM coins WHERE coin_id=?",
+                (database.norm_coin_id(source),),
+            ).fetchone()[0]
+            == "free"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM coins WHERE coin_id=?",
+                (database.norm_coin_id(outputs[0]["coin_id"]),),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_split_and_combine_identities_are_deterministic_and_purpose_bound():
@@ -726,14 +870,13 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
         assert database.upsert_coin(output_cat, "cat", 90, purpose="replacement")
         assert database.lock_coin(output_cat, "terminal-trade")
         assert database.mark_coin_spent(output_cat)
-        original_terminal_guard = database._coin_terminal_mutation_is_protected
+        original_terminal_guard = database._batch_coin_terminal_mutation_protection
         monkeypatch.setattr(
             database,
-            "_coin_terminal_mutation_is_protected",
-            lambda conn, coin_id: (
-                True
-                if database.norm_coin_id(coin_id) == database.norm_coin_id(output_cat)
-                else original_terminal_guard(conn, coin_id)
+            "_batch_coin_terminal_mutation_protection",
+            lambda conn, coin_ids: (
+                original_terminal_guard(conn, coin_ids)
+                | {database.norm_coin_id(output_cat)}
             ),
         )
     database.bind_coin_prep_constructed_outputs(
