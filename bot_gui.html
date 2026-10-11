@@ -36745,24 +36745,20 @@ function closeCtgErrorModal() {
                 btn.textContent = 'Checking history…';
             }
 
-            // Pre-prep: show the tri-checkbox history modal. Returns
-            // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
-            // When there's no data worth preserving it short-circuits to
-            // 'proceed' with all resets false so first-run UX is frictionless.
-            const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
-                .includes(String(recoveryIntent?.action || ''));
-            const historyChoice = cancellationOnlyRecovery
-                ? {action: 'proceed', resets: {}}
-                : await askPrepHistoryChoice();
-            if (!historyChoice || historyChoice.action === 'cancel') {
-                _coinPrepFeeConfirmBusy = false;
-                validateCoinPrepFeeMaximum();
-                return;
-            }
-            const resets = historyChoice.resets || {};
-            if (btn) btn.textContent = 'Starting...';
-
             try {
+                // Pre-prep: show the tri-checkbox history modal. Returns
+                // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
+                // When there's no data worth preserving it short-circuits to
+                // 'proceed' with all resets false so first-run UX is frictionless.
+                const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
+                    .includes(String(recoveryIntent?.action || ''));
+                const historyChoice = cancellationOnlyRecovery
+                    ? {action: 'proceed', resets: {}}
+                    : await askPrepHistoryChoice();
+                if (!historyChoice || historyChoice.action === 'cancel') return;
+                const resets = historyChoice.resets || {};
+                if (btn) btn.textContent = 'Starting...';
+
                 if (confirmedPreview !== _coinPrepFeePreview) {
                     throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
                 }
@@ -36899,7 +36895,11 @@ function closeCtgErrorModal() {
             } finally {
                 _coinPrepFeeConfirmBusy = false;
                 const confirmView = document.getElementById('coinPrepConfirmView');
-                if (confirmView && confirmView.style.display !== 'none' && _coinPrepFeePreview) {
+                if (confirmView && confirmView.style.display !== 'none') {
+                    // A failed pre-start is a review state, not an active worker.
+                    // Restore the label even when expiry/provider failure keeps
+                    // the action disabled until a new quote is reviewed.
+                    if (btn) btn.textContent = _coinPrepConfirmReadyText;
                     validateCoinPrepFeeMaximum();
                 }
             }

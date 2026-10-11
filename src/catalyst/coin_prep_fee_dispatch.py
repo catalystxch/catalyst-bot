@@ -9,6 +9,7 @@ from coin_prep_fee_funding import prepare_fee_inventory
 from coin_prep_fee_pricing import is_current_fee_quote, price_next_prep_batch
 from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
 from fee_estimation import fee_failure_diagnostics
+from super_log import slog
 import database
 import json
 from dataclasses import replace
@@ -148,7 +149,11 @@ def price_approved_prep_batch(approval_id: str) -> dict:
 
 
 def reserve_approved_prep_dispatch(
-    *, approval_id: str, operation_id: str, priced_batch: dict
+    *,
+    approval_id: str,
+    operation_id: str,
+    priced_batch: dict,
+    attempt_id: str | None = None,
 ) -> dict:
     """Bind executable cost/effects to PREPARED journal and hold the exact fee.
 
@@ -213,6 +218,7 @@ def reserve_approved_prep_dispatch(
         purpose="replacement",
         source_coin_ids=list(plan.source_coin_ids),
         target_contract=target,
+        attempt_id=attempt_id,
     )
     if canonical["operation_id"] != operation_id:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
@@ -239,6 +245,26 @@ def reserve_approved_prep_dispatch(
         not is_current_fee_quote(quote, cost, economics["target_seconds"])
         or quote["fee_mojos"] != plan.fee_mojos
     ):
+        slog(
+            "coin_prep",
+            "Direct batch fee quote rejected before wallet dispatch",
+            {
+                "operation_id": operation_id,
+                "quote_observed_at": quote.get("observed_at")
+                if type(quote) is dict
+                else None,
+                "quote_expires_at": quote.get("expires_at")
+                if type(quote) is dict
+                else None,
+                "quoted_cost": quote.get("cost") if type(quote) is dict else None,
+                "validated_cost": cost,
+                "quoted_fee_mojos": quote.get("fee_mojos")
+                if type(quote) is dict
+                else None,
+                "planned_fee_mojos": plan.fee_mojos,
+            },
+            level="warning",
+        )
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     # Bind actual derived additions; a different earlier binding cannot survive.
     database.bind_coin_prep_constructed_outputs(
