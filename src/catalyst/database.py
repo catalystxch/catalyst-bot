@@ -36323,6 +36323,15 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
     for row in rows:
         evidence = json.loads(row[0])
         exact_subset = evidence.get("exact_subset") if type(evidence) is dict else None
+        if (
+            type(exact_subset) is not dict
+            and type(evidence) is dict
+            and type(evidence.get("evidence")) is dict
+        ):
+            # Normal Task 9 reconciliation persists its exact classification
+            # and cohort context at the top level. Older journal writers
+            # wrapped the same proof in exact_subset.
+            exact_subset = evidence
         cancel_context = (
             exact_subset.get("cancel_context") if type(exact_subset) is dict else None
         )
