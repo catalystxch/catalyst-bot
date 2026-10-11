@@ -2272,12 +2272,12 @@ class CoinManager:
         for pending cancel transactions.
 
         Much lighter than a full update_coin_counts() — one RPC call,
-        filtered to fee-sized coins only.
+        restricted to durable fee-reserve coins. When the configured fee tier
+        is disabled, previously prepared reserves remain usable for cancelling
+        outstanding offers.
         """
         try:
             fee_size = get_fee_coin_size_mojos()
-            if fee_size <= 0:
-                return
             result = get_exact_spendable_coins_rpc(WALLET_ID_XCH)
             if not result or not result.get("success"):
                 return  # can't refresh — keep existing pool
@@ -2299,7 +2299,7 @@ class CoinManager:
             fee_records = []
             for record in records:
                 amount = int((record.get("coin") or {}).get("amount", 0))
-                if not (low <= amount <= high):
+                if amount <= 0 or (fee_size > 0 and not (low <= amount <= high)):
                     continue
                 enriched = dict(record)
                 enriched["_catalyst_policy_purpose"] = purpose_by_coin_id.get(
