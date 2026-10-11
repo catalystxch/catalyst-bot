@@ -1555,6 +1555,8 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert result["requestCount"] == 1
     assert result["campaignId"] == "campaign-live"
     assert result["globalStatus"].startswith("Bootstrap active")
+    assert "10% stage target" in result["globalStatus"]
+    assert "deployed" not in result["globalStatus"]
     assert "corridor 0.00005–0.0002 XCH/MZ" in result["dashboardStatus"]
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
 

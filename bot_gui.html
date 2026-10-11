@@ -40144,7 +40144,7 @@ function _bootstrapRenderStatus(payload) {
                 summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
             }
         } else {
-            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% stage target · ${remainingTime} · revision ${campaign.revision}`;
         }
         campaign._uiCooldownCount = cooldowns;
     }
