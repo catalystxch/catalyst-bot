@@ -33009,6 +33009,8 @@
                 const reason = String(status?.reason_code || status?.code || '');
                 banner.textContent = ['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH'].includes(reason)
                     ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                    : reason === 'FEE_BUDGET_APPROVAL_REQUIRED'
+                        ? 'This campaign has live offers but no campaign-bound cancellation fee approval. Review the cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                     : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
                         ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                         : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
