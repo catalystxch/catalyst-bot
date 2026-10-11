@@ -2440,11 +2440,15 @@ class CoinPrepWorker:
         target = batch_target_contract(
             plan, address, priced_batch["identity"]["asset_id"]
         )
+        from uuid import uuid4
+
+        attempt_id = uuid4().hex
         canonical = canonical_coin_prep_contract(
             operation_kind="split",
             purpose="replacement",
             source_coin_ids=list(plan.source_coin_ids),
             target_contract=target,
+            attempt_id=attempt_id,
         )
         target = canonical["target_contract"]
         # Pricing can spend most of a short quote's lifetime in wallet/RPC
@@ -2482,9 +2486,11 @@ class CoinPrepWorker:
                         set(plan.source_coin_ids) | set(fee_coin_ids)
                     ),
                     "execution_mode": "direct_final_batch_v2",
+                    "attempt_id": attempt_id,
                 },
                 effect_claim_token=claim["claim_token"],
                 effect_claim_generation=claim["generation"],
+                attempt_id=attempt_id,
             )["operation"]
         except Exception as exc:
             retain_wallet_effect_claim_for_reconciliation(
@@ -2499,6 +2505,7 @@ class CoinPrepWorker:
                 approval_id=approval_id,
                 operation_id=canonical["operation_id"],
                 priced_batch=priced_batch,
+                attempt_id=attempt_id,
             )
             validated = hold["validated_unsigned"]
             recheck_approved_prep_dispatch(

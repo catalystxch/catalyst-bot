@@ -149,7 +149,8 @@ def price_approved_prep_batch(approval_id: str) -> dict:
 
 
 def reserve_approved_prep_dispatch(
-    *, approval_id: str, operation_id: str, priced_batch: dict
+    *, approval_id: str, operation_id: str, priced_batch: dict,
+    attempt_id: str | None = None,
 ) -> dict:
     """Bind executable cost/effects to PREPARED journal and hold the exact fee.
 
@@ -214,6 +215,7 @@ def reserve_approved_prep_dispatch(
         purpose="replacement",
         source_coin_ids=list(plan.source_coin_ids),
         target_contract=target,
+        attempt_id=attempt_id,
     )
     if canonical["operation_id"] != operation_id:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")

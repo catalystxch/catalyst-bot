@@ -11725,8 +11725,10 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
         latch = dict(latch_row)
         if (
             latch["state"] != "tripped"
-            or latch["reason"]
-            != "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED"
+            or latch["reason"] not in {
+                "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED",
+                "wallet effect authority was retained: DIRECT_BATCH_PREPARED_PERSIST_FAILED",
+            }
         ):
             conn.commit()
             return 0
@@ -25114,6 +25116,7 @@ def prepare_coin_prep_operation(
     effect_claim_token: str,
     effect_claim_generation: int,
     prepared_at: Any = None,
+    attempt_id: str | None = None,
 ) -> Dict[str, Any]:
     """Persist one deterministic PREPARED split/combine before wallet effect."""
 
@@ -25124,6 +25127,7 @@ def prepare_coin_prep_operation(
         purpose=purpose,
         source_coin_ids=source_coin_ids,
         target_contract=target_contract,
+        attempt_id=attempt_id,
     )
     source_json = _canonical_json_text(
         contract["source_coin_ids"],
