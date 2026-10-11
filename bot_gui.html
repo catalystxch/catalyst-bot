@@ -18430,7 +18430,15 @@
                 : (_shouldExposeRestoredPairToUI()
                     ? (getSettingsSelectedCAT()?.asset_id ? getSettingsSelectedCAT() : (currentCAT?.asset_id ? currentCAT : {}))
                     : {});
-            const hasPair = !!(effectiveCat && effectiveCat.asset_id);
+            // Match the same explicit-selection gate used by Bootstrap Preview.
+            // A stopped campaign can leave currentCAT and the settings selector
+            // populated even though the user must choose a pair for a new run.
+            const selectedPair = getDashboardSelectedPair({ requireExplicit: true });
+            const hasPair = !!(
+                effectiveCat?.asset_id
+                && selectedPair.selected
+                && selectedPair.asset_id === effectiveCat.asset_id
+            );
             const pairReady = hasPair ? isPairDataReadyFor(effectiveCat.asset_id) : false;
             const pairName = effectiveCat?.name || effectiveCat?.ticker_id || 'Selected Pair';
             const locked = !!(bot_state && bot_state.running);
@@ -19679,6 +19687,12 @@
                 if (typeof err === 'object') {
                     if (err.error === 'mutation_gate_blocked') {
                         return startSafetyMessage(err.reason || err.reason_code);
+                    }
+                    // Bulk config writes can reject one field after applying others.
+                    // Show the rejected field so the operator can correct it.
+                    const firstFieldError = Array.isArray(err.errors) ? err.errors[0] : null;
+                    if (typeof firstFieldError === 'string' && firstFieldError.trim()) {
+                        return firstFieldError.trim().slice(0, 200);
                     }
                     const code = err.code || err.error_code;
                     if (code && _ERROR_CODE_MAP[code]) return _ERROR_CODE_MAP[code];
@@ -34936,8 +34950,16 @@
 
         async function saveConfig() {
             setSaveConfigButtonState(true, 'Saving Settings...');
+            const spreadInput = document.getElementById('configSpreadBps');
+            const spreadValue = Number(spreadInput?.value);
+            if (!Number.isFinite(spreadValue) || spreadValue <= 0) {
+                showToast('Spread must be a positive percentage before saving settings.', 'error');
+                if (spreadInput) spreadInput.style.borderColor = 'var(--status-danger)';
+                setSaveConfigButtonState(false);
+                return;
+            }
             // Client-side spread warning (value is now in %)
-            const spreadPct = parseFloat(document.getElementById('configSpreadBps')?.value) || 0;
+            const spreadPct = spreadValue;
             if (spreadPct > 0 && spreadPct < 2) {
                 const proceed = await showStyledConfirm({
                     icon: '📉',

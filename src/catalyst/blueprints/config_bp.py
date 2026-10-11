@@ -532,6 +532,26 @@ def api_config_update():
             env_key = _KEY_MAP.get(gui_key, gui_key.upper())
             if env_key in _DEXIE_ONLY_BETA_KEYS:
                 return _dexie_only_beta_response(env_key)
+    # A blank Smart Settings spread serializes as JSON null. Reject the whole
+    # bulk request before writing any other setting, including trade bounds.
+    for gui_key, value in data.items():
+        if _KEY_MAP.get(gui_key, gui_key.upper()) != "SPREAD_BPS":
+            continue
+        try:
+            spread_bps = int(float(value))
+        except (ValueError, TypeError, OverflowError):
+            spread_bps = 0
+        if spread_bps <= 0:
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "invalid",
+                    "updated": [],
+                    "errors": ["SPREAD_BPS must be a positive integer"],
+                    "warnings": None,
+                    "change_address_result": None,
+                }
+            )
     data = _with_coherent_trade_bounds(data, cfg)
     updated = []
     errors = []

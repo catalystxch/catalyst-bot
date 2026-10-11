@@ -1963,6 +1963,41 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
+def test_blank_spread_cannot_submit_partial_settings_save(page):
+    """A blank Smart Settings spread must stop before the bulk config write."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('configSpreadBps').value = '';
+            let apiCalls = 0;
+            window.apiFetch = async () => { apiCalls++; throw Error('unexpected save'); };
+            await saveConfig();
+            return {
+                apiCalls,
+                saveLabel: document.getElementById('saveConfigBtn')?.textContent,
+            };
+        }"""
+    )
+
+    assert result["apiCalls"] == 0
+    assert "Saving" not in result["saveLabel"]
+
+
+def test_bulk_settings_error_shows_specific_rejected_field(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    message = page.evaluate(
+        """() => formatError({success: false, errors: [
+            'SPREAD_BPS must be a positive integer'
+        ]})"""
+    )
+
+    assert message == "SPREAD_BPS must be a positive integer"
+
+
 def test_smart_settings_snapshot_accepts_save_time_spread_floor_normalization(page):
     """Save-time ladder-floor normalization must not falsely mark Smart Settings stale."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
@@ -2463,6 +2498,57 @@ def test_idle_reload_does_not_render_persisted_pair_as_selected(page):
         "competitors": "loading",
         "catRows": "none",
         "cacheCleared": True,
+    }
+
+
+def test_settings_pair_card_requires_the_same_explicit_pair_as_bootstrap_preview(page):
+    """A stopped campaign must not display a confirmed pair that Preview rejects."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'ab'.repeat(32);
+            const cat = { asset_id: assetId, name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH' };
+            const dash = document.getElementById('catSelector');
+            const settings = document.getElementById('configCatSelector');
+            dash.innerHTML = `<option value="${assetId}" selected>MZ</option>`;
+            settings.innerHTML = `<option value="${assetId}" selected>MZ</option>`;
+            currentCAT = { ...cat };
+            _pairDataReadyAssetId = assetId;
+            _pairSelectedByUser = false;
+            _resumeSessionSummary = null;
+            _bootstrapActiveCampaign = null;
+            bot_state = { running: false };
+
+            updateSettingsPairControl(cat);
+            const withoutSelection = {
+                previewPairSelected: getDashboardSelectedPair({ requireExplicit: true }).selected,
+                cardStatus: document.getElementById('settingsPairDisplayStatus').textContent,
+            };
+
+            _pairSelectedByUser = true;
+            updateSettingsPairControl(cat);
+            return {
+                withoutSelection,
+                withSelection: {
+                    previewPairSelected: getDashboardSelectedPair({ requireExplicit: true }).selected,
+                    cardStatus: document.getElementById('settingsPairDisplayStatus').textContent,
+                },
+            };
+        }"""
+    )
+
+    assert result == {
+        "withoutSelection": {
+            "previewPairSelected": False,
+            "cardStatus": "Waiting for pair selection",
+        },
+        "withSelection": {
+            "previewPairSelected": True,
+            "cardStatus": "App-wide trading pair confirmed",
+        },
     }
 
 
