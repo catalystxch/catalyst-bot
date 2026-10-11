@@ -11724,18 +11724,17 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
             raise RuntimeError("runtime safety latch singleton is missing")
         latch = dict(latch_row)
         retained_prepare_failure = latch["reason"] in {
-                "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED",
-                "wallet effect authority was retained: DIRECT_BATCH_PREPARED_PERSIST_FAILED",
+            "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED",
+            "wallet effect authority was retained: DIRECT_BATCH_PREPARED_PERSIST_FAILED",
         }
         # An intervening older startup reasserts this exact unresolved claim
         # with a crash reason. The durable collision/no-dispatch proof below,
         # not the mutable diagnostic wording, is the recovery authority.
-        reasserted_crash = (
-            latch["reason_code"] == "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED"
-            and latch["reason"] == (
-                "restart found a wallet coin effect claim without an exact "
-                "Task 12 no-effect resolution"
-            )
+        reasserted_crash = latch[
+            "reason_code"
+        ] == "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED" and latch["reason"] == (
+            "restart found a wallet coin effect claim without an exact "
+            "Task 12 no-effect resolution"
         )
         if latch["state"] != "tripped" or not (
             retained_prepare_failure or reasserted_crash

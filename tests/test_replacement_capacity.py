@@ -508,17 +508,36 @@ def test_batch_contract_round_trip_binds_plan_hash_and_exact_outputs():
 
 
 def test_batch_attempt_identity_does_not_change_economics_or_legacy_identity():
-    args = dict(operation_kind="split", purpose="replacement",
-                source_coin_ids=["a" * 64], target_contract=_batch_target())
+    args = dict(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=["a" * 64],
+        target_contract=_batch_target(),
+    )
     legacy = replacement_capacity.canonical_coin_prep_contract(**args)
-    first = replacement_capacity.canonical_coin_prep_contract(**args, attempt_id="1" * 32)
-    second = replacement_capacity.canonical_coin_prep_contract(**args, attempt_id="2" * 32)
-    assert len({legacy["operation_id"], first["operation_id"], second["operation_id"]}) == 3
-    assert legacy["target_contract"] == first["target_contract"] == second["target_contract"]
-    assert first == replacement_capacity.canonical_coin_prep_contract(**args, attempt_id="1" * 32)
+    first = replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="1" * 32
+    )
+    second = replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="2" * 32
+    )
+    assert (
+        len({legacy["operation_id"], first["operation_id"], second["operation_id"]})
+        == 3
+    )
+    assert (
+        legacy["target_contract"]
+        == first["target_contract"]
+        == second["target_contract"]
+    )
+    assert first == replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="1" * 32
+    )
     for invalid in ("", "1" * 31, "G" * 32, 1):
         with pytest.raises(ValueError, match="attempt_id"):
-            replacement_capacity.canonical_coin_prep_contract(**args, attempt_id=invalid)
+            replacement_capacity.canonical_coin_prep_contract(
+                **args, attempt_id=invalid
+            )
 
 
 def test_batch_constructed_outputs_bind_once_before_dispatch(
@@ -1079,13 +1098,18 @@ def test_submitted_coin_prep_can_resolve_no_effect_only_from_exact_selectable_co
 
 
 @pytest.mark.parametrize("journal_outcome", ["PREPARED", "SUBMITTED_UNKNOWN"])
-@pytest.mark.parametrize("persist_failure", [
-    "COIN_PREP_PREPARED_PERSIST_FAILED", "DIRECT_BATCH_PREPARED_PERSIST_FAILED"
-])
+@pytest.mark.parametrize(
+    "persist_failure",
+    ["COIN_PREP_PREPARED_PERSIST_FAILED", "DIRECT_BATCH_PREPARED_PERSIST_FAILED"],
+)
 @pytest.mark.parametrize("intervening_startup", [False, True])
 @pytest.mark.parametrize("recovery_fault", [None, "prior_effect", "identity", "reason"])
 def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect_view(
-    isolated_database, monkeypatch, journal_outcome, persist_failure, intervening_startup,
+    isolated_database,
+    monkeypatch,
+    journal_outcome,
+    persist_failure,
+    intervening_startup,
     recovery_fault,
 ):
     """A rejected pre-dispatch fee check must not permanently fence untouched coins."""
@@ -1213,13 +1237,15 @@ def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect
         conn.execute(
             "UPDATE coin_prep_operations SET outcome_evidence_json="
             "json_set(outcome_evidence_json, '$.effect_attempted', json('true')) "
-            "WHERE operation_id=?", (contract["operation_id"],),
+            "WHERE operation_id=?",
+            (contract["operation_id"],),
         )
     elif recovery_fault == "identity":
         conn.execute(
             "UPDATE coin_prep_operations SET wallet_identity_json="
             "json_set(wallet_identity_json, '$.network_id', 'testnet11') "
-            "WHERE operation_id=?", (contract["operation_id"],),
+            "WHERE operation_id=?",
+            (contract["operation_id"],),
         )
     elif recovery_fault == "reason":
         conn.execute("UPDATE runtime_safety_latch SET reason='unrelated failure'")
@@ -1227,10 +1253,13 @@ def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect
     if recovery_fault is not None:
         assert database.recover_coin_prep_predispatch_retry_collisions() == 0
         assert database.get_runtime_safety_latch()["state"] == "tripped"
-        assert conn.execute(
-            "SELECT COUNT(*) FROM wallet_effect_claim_resolutions WHERE claim_token=?",
-            (retry["claim_token"],),
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+                (retry["claim_token"],),
+            ).fetchone()[0]
+            == 0
+        )
         return
     if intervening_startup:
         database.close_connection()
@@ -1239,10 +1268,14 @@ def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect
         assert database.recover_coin_prep_predispatch_retry_collisions() == 0
     else:
         assert database.recover_coin_prep_predispatch_retry_collisions() == 1
-    resolution = database.get_connection().execute(
-        "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
-        (retry["claim_token"],),
-    ).fetchone()
+    resolution = (
+        database.get_connection()
+        .execute(
+            "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (retry["claim_token"],),
+        )
+        .fetchone()
+    )
     assert resolution[0] == "RELEASED_NO_EFFECT"
     assert database.get_runtime_safety_latch()["state"] == "resolved"
 

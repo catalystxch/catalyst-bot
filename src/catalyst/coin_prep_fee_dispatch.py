@@ -149,7 +149,10 @@ def price_approved_prep_batch(approval_id: str) -> dict:
 
 
 def reserve_approved_prep_dispatch(
-    *, approval_id: str, operation_id: str, priced_batch: dict,
+    *,
+    approval_id: str,
+    operation_id: str,
+    priced_batch: dict,
     attempt_id: str | None = None,
 ) -> dict:
     """Bind executable cost/effects to PREPARED journal and hold the exact fee.

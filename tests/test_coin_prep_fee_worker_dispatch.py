@@ -248,18 +248,24 @@ def test_pre_dispatch_fee_failure_recovers_only_after_exact_no_effect_view(
 
     # Identical economics after proven no-effect must create a new journal,
     # not collide with the immutable claim/evidence of the failed attempt.
-    first = [dict(row) for row in database.get_connection().execute(
-        "SELECT * FROM coin_prep_operations"
-    )]
+    first = [
+        dict(row)
+        for row in database.get_connection().execute(
+            "SELECT * FROM coin_prep_operations"
+        )
+    ]
     with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
         worker._submit_direct_batch_plan(
             active_worker["priced"]["pricing"]["plan"],
             utils.ADDRESS,
             priced_batch=active_worker["priced"],
         )
-    rows = [dict(row) for row in database.get_connection().execute(
-        "SELECT * FROM coin_prep_operations"
-    )]
+    rows = [
+        dict(row)
+        for row in database.get_connection().execute(
+            "SELECT * FROM coin_prep_operations"
+        )
+    ]
     assert len(rows) == 2
     assert first[0] in rows
     assert len({row["operation_id"] for row in rows}) == 2
@@ -290,11 +296,14 @@ def test_pre_dispatch_fee_failure_keeps_fence_without_wallet_proof(
     assert database.get_runtime_safety_latch()["state"] == "tripped"
     assert len(database.get_recoverable_coin_prep_operations()) == 1
     # A fresh attempt nonce cannot bypass an unresolved claim's cohort fence.
-    assert worker._submit_direct_batch_plan(
-        active_worker["priced"]["pricing"]["plan"],
-        utils.ADDRESS,
-        priced_batch=active_worker["priced"],
-    ) is False
+    assert (
+        worker._submit_direct_batch_plan(
+            active_worker["priced"]["pricing"]["plan"],
+            utils.ADDRESS,
+            priced_batch=active_worker["priced"],
+        )
+        is False
+    )
     assert utils._counts()["wallet_effect_claims"] == 1
     assert active_worker["adapter_attempts"] == []
 
