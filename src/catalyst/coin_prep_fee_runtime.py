@@ -260,7 +260,9 @@ def read_fee_wallet_snapshot() -> dict:
     ids = [row["coin_id"] for rows in observed.values() for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("FEE_WALLET_INVENTORY_UNAVAILABLE")
-    reconciliation = set(database.get_coin_reconciliation_protected_ids(ids))
+    reconciliation = {
+        _hex(coin_id) for coin_id in database.get_coin_reconciliation_protected_ids(ids)
+    }
     coins = []
     for asset, rows in observed.items():
         reserves = {_hex(row["coin_id"]) for row in database.get_reserve_coins(asset)}
