@@ -25,3 +25,9 @@ Cycles `#0` through `#5` completed with `3b/3s active` and the live safety endpo
 The durable campaign expiry is `2026-10-12T15:31:46.533868Z`, about 74 minutes before that monitor reaches 24 hours. Consequently this run cannot satisfy a continuous 24-hour **active-campaign** gate, even if every sample remains healthy until the campaign stops. Preserve it as a bounded live-book/restart observation; a fresh campaign and separately timed trace are required for the full gate. At the read-only check on 2026-10-11, the campaign was still active, the authoritative fee spend remained zero, and no renewal or cancellation was performed.
 
 Harvestr on the other PC remains separately safety-fenced after its confirmed Coin Prep transactions and a heartbeat SQLite lock failure. This TEST 7 bridge fix does not address that failure.
+
+## Overnight read-only observation
+
+At `2026-10-12T02:58:14Z`, the exact-PID/hash monitor had recorded `604` clean samples with the bot running, Sage synced, safety allowed, and the lease owned. The native Offers view showed six open MZ offers: three buys and three sells. All six rows showed exact Dexie discovery; Splash rows said local submission was acknowledged but peer broadcast was unverified. The current app log reported cycle `#802` complete with `3b/3s active` and an empty Splash queue.
+
+The existing local Splash process was PID `197208`, listening for offers on `127.0.0.1:4000` and exposing metrics on `127.0.0.1:4001`. A read-only metrics request at approximately `03:00Z` returned `peers: 0`, `offers_broadcasted: 0`, `offers_received: 0`, and `total_connections: 0`. This confirms local Splash operation but provides no independent peer-delivery evidence. The earlier rejected two-node launch was not retried. No offer, wallet, campaign, or node setting was changed during this check.
