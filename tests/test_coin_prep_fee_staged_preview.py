@@ -100,7 +100,9 @@ def test_runtime_preview_prices_exact_cat_future_native_and_protected_cancels(st
     ) and "coin_spends" not in json.dumps(result)
 
 
-@pytest.mark.parametrize("root_count,amount,remaining", [(55, 200, 0), (153, 80, 2), (500, 24, 9)])
+@pytest.mark.parametrize(
+    "root_count,amount,remaining", [(55, 200, 0), (153, 80, 2), (500, 24, 9)]
+)
 def test_cat_fragmentation_preview_covers_consolidation_final_prep_and_cancels(
     staged, root_count, amount, remaining
 ):

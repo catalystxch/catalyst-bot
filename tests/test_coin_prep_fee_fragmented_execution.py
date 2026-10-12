@@ -104,7 +104,10 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
             competitor.status = copy.copy(state["worker"].status)
             with pytest.raises(ValueError, match="FEE_EFFECT_RECOVERY_REQUIRED"):
                 competitor._run_direct_batch_prep()
-            assert database.get_fee_approval(approval["approval_id"])["held_fee_mojos"] == 20
+            assert (
+                database.get_fee_approval(approval["approval_id"])["held_fee_mojos"]
+                == 20
+            )
         sent.append(unsigned)
         return {"success": True, "transaction_id": len(sent).to_bytes(32, "big").hex()}
 
@@ -170,7 +173,9 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
                 raise RuntimeError("simulated restart after confirmed prerequisite")
             return price(approval_id)
 
-        monkeypatch.setattr(dispatch, "price_approved_prep_batch", interrupt_after_confirmed)
+        monkeypatch.setattr(
+            dispatch, "price_approved_prep_batch", interrupt_after_confirmed
+        )
         with pytest.raises(RuntimeError, match="simulated restart"):
             worker._run_direct_batch_prep()
         assert len(sent) == 1 and len(observations) == 1

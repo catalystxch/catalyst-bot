@@ -967,19 +967,25 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             )
         return None
 
-    future_amounts = [] if plan is None else [
-        c.amount_mojos
-        for c in context["funding"]["snapshot"].coins
-        if c.asset == "xch"
-        and c.selectable
-        and not c.protected
-        and c.coin_id not in plan.reused_coin_ids
-        and c.coin_id not in plan.source_coin_ids
-        and c.coin_id != plan.fee_source_id
-    ] + [
-        o.amount_mojos for o in plan.outputs
-        if o.asset == "xch" and o.purpose in {"change", "fee_change"}
-    ]
+    future_amounts = (
+        []
+        if plan is None
+        else [
+            c.amount_mojos
+            for c in context["funding"]["snapshot"].coins
+            if c.asset == "xch"
+            and c.selectable
+            and not c.protected
+            and c.coin_id not in plan.reused_coin_ids
+            and c.coin_id not in plan.source_coin_ids
+            and c.coin_id != plan.fee_source_id
+        ]
+        + [
+            o.amount_mojos
+            for o in plan.outputs
+            if o.asset == "xch" and o.purpose in {"change", "fee_change"}
+        ]
+    )
     future_cat_fee_steps = []
     if cat_prerequisite:
         # Only amounts of future confirmed roots are used for coverage, never

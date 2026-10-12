@@ -183,10 +183,14 @@ def test_cat_prerequisite_excludes_reused_and_protected_roots():
                 coin("xch", "fee", 100),
             )
         ),
-        (target("cat", "tier", 11000, 0), target("cat", "tier", 50, 1),
-         target("xch", "tier", 20, 0)),
-        constraints(reserve_floors={"xch": 20, "cat": 50},
-                    allow_bounded_prerequisite=True),
+        (
+            target("cat", "tier", 11000, 0),
+            target("cat", "tier", 50, 1),
+            target("xch", "tier", 20, 0),
+        ),
+        constraints(
+            reserve_floors={"xch": 20, "cat": 50}, allow_bounded_prerequisite=True
+        ),
     )
     assert isinstance(result, BatchPlan)
     assert result.fee_source_id == "fee"
