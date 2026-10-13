@@ -305,3 +305,26 @@ requested Take test.
   remained draft with all 11 checks green. The older exact-PID monitor ended
   after the planned app close and had previously recorded a blocked safety
   sample, so it earns no 24-hour acceptance credit.
+
+## 11:55 UTC new cancellation pending, safety fence retained
+
+- After a fresh user confirmation, the native Cancel All dialog was confirmed
+  for the three Sage-active MZ offers (one buy, two sells), with TEST 7
+  fingerprint 736588221, zero pending transactions, and the resolved latch
+  rechecked just before the click. The app began with sell
+  `4d9e0b37...c8c7`: journal sequence 10153 `CANCEL/PREPARED`, then 10154
+  `CANCEL/FINALIZED/CANCEL_SUBMITTED_UNCONFIRMED` at 11:55:45Z. The native
+  progress display remained at 0/3, waiting for authoritative proof.
+- Sage reported one pending transaction
+  `23fc328ac201fe084f7fd73f7e0891fc9aba4fc1f2d3989f1d09e4ac30c9161f`.
+  Its native log recorded multiple peer acknowledgements with status 1 and
+  no error. Relay acceptance is not chain confirmation. At the 12:04Z
+  read-only check Sage still classified all three offers active, with one
+  pending transaction; CATalyst still had three open rows. The transaction
+  reports fee zero, matching this profile's manual `TRANSACTION_FEE_XCH=0`
+  setting. No claim is made that the fee setting caused the delay.
+- Safety latch generation 667 tripped `UNRESOLVED_OPERATIONS` for the first
+  cancellation, and the background batch did not submit the other two while
+  proof remained missing. The bot stayed stopped and the new PID 188444 lease
+  continued renewing. No retry, manual latch clear, fee bump, or second
+  cancellation was attempted. Final disposition and fee ledger remain open.
