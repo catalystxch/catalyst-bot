@@ -106,6 +106,12 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   computer-use tool because its mapped point was outside the 1000×700 window;
   no tab change occurred. The current window therefore cannot support a fresh
   full visual GUI acceptance. A physical-screen report is still pending.
+- A later normal in-window `Ctrl+R` refresh on the observed Dashboard returned a
+  populated, running accessibility document but the captured WebView remained
+  black. No wallet control, process restart, or offer mutation was used. The
+  active monitor remained clean. Recent Application Error/Windows Error
+  Reporting events contained no CATalyst or WebView2 crash, and no display
+  driver recovery event appeared; this does not identify the rendering cause.
 
 ## Inbound Splash rule found at 05:57 UTC
 
@@ -125,3 +131,29 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   <https://github.com/dexie-space/splash/blob/main/src/main.rs>.
 - A request for the operator to allow private-network inbound Splash traffic on
   this PC was sent. Direct two-PC peer receipt remains unverified.
+
+## Recheck at 06:13 UTC
+
+- The original TEST 7 executable still matched the pinned SHA-256 and solely
+  owned local port 5000. The exact-PID/hash trace had 160 contiguous samples
+  through 06:12:59Z, with no process, bot, Sage sync, safety or owned-lease
+  failure; its largest intersample gap was 63.62 seconds. This is not the
+  24-hour endpoint.
+- Both exact primary Dexie offer IDs still returned public status `0` and the
+  expected Sage trade IDs. The local Splash metrics remained at zero peers,
+  zero received offers and zero connections. No cross-wallet take or reverse
+  peer receipt had occurred.
+- The WebView2 child process remained alive. The native window capture was
+  still black after a normal in-window refresh, while its accessibility tree
+  continued to expose a live running Dashboard. The desktop code selects Edge
+  WebView2 and a frameless window; these observations do not isolate a renderer
+  cause. No live runtime or wallet action was changed.
+- The draft integration PR head `7dd011e01be261ddd27b9a0f9877c4fde1994aea`
+  completed all 11 checks successfully. This is source/CI evidence; the
+  original-profile live processes still run their earlier pinned binaries.
+- The independent Harvestr tester audited 159 continuous clean live samples
+  and left Sage's exact TEST 7 sell-offer preview untouched. Its installed
+  Splash CLI has no identity-query command, metrics expose only counters, and
+  retained accessible logs no longer contain its startup PeerId. A complete
+  known-peer LAN multiaddress for the current process therefore remains
+  unverified. No node was restarted to obtain one.
