@@ -1083,7 +1083,8 @@ def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
 
 
 def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing(
-    isolated_database, monkeypatch,
+    isolated_database,
+    monkeypatch,
 ):
     """The exact Cancel All incident needs a durable stop before Task 9 settles."""
 
@@ -1091,7 +1092,8 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
 
     database.init_database()
     monkeypatch.setattr(
-        database, "_stability_wall_clock",
+        database,
+        "_stability_wall_clock",
         lambda: "2026-08-15T12:00:00.000000Z",
     )
     fingerprint = 736588221
@@ -1138,17 +1140,24 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
     )
     _prepare("parent", reserve_selected_coins=True, wallet_hash=wallet_hash)
     _confirm(
-        "parent", finalize_selected_coin_reservations=True,
+        "parent",
+        finalize_selected_coin_reservations=True,
         wallet_hash=wallet_hash,
     )
     database.record_offer_intent_visibility(
-        "parent", publication_identity="registry:parent",
+        "parent",
+        publication_identity="registry:parent",
         visible_at="2026-08-15T12:01:00.000000Z",
     )
     parent_trade = _sha("trade:parent")
     assert database.add_offer(
-        parent_trade, "buy", Decimal("0.01"), Decimal("1"),
-        Decimal("100"), _sha("asset-a"), tier="inner",
+        parent_trade,
+        "buy",
+        Decimal("0.01"),
+        Decimal("1"),
+        Decimal("100"),
+        _sha("asset-a"),
+        tier="inner",
     )
     operation = f"cancel:{parent_trade}"
     database.prepare_offer_cancel(
@@ -1167,8 +1176,7 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
         },
         prepared_at="2026-08-15T12:02:00.000000Z",
     )
-    _prepare("child", parent_intent_id="parent", generation=1,
-             wallet_hash=wallet_hash)
+    _prepare("child", parent_intent_id="parent", generation=1, wallet_hash=wallet_hash)
     _confirm("child", wallet_hash=wallet_hash)
     database.bind_refresh_lineage("parent", "child")
     assert database.claim_offer_cancel_effect(
@@ -1237,25 +1245,40 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
     assert database.refresh_lineage_completion("parent")["complete"] is False
     assert database.begin_refresh_abort(**request)["idempotent"] is True
     with pytest.raises(ValueError):
-        database.begin_refresh_abort(**{
-            **request, "expected_latch_generation": before["generation"] + 1,
-        })
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "expected_latch_generation": before["generation"] + 1,
+            }
+        )
     with pytest.raises(ValueError):
-        database.begin_refresh_abort(**{
-            **request, "observed_trade_ids": [_sha("unknown-trade")],
-        })
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "observed_trade_ids": [_sha("unknown-trade")],
+            }
+        )
     with pytest.raises(ValueError):
-        database.begin_refresh_abort(**{
-            **request, "owner_run_id": "another-run",
-        })
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "owner_run_id": "another-run",
+            }
+        )
     with pytest.raises(ValueError):
-        database.begin_refresh_abort(**{
-            **request, "child_intent_id": "unrelated-child",
-        })
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "child_intent_id": "unrelated-child",
+            }
+        )
     with pytest.raises(ValueError):
-        database.begin_refresh_abort(**{
-            **request, "expected_lease_version": lease["lease"]["lease_version"] + 1,
-        })
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "expected_lease_version": lease["lease"]["lease_version"] + 1,
+            }
+        )
     database.trip_runtime_safety_latch(
         reason_code="UNRESOLVED_OPERATIONS",
         blocking_operation_ids=["another:operation"],

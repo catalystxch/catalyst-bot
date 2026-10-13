@@ -29688,7 +29688,9 @@ def begin_refresh_abort(
         if latch_row is None or lease_row is None or campaign_row is None:
             raise ValueError("abort authority is incomplete")
         latch, lease, saved_campaign = (
-            dict(latch_row), dict(lease_row), dict(campaign_row)
+            dict(latch_row),
+            dict(lease_row),
+            dict(campaign_row),
         )
         wallet_hash, network = parent["wallet_fingerprint_hash"], parent["network"]
         if (
@@ -29784,7 +29786,8 @@ def begin_refresh_abort(
             if any(current[key] != value for key, value in immutable.items()):
                 raise ValueError("refresh abort replay differs")
             if set(json.loads(latch["blocking_operation_ids_json"])) != {
-                cancel_op, blocker,
+                cancel_op,
+                blocker,
             }:
                 raise ValueError("refresh abort has an additional safety blocker")
             conn.commit()
