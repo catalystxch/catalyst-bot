@@ -266,3 +266,42 @@ requested Take test.
   configured Sage wallet. They include the proof-only Cancel All status and
   preflight rejection display. This is isolated GUI evidence, not a live
   original-profile native traversal or wallet recovery pass.
+
+## 11:45 UTC original-profile recovery on the verified replacement
+
+- With the user's action-time approval, the older f034 app was closed through
+  its native shutdown dialog with **cancel offers unchecked**. Its PID and
+  port 5000 cleared and its lease was released. The pinned `49c745e` EXE
+  above was launched through native computer use as PID 188444, sole port
+  5000 owner; its on-disk SHA-256 matched the pinned package. The user had
+  previously acknowledged testing Risk Disclosure. TEST 7 fingerprint
+  736588221 was explicitly selected, and the prior MZ session was loaded
+  without starting the bot or running Coin Prep. The exact MZ asset remains
+  `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`.
+- Startup's normal proof reconciliation recorded journal sequence 10151
+  `RECONCILE/FINALIZED/CANCELLED_PROVEN` and sequence 10152
+  `CANCEL/RECONCILED/CANCEL_CONFIRMED` at 11:45:55.676035Z. The cancelled
+  parent `37640699...8ecf` became `cancelled` in `offers`, and safety latch
+  generation 666 changed from `tripped/UNRESOLVED_OPERATIONS` to `resolved`
+  with zero blockers. No wallet dispatch occurred after launch; the latest
+  `wallet_effect_dispatches.dispatched_at` remained 2026-10-11T08:27:07Z.
+  The native Cancel All bridge's blocked branch was therefore **not**
+  exercised on the original profile: startup cleared the latch first.
+- CATalyst's restored session and `Offers` tab show one buy and two sells;
+  a read-only Sage wallet facade call reports the same three exact active
+  trade IDs (`9d4f36...5331e`, `4d9e0b...c8c7`,
+  `ab93ca...901b`), zero pending transactions, and the same mainnet
+  fingerprint. The bot remains stopped. The native Cancel All confirmation
+  dialog is open but its final control has **not** been pressed; a fresh
+  action-time answer is pending. The dialog warns that it covers every live
+  offer in the connected wallet, including offers not tracked by CATalyst.
+- Splash was started from the native startup screen as a separate
+  `splash.exe` process. At inspection it had three listening sockets and
+  two `SynSent` connections, with no established peer connection. This is
+  only a node-start check; peer receipt remains unproven.
+- The full serial local Windows backend suite on this worktree completed
+  `7670 passed, 279 skipped, 457 subtests passed` in 1553.19 seconds.
+  The evidence-only PR head `4f495f08056dcbf8bc0bac4b87f816b778b8cd32`
+  remained draft with all 11 checks green. The older exact-PID monitor ended
+  after the planned app close and had previously recorded a blocked safety
+  sample, so it earns no 24-hour acceptance credit.
