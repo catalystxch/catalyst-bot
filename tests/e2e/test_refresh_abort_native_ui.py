@@ -9,6 +9,99 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.e2e
 
 
+def test_restricted_recovery_page_only_submits_reviewed_next_target(page):
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
+    page.evaluate(
+        """() => {
+          const trade = 'c'.repeat(64), campaign = 'b'.repeat(64);
+          window.__recoveryCalls = [];
+          window.confirm = () => true;
+          window.fetch = async (path, options = {}) => {
+            if (options.method === 'POST') {
+              window.__recoveryCalls.push({path, body: JSON.parse(options.body)});
+              return new Response(JSON.stringify({success: true,
+                stage: 'awaiting_target_proof'}), {status: 200});
+            }
+            return new Response(JSON.stringify({
+              success: true, stage: 'parent_terminal',
+              abort: {abort_id: 'a'.repeat(64), campaign_id: campaign,
+                      latch_generation: 7},
+              wallet: {fingerprint: 736588221, network: 'mainnet',
+                       asset_id: 'd'.repeat(64), active_trade_ids: [trade],
+                       pending_transaction_count: 0},
+              safety: {state: 'tripped', generation: 7, lease_owned: true},
+              stopped_campaigns: [{campaign_id: campaign,
+                                   fee_approval_id: 'f'.repeat(64)}],
+              next_target_journal: null
+            }), {status: 200});
+          };
+        }"""
+    )
+    page.locator("#refresh").click()
+    expect(page.locator("#advance")).to_have_text("Review cancellation of " + "c" * 64)
+    page.locator("#advance").click()
+    page.wait_for_function("() => window.__recoveryCalls.length === 1")
+    call = page.evaluate("window.__recoveryCalls[0]")
+    assert call["path"].endswith("/refresh_abort/cancel_next")
+    assert call["body"]["expected_next_trade_id"] == "c" * 64
+    assert call["body"]["expected_trade_ids"] == ["c" * 64]
+
+
+def test_restricted_recovery_fee_flow_never_calls_coin_prep(page):
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
+    page.evaluate(
+        """() => {
+          const campaign = 'b'.repeat(64);
+          window.__recoveryCalls = [];
+          window.__approved = false;
+          window.confirm = () => true;
+          window.fetch = async (path, options = {}) => {
+            if (options.method === 'POST') {
+              window.__recoveryCalls.push({path, body: JSON.parse(options.body)});
+              if (path.endsWith('/fee_preview')) return new Response(JSON.stringify({
+                success: true, preview_id: '2'.repeat(64),
+                preparation_transaction_count_min: 0,
+                suggested_maximum_fee_mojos: '5000000000',
+                minimum_cancellation_reserve_mojos: '1000000000'
+              }), {status: 200});
+              window.__approved = true;
+              return new Response(JSON.stringify({success: true,
+                approval_id: '3'.repeat(64)}), {status: 200});
+            }
+            return new Response(JSON.stringify({
+              success: true, stage: 'parent_terminal',
+              abort: {abort_id: 'a'.repeat(64), campaign_id: campaign,
+                      latch_generation: 7},
+              wallet: {fingerprint: 736588221, network: 'mainnet',
+                       asset_id: 'd'.repeat(64), active_trade_ids: ['c'.repeat(64)],
+                       pending_transaction_count: 0},
+              safety: {state: 'tripped', generation: 7, lease_owned: true},
+              stopped_campaigns: [{campaign_id: campaign,
+                fee_approval_id: window.__approved ? '3'.repeat(64) : null}],
+              next_target_journal: null
+            }), {status: 200});
+          };
+        }"""
+    )
+    page.locator("#refresh").click()
+    page.locator("#advance").click()
+    expect(page.locator("#feeRow")).to_be_visible()
+    expect(page.locator("#feeMaximum")).to_have_value("0.005")
+    page.locator("#advance").click()
+    page.wait_for_function("() => window.__recoveryCalls.length === 2")
+    calls = page.evaluate("window.__recoveryCalls")
+    assert [call["path"].split("/")[-1] for call in calls] == [
+        "fee_preview",
+        "fee_approval",
+    ]
+    assert calls[1]["body"]["maximum_fee_mojos"] == "5000000000"
+    assert calls[1]["body"]["cancellation_reserve_mojos"] == "1000000000"
+
+
 def test_fenced_cancel_dialog_submits_one_exact_target(page):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
     page.evaluate(

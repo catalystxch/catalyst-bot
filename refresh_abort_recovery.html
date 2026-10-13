@@ -23,7 +23,7 @@
 <body>
   <main>
     <h1>Fenced offer recovery</h1>
-    <p class="notice">Trading remains stopped. This page reads the exact wallet and safety state. It cannot create, cancel, or publish an offer.</p>
+    <p class="notice">Trading remains stopped. This page can recover only the fenced offer lineage shown below. Each cancellation needs a fresh wallet and safety check and a separate confirmation.</p>
     <button type="button" id="refresh">Refresh proof</button>
     <p id="status" role="status" aria-live="polite">Reading recovery state…</p>
     <dl>
@@ -36,6 +36,17 @@
       <dt>Sage active offers</dt><dd id="offers">—</dd>
       <dt>Last observation</dt><dd id="observed">—</dd>
     </dl>
+    <h2>Exact cleanup</h2>
+    <p id="scope">No fenced cleanup is ready.</p>
+    <label id="campaignRow" hidden>Stopped campaign
+      <select id="campaign"></select>
+    </label>
+    <div id="feeRow" hidden>
+      <p id="feeEstimate">—</p>
+      <label>Maximum total fee (XCH) <input id="feeMaximum" inputmode="decimal" autocomplete="off"></label>
+      <label>Cancellation reserve (XCH) <input id="feeReserve" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <p><button type="button" id="advance" disabled>Review exact recovery</button></p>
   </main>
   <script>
     const fields = Object.fromEntries(
@@ -43,7 +54,90 @@
         .map(key => [key, document.getElementById(key)])
     );
     const button = document.getElementById('refresh');
+    const advance = document.getElementById('advance');
+    const campaignRow = document.getElementById('campaignRow');
+    const campaignSelect = document.getElementById('campaign');
+    const feeRow = document.getElementById('feeRow');
+    const feeMaximum = document.getElementById('feeMaximum');
+    const feeReserve = document.getElementById('feeReserve');
+    const feeEstimate = document.getElementById('feeEstimate');
+    let proof = null;
+    let feeQuote = null;
+    let nextAction = null;
     const show = (key, value) => { fields[key].textContent = String(value ?? '—'); };
+    const asXch = value => {
+      const mojos = BigInt(String(value));
+      const whole = mojos / 1000000000000n;
+      const fraction = (mojos % 1000000000000n).toString().padStart(12, '0').replace(/0+$/, '');
+      return `${whole}${fraction ? '.' + fraction : ''}`;
+    };
+    const asMojos = value => {
+      if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,12})?$/.test(value)) throw new Error('Enter an exact XCH amount with at most 12 decimals.');
+      const [whole, fraction = ''] = value.split('.');
+      return (BigInt(whole) * 1000000000000n + BigInt(fraction.padEnd(12, '0'))).toString();
+    };
+    async function postExact(action, body) {
+      const response = await fetch(`/api/offers/refresh_abort/${action}`, {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+        headers: {'Content-Type': 'application/json', Accept: 'application/json'},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok || data.success !== true) throw new Error(data.error || data.reason || data.stage || 'Exact recovery unavailable');
+      return data;
+    }
+    const abortScope = data => ({
+      abort_id: data.abort.abort_id,
+      expected_latch_generation: data.abort.latch_generation,
+      expected_trade_ids: data.wallet.active_trade_ids
+    });
+    function renderAction(data) {
+      proof = data;
+      feeQuote = null;
+      nextAction = null;
+      feeRow.hidden = true;
+      campaignRow.hidden = true;
+      advance.disabled = true;
+      const trades = data.wallet?.active_trade_ids;
+      const ready = data.safety?.lease_owned === true && data.safety?.state === 'tripped'
+        && data.wallet?.pending_transaction_count === 0 && Array.isArray(trades);
+      document.getElementById('scope').textContent = data.abort
+        ? `Abort ${data.abort.abort_id} · campaign ${data.abort.campaign_id} · ${trades.length} active Sage offers`
+        : data.candidate ? `Submitted parent ${data.candidate.parent_intent_id}` : 'No exact fenced cleanup candidate.';
+      if (!ready) return;
+      if (data.stage === 'submitted_parent_proof' && data.candidate) {
+        const campaigns = data.stopped_campaigns || [];
+        campaignSelect.replaceChildren();
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Choose the reviewed stopped campaign';
+        campaignSelect.append(placeholder);
+        for (const campaign of campaigns) {
+          const option = document.createElement('option');
+          option.value = campaign.campaign_id;
+          option.textContent = `${campaign.campaign_id} · fee budget ${campaign.fee_budget_xch} XCH`;
+          campaignSelect.append(option);
+        }
+        campaignRow.hidden = false;
+        nextAction = 'begin';
+        advance.textContent = 'Verify parent cancellation';
+        advance.disabled = true;
+      } else if (data.abort && data.stage === 'parent_terminal') {
+        if (data.next_target_journal) {
+          nextAction = 'reconcile_target';
+          advance.textContent = 'Check submitted cancellation proof';
+        } else if (trades.length === 0) {
+          nextAction = 'complete';
+          advance.textContent = 'Verify empty book and complete recovery';
+        } else {
+          const campaign = (data.stopped_campaigns || []).find(c => c.campaign_id === data.abort.campaign_id);
+          nextAction = campaign?.fee_approval_id ? 'cancel_next' : 'fee_preview';
+          advance.textContent = nextAction === 'cancel_next'
+            ? `Review cancellation of ${trades[0]}` : 'Review cancellation-only fee estimate';
+        }
+        advance.disabled = false;
+      }
+    }
     async function refreshProof() {
       button.disabled = true;
       show('status', 'Reading recovery state…');
@@ -62,14 +156,86 @@
         show('offers', Array.isArray(data.wallet?.active_trade_ids)
           ? data.wallet.active_trade_ids.join('\n') || 'None' : 'Unavailable');
         show('observed', data.wallet?.observed_at);
-        show('status', 'Read-only proof loaded.');
+        renderAction(data);
+        show('status', 'Exact proof loaded. Review the next action before proceeding.');
       } catch (_) {
+        proof = null;
+        nextAction = null;
+        advance.disabled = true;
+        feeRow.hidden = true;
+        campaignRow.hidden = true;
         show('status', 'Recovery proof is unavailable. Trading remains stopped.');
         for (const key of ['stage', 'wallet', 'asset', 'safety', 'lease', 'pending', 'offers', 'observed']) show(key, 'Unavailable');
       } finally {
         button.disabled = false;
       }
     }
+    campaignSelect.addEventListener('change', () => {
+      advance.disabled = nextAction !== 'begin' || !campaignSelect.value;
+    });
+    advance.addEventListener('click', async () => {
+      if (!proof || !nextAction || advance.disabled) return;
+      advance.disabled = true;
+      try {
+        const action = nextAction;
+        if (action === 'begin') {
+          if (!window.confirm(`Verify the submitted parent and fence only campaign ${campaignSelect.value}?`)) return;
+          await postExact('begin', {
+            confirmation: true,
+            parent_intent_id: proof.candidate.parent_intent_id,
+            child_intent_id: proof.candidate.child_intent_id,
+            campaign_id: campaignSelect.value,
+            expected_latch_generation: proof.safety.generation,
+            expected_trade_ids: proof.wallet.active_trade_ids
+          });
+        } else if (action === 'fee_preview') {
+          feeQuote = await postExact('fee_preview', abortScope(proof));
+          if (feeQuote.preparation_transaction_count_min !== 0) throw new Error('Cancellation-only quote unavailable');
+          feeMaximum.value = asXch(feeQuote.suggested_maximum_fee_mojos);
+          feeReserve.value = asXch(feeQuote.minimum_cancellation_reserve_mojos);
+          feeEstimate.textContent = `Cancellation only: zero preparation transactions. Suggested maximum ${feeMaximum.value} XCH; minimum cancellation reserve ${feeReserve.value} XCH.`;
+          feeRow.hidden = false;
+          nextAction = 'fee_approval';
+          advance.textContent = 'Approve cancellation fee budget';
+          show('status', 'Review the exact fee amounts, then approve this campaign only.');
+          return;
+        } else if (action === 'fee_approval') {
+          if (!feeQuote || !window.confirm('Approve this cancellation-only fee budget for the displayed campaign? No coins will be prepared.')) return;
+          await postExact('fee_approval', {
+            ...abortScope(proof), confirmation: true, preview_id: feeQuote.preview_id,
+            maximum_fee_mojos: asMojos(feeMaximum.value),
+            cancellation_reserve_mojos: asMojos(feeReserve.value)
+          });
+        } else if (action === 'cancel_next') {
+          const target = proof.wallet.active_trade_ids[0];
+          const campaign = proof.stopped_campaigns.find(c => c.campaign_id === proof.abort.campaign_id);
+          if (!window.confirm(`Cancel only Sage offer ${target}? This is a wallet transaction and may incur a fee.`)) return;
+          await postExact('cancel_next', {
+            ...abortScope(proof), confirmation: true, expected_next_trade_id: target,
+            fee_approval_id: campaign.fee_approval_id
+          });
+        } else if (action === 'reconcile_target') {
+          await postExact('reconcile_target', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            trade_id: proof.next_target_journal.trade_id
+          });
+        } else if (action === 'complete') {
+          if (!window.confirm('Verify the empty Sage book and complete only this fenced recovery?')) return;
+          await postExact('complete', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            confirmation: true
+          });
+        }
+        await refreshProof();
+      } catch (error) {
+        show('status', `Action held: ${error.message}. Refresh proof before retrying.`);
+        nextAction = null;
+      } finally {
+        advance.disabled = !nextAction || (nextAction === 'begin' && !campaignSelect.value);
+      }
+    });
     button.addEventListener('click', refreshProof);
     refreshProof();
   </script>
