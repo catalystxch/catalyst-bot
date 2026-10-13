@@ -487,3 +487,25 @@ requested Take test.
   revision manifest, so source identity rests on the pinned build worktree,
   command and handoff hash. Packaged runtime and original-profile recovery
   remain unverified.
+
+## 14:48 UTC exact replacement publication sequence
+
+- Original-profile log and read-only durable outbox rows show the replacement
+  sell `ab93cacc...901b` was created at 08:54:29Z. Its Dexie outbox entry
+  was queued then and still has **zero attempts**; the same child's Splash
+  entry records one successful *local dispatch* at 08:54:50Z.
+- The 08:54 cycle's Dexie flush posted the replacement buy first, then logged
+  `dexie_durable_flush_budget` at 08:54:42Z, explicitly leaving remaining
+  claims queued for the next cycle. That buy was independently rediscovered
+  on Dexie at 08:54:45Z. Splash reported `InsufficientPeers` twice. The next
+  cycle spent about 90 seconds waiting for an earlier submitted cancellation,
+  then the bot switched read-only on `UNRESOLVED_OPERATIONS` at 08:56:52Z,
+  before another successful Dexie drain of the queued sell.
+- This establishes the local sequence that stranded the child's Dexie work:
+  the bounded publication queue deferred it and a later safety stop prevented
+  the next normal bot-cycle drain. It does **not** prove the offer never reached
+  any peer or justify publishing while the safety gate is closed. The later
+  11:55 Cancel All was incorrectly able to prepare this child's parent while
+  the child remained `created`, which the exact PR #268 guard now prevents
+  prospectively. Recovery for the already submitted parent still needs a
+  separately reviewed path that preserves the current fence.
