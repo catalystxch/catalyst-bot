@@ -8444,9 +8444,9 @@ def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
     monkeypatch.setattr(
         database,
         "list_fenced_refresh_abort_candidates",
-        lambda **_kwargs: [{"cancel_operation_id": operation_id}]
-        if change != "none"
-        else [],
+        lambda **_kwargs: (
+            [{"cancel_operation_id": operation_id}] if change != "none" else []
+        ),
     )
     monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
     monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
