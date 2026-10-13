@@ -7554,6 +7554,10 @@ def _migrate_stability_schema() -> None:
                 "offer_fill_sweep_delivery_claim_attestations",
                 "offer_refresh_lineage_commits",
                 "offer_refresh_lineage_blockers",
+                # Introduced after the original stability backfill watermark.
+                # An existing profile can legitimately lack this table on
+                # its first fenced refresh-abort upgrade.
+                "offer_refresh_aborts",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",
                 "runtime_recovery_passes",
