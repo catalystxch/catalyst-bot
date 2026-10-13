@@ -116,3 +116,10 @@
   A watermarked existing-profile schema upgrade installs the receipt table;
   the 143-test schema/recovery suite passed locally. This is still a dormant
   recovery primitive, not a live recovery result.
+- A disposable two-target incident now passes through both distinct Task 8
+  cancellation submissions, both Task 9 terminal chain/coin proofs, and the
+  final empty-book abort completion. The test asserts one Sage cancellation
+  effect per exact target, two separate fee coins, a retained fence between
+  targets, and an unresolved Task 11 refresh lineage after completion. All
+  ten incident variants plus the real fee-finalization test passed locally.
+  This is mock-Sage evidence only; it does not approve original-profile use.

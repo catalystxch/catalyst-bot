@@ -9015,7 +9015,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     )
     database.bind_refresh_lineage("intent-task9", child_id)
     extra_trade = "f" * 64
-    extra_intent = "extra-cleanup-intent"
+    extra_intent = "9" * 64
     observed_book = [OTHER_TRADE]
     if prepared_cleanup == "multi_target":
         extra_coin = "e" * 64
@@ -9501,23 +9501,23 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             wallet, "close_offer_cancel_continuation", lambda *_args: True
         )
         effects = []
-        monkeypatch.setattr(
-            wallet,
-            "cancel_offers_batch",
-            lambda selected, **_request: (
-                effects.append(selected)
-                or {
-                    OTHER_TRADE: cancellation_result(
-                        CANCEL_SUBMITTED_UNCONFIRMED,
-                        method="sage_native_cancel_offers",
-                        raw_response={"success": True},
-                        transaction_id="a" * 64,
-                        spend_identity="sha256:" + "b" * 64,
-                    ),
-                    "_catalyst_effect_attempted": True,
-                }
-            ),
-        )
+
+        def cancelled_one(selected, **_request):
+            effects.append(selected)
+            trade_id = selected[0]
+            return {
+                trade_id: cancellation_result(
+                    CANCEL_SUBMITTED_UNCONFIRMED,
+                    method="sage_native_cancel_offers",
+                    raw_response={"success": True},
+                    transaction_id=("a" if trade_id == OTHER_TRADE else "c") * 64,
+                    spend_identity="sha256:"
+                    + ("b" if trade_id == OTHER_TRADE else "d") * 64,
+                ),
+                "_catalyst_effect_attempted": True,
+            }
+
+        monkeypatch.setattr(wallet, "cancel_offers_batch", cancelled_one)
         pricing = __import__("coin_prep_fee_cancellation")
         monkeypatch.setattr(
             pricing,
@@ -9551,7 +9551,16 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             database, "record_coin_prep_cancellation_fee_outcome", lambda _manifest: {}
         )
         pool = FeeCoinPool()
-        pool.refresh([{"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}}])
+        pool.refresh(
+            [
+                {"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}},
+                *(
+                    [{"coin_id": "7" * 64, "coin": {"amount": 500_000_000}}]
+                    if prepared_cleanup == "multi_target"
+                    else []
+                ),
+            ]
+        )
         manager = offer_manager.OfferManager()
         manager._fee_pool = pool
         if prepared_cleanup == "crash_after_claim":
@@ -9807,6 +9816,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             database.get_runtime_safety_latch()["blocking_operation_ids_json"]
         ) == [abort["blocking_operation_id"]]
         if prepared_cleanup == "multi_target":
+            observed_book[:] = [extra_trade]
             remaining = database.authorize_refresh_abort_cleanup_target(
                 abort_id=abort["abort_id"],
                 trade_id=extra_trade,
@@ -9832,6 +9842,153 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
                     observed_pending_transaction_ids=[],
                     observed_at=fresh_clock(),
                 )
+            second = manager.cancel_refresh_abort_targets(**request)
+            assert second["trade_id"] == extra_trade
+            assert second["result"]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+            assert effects == [[OTHER_TRADE], [extra_trade]]
+            second_prepared = database.get_offer_operation_events(
+                f"cancel:{extra_trade}"
+            )[0]
+            second_observed = (
+                (
+                    datetime.fromisoformat(
+                        second_prepared["request_timestamp"].replace("Z", "+00:00")
+                    )
+                    + timedelta(seconds=2)
+                )
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
+            extra_fee_coin = "7" * 64
+            extra_return = "d" * 64
+            extra_fee_return = "0" * 64
+            extra_tx = "c" * 64
+            extra_spend = "sha256:" + "d" * 64
+            second_transaction = _transaction(
+                transaction_id=extra_tx,
+                height=43,
+                timestamp=second_observed,
+                spent=[
+                    {
+                        "coin_id": extra_coin,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "offer",
+                    },
+                    {
+                        "coin_id": extra_fee_coin,
+                        "asset_id": "xch",
+                        "amount": 500_000_000,
+                        "address_kind": "own",
+                    },
+                ],
+                created=[
+                    {
+                        "coin_id": extra_return,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    },
+                    {
+                        "coin_id": extra_fee_return,
+                        "asset_id": "xch",
+                        "amount": 499_999_958,
+                        "address_kind": "own",
+                    },
+                ],
+            )
+            second_transaction["spend_identity"] = extra_spend
+            second_proof = _evidence(
+                observed_at=second_observed,
+                offers=[
+                    _offer(
+                        status=3,
+                        trade_id=extra_trade,
+                        selected_coin_ids=[extra_coin],
+                        transaction_id=extra_tx,
+                    )
+                ],
+                transactions=[second_transaction],
+                coins={
+                    extra_coin: _coin(
+                        extra_coin,
+                        asset_id="xch",
+                        amount=1000,
+                        spent_height=43,
+                        transaction_id=extra_tx,
+                        offer_id=extra_trade,
+                    ),
+                    extra_return: _coin(
+                        extra_return,
+                        asset_id="xch",
+                        amount=1000,
+                        created_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                    extra_fee_coin: _coin(
+                        extra_fee_coin,
+                        asset_id="xch",
+                        amount=500_000_000,
+                        spent_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                    extra_fee_return: _coin(
+                        extra_fee_return,
+                        asset_id="xch",
+                        amount=499_999_958,
+                        created_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                },
+            )
+            second_prepared_evidence = json.loads(second_prepared["evidence_json"])
+            second_manifest = database.get_offer_cancel_cohort_manifest(
+                second_prepared_evidence["cohort_id"]
+            )
+            second_member = second_manifest["members"][0]
+            second_context = {
+                "cohort_id": second_manifest["cohort_id"],
+                "manifest_sha256": second_manifest["manifest_sha256"],
+                "members": [
+                    {
+                        "intent_id": extra_intent,
+                        "trade_id": extra_trade,
+                        "member_id": second_member["member_id"],
+                        "prepared_event_id": second_member["prepared_event_id"],
+                        "selected_coin_ids": [extra_coin],
+                        "request_timestamp": second_prepared["request_timestamp"],
+                        "transaction_timestamp": second_observed,
+                        "asset_id": ASSET,
+                        "side": "buy",
+                        "offered_amount_atomic": "1000",
+                        "requested_amount_atomic": "2000",
+                        "offer_text_sha256": "0" * 64,
+                        "transaction_id": extra_tx,
+                        "spend_identity": extra_spend,
+                    }
+                ],
+                "auxiliary_coin_ids": [extra_fee_coin],
+            }
+            second_applied = reconcile_offer(
+                extra_intent,
+                evidence=second_proof,
+                cancel_context=second_context,
+                now=second_observed,
+            )
+            assert second_applied["classification"] == CANCELLED_PROVEN
+            assert second_applied["applied"] is True
+            assert (
+                database.get_offer_intent(extra_intent)["lifecycle_state"] == "terminal"
+            )
+            observed_book.clear()
+            completed = database.complete_refresh_abort(
+                **{**completion_request, "observed_at": fresh_clock()}
+            )
+            assert completed["state"] == "aborted"
+            assert database.get_runtime_safety_latch()["state"] == "resolved"
+            assert (
+                database.refresh_lineage_completion("intent-task9")["complete"] is False
+            )
             return
         if prepared_cleanup == "completion_extra_blocker":
             database.trip_runtime_safety_latch(
