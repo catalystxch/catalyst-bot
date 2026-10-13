@@ -43,6 +43,25 @@
     "fee_holds": 0
   },
   "installed_sage_version": "0.13.0",
+  "isolated_fixture": {
+    "file": "sage_v013_cat_retry_fixture.py",
+    "characterization_exit_code": 0,
+    "require_retry_exit_code": 1,
+    "expected_failure": "REGRESSION: missing parent evidence must remain retryable",
+    "scope": "In-memory SQLite reproduction of released query/fallback semantics; not compiled Rust execution or a production fix"
+  },
+  "public_beta_check": {
+    "latest_release": "v0.13.1",
+    "release_published_utc": "2026-09-19T22:16:19Z",
+    "same_fallback_and_retry_exclusion_present": true,
+    "binary_reproduction_performed": false
+  },
+  "supported_recovery_review": {
+    "api": "Sage v0.13.0 keys.rs resync lines44-107",
+    "behavior": "Switches logged-in wallet away, optionally deletes coins/assets/files/offers/addresses/blocks, checkpoints and vacuums DB, then switches wallet back.",
+    "assessment": "Supported resync exists but is destructive and disrupts identity/session. No proof a non-deleting resync requeues asset_id=0 unspent receipt; deletion/rebuild may encounter the same parent-fetch bug. Not approved or executed on the original wallet.",
+    "safe_next_step": "First use disposable, credential-free fixture/profile with reviewed parent-evidence handling; demonstrate ownership, exact CAT asset, parent lineage, retained offer history and complete reconciliation. Only then consider an explicitly authorized supported original recovery with consistent backup and quiescent wallet effects. Keep CATalyst latch until its normal authoritative proof succeeds."
+  },
   "official_release_source": "a98ca34b3f6f802c7070834ec914cab1995ca822",
   "sage_database_read_only": {
     "receive_row_id": 20083,
