@@ -1965,7 +1965,12 @@ def test_pnl_history_scope_matches_the_period_behind_fills(page):
         }"""
     )
     expect(page.locator("#heroPnlScopeLabel")).to_have_text("Lifetime PnL")
-    expect(page.locator("#pnlHistoryScope")).to_have_text("Lifetime history")
+    expect(page.locator("#pnlHistoryScope")).to_have_text(
+        "Fills and realized PnL: lifetime"
+    )
+    expect(page.locator("#v4View-pnl .v4-view-subtitle")).to_contain_text(
+        "current inventory"
+    )
 
     page.evaluate(
         """() => {
@@ -1974,7 +1979,9 @@ def test_pnl_history_scope_matches_the_period_behind_fills(page):
         }"""
     )
     expect(page.locator("#heroPnlScopeLabel")).to_have_text("Since Fresh Start PnL")
-    expect(page.locator("#pnlHistoryScope")).to_have_text("Since fresh start")
+    expect(page.locator("#pnlHistoryScope")).to_have_text(
+        "Fills and realized PnL: since fresh start"
+    )
 
 
 def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):

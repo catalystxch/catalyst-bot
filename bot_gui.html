@@ -9983,8 +9983,8 @@
                         <div class="v4-view-header-copy">
                             <div class="v4-view-kicker">Performance</div>
                             <h1 class="v4-view-title">PnL & Inventory</h1>
-                            <p class="v4-view-subtitle">Track verified fills, realized round-trip profit, and inventory for the displayed history period.</p>
-                            <div id="pnlHistoryScope" class="panel-context-note">History period loading...</div>
+                            <p class="v4-view-subtitle">Track verified fills and realized round-trip profit alongside your current inventory position.</p>
+                            <div id="pnlHistoryScope" class="panel-context-note">Fill and realized PnL period loading...</div>
                             <div class="v4-tab-token-pill"><img class="cc-token-icon cc-token-icon-sm" src="" alt="" onerror="if(this.dataset.fallbackSrc&&this.src!==this.dataset.fallbackSrc){this.src=this.dataset.fallbackSrc;}else{this.style.display='none';}" style="display:none;"><span class="v4-tab-token-name"></span><span class="v4-tab-token-xch">&nbsp;/ XCH</span></div>
                         </div>
                     </div>
@@ -26645,8 +26645,8 @@
             const el = id => document.getElementById(id);
             const scopeLabel = el('pnlHistoryScope');
             if (scopeLabel) scopeLabel.textContent = data.history_scope === 'fresh_run'
-                ? 'Since fresh start' : data.history_scope === 'lifetime'
-                    ? 'Lifetime history' : 'History period unknown';
+                ? 'Fills and realized PnL: since fresh start' : data.history_scope === 'lifetime'
+                    ? 'Fills and realized PnL: lifetime' : 'Fill and realized PnL period unknown';
             const verifiedFills = Number(data.total_fills || 0);
             const pendingCount = Number(data.pending_verification_count || 0);
             const fillRate = Number(data.fill_rate_per_hour || 0);
