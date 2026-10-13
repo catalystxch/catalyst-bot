@@ -75,3 +75,34 @@ requested Take test.
   quiescence check, and settlement worker outcome before another control
   attempt. Keep the original profile fenced. The user's requested TEST 7
   offer link remains withheld until the live state and offer book reconcile.
+
+## 09:46 UTC GUI response defect and candidate fix
+
+- Source review found a separate, deterministic GUI bug: the blocked-gate
+  `/api/offers/cancel_all` route can return HTTP 202 with
+  `success=false`, `async=true`, and `reconciliation_only=true` while it
+  checks the old cancellation without submitting another transaction. The
+  existing `confirmCancelAll()` treated every `success=false` response as an
+  immediate error, closed the dialog, and never polled the proof result.
+- A new Chromium test reproduced that behavior (no status poll), then passed
+  after the GUI was changed to show and poll the proof-only operation. The
+  revised GUI reports `reconciled` and `awaiting_authoritative_proof` as
+  distinct terminal states and never starts a second cancellation from that
+  response. Another red/green Chromium test proved that a preflight rejection
+  such as `BOT_STOPPING` had no visible toast; the GUI now displays its exact
+  error. Ten focused Cancel All tests, all 110 Chromium smoke tests, 17
+  cancellation fee-flow tests, and 62 backend offers endpoint tests passed
+  locally.
+- A clean Windows PyInstaller build succeeded from this worktree. The bundled
+  `bot_gui.html` SHA-256 equals the source HTML SHA-256
+  `A112496160F3B7A0419ECB180C70714EB4F03A29845F107C2C5D9CDB5FBF06ED`.
+  The rebuilt EXE SHA-256 is
+  `1728F315C3BEB54FF83E5416BBA5AF2D2CE4ECBA3F6080B6D92FE0E519BAAC37`.
+  Packaged API smoke passed against an isolated mock Sage RPC and temporary
+  profile on a non-default port. This package has not run on the original
+  TEST 7 profile and does not establish live reconciliation.
+- This identifies why the UI did not show a useful outcome. It does **not**
+  establish whether the live request was rejected by its quiescence check,
+  entered the background proof worker, or failed during settlement. The
+  original packaged process remains on the older GUI and its safety gate is
+  still blocked. No wallet action or latch release was made by this fix.

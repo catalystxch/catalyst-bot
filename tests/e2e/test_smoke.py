@@ -3424,6 +3424,102 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
     page.wait_for_function("_cancelAllInProgress === false", timeout=2_000)
 
 
+@pytest.mark.parametrize(
+    ("phase", "message"),
+    [
+        ("awaiting_authoritative_proof", "No second cancellation was submitted"),
+        ("reconciled", "The earlier cancellation is authoritatively resolved"),
+    ],
+)
+def test_cancel_all_displays_proof_only_reconciliation_without_new_cancellation(
+    page, phase, message
+):
+    """A blocked cancel must report its proof check and never imply a new cancel."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """async ({ phase, message }) => {
+            const nativeSetInterval = window.setInterval.bind(window);
+            window.setInterval = (fn, delay, ...args) =>
+                nativeSetInterval(fn, Math.min(Number(delay) || 0, 20), ...args);
+            window.__proofOnly = { cancelCalls: 0, statusCalls: 0, logs: [], toasts: [] };
+            bot_state = { running: false, offers: { buy: [{ trade_id: 'parent' }], sell: [] } };
+            fetchStatus = async () => {};
+            addLogEntry = (_, message) => window.__proofOnly.logs.push(message);
+            showToast = (message) => window.__proofOnly.toasts.push(message);
+            apiFetch = async (path) => {
+                if (String(path).includes('/offers/cancel_all/status')) {
+                    window.__proofOnly.statusCalls += 1;
+                    return new Response(JSON.stringify({
+                        success: true,
+                        running: false,
+                        complete: phase === 'reconciled',
+                        phase,
+                        total: 1,
+                        pending: phase === 'reconciled' ? 0 : 1,
+                        message,
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                if (String(path).includes('/offers/cancel_all')) {
+                    window.__proofOnly.cancelCalls += 1;
+                    return new Response(JSON.stringify({
+                        success: false,
+                        async: true,
+                        reconciliation_only: true,
+                        reason: 'UNRESOLVED_OPERATIONS',
+                        message: 'Checking earlier cancellation proof; no new transaction was submitted.',
+                    }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+                }
+                throw new Error(`Unexpected test request: ${path}`);
+            };
+            await cancelAllOffers();
+            await confirmCancelAll();
+        }""",
+        {"phase": phase, "message": message},
+    )
+
+    page.wait_for_function("window.__proofOnly.statusCalls >= 1", timeout=2_000)
+    page.wait_for_function("_cancelAllInProgress === false", timeout=2_000)
+    result = page.evaluate("window.__proofOnly")
+    assert result["cancelCalls"] == 1
+    assert any(message in line for line in result["logs"])
+    assert any(message in line for line in result["toasts"])
+    assert message in page.locator("#cancelProgressSummary").inner_text()
+
+
+def test_cancel_all_shows_preflight_rejection_to_operator(page):
+    """A stopped-process guard failure must be visible without another click."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            const result = { cancelCalls: 0, toasts: [] };
+            bot_state = { running: false, offers: { buy: [{ trade_id: 'parent' }], sell: [] } };
+            addLogEntry = () => {};
+            showToast = (message) => result.toasts.push(message);
+            apiFetch = async (path) => {
+                if (!String(path).includes('/offers/cancel_all')) throw new Error('Unexpected request');
+                result.cancelCalls += 1;
+                return new Response(JSON.stringify({
+                    success: false,
+                    reason: 'BOT_STOPPING',
+                    error: 'Bot stop is still completing; retry Cancel All after it finishes.',
+                }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+            };
+            await cancelAllOffers();
+            await confirmCancelAll();
+            return result;
+        }"""
+    )
+
+    assert result["cancelCalls"] == 1
+    assert result["toasts"] == [
+        "Bot stop is still completing; retry Cancel All after it finishes."
+    ]
+
+
 def test_loaded_session_formats_internal_ticker_as_human_pair(page):
     """Recovery must show MZ/XCH, never the internal MZ_XCH/XCH label."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

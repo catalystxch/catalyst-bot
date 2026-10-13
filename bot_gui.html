@@ -32917,8 +32917,11 @@
                 });
                 const result = await response.json();
 
-                if (!result.success) {
-                    addLogEntry('error', '   ❌ Cancel failed: ' + (result.error || 'Unknown error'));
+                const proofOnly = result.async === true && result.reconciliation_only === true;
+                if (!result.success && !proofOnly) {
+                    const failure = result.error || result.message || 'Unknown error';
+                    addLogEntry('error', '   ❌ Cancel failed: ' + failure);
+                    showToast(failure, 'error');
                     _cancelAllInProgress = false;
                     return;
                 }
@@ -32926,8 +32929,10 @@
                 // Backend runs asynchronously — open progress modal and poll
                 if (result.async) {
                     releaseImmediately = false;
-                    const total = result.total || totalActive;
-                    addLogEntry('info', `   Wallet cancel started for ${total} offers — tracking progress...`);
+                    const total = proofOnly ? 1 : (result.total || totalActive);
+                    addLogEntry('info', proofOnly
+                        ? `   ${result.message || 'Checking earlier cancellation proof; no new cancellation was submitted.'}`
+                        : `   Wallet cancel started for ${total} offers — tracking progress...`);
                     openCancelProgressModal(total);
                     startCancelAllProgressPolling(total, operationGeneration);
 
@@ -32937,12 +32942,20 @@
                     _cancelAllCompletionPoll = setInterval(async () => {
                         try {
                             const st = _get_cancel_all_state_local();
-                            if (st && (st.phase === 'complete' || st.phase === 'error')) {
+                            if (st && (st.phase === 'complete' || st.phase === 'error'
+                                || (proofOnly && ['reconciled', 'awaiting_authoritative_proof'].includes(st.phase)))) {
                                 clearCancelAllCompletionTimers();
                                 stopCancelAllProgressPolling();
                                 await fetchStatus();
                                 try { updateResumeOverview(); } catch (_re) { /* non-fatal */ }
-                                if (st.phase === 'complete') {
+                                if (proofOnly) {
+                                    const message = st.message || (st.phase === 'reconciled'
+                                        ? 'The earlier cancellation is resolved. Review the remaining offers before cancelling again.'
+                                        : 'The earlier cancellation still awaits Sage proof. No new cancellation was submitted.');
+                                    const severity = st.phase === 'reconciled' ? 'success' : 'warning';
+                                    addLogEntry(severity, `   ${message}`);
+                                    showToast(message, severity);
+                                } else if (st.phase === 'complete') {
                                     const view = cancelAllProgressView(st, total);
                                     addLogEntry(view.severity, `   ${view.message}`);
                                     showToast(view.message, view.severity);
@@ -32975,7 +32988,9 @@
                         if (operationGeneration !== _cancelAllOperationGeneration) return;
                         clearCancelAllCompletionTimers();
                         stopCancelAllProgressPolling();
-                        const timeoutMessage = 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
+                        const timeoutMessage = proofOnly
+                            ? 'Cancellation proof check timed out. No new cancellation was submitted; check Sage and safety status.'
+                            : 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
                         _cancelAllLastState = {
                             success: false,
                             phase: 'error',
@@ -33104,14 +33119,20 @@
             const failed = Number(status.failed) || 0;
             const processed = Math.min(total || cancelled, cancelled);
             const phase = String(status.phase || 'starting').toLowerCase();
-            const isDone = phase === 'complete' || phase === 'error';
+            const isDone = ['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(phase);
             const remaining = Math.max(0, total - processed);
             const terminalComplete = phase === 'complete'
                 && cancelled === total && pending === 0 && failed === 0;
             let title = 'Cancelling offers';
             let message = status.message || 'Preparing durable cancellation requests...';
             let severity = 'info';
-            if (terminalComplete) {
+            if (phase === 'reconciled') {
+                title = 'Earlier cancellation resolved';
+                severity = 'success';
+            } else if (phase === 'awaiting_authoritative_proof') {
+                title = 'Cancellation still blocked';
+                severity = 'warning';
+            } else if (terminalComplete) {
                 title = 'Cancel all complete';
                 message = `${cancelled} offer${cancelled !== 1 ? 's are' : ' is'} authoritatively terminal.`;
                 severity = 'success';
@@ -33163,9 +33184,11 @@
             if (iconEl) iconEl.textContent = view.severity === 'success' ? '✅' : view.severity === 'error' ? '❌' : '⏳';
             if (messageEl) messageEl.textContent = view.message;
             if (summaryEl) {
-                summaryEl.textContent = total > 0
-                    ? `${processed} of ${total} offers processed`
-                    : (status.message || 'Preparing cancel request...');
+                summaryEl.textContent = ['reconciled', 'awaiting_authoritative_proof'].includes(phase)
+                    ? view.message
+                    : total > 0
+                        ? `${processed} of ${total} offers processed`
+                        : (status.message || 'Preparing cancel request...');
             }
             if (statusEl) statusEl.textContent = status.message || 'Waiting for wallet progress...';
             if (processedEl) processedEl.textContent = `${processed} / ${total || 0}`;
@@ -33181,7 +33204,7 @@
                 percent = Math.max(8, Math.min(98, Math.round((processed / total) * 100)));
             }
             if (barEl) barEl.style.width = `${percent}%`;
-            if (closeBtn) closeBtn.textContent = (phase === 'complete' || phase === 'error') ? 'Close' : 'Hide';
+            if (closeBtn) closeBtn.textContent = isDone ? 'Close' : 'Hide';
             if (isDone) _stopCancelDots();
         }
 
@@ -33192,7 +33215,7 @@
                 if (!status || status.success === false) return;
                 if (operationGeneration !== _cancelAllOperationGeneration) return;
                 const statusPhase = String(status.phase || '').toLowerCase();
-                if (!_cancelAllInProgress && statusPhase !== 'complete' && statusPhase !== 'error') {
+                if (!_cancelAllInProgress && !['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(statusPhase)) {
                     return;
                 }
                 const terminalEmptyBook = statusPhase === 'complete'
@@ -33214,7 +33237,9 @@
                 if (status.message && progressKey !== _cancelAllLastProgressKey) {
                     const severity = status.phase === 'error'
                         ? 'error'
-                        : status.phase === 'complete'
+                        : status.phase === 'awaiting_authoritative_proof'
+                            ? 'warning'
+                        : status.phase === 'complete' || status.phase === 'reconciled'
                             ? 'success'
                             : 'info';
                     addLogEntry(severity, `   ${status.message}`);
@@ -33224,7 +33249,7 @@
                 const offerRefreshKey = `${status.cancelled || 0}|${status.pending || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
                 const shouldRefreshOffers = (
                     offerRefreshKey !== _cancelAllLastOfferRefreshKey
-                    && (status.pending || status.failed || status.phase === 'complete' || status.phase === 'error')
+                    && (status.pending || status.failed || ['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(status.phase))
                 );
                 if (shouldRefreshOffers) {
                     _cancelAllLastOfferRefreshKey = offerRefreshKey;
