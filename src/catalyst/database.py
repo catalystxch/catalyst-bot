@@ -23872,9 +23872,19 @@ def _prepare_offer_cancel_in_transaction(
         ).fetchone()
         if registered is not None:
             child_id = registered["child_intent_id"]
-            if child_id:
+            child_claims = conn.execute(
+                "SELECT intent_id FROM offer_intents WHERE parent_intent_id=?",
+                (registered["intent_id"],),
+            ).fetchall()
+            if child_id or child_claims:
                 if registered["intent_id"] != intent_id:
                     raise ValueError("cancellation intent identity differs")
+                if (
+                    not child_id
+                    or len(child_claims) != 1
+                    or child_claims[0]["intent_id"] != child_id
+                ):
+                    raise ValueError("replacement child lineage is not bound")
                 _parent, child = _refresh_lineage_rows(
                     conn, registered["intent_id"], child_id
                 )

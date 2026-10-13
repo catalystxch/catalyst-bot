@@ -403,3 +403,26 @@ requested Take test.
   This current retained view cannot prove that the offer never propagated,
   but it supplies no reciprocal receipt. Neither PC changed a wallet or
   publication record for this check.
+
+## 13:56 UTC cancellation-preparation guard and independent review
+
+- The generic atomic cancellation-preparation path allowed the first TEST 7
+  parent cancellation even though its linked replacement child had never
+  become visibly published. This is distinct from the later proof-only
+  reconciliation failure. A new regression test first failed against that
+  path, and the guard now rejects a new cancellation before writing its
+  PREPARED journal event when a registered parent's child is not visible.
+- Independent review on the Harvestr PC found a second window: a child can
+  already claim `parent_intent_id` while the parent's reverse
+  `child_intent_id` is still null after a crash. A separate disposable-DB
+  regression test reproduced the bypass before the follow-up fix. The atomic
+  guard now checks both directions, requires one reciprocally bound child,
+  and refuses provisional or contradictory lineage. Existing PREPARED replay
+  remains a reconciliation path, not authorization for another wallet effect.
+- Focused refresh, cancellation-journal, reconciliation and Cancel All tests
+  passed **516/516** after the follow-up fix. Ruff and `git diff --check`
+  passed. The full backend suite and new PR CI have not yet finished for this
+  source. Neither PC's live app was replaced; TEST 7 still has the two
+  Sage-active offers and its unresolved safety latch, while Harvestr remains
+  fenced. This prevention change does not resolve the already confirmed
+  parent cancellation or establish public readiness.
