@@ -43,6 +43,18 @@
     "fee_holds": 0
   },
   "installed_sage_version": "0.13.0",
+  "isolated_sage_candidate_verification": {
+    "base_v0131": "f2ec89dd59d07227bed657bc268fc32ce97551f6",
+    "candidate_commit": "1cae311deba6995469582d35e660e2c83b7e8b54",
+    "patch": "sage-v0131-unknown-parent-candidate.patch",
+    "cargo_wallet_lib_build": "PASS, 7m32s",
+    "build_warning": "LNK4098 MSVCRTD default library conflict",
+    "full_wallet_lib_tests": "53 passed, 0 failed, 94.89s",
+    "exact_receipt_test": "PASS: actual public parent CLVM, CAT asset, registered wallet inner puzzle, exact lineage, foreign-ownership rejection, owned CAT inventory and corrected transaction history",
+    "initial_test_run": "52 passed, 1 fixture setup failure: foreign-wallet check correctly deleted rejected coin; fixture reinsert corrected before final full rerun",
+    "disposable_snapshot": "SQLite backup from mode=ro source; delete_coins resync SQL semantics preserve 2906 assets, 955 offers, 1001 p2 puzzles and 1000 public keys; copy transaction rolled back",
+    "limits": "No real running resync endpoint or native Sage packaging test; no live deployment/recovery; already bad asset_id=0 row needs separately reviewed supported rebuild; patch remains review candidate"
+  },
   "isolated_fixture": {
     "file": "sage_v013_cat_retry_fixture.py",
     "characterization_exit_code": 0,
