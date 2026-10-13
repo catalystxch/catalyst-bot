@@ -228,3 +228,27 @@ requested Take test.
   completed with zero matching detections. These are isolated results; the
   original TEST 7 process remains on f034 and its live safety latch is
   unchanged.
+
+## 10:48 UTC replacement-sell publication audit
+
+- Read-only original SQLite inspection identified replacement sell intent
+  `52de45fbed1743b99d75195140c0b5d6c34b4f4f65b2d4e4c15bd87cbbbe31ce`
+  for Sage trade `ab93cacc6da604ac5b0213befea1d7758f779300d1a8869981f03aa837f3901b`.
+  Its Dexie outbox row is still `queued`, with zero attempts and no dispatch
+  timestamp. The Splash outbox row says `succeeded`, but neither provider has
+  an observed publication identity; both discovery rows expired at
+  `08:55:59.186133Z`. Splash outbox success therefore does not prove receipt
+  by a peer.
+- The original superlog shows the child sell created at 08:54:29.272. The
+  same cycle spent 12.928 seconds on one Dexie POST, then stopped its durable
+  flush at 08:54:42.709 because less than one configured request timeout
+  remained in the 25-second cycle budget. The child sell remained queued.
+  Splash logged `InsufficientPeers` at 08:54:48 and 08:54:50. The next cycle
+  began at 08:55:04 but spent about 90 seconds in cancellation proof retry;
+  its safety gate then blocked further effects at 08:56:52. The outbox row
+  confirms this child was never submitted to Dexie in this run.
+- This is a concrete publication failure for this active child offer, not a
+  general claim that Dexie or Splash always fail. A future acceptance run
+  must prove every created child either reaches an exact public identity or
+  receives authoritative terminal handling. No original profile data or
+  wallet state was changed for this audit.
