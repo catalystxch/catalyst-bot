@@ -646,9 +646,13 @@ def api_refresh_abort_begin():
         "expected_latch_generation",
         "expected_trade_ids",
     }
-    if type(body) is not dict or set(body) != required:
+    if type(body) is not dict or set(body) not in (
+        required,
+        required | {"published_cleanup"},
+    ):
         return jsonify({"success": False, "error": "invalid_request"}), 400
     expected = body["expected_trade_ids"]
+    published_cleanup = body.get("published_cleanup", False)
     if (
         body["confirmation"] is not True
         or type(body["parent_intent_id"]) is not str
@@ -666,6 +670,7 @@ def api_refresh_abort_begin():
             for trade in expected
         )
         or expected != sorted(set(expected))
+        or type(published_cleanup) is not bool
     ):
         return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
     with api_server._bot_cancel_lifecycle_lock:
@@ -700,6 +705,10 @@ def api_refresh_abort_begin():
                 )
             ):
                 return jsonify({"success": False, "error": "lineage_changed"}), 409
+            if (candidates[0].get("published_cleanup") is True) != published_cleanup:
+                return jsonify(
+                    {"success": False, "error": "publication_scope_changed"}
+                ), 409
             lease = database.get_runtime_mutation_lease()
             if (
                 lease is None
@@ -716,6 +725,7 @@ def api_refresh_abort_begin():
                 expected_lease_version=lease["lease_version"],
                 observed_trade_ids=snapshot["trade_ids"],
                 observed_at=snapshot["observed_at"],
+                published_cleanup=published_cleanup,
             )
         except Exception as exc:
             slog(

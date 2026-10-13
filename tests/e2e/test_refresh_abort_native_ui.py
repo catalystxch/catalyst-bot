@@ -118,7 +118,8 @@ def test_restricted_recovery_retries_fenced_parent_proof(page):
             }
             return new Response(JSON.stringify({
               success: true, stage: 'fenced',
-              candidate: {parent_intent_id: 'parent', child_intent_id: 'child'},
+              candidate: {parent_intent_id: 'parent', child_intent_id: 'child',
+                          published_cleanup: true},
               abort: {abort_id: 'a'.repeat(64), campaign_id: 'b'.repeat(64),
                       latch_generation: 7},
               wallet: {fingerprint: 736588221, network: 'mainnet',
@@ -138,6 +139,8 @@ def test_restricted_recovery_retries_fenced_parent_proof(page):
     assert call["path"].endswith("/refresh_abort/begin")
     assert call["body"]["campaign_id"] == "b" * 64
     assert call["body"]["expected_trade_ids"] == ["c" * 64]
+    assert call["body"]["published_cleanup"] is True
+    expect(page.locator("#scope")).to_contain_text("potentially public")
 
 
 def test_fenced_cancel_dialog_submits_one_exact_target(page):

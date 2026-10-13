@@ -4102,6 +4102,23 @@ CREATE TABLE IF NOT EXISTS offer_refresh_aborts (
     updated_at                 TEXT NOT NULL,
     completed_at               TEXT
 );
+CREATE TABLE IF NOT EXISTS offer_refresh_published_cleanups (
+    abort_id                   TEXT PRIMARY KEY,
+    child_intent_id            TEXT NOT NULL,
+    offer_fingerprint          TEXT NOT NULL CHECK(length(offer_fingerprint)=64),
+    receipts_json             TEXT NOT NULL CHECK(json_valid(receipts_json)),
+    receipts_sha256           TEXT NOT NULL CHECK(length(receipts_sha256)=64),
+    recorded_at                TEXT NOT NULL,
+    FOREIGN KEY(abort_id) REFERENCES offer_refresh_aborts(abort_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_refresh_published_cleanups_no_update
+BEFORE UPDATE ON offer_refresh_published_cleanups BEGIN
+    SELECT RAISE(ABORT, 'published cleanup proofs are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_refresh_published_cleanups_no_delete
+BEFORE DELETE ON offer_refresh_published_cleanups BEGIN
+    SELECT RAISE(ABORT, 'published cleanup proofs are append-only');
+END;
 CREATE TABLE IF NOT EXISTS offer_refresh_abort_successions (
     succession_id              TEXT PRIMARY KEY CHECK(length(succession_id)=64),
     abort_id                   TEXT NOT NULL,
@@ -5006,6 +5023,14 @@ _STABILITY_REQUIRED_COLUMNS = {
         "recorded_at",
         "updated_at",
         "completed_at",
+    },
+    "offer_refresh_published_cleanups": {
+        "abort_id",
+        "child_intent_id",
+        "offer_fingerprint",
+        "receipts_json",
+        "receipts_sha256",
+        "recorded_at",
     },
     "offer_refresh_abort_successions": {
         "succession_id",
@@ -7590,6 +7615,7 @@ def _migrate_stability_schema() -> None:
                 # An existing profile can legitimately lack this table on
                 # its first fenced refresh-abort upgrade.
                 "offer_refresh_aborts",
+                "offer_refresh_published_cleanups",
                 "offer_refresh_abort_successions",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",
@@ -29834,6 +29860,86 @@ def _refresh_abort_child_is_fenced_or_cancelled(
     )
 
 
+def _assert_refresh_abort_publication_scope(
+    conn: sqlite3.Connection,
+    child: Dict[str, Any],
+    *,
+    abort_id: Optional[str] = None,
+    published_cleanup: bool = False,
+) -> str:
+    """Bind possible public exposure to a distinct, append-only cleanup proof.
+
+    A successful provider acknowledgement does not prove external discovery.
+    The child is still an exact cancellation target, and the completed row must
+    survive terminal cleanup as evidence of its possible public exposure.
+    """
+
+    if type(published_cleanup) is not bool:
+        raise TypeError("published_cleanup must be an exact bool")
+    marker = None
+    if abort_id is not None:
+        marker = conn.execute(
+            "SELECT * FROM offer_refresh_published_cleanups WHERE abort_id=?",
+            (abort_id,),
+        ).fetchone()
+        published_cleanup = marker is not None
+    rows = conn.execute(
+        "SELECT publication_id,network,offer_fingerprint,publisher,state,"
+        "dispatch_started_at,succeeded_at,acknowledgement_json,"
+        "acknowledgement_sha256 FROM publication_outbox WHERE intent_id=? "
+        "ORDER BY publisher,publication_id",
+        (child["intent_id"],),
+    ).fetchall()
+    receipts = []
+    for row in rows:
+        if (
+            row["network"] != child["network"]
+            or row["offer_fingerprint"] != child["offer_text_sha256"]
+        ):
+            raise ValueError("replacement publication identity differs")
+        if row["state"] == "succeeded":
+            acknowledgement = row["acknowledgement_json"]
+            digest = row["acknowledgement_sha256"]
+            if (
+                not row["dispatch_started_at"]
+                or not row["succeeded_at"]
+                or type(acknowledgement) is not str
+                or type(digest) is not str
+                or hashlib.sha256(acknowledgement.encode("utf-8")).hexdigest() != digest
+            ):
+                raise ValueError("replacement publication success proof is incomplete")
+            receipts.append(
+                {
+                    "publication_id": row["publication_id"],
+                    "publisher": row["publisher"],
+                    "offer_fingerprint": row["offer_fingerprint"],
+                    "dispatch_started_at": row["dispatch_started_at"],
+                    "succeeded_at": row["succeeded_at"],
+                    "acknowledgement_sha256": digest,
+                }
+            )
+        elif (
+            row["state"] not in {"queued", "suppressed"}
+            or row["dispatch_started_at"] is not None
+        ):
+            raise ValueError("replacement publication dispatch is ambiguous")
+    if bool(receipts) != published_cleanup:
+        raise ValueError("replacement publication cleanup mode differs")
+    receipts_json = _canonical_json_text(
+        receipts, "published cleanup receipts", expected_type=list
+    )
+    if marker is not None:
+        if (
+            marker["child_intent_id"] != child["intent_id"]
+            or marker["offer_fingerprint"] != child["offer_text_sha256"]
+            or marker["receipts_json"] != receipts_json
+            or marker["receipts_sha256"]
+            != hashlib.sha256(receipts_json.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError("published cleanup receipt authority differs")
+    return receipts_json
+
+
 def _refresh_abort_unresolved_journal_ids(conn: sqlite3.Connection) -> set[str]:
     """Read the latest durable operation blockers in the same DB snapshot."""
 
@@ -30025,7 +30131,7 @@ def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
 def list_fenced_refresh_abort_candidates(
     *, asset_id: str, wallet_fingerprint_hash: str, network: str
 ) -> List[Dict[str, Any]]:
-    """List exact unpublished-child lineages with a submitted parent cancel.
+    """List exact unconfirmed-visibility lineages with submitted parent cancel.
 
     This is diagnostic discovery only. A candidate has no abort or wallet
     authority until ``begin_refresh_abort`` validates fresh Sage and lease
@@ -30086,6 +30192,12 @@ def list_fenced_refresh_abort_candidates(
             or not (latest["transaction_id"] or latest["spend_identity"])
         ):
             continue
+        published_row = conn.execute(
+            "SELECT 1 FROM publication_outbox WHERE intent_id=? "
+            "AND state='succeeded' LIMIT 1",
+            (candidate["child_intent_id"],),
+        ).fetchone()
+        candidate["published_cleanup"] = published_row is not None
         result.append({**candidate, "cancel_operation_id": operation_id})
     return result
 
@@ -30328,15 +30440,7 @@ def adopt_refresh_abort_successor(
             )
         ):
             raise ValueError("refresh abort lineage differs")
-        if (
-            conn.execute(
-                "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-                "AND (state='succeeded' OR dispatch_started_at IS NOT NULL) LIMIT 1",
-                (child["intent_id"],),
-            ).fetchone()
-            is not None
-        ):
-            raise ValueError("replacement publication may already be visible")
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
         active = conn.execute(
             "SELECT sage_trade_id,asset_id FROM offer_intents WHERE "
             "wallet_fingerprint_hash=? AND network=? "
@@ -30679,14 +30783,7 @@ def authorize_refresh_abort_cleanup_target(
             {safe_prepared} if safe_prepared is not None else set(),
             fee_hold,
         )
-        unsafe_dispatch = conn.execute(
-            "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-            "AND (state IN ('claimed','unresolved','retryable') OR "
-            "(dispatch_started_at IS NOT NULL AND state<>'succeeded')) LIMIT 1",
-            (abort["child_intent_id"],),
-        ).fetchone()
-        if unsafe_dispatch is not None:
-            raise ValueError("replacement publication dispatch is ambiguous")
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
         if own_connection:
             conn.commit()
         return {
@@ -30939,14 +31036,7 @@ def complete_refresh_abort(
                 or cancel["blocks_mutation"] != 0
             ):
                 raise ValueError("cleanup target is not cancellation proven")
-        unsafe_publication = conn.execute(
-            "SELECT 1 FROM publication_outbox WHERE intent_id=? AND "
-            "(state IN ('claimed','retryable','unresolved') OR "
-            "(dispatch_started_at IS NOT NULL AND state<>'succeeded')) LIMIT 1",
-            (abort["child_intent_id"],),
-        ).fetchone()
-        if unsafe_publication is not None:
-            raise ValueError("replacement publication dispatch is ambiguous")
+        _assert_refresh_abort_publication_scope(conn, child, abort_id=safe_abort)
         _suppress_publication_outbox_rows(
             conn,
             intent_id=abort["child_intent_id"],
@@ -31044,6 +31134,7 @@ def _validate_refresh_abort_commit_authority(
         {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
         parent_fee_hold,
     )
+    _assert_refresh_abort_publication_scope(conn, child, abort_id=abort_id)
     if (
         abort["parent_intent_id"] != parent["intent_id"]
         or abort["child_intent_id"] != child["intent_id"]
@@ -31085,6 +31176,7 @@ def begin_refresh_abort(
     expected_lease_version: int,
     observed_trade_ids: Any,
     observed_at: Any,
+    published_cleanup: bool = False,
 ) -> Dict[str, Any]:
     """Retain an exact stop fence before settling an already-submitted cancel.
 
@@ -31094,6 +31186,9 @@ def begin_refresh_abort(
     """
 
     from mutation_gate import wallet_fingerprint_hash
+
+    if type(published_cleanup) is not bool:
+        raise TypeError("published_cleanup must be an exact bool")
 
     parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
     child_id = _required_stability_text(child_intent_id, "child_intent_id")
@@ -31167,14 +31262,19 @@ def begin_refresh_abort(
                 network=parent["network"],
                 at=at,
             )
-            ambiguous_dispatch = conn.execute(
-                "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-                "AND (state IN ('claimed','unresolved','retryable','succeeded') "
-                "OR dispatch_started_at IS NOT NULL) LIMIT 1",
-                (child_id,),
-            ).fetchone()
-            if ambiguous_dispatch is not None:
-                raise ValueError("replacement publication has ambiguous dispatch")
+            _assert_refresh_abort_publication_scope(
+                conn, child, abort_id=prior["abort_id"]
+            )
+            if (
+                bool(
+                    conn.execute(
+                        "SELECT 1 FROM offer_refresh_published_cleanups WHERE abort_id=?",
+                        (prior["abort_id"],),
+                    ).fetchone()
+                )
+                != published_cleanup
+            ):
+                raise ValueError("refresh abort replay cleanup mode differs")
             conn.commit()
             return {**prior, "idempotent": True}
         parent_offer = conn.execute(
@@ -31198,7 +31298,7 @@ def begin_refresh_abort(
             or not child.get("sage_trade_id")
             or child["sage_trade_id"] not in trades
         ):
-            raise ValueError("abort lineage is not an unpublished replacement")
+            raise ValueError("abort lineage is not an exact created replacement")
         latch_row = conn.execute(
             "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
         ).fetchone()
@@ -31273,14 +31373,9 @@ def begin_refresh_abort(
         )
         if db_trades != trades:
             raise ValueError("complete Sage book differs from durable offer intents")
-        unsafe_publication = conn.execute(
-            "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-            "AND (state IN ('claimed','unresolved','retryable','succeeded') "
-            "OR dispatch_started_at IS NOT NULL) LIMIT 1",
-            (child_id,),
-        ).fetchone()
-        if unsafe_publication is not None:
-            raise ValueError("replacement publication has ambiguous dispatch")
+        receipts_json = _assert_refresh_abort_publication_scope(
+            conn, child, published_cleanup=published_cleanup
+        )
         material = _canonical_json_text(
             {
                 "parent_intent_id": parent_id,
@@ -31349,6 +31444,20 @@ def begin_refresh_abort(
             + ",?,?,?)",
             (*immutable.values(), "fenced", at, at),
         )
+        if published_cleanup:
+            conn.execute(
+                "INSERT INTO offer_refresh_published_cleanups ("
+                "abort_id,child_intent_id,offer_fingerprint,receipts_json,"
+                "receipts_sha256,recorded_at) VALUES (?,?,?,?,?,?)",
+                (
+                    abort_id,
+                    child_id,
+                    child["offer_text_sha256"],
+                    receipts_json,
+                    hashlib.sha256(receipts_json.encode("utf-8")).hexdigest(),
+                    at,
+                ),
+            )
         _reconciliation_latch_update(
             conn,
             operation_id=blocker,

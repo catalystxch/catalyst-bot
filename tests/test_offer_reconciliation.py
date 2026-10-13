@@ -8918,6 +8918,9 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
         "cleanup_unrelated_journal",
         "cleanup_active_worker",
         "completion_unrelated_journal",
+        "published_child",
+        "published_child_restart",
+        "dispatched_unconfirmed_child",
     ],
 )
 def test_fenced_abort_records_confirmed_parent_without_publishing_child(
@@ -8925,7 +8928,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     monkeypatch,
     prepared_cleanup,
 ):
-    """The on-chain parent result settles while its unpublished child stays fenced."""
+    """The parent settles while exact child cancellation keeps recovery fenced."""
 
     import mutation_gate
 
@@ -9015,10 +9018,51 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         finalize_selected_coin_reservations=True,
     )
     database.bind_refresh_lineage("intent-task9", child_id)
+    if prepared_cleanup in {
+        "published_child",
+        "published_child_restart",
+        "dispatched_unconfirmed_child",
+    }:
+        from publication_outbox import canonical_publication_identity
+
+        identity = canonical_publication_identity(NETWORK, "e" * 64, "epoch-child")
+        database.enqueue_publication_outbox(
+            publication_id="published-child-splash",
+            idempotency_key=identity.idempotency_key,
+            network=NETWORK,
+            offer_fingerprint="e" * 64,
+            publication_epoch="epoch-child",
+            publisher="splash",
+            payload_json={"offer_ref": OTHER_TRADE},
+            intent_id=child_id,
+            queued_at=AT,
+        )
+        conn = database.get_connection()
+        if prepared_cleanup == "dispatched_unconfirmed_child":
+            conn.execute(
+                "UPDATE publication_outbox SET state='claimed',"
+                "dispatch_started_at=? "
+                "WHERE publication_id='published-child-splash'",
+                (AT,),
+            )
+        else:
+            ack = '{"code":"SPLASH_HTTP_ACCEPTED"}'
+            conn.execute(
+                "UPDATE publication_outbox SET state='succeeded',"
+                "dispatch_started_at=?,succeeded_at=?,terminal_at=?,"
+                "acknowledgement_json=?,acknowledgement_sha256=? "
+                "WHERE publication_id='published-child-splash'",
+                (AT, AFTER, AFTER, ack, hashlib.sha256(ack.encode()).hexdigest()),
+            )
+        conn.commit()
     extra_trade = "f" * 64
     extra_intent = "9" * 64
     observed_book = [OTHER_TRADE]
-    if prepared_cleanup in {"multi_target", "restart_after_child"}:
+    if prepared_cleanup in {
+        "multi_target",
+        "restart_after_child",
+        "published_child_restart",
+    }:
         extra_coin = "e" * 64
         assert database.upsert_coin(
             extra_coin,
@@ -9094,6 +9138,27 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     assert candidates[0]["parent_trade_id"] == TRADE
     assert candidates[0]["child_trade_id"] == OTHER_TRADE
     assert candidates[0]["cancel_operation_id"] == f"cancel:{TRADE}"
+    published_case = prepared_cleanup in {"published_child", "published_child_restart"}
+    if published_case:
+        with pytest.raises(ValueError, match="cleanup mode differs"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        assert (
+            database.list_incomplete_refresh_aborts(
+                asset_id=ASSET,
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            == []
+        )
 
     def append_unrelated_blocker():
         database.append_offer_operation_event(
@@ -9127,6 +9192,27 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
                 observed_at=AFTER,
             )
         return
+    if prepared_cleanup == "dispatched_unconfirmed_child":
+        with pytest.raises(ValueError, match="unresolved publication effect"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        assert (
+            database.list_incomplete_refresh_aborts(
+                asset_id=ASSET,
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            == []
+        )
+        return
     abort = database.begin_refresh_abort(
         parent_intent_id="intent-task9",
         child_intent_id=child_id,
@@ -9136,7 +9222,20 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         expected_lease_version=lease["lease"]["lease_version"],
         observed_trade_ids=observed_book,
         observed_at=AFTER,
+        published_cleanup=published_case,
     )
+    if published_case:
+        marker = (
+            database.get_connection()
+            .execute(
+                "SELECT * FROM offer_refresh_published_cleanups WHERE abort_id=?",
+                (abort["abort_id"],),
+            )
+            .fetchone()
+        )
+        assert marker is not None
+        assert marker["offer_fingerprint"] == "e" * 64
+        assert len(json.loads(marker["receipts_json"])) == 1
     assert [
         row["abort_id"]
         for row in database.list_incomplete_refresh_aborts(
@@ -9161,6 +9260,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         expected_lease_version=renewed["lease"]["lease_version"],
         observed_trade_ids=observed_book,
         observed_at=AFTER,
+        published_cleanup=published_case,
     )
     assert replayed_abort["idempotent"] is True
     assert replayed_abort["abort_id"] == abort["abort_id"]
@@ -9174,6 +9274,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             expected_lease_version=lease["lease"]["lease_version"],
             observed_trade_ids=observed_book,
             observed_at=AFTER,
+            published_cleanup=published_case,
         )
     with pytest.raises(ValueError, match="exact proven parent cancellation"):
         reconcile_offer(
@@ -9240,6 +9341,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         expected_lease_version=renewed["lease"]["lease_version"],
         observed_trade_ids=observed_book,
         observed_at=AFTER,
+        published_cleanup=published_case,
     )
     assert terminal_replay["idempotent"] is True
     assert terminal_replay["state"] == "parent_terminal"
@@ -9447,6 +9549,8 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         "multi_target",
         "restart_after_child",
         "completion_unrelated_journal",
+        "published_child",
+        "published_child_restart",
     }:
         # Exercise the complete manager -> durable Task 8 -> exact effect claim
         # boundary on the same disposable incident.  The adapter and fee signer
@@ -9558,7 +9662,12 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
                 {"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}},
                 *(
                     [{"coin_id": "7" * 64, "coin": {"amount": 500_000_000}}]
-                    if prepared_cleanup in {"multi_target", "restart_after_child"}
+                    if prepared_cleanup
+                    in {
+                        "multi_target",
+                        "restart_after_child",
+                        "published_child_restart",
+                    }
                     else []
                 ),
             ]
@@ -9814,7 +9923,11 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             )
         finally:
             proof_connection.close()
-        if prepared_cleanup in {"multi_target", "restart_after_child"}:
+        if prepared_cleanup in {
+            "multi_target",
+            "restart_after_child",
+            "published_child_restart",
+        }:
             # A restart may adopt the unfinished abort after the child has
             # already obtained exact terminal cancellation proof.
             authority_connection = database._stability_connection()
@@ -9834,7 +9947,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         assert json.loads(
             database.get_runtime_safety_latch()["blocking_operation_ids_json"]
         ) == [abort["blocking_operation_id"]]
-        if prepared_cleanup == "restart_after_child":
+        if prepared_cleanup in {"restart_after_child", "published_child_restart"}:
             observed_book[:] = [extra_trade]
             prior_lease = database.get_runtime_mutation_lease()
             released = database.release_runtime_mutation_lease(
@@ -10087,7 +10200,11 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             )
         queued_publications = database.list_publication_outbox(intent_id=child_id)
         assert queued_publications
-        assert {row["state"] for row in queued_publications} == {"suppressed"}
+        assert {row["state"] for row in queued_publications} == (
+            {"suppressed", "succeeded"}
+            if prepared_cleanup in {"published_child", "published_child_restart"}
+            else {"suppressed"}
+        )
         completed = database.complete_refresh_abort(
             **{**completion_request, "observed_at": fresh_clock()}
         )
@@ -10097,7 +10214,11 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         assert database.refresh_lineage_completion("intent-task9")["complete"] is False
         assert {
             row["state"] for row in database.list_publication_outbox(intent_id=child_id)
-        } == {"suppressed"}
+        } == (
+            {"suppressed", "succeeded"}
+            if prepared_cleanup in {"published_child", "published_child_restart"}
+            else {"suppressed"}
+        )
         replay = database.complete_refresh_abort(
             **{**completion_request, "observed_at": fresh_clock()}
         )

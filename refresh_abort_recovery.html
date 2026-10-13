@@ -23,7 +23,7 @@
 <body>
   <main>
     <h1>Fenced offer recovery</h1>
-    <p class="notice">Trading remains stopped. This page can recover only the fenced offer lineage shown below. Each cancellation needs a fresh wallet and safety check and a separate confirmation.</p>
+    <p class="notice">Trading remains stopped. This page can recover only the fenced offer lineage shown below. A replacement may already have been broadcast, so recovery requires proof that every active wallet offer is cancelled. Each cancellation needs a fresh wallet and safety check and a separate confirmation.</p>
     <button type="button" id="refresh">Refresh proof</button>
     <p id="status" role="status" aria-live="polite">Reading recovery state…</p>
     <dl>
@@ -102,8 +102,10 @@
       const ready = data.safety?.lease_owned === true && data.safety?.state === 'tripped'
         && data.wallet?.pending_transaction_count === 0 && Array.isArray(trades);
       document.getElementById('scope').textContent = data.abort
-        ? `Abort ${data.abort.abort_id} · campaign ${data.abort.campaign_id} · ${trades.length} active Sage offers`
-        : data.candidate ? `Submitted parent ${data.candidate.parent_intent_id}` : 'No exact fenced cleanup candidate.';
+        ? `Abort ${data.abort.abort_id} · campaign ${data.abort.campaign_id} · ${trades.length} active Sage offers${data.candidate?.published_cleanup ? ' · replacement potentially public' : ''}`
+        : data.candidate
+          ? `Submitted parent ${data.candidate.parent_intent_id} · replacement ${data.candidate.published_cleanup ? 'dispatched to a provider; potentially public' : 'has no completed provider dispatch'}`
+          : 'No exact fenced cleanup candidate.';
       if (!ready) return;
       if (data.stage === 'submitted_parent_proof' && data.candidate) {
         const campaigns = data.stopped_campaigns || [];
@@ -191,7 +193,8 @@
             child_intent_id: proof.candidate.child_intent_id,
             campaign_id: campaignId,
             expected_latch_generation: proof.safety.generation,
-            expected_trade_ids: proof.wallet.active_trade_ids
+            expected_trade_ids: proof.wallet.active_trade_ids,
+            published_cleanup: proof.candidate.published_cleanup === true
           });
         } else if (action === 'fee_preview') {
           feeQuote = await postExact('fee_preview', abortScope(proof));
