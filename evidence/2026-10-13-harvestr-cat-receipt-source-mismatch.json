@@ -42,6 +42,35 @@
     "campaign_fee_spent_xch": "0",
     "fee_holds": 0
   },
-  "conclusion": "The raw Sage RPC already misclassifies the chain-bound CAT receipt and omits it from owned coin reads before CATalyst parsing. The source discrepancy is Sage-side; internal Sage root cause and persistence versus delayed recognition remain unproven. No safe complete-wallet reconciliation is available yet.",
+  "installed_sage_version": "0.13.0",
+  "official_release_source": "a98ca34b3f6f802c7070834ec914cab1995ca822",
+  "sage_database_read_only": {
+    "receive_row_id": 20083,
+    "receive_asset_id": 0,
+    "receive_p2_puzzle_id": null,
+    "receive_lineage_proof_count": 0,
+    "receive_spent_height": null,
+    "receive_is_children_synced": 0,
+    "wallet_inner_puzzle_registration_id": 2,
+    "prior_cat_receive_asset_id": 40,
+    "prior_cat_receive_p2_puzzle_id": 2,
+    "prior_cat_receive_lineage_proof_count": 1,
+    "prior_cat_receive_height": 9421325
+  },
+  "source_findings": {
+    "puzzle_queue": "v0.13.0 crates/sage-wallet/src/queues/puzzle_queue.rs:272-300: absent optional parent spend yields kind None. Lines130-143 then update_coin with default/XCH asset hash and outer puzzle as p2 hash.",
+    "retry_queue": "v0.13.0 crates/sage-database/src/tables/coins.rs:350-363: asset discovery selects asset_id IS NULL; child discovery requires spent_height IS NOT NULL. This unspent asset_id=0 coin meets neither condition.",
+    "binding_update": "coins.rs:396-416 resolves asset hash and p2 puzzle hash through registered tables. CAT outer puzzle is not the wallet inner puzzle, explaining null ownership in the fallback state.",
+    "causal_limit": "Observed DB state and retry exclusion are proven. The precise initial parent-spend fetch failure or fallback entry is not logged; do not claim its exact peer/transport cause is established."
+  },
+  "upstream_issue_draft": {
+    "title": "Sage 0.13.0 can permanently classify an incoming CAT2 as external XCH after unavailable parent-spend discovery",
+    "reproduction": "Use a fixture with the exact CAT2 receive and its parent spend. Make the first optional parent-spend fetch return None, then make it available. Assert receipt remains retryable, later resolves CAT asset, wallet inner puzzle ownership and lineage, and appears in owned inventory. No real-wallet mutation is required for regression reproduction.",
+    "expected": "Unknown asset evidence remains unknown/retryable, not terminally treated as XCH; confirmed CAT receipt appears in correct owned CAT inventory after exact parent/lineage validation.",
+    "observed": "Coin is asset_id=0, p2_puzzle_id=null, unspent, no lineage and excluded from unsynced-coins query; RPC history reports external XCH and exact owned coin query omits it.",
+    "not_published": true
+  },
+  "safe_local_acceptance_proposal": "Keep live trading and latch blocked. Independently validate exact chain receipt and use it only as isolated evidence/regression input. Test a reviewed Sage fix in a disposable fixture/profile, preserving unknown-vs-XCH semantics and retriable parent discovery. Any later original-wallet recovery/rescan or candidate rollover requires an explicitly reviewed supported path and separate authorization; no database edits, synthetic ownership injection, manual latch release, or accounting from hint/amount alone.",
+  "conclusion": "Raw Sage RPC and read-only wallet DB misclassify and fail to register the chain-bound CAT receipt before CATalyst parsing. The installed-version queue excludes this stored state from normal retry, so merely waiting for more blocks does not supply a supported recovery path. Initial fallback entry remains inferred from matching source behavior, not a captured parent-fetch log. No safe complete-wallet reconciliation is available yet.",
   "actions_not_taken": ["restart", "resync", "coin import", "latch release", "wallet effect", "pending Take", "campaign change"]
 }
