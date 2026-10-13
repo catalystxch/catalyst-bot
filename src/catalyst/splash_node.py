@@ -469,6 +469,13 @@ class SplashNode:
             self._metrics_bind,
         ]
 
+        # A full /p2p/<peer-id> multiaddress can bootstrap a reachable peer
+        # when the public DNS introducer is unavailable. Splash uses DNS when
+        # this optional setting is empty.
+        known_peer = getattr(cfg, "SPLASH_KNOWN_PEER", "").strip()
+        if known_peer:
+            cmd.extend(["--known-peer", known_peer])
+
         # Only add --offer-hook if SPLASH_RECEIVE_ENABLED is True.
         # Without this check, Splash forwards every P2P offer to the bot
         # and the bot rejects them all with 403 — flooding the terminal.
