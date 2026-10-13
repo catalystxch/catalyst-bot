@@ -4102,6 +4102,27 @@ CREATE TABLE IF NOT EXISTS offer_refresh_aborts (
     updated_at                 TEXT NOT NULL,
     completed_at               TEXT
 );
+CREATE TABLE IF NOT EXISTS offer_refresh_abort_successions (
+    succession_id              TEXT PRIMARY KEY CHECK(length(succession_id)=64),
+    abort_id                   TEXT NOT NULL,
+    prior_owner_run_id         TEXT NOT NULL,
+    prior_lease_version        INTEGER NOT NULL CHECK(prior_lease_version > 0),
+    successor_owner_run_id     TEXT NOT NULL,
+    successor_lease_version    INTEGER NOT NULL CHECK(successor_lease_version > 0),
+    proof_json                 TEXT NOT NULL CHECK(json_valid(proof_json)),
+    proof_sha256               TEXT NOT NULL CHECK(length(proof_sha256)=64),
+    adopted_at                 TEXT NOT NULL,
+    UNIQUE(abort_id, successor_lease_version),
+    FOREIGN KEY(abort_id) REFERENCES offer_refresh_aborts(abort_id)
+);
+CREATE TRIGGER IF NOT EXISTS offer_refresh_abort_successions_no_update
+BEFORE UPDATE ON offer_refresh_abort_successions BEGIN
+    SELECT RAISE(ABORT, 'refresh abort successions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_refresh_abort_successions_no_delete
+BEFORE DELETE ON offer_refresh_abort_successions BEGIN
+    SELECT RAISE(ABORT, 'refresh abort successions are append-only');
+END;
 
 -- v1.4 provider evidence. Raw evidence is bounded and redacted before this
 -- database boundary; exact digests make retries idempotent.
@@ -4985,6 +5006,17 @@ _STABILITY_REQUIRED_COLUMNS = {
         "recorded_at",
         "updated_at",
         "completed_at",
+    },
+    "offer_refresh_abort_successions": {
+        "succession_id",
+        "abort_id",
+        "prior_owner_run_id",
+        "prior_lease_version",
+        "successor_owner_run_id",
+        "successor_lease_version",
+        "proof_json",
+        "proof_sha256",
+        "adopted_at",
     },
     "bootstrap_campaigns": {
         "campaign_id",
@@ -7558,6 +7590,7 @@ def _migrate_stability_schema() -> None:
                 # An existing profile can legitimately lack this table on
                 # its first fenced refresh-abort upgrade.
                 "offer_refresh_aborts",
+                "offer_refresh_abort_successions",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",
                 "runtime_recovery_passes",
@@ -30085,6 +30118,52 @@ def list_incomplete_refresh_aborts(
     return [dict(row) for row in rows]
 
 
+def list_refresh_abort_successions(abort_id: str) -> List[Dict[str, Any]]:
+    """Read bounded immutable owner handoff receipts for one exact abort."""
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_refresh_abort_successions WHERE abort_id=? "
+            "ORDER BY successor_lease_version LIMIT 65",
+            (safe_abort,),
+        )
+        .fetchall()
+    )
+    if len(rows) > 64:
+        raise ValueError("refresh abort succession history exceeds bounded review")
+    result = []
+    for row in rows:
+        saved = dict(row)
+        proof_json = saved["proof_json"]
+        proof = json.loads(proof_json)
+        if (
+            type(proof) is not dict
+            or type(proof.get("predecessor_lease")) is not dict
+            or type(proof.get("successor_lease")) is not dict
+            or hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+            != saved["proof_sha256"]
+            or hashlib.sha256(
+                b"catalyst-refresh-abort-succession-v1\x00" + proof_json.encode("utf-8")
+            ).hexdigest()
+            != saved["succession_id"]
+            or proof.get("abort_id") != saved["abort_id"]
+            or proof.get("predecessor_lease", {}).get("owner_run_id")
+            != saved["prior_owner_run_id"]
+            or proof.get("predecessor_lease", {}).get("lease_version")
+            != saved["prior_lease_version"]
+            or proof.get("successor_lease", {}).get("owner_run_id")
+            != saved["successor_owner_run_id"]
+            or proof.get("successor_lease", {}).get("lease_version")
+            != saved["successor_lease_version"]
+            or proof.get("adopted_at") != saved["adopted_at"]
+        ):
+            raise ValueError("refresh abort succession proof digest or binding differs")
+        result.append(saved)
+    return result
+
+
 def adopt_refresh_abort_successor(
     *,
     abort_id: str,
@@ -30341,8 +30420,77 @@ def adopt_refresh_abort_successor(
                 "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
             ).fetchone()
         )
+        proof_json = _canonical_json_text(
+            {
+                "abort_id": safe_abort,
+                "latch_generation": abort["latch_generation"],
+                "blocking_operation_ids": sorted(expected_blockers),
+                "campaign_id": abort["campaign_id"],
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": safe_network,
+                "asset_id": safe_asset,
+                "observed_trade_ids": observed,
+                "observed_pending_transaction_ids": [],
+                "prior_owner_liveness_proven_dead": prior_owner_liveness_proven_dead,
+                "predecessor_lease": {
+                    key: lease[key]
+                    for key in (
+                        "owner_run_id",
+                        "owner_pid",
+                        "owner_host",
+                        "lease_version",
+                        "active",
+                        "acquired_at",
+                        "heartbeat_at",
+                        "expires_at",
+                        "released_at",
+                    )
+                },
+                "successor_lease": {
+                    key: successor[key]
+                    for key in (
+                        "owner_run_id",
+                        "owner_pid",
+                        "owner_host",
+                        "lease_version",
+                        "acquired_at",
+                        "expires_at",
+                    )
+                },
+                "adopted_at": locked_at,
+            },
+            "refresh abort succession proof",
+            expected_type=dict,
+            max_bytes=32768,
+        )
+        proof_sha256 = hashlib.sha256(proof_json.encode("utf-8")).hexdigest()
+        succession_id = hashlib.sha256(
+            b"catalyst-refresh-abort-succession-v1\x00" + proof_json.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            "INSERT INTO offer_refresh_abort_successions ("
+            "succession_id,abort_id,prior_owner_run_id,prior_lease_version,"
+            "successor_owner_run_id,successor_lease_version,proof_json,"
+            "proof_sha256,adopted_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                succession_id,
+                safe_abort,
+                lease["owner_run_id"],
+                version,
+                owner,
+                successor["lease_version"],
+                proof_json,
+                proof_sha256,
+                locked_at,
+            ),
+        )
         conn.commit()
-        return {"adopted": True, "abort": saved, "lease": successor}
+        return {
+            "adopted": True,
+            "abort": saved,
+            "lease": successor,
+            "succession_id": succession_id,
+        }
     except Exception:
         conn.rollback()
         raise

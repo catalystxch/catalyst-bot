@@ -110,3 +110,9 @@
   entry, native recovery page, fee consent, final packaged candidate, and
   original TEST 7 recovery remain open. The live diagnostic process and its
   unresolved latch have not been changed by these tests.
+- Each successor now writes a same-transaction, append-only receipt binding
+  the prior and new leases to the exact abort, latch, campaign, identity and
+  observed Sage book. Readback validates the receipt digest and bindings.
+  A watermarked existing-profile schema upgrade installs the receipt table;
+  the 143-test schema/recovery suite passed locally. This is still a dormant
+  recovery primitive, not a live recovery result.

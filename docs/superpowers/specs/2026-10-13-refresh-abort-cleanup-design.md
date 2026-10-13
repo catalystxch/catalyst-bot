@@ -89,6 +89,10 @@ transaction must compare-and-set the lease and rebind only that abort record
 to the new owner. Both the old and new run remain unable to create offers;
 the latch and abort target set remain unchanged. Any mismatch returns to
 read-only diagnostics, with no generic lease takeover or SQL repair.
+The same transaction appends an immutable succession receipt with both lease
+bindings, the exact abort and latch, stopped campaign, complete observed Sage
+book and liveness proof. The receipt digest and row bindings are checked on
+readback so recovery evidence cannot silently diverge from the durable owner.
 
 - Entry requires a stopped bot and campaign, an owned renewing lease, the
   expected latch generation with exactly the named submitted cancel blocker,

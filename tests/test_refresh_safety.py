@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -1394,6 +1395,7 @@ def test_refresh_abort_successor_rebinds_only_exact_released_owner(
         with pytest.raises(ValueError):
             database.adopt_refresh_abort_successor(**{**request, **changed})
         assert database.get_runtime_mutation_lease()["active"] == 0
+    assert database.list_refresh_abort_successions(abort["abort_id"]) == []
     adopted = database.adopt_refresh_abort_successor(**request)
     assert adopted["adopted"] is True
     assert adopted["lease"]["owner_run_id"] == "run-b"
@@ -1403,6 +1405,34 @@ def test_refresh_abort_successor_rebinds_only_exact_released_owner(
     assert set(
         json.loads(database.get_runtime_safety_latch()["blocking_operation_ids_json"])
     ) == {operation, abort["blocking_operation_id"]}
+    successions = database.list_refresh_abort_successions(abort["abort_id"])
+    assert len(successions) == 1
+    assert successions[0]["prior_owner_run_id"] == "run-a"
+    assert successions[0]["successor_owner_run_id"] == "run-b"
+    assert successions[0]["prior_lease_version"] == released["lease"]["lease_version"]
+    assert (
+        successions[0]["successor_lease_version"] == adopted["lease"]["lease_version"]
+    )
+    assert (
+        successions[0]["proof_sha256"]
+        == hashlib.sha256(successions[0]["proof_json"].encode("utf-8")).hexdigest()
+    )
+    with pytest.raises(sqlite3.DatabaseError):
+        database.get_connection().execute(
+            "UPDATE offer_refresh_abort_successions SET successor_owner_run_id=? "
+            "WHERE succession_id=?",
+            ("tampered", successions[0]["succession_id"]),
+        )
+    conn = database.get_connection()
+    conn.execute("DROP TRIGGER offer_refresh_abort_successions_no_update")
+    conn.execute(
+        "UPDATE offer_refresh_abort_successions SET proof_sha256=? "
+        "WHERE succession_id=?",
+        ("0" * 64, successions[0]["succession_id"]),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="succession proof digest"):
+        database.list_refresh_abort_successions(abort["abort_id"])
 
 
 def test_refresh_abort_successor_requires_expiry_and_dead_owner_proof(
