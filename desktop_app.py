@@ -1946,7 +1946,13 @@ def _initialize_startup_ownership() -> dict:
         authorization.get("allowed") is False
         and authorization.get("reason_code") in legacy_recovery_reasons
     ):
-        for attempt in range(_LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS):
+        exact_abort_candidate = (
+            authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+            and api_server.has_exact_refresh_abort_startup_candidate()
+        )
+        for attempt in range(
+            0 if exact_abort_candidate else _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS
+        ):
             recovery = None
             try:
                 recovery = api_server.recover_legacy_startup_reservations()

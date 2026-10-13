@@ -3904,6 +3904,49 @@ def recover_legacy_startup_reservations() -> dict[str, int]:
     )
 
 
+def has_exact_refresh_abort_startup_candidate() -> bool:
+    """Preserve a single submitted parent blocker for scoped recovery.
+
+    The ordinary Task 9 recovery cannot terminalize this parent while its
+    replacement child is unpublished. Trying it first would add a second
+    denial blocker and prevent the exact refresh-abort path from entering.
+    This read-only check grants no lease, abort, or wallet authority.
+    """
+
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return False
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
+            return False
+        wallet_hash, network = _configured_mutation_binding()
+        candidates = database.list_fenced_refresh_abort_candidates(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if len(candidates) != 1:
+            return False
+        operation_id = candidates[0]["cancel_operation_id"]
+        latch = database.get_runtime_safety_latch()
+        lease = database.get_runtime_mutation_lease()
+        blockers = database.get_unresolved_offer_operation_blockers()
+        return bool(
+            latch
+            and latch["state"] == "tripped"
+            and latch["reason_code"] == "UNRESOLVED_OPERATIONS"
+            and latch["wallet_fingerprint_hash"] == wallet_hash
+            and latch["network"] == network
+            and json.loads(latch["blocking_operation_ids_json"]) == [operation_id]
+            and lease
+            and lease["active"] == 0
+            and len(blockers) == 1
+            and blockers[0]["operation_id"] == operation_id
+        )
+    except Exception:
+        return False
+
+
 def promote_wallet_setup_bootstrap() -> dict:
     """Promote an exact persisted Sage identity into normal owner mode."""
 

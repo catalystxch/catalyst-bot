@@ -155,3 +155,26 @@ abort fenced, cleanup pending, and zero-offer completion.
   wallet/lease/fee/offer fact, and use the native action-time confirmation.
   Audit final Sage, CATalyst, Dexie/Splash and fee state before closing the
   live acceptance item.
+
+### Task 6: Blocked-profile recovery startup
+
+The original TEST 7 profile revealed that normal startup returns the
+read-only diagnostics window before the Task 5 routes are served. A copied
+profile also showed legacy reconciliation adding a second denial blocker
+for the unpublished child. This task is required before any further live
+replacement launch.
+
+- [ ] Add a red disposable-profile startup test with the submitted parent,
+  created child, one latch blocker and inactive released lease. Prove ordinary
+  legacy recovery is not attempted for that exact candidate and all other
+  malformed or extra-blocker profiles remain diagnostic-only.
+- [ ] Add a restricted recovery owner entry with exact wallet/Sage/lease
+  preflight. Keep the durable latch tripped, renew the lease, and refuse to
+  construct or start the trading BotLoop, publication workers or Coin Prep.
+- [ ] Serve only the recovery view and its exact proof/cleanup routes. Block
+  generic wallet, config, campaign, publication, update and trading writes,
+  including through the native bridge. Verify no effect on page load.
+- [ ] Test crash/restart and lost-lease behavior at each stage, wrong wallet,
+  changed Sage book, pending transaction, extra blocker and stale fee scope.
+  Run full relevant backend/Chromium suites and an isolated packaged native
+  replay. Obtain independent review before TEST 7 handoff.

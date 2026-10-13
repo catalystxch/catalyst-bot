@@ -8366,6 +8366,97 @@ def test_desktop_refreshes_authorization_after_zero_count_latch_recovery(
     assert calls == ["authorize", "recover", "authorize"]
 
 
+def test_desktop_preserves_single_refresh_abort_blocker_before_legacy_recovery(
+    monkeypatch,
+):
+    """Normal Task 9 would add a second blocker for an unpublished child."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    calls = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "failed_check": "unresolved_operations",
+    }
+    monkeypatch.setattr(database, "init_database", lambda: calls.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: calls.append("authorize") or blocked,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "has_exact_refresh_abort_startup_candidate",
+        lambda: calls.append("candidate") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: calls.append("legacy_recovery") or {"remaining": 1},
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result == blocked
+    assert calls == ["database", "authorize", "candidate"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["valid", "none", "extra_latch", "extra_journal", "active_lease", "wrong_wallet"],
+)
+def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
+    monkeypatch, change
+):
+    import api_server
+
+    operation_id = "cancel:" + "c" * 64
+    latch = {
+        "state": "tripped",
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "blocking_operation_ids_json": json.dumps([operation_id]),
+    }
+    lease = {"active": 0}
+    blockers = [{"operation_id": operation_id}]
+    if change == "extra_latch":
+        latch["blocking_operation_ids_json"] = json.dumps(
+            [operation_id, "create:other"]
+        )
+    elif change == "extra_journal":
+        blockers.append({"operation_id": "create:other"})
+    elif change == "active_lease":
+        lease["active"] = 1
+    elif change == "wrong_wallet":
+        latch["wallet_fingerprint_hash"] = OTHER_WALLET_HASH
+    monkeypatch.setattr(
+        api_server,
+        "cfg",
+        SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64),
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kwargs: [{"cancel_operation_id": operation_id}]
+        if change != "none"
+        else [],
+    )
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database, "get_unresolved_offer_operation_blockers", lambda: blockers
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is (change == "valid")
+
+
 def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
     monkeypatch,
 ):

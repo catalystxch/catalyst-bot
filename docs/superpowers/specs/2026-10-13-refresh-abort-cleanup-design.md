@@ -46,6 +46,27 @@ coverage rule would increase exposure contrary to Cancel All.
 
 ## Entry and atomicity
 
+### Blocked-profile startup entry
+
+The submitted parent cancellation already trips the normal startup gate.
+The recovery UI therefore cannot depend on an ordinary `allowed` startup or
+on the normal BotLoop creation path. A separate restricted startup entry must
+first validate the exact single parent/child candidate, existing cancellation
+blocker, stopped campaign, wallet binding and complete Sage read. It must not
+run legacy reconciliation on that parent: the normal registry rule rejects an
+unpublished child and would add a second denial blocker before the scoped
+abort can be created. A second blocker or changed evidence leaves the normal
+read-only diagnostics screen in place.
+
+Only after those checks may this process acquire and renew an inactive lease
+for restricted recovery. The durable latch stays tripped, the generic
+mutation gate remains blocked, and no trading BotLoop or publication worker
+starts. The restricted native view exposes the preview and exact abort stages;
+every wallet effect still uses the one-target cleanup permit and fresh fee,
+identity, Sage-book and lease checks. A crash or failed preflight releases no
+fence and returns to read-only diagnostics. Normal startup is retried only
+after the abort is durably complete and its blocker is released.
+
 - Entry requires a stopped bot and campaign, an owned renewing lease, the
   expected latch generation with exactly the named submitted cancel blocker,
   reciprocal parent/child binding, and a complete same-wallet/network Sage
