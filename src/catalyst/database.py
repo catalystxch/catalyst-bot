@@ -24952,7 +24952,16 @@ def _authorize_refresh_abort_cancel_finalization(
     if row is None:
         return False
     abort = dict(row)
-    _assert_refresh_abort_effect_scope(conn, {operation_id})
+    fee_hold = _refresh_abort_prepared_fee_hold(
+        conn,
+        prepared_operation_id=operation_id,
+        trade_id=trade_id,
+        intent_id=intent_id,
+        campaign_id=abort["campaign_id"],
+    )
+    if fee_hold is None:
+        raise ValueError("exact cleanup fee reservation is missing")
+    _assert_refresh_abort_effect_scope(conn, {operation_id}, fee_hold)
     latch_row = conn.execute(
         "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
     ).fetchone()
@@ -29882,8 +29891,9 @@ def _refresh_abort_prepared_fee_hold(
     trade_id: str,
     intent_id: str,
     campaign_id: str,
+    allow_submitted_parent: bool = False,
 ) -> Optional[str]:
-    """Admit only the reservation sealed to this one durable Task 8 cohort."""
+    """Admit only the reservation sealed to this one durable cancel cohort."""
 
     prepared = conn.execute(
         "SELECT * FROM offer_operation_journal WHERE operation_id=? "
@@ -29892,14 +29902,33 @@ def _refresh_abort_prepared_fee_hold(
     ).fetchone()
     if prepared is None:
         raise ValueError("exact cleanup PREPARED journal is missing")
+    latest = validate_offer_operation_event(dict(prepared))
+    if allow_submitted_parent:
+        if (
+            latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+        ):
+            raise ValueError("submitted parent cancellation journal differs")
+        prepared = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "AND attempt=1 AND phase='PREPARED'",
+            (prepared_operation_id,),
+        ).fetchone()
+        if prepared is None:
+            raise ValueError("submitted parent PREPARED journal is missing")
     event = validate_offer_operation_event(dict(prepared))
     evidence = json.loads(event["evidence_json"])
+    if allow_submitted_parent and evidence.get("reason") != "coin_prep_cancel_all":
+        if event["phase"] != "PREPARED" or event["intent_id"] != intent_id:
+            raise ValueError("submitted parent PREPARED journal differs")
+        return None
     if (
         event["phase"] != "PREPARED"
         or event["intent_id"] != intent_id
-        or evidence.get("reason") != "coin_prep_cancel_all"
         or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
     ):
+        raise ValueError("exact cleanup fee journal differs")
+    if evidence.get("reason") != "coin_prep_cancel_all":
         raise ValueError("exact cleanup fee journal differs")
     cohort_id = _required_stability_text(evidence.get("cohort_id"), "cohort_id")
     row = conn.execute(
@@ -30582,9 +30611,22 @@ def _validate_refresh_abort_commit_authority(
         conn,
         {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
     )
+    parent_fee_hold = (
+        _refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=abort["cancel_operation_id"],
+            trade_id=parent["sage_trade_id"],
+            intent_id=parent["intent_id"],
+            campaign_id=abort["campaign_id"],
+            allow_submitted_parent=True,
+        )
+        if abort["state"] == "fenced"
+        else None
+    )
     _assert_refresh_abort_effect_scope(
         conn,
         {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
+        parent_fee_hold,
     )
     if (
         abort["parent_intent_id"] != parent["intent_id"]
@@ -30795,7 +30837,15 @@ def begin_refresh_abort(
         ):
             raise ValueError("submitted cancellation is not an exact blocker")
         _assert_refresh_abort_journal_scope(conn, {cancel_op})
-        _assert_refresh_abort_effect_scope(conn, {cancel_op})
+        parent_fee_hold = _refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=cancel_op,
+            trade_id=parent_trade,
+            intent_id=parent_id,
+            campaign_id=campaign,
+            allow_submitted_parent=True,
+        )
+        _assert_refresh_abort_effect_scope(conn, {cancel_op}, parent_fee_hold)
         db_trades = sorted(
             str(row["sage_trade_id"])
             for row in conn.execute(

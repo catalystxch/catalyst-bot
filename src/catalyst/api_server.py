@@ -273,6 +273,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/offers/open_count",
         "/api/offers/cancel_all/status",
         "/api/offers/diagnostic",
+        "/api/offers/refresh_abort/preview",
         "/api/fills",
         "/api/fills/classified",
         "/api/fills/arb-wallets",
