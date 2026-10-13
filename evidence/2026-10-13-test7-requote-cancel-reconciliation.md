@@ -42,10 +42,36 @@ authorize a latch release, restart, cancellation retry, or offer Take.
 
 ## Next acceptance work
 
-Run CATalyst's built-in proof-only submitted-cancel reconciliation while the
-gate is still blocked; verify no second wallet effect, exact latch release,
-fee ledger, all four offer IDs and publication state. The native UI is
-currently covered by an unrelated eBay Windows Security passkey prompt. That
-authentication dialog must be handled by the user; it was not automated.
-Only after the live safety state and exact book agree should TEST 7 resume or
-provide a public offer for the requested Take test.
+Investigate why CATalyst's built-in proof-only submitted-cancel recovery did
+not clear the live gate, then verify no second wallet effect, exact latch
+release, fee ledger, all four offer IDs and publication state. An unrelated
+eBay Windows Security passkey prompt initially covered the native UI; the
+user dismissed it, and it was not automated. Only after the live safety state
+and exact book agree should TEST 7 resume or provide a public offer for the
+requested Take test.
+
+## 09:27 UTC native recovery attempt and isolated proof
+
+- The user dismissed the passkey prompt and gave action-time approval for the
+  final native **Cancel All** control. Immediately before the click, the live
+  gate still reported `UNRESOLVED_OPERATIONS`, Sage had zero pending
+  transactions and exactly three active offers, and CATalyst displayed four
+  (including the cancelled parent). The bot was stopped.
+- The native confirmation was clicked once. Its dialog closed, but at 09:29
+  UTC the live gate still reported one blocker and `allowed=false`. The exact
+  cancellation journal remained `CANCEL_SUBMITTED_UNCONFIRMED`; Sage still had
+  the same three active offers and zero pending transactions. The campaign's
+  authoritative fee-spend total remained zero. No second cancellation or
+  other wallet effect was observed. The UI did not expose a useful result.
+- A private SQLite snapshot of the original profile was made with SQLite's
+  backup API under `C:\catalyst\.superpowers\forensic-test7-20261013`.
+  Against that **copy only**, the exact packaged source classified the parent
+  cancellation as `CANCELLED_PROVEN / EXACT_CANCEL_RETURN_PROOF` and
+  `reconcile_offer` returned `applied=true`, resolved the copied latch, and
+  cleared its blocker. This proves the recorded evidence can pass Task 9's
+  database commit path. It does **not** prove the live API request reached that
+  path or that the live gate is clear.
+- Investigate the native recovery route's actual response, stopped-process
+  quiescence check, and settlement worker outcome before another control
+  attempt. Keep the original profile fenced. The user's requested TEST 7
+  offer link remains withheld until the live state and offer book reconcile.
