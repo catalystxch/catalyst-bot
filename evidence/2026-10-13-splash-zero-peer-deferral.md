@@ -39,8 +39,10 @@ Critical or Important regression in this final refinement.
 The clean Windows package built from that exact source. Its EXE SHA-256 is
 `61D5B7CE7926E6587785D2718001E6258EC7EF44F31402EF6A14C75C35903944`.
 Isolated packaged API, mock Sage RPC, native clean/duplicate/persisted/safety
-launches, and interrupted-publication upgrade recovery all passed. Exact-head
-CI was still completing at the time of this evidence update.
+launches, and interrupted-publication upgrade recovery all passed. All 11
+GitHub checks on exact source commit `b2d75331fa929e6c716f21b9a0acc4cac1640b4d`
+completed successfully, including the full unit test job, lint, security scans,
+and CodeQL. Later commits on draft PR #268 contain evidence only.
 
 This prevents the observed zero-peer local acknowledgement loss but does not
 prove delivery to an independent peer. Peers can disconnect after the metrics
