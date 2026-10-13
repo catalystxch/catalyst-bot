@@ -389,3 +389,17 @@ requested Take test.
 - The current PR head `54ed9a3c3b59dee7d6f9fde496bcffc79a504c50`
   passed all 11 checks. This source only replay does not establish a native
   recovery pass or public readiness.
+
+## 12:44 UTC independent Splash receipt check
+
+- Primary Splash `splash.exe` PID 202680 was still listening on ports 11511,
+  4000 and 4001, but its loopback metrics reported **zero peers, zero
+  broadcast offers and zero received offers**. A listening node alone does
+  not establish peer delivery.
+- The Harvestr PC's independent Splash node reported six peers and recent
+  incoming traffic. A read-only query of its retained incoming-offer records
+  found **no match** for the exact replacement-child offer fingerprint
+  `3400270bcb816b978fd3f194f9e5eceefb3437957803228a580f6b6cef2dc06a`.
+  This current retained view cannot prove that the offer never propagated,
+  but it supplies no reciprocal receipt. Neither PC changed a wallet or
+  publication record for this check.
