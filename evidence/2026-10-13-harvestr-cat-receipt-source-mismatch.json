@@ -43,6 +43,16 @@
     "fee_holds": 0
   },
   "installed_sage_version": "0.13.0",
+  "actual_disposable_api_test": {
+    "source_commit": "5669e8c",
+    "command": "cargo test -p sage --test harvestr_resync -- --nocapture",
+    "build": "PASS 1m45s, LNK4098 warning retained",
+    "result": "1 passed, 0 failed, 2.94s",
+    "api_test_binary_sha256": "3F33FD710AE740E1087448DF237600C448019F71594353302C05EE566D9FFA03",
+    "wallet_test_binary_sha256": "B6567AC9D86FD928A8DFA0165488FAFA9BF6EF47F4636E188036756ACABBD698",
+    "verified": "Actual Sage::resync API implementation invoked against disposable snapshot; metadata retained; exact receipt rebuilt by real parent CLVM/asset/ownership/lineage routines; database history correct",
+    "limits": "Not HTTP/mTLS transport, not logged-in wallet switch branch, not full network resync/full aggregate owned balance, not CATalyst safety resolution. Source formatting after compilation changes presentation only. No original-profile effects."
+  },
   "isolated_sage_candidate_verification": {
     "base_v0131": "f2ec89dd59d07227bed657bc268fc32ce97551f6",
     "candidate_commit": "1cae311deba6995469582d35e660e2c83b7e8b54",
