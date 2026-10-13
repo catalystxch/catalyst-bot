@@ -4079,6 +4079,26 @@ CREATE TABLE IF NOT EXISTS offer_refresh_lineage_blockers (
     recorded_at                TEXT NOT NULL,
     resolved_at                TEXT
 );
+CREATE TABLE IF NOT EXISTS offer_refresh_aborts (
+    abort_id                   TEXT PRIMARY KEY,
+    parent_intent_id           TEXT NOT NULL UNIQUE,
+    child_intent_id            TEXT NOT NULL UNIQUE,
+    campaign_id                TEXT NOT NULL,
+    cancel_operation_id        TEXT NOT NULL UNIQUE,
+    blocking_operation_id      TEXT NOT NULL UNIQUE,
+    latch_generation           INTEGER NOT NULL CHECK(latch_generation > 0),
+    owner_run_id               TEXT NOT NULL,
+    lease_version              INTEGER NOT NULL CHECK(lease_version > 0),
+    wallet_fingerprint_hash    TEXT NOT NULL,
+    network                    TEXT NOT NULL,
+    asset_id                   TEXT NOT NULL,
+    target_trade_ids_json      TEXT NOT NULL CHECK(json_valid(target_trade_ids_json)),
+    state                      TEXT NOT NULL CHECK(state IN
+                               ('fenced','parent_terminal','cleanup','aborted')),
+    recorded_at                TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    completed_at               TEXT
+);
 
 -- v1.4 provider evidence. Raw evidence is bounded and redacted before this
 -- database boundary; exact digests make retries idempotent.
@@ -4940,6 +4960,25 @@ _STABILITY_REQUIRED_COLUMNS = {
         "state",
         "recorded_at",
         "resolved_at",
+    },
+    "offer_refresh_aborts": {
+        "abort_id",
+        "parent_intent_id",
+        "child_intent_id",
+        "campaign_id",
+        "cancel_operation_id",
+        "blocking_operation_id",
+        "latch_generation",
+        "owner_run_id",
+        "lease_version",
+        "wallet_fingerprint_hash",
+        "network",
+        "asset_id",
+        "target_trade_ids_json",
+        "state",
+        "recorded_at",
+        "updated_at",
+        "completed_at",
     },
     "bootstrap_campaigns": {
         "campaign_id",
@@ -29553,6 +29592,235 @@ def _refresh_lineage_rows(
     if parent["child_intent_id"] not in (None, child_intent_id):
         raise ValueError("refresh parent is already bound to another child")
     return parent, child
+
+
+def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
+    """Read one exact abort fence without implying cleanup progress."""
+
+    safe_id = _required_stability_text(abort_id, "abort_id")
+    row = (
+        get_connection()
+        .execute("SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_id,))
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def begin_refresh_abort(
+    *,
+    parent_intent_id: str,
+    child_intent_id: str,
+    campaign_id: str,
+    expected_latch_generation: int,
+    owner_run_id: str,
+    expected_lease_version: int,
+    observed_trade_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Retain an exact stop fence before settling an already-submitted cancel.
+
+    This is a durable authority check, not a wallet or publication action.
+    The caller must obtain the complete Sage book independently. Later stages
+    re-read that book before each effect; this snapshot cannot grant one.
+    """
+
+    from mutation_gate import wallet_fingerprint_hash
+
+    parent_id = _required_stability_text(parent_intent_id, "parent_intent_id")
+    child_id = _required_stability_text(child_intent_id, "child_intent_id")
+    campaign = _bootstrap_identity(campaign_id, "campaign_id")
+    generation = _exact_integer(
+        expected_latch_generation, "expected_latch_generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "owner_run_id")
+    lease_version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    at = _stability_timestamp(observed_at, "observed_at")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("observed_trade_ids must be a bounded exact list")
+    trades = sorted(
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    )
+    if not trades or len(trades) != len(set(trades)):
+        raise ValueError("observed Sage trade identities are empty or duplicated")
+    target_json = _canonical_json_text(
+        trades, "target_trade_ids_json", expected_type=list
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        parent, child = _refresh_lineage_rows(conn, parent_id, child_id)
+        parent_trade = parent.get("sage_trade_id")
+        cancel_op = f"cancel:{parent_trade}"
+        parent_offer = conn.execute(
+            "SELECT status,lifecycle_state FROM offers WHERE trade_id=?",
+            (parent_trade,),
+        ).fetchone()
+        if (
+            parent["child_intent_id"] != child_id
+            or parent["lifecycle_state"] != "visible"
+            or parent["first_visible_at"] is None
+            or parent_offer is None
+            or parent_offer["status"] != "open"
+            or parent_offer["lifecycle_state"] != "cancel_requested"
+            or _authority_sql_selected_coin_digest(parent["selected_coin_ids_json"])
+            != parent["selected_coin_ids_sha256"]
+            or _authority_sql_selected_coin_digest(child["selected_coin_ids_json"])
+            != child["selected_coin_ids_sha256"]
+            or child["lifecycle_state"] != "created"
+            or child["first_visible_at"] is not None
+            or not parent_trade
+            or not child.get("sage_trade_id")
+            or child["sage_trade_id"] not in trades
+        ):
+            raise ValueError("abort lineage is not an unpublished replacement")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        campaign_row = conn.execute(
+            "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (campaign,)
+        ).fetchone()
+        if latch_row is None or lease_row is None or campaign_row is None:
+            raise ValueError("abort authority is incomplete")
+        latch, lease, saved_campaign = (
+            dict(latch_row), dict(lease_row), dict(campaign_row)
+        )
+        wallet_hash, network = parent["wallet_fingerprint_hash"], parent["network"]
+        if (
+            latch["generation"] != generation
+            or latch["state"] != "tripped"
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != network
+            or lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or lease["lease_version"] != lease_version
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != network
+            or lease["expires_at"] is None
+            or lease["expires_at"] <= at
+            or saved_campaign["status"] != "stopped"
+            or saved_campaign["network"] != network
+            or saved_campaign["asset_id"] != parent["asset_id"]
+            or wallet_fingerprint_hash(saved_campaign["wallet_fingerprint"])
+            != wallet_hash
+        ):
+            raise ValueError("abort safety, lease or stopped campaign differs")
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (cancel_op,),
+        ).fetchone()
+        if latest_row is None:
+            raise ValueError("submitted cancellation journal is missing")
+        latest = validate_offer_operation_event(dict(latest_row))
+        if (
+            latest["intent_id"] != parent_id
+            or latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+            or latest["blocks_mutation"] != 1
+            or not (latest["transaction_id"] or latest["spend_identity"])
+        ):
+            raise ValueError("submitted cancellation is not an exact blocker")
+        db_trades = sorted(
+            str(row["sage_trade_id"])
+            for row in conn.execute(
+                "SELECT sage_trade_id FROM offer_intents WHERE "
+                "wallet_fingerprint_hash=? AND network=? AND asset_id=? "
+                "AND lifecycle_state IN ('created','visible','cancel_requested') "
+                "AND sage_trade_id IS NOT NULL AND intent_id<>?",
+                (wallet_hash, network, parent["asset_id"], parent_id),
+            ).fetchall()
+        )
+        if db_trades != trades:
+            raise ValueError("complete Sage book differs from durable offer intents")
+        unsafe_publication = conn.execute(
+            "SELECT 1 FROM publication_outbox WHERE intent_id=? "
+            "AND (state IN ('claimed','unresolved','retryable') OR "
+            "(dispatch_started_at IS NOT NULL AND state<>'succeeded')) LIMIT 1",
+            (child_id,),
+        ).fetchone()
+        if unsafe_publication is not None:
+            raise ValueError("replacement publication has ambiguous dispatch")
+        material = _canonical_json_text(
+            {
+                "parent_intent_id": parent_id,
+                "child_intent_id": child_id,
+                "cancel_operation_id": cancel_op,
+                "latch_generation": generation,
+            },
+            "refresh abort identity",
+            expected_type=dict,
+        )
+        abort_id = hashlib.sha256(
+            b"catalyst-refresh-abort-v1\x00" + material.encode("utf-8")
+        ).hexdigest()
+        blocker = f"refresh-abort:{abort_id}"
+        immutable = {
+            "abort_id": abort_id,
+            "parent_intent_id": parent_id,
+            "child_intent_id": child_id,
+            "campaign_id": campaign,
+            "cancel_operation_id": cancel_op,
+            "blocking_operation_id": blocker,
+            "latch_generation": generation,
+            "owner_run_id": owner,
+            "lease_version": lease_version,
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": network,
+            "asset_id": parent["asset_id"],
+            "target_trade_ids_json": target_json,
+        }
+        existing = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE parent_intent_id=?",
+            (parent_id,),
+        ).fetchone()
+        if existing is not None:
+            current = dict(existing)
+            if any(current[key] != value for key, value in immutable.items()):
+                raise ValueError("refresh abort replay differs")
+            if set(json.loads(latch["blocking_operation_ids_json"])) != {
+                cancel_op, blocker,
+            }:
+                raise ValueError("refresh abort has an additional safety blocker")
+            conn.commit()
+            return {**current, "idempotent": True}
+        if json.loads(latch["blocking_operation_ids_json"]) != [cancel_op]:
+            raise ValueError("refresh abort has an additional safety blocker")
+        conn.execute(
+            "INSERT INTO offer_refresh_aborts ("
+            + ",".join(immutable)
+            + ",state,recorded_at,updated_at) VALUES ("
+            + ",".join("?" for _ in immutable)
+            + ",?,?,?)",
+            (*immutable.values(), "fenced", at, at),
+        )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=blocker,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+            reason_code="REFRESH_ABORT_CLEANUP",
+            reason="Confirmed cancellation needs fenced offer cleanup",
+            reconciled_at=at,
+            blocking=True,
+        )
+        saved = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (abort_id,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {**saved, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def bind_refresh_lineage(parent_intent_id: str, child_intent_id: str) -> Dict[str, Any]:

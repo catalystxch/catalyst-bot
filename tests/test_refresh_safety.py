@@ -66,13 +66,15 @@ def _prepare(
     reserve_selected_coins: bool = False,
     slot_key: str = "asset-a:buy:inner",
     run_id: str = "run-a",
+    wallet_hash: str | None = None,
 ):
+    wallet_hash = wallet_hash or _sha("wallet-a")
     return database.prepare_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
         event_id=f"create:{intent_id}:prepared",
         run_id=run_id,
-        wallet_fingerprint_hash=_sha("wallet-a"),
+        wallet_fingerprint_hash=wallet_hash,
         network="mainnet",
         asset_id=_sha("asset-a"),
         side="buy",
@@ -85,7 +87,7 @@ def _prepare(
         requested_amount_atomic="200",
         selected_coin_ids_json=[_sha(f"coin:{intent_id}")],
         wallet_identity_json={
-            "fingerprint_sha256": _sha("wallet-a"),
+            "fingerprint_sha256": wallet_hash,
             "network": "mainnet",
         },
         evidence_json={"source": "task-11-test"},
@@ -94,7 +96,13 @@ def _prepare(
     )
 
 
-def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = False):
+def _confirm(
+    intent_id: str,
+    *,
+    finalize_selected_coin_reservations: bool = False,
+    wallet_hash: str | None = None,
+):
+    wallet_hash = wallet_hash or _sha("wallet-a")
     return database.finalize_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
@@ -104,7 +112,7 @@ def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = Fals
         sage_trade_id=_sha(f"trade:{intent_id}"),
         offer_text_sha256=_sha(f"offer:{intent_id}"),
         wallet_identity_json={
-            "fingerprint_sha256": _sha("wallet-a"),
+            "fingerprint_sha256": wallet_hash,
             "network": "mainnet",
         },
         evidence_json={"source": "task-11-test"},
@@ -1072,6 +1080,191 @@ def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
     assert parents == {}
     assert pause == "awaiting_task8_task9"
     assert cancelled == []
+
+
+def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing(
+    isolated_database, monkeypatch,
+):
+    """The exact Cancel All incident needs a durable stop before Task 9 settles."""
+
+    from mutation_gate import wallet_fingerprint_hash
+
+    database.init_database()
+    monkeypatch.setattr(
+        database, "_stability_wall_clock",
+        lambda: "2026-08-15T12:00:00.000000Z",
+    )
+    fingerprint = 736588221
+    wallet_hash = wallet_fingerprint_hash(fingerprint)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    assert lease["acquired"] is True
+    campaign_id = database.create_bootstrap_campaign(
+        {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": fingerprint,
+            "wallet_id": 2,
+            "asset_id": _sha("asset-a"),
+            "anchor_price": "0.01",
+            "minimum_price": "0.005",
+            "maximum_price": "0.02",
+            "xch_budget": "1",
+            "cat_budget": "200",
+            "fee_budget_xch": "0.05",
+            "subsidy_budget_xch": "0",
+            "created_at": "2026-08-15T12:00:00Z",
+            "expires_at": "2026-08-16T12:00:00Z",
+        }
+    )
+    assert database.stop_bootstrap_campaign(
+        campaign_id, "manual", "2026-08-15T12:02:00.000000Z"
+    )
+    assert database.upsert_coin(
+        _sha("coin:parent"),
+        "xch",
+        100,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    _prepare("parent", reserve_selected_coins=True, wallet_hash=wallet_hash)
+    _confirm(
+        "parent", finalize_selected_coin_reservations=True,
+        wallet_hash=wallet_hash,
+    )
+    database.record_offer_intent_visibility(
+        "parent", publication_identity="registry:parent",
+        visible_at="2026-08-15T12:01:00.000000Z",
+    )
+    parent_trade = _sha("trade:parent")
+    assert database.add_offer(
+        parent_trade, "buy", Decimal("0.01"), Decimal("1"),
+        Decimal("100"), _sha("asset-a"), tier="inner",
+    )
+    operation = f"cancel:{parent_trade}"
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": "mainnet",
+        },
+        evidence_json={
+            "trade_id": parent_trade,
+            "effect_claim_protocol": "durable_cohort_claim_v1",
+        },
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    _prepare("child", parent_intent_id="parent", generation=1,
+             wallet_hash=wallet_hash)
+    _confirm("child", wallet_hash=wallet_hash)
+    database.bind_refresh_lineage("parent", "child")
+    assert database.claim_offer_cancel_effect(
+        operation_id=operation,
+        trade_id=parent_trade,
+        attempt=1,
+        claimed_at="2026-08-15T12:02:00.000000Z",
+    )
+    cancel_result = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="legacy_cancel_all",
+        raw_response={"success": True},
+        transaction_id=_sha("cancel-transaction"),
+        spend_identity=_sha("cancel-spend"),
+    )
+    database.finalize_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:finalized",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        cancel_result=cancel_result,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade, "cancel_result": cancel_result},
+        finalized_at="2026-08-15T12:02:30.000000Z",
+    )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[operation],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at="2026-08-15T12:02:31.000000Z",
+    )
+    before = database.get_runtime_safety_latch()
+    assert before["state"] == "tripped"
+    assert database.get_offer_intent("child")["first_visible_at"] is None
+    assert database.get_offer_intent("parent")["lifecycle_state"] == "visible"
+    assert database.get_offer(parent_trade)["lifecycle_state"] == "cancel_requested"
+    assert database.get_offer_intent("child")["lifecycle_state"] == "created"
+
+    request = dict(
+        parent_intent_id="parent",
+        child_intent_id="child",
+        campaign_id=campaign_id,
+        expected_latch_generation=before["generation"],
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        observed_trade_ids=[_sha("trade:child")],
+        observed_at="2026-08-15T12:03:00.000000Z",
+    )
+    abort = database.begin_refresh_abort(**request)
+
+    after = database.get_runtime_safety_latch()
+    assert abort["state"] == "fenced"
+    assert abort["parent_intent_id"] == "parent"
+    assert abort["child_intent_id"] == "child"
+    assert after["state"] == "tripped"
+    assert operation in json.loads(after["blocking_operation_ids_json"])
+    assert abort["blocking_operation_id"] in json.loads(
+        after["blocking_operation_ids_json"]
+    )
+    assert database.get_offer_intent("child")["lifecycle_state"] == "created"
+    assert database.refresh_lineage_completion("parent")["complete"] is False
+    assert database.begin_refresh_abort(**request)["idempotent"] is True
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(**{
+            **request, "expected_latch_generation": before["generation"] + 1,
+        })
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(**{
+            **request, "observed_trade_ids": [_sha("unknown-trade")],
+        })
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(**{
+            **request, "owner_run_id": "another-run",
+        })
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(**{
+            **request, "child_intent_id": "unrelated-child",
+        })
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(**{
+            **request, "expected_lease_version": lease["lease"]["lease_version"] + 1,
+        })
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["another:operation"],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at="2026-08-15T12:03:01.000000Z",
+    )
+    with pytest.raises(ValueError, match="additional safety blocker"):
+        database.begin_refresh_abort(**request)
 
 
 def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(
