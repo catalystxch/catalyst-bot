@@ -779,6 +779,48 @@ def test_splash_node_offer_hook_uses_actual_flask_port(
         assert "--offer-hook" not in captured["cmd"]
 
 
+def test_splash_node_can_bootstrap_from_explicit_lan_peer(monkeypatch):
+    """The optional known peer reaches Splash as one complete multiaddress."""
+    import splash_node
+    from config import cfg
+
+    peer = (
+        "/ip4/192.168.1.130/tcp/11511/p2p/"
+        "12D3KooWEDjR2wjqoroJxcMToEj2wvCo5ybSnKaodkWh9XU6Ri1j"
+    )
+    launched = []
+
+    class FakeProcess:
+        pid = 12345
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(cfg, "SPLASH_KNOWN_PEER", peer, raising=False)
+    monkeypatch.setattr(
+        splash_node.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: launched.append(cmd) or FakeProcess(),
+    )
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda port: None)
+
+    node._launch_process()
+
+    assert launched[0][launched[0].index("--known-peer") + 1] == peer
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows process ownership regression")
 def test_splash_start_does_not_terminate_unowned_listener(monkeypatch):
     """An occupied submit port is not proof that CATalyst owns its listener."""
