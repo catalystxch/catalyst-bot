@@ -3921,6 +3921,52 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
         if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
             return False
         wallet_hash, network = _configured_mutation_binding()
+        incomplete = database.list_incomplete_refresh_aborts(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if incomplete:
+            if len(incomplete) != 1:
+                return False
+            abort = incomplete[0]
+            expected_blockers = {abort["blocking_operation_id"]}
+            expected_journal = set()
+            if abort["state"] == "fenced":
+                expected_blockers.add(abort["cancel_operation_id"])
+                expected_journal.add(abort["cancel_operation_id"])
+            elif abort["state"] != "parent_terminal":
+                return False
+            latch = database.get_runtime_safety_latch()
+            lease = database.get_runtime_mutation_lease()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            expired_abort_owner = False
+            if lease and lease["active"] == 1:
+                expiry = lease.get("expires_at")
+                expired_abort_owner = bool(
+                    type(expiry) is str
+                    and datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                    <= datetime.now(timezone.utc)
+                    and lease.get("owner_run_id") == abort["owner_run_id"]
+                    and lease.get("owner_pid") == abort["lease_owner_pid"]
+                    and lease.get("owner_host") == abort["lease_owner_host"]
+                    and lease.get("acquired_at") == abort["lease_acquired_at"]
+                )
+            return bool(
+                latch
+                and latch["state"] == "tripped"
+                and latch["generation"] == abort["latch_generation"]
+                and latch["wallet_fingerprint_hash"] == wallet_hash
+                and latch["network"] == network
+                and set(json.loads(latch["blocking_operation_ids_json"]))
+                == expected_blockers
+                and abort["wallet_fingerprint_hash"] == wallet_hash
+                and abort["network"] == network
+                and abort["asset_id"] == asset_id
+                and lease
+                and (lease["active"] == 0 or expired_abort_owner)
+                and {row["operation_id"] for row in blockers} == expected_journal
+            )
         candidates = database.list_fenced_refresh_abort_candidates(
             asset_id=asset_id,
             wallet_fingerprint_hash=wallet_hash,

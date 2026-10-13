@@ -30085,6 +30085,271 @@ def list_incomplete_refresh_aborts(
     return [dict(row) for row in rows]
 
 
+def adopt_refresh_abort_successor(
+    *,
+    abort_id: str,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    asset_id: str,
+    expected_lease_version: int,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Move one fenced abort to a successor without granting normal mutation.
+
+    An inactive lease is its own release proof. An active predecessor must be
+    expired and independently proven dead by the process layer. The lease and
+    abort owner change in the same transaction; the latch never changes.
+    """
+
+    safe_abort = _reconciliation_coin_identity(abort_id, "abort_id")[0]
+    owner = _required_stability_text(successor_owner_run_id, "successor_owner_run_id")
+    pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
+    host = _required_stability_text(successor_owner_host, "successor_owner_host")
+    wallet_hash = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior_owner_liveness_proven_dead must be an exact bool")
+    at = _stability_timestamp(observed_at, "observed_at")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at")
+    if type(observed_trade_ids) is not list or len(observed_trade_ids) > 256:
+        raise ValueError("complete Sage offer book is required")
+    observed = sorted(
+        _reconciliation_coin_identity(value, "observed trade_id")[0]
+        for value in observed_trade_ids
+    )
+    if len(observed) != len(set(observed)):
+        raise ValueError("observed Sage trade identities are duplicated")
+    if (
+        type(observed_pending_transaction_ids) is not list
+        or len(observed_pending_transaction_ids) > 256
+    ):
+        raise ValueError("complete Sage pending transaction read is required")
+    pending = [
+        _reconciliation_coin_identity(value, "pending transaction_id")[0]
+        for value in observed_pending_transaction_ids
+    ]
+    if pending:
+        raise ValueError("refresh abort successor has a pending wallet effect")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        observed_time = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        authority_time = datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
+        if (
+            not timedelta(seconds=-5)
+            <= authority_time - observed_time
+            <= timedelta(seconds=30)
+        ):
+            raise ValueError("fresh Sage offer book is required")
+        if expiry <= max(at, locked_at):
+            raise ValueError("successor lease expiry is stale")
+        abort_row = conn.execute(
+            "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if abort_row is None or lease_row is None or latch_row is None:
+            raise ValueError("refresh abort successor authority is missing")
+        abort, lease, latch = dict(abort_row), dict(lease_row), dict(latch_row)
+        if abort["state"] not in {"fenced", "parent_terminal"}:
+            raise ValueError("refresh abort stage cannot be succeeded")
+        expected_blockers = {abort["blocking_operation_id"]}
+        if abort["state"] == "fenced":
+            expected_blockers.add(abort["cancel_operation_id"])
+        if (
+            abort["wallet_fingerprint_hash"] != wallet_hash
+            or abort["network"] != safe_network
+            or abort["asset_id"] != safe_asset
+            or latch["state"] != "tripped"
+            or latch["generation"] != abort["latch_generation"]
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != safe_network
+            or set(json.loads(latch["blocking_operation_ids_json"]))
+            != expected_blockers
+            or lease["lease_version"] != version
+            or lease["owner_run_id"] != abort["owner_run_id"]
+            or lease["owner_pid"] != abort["lease_owner_pid"]
+            or lease["owner_host"] != abort["lease_owner_host"]
+            or lease["acquired_at"] != abort["lease_acquired_at"]
+            or lease["lease_version"] < abort["lease_version"]
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != safe_network
+            or owner == abort["owner_run_id"]
+        ):
+            raise ValueError("refresh abort successor authority changed")
+        if lease["active"] == 1:
+            if (
+                lease["expires_at"] is None
+                or lease["expires_at"] > max(at, locked_at)
+                or lease["released_at"] is not None
+                or not prior_owner_liveness_proven_dead
+            ):
+                raise ValueError("prior refresh abort owner is not proven stopped")
+        elif lease["active"] == 0:
+            if lease["expires_at"] is not None or lease["released_at"] is None:
+                raise ValueError("prior refresh abort release proof is invalid")
+        else:
+            raise ValueError("prior refresh abort lease state is invalid")
+        campaign_row = conn.execute(
+            "SELECT status,network,asset_id,wallet_fingerprint FROM "
+            "bootstrap_campaigns WHERE campaign_id=?",
+            (abort["campaign_id"],),
+        ).fetchone()
+        if (
+            campaign_row is None
+            or campaign_row["status"] != "stopped"
+            or campaign_row["network"] != safe_network
+            or campaign_row["asset_id"] != safe_asset
+        ):
+            raise ValueError("refresh abort campaign is not stopped and exact")
+        from mutation_gate import wallet_fingerprint_hash as hash_fingerprint
+
+        if hash_fingerprint(campaign_row["wallet_fingerprint"]) != wallet_hash:
+            raise ValueError("refresh abort campaign wallet differs")
+        if (
+            conn.execute(
+                "SELECT COUNT(*) FROM offer_refresh_aborts WHERE "
+                "state IN ('fenced','parent_terminal')"
+            ).fetchone()[0]
+            != 1
+        ):
+            raise ValueError("refresh abort successor is not unique")
+        parent, child = _refresh_lineage_rows(
+            conn, abort["parent_intent_id"], abort["child_intent_id"]
+        )
+        if (
+            parent["child_intent_id"] != child["intent_id"]
+            or child["parent_intent_id"] != parent["intent_id"]
+            or child["lifecycle_state"] != "created"
+            or child["first_visible_at"] is not None
+            or child["sage_trade_id"] not in json.loads(abort["target_trade_ids_json"])
+            or (abort["state"] == "fenced" and parent["lifecycle_state"] != "visible")
+            or (
+                abort["state"] == "parent_terminal"
+                and parent["lifecycle_state"] != "terminal"
+            )
+        ):
+            raise ValueError("refresh abort lineage differs")
+        if (
+            conn.execute(
+                "SELECT 1 FROM publication_outbox WHERE intent_id=? "
+                "AND (state='succeeded' OR dispatch_started_at IS NOT NULL) LIMIT 1",
+                (child["intent_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("replacement publication may already be visible")
+        active = conn.execute(
+            "SELECT sage_trade_id,asset_id FROM offer_intents WHERE "
+            "wallet_fingerprint_hash=? AND network=? "
+            "AND lifecycle_state IN ('created','visible','cancel_requested') "
+            "AND intent_id<>?",
+            (wallet_hash, safe_network, parent["intent_id"]),
+        ).fetchall()
+        if (
+            any(
+                not row["sage_trade_id"] or row["asset_id"] != safe_asset
+                for row in active
+            )
+            or sorted(row["sage_trade_id"] for row in active) != observed
+            or not set(observed).issubset(
+                set(json.loads(abort["target_trade_ids_json"]))
+            )
+        ):
+            raise ValueError("complete Sage book differs from refresh abort targets")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1, "
+            "active=1,owner_run_id=?,owner_pid=?,owner_host=?,acquired_at=?,"
+            "heartbeat_at=?,expires_at=?,released_at=NULL,updated_at=? "
+            "WHERE singleton_id=1 AND lease_version=? AND owner_run_id=?",
+            (
+                owner,
+                pid,
+                host,
+                locked_at,
+                locked_at,
+                expiry,
+                locked_at,
+                version,
+                abort["owner_run_id"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("refresh abort lease compare-and-set failed")
+        successor = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        changed = conn.execute(
+            "UPDATE offer_refresh_aborts SET owner_run_id=?,lease_version=?,"
+            "lease_acquired_at=?,lease_owner_pid=?,lease_owner_host=?,updated_at=? "
+            "WHERE abort_id=? AND owner_run_id=? AND lease_version<=?",
+            (
+                owner,
+                successor["lease_version"],
+                locked_at,
+                pid,
+                host,
+                locked_at,
+                safe_abort,
+                abort["owner_run_id"],
+                version,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("refresh abort owner compare-and-set failed")
+        _validate_refresh_abort_commit_authority(
+            conn,
+            abort_id=safe_abort,
+            parent=parent,
+            child=child,
+            wallet_hash=wallet_hash,
+            network=safe_network,
+            at=locked_at,
+        )
+        if lease["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked', "
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (locked_at, locked_at, lease["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("refresh abort successor lease expired during adoption")
+        saved = dict(
+            conn.execute(
+                "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (safe_abort,)
+            ).fetchone()
+        )
+        conn.commit()
+        return {"adopted": True, "abort": saved, "lease": successor}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def authorize_refresh_abort_cleanup_target(
     *,
     abort_id: str,
@@ -30758,8 +31023,8 @@ def begin_refresh_abort(
             )
             ambiguous_dispatch = conn.execute(
                 "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-                "AND (state IN ('claimed','unresolved','retryable') OR "
-                "(dispatch_started_at IS NOT NULL AND state<>'succeeded')) LIMIT 1",
+                "AND (state IN ('claimed','unresolved','retryable','succeeded') "
+                "OR dispatch_started_at IS NOT NULL) LIMIT 1",
                 (child_id,),
             ).fetchone()
             if ambiguous_dispatch is not None:
@@ -30864,8 +31129,8 @@ def begin_refresh_abort(
             raise ValueError("complete Sage book differs from durable offer intents")
         unsafe_publication = conn.execute(
             "SELECT 1 FROM publication_outbox WHERE intent_id=? "
-            "AND (state IN ('claimed','unresolved','retryable') OR "
-            "(dispatch_started_at IS NOT NULL AND state<>'succeeded')) LIMIT 1",
+            "AND (state IN ('claimed','unresolved','retryable','succeeded') "
+            "OR dispatch_started_at IS NOT NULL) LIMIT 1",
             (child_id,),
         ).fetchone()
         if unsafe_publication is not None:

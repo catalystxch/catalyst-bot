@@ -92,3 +92,21 @@
   exists yet. Without it, a crash after abort entry could leave the profile
   permanently fenced despite valid Sage proof. A new atomic successor path
   and crash/replay tests are required before original-profile recovery.
+
+## Isolated successor work in progress
+
+- A disposable database reproduction now proves an exact abort can move from
+  a released owner or a proven-dead expired owner to one successor while the
+  safety latch stays tripped. Incomplete Sage books, pending transactions,
+  asset mismatches, active predecessors and missing death proof are rejected.
+- A production gate wrapper supplies the process liveness proof and keeps
+  ordinary offer creation blocked after the scoped handoff. The read-only
+  startup detector also recognizes a previously entered abort, including an
+  expired predecessor, without granting a lease.
+- A separate red/green test exposed an inconsistent state in which the child
+  publication outbox said `succeeded` while the local child intent still said
+  unpublished. Abort entry and successor adoption now reject that state.
+- These are isolated code and database tests only. The restricted desktop
+  entry, native recovery page, fee consent, final packaged candidate, and
+  original TEST 7 recovery remain open. The live diagnostic process and its
+  unresolved latch have not been changed by these tests.

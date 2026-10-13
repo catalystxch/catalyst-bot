@@ -8510,6 +8510,7 @@ def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
             [{"cancel_operation_id": operation_id}] if change != "none" else []
         ),
     )
+    monkeypatch.setattr(database, "list_incomplete_refresh_aborts", lambda **_kw: [])
     monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
     monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
     monkeypatch.setattr(
@@ -8517,6 +8518,78 @@ def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
     )
 
     assert api_server.has_exact_refresh_abort_startup_candidate() is (change == "valid")
+
+
+@pytest.mark.parametrize("stage", ["fenced", "parent_terminal"])
+@pytest.mark.parametrize("lease_state", ["released", "expired"])
+def test_exact_refresh_abort_startup_discovers_incomplete_abort_without_effect(
+    monkeypatch, stage, lease_state
+):
+    """Restart after abort entry must retain its fenced recovery path."""
+
+    import api_server
+
+    abort_id = "a" * 64
+    cancel_op = "cancel:" + "c" * 64
+    abort_op = f"refresh-abort:{abort_id}"
+    expected = {abort_op, cancel_op} if stage == "fenced" else {abort_op}
+    latch = {
+        "state": "tripped",
+        "reason_code": "REFRESH_ABORT_CLEANUP",
+        "generation": 10,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "blocking_operation_ids_json": json.dumps(sorted(expected)),
+    }
+    abort = {
+        "abort_id": abort_id,
+        "state": stage,
+        "cancel_operation_id": cancel_op,
+        "blocking_operation_id": abort_op,
+        "latch_generation": 10,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "asset_id": "a" * 64,
+        "owner_run_id": "run-a",
+        "lease_owner_pid": 111,
+        "lease_owner_host": "test-host",
+        "lease_acquired_at": "2026-08-15T12:00:00.000000Z",
+    }
+    lease = (
+        {"active": 0}
+        if lease_state == "released"
+        else {
+            "active": 1,
+            "expires_at": "2020-01-01T00:00:00.000000Z",
+            "owner_run_id": "run-a",
+            "owner_pid": 111,
+            "owner_host": "test-host",
+            "acquired_at": "2026-08-15T12:00:00.000000Z",
+        }
+    )
+    monkeypatch.setattr(
+        api_server,
+        "cfg",
+        SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64),
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        database, "list_incomplete_refresh_aborts", lambda **_kw: [abort]
+    )
+    monkeypatch.setattr(
+        database, "list_fenced_refresh_abort_candidates", lambda **_kw: []
+    )
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": cancel_op}] if stage == "fenced" else [],
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is True
 
 
 def test_desktop_retries_startup_after_persisted_reconciliation_conflict(

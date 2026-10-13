@@ -186,3 +186,7 @@ replacement launch.
   authority only after exact latch, wallet, campaign, Sage-book, effect and
   publication checks. Keep generic takeover blocked while the latch is
   tripped, and prove crash/replay leaves no period of trading authority.
+- [ ] Persist a bounded append-only receipt for each abort owner handoff,
+  including predecessor and successor lease identities. Test the parent
+  terminal stage, stale compare-and-set, extra blockers, publication-success
+  contradiction and crash between stages before enabling desktop entry.

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import database
+import mutation_gate
 from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
 from refresh_safety import plan_refresh
 
@@ -1082,11 +1084,40 @@ def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
     assert cancelled == []
 
 
-def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing(
+def _record_published_child_outbox():
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO publication_outbox (publication_id,idempotency_key,"
+        "intent_id,network,offer_fingerprint,publication_epoch,publisher,"
+        "payload_json,state,payload_sha256,queued_at,dispatch_started_at,"
+        "succeeded_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            _sha("publication:child"),
+            _sha("idempotency:child"),
+            "child",
+            "mainnet",
+            _sha("offer:child"),
+            "epoch:child",
+            "dexie",
+            "{}",
+            "succeeded",
+            _sha("{}"),
+            "2026-08-15T12:02:00.000000Z",
+            "2026-08-15T12:02:01.000000Z",
+            "2026-08-15T12:02:02.000000Z",
+            "2026-08-15T12:02:02.000000Z",
+        ),
+    )
+    conn.commit()
+
+
+def _fenced_refresh_abort_fixture(
     isolated_database,
     monkeypatch,
+    *,
+    published_child=False,
 ):
-    """The exact Cancel All incident needs a durable stop before Task 9 settles."""
+    """Build the exact submitted-parent/unpublished-child abort state."""
 
     from mutation_gate import wallet_fingerprint_hash
 
@@ -1230,7 +1261,21 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
         observed_trade_ids=[_sha("trade:child")],
         observed_at="2026-08-15T12:03:00.000000Z",
     )
+    if published_child:
+        _record_published_child_outbox()
     abort = database.begin_refresh_abort(**request)
+    return before, request, abort, operation, wallet_hash, lease
+
+
+def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing(
+    isolated_database,
+    monkeypatch,
+):
+    """The exact Cancel All incident needs a durable stop before Task 9 settles."""
+
+    before, request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
 
     after = database.get_runtime_safety_latch()
     assert abort["state"] == "fenced"
@@ -1305,6 +1350,219 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
             refresh_abort_id=abort["abort_id"],
             reconciled_at="2026-08-15T12:03:02.000000Z",
         )
+
+
+def test_refresh_abort_successor_rebinds_only_exact_released_owner(
+    isolated_database, monkeypatch
+):
+    """A restart may resume one fenced abort without opening general trading."""
+
+    _before, _request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    released = database.release_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        released_at="2026-08-15T12:04:00.000000Z",
+    )
+    assert released["released"] is True
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    request = dict(
+        abort_id=abort["abort_id"],
+        successor_owner_run_id="run-b",
+        successor_owner_pid=2,
+        successor_owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        asset_id=_sha("asset-a"),
+        expected_lease_version=released["lease"]["lease_version"],
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        prior_owner_liveness_proven_dead=False,
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:05:00.000000Z",
+    )
+    for changed in (
+        {"observed_trade_ids": []},
+        {"observed_pending_transaction_ids": [_sha("pending")]},
+        {"asset_id": _sha("wrong-asset")},
+    ):
+        with pytest.raises(ValueError):
+            database.adopt_refresh_abort_successor(**{**request, **changed})
+        assert database.get_runtime_mutation_lease()["active"] == 0
+    adopted = database.adopt_refresh_abort_successor(**request)
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-b"
+    assert adopted["abort"]["owner_run_id"] == "run-b"
+    assert adopted["abort"]["lease_version"] == adopted["lease"]["lease_version"]
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert set(
+        json.loads(database.get_runtime_safety_latch()["blocking_operation_ids_json"])
+    ) == {operation, abort["blocking_operation_id"]}
+
+
+def test_refresh_abort_successor_requires_expiry_and_dead_owner_proof(
+    isolated_database, monkeypatch
+):
+    """An active predecessor cannot be replaced by a generic stale-owner guess."""
+
+    _before, _request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    request = dict(
+        abort_id=abort["abort_id"],
+        successor_owner_run_id="run-b",
+        successor_owner_pid=2,
+        successor_owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        asset_id=_sha("asset-a"),
+        expected_lease_version=lease["lease"]["lease_version"],
+        lease_expires_at="2026-08-15T12:16:00.000000Z",
+        prior_owner_liveness_proven_dead=True,
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:05:00.000000Z",
+    )
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    with pytest.raises(ValueError, match="not proven stopped"):
+        database.adopt_refresh_abort_successor(**request)
+    assert database.get_runtime_mutation_lease()["owner_run_id"] == "run-a"
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:11:00.000000Z",
+    )
+    expired_request = {
+        **request,
+        "observed_at": "2026-08-15T12:11:00.000000Z",
+        "prior_owner_liveness_proven_dead": False,
+    }
+    with pytest.raises(ValueError, match="not proven stopped"):
+        database.adopt_refresh_abort_successor(**expired_request)
+    adopted = database.adopt_refresh_abort_successor(
+        **{**expired_request, "prior_owner_liveness_proven_dead": True}
+    )
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-b"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert set(
+        json.loads(database.get_runtime_safety_latch()["blocking_operation_ids_json"])
+    ) == {operation, abort["blocking_operation_id"]}
+
+
+def test_refresh_abort_successor_gate_keeps_offer_creation_closed(
+    isolated_database, monkeypatch
+):
+    """A successor lease is only an exact cleanup authority, never a bot start."""
+
+    _before, _request, abort, _operation, wallet_hash, _lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    now = datetime(2026, 8, 15, 12, 11, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:11:00.000000Z",
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=736588221,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc="2026-08-15T12:11:00.000000Z",
+        maximum_age_seconds=30,
+    )
+    gate = mutation_gate.MutationGate(
+        run_id="run-b",
+        owner_pid=2,
+        owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        lease_seconds=300,
+        clock=lambda: now,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+    )
+    adopted = gate.acquire_refresh_abort_successor(
+        abort_id=abort["abort_id"],
+        asset_id=_sha("asset-a"),
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:11:00.000000Z",
+    )
+    assert adopted["acquired"] is True
+    assert gate.status().allowed is False
+    assert gate.status().owner_is_this_run is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+
+
+def test_refresh_abort_successor_rejects_published_child_without_local_visibility(
+    isolated_database, monkeypatch
+):
+    """An external publish cannot be treated as an unpublished replacement."""
+
+    _before, _request, abort, _operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    _record_published_child_outbox()
+    released = database.release_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        released_at="2026-08-15T12:04:00.000000Z",
+    )
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    with pytest.raises(ValueError, match="publication"):
+        database.adopt_refresh_abort_successor(
+            abort_id=abort["abort_id"],
+            successor_owner_run_id="run-b",
+            successor_owner_pid=2,
+            successor_owner_host="test-host",
+            wallet_fingerprint_hash=wallet_hash,
+            network="mainnet",
+            asset_id=_sha("asset-a"),
+            expected_lease_version=released["lease"]["lease_version"],
+            lease_expires_at="2026-08-15T12:10:00.000000Z",
+            prior_owner_liveness_proven_dead=False,
+            observed_trade_ids=[_sha("trade:child")],
+            observed_pending_transaction_ids=[],
+            observed_at="2026-08-15T12:05:00.000000Z",
+        )
+    assert database.get_runtime_mutation_lease()["active"] == 0
+
+
+def test_refresh_abort_entry_rejects_already_published_child(
+    isolated_database, monkeypatch
+):
+    """The abort cannot claim an unpublished replacement already broadcast."""
+
+    with pytest.raises(ValueError, match="publication"):
+        _fenced_refresh_abort_fixture(
+            isolated_database, monkeypatch, published_child=True
+        )
+    assert (
+        database.list_incomplete_refresh_aborts(
+            asset_id=_sha("asset-a"),
+            wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(736588221),
+            network="mainnet",
+        )
+        == []
+    )
 
 
 def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(
