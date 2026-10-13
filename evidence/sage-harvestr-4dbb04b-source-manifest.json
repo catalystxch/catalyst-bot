@@ -1,0 +1,13 @@
+{
+  "purpose": "Formatting-only successor of reviewed source bundle; no runtime logic change",
+  "upstream": "https://github.com/xch-dev/sage.git",
+  "base": "f2ec89dd59d07227bed657bc268fc32ce97551f6",
+  "previous_tip": "63cdfaabcfd7992d95f6faf8c58e272b9f2caecd",
+  "tip": "4dbb04bd827aa0ee3f16a556007dae3601fad41a",
+  "ref": "refs/heads/fix/retry-unknown-cat-parent",
+  "file": "sage-harvestr-4dbb04b-source.bundle",
+  "bytes": 26472,
+  "sha256": "DB674976A21343310878D9ABE7FE39EF782D0A088E6758033E27C1F02CEEF54F",
+  "change": "Wrap tx.insert_coin(...).await? at harvestr_receipt_test.rs:71; rustfmt edition 2024 check on changed file passed",
+  "constraints": "All package, isolated startup, original handoff and independent Splash receipt gates from sage-harvestr-63cdfaa-source-manifest.json remain open; no private wallet files, keys, certificates or executable binaries included; previous bundle preserved"
+}

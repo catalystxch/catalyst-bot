@@ -1,0 +1,117 @@
+{
+  "observed_utc": "2026-10-13T09:23:03Z",
+  "scope": "Read-only original Harvestr wallet evidence; no recovery or wallet mutation",
+  "trade_id": "b97ee4ef2ca6adcf893ee1a082b9434989bcb93c5d9d0dde6224aa43364c662f",
+  "confirmed_height": 9424451,
+  "confirmed_utc": "2026-10-13T09:06:13Z",
+  "receive_coin_id": "f80e20e4ab1f21815b9cd34bb64ae95ff11d83b2ea1dcb18be15c0e698c3c509",
+  "amount_cat_atomic": 98276643,
+  "cat_asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+  "wallet_inner_puzzle_hash": "57d46e4646727fc15530f79cf94b41048cade4642d6b7c89008c36ab082a2347",
+  "cat_outer_puzzle_hash": "25c64fb600509f0dfcc04e3cb5492c9ca72c63e5b80828981a7ee721df241f4d",
+  "parent_coin_id": "451b3f586b70fe01fb3afbb7e2247676e80dfe096faf6cbdd42e11c36865d6c1",
+  "binding_proof": "Canonical CAT2 curry tree hash of module 37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a, exact asset and wallet inner puzzle equals chain outer puzzle. chia_rs.Coin(parent, outer, amount).name equals receive_coin_id. Coinset exact coin lookup confirms unspent at confirmed_height.",
+  "sage_raw_transaction_created": {
+    "coin_id": "f80e20e4ab1f21815b9cd34bb64ae95ff11d83b2ea1dcb18be15c0e698c3c509",
+    "amount": 98276643,
+    "address": null,
+    "address_kind": "external",
+    "asset": {"asset_id": null, "ticker": "XCH", "precision": 12}
+  },
+  "sage_raw_evidence": {
+    "get_transaction_height": 9424451,
+    "get_transactions_latest_height": 9424451,
+    "get_coins_by_ids_bare_receive": {"coins": []},
+    "get_coins_by_ids_bare_source_spent_height": 9424451,
+    "owned_mz_receive_present": false,
+    "owned_mz_total_atomic": 3381521720,
+    "synced_coins": 19534,
+    "total_coins": 19534,
+    "checked_files": 72,
+    "total_files": 72,
+    "sync_height_exposed": false
+  },
+  "catalyst": {
+    "safety_generation": 150,
+    "safety_state": "tripped",
+    "reason_code": "COIN_RECORDS_INCOMPLETE",
+    "blocking_operation": "reconcile:8d276a5b52cdbad607f8e2d598f981d02bc88471de44f1305cba98e85ca0fdbb",
+    "db_offer_status": "open",
+    "fill_rows": 0,
+    "campaign_confirmed_fills": 0,
+    "campaign_fee_spent_xch": "0",
+    "fee_holds": 0
+  },
+  "installed_sage_version": "0.13.0",
+  "actual_disposable_api_test": {
+    "source_commit": "5669e8c",
+    "command": "cargo test -p sage --test harvestr_resync -- --nocapture",
+    "build": "PASS 1m45s, LNK4098 warning retained",
+    "result": "1 passed, 0 failed, 2.94s",
+    "api_test_binary_sha256": "3F33FD710AE740E1087448DF237600C448019F71594353302C05EE566D9FFA03",
+    "wallet_test_binary_sha256": "B6567AC9D86FD928A8DFA0165488FAFA9BF6EF47F4636E188036756ACABBD698",
+    "verified": "Actual Sage::resync API implementation invoked against disposable snapshot; metadata retained; exact receipt rebuilt by real parent CLVM/asset/ownership/lineage routines; database history correct",
+    "limits": "Not HTTP/mTLS transport, not logged-in wallet switch branch, not full network resync/full aggregate owned balance, not CATalyst safety resolution. Source formatting after compilation changes presentation only. No original-profile effects."
+  },
+  "isolated_sage_candidate_verification": {
+    "base_v0131": "f2ec89dd59d07227bed657bc268fc32ce97551f6",
+    "candidate_commit": "1cae311deba6995469582d35e660e2c83b7e8b54",
+    "patch": "sage-v0131-unknown-parent-candidate.patch",
+    "cargo_wallet_lib_build": "PASS, 7m32s",
+    "build_warning": "LNK4098 MSVCRTD default library conflict",
+    "full_wallet_lib_tests": "53 passed, 0 failed, 94.89s",
+    "exact_receipt_test": "PASS: actual public parent CLVM, CAT asset, registered wallet inner puzzle, exact lineage, foreign-ownership rejection, owned CAT inventory and corrected transaction history",
+    "initial_test_run": "52 passed, 1 fixture setup failure: foreign-wallet check correctly deleted rejected coin; fixture reinsert corrected before final full rerun",
+    "disposable_snapshot": "SQLite backup from mode=ro source; delete_coins resync SQL semantics preserve 2906 assets, 955 offers, 1001 p2 puzzles and 1000 public keys; copy transaction rolled back",
+    "limits": "No real running resync endpoint or native Sage packaging test; no live deployment/recovery; already bad asset_id=0 row needs separately reviewed supported rebuild; patch remains review candidate"
+  },
+  "isolated_fixture": {
+    "file": "sage_v013_cat_retry_fixture.py",
+    "characterization_exit_code": 0,
+    "require_retry_exit_code": 1,
+    "expected_failure": "REGRESSION: missing parent evidence must remain retryable",
+    "scope": "In-memory SQLite reproduction of released query/fallback semantics; not compiled Rust execution or a production fix"
+  },
+  "public_beta_check": {
+    "latest_release": "v0.13.1",
+    "release_published_utc": "2026-09-19T22:16:19Z",
+    "same_fallback_and_retry_exclusion_present": true,
+    "binary_reproduction_performed": false
+  },
+  "supported_recovery_review": {
+    "api": "Sage v0.13.0 keys.rs resync lines44-107",
+    "behavior": "Switches logged-in wallet away, optionally deletes coins/assets/files/offers/addresses/blocks, checkpoints and vacuums DB, then switches wallet back.",
+    "assessment": "Supported resync exists but is destructive and disrupts identity/session. No proof a non-deleting resync requeues asset_id=0 unspent receipt; deletion/rebuild may encounter the same parent-fetch bug. Not approved or executed on the original wallet.",
+    "safe_next_step": "First use disposable, credential-free fixture/profile with reviewed parent-evidence handling; demonstrate ownership, exact CAT asset, parent lineage, retained offer history and complete reconciliation. Only then consider an explicitly authorized supported original recovery with consistent backup and quiescent wallet effects. Keep CATalyst latch until its normal authoritative proof succeeds."
+  },
+  "official_release_source": "a98ca34b3f6f802c7070834ec914cab1995ca822",
+  "sage_database_read_only": {
+    "receive_row_id": 20083,
+    "receive_asset_id": 0,
+    "receive_p2_puzzle_id": null,
+    "receive_lineage_proof_count": 0,
+    "receive_spent_height": null,
+    "receive_is_children_synced": 0,
+    "wallet_inner_puzzle_registration_id": 2,
+    "prior_cat_receive_asset_id": 40,
+    "prior_cat_receive_p2_puzzle_id": 2,
+    "prior_cat_receive_lineage_proof_count": 1,
+    "prior_cat_receive_height": 9421325
+  },
+  "source_findings": {
+    "puzzle_queue": "v0.13.0 crates/sage-wallet/src/queues/puzzle_queue.rs:272-300: absent optional parent spend yields kind None. Lines130-143 then update_coin with default/XCH asset hash and outer puzzle as p2 hash.",
+    "retry_queue": "v0.13.0 crates/sage-database/src/tables/coins.rs:350-363: asset discovery selects asset_id IS NULL; child discovery requires spent_height IS NOT NULL. This unspent asset_id=0 coin meets neither condition.",
+    "binding_update": "coins.rs:396-416 resolves asset hash and p2 puzzle hash through registered tables. CAT outer puzzle is not the wallet inner puzzle, explaining null ownership in the fallback state.",
+    "causal_limit": "Observed DB state and retry exclusion are proven. The precise initial parent-spend fetch failure or fallback entry is not logged; do not claim its exact peer/transport cause is established."
+  },
+  "upstream_issue_draft": {
+    "title": "Sage 0.13.0 can permanently classify an incoming CAT2 as external XCH after unavailable parent-spend discovery",
+    "reproduction": "Use a fixture with the exact CAT2 receive and its parent spend. Make the first optional parent-spend fetch return None, then make it available. Assert receipt remains retryable, later resolves CAT asset, wallet inner puzzle ownership and lineage, and appears in owned inventory. No real-wallet mutation is required for regression reproduction.",
+    "expected": "Unknown asset evidence remains unknown/retryable, not terminally treated as XCH; confirmed CAT receipt appears in correct owned CAT inventory after exact parent/lineage validation.",
+    "observed": "Coin is asset_id=0, p2_puzzle_id=null, unspent, no lineage and excluded from unsynced-coins query; RPC history reports external XCH and exact owned coin query omits it.",
+    "not_published": true
+  },
+  "safe_local_acceptance_proposal": "Keep live trading and latch blocked. Independently validate exact chain receipt and use it only as isolated evidence/regression input. Test a reviewed Sage fix in a disposable fixture/profile, preserving unknown-vs-XCH semantics and retriable parent discovery. Any later original-wallet recovery/rescan or candidate rollover requires an explicitly reviewed supported path and separate authorization; no database edits, synthetic ownership injection, manual latch release, or accounting from hint/amount alone.",
+  "conclusion": "Raw Sage RPC and read-only wallet DB misclassify and fail to register the chain-bound CAT receipt before CATalyst parsing. The installed-version queue excludes this stored state from normal retry, so merely waiting for more blocks does not supply a supported recovery path. Initial fallback entry remains inferred from matching source behavior, not a captured parent-fetch log. No safe complete-wallet reconciliation is available yet.",
+  "actions_not_taken": ["restart", "resync", "coin import", "latch release", "wallet effect", "pending Take", "campaign change"]
+}

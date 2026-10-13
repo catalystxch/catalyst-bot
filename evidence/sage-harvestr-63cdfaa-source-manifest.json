@@ -1,0 +1,19 @@
+{
+  "purpose": "Source-only exact committed Sage recovery handoff; not a native package or permission to launch against a real profile",
+  "upstream": "https://github.com/xch-dev/sage.git",
+  "base": "f2ec89dd59d07227bed657bc268fc32ce97551f6",
+  "tip": "63cdfaabcfd7992d95f6faf8c58e272b9f2caecd",
+  "ref": "refs/heads/fix/retry-unknown-cat-parent",
+  "commits_above_base": 9,
+  "file": "sage-harvestr-63cdfaa-source.bundle",
+  "bytes": 26052,
+  "sha256": "99E72DA3C8F1CDCC93F792F473FAC2C61EE9D577789C040CF6FE185AAF63641B",
+  "requires_upstream_base": true,
+  "contains": "Committed source, tests, public-chain puzzle fixtures and plan only; no local wallet DB, credentials, certificates, private keys or built executables",
+  "toolchain": {"rust": "1.97.1", "target": "x86_64-pc-windows-msvc", "pnpm": "10.13.1", "nasm": "2.16.03", "libclang": "18.1.1", "cmake": "4.4.4"},
+  "commands": ["pnpm install --frozen-lockfile", "cargo test -p sage-wallet -p sage-database", "cargo test -p sage -p sage-rpc -p sage-client -p sage-keychain -p sage-config", "pnpm tauri build --target x86_64-pc-windows-msvc"],
+  "environment": {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0", "SQLX_OFFLINE": "true", "LIBCLANG_PATH": "Use the build host's actual libclang native directory"},
+  "verified": {"wallet_tests": "57/57 passed", "core_config_rpc_tests": "7/7 passed", "disposable_full_network_inventory": "719 exact owned coins, 19533/19533 classified", "disposable_registry": "one fill and five expiry normal reconciliations, durable latch auto-resolved"},
+  "remaining_gates": ["Native GUI package build and exact package hashes", "Fresh isolated package startup and lease ownership", "Independent Splash peer receipt", "Explicit operator original-profile handoff"],
+  "constraints": ["Never use original wallet snapshots in build tests", "Private snapshot integration is opt-in and ignored by default", "Existing linker LNK4098 warning retained", "No signing or original profile changes authorized by this manifest", "Dirty bounded-inspection example changes are excluded from the bundle"]
+}

@@ -1,0 +1,213 @@
+diff --git a/crates/sage-wallet/src/fixtures/harvestr_parent_puzzle.hex b/crates/sage-wallet/src/fixtures/harvestr_parent_puzzle.hex
+new file mode 100644
+index 0000000..c3cde94
+--- /dev/null
++++ b/crates/sage-wallet/src/fixtures/harvestr_parent_puzzle.hex
+@@ -0,0 +1 @@
++ff02ffff01ff02ffff01ff02ff5effff04ff02ffff04ffff04ff05ffff04ffff0bff34ff0580ffff04ff0bff80808080ffff04ffff02ff17ff2f80ffff04ff5fffff04ffff02ff2effff04ff02ffff04ff17ff80808080ffff04ffff02ff2affff04ff02ffff04ff82027fffff04ff82057fffff04ff820b7fff808080808080ffff04ff81bfffff04ff82017fffff04ff8202ffffff04ff8205ffffff04ff820bffff80808080808080808080808080ffff04ffff01ffffffff3d46ff02ff333cffff0401ff01ff81cb02ffffff20ff02ffff03ff05ffff01ff02ff32ffff04ff02ffff04ff0dffff04ffff0bff7cffff0bff34ff2480ffff0bff7cffff0bff7cffff0bff34ff2c80ff0980ffff0bff7cff0bffff0bff34ff8080808080ff8080808080ffff010b80ff0180ffff02ffff03ffff22ffff09ffff0dff0580ff2280ffff09ffff0dff0b80ff2280ffff15ff17ffff0181ff8080ffff01ff0bff05ff0bff1780ffff01ff088080ff0180ffff02ffff03ff0bffff01ff02ffff03ffff09ffff02ff2effff04ff02ffff04ff13ff80808080ff820b9f80ffff01ff02ff56ffff04ff02ffff04ffff02ff13ffff04ff5fffff04ff17ffff04ff2fffff04ff81bfffff04ff82017fffff04ff1bff8080808080808080ffff04ff82017fff8080808080ffff01ff088080ff0180ffff01ff02ffff03ff17ffff01ff02ffff03ffff20ff81bf80ffff0182017fffff01ff088080ff0180ffff01ff088080ff018080ff0180ff04ffff04ff05ff2780ffff04ffff10ff0bff5780ff778080ffffff02ffff03ff05ffff01ff02ffff03ffff09ffff02ffff03ffff09ff11ff5880ffff0159ff8080ff0180ffff01818f80ffff01ff02ff26ffff04ff02ffff04ff0dffff04ff0bffff04ffff04ff81b9ff82017980ff808080808080ffff01ff02ff7affff04ff02ffff04ffff02ffff03ffff09ff11ff5880ffff01ff04ff58ffff04ffff02ff76ffff04ff02ffff04ff13ffff04ff29ffff04ffff0bff34ff5b80ffff04ff2bff80808080808080ff398080ffff01ff02ffff03ffff09ff11ff7880ffff01ff02ffff03ffff20ffff02ffff03ffff09ffff0121ffff0dff298080ffff01ff02ffff03ffff09ffff0cff29ff80ff3480ff5c80ffff01ff0101ff8080ff0180ff8080ff018080ffff0109ffff01ff088080ff0180ffff010980ff018080ff0180ffff04ffff02ffff03ffff09ff11ff5880ffff0159ff8080ff0180ffff04ffff02ff26ffff04ff02ffff04ff0dffff04ff0bffff04ff17ff808080808080ff80808080808080ff0180ffff01ff04ff80ffff04ff80ff17808080ff0180ffff02ffff03ff05ffff01ff04ff09ffff02ff56ffff04ff02ffff04ff0dffff04ff0bff808080808080ffff010b80ff0180ff0bff7cffff0bff34ff2880ffff0bff7cffff0bff7cffff0bff34ff2c80ff0580ffff0bff7cffff02ff32ffff04ff02ffff04ff07ffff04ffff0bff34ff3480ff8080808080ffff0bff34ff8080808080ffff02ffff03ffff07ff0580ffff01ff0bffff0102ffff02ff2effff04ff02ffff04ff09ff80808080ffff02ff2effff04ff02ffff04ff0dff8080808080ffff01ff0bffff0101ff058080ff0180ffff04ffff04ff30ffff04ff5fff808080ffff02ff7effff04ff02ffff04ffff04ffff04ff2fff0580ffff04ff5fff82017f8080ffff04ffff02ff26ffff04ff02ffff04ff0bffff04ff05ffff01ff808080808080ffff04ff17ffff04ff81bfffff04ff82017fffff04ffff02ff2affff04ff02ffff04ff8204ffffff04ffff02ff76ffff04ff02ffff04ff09ffff04ff820affffff04ffff0bff34ff2d80ffff04ff15ff80808080808080ffff04ff8216ffff808080808080ffff04ff8205ffffff04ff820bffff808080808080808080808080ff02ff5affff04ff02ffff04ff5fffff04ff3bffff04ffff02ffff03ff17ffff01ff09ff2dffff02ff2affff04ff02ffff04ff27ffff04ffff02ff76ffff04ff02ffff04ff29ffff04ff57ffff04ffff0bff34ff81b980ffff04ff59ff80808080808080ffff04ff81b7ff80808080808080ff8080ff0180ffff04ff17ffff04ff05ffff04ff8202ffffff04ffff04ffff04ff78ffff04ffff0eff5cffff02ff2effff04ff02ffff04ffff04ff2fffff04ff82017fff808080ff8080808080ff808080ffff04ffff04ff20ffff04ffff0bff81bfff5cffff02ff2effff04ff02ffff04ffff04ff15ffff04ffff10ff82017fffff11ff8202dfff2b80ff8202ff80ff808080ff8080808080ff808080ff138080ff80808080808080808080ff018080ffff04ffff01a037bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7affff04ffff01a0b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105ffff04ffff01ff02ffff01ff02ff0affff04ff02ffff04ff03ff80808080ffff04ffff01ffff333effff02ffff03ff05ffff01ff04ffff04ff0cffff04ffff02ff1effff04ff02ffff04ff09ff80808080ff808080ffff02ff16ffff04ff02ffff04ff19ffff04ffff02ff0affff04ff02ffff04ff0dff80808080ff808080808080ff8080ff0180ffff02ffff03ff05ffff01ff02ffff03ffff15ff29ff8080ffff01ff04ffff04ff08ff0980ffff02ff16ffff04ff02ffff04ff0dffff04ff0bff808080808080ffff01ff088080ff0180ffff010b80ff0180ff02ffff03ffff07ff0580ffff01ff0bffff0102ffff02ff1effff04ff02ffff04ff09ff80808080ffff02ff1effff04ff02ffff04ff0dff8080808080ffff01ff0bffff0101ff058080ff0180ff018080ff0180808080
+diff --git a/crates/sage-wallet/src/fixtures/harvestr_parent_solution.hex b/crates/sage-wallet/src/fixtures/harvestr_parent_solution.hex
+new file mode 100644
+index 0000000..1cb97d2
+--- /dev/null
++++ b/crates/sage-wallet/src/fixtures/harvestr_parent_solution.hex
+@@ -0,0 +1 @@
++ffffffa030acb736939f8dc7acf6e95e13140f8359eee6149dd18fa6b934d98d05f1267dffffa057d46e4646727fc15530f79cf94b41048cade4642d6b7c89008c36ab082a2347ff8405db9523ffffa057d46e4646727fc15530f79cf94b41048cade4642d6b7c89008c36ab082a234780808080ffffa0838738d1b34f9505ea2276244b5080908b97860f856c4fceb507a835e4c0b41bffa0bf568c7161a9c43b629aa1ac2a8f2754b76bc021e6a0a01630c9b1677e799686ff8406b25b9b80ffa0d8186ea88e378d22848729ddef1ea420bfa3c2ba67d3b1c5a7d1310766eda686ffffa0d8186ea88e378d22848729ddef1ea420bfa3c2ba67d3b1c5a7d1310766eda686ffa004466c09a14143ec0d8b88ad4b38c6f9a94703138f824997f667f300937754cfff8080ffffa0838738d1b34f9505ea2276244b5080908b97860f856c4fceb507a835e4c0b41bffa0bf568c7161a9c43b629aa1ac2a8f2754b76bc021e6a0a01630c9b1677e799686ff8406b25b9b80ff8405db9523ff8080
+diff --git a/crates/sage-wallet/src/harvestr_receipt_test.rs b/crates/sage-wallet/src/harvestr_receipt_test.rs
+new file mode 100644
+index 0000000..857785f
+--- /dev/null
++++ b/crates/sage-wallet/src/harvestr_receipt_test.rs
+@@ -0,0 +1,118 @@
++//! Public-chain regression fixture; no keys, RPC or original database.
++use chia_wallet_sdk::prelude::*;
++use sage_database::Database;
++use sqlx::sqlite::SqlitePoolOptions;
++
++use crate::{ChildKind, PuzzleContext, insert_puzzle, validate_wallet_coin};
++
++fn hash(value: &str) -> Bytes32 {
++    hex::decode(value).unwrap().try_into().unwrap()
++}
++
++#[tokio::test]
++async fn exact_ephemeral_parent_registers_owned_cat_and_lineage() -> anyhow::Result<()> {
++    let asset = hash("b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105");
++    let inner = hash("57d46e4646727fc15530f79cf94b41048cade4642d6b7c89008c36ab082a2347");
++    let parent = Coin::new(
++        hash("d8186ea88e378d22848729ddef1ea420bfa3c2ba67d3b1c5a7d1310766eda686"),
++        hash("04466c09a14143ec0d8b88ad4b38c6f9a94703138f824997f667f300937754cf"),
++        0,
++    );
++    let child = Coin::new(
++        parent.coin_id(),
++        hash("25c64fb600509f0dfcc04e3cb5492c9ca72c63e5b80828981a7ee721df241f4d"),
++        98276643,
++    );
++    assert_eq!(
++        child.coin_id(),
++        hash("f80e20e4ab1f21815b9cd34bb64ae95ff11d83b2ea1dcb18be15c0e698c3c509")
++    );
++    let puzzle = Program::from(hex::decode(
++        include_str!("fixtures/harvestr_parent_puzzle.hex").trim(),
++    )?);
++    let solution = Program::from(hex::decode(
++        include_str!("fixtures/harvestr_parent_solution.hex").trim(),
++    )?);
++    let kind = ChildKind::from_parent(parent, &puzzle, &solution, child)?;
++    let ChildKind::Cat {
++        info,
++        lineage_proof,
++        ..
++    } = &kind
++    else {
++        panic!("Exact validated parent must classify this child as CAT");
++    };
++    assert_eq!(info.asset_id, asset);
++    assert_eq!(info.p2_puzzle_hash, inner);
++    assert_eq!(
++        lineage_proof.parent_parent_coin_info,
++        parent.parent_coin_info
++    );
++    assert_eq!(lineage_proof.parent_amount, 0);
++    let expected_lineage = *lineage_proof;
++
++    let pool = SqlitePoolOptions::new()
++        .max_connections(1)
++        .connect("sqlite::memory:")
++        .await?;
++    sqlx::migrate!("../../migrations").run(&pool).await?;
++    let db = Database::new(pool.clone());
++    db.run_rust_migrations("XCH".into()).await?;
++    let mut tx = db.tx().await?;
++    tx.insert_height(9424451).await?;
++    tx.insert_coin(CoinState::new(child, None, Some(9424451)))
++        .await?;
++    assert!(!validate_wallet_coin(&mut tx, child.coin_id(), &kind).await?);
++    tx.commit().await?;
++    // Register only the exact pre-proven wallet inner puzzle in this disposable DB.
++    sqlx::query("INSERT INTO p2_puzzles(hash,kind) VALUES(?,0)")
++        .bind(inner.as_ref())
++        .execute(&pool)
++        .await?;
++    // The foreign-wallet check deliberately deleted its rejected coin.
++    let mut tx = db.tx().await?;
++    tx.insert_coin(CoinState::new(child, None, Some(9424451))).await?;
++    tx.commit().await?;
++    assert_eq!(db.unsynced_coins(100).await?.len(), 1);
++    assert!(crate::queues::asset_discovery::defer_unknown_asset(
++        false, false
++    ));
++    // Simulate the observed released fallback state, then only in this
++    // disposable database exercise the documented delete_coins resync semantics.
++    db.update_coin(child.coin_id(), Bytes32::default(), child.puzzle_hash)
++        .await?;
++    assert!(db.unsynced_coins(100).await?.is_empty());
++    sqlx::query("DELETE FROM coins").execute(&pool).await?;
++    let mut tx = db.tx().await?;
++    tx.insert_coin(CoinState::new(child, None, Some(9424451)))
++        .await?;
++    assert!(validate_wallet_coin(&mut tx, child.coin_id(), &kind).await?);
++    assert!(
++        insert_puzzle(
++            &mut tx,
++            CoinState::new(child, None, Some(9424451)),
++            kind,
++            PuzzleContext::None,
++            None
++        )
++        .await?
++    );
++    tx.commit().await?;
++    let cat = db
++        .cat_coin(child.coin_id())
++        .await?
++        .expect("owned CAT inventory");
++    assert_eq!(cat.info.asset_id, asset);
++    assert_eq!(cat.info.p2_puzzle_hash, inner);
++    assert_eq!(cat.lineage_proof, Some(expected_lineage));
++    assert!(db.unsynced_coins(100).await?.is_empty());
++    let history = db.transaction(9424451).await?.expect("receipt history");
++    let received = history
++        .created
++        .iter()
++        .find(|flow| flow.coin.coin_id() == child.coin_id())
++        .expect("exact created receipt");
++    assert_eq!(received.asset.hash, asset);
++    assert_eq!(received.p2_puzzle_hash, Some(inner));
++    Ok(())
++}
+diff --git a/crates/sage-wallet/src/lib.rs b/crates/sage-wallet/src/lib.rs
+index e89ce74..34ea9a5 100644
+--- a/crates/sage-wallet/src/lib.rs
++++ b/crates/sage-wallet/src/lib.rs
+@@ -25,5 +25,8 @@ pub use wallet_peer::*;
+ #[cfg(test)]
+ mod test;
+ 
++#[cfg(test)]
++mod harvestr_receipt_test;
++
+ #[cfg(test)]
+ pub use test::*;
+diff --git a/crates/sage-wallet/src/queues.rs b/crates/sage-wallet/src/queues.rs
+index 0308aab..3084f25 100644
+--- a/crates/sage-wallet/src/queues.rs
++++ b/crates/sage-wallet/src/queues.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod asset_discovery;
+ mod blocktime_queue;
+ mod cat_queue;
+ mod nft_uri_queue;
+diff --git a/crates/sage-wallet/src/queues/asset_discovery.rs b/crates/sage-wallet/src/queues/asset_discovery.rs
+new file mode 100644
+index 0000000..f2866e7
+--- /dev/null
++++ b/crates/sage-wallet/src/queues/asset_discovery.rs
+@@ -0,0 +1,25 @@
++/// Missing parent evidence must not finalize an unknown puzzle as XCH.
++pub(crate) fn defer_unknown_asset(kind_known: bool, custody_puzzle_known: bool) -> bool {
++    !kind_known && !custody_puzzle_known
++}
++
++#[cfg(test)]
++mod tests {
++    use super::defer_unknown_asset;
++
++    #[test]
++    fn missing_parent_remains_retryable() {
++        assert!(defer_unknown_asset(false, false));
++    }
++
++    #[test]
++    fn proved_parent_allows_normal_cat_validation() {
++        assert!(!defer_unknown_asset(true, false));
++    }
++
++    #[test]
++    fn registered_custody_puzzle_keeps_xch_path() {
++        assert!(!defer_unknown_asset(false, true));
++        assert!(!defer_unknown_asset(true, true));
++    }
++}
+diff --git a/crates/sage-wallet/src/queues/puzzle_queue.rs b/crates/sage-wallet/src/queues/puzzle_queue.rs
+index b72e6ef..3ad3a8f 100644
+--- a/crates/sage-wallet/src/queues/puzzle_queue.rs
++++ b/crates/sage-wallet/src/queues/puzzle_queue.rs
+@@ -127,6 +127,17 @@ impl PuzzleQueue {
+                         let is_custody_p2_puzzle_hash =
+                             tx.is_custody_p2_puzzle_hash(coin_id).await?;
+ 
++                        // No parent-spend proof is not proof of an XCH coin.
++                        // Leave asset_id unknown so unsynced_coins retries it.
++                        // Known custody puzzles still use the XCH path below.
++                        if super::asset_discovery::defer_unknown_asset(
++                            item.kind.is_some(),
++                            is_custody_p2_puzzle_hash,
++                        ) {
++                            warn!("Parent puzzle evidence unavailable for {coin_id}; deferring asset discovery");
++                            continue;
++                        }
++
+                         let Some(kind) = item.kind.filter(|_| !is_custody_p2_puzzle_hash) else {
+                             warn!(
+                                 "Retroactively inserting XCH coin that should have already been synced: {coin_id}"
