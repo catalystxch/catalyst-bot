@@ -1,0 +1,47 @@
+{
+  "observed_utc": "2026-10-13T09:23:03Z",
+  "scope": "Read-only original Harvestr wallet evidence; no recovery or wallet mutation",
+  "trade_id": "b97ee4ef2ca6adcf893ee1a082b9434989bcb93c5d9d0dde6224aa43364c662f",
+  "confirmed_height": 9424451,
+  "confirmed_utc": "2026-10-13T09:06:13Z",
+  "receive_coin_id": "f80e20e4ab1f21815b9cd34bb64ae95ff11d83b2ea1dcb18be15c0e698c3c509",
+  "amount_cat_atomic": 98276643,
+  "cat_asset_id": "b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+  "wallet_inner_puzzle_hash": "57d46e4646727fc15530f79cf94b41048cade4642d6b7c89008c36ab082a2347",
+  "cat_outer_puzzle_hash": "25c64fb600509f0dfcc04e3cb5492c9ca72c63e5b80828981a7ee721df241f4d",
+  "parent_coin_id": "451b3f586b70fe01fb3afbb7e2247676e80dfe096faf6cbdd42e11c36865d6c1",
+  "binding_proof": "Canonical CAT2 curry tree hash of module 37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a, exact asset and wallet inner puzzle equals chain outer puzzle. chia_rs.Coin(parent, outer, amount).name equals receive_coin_id. Coinset exact coin lookup confirms unspent at confirmed_height.",
+  "sage_raw_transaction_created": {
+    "coin_id": "f80e20e4ab1f21815b9cd34bb64ae95ff11d83b2ea1dcb18be15c0e698c3c509",
+    "amount": 98276643,
+    "address": null,
+    "address_kind": "external",
+    "asset": {"asset_id": null, "ticker": "XCH", "precision": 12}
+  },
+  "sage_raw_evidence": {
+    "get_transaction_height": 9424451,
+    "get_transactions_latest_height": 9424451,
+    "get_coins_by_ids_bare_receive": {"coins": []},
+    "get_coins_by_ids_bare_source_spent_height": 9424451,
+    "owned_mz_receive_present": false,
+    "owned_mz_total_atomic": 3381521720,
+    "synced_coins": 19534,
+    "total_coins": 19534,
+    "checked_files": 72,
+    "total_files": 72,
+    "sync_height_exposed": false
+  },
+  "catalyst": {
+    "safety_generation": 150,
+    "safety_state": "tripped",
+    "reason_code": "COIN_RECORDS_INCOMPLETE",
+    "blocking_operation": "reconcile:8d276a5b52cdbad607f8e2d598f981d02bc88471de44f1305cba98e85ca0fdbb",
+    "db_offer_status": "open",
+    "fill_rows": 0,
+    "campaign_confirmed_fills": 0,
+    "campaign_fee_spent_xch": "0",
+    "fee_holds": 0
+  },
+  "conclusion": "The raw Sage RPC already misclassifies the chain-bound CAT receipt and omits it from owned coin reads before CATalyst parsing. The source discrepancy is Sage-side; internal Sage root cause and persistence versus delayed recognition remain unproven. No safe complete-wallet reconciliation is available yet.",
+  "actions_not_taken": ["restart", "resync", "coin import", "latch release", "wallet effect", "pending Take", "campaign change"]
+}
