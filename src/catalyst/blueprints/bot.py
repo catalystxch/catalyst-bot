@@ -1827,6 +1827,7 @@ def api_status():
             "loop_count": raw.get("loop_count", 0),
             "uptime_seconds": _uptime,
             "last_loop_time": raw.get("loop_duration") or raw.get("last_loop_time", 0),
+            "history_scope": db_stats.get("history_scope", "lifetime"),
             "total_fills": db_stats.get("total_fills", 0),
             "errors": db_stats.get("errors", 0),
         }

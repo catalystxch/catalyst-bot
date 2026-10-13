@@ -9285,7 +9285,7 @@
                             <div class="v4-hero-sub data-pending" id="heroOffersSplit">— buy / — sell</div>
                         </div>
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label">Session PnL <span class="cc-help">?<span class="cc-tooltip">Realised profit/loss from completed round-trip trades this session (buy then sell, or vice versa).</span></span></div>
+                            <div class="v4-hero-label"><span id="heroPnlScopeLabel">History PnL</span> <span class="cc-help">?<span class="cc-tooltip">Realised profit/loss from completed round-trip trades in the displayed history period (buy then sell, or vice versa).</span></span></div>
                             <div class="v4-hero-value neutral" id="heroPnl">0.000</div>
                             <div class="v4-hero-sub" id="heroFills">0 fills</div>
                         </div>
@@ -9585,7 +9585,7 @@
                 <div class="cc-panel-title" style="display: flex; justify-content: space-between; align-items: center;">
                     <span style="display: flex; align-items: center; gap: 6px;">
                         WALLET &amp; PERFORMANCE
-                        <span class="cc-help">?<span class="cc-tooltip">Live balances from your Sage wallet and bot performance stats this session.</span></span>
+                        <span class="cc-help">?<span class="cc-tooltip">Live balances from your Sage wallet and bot performance stats for the displayed history period.</span></span>
                     </span>
                     <button class="btn btn-config btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="refreshBalances()" title="Refresh balances from wallet">Refresh</button>
                 </div>
@@ -9695,7 +9695,7 @@
                         <span class="cc-val" id="loopTime">0.00s</span>
                     </div>
                     <div class="cc-row">
-                        <span class="cc-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Number of your offers that have been taken by other traders this session.</span></span></span>
+                        <span class="cc-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified offer fills in the displayed history period.</span></span></span>
                         <span class="cc-val" id="totalFills">0</span>
                     </div>
                     <div class="cc-row">
@@ -9968,7 +9968,7 @@
             <div id="historyTab" class="tab-content">
                 <div class="card-title">Recent Activity</div>
                 <div class="offers-list" id="historyOffers" style="max-height: 500px; overflow-y: auto;">
-                    <div class="empty-state">No fills in this session yet. As Dexie matches your offers, each fill will appear here with its side, price, and size.</div>
+                    <div class="empty-state">No fills in the displayed history period yet. As Dexie matches your offers, each fill will appear here with its side, price, and size.</div>
                 </div>
             </div>
 
@@ -9983,7 +9983,8 @@
                         <div class="v4-view-header-copy">
                             <div class="v4-view-kicker">Performance</div>
                             <h1 class="v4-view-title">PnL & Inventory</h1>
-                            <p class="v4-view-subtitle">Track verified fills, realized round-trip profit, and the inventory position the bot is carrying this session.</p>
+                            <p class="v4-view-subtitle">Track verified fills, realized round-trip profit, and inventory for the displayed history period.</p>
+                            <div id="pnlHistoryScope" class="panel-context-note">History period loading...</div>
                             <div class="v4-tab-token-pill"><img class="cc-token-icon cc-token-icon-sm" src="" alt="" onerror="if(this.dataset.fallbackSrc&&this.src!==this.dataset.fallbackSrc){this.src=this.dataset.fallbackSrc;}else{this.style.display='none';}" style="display:none;"><span class="v4-tab-token-name"></span><span class="v4-tab-token-xch">&nbsp;/ XCH</span></div>
                         </div>
                     </div>
@@ -10029,7 +10030,7 @@
                 <!-- Time-Period Hero Cards -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlRoundTripsCard">
-                        <div class="v4-hero-label">Realized PnL <span class="cc-help">?<span class="cc-tooltip">Profit/loss from completed round trips this session.</span></span></div>
+                        <div class="v4-hero-label">Realized PnL <span class="cc-help">?<span class="cc-tooltip">Profit/loss from completed round trips in the displayed history period.</span></span></div>
                         <div class="v4-hero-value" id="pnlRealised" style="font-size: var(--text-xl);">0.000</div>
                         <div class="v4-hero-sub" id="pnlRealisedSub" style="color: var(--status-success);">XCH realized</div>
                     </div>
@@ -10040,7 +10041,7 @@
                         <div class="v4-hero-sub" id="pnlRoundTripTime" style="color: var(--text-tertiary); margin-top: 2px;">— avg time</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified fills recorded for this session. If Sage cannot safely confirm a take yet, it appears as pending verification instead of being counted into realized PnL.</span></span></div>
+                        <div class="v4-hero-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified fills recorded for the displayed history period. If Sage cannot safely confirm a take yet, it appears as pending verification instead of being counted into realized PnL.</span></span></div>
                         <div class="v4-hero-value" id="pnlTotalFills">0</div>
                         <div class="v4-hero-sub" id="pnlFillRate">0.0/hr</div>
                         <div class="v4-hero-sub" id="pnlBuySellSplit" style="color: var(--text-tertiary); margin-top: 2px;">—B / —S</div>
@@ -10061,7 +10062,7 @@
                 <!-- Secondary Stats Row -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Volume Traded <span class="cc-help">?<span class="cc-tooltip">Total XCH value of all verified fills this session. Shows trading activity even when PnL is zero from unmatched legs.</span></span></div>
+                        <div class="v4-hero-label">Volume Traded <span class="cc-help">?<span class="cc-tooltip">Total XCH value of verified fills in the displayed history period. Shows trading activity even when PnL is zero from unmatched legs.</span></span></div>
                         <div class="v4-hero-value" id="pnlVolumeXch" style="font-size: var(--text-xl);">0.00</div>
                         <div class="v4-hero-sub" id="pnlVolumeCat">0 CAT</div>
                     </div>
@@ -10080,17 +10081,17 @@
                 <!-- Gross Volume Breakdown Row — bought vs sold vs net flow -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Bought <span class="cc-help">?<span class="cc-tooltip">Gross XCH we paid out across all buy fills this session, and the CAT received in return. These are raw amounts (not round-trip pairs).</span></span></div>
+                        <div class="v4-hero-label">Bought <span class="cc-help">?<span class="cc-tooltip">Gross XCH paid across buy fills in the displayed history period, and CAT received in return. These are raw amounts (not round-trip pairs).</span></span></div>
                         <div class="v4-hero-value" id="pnlBuyVolumeXch" style="font-size: var(--text-xl); color: var(--status-danger);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlBuyVolumeCat">0 CAT received</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Sold <span class="cc-help">?<span class="cc-tooltip">Gross XCH we received across all sell fills this session, and the CAT delivered in return. These are raw amounts (not round-trip pairs).</span></span></div>
+                        <div class="v4-hero-label">Sold <span class="cc-help">?<span class="cc-tooltip">Gross XCH received across sell fills in the displayed history period, and CAT delivered in return. These are raw amounts (not round-trip pairs).</span></span></div>
                         <div class="v4-hero-value" id="pnlSellVolumeXch" style="font-size: var(--text-xl); color: var(--status-success);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlSellVolumeCat">0 CAT delivered</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Net Flow <span class="cc-help">?<span class="cc-tooltip">Raw XCH gain/loss: sold XCH minus bought XCH. Positive = wallet ended the session with more XCH than it started. Different from Realized PnL, which matches buys and sells into round trips.</span></span></div>
+                        <div class="v4-hero-label">Net Flow <span class="cc-help">?<span class="cc-tooltip">Raw XCH gain/loss: sold XCH minus bought XCH in the displayed history period. Different from Realized PnL, which matches buys and sells into round trips.</span></span></div>
                         <div class="v4-hero-value" id="pnlNetXchFlow" style="font-size: var(--text-xl);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlNetCatFlow">0 CAT net</div>
                     </div>
@@ -10122,13 +10123,13 @@
                 <!-- Cumulative PnL Chart Area -->
                 <div class="mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlCumulativeChartPanel" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-5);">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3);">
-                        <span style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px;">Cumulative PnL <span class="cc-help">?<span class="cc-tooltip">Running total of all realized PnL this session, shown as a bar chart. Updates after each round-trip match.</span></span></span>
+                        <span style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px;">Cumulative PnL <span class="cc-help">?<span class="cc-tooltip">Running total of realized PnL in the displayed history period, shown as a bar chart. Updates after each round-trip match.</span></span></span>
                         <span id="v4PnlChartStatus" style="font-size: var(--text-xs); color: var(--text-tertiary);">Collecting data...</span>
                     </div>
                     <div id="v4PnlChart" style="height: 140px; position: relative;">
                         <div style="text-align: center; width: 100%; color: var(--text-tertiary); font-size: var(--text-xs); align-self: center;">PnL chart updates as fills are recorded</div>
                     </div>
-                    <div id="pnlEmptyState" style="display:none; text-align:center; padding: 12px 0 4px; color: var(--text-tertiary); font-size: var(--text-xs);">No fills recorded this session yet. Fills will appear here as trades complete.</div>
+                    <div id="pnlEmptyState" style="display:none; text-align:center; padding: 12px 0 4px; color: var(--text-tertiary); font-size: var(--text-xs);">No fills recorded in the displayed history period yet. Fills will appear here as trades complete.</div>
                 </div>
 
                 <!-- Inventory Position Gauge -->
@@ -14953,13 +14954,17 @@
             const cancelAllCountEl = document.getElementById('cancelAllCount');
             if (cancelAllCountEl) cancelAllCountEl.textContent = totalOffers;
 
-            // Session PnL — prefer cached dashboard payload (authoritative
+            // History PnL — prefer cached dashboard payload (authoritative
             // source with full precision), fall back to scraping the ccPnl
             // element which is populated later. Without this fallback chain,
             // the hero tile shows stale +0.0000 for the first few seconds
             // after page load until /api/dashboard resolves.
             let pnl = 0;
             const _perf = (typeof _dashboardData !== 'undefined' && _dashboardData && _dashboardData.performance) || null;
+            const historyScope = (data.stats && data.stats.history_scope) || (_perf && _perf.history_scope) || '';
+            const heroScopeLabel = document.getElementById('heroPnlScopeLabel');
+            if (heroScopeLabel) heroScopeLabel.textContent = historyScope === 'fresh_run'
+                ? 'Since Fresh Start PnL' : historyScope === 'lifetime' ? 'Lifetime PnL' : 'History PnL';
             if (_perf && _perf.realised_pnl_xch !== undefined && _perf.realised_pnl_xch !== null) {
                 pnl = parseFloat(_perf.realised_pnl_xch) || 0;
             } else {
@@ -26638,6 +26643,10 @@
         // ============ PnL & INVENTORY UPDATE (V2 NEW) ============
         function applyPnlSummary(data = {}) {
             const el = id => document.getElementById(id);
+            const scopeLabel = el('pnlHistoryScope');
+            if (scopeLabel) scopeLabel.textContent = data.history_scope === 'fresh_run'
+                ? 'Since fresh start' : data.history_scope === 'lifetime'
+                    ? 'Lifetime history' : 'History period unknown';
             const verifiedFills = Number(data.total_fills || 0);
             const pendingCount = Number(data.pending_verification_count || 0);
             const fillRate = Number(data.fill_rate_per_hour || 0);
@@ -31718,7 +31727,7 @@
             const container = document.getElementById('historyOffers');
             
             if (!history || history.length === 0) {
-                container.innerHTML = '<div class="empty-state">No fills in this session yet. Each time Dexie matches one of your offers, it will show up here with the side, price, and size.</div>';
+                container.innerHTML = '<div class="empty-state">No fills in the displayed history period yet. Each time Dexie matches one of your offers, it will show up here with the side, price, and size.</div>';
                 return;
             }
 

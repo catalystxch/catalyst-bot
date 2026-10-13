@@ -2601,6 +2601,7 @@ def api_pnl():
             pass
 
         pnl_data = {
+            "history_scope": stats.get("history_scope", "lifetime"),
             "realised_pnl_xch": realised_pnl,
             "realised_pnl_usd": _usd_string(realised_pnl, xch_usd_price),
             "unrealised_pnl_xch": unrealised_pnl,

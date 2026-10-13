@@ -1953,6 +1953,30 @@ def test_pair_pnl_reset_allows_identical_fill_snapshot_to_render_again(page):
     expect(page.locator("#pnlEmptyState")).to_be_hidden()
 
 
+def test_pnl_history_scope_matches_the_period_behind_fills(page):
+    """Historic fills must not be presented as fills from this app session."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate(
+        """() => {
+            v4UpdateHeroStrip({ stats: { history_scope: 'lifetime', total_fills: 3 }, offers: { buy: [], sell: [] } });
+            applyPnlSummary({ history_scope: 'lifetime', total_fills: 3 });
+        }"""
+    )
+    expect(page.locator("#heroPnlScopeLabel")).to_have_text("Lifetime PnL")
+    expect(page.locator("#pnlHistoryScope")).to_have_text("Lifetime history")
+
+    page.evaluate(
+        """() => {
+            v4UpdateHeroStrip({ stats: { history_scope: 'fresh_run', total_fills: 1 }, offers: { buy: [], sell: [] } });
+            applyPnlSummary({ history_scope: 'fresh_run', total_fills: 1 });
+        }"""
+    )
+    expect(page.locator("#heroPnlScopeLabel")).to_have_text("Since Fresh Start PnL")
+    expect(page.locator("#pnlHistoryScope")).to_have_text("Since fresh start")
+
+
 def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     """A save/reload formatting round-trip must not mark Smart Settings stale."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

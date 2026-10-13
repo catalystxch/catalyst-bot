@@ -20227,6 +20227,7 @@ def get_stats(cat_asset_id: str = None, since: str = None) -> Dict:
     """
     conn = get_connection()
     stats = {}
+    stats["history_scope"] = "fresh_run" if since else "lifetime"
 
     # Open offers count
     live_open_offers = get_open_offers(cat_asset_id=cat_asset_id)

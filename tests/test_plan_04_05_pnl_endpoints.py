@@ -36,6 +36,7 @@ except (ModuleNotFoundError, ImportError) as exc:
 
 def _fake_stats():
     return {
+        "history_scope": "fresh_run",
         "realised_pnl_xch": "0.05",
         "total_fills": 10,
         "buy_fills": 5,
@@ -201,6 +202,7 @@ class TestPnlGet(_FlaskBase):
             resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in (
+            "history_scope",
             "realised_pnl_xch",
             "total_fills",
             "buy_fills",
@@ -213,6 +215,7 @@ class TestPnlGet(_FlaskBase):
             "max_position_xch",
         ):
             self.assertIn(key, body)
+        self.assertEqual(body["history_scope"], "fresh_run")
 
     def test_response_exposes_live_position_limit(self):
         with (
