@@ -328,3 +328,36 @@ requested Take test.
   proof remained missing. The bot stayed stopped and the new PID 188444 lease
   continued renewing. No retry, manual latch clear, fee bump, or second
   cancellation was attempted. Final disposition and fee ledger remain open.
+
+## 12:09 UTC Sage cancellation confirmed; CATalyst proof pending
+
+- Sage's pending transaction list no longer included
+  `23fc328ac201fe084f7fd73f7e0891fc9aba4fc1f2d3989f1d09e4ac30c9161f`.
+  Its exact `get_offer` lookup returned `complete: true` and `cancelled` for
+  `4d9e0b37...c8c7`; the current active-offer list now held only buy
+  `9d4f36...5331e` and sell `ab93ca...901b`. Independent coin history
+  strengthened this beyond a status-only check: exact offered MZ coin
+  `69352034...a8881` was spent at height **9,425,001**, and Sage's
+  transaction at that height created own-wallet MZ coin
+  `56256a1a...d5fa1` for the same **3,333,334 atomic units**. The
+  created coin was independently found unspent at that exact creation height.
+  Both exact Sage coin reads had no offer lock on the return coin. The
+  cancellation fee was zero in this transaction, consistent with the wallet
+  profile's manual zero-fee setting; the prior confirmation delay's cause
+  remains unproven.
+- The CATalyst DB still held the first row as `open/cancel_requested` and
+  journal sequence 10154 as `CANCEL_SUBMITTED_UNCONFIRMED`. Safety generation
+  667 remained tripped for that operation, with PID 188444's mutation lease
+  renewing and the bot stopped. This is a source-of-truth reconciliation lag,
+  not permission to release the safety fence by hand.
+- The intended proof-only `POST /api/offers/cancel_all` route was checked from
+  source: while `UNRESOLVED_OPERATIONS` blocks mutation, it runs
+  `reconcile_submitted_cancels_only()` and sends no wallet transaction. A
+  direct request returned HTTP 401 `unauthorized` before execution. No
+  reconciliation or wallet effect occurred through that request.
+- The native app still displayed the prior Cancel All progress modal as
+  `Cancellation stopped`, `0 of 3 offers processed`, after its client status
+  timeout. Computer-use clicks on its Close control and a Tab key did not
+  change the visible modal. The operator was asked to test that Close control;
+  no further cancellation was submitted. The remaining two active offers,
+  exact on-chain proof reconciliation and GUI recovery remain open.
