@@ -540,6 +540,53 @@ def test_quote_expiring_during_history_choice_does_not_record_approval(page):
     assert result["disabled"] is True
 
 
+@pytest.mark.parametrize("history_failure", ["expired", "exception"])
+def test_failed_history_review_restores_fee_review_without_wallet_effect(
+    page, history_failure
+):
+    _open_gui(page)
+    result = page.evaluate(
+        """async ({preview, historyFailure}) => {
+            const originalNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            const calls = [];
+            window.apiFetch = async path => {
+                calls.push(String(path));
+                if (!String(path).endsWith('/fee-preview')) throw new Error('Unexpected wallet effect');
+                return new Response(JSON.stringify(preview), {status: 200});
+            };
+            document.getElementById('coinPrepConfirmView').style.display = 'block';
+            window.askPrepHistoryChoice = async () => {
+                if (historyFailure === 'exception') throw new Error('History unavailable');
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {}};
+            };
+            let escaped = false;
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                try { await startCoinPrepFromModal(); } catch (_) { escaped = true; }
+                const btn = document.getElementById('cpConfirmBtn');
+                const failed = {busy: _coinPrepFeeConfirmBusy, label: btn.textContent,
+                    disabled: btn.disabled};
+                Date.now = originalNow;
+                preview.expires_at = now + 60;
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                return {failed, escaped, calls, retryEnabled: !btn.disabled};
+            } finally { Date.now = originalNow; }
+        }""",
+        {"preview": _preview(), "historyFailure": history_failure},
+    )
+    assert result["escaped"] is False
+    assert result["failed"]["busy"] is False
+    assert result["failed"]["label"] == "Yes, Prepare Coins"
+    if history_failure == "expired":
+        assert result["failed"]["disabled"] is True
+    assert result["retryEnabled"] is True
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * 2
+
+
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
     _open_gui(page)
     assert (

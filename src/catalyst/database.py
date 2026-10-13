@@ -11723,10 +11723,21 @@ def recover_coin_prep_predispatch_retry_collisions() -> int:
         if latch_row is None:
             raise RuntimeError("runtime safety latch singleton is missing")
         latch = dict(latch_row)
-        if (
-            latch["state"] != "tripped"
-            or latch["reason"]
-            != "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED"
+        retained_prepare_failure = latch["reason"] in {
+            "wallet effect authority was retained: COIN_PREP_PREPARED_PERSIST_FAILED",
+            "wallet effect authority was retained: DIRECT_BATCH_PREPARED_PERSIST_FAILED",
+        }
+        # An intervening older startup reasserts this exact unresolved claim
+        # with a crash reason. The durable collision/no-dispatch proof below,
+        # not the mutable diagnostic wording, is the recovery authority.
+        reasserted_crash = latch[
+            "reason_code"
+        ] == "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED" and latch["reason"] == (
+            "restart found a wallet coin effect claim without an exact "
+            "Task 12 no-effect resolution"
+        )
+        if latch["state"] != "tripped" or not (
+            retained_prepare_failure or reasserted_crash
         ):
             conn.commit()
             return 0
@@ -25114,6 +25125,7 @@ def prepare_coin_prep_operation(
     effect_claim_token: str,
     effect_claim_generation: int,
     prepared_at: Any = None,
+    attempt_id: str | None = None,
 ) -> Dict[str, Any]:
     """Persist one deterministic PREPARED split/combine before wallet effect."""
 
@@ -25124,6 +25136,7 @@ def prepare_coin_prep_operation(
         purpose=purpose,
         source_coin_ids=source_coin_ids,
         target_contract=target_contract,
+        attempt_id=attempt_id,
     )
     source_json = _canonical_json_text(
         contract["source_coin_ids"],
@@ -26116,6 +26129,14 @@ def record_coin_prep_operation_outcome(
                         "last_seen=? WHERE coin_id=?",
                         (when, norm_coin_id(fee_coin_id)),
                     )
+            # All output writes share this BEGIN IMMEDIATE transaction. No
+            # other writer can change their protection authorities between
+            # this snapshot and commit. Avoid rescanning every global claim
+            # and intent for each output while starving the lease heartbeat.
+            protected_outputs = _batch_coin_terminal_mutation_protection(
+                conn,
+                [output["coin_id"] for output in evidence_payload["expected_outputs"]],
+            )
             for output in evidence_payload["expected_outputs"]:
                 output_coin_id = norm_coin_id(output["coin_id"])
                 output_wallet_type = output_wallet_types.get(
@@ -26142,7 +26163,7 @@ def record_coin_prep_operation_outcome(
                     "FROM coins WHERE coin_id=?",
                     (output_coin_id,),
                 ).fetchone()
-                if _coin_terminal_mutation_is_protected(conn, output_coin_id):
+                if output_coin_id in protected_outputs:
                     if (
                         not output_is_spent
                         or existing_output is None

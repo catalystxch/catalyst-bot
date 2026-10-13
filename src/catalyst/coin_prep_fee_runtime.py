@@ -260,7 +260,9 @@ def read_fee_wallet_snapshot() -> dict:
     ids = [row["coin_id"] for rows in observed.values() for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("FEE_WALLET_INVENTORY_UNAVAILABLE")
-    reconciliation = set(database.get_coin_reconciliation_protected_ids(ids))
+    reconciliation = {
+        _hex(coin_id) for coin_id in database.get_coin_reconciliation_protected_ids(ids)
+    }
     coins = []
     for asset, rows in observed.items():
         reserves = {_hex(row["coin_id"]) for row in database.get_reserve_coins(asset)}
@@ -850,17 +852,23 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             templates.setdefault(assets[spend.coin.name().hex()], spend.puzzle_reveal)
         return True
 
-    native_prerequisite = (
+    prerequisite = (
         plan is not None
         and plan.transaction_required
-        and plan.asset == "xch"
         and bool(plan.outputs)
-        and all(o.ordinal < 0 and o.purpose == "change" for o in plan.outputs)
+        and all(
+            o.ordinal < 0 and o.purpose in {"change", "fee_change"}
+            for o in plan.outputs
+        )
     )
+    native_prerequisite = prerequisite and plan.asset == "xch"
+    cat_prerequisite = prerequisite and plan.asset == "cat"
     if plan is not None and plan.transaction_required:
         inspection = context["pricing"]["inspection"]
         remember(inspection)
-        name = "prep_xch_consolidation" if native_prerequisite else f"prep_{plan.asset}"
+        name = (
+            f"prep_{plan.asset}_consolidation" if prerequisite else f"prep_{plan.asset}"
+        )
         stages.append(
             {
                 "stage_id": name,
@@ -887,6 +895,13 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         and t.asset == "xch"
         and (t.asset, t.ordinal) not in plan.reused_target_ids
     ]
+    missing_cat = [
+        t
+        for t in context["recipe"]["targets"]
+        if plan is not None
+        and t.asset == "cat"
+        and (t.asset, t.ordinal) not in plan.reused_target_ids
+    ]
     need_future_native = (
         plan is not None
         and plan.transaction_required
@@ -896,7 +911,7 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
     needed_templates = (
         {"xch"} if need_future_native or any(cancellation_counts.values()) else set()
     )
-    if cancellation_counts["cat"]:
+    if cancellation_counts["cat"] or cat_prerequisite:
         needed_templates.add("cat")
     for asset in sorted(needed_templates - templates.keys()):
         coin = next(
@@ -986,6 +1001,89 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             )
         return None
 
+    future_amounts = (
+        []
+        if plan is None
+        else [
+            c.amount_mojos
+            for c in context["funding"]["snapshot"].coins
+            if c.asset == "xch"
+            and c.selectable
+            and not c.protected
+            and c.coin_id not in plan.reused_coin_ids
+            and c.coin_id not in plan.source_coin_ids
+            and c.coin_id != plan.fee_source_id
+        ]
+        + [
+            o.amount_mojos
+            for o in plan.outputs
+            if o.asset == "xch" and o.purpose in {"change", "fee_change"}
+        ]
+    )
+    future_cat_fee_steps = []
+    if cat_prerequisite:
+        # Only amounts of future confirmed roots are used for coverage, never
+        # invented selectable identities. CAT consolidation loses no CAT value.
+        future_cat = [
+            c.amount_mojos
+            for c in context["funding"]["snapshot"].coins
+            if c.asset == "cat"
+            and c.selectable
+            and not c.protected
+            and c.coin_id not in plan.reused_coin_ids
+            and c.coin_id not in plan.source_coin_ids
+        ] + [o.amount_mojos for o in plan.outputs if o.asset == "cat"]
+        principal = sum(t.amount_mojos for t in missing_cat)
+        if sum(future_cat) < principal:
+            return unavailable("FEE_FUTURE_CAT_FUNDING_UNAVAILABLE")
+        # The validated standard profile covers <=50 CAT returns. Refuse a
+        # wider final output shape instead of treating it as covered authority.
+        if len(missing_cat) + 1 > 50:
+            return unavailable("FEE_PROJECTION_PROFILE_INVALID")
+        if sum(sorted(future_cat, reverse=True)[:50]) < principal:
+            maximum = (len(future_cat) - 50 + 48) // 49
+            reason = add_projection(
+                "prep_cat_consolidation_remaining",
+                xch_inputs=1,
+                cat_inputs=50,
+                xch_outputs=1,
+                count=maximum,
+            )
+            if reason:
+                return unavailable(reason)
+            profiles["prep_cat_consolidation_remaining"]["assumptions"].append(
+                "bounded_cat_50_to_1_prerequisites_no_cat_fee_loss"
+            )
+            future_cat_fee_steps.extend(
+                [quotes["prep_cat_consolidation_remaining"]["fee_mojos"]] * maximum
+            )
+        reason = add_projection(
+            "prep_cat",
+            xch_inputs=1,
+            cat_inputs=50,
+            xch_outputs=1,
+        )
+        if reason:
+            return unavailable(reason)
+        future_cat_fee_steps.append(quotes["prep_cat"]["fee_mojos"])
+        # Aggregate XCH is insufficient: every CAT step needs one eligible
+        # fee root. Reserve exact native target denominations as the planner
+        # does, and simulate only confirmed change amounts, never identities.
+        for fee in future_cat_fee_steps:
+            if fee == 0:
+                continue
+            eligible = list(future_amounts)
+            for target in missing_native:
+                if target.amount_mojos in eligible:
+                    eligible.remove(target.amount_mojos)
+            candidates = [amount for amount in eligible if amount >= fee]
+            if not candidates:
+                return unavailable("FEE_FUTURE_CAT_FEE_SOURCE_UNAVAILABLE")
+            source = min(candidates)
+            future_amounts.remove(source)
+            if source > fee:
+                future_amounts.append(source - fee)
+
     if need_future_native:
         # Confirmation changes the fee root to change, never a known selectable
         # future coin. Bound possible roots and explicitly include intermediate
@@ -1010,21 +1108,6 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         # Inspect only future amounts, not invented selectable coin identities.
         # The CAT fee root is consumed; its validated change replaces it only
         # after confirmation. The later exact batch must refresh that evidence.
-        future_amounts = [
-            c.amount_mojos
-            for c in context["funding"]["snapshot"].coins
-            if c.asset == "xch"
-            and c.selectable
-            and not c.protected
-            and c.coin_id not in plan.reused_coin_ids
-            and c.coin_id not in plan.source_coin_ids
-            and c.coin_id != plan.fee_source_id
-        ]
-        future_amounts += [
-            o.amount_mojos
-            for o in plan.outputs
-            if o.asset == "xch" and o.purpose in {"change", "fee_change"}
-        ]
         principal = sum(t.amount_mojos for t in missing_native)
         largest = sum(sorted(future_amounts, reverse=True)[:50])
         if largest < principal + quotes["prep_xch"]["fee_mojos"]:
