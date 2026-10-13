@@ -468,3 +468,22 @@ requested Take test.
   transactions. The already-confirmed first cancellation has not been
   reclassified as resolved. No additional wallet or publication effect was
   attempted during this verification.
+
+## 14:44 UTC independent private Windows archive inspection
+
+- The 192-file package was archived as a private ZIP: 37,398,549 bytes,
+  SHA-256 `371729ABDD6642B23DDD789D9ADFB3CCAA9047715F794EE4ECF03F7FC4CB10E9`.
+  Local ZIP CRC checks passed on all 206 entries including directories, and
+  the embedded `Catalyst/Catalyst.exe` hash matched the clean build above.
+- The other PC retrieved the exact ZIP through the same owner's private Drive
+  account. It independently confirmed owner-only access, size, hash, all ZIP
+  CRCs, no unsafe or duplicate paths, the embedded EXE's size and hash, no
+  runtime wallet data or private keys, and zero matching Defender detections
+  from a custom scan of both archive and extracted tree. It did not execute
+  or install the EXE or change the Harvestr profile.
+- The embedded PE identifies as version **1.4.0**, as expected from the
+  current source metadata. This private prevention package is not labelled
+  as a released 1.4.1 build. The archive has no independent embedded Git
+  revision manifest, so source identity rests on the pinned build worktree,
+  command and handoff hash. Packaged runtime and original-profile recovery
+  remain unverified.
