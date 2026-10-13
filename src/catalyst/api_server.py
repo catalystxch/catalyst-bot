@@ -19,6 +19,7 @@ origin or token checks must preserve that invariant.
 """
 
 import os
+import socket
 import re
 import sys
 import io
@@ -3905,7 +3906,9 @@ def recover_legacy_startup_reservations() -> dict[str, int]:
     )
 
 
-def has_exact_refresh_abort_startup_candidate() -> bool:
+def has_exact_refresh_abort_startup_candidate(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> bool:
     """Preserve a single submitted parent blocker for scoped recovery.
 
     The ordinary Task 9 recovery cannot terminalize this parent while its
@@ -3921,6 +3924,24 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
         if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
             return False
         wallet_hash, network = _configured_mutation_binding()
+
+        def current_requested_owner(lease: dict[str, Any] | None) -> bool:
+            if not lease or type(allow_active_owner_run_id) is not str:
+                return False
+            if not allow_active_owner_run_id or lease.get("active") != 1:
+                return False
+            expiry = lease.get("expires_at")
+            return bool(
+                type(expiry) is str
+                and lease.get("owner_run_id") == allow_active_owner_run_id
+                and lease.get("owner_pid") == os.getpid()
+                and lease.get("owner_host") == socket.gethostname()
+                and lease.get("wallet_fingerprint_hash") == wallet_hash
+                and lease.get("network") == network
+                and datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                > datetime.now(timezone.utc)
+            )
+
         incomplete = database.list_incomplete_refresh_aborts(
             asset_id=asset_id,
             wallet_fingerprint_hash=wallet_hash,
@@ -3964,7 +3985,15 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
                 and abort["network"] == network
                 and abort["asset_id"] == asset_id
                 and lease
-                and (lease["active"] == 0 or expired_abort_owner)
+                and (
+                    lease["active"] == 0
+                    or expired_abort_owner
+                    or (
+                        current_requested_owner(lease)
+                        and lease.get("owner_run_id") == abort["owner_run_id"]
+                        and lease.get("acquired_at") == abort["lease_acquired_at"]
+                    )
+                )
                 and {row["operation_id"] for row in blockers} == expected_journal
             )
         candidates = database.list_fenced_refresh_abort_candidates(
@@ -3986,7 +4015,7 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
             and latch["network"] == network
             and json.loads(latch["blocking_operation_ids_json"]) == [operation_id]
             and lease
-            and lease["active"] == 0
+            and (lease["active"] == 0 or current_requested_owner(lease))
             and len(blockers) == 1
             and blockers[0]["operation_id"] == operation_id
         )
@@ -3994,7 +4023,9 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
         return False
 
 
-def preflight_refresh_abort_restricted_startup() -> dict[str, Any]:
+def preflight_refresh_abort_restricted_startup(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> dict[str, Any]:
     """Read fresh exact authority before considering fenced lease entry.
 
     This function is diagnostic only. Its observations are rechecked at the
@@ -4003,7 +4034,9 @@ def preflight_refresh_abort_restricted_startup() -> dict[str, Any]:
 
     denied = {"eligible": False, "reason": "refresh_abort_startup_unproven"}
     try:
-        if not has_exact_refresh_abort_startup_candidate():
+        if not has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=allow_active_owner_run_id
+        ):
             return denied
         asset_id = getattr(cfg, "CAT_ASSET_ID", None)
         wallet_hash, network = _configured_mutation_binding()
@@ -4085,7 +4118,9 @@ def preflight_refresh_abort_restricted_startup() -> dict[str, Any]:
             or candidate["parent_trade_id"] in second_trades
         ):
             return denied
-        if not has_exact_refresh_abort_startup_candidate():
+        if not has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=allow_active_owner_run_id
+        ):
             return denied
         return {
             "eligible": True,

@@ -8520,6 +8520,76 @@ def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
     assert api_server.has_exact_refresh_abort_startup_candidate() is (change == "valid")
 
 
+def test_exact_refresh_abort_discovery_accepts_only_the_current_owned_lease(
+    monkeypatch,
+):
+    import api_server
+
+    operation_id = "cancel:" + "c" * 64
+    run_id = "restricted-owner"
+    monkeypatch.setattr(
+        api_server, "cfg", SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64)
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(database, "list_incomplete_refresh_aborts", lambda **_kw: [])
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kw: [{"cancel_operation_id": operation_id}],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {
+            "state": "tripped",
+            "reason_code": "UNRESOLVED_OPERATIONS",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "blocking_operation_ids_json": json.dumps([operation_id]),
+        },
+    )
+    lease = {
+        "active": 1,
+        "owner_run_id": run_id,
+        "owner_pid": os.getpid(),
+        "owner_host": socket.gethostname(),
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": operation_id}],
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is False
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=run_id
+        )
+        is True
+    )
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id="different-run"
+        )
+        is False
+    )
+    lease["owner_pid"] += 1
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=run_id
+        )
+        is False
+    )
+
+
 @pytest.mark.parametrize("stage", ["fenced", "parent_terminal"])
 @pytest.mark.parametrize("lease_state", ["released", "expired"])
 def test_exact_refresh_abort_startup_discovers_incomplete_abort_without_effect(
@@ -8653,7 +8723,7 @@ def test_refresh_abort_startup_requires_two_fresh_identity_and_sage_reads(
         snapshots[1]["pending_transaction_ids"] = ["d" * 64]
     discovery_calls = []
 
-    def discover():
+    def discover(**_kwargs):
         discovery_calls.append(True)
         return change != "candidate_gone" or len(discovery_calls) == 1
 
