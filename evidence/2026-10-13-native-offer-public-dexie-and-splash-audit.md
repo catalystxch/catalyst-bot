@@ -48,3 +48,24 @@ observation, not a final 24-hour or fill acceptance result.
 Neither original-profile process was changed during these checks. A witnessed
 cross-wallet offer view/take and fill, full visual GUI traversal, both final
 24-hour audits, and final review remain unverified.
+
+## Follow-up at 05:16 UTC
+
+- The primary exact-PID/hash monitor reached 104 contiguous sample rows through
+  05:15:53Z, with zero process, bot-running, Sage-sync, safety, lease or reason-code
+  failures. PID 171260 still exclusively owns port 5000 and its executable hash
+  still matches the value above. This remains far short of its 24-hour endpoint.
+- Independent public Dexie v1 reads again returned status `0` and the matching
+  Sage trade IDs for both primary offers and the sampled Harvestr buy and sell.
+  These reads establish public Dexie visibility at this instant, not fills or
+  a 24-hour lifecycle pass.
+- The primary Splash metrics still read `peers: 0`, `offers_broadcasted: 2`,
+  `offers_received: 0`, `total_connections: 0`. The running app log for its
+  03:25Z offer cycle explicitly records two `Broadcasting Offer failed:
+  InsufficientPeers` warnings after successful local submission and a cleared
+  Splash queue. A local submission acknowledgement is therefore not evidence
+  of peer broadcast. The exact cause of the missing peer connection is open.
+- The secondary task independently audited 99 contiguous clean samples through
+  05:14:44Z, with the six-offer book, balances, campaign fee ledger and safety
+  unchanged. Harvestr's campaign expires at 10:26:40Z, before a full 24-hour
+  run. Its terminal trace and settled post-expiry book still require review.
