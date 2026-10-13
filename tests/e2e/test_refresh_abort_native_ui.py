@@ -118,6 +118,25 @@ def test_submitted_target_removed_from_sage_book_still_checks_proof(page):
     assert calls[0]["body"]["trade_id"] == "c" * 64
 
 
+@pytest.mark.parametrize("gate_allowed", [True, False])
+def test_ordinary_cancel_requires_fresh_runtime_gate_not_latch_spelling(
+    page, gate_allowed
+):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """async gateAllowed => {
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: true, stage: 'no_exact_candidate', candidate: null,
+                abort: null, safety: {state: 'resolved', allowed: gateAllowed},
+            }), {status: 200});
+            await cancelAllOffers();
+        }""",
+        gate_allowed,
+    )
+    assert page.locator("#cancelAllConfirmBtn").is_disabled() is not gate_allowed
+
+
 @pytest.mark.parametrize("cached_allowed", [True, False])
 def test_preview_failure_keeps_broad_cancel_disabled(page, cached_allowed):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())

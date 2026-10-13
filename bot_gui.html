@@ -32804,7 +32804,7 @@
             }
             _refreshAbortPreview = preview;
             const hasRecovery = Boolean(preview.candidate || preview.abort);
-            if (!hasRecovery && preview.safety?.state === 'allowed') {
+            if (!hasRecovery && preview.safety?.allowed === true) {
                 broad.disabled = false;
                 return;
             }
@@ -33026,7 +33026,7 @@
 
         async function confirmCancelAll() {
             const review = _refreshAbortPreview;
-            if (!review || review.candidate || review.abort || review.safety?.state !== 'allowed') {
+            if (!review || review.candidate || review.abort || review.safety?.allowed !== true) {
                 showToast('Broad cancellation is held pending exact wallet recovery review.', 'warning');
                 return;
             }

@@ -618,7 +618,7 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
                 if (String(path).endsWith('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({success: true,
                         stage: 'no_exact_candidate', candidate: null, abort: null,
-                        safety: {state: 'allowed'}}), {status: 200});
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
                 }
                 return new Response(JSON.stringify({success: false, error: 'test stop'}), {
                     status: 400,
@@ -666,7 +666,7 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
                 if (url.includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({success: true,
                         stage: 'no_exact_candidate', candidate: null, abort: null,
-                        safety: {state: 'allowed'}}), {status: 200});
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
                 }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__statusReads += 1;
@@ -748,7 +748,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
                 if (url.includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({success: true,
                         stage: 'no_exact_candidate', candidate: null, abort: null,
-                        safety: {state: 'allowed'}}), {status: 200});
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
                 }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
@@ -826,7 +826,7 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page, reason):
                 if (url.includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({success: true,
                         stage: 'no_exact_candidate', candidate: null, abort: null,
-                        safety: {state: 'allowed'}}), {status: 200});
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
                 }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({

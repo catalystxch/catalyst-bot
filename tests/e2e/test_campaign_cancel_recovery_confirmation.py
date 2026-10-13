@@ -40,7 +40,7 @@ def test_recovery_confirmation_keeps_cancel_only_intent(page, action):
                 if (url.includes('/offers/refresh_abort/preview')) {
                     data = {success: true, stage: 'no_exact_candidate',
                             candidate: null, abort: null,
-                            safety: {state: 'allowed'}};
+                            safety: {state: 'resolved', allowed: true}};
                 } else if (url.includes('/coin-prep/fee-preview')) {
                     data = preview;
                 } else if (url.includes('/coin-prep/fee-approval')) {

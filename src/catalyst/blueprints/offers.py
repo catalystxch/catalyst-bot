@@ -519,6 +519,7 @@ def api_refresh_abort_preview():
         )
         latch = database.get_runtime_safety_latch()
         lease = database.get_runtime_mutation_lease()
+        gate = runtime.read_only_status().to_dict()
     except Exception as exc:
         slog(
             "SAFETY",
@@ -590,6 +591,8 @@ def api_refresh_abort_preview():
             },
             "safety": {
                 "state": latch["state"] if latch else "unavailable",
+                "allowed": gate.get("allowed") is True,
+                "reason_code": gate.get("reason_code"),
                 "generation": latch["generation"] if latch else None,
                 "blocking_operation_ids": (
                     json.loads(latch["blocking_operation_ids_json"]) if latch else []

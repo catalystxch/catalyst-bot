@@ -9398,28 +9398,18 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             abort["blocking_operation_id"],
             child_operation,
         }
-        prepared_authority = database.authorize_refresh_abort_cleanup_target(
-            abort_id=abort["abort_id"],
-            trade_id=OTHER_TRADE,
-            expected_latch_generation=abort["latch_generation"],
-            owner_run_id="run-task9",
-            observed_trade_ids=observed_book,
-            observed_pending_transaction_ids=[],
-            observed_at=AFTER,
-            prepared_operation_id=child_operation,
-        )
-        assert prepared_authority["trade_id"] == OTHER_TRADE
-        effect_claim = database.claim_refresh_abort_cleanup_cancel_effect(
-            abort_id=abort["abort_id"],
-            trade_id=OTHER_TRADE,
-            expected_latch_generation=abort["latch_generation"],
-            owner_run_id="run-task9",
-            observed_trade_ids=observed_book,
-            observed_pending_transaction_ids=[],
-            observed_at=AFTER,
-        )
-        assert effect_claim is True
-        assert (
+        with pytest.raises(ValueError, match="fee journal differs"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+                prepared_operation_id=child_operation,
+            )
+        with pytest.raises(ValueError, match="fee journal differs"):
             database.claim_refresh_abort_cleanup_cancel_effect(
                 abort_id=abort["abort_id"],
                 trade_id=OTHER_TRADE,
@@ -9429,8 +9419,6 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
                 observed_pending_transaction_ids=[],
                 observed_at=AFTER,
             )
-            is False
-        )
         for changed in (
             {"observed_trade_ids": observed_book + ["0" * 64]},
             {"observed_pending_transaction_ids": ["f" * 64]},
@@ -9548,6 +9536,13 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             lambda **_request: {
                 "validated_unsigned": {"sealed": True},
             },
+        )
+        # This branch mocks the signer and its fee reservation. The real
+        # reservation lineage is exercised in test_coin_prep_fee_cancellation.
+        monkeypatch.setattr(
+            database,
+            "_refresh_abort_prepared_fee_hold",
+            lambda _conn, **_scope: "mock-exact-cancellation-fee-hold",
         )
         monkeypatch.setattr(
             pricing, "recheck_reserved_approved_cancellation", lambda **_request: {}

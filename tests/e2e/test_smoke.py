@@ -3315,7 +3315,7 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
                 if (url.includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (url.includes('/offers/cancel_all/status')) {
@@ -3408,7 +3408,7 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
                 if (String(path).includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (String(path).includes('/offers/cancel_all/status')) {
@@ -3464,7 +3464,7 @@ def test_cancel_all_displays_proof_only_reconciliation_without_new_cancellation(
                 if (String(path).includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (String(path).includes('/offers/cancel_all/status')) {
@@ -3521,7 +3521,7 @@ def test_cancel_all_shows_preflight_rejection_to_operator(page):
                 if (String(path).includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (!String(path).includes('/offers/cancel_all')) throw new Error('Unexpected request');
@@ -3787,7 +3787,7 @@ def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
                 if (String(path).includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (String(path).includes('/offers/cancel_all/status')) {
@@ -3900,7 +3900,7 @@ def test_cancel_all_timeout_is_visible_and_releases_latch(page):
                 if (String(path).includes('/offers/refresh_abort/preview')) {
                     return new Response(JSON.stringify({
                         success: true, stage: 'no_exact_candidate', candidate: null,
-                        abort: null, safety: {state: 'allowed'},
+                        abort: null, safety: {state: 'resolved', allowed: true},
                     }), {status: 200});
                 }
                 if (String(path).includes('/offers/cancel_all/status')) {

@@ -108,6 +108,12 @@ def test_refresh_abort_preview_uses_complete_sage_book_not_stale_ui_count(
         "current_runtime",
         lambda: types.SimpleNamespace(
             run_id="run-preview",
+            read_only_status=lambda: types.SimpleNamespace(
+                to_dict=lambda: {
+                    "allowed": False,
+                    "reason_code": "UNRESOLVED_OPERATIONS",
+                }
+            ),
             wallet_identity_binding=types.SimpleNamespace(
                 backend="sage", fingerprint=736588221, network_id="mainnet"
             ),
@@ -178,6 +184,7 @@ def test_refresh_abort_preview_uses_complete_sage_book_not_stale_ui_count(
     assert body["wallet"]["pending_transaction_count"] == 0
     assert body["candidate"]["child_trade_id"] == child_trade
     assert body["safety"]["lease_owned"] is True
+    assert body["safety"]["allowed"] is False
     assert body["wallet_effect_started"] is False
     native = app_bridge.AppBridge().get_refresh_abort_preview()
     assert native["success"] is True

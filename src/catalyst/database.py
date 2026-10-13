@@ -29812,7 +29812,9 @@ def _assert_refresh_abort_journal_scope(
 
 
 def _assert_refresh_abort_effect_scope(
-    conn: sqlite3.Connection, permitted_operations: set[str]
+    conn: sqlite3.Connection,
+    permitted_operations: set[str],
+    permitted_fee_hold: Optional[str] = None,
 ) -> None:
     """Reject any other retained wallet effect before granting cleanup authority."""
 
@@ -29838,9 +29840,6 @@ def _assert_refresh_abort_effect_scope(
         "'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
         "AND json_extract(prep.outcome_evidence_json, '$.effect_attempted')=0)),1) "
         "LIMIT 257",
-        "SELECT reservation.operation_id FROM approved_fee_reservations AS reservation "
-        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
-        "WHERE outcome.operation_id IS NULL LIMIT 257",
         "SELECT operation_id FROM coin_prep_operations "
         "WHERE outcome IN ('PREPARED','SUBMITTED_UNKNOWN') LIMIT 257",
     ):
@@ -29849,6 +29848,15 @@ def _assert_refresh_abort_effect_scope(
             str(row["operation_id"]) not in permitted_operations for row in rows
         ):
             raise ValueError("refresh abort has an unrelated wallet effect")
+    fee_rows = conn.execute(
+        "SELECT reservation.operation_id FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE outcome.operation_id IS NULL LIMIT 257"
+    ).fetchall()
+    if len(fee_rows) > 256 or any(
+        str(row["operation_id"]) != permitted_fee_hold for row in fee_rows
+    ):
+        raise ValueError("refresh abort has an unrelated wallet effect")
     if (
         conn.execute(
             "SELECT 1 FROM publication_outbox WHERE state IN ('claimed','unresolved') "
@@ -29865,6 +29873,75 @@ def _assert_refresh_abort_effect_scope(
         is not None
     ):
         raise ValueError("refresh abort has an active worker delegation")
+
+
+def _refresh_abort_prepared_fee_hold(
+    conn: sqlite3.Connection,
+    *,
+    prepared_operation_id: str,
+    trade_id: str,
+    intent_id: str,
+    campaign_id: str,
+) -> Optional[str]:
+    """Admit only the reservation sealed to this one durable Task 8 cohort."""
+
+    prepared = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (prepared_operation_id,),
+    ).fetchone()
+    if prepared is None:
+        raise ValueError("exact cleanup PREPARED journal is missing")
+    event = validate_offer_operation_event(dict(prepared))
+    evidence = json.loads(event["evidence_json"])
+    if (
+        event["phase"] != "PREPARED"
+        or event["intent_id"] != intent_id
+        or evidence.get("reason") != "coin_prep_cancel_all"
+        or evidence.get("effect_claim_protocol") != "durable_cohort_claim_v1"
+    ):
+        raise ValueError("exact cleanup fee journal differs")
+    cohort_id = _required_stability_text(evidence.get("cohort_id"), "cohort_id")
+    row = conn.execute(
+        "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
+        "manifest_json,created_at FROM offer_cancel_cohort_manifests "
+        "WHERE cohort_id=?",
+        (cohort_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("exact cleanup fee manifest is missing")
+    manifest = _validated_offer_cancel_cohort_manifest_row(dict(row))
+    if manifest["member_count"] != 1 or any(
+        member[key] != value
+        for member in manifest["members"]
+        for key, value in (
+            ("trade_id", trade_id),
+            ("intent_id", intent_id),
+            ("operation_id", prepared_operation_id),
+            ("prepared_event_id", event["event_id"]),
+            ("attempt", 1),
+        )
+    ):
+        raise ValueError("exact cleanup fee manifest targets another effect")
+    fee_operation_id = _coin_prep_cancellation_fee_operation_id(manifest)
+    hold = conn.execute(
+        "SELECT reservation.cancellation,reservation.fee_mojos,"
+        "json_extract(preview.scope_json, '$.campaign_id') AS campaign_id "
+        "FROM approved_fee_reservations AS reservation "
+        "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+        "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+        "WHERE reservation.operation_id=?",
+        (fee_operation_id,),
+    ).fetchone()
+    if hold is None:
+        return None
+    if (
+        hold["cancellation"] != 1
+        or hold["campaign_id"] != campaign_id
+        or evidence.get("wallet_effect", {}).get("fee_mojos") != hold["fee_mojos"]
+    ):
+        raise ValueError("exact cleanup fee hold differs")
+    return fee_operation_id
 
 
 def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
@@ -29985,6 +30062,7 @@ def authorize_refresh_abort_cleanup_target(
     observed_pending_transaction_ids: Any,
     observed_at: Any,
     prepared_operation_id: Optional[str] = None,
+    require_reserved_fee_hold: bool = False,
     _connection: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     """Validate one exact cleanup target against the retained abort fence.
@@ -30103,9 +30181,6 @@ def authorize_refresh_abort_cleanup_target(
         _assert_refresh_abort_journal_scope(
             conn, {safe_prepared} if safe_prepared is not None else set()
         )
-        _assert_refresh_abort_effect_scope(
-            conn, {safe_prepared} if safe_prepared is not None else set()
-        )
         active_rows = conn.execute(
             "SELECT intent_id,sage_trade_id,asset_id FROM offer_intents WHERE "
             "wallet_fingerprint_hash=? AND network=? "
@@ -30141,6 +30216,24 @@ def authorize_refresh_abort_cleanup_target(
                 or latest["blocks_mutation"] != 1
             ):
                 raise ValueError("prepared cleanup cancellation journal differs")
+        fee_hold = (
+            _refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=safe_prepared,
+                trade_id=safe_trade,
+                intent_id=target["intent_id"],
+                campaign_id=abort["campaign_id"],
+            )
+            if safe_prepared is not None
+            else None
+        )
+        if require_reserved_fee_hold and fee_hold is None:
+            raise ValueError("exact cleanup fee reservation is missing")
+        _assert_refresh_abort_effect_scope(
+            conn,
+            {safe_prepared} if safe_prepared is not None else set(),
+            fee_hold,
+        )
         unsafe_dispatch = conn.execute(
             "SELECT 1 FROM publication_outbox WHERE intent_id=? "
             "AND (state IN ('claimed','unresolved','retryable') OR "
@@ -30200,6 +30293,7 @@ def claim_refresh_abort_cleanup_cancel_effect(
             observed_pending_transaction_ids=observed_pending_transaction_ids,
             observed_at=observed_at,
             prepared_operation_id=operation_id,
+            require_reserved_fee_hold=True,
             _connection=conn,
         )
         prepared_row = conn.execute(
