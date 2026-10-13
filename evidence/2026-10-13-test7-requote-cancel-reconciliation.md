@@ -509,3 +509,28 @@ requested Take test.
   the child remained `created`, which the exact PR #268 guard now prevents
   prospectively. Recovery for the already submitted parent still needs a
   separately reviewed path that preserves the current fence.
+
+## 14:50 UTC recovery dependency review
+
+- Source review and an independent read-only review on Harvestr identified a
+  dependency cycle in the already committed TEST 7 incident. Task 9's normal
+  terminal transition rejects the parent while its replacement child is only
+  `created` (`offer_registry.py`); the child's queued Dexie publication cannot
+  be claimed while the runtime safety latch is tripped (`database.py`). The
+  proof-only submitted-cancel worker uses Task 9, so repeating it does not
+  break this cycle. No current code path safely completes this case unchanged.
+- The needed recovery must distinguish the confirmed chain cancellation from
+  the still unproven replacement coverage. It must retain a durable stop fence,
+  keep the child as Sage-active but not visibly published, and leave Task 11's
+  refresh-completion check false. Since the operator requested Cancel All, an
+  abort-and-cleanup path is preferable to republishing the child merely to
+  unlock the parent. Any cleanup of the two remaining live offers still needs
+  normal exact wallet, lease, fee and confirmation checks. Clearing the latch
+  or directly editing offer/publication rows would open unrelated effects and
+  would not establish the missing publication proof.
+- A future recovery implementation needs disposable-DB and packaged tests for
+  the exact parent/child binding, chain and return-coin proof, crash replay,
+  absence of duplicate cancellation or publication, a retained stop fence,
+  and refusal to mark the refresh complete without child visibility. The
+  independent reviewer made no code, UI or wallet changes. This is a design
+  finding, not a claim that recovery or acceptance has passed.
