@@ -211,6 +211,45 @@ def test_submitted_parent_requires_explicit_stopped_campaign(page):
     expect(page.locator("#refreshAbortActionBtn")).to_be_enabled()
 
 
+def test_trading_recovery_preserves_published_child_scope(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            window.__abortCalls = [];
+            const preview = {
+                success: true, stage: 'submitted_parent_proof',
+                candidate: {parent_intent_id: 'parent', child_intent_id: 'child',
+                    parent_trade_id: 'a'.repeat(64), published_cleanup: true},
+                wallet: {fingerprint: 736588221,
+                    active_trade_ids: ['c'.repeat(64)],
+                    pending_transaction_count: 0},
+                safety: {state: 'tripped', generation: 2, lease_owned: true},
+                stopped_campaigns: [{campaign_id: 'b'.repeat(64),
+                    fee_budget_xch: '0.05'}],
+            };
+            window.apiFetch = async (path, options = {}) => {
+                if (options.method === 'POST') {
+                    window.__abortCalls.push({path, body: JSON.parse(options.body)});
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'fenced'}), {status: 200});
+                }
+                return new Response(JSON.stringify(preview), {status: 200});
+            };
+            showStyledConfirm = async () => true;
+            await cancelAllOffers();
+        }"""
+    )
+    expect(page.locator("#refreshAbortSummary")).to_contain_text("potentially public")
+    page.locator("#refreshAbortCampaign").select_option("b" * 64)
+    page.locator("#refreshAbortActionBtn").click()
+    page.wait_for_function("() => window.__abortCalls.length === 1")
+    call = page.evaluate("window.__abortCalls[0]")
+    assert call["path"].endswith("/offers/refresh_abort/begin")
+    assert call["body"]["published_cleanup"] is True
+
+
 def test_submitted_target_removed_from_sage_book_still_checks_proof(page):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
     page.evaluate(

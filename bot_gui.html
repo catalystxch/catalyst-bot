@@ -32837,7 +32837,10 @@
                     campaignSelect.appendChild(option);
                 }
                 campaignRow.hidden = preview.stage !== 'submitted_parent_proof';
-                summary.textContent = `${scope} Parent ${preview.candidate?.parent_trade_id?.slice(0, 14) || 'recorded'} has a submitted cancellation. The replacement child must remain unpublished while parent terminal proof is checked. No new cancellation is sent at this stage.`;
+                const publicationScope = preview.candidate?.published_cleanup === true
+                    ? 'The replacement is potentially public; every active wallet offer needs exact cancellation proof.'
+                    : 'The replacement child must remain unpublished while parent terminal proof is checked.';
+                summary.textContent = `${scope} Parent ${preview.candidate?.parent_trade_id?.slice(0, 14) || 'recorded'} has a submitted cancellation. ${publicationScope} No new cancellation is sent at this stage.`;
                 action.textContent = 'Check parent cancellation proof';
                 action.disabled = preview.stage === 'submitted_parent_proof';
             } else if (preview.stage === 'parent_terminal') {
@@ -32872,7 +32875,8 @@
                 path = 'begin';
                 body = { confirmation: true, parent_intent_id: preview.candidate.parent_intent_id,
                     child_intent_id: preview.candidate.child_intent_id, campaign_id: campaignId,
-                    expected_latch_generation: preview.safety.generation, expected_trade_ids: trades };
+                    expected_latch_generation: preview.safety.generation, expected_trade_ids: trades,
+                    published_cleanup: preview.candidate.published_cleanup === true };
                 title = 'Check exact parent cancellation?';
                 message = 'Keep the wallet fenced while CATalyst checks authoritative cancellation proof. This does not send another wallet transaction.';
             } else if (preview.stage === 'parent_terminal' && preview.next_target_journal) {
