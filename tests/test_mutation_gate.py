@@ -8045,6 +8045,47 @@ def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
     ]
 
 
+def test_desktop_enters_only_exact_restricted_refresh_abort_owner(monkeypatch):
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"}
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+            return True
+
+    monkeypatch.setattr(
+        read_only_diagnostics, "acquire_startup_arbiter", lambda: Arbiter()
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
+    monkeypatch.setattr(
+        desktop_app, "_initialize_startup_ownership", lambda: dict(blocked)
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_refresh_abort_restricted_startup",
+        lambda auth: events.append(("restricted", auth)) or True,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_wallet_setup_bootstrap",
+        lambda _auth: events.append("bootstrap"),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is True
+    assert events == [("restricted", blocked), "arbiter_release"]
+
+
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
     lease = {
@@ -8588,6 +8629,206 @@ def test_exact_refresh_abort_discovery_accepts_only_the_current_owned_lease(
         )
         is False
     )
+
+
+@pytest.mark.parametrize("post_acquire_valid", [True, False])
+@pytest.mark.parametrize("incomplete_abort", [True, False])
+def test_restricted_startup_rechecks_owned_lease_before_serving(
+    monkeypatch, post_acquire_valid, incomplete_abort
+):
+    import api_server
+
+    events = []
+    run_id = "restricted-owner"
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=736588221,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    authority = object()
+    abort_id = "a" * 64 if incomplete_abort else None
+
+    class Runtime:
+        last_acquire_result = {"acquired": True}
+
+        def __init__(self):
+            self.run_id = run_id
+
+        def register_stop_handler(self, _handler):
+            events.append("stop_handler")
+
+        def status(self):
+            events.append("status")
+            return mutation_gate.GateStatus(
+                allowed=False,
+                reason_code=(
+                    "REFRESH_ABORT_CLEANUP"
+                    if incomplete_abort
+                    else "UNRESOLVED_OPERATIONS"
+                ),
+                source="durable_latch",
+                latch_generation=667,
+                blocking_operation_ids=("cancel:" + "c" * 64,),
+                lease_active=True,
+                owner_run_id=run_id,
+                owner_pid=os.getpid(),
+                owner_is_this_run=True,
+            )
+
+        def start_heartbeat(self):
+            events.append("heartbeat")
+            return True
+
+        def acquire_refresh_abort_successor(self, **kwargs):
+            events.append(("successor", kwargs["abort_id"]))
+            return {"acquired": True}
+
+    runtime = Runtime()
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setattr(api_server, "_mutation_runtime", None)
+    monkeypatch.setattr(api_server, "_mutation_runtime_db_path", None)
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: None)
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", lambda: authority)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(CAT_ASSET_ID="f" * 64))
+
+    def preflight(*, allow_active_owner_run_id=None):
+        events.append(("preflight", allow_active_owner_run_id))
+        return {
+            "eligible": allow_active_owner_run_id is None or post_acquire_valid,
+            "abort_id": abort_id,
+            "wallet_snapshot": {
+                "trade_ids": [],
+                "pending_transaction_ids": [],
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+    monkeypatch.setattr(
+        api_server, "preflight_refresh_abort_restricted_startup", preflight
+    )
+
+    def initialize(**kwargs):
+        events.append(("initialize", kwargs["acquire_lease"]))
+        return runtime
+
+    monkeypatch.setattr(mutation_gate, "initialize", initialize)
+    monkeypatch.setattr(
+        mutation_gate,
+        "shutdown_runtime",
+        lambda **kwargs: (
+            events.append(("shutdown", kwargs["release_owned_lease"]))
+            or {"released": True}
+        ),
+    )
+    blocked = {
+        "allowed": False,
+        "reason_code": (
+            "REFRESH_ABORT_CLEANUP" if incomplete_abort else "UNRESOLVED_OPERATIONS"
+        ),
+    }
+    assert (
+        api_server.activate_refresh_abort_restricted_startup(blocked)
+        is post_acquire_valid
+    )
+    assert api_server._refresh_abort_recovery_active is post_acquire_valid
+    assert events[0] == ("preflight", None)
+    assert ("preflight", run_id) in events
+    assert (("successor", abort_id) in events) is incomplete_abort
+    if post_acquire_valid:
+        assert "heartbeat" in events
+        assert not any(type(item) is tuple and item[0] == "shutdown" for item in events)
+    else:
+        assert "heartbeat" not in events
+        assert ("shutdown", True) in events
+
+
+@pytest.mark.parametrize("post_ok", [True, False])
+def test_restricted_startup_owns_disposable_fenced_lease_without_trading(
+    isolated_gate_database, monkeypatch, post_ok
+):
+    import api_server
+
+    _path, _clock = isolated_gate_database
+    fingerprint = 736588221
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=fingerprint,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=(datetime.now(timezone.utc) - timedelta(seconds=1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    predecessor = mutation_gate.MutationGate(
+        run_id="disposable-prior",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+    )
+    assert predecessor.acquire()["acquired"] is True
+    blocker = "cancel:" + "c" * 64
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at=datetime.now(timezone.utc),
+    )
+    assert predecessor.release_lease()["released"] is True
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setattr(api_server, "_mutation_runtime", None)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", object)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(CAT_ASSET_ID="f" * 64))
+
+    def preflight(*, allow_active_owner_run_id=None):
+        if allow_active_owner_run_id is not None:
+            lease = database.get_runtime_mutation_lease()
+            assert lease["owner_run_id"] == allow_active_owner_run_id
+            assert lease["active"] == 1
+        return {
+            "eligible": allow_active_owner_run_id is None or post_ok,
+            "abort_id": None,
+        }
+
+    monkeypatch.setattr(
+        api_server, "preflight_refresh_abort_restricted_startup", preflight
+    )
+    blocked = {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"}
+    assert api_server.activate_refresh_abort_restricted_startup(blocked) is post_ok
+    owned = database.get_runtime_mutation_lease()
+    assert owned["active"] == int(post_ok)
+    assert owned["owner_pid"] == os.getpid()
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    if post_ok:
+        assert mutation_gate.status().allowed is False
+        with pytest.raises(mutation_gate.MutationBlocked):
+            mutation_gate.enter_mutation("wallet:create_offer")
+        mutation_gate.shutdown_runtime(release_owned_lease=True)
+    else:
+        assert mutation_gate.current_runtime() is None
 
 
 @pytest.mark.parametrize("stage", ["fenced", "parent_terminal"])

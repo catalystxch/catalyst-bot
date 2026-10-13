@@ -2046,6 +2046,12 @@ def _authorize_desktop_startup() -> bool:
         try:
             import api_server
 
+            if (
+                authorization.get("reason_code")
+                in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                and api_server.activate_refresh_abort_restricted_startup(authorization)
+            ):
+                return True
             if api_server.activate_wallet_setup_bootstrap(authorization):
                 return True
         except Exception:

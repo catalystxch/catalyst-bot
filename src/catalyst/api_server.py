@@ -4132,6 +4132,116 @@ def preflight_refresh_abort_restricted_startup(
         return denied
 
 
+def activate_refresh_abort_restricted_startup(authorization: Any) -> bool:
+    """Own only the fenced cleanup profile, never normal trading authority.
+
+    The first wallet proof precedes the lease compare-and-set. A second,
+    independent proof follows acquisition and must name this exact live owner
+    before the restricted HTTP view is enabled. Failure retains the latch.
+    """
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    global _refresh_abort_recovery_active, _stability_startup_status
+
+    if (
+        type(authorization) is not dict
+        or authorization.get("allowed") is not False
+        or authorization.get("reason_code")
+        not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+    ):
+        return False
+    with _mutation_runtime_init_lock:
+        if (
+            _refresh_abort_recovery_active
+            or bot is not None
+            or mutation_gate.current_runtime() is not None
+        ):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            first = preflight_refresh_abort_restricted_startup()
+            if first.get("eligible") is not True:
+                return False
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            adapter_authority = get_wallet_adapter_authority()
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=adapter_authority,
+                acquire_lease=False,
+                start_heartbeat=False,
+            )
+            abort_id = first.get("abort_id")
+            if abort_id is None:
+                runtime = mutation_gate.initialize(
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    wallet_identity_binding=binding,
+                    wallet_adapter_authority=adapter_authority,
+                    acquire_lease=True,
+                    start_heartbeat=False,
+                )
+                acquired = runtime.last_acquire_result.get("acquired") is True
+            elif type(abort_id) is str and type(asset_id) is str:
+                snapshot = first["wallet_snapshot"]
+                acquired = (
+                    runtime.acquire_refresh_abort_successor(
+                        abort_id=abort_id,
+                        asset_id=asset_id,
+                        observed_trade_ids=snapshot["trade_ids"],
+                        observed_pending_transaction_ids=snapshot[
+                            "pending_transaction_ids"
+                        ],
+                        observed_at=snapshot["observed_at"],
+                    ).get("acquired")
+                    is True
+                )
+            if not acquired:
+                return False
+            second = preflight_refresh_abort_restricted_startup(
+                allow_active_owner_run_id=runtime.run_id
+            )
+            status = runtime.status().to_dict()
+            lease = status.get("lease") or {}
+            if (
+                second.get("eligible") is not True
+                or second.get("abort_id") != abort_id
+                or status.get("allowed") is not False
+                or status.get("reason_code")
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or status.get("source") != "durable_latch"
+                or lease.get("active") is not True
+                or lease.get("owned_by_this_run") is not True
+                or lease.get("owner_run_id") != runtime.run_id
+            ):
+                return False
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(
+                os.path.abspath(database.DB_PATH)
+            )
+            _stability_startup_status = _redacted_startup_status(status)
+            _refresh_abort_recovery_active = True
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated and runtime is not None:
+                mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
 def promote_wallet_setup_bootstrap() -> dict:
     """Promote an exact persisted Sage identity into normal owner mode."""
 
