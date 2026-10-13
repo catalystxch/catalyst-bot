@@ -106,3 +106,22 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   computer-use tool because its mapped point was outside the 1000×700 window;
   no tab change occurred. The current window therefore cannot support a fresh
   full visual GUI acceptance. A physical-screen report is still pending.
+
+## Inbound Splash rule found at 05:57 UTC
+
+- Read-only Windows Firewall inspection found an enabled persistent GlassWire
+  application rule for the exact managed
+  `C:\Users\t_you\AppData\Roaming\Catalyst\splash\splash.exe` path with
+  `Direction: Inbound`, `Action: Block`, `Profile: Any`. A separate outbound
+  application rule allows that path; the active Ethernet network is Private.
+  The inbound block is a concrete explanation for the failed Harvestr-to-primary
+  LAN TCP 11511 probe, but does not establish why the primary cannot reach the
+  public introducers or those public peer addresses. No firewall rule changed.
+- The upstream Splash README requires a complete `/p2p/<peer-id>` multiaddress
+  for `--known-peer`; upstream `src/main.rs` prints `Our Peer ID` on startup,
+  but the current managed status and retained logs do not expose the already
+  running Harvestr node's ID. See
+  <https://github.com/dexie-space/splash/blob/main/README.md> and
+  <https://github.com/dexie-space/splash/blob/main/src/main.rs>.
+- A request for the operator to allow private-network inbound Splash traffic on
+  this PC was sent. Direct two-PC peer receipt remains unverified.
