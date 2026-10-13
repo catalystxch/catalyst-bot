@@ -101,8 +101,35 @@ requested Take test.
   Packaged API smoke passed against an isolated mock Sage RPC and temporary
   profile on a non-default port. This package has not run on the original
   TEST 7 profile and does not establish live reconciliation.
+- A second fresh SQLite backup of the original profile, made with SQLite's
+  backup API under `C:\catalyst\.superpowers\forensic-test7-20261013-route`,
+  was exercised with the exact packaged source's
+  `OfferManager.reconcile_submitted_cancels_only()` and a zero-wait local
+  config. The copied blocker count went from one to zero and the copied latch
+  from `tripped` to `resolved`. The method returned `-1` because the isolated
+  Python process has no owning mutation runtime to release; it made no change
+  to the original profile. This narrows the live failure to request entry,
+  process quiescence, or runtime release rather than missing Task 9 proof.
 - This identifies why the UI did not show a useful outcome. It does **not**
   establish whether the live request was rejected by its quiescence check,
   entered the background proof worker, or failed during settlement. The
   original packaged process remains on the older GUI and its safety gate is
   still blocked. No wallet action or latch release was made by this fix.
+
+## 10:09 UTC CI and attempted controlled switch
+
+- All 11 PR #268 checks passed on exact source head
+  `e57f05337d66396823f215c6b8fabe7da40d386b`, including the unit test
+  job completed at 10:09:22 UTC. The separately pinned EXE hash remained
+  `1728F315C3BEB54FF83E5416BBA5AF2D2CE4ECBA3F6080B6D92FE0E519BAAC37`.
+- The original f034 process was still PID 171260, sole port-5000 owner,
+  with bot stopped, safety `UNRESOLVED_OPERATIONS`, and an owned renewing
+  lease. The three Sage offers remained live at the most recent complete
+  wallet preflight; the offered cancellation had not reconciled.
+- The native shutdown dialog was opened with its wallet-wide cancellation
+  checkbox visibly **unchecked**, so a successful shutdown would leave those
+  offers live. Before the final shutdown action completed, the user pressed
+  physical Escape and Computer Use stopped. The process was independently
+  rechecked afterward and remained PID 171260/port 5000. No replacement
+  package was launched and no new financial action was taken. Further native
+  control awaits the user's direction.
