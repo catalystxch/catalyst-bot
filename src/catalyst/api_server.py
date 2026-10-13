@@ -398,6 +398,8 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     # can start any fresh wallet effect.
     "offers.api_cancel_all",
     "offers.api_refresh_abort_begin",
+    "offers.api_refresh_abort_fee_preview",
+    "offers.api_refresh_abort_fee_approval",
     "offers.api_refresh_abort_cancel_next",
     "offers.api_refresh_abort_reconcile_target",
     "offers.api_refresh_abort_complete",
@@ -4390,6 +4392,8 @@ def enforce_local_runtime_guard():
             ("GET", "/api/safety/status"),
             ("GET", "/api/offers/refresh_abort/preview"),
             ("POST", "/api/offers/refresh_abort/begin"),
+            ("POST", "/api/offers/refresh_abort/fee_preview"),
+            ("POST", "/api/offers/refresh_abort/fee_approval"),
             ("POST", "/api/offers/refresh_abort/cancel_next"),
             ("POST", "/api/offers/refresh_abort/reconcile_target"),
             ("POST", "/api/offers/refresh_abort/complete"),

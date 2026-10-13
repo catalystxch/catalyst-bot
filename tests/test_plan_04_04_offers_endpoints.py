@@ -519,6 +519,192 @@ def test_refresh_abort_cancel_next_refuses_stale_target_before_wallet_effect(
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(monkeypatch):
+    import blueprints.offers as offers_bp
+    import coin_prep_fee_approval
+    import coin_prep_fee_runtime
+    import database
+    import wallet
+
+    abort_id, campaign_id, trade_id = "e" * 64, "1" * 64, "c" * 64
+    preview_id, approval_id = "2" * 64, "3" * 64
+    effects = []
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(
+        api_server, "has_exact_refresh_abort_startup_candidate", lambda **_kw: True
+    )
+    monkeypatch.setattr(offers_bp.cfg, "CAT_ASSET_ID", "a" * 64, raising=False)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: types.SimpleNamespace(
+            run_id="exact-recovery",
+            wallet_identity_binding=types.SimpleNamespace(
+                backend="sage", fingerprint=736588221, network_id="mainnet"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate, "wallet_fingerprint_hash", lambda _value: "f" * 64
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_mutation_lease",
+        lambda: {"active": 1, "owner_run_id": "exact-recovery"},
+    )
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: {"generation": 7})
+    monkeypatch.setattr(
+        database,
+        "get_refresh_abort",
+        lambda _id: {
+            "abort_id": abort_id,
+            "state": "parent_terminal",
+            "latch_generation": 7,
+            "campaign_id": campaign_id,
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+            "asset_id": "a" * 64,
+            "target_trade_ids_json": json.dumps([trade_id]),
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "get_bootstrap_campaign",
+        lambda _id: {
+            "campaign_id": campaign_id,
+            "revision": 1,
+            "status": "stopped",
+            "network": "mainnet",
+            "wallet_fingerprint": 736588221,
+            "asset_id": "a" * 64,
+        },
+    )
+    book = {"trade_ids": [trade_id], "pending_transaction_ids": []}
+    monkeypatch.setattr(wallet, "_read_refresh_abort_cleanup_snapshot", lambda: book)
+    monkeypatch.setattr(
+        coin_prep_fee_approval,
+        "preview_coin_prep_fees",
+        lambda options: (
+            effects.append(("preview", options))
+            or {
+                "available": True,
+                "preview_id": preview_id,
+                "preparation_transaction_count_min": 0,
+                "suggested_maximum_fee_mojos": 5000,
+                "minimum_cancellation_reserve_mojos": 1000,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "get_coin_prep_fee_preview",
+        lambda _id: {
+            "request_options_json": json.dumps(
+                {
+                    "bootstrap_campaign_id": campaign_id,
+                    "bootstrap_campaign_revision": 1,
+                    "cancellation_recovery_action": "cancel_all",
+                }
+            )
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_fee_economic_snapshot",
+        lambda _options: {
+            "recovery_only": True,
+            "campaign": {"campaign_id": campaign_id},
+            "recipe": {"targets": []},
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_approval,
+        "approve_coin_prep_fees",
+        lambda **kwargs: (
+            effects.append(("approve", kwargs)) or {"approval_id": approval_id}
+        ),
+    )
+    client = api_server.app.test_client()
+    req = {
+        "headers": {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        "environ_base": {"REMOTE_ADDR": "127.0.0.1"},
+    }
+    scope = {
+        "abort_id": abort_id,
+        "expected_latch_generation": 7,
+        "expected_trade_ids": [trade_id],
+    }
+    malformed = client.post(
+        "/api/offers/refresh_abort/fee_preview",
+        json={**scope, "expected_trade_ids": [{"trade_id": trade_id}]},
+        **req,
+    )
+    assert malformed.status_code == 400
+    assert effects == []
+    quoted = client.post("/api/offers/refresh_abort/fee_preview", json=scope, **req)
+    assert quoted.status_code == 200
+    assert effects == [
+        (
+            "preview",
+            {
+                "bootstrap_campaign_id": campaign_id,
+                "bootstrap_campaign_revision": 1,
+                "cancellation_recovery_action": "cancel_all",
+            },
+        )
+    ]
+    consent = {
+        **scope,
+        "confirmation": True,
+        "preview_id": preview_id,
+        "maximum_fee_mojos": "5000",
+        "cancellation_reserve_mojos": "1000",
+    }
+    approved = client.post(
+        "/api/offers/refresh_abort/fee_approval", json=consent, **req
+    )
+    assert approved.status_code == 200
+    assert effects[-1] == (
+        "approve",
+        {
+            "preview_id": preview_id,
+            "maximum_fee_mojos": 5000,
+            "cancellation_reserve_mojos": 1000,
+        },
+    )
+    book["trade_ids"] = []
+    assert (
+        client.post(
+            "/api/offers/refresh_abort/fee_approval", json=consent, **req
+        ).status_code
+        == 409
+    )
+    assert len(effects) == 2
+    book["trade_ids"] = [trade_id]
+    monkeypatch.setattr(
+        database,
+        "get_coin_prep_fee_preview",
+        lambda _id: {
+            "request_options_json": json.dumps(
+                {
+                    "bootstrap_campaign_id": "9" * 64,
+                    "bootstrap_campaign_revision": 1,
+                    "cancellation_recovery_action": "cancel_all",
+                }
+            )
+        },
+    )
+    assert (
+        client.post(
+            "/api/offers/refresh_abort/fee_approval", json=consent, **req
+        ).status_code
+        == 409
+    )
+    assert len(effects) == 2
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
     monkeypatch,
 ):

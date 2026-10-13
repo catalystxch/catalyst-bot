@@ -784,6 +784,185 @@ def _exact_refresh_abort_manager(*, with_fee_inventory: bool):
     return bot.offer_manager if bot is not None else None
 
 
+def _exact_refresh_abort_fee_context(body: dict):
+    """Bind a cancellation-only fee decision to the current fenced abort."""
+
+    import wallet
+
+    if not api_server._refresh_abort_recovery_active or api_server.bot is not None:
+        raise ValueError("restricted_recovery_required")
+    runtime = api_server.mutation_gate.current_runtime()
+    binding = getattr(runtime, "wallet_identity_binding", None)
+    if runtime is None or binding is None or binding.backend != "sage":
+        raise ValueError("sage_identity_unavailable")
+    if not api_server.has_exact_refresh_abort_startup_candidate(
+        allow_active_owner_run_id=runtime.run_id
+    ):
+        raise ValueError("refresh_abort_authority_changed")
+    lease = database.get_runtime_mutation_lease()
+    latch = database.get_runtime_safety_latch()
+    abort = database.get_refresh_abort(body["abort_id"])
+    if (
+        lease is None
+        or lease["active"] != 1
+        or lease["owner_run_id"] != runtime.run_id
+        or latch is None
+        or latch["generation"] != body["expected_latch_generation"]
+        or abort is None
+        or abort["state"] != "parent_terminal"
+        or abort["latch_generation"] != latch["generation"]
+        or abort["wallet_fingerprint_hash"]
+        != api_server.mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+        or abort["network"] != binding.network_id
+        or abort["asset_id"] != getattr(cfg, "CAT_ASSET_ID", None)
+    ):
+        raise ValueError("cleanup_scope_changed")
+    expected = body["expected_trade_ids"]
+    targets = json.loads(abort["target_trade_ids_json"])
+    snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+    if (
+        snapshot["trade_ids"] != expected
+        or snapshot["pending_transaction_ids"]
+        or not expected
+        or not set(expected).issubset(targets)
+    ):
+        raise ValueError("sage_book_changed")
+    campaign = database.get_bootstrap_campaign(abort["campaign_id"])
+    if (
+        campaign is None
+        or campaign["status"] != "stopped"
+        or campaign["network"] != binding.network_id
+        or campaign["wallet_fingerprint"] != binding.fingerprint
+        or campaign["asset_id"] != abort["asset_id"]
+    ):
+        raise ValueError("stopped_campaign_changed")
+    return abort, campaign
+
+
+def _valid_refresh_abort_fee_scope(body: object, extra: set[str]) -> bool:
+    required = {
+        "abort_id",
+        "expected_latch_generation",
+        "expected_trade_ids",
+    } | extra
+    if type(body) is not dict or set(body) != required:
+        return False
+    trades = body["expected_trade_ids"]
+    return (
+        type(body["abort_id"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", body["abort_id"]) is not None
+        and type(body["expected_latch_generation"]) is int
+        and body["expected_latch_generation"] > 0
+        and type(trades) is list
+        and 1 <= len(trades) <= 256
+        and all(
+            type(trade) is str and re.fullmatch(r"[0-9a-f]{64}", trade)
+            for trade in trades
+        )
+        and trades == sorted(set(trades))
+    )
+
+
+@bp.route("/api/offers/refresh_abort/fee_preview", methods=["POST"])
+def api_refresh_abort_fee_preview():
+    """Quote only the stopped campaign's outstanding abort cancellations."""
+
+    from coin_prep_fee_approval import preview_coin_prep_fees
+    from blueprints.coin_prep import _fee_json_amounts
+
+    body = request.get_json(silent=True)
+    if not _valid_refresh_abort_fee_scope(body, set()):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    try:
+        with api_server._bot_cancel_lifecycle_lock:
+            _abort, campaign = _exact_refresh_abort_fee_context(body)
+            result = preview_coin_prep_fees(
+                {
+                    "bootstrap_campaign_id": campaign["campaign_id"],
+                    "bootstrap_campaign_revision": campaign["revision"],
+                    "cancellation_recovery_action": "cancel_all",
+                }
+            )
+            if (
+                result.get("available") is not True
+                or result.get("preparation_transaction_count_min") != 0
+            ):
+                raise ValueError("cancellation_quote_unavailable")
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Exact cancellation-only fee preview refused",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+        return jsonify({"success": False, "error": "cleanup_fee_scope_changed"}), 409
+    return jsonify(_fee_json_amounts({**result, "success": True}))
+
+
+@bp.route("/api/offers/refresh_abort/fee_approval", methods=["POST"])
+def api_refresh_abort_fee_approval():
+    """Record exact cancellation fee consent without starting Coin Prep."""
+
+    from coin_prep_fee_approval import MAX_ATOMIC_AMOUNT, approve_coin_prep_fees
+    from coin_prep_fee_runtime import read_fee_economic_snapshot
+    from blueprints.coin_prep import _fee_json_amounts
+
+    body = request.get_json(silent=True)
+    extra = {
+        "confirmation",
+        "preview_id",
+        "maximum_fee_mojos",
+        "cancellation_reserve_mojos",
+    }
+    if not _valid_refresh_abort_fee_scope(body, extra):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    if (
+        body["confirmation"] is not True
+        or type(body["preview_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None
+        or any(
+            type(body[key]) is not str
+            or re.fullmatch(r"0|[1-9][0-9]{0,18}", body[key]) is None
+            or int(body[key]) > MAX_ATOMIC_AMOUNT
+            for key in ("maximum_fee_mojos", "cancellation_reserve_mojos")
+        )
+    ):
+        return jsonify({"success": False, "error": "invalid_fee_consent"}), 400
+    try:
+        with api_server._bot_cancel_lifecycle_lock:
+            _abort, campaign = _exact_refresh_abort_fee_context(body)
+            preview = database.get_coin_prep_fee_preview(body["preview_id"])
+            options = json.loads(preview["request_options_json"])
+            if (
+                options.get("bootstrap_campaign_id") != campaign["campaign_id"]
+                or options.get("bootstrap_campaign_revision") != campaign["revision"]
+                or options.get("cancellation_recovery_action") != "cancel_all"
+            ):
+                raise ValueError("fee_preview_scope_changed")
+            economics = read_fee_economic_snapshot(options)
+            if (
+                economics.get("recovery_only") is not True
+                or economics.get("campaign", {}).get("campaign_id")
+                != campaign["campaign_id"]
+                or economics.get("recipe", {}).get("targets")
+            ):
+                raise ValueError("fee_preview_is_not_cancellation_only")
+            result = approve_coin_prep_fees(
+                preview_id=body["preview_id"],
+                maximum_fee_mojos=int(body["maximum_fee_mojos"]),
+                cancellation_reserve_mojos=int(body["cancellation_reserve_mojos"]),
+            )
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Exact cancellation-only fee approval refused",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+        return jsonify({"success": False, "error": "cleanup_fee_scope_changed"}), 409
+    return jsonify(_fee_json_amounts({**result, "success": True}))
+
+
 @bp.route("/api/offers/refresh_abort/cancel_next", methods=["POST"])
 def api_refresh_abort_cancel_next():
     """Cancel only the next immutable abort target after native review."""
