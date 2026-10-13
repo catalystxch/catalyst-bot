@@ -69,3 +69,25 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   05:14:44Z, with the six-offer book, balances, campaign fee ledger and safety
   unchanged. Harvestr's campaign expires at 10:26:40Z, before a full 24-hour
   run. Its terminal trace and settled post-expiry book still require review.
+
+## Read-only transport and browser checks
+
+- From the primary PC, a 3.5-second TCP probe reached Harvestr's LAN Splash
+  listener at `192.168.1.130:11511`. The same probe did not reach either
+  previously resolved public introducer (`46.126.171.63:11711`,
+  `178.33.32.19:11512`) or three public endpoints to which Harvestr had
+  reported established connections (`65.109.166.68:11511`,
+  `146.70.129.125:11511`, `178.63.169.37:13804`). This is a transport
+  observation, not proof of which firewall, router, VPN or remote endpoint
+  causes the failure. Primary outbound firewall default is Allow; Ethernet is
+  the selected default route. Harvestr's reverse LAN probe to the primary
+  Splash listener failed, so no direct two-way peer connection is proven.
+- The installed Splash CLI exposes `--known-peer <MULTIADDR>` but no command to
+  report the running node's public PeerId. Harvestr's current supported
+  status/metrics and retained startup logs do not reveal its PeerId. The
+  reachable LAN address alone is therefore not a verified complete known-peer
+  multiaddress. Neither live node nor firewall configuration was changed.
+- A separate headless Chromium navigation to the running Flask root returned
+  HTTP 401, and the browser was closed. This expected authorization boundary
+  prevents that independent browser session from substituting for a visual
+  check of the native window. The human physical-screen check is still open.
