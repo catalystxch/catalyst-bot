@@ -191,6 +191,9 @@ class _DummySplashManager:
     def queue_post(self, *args, **kwargs):
         pass
 
+    def set_peer_readiness_provider(self, provider):
+        self.peer_readiness_provider = provider
+
     def flush_queue(self):
         return {"posted": 0, "failed": 0, "skipped": 0}
 
@@ -200,7 +203,8 @@ class _DummySplashManager:
 
 
 class _DummySplashNode:
-    pass
+    def get_metrics(self):
+        return {"reachable": False, "peers": 0}
 
 
 class _DummyCoinsetClient:

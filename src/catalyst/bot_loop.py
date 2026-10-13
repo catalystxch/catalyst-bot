@@ -506,6 +506,7 @@ class BotLoop:
         self.dexie_manager = DexieManager()
         self.splash_manager = SplashManager()
         self.splash_node = SplashNode()
+        self.splash_manager.set_peer_readiness_provider(self.splash_node.get_metrics)
         self.coinset_client = CoinsetClient()
         self.market_toxicity_guard = MarketToxicityGuard()
         self._market_runtime_required = True

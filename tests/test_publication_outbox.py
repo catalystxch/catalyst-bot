@@ -1041,6 +1041,60 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     assert isolated_database.get_offer(trade_id)["status"] == "open"
 
 
+def test_splash_durable_waits_for_peer_before_local_ack(
+    isolated_database, monkeypatch
+):
+    intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
+    offer_text = _offer_text(intent["intent_id"])
+    _persist_offer_projection(isolated_database, trade_id, offer_text)
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    peer_count = {"value": 0}
+    manager.set_peer_readiness_provider(
+        lambda: {"reachable": True, "peers": peer_count["value"]}
+    )
+    posted = []
+
+    def local_ack(_offer, _trade_id, _force, *, idempotency_key, request_contract):
+        posted.append(idempotency_key)
+        return {
+            "outcome": "acknowledged",
+            "provider": "splash",
+            "provider_response_id": None,
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                request_contract
+            ),
+            "response_sha256": _sha("local-splash-ack"),
+            "status_code": 200,
+        }
+
+    monkeypatch.setattr(manager, "_post_single", local_ack)
+    waiting = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+    assert waiting["deferred_no_peers"] is True
+    assert waiting["posted"] == 0
+    assert waiting["requeued"] == 0
+    assert posted == []
+    assert row["state"] == "queued"
+
+    peer_count["value"] = 1
+    ready = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+    assert ready["posted"] == 1
+    assert len(posted) == 1
+    assert row["state"] == "succeeded"
+
+
 def test_durable_dexie_flush_stops_before_cycle_sla_budget(
     isolated_database, monkeypatch
 ):

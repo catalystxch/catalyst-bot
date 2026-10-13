@@ -68,6 +68,7 @@ class SplashManager:
         self._durable_lease_expires_provider = None
         self._durable_dispatch_authorizer = None
         self._durable_network: Optional[str] = None
+        self._peer_readiness_provider = None
         # A slow local relay must not monopolize the trading loop.  Durable
         # claims not reached within this budget remain queued for a later
         # cycle, preserving exact-once publication bookkeeping.
@@ -88,6 +89,13 @@ class SplashManager:
     # -------------------------------------------------------------------
     # Queue management
     # -------------------------------------------------------------------
+
+    def set_peer_readiness_provider(self, provider) -> None:
+        """Use managed-node metrics to defer local submission without peers."""
+
+        if not callable(provider):
+            raise TypeError("peer readiness provider must be callable")
+        self._peer_readiness_provider = provider
 
     def enable_durable_outbox(
         self,
@@ -368,6 +376,30 @@ class SplashManager:
             cfg, "SPLASH_ENABLED", False
         ):
             return {"posted": 0, "failed": 0, "skipped": 0, "disabled": True}
+        if self._peer_readiness_provider is not None:
+            try:
+                metrics = self._peer_readiness_provider()
+            except Exception:
+                metrics = None
+            if (
+                type(metrics) is dict
+                and metrics.get("reachable") is True
+                and type(metrics.get("peers")) is int
+                and metrics["peers"] <= 0
+            ):
+                # Splash's local HTTP acknowledgement precedes its asynchronous
+                # peer broadcast. With zero peers the daemon later emits
+                # InsufficientPeers, so keep the durable claim (or local queue)
+                # untouched until the next cycle can reach a peer.
+                return {
+                    "posted": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "requeued": 0,
+                    "budget_exhausted": False,
+                    "authorization_blocked": False,
+                    "deferred_no_peers": True,
+                }
         if self._durable_outbox_owner is not None:
             return self._flush_durable_outbox(flush_all)
 
