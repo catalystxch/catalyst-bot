@@ -9295,7 +9295,10 @@ class OfferManager:
                     member["operation_id"]: member
                     for member in exact_manifest["members"]
                 }
-                representative_member = members_by_operation[current_ids[0]]
+                # Cohort proof is anchored to the first immutable manifest
+                # member, even when that member was already reconciled before
+                # this recovery run and is no longer a blocker.
+                representative_member = exact_manifest["members"][0]
                 representative_intent = database.get_offer_intent(
                     representative_member["intent_id"]
                 )
@@ -9336,11 +9339,29 @@ class OfferManager:
                         raise ValueError(
                             "native bulk cancellation intent binding changed"
                         )
+                    member_evidence = evidence
+                    member_observed_at = observed_at
+                    if intent_row["intent_id"] != representative_intent[
+                        "intent_id"
+                    ] and (
+                        evidence["offer_history"].get("scope_trade_ids") is not None
+                        or evidence["transaction_history"].get(
+                            "scope_selected_coin_ids"
+                        )
+                        is not None
+                    ):
+                        # Sage scopes each transaction/coin view to one intent.
+                        # Reuse the cohort proof, but collect each peer's own
+                        # exact view before classifying or committing it.
+                        member_evidence = (
+                            offer_reconciliation.load_authoritative_evidence(intent_row)
+                        )
+                        member_observed_at = offer_reconciliation._clock_utc()
                     classification = offer_reconciliation.classify_terminal_evidence(
                         intent_row,
-                        evidence,
+                        member_evidence,
                         cancel_context=cancel_context,
-                        now=observed_at,
+                        now=member_observed_at,
                     )
                     if (
                         classification.get("classification")
@@ -9349,9 +9370,9 @@ class OfferManager:
                         raise ValueError("native bulk cancellation proof is incomplete")
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent_row["intent_id"],
-                        evidence=evidence,
+                        evidence=member_evidence,
                         cancel_context=cancel_context,
-                        now=observed_at,
+                        now=member_observed_at,
                     )
                     if (
                         reconciled.get("classification")

@@ -18430,7 +18430,15 @@
                 : (_shouldExposeRestoredPairToUI()
                     ? (getSettingsSelectedCAT()?.asset_id ? getSettingsSelectedCAT() : (currentCAT?.asset_id ? currentCAT : {}))
                     : {});
-            const hasPair = !!(effectiveCat && effectiveCat.asset_id);
+            // Match the same explicit-selection gate used by Bootstrap Preview.
+            // A stopped campaign can leave currentCAT and the settings selector
+            // populated even though the user must choose a pair for a new run.
+            const selectedPair = getDashboardSelectedPair({ requireExplicit: true });
+            const hasPair = !!(
+                effectiveCat?.asset_id
+                && selectedPair.selected
+                && selectedPair.asset_id === effectiveCat.asset_id
+            );
             const pairReady = hasPair ? isPairDataReadyFor(effectiveCat.asset_id) : false;
             const pairName = effectiveCat?.name || effectiveCat?.ticker_id || 'Selected Pair';
             const locked = !!(bot_state && bot_state.running);
@@ -18658,7 +18666,15 @@
         }
 
         function shouldUseFreshStartBlankTierTemplates() {
-            return _freshStartBlankTierTemplates && !isSettingsReviewedForCurrentPair() && !hasResumedLiveBook();
+            // A saved Bootstrap campaign is an explicit, pair-bound price and
+            // budget authority. Show this pair's persisted settings for review
+            // before Coin Prep, even when Follow market Smart Settings cannot
+            // calculate a plan from thin liquidity. A different pair still
+            // starts with blank templates.
+            const campaignForPair = _bootstrapActiveCampaign?.status === 'active'
+                && _bootstrapActiveCampaign.asset_id === currentCAT?.asset_id;
+            return _freshStartBlankTierTemplates && !isSettingsReviewedForCurrentPair()
+                && !hasResumedLiveBook() && !campaignForPair;
         }
 
         function resetCoreOrderBookInputsForFreshStart() {
@@ -19679,6 +19695,12 @@
                 if (typeof err === 'object') {
                     if (err.error === 'mutation_gate_blocked') {
                         return startSafetyMessage(err.reason || err.reason_code);
+                    }
+                    // Bulk config writes can reject one field after applying others.
+                    // Show the rejected field so the operator can correct it.
+                    const firstFieldError = Array.isArray(err.errors) ? err.errors[0] : null;
+                    if (typeof firstFieldError === 'string' && firstFieldError.trim()) {
+                        return firstFieldError.trim().slice(0, 200);
                     }
                     const code = err.code || err.error_code;
                     if (code && _ERROR_CODE_MAP[code]) return _ERROR_CODE_MAP[code];
@@ -33009,6 +33031,8 @@
                 const reason = String(status?.reason_code || status?.code || '');
                 banner.textContent = ['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH'].includes(reason)
                     ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                    : reason === 'FEE_BUDGET_APPROVAL_REQUIRED'
+                        ? 'This campaign has live offers but no campaign-bound cancellation fee approval. Review the cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                     : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
                         ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                         : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
@@ -34932,10 +34956,41 @@
             return adjustments;
         }
 
+        function omitInactiveBlankSettings(config) {
+            const blankNumber = key => typeof config[key] === 'number' && !Number.isFinite(config[key]);
+            const omit = keys => keys.forEach(key => { if (blankNumber(key)) delete config[key]; });
+            const dbxInput = document.getElementById('configDbxMaxSpreadBps');
+            if (dbxInput?.closest('.form-group')?.style.display === 'none'
+                    && dbxInput.value === '') {
+                omit(['dbx_max_spread_bps']);
+            }
+            if (!config.tier_enabled) {
+                omit(['inner_size_xch', 'mid_size_xch', 'outer_size_xch', 'extreme_size_xch']);
+            }
+            if (!config.auto_requote) {
+                omit(['requote_bps', 'requote_cooldown', 'requote_batch_size']);
+            }
+            if (!config.dynamic_spread_enabled) {
+                omit(['base_spread_bps', 'min_spread_bps', 'max_spread_bps', 'volatility_window_hours']);
+            }
+            if (!config.inventory_enabled) {
+                omit(['skew_intensity', 'max_position_xch']);
+            }
+            return config;
+        }
+
         async function saveConfig() {
             setSaveConfigButtonState(true, 'Saving Settings...');
+            const spreadInput = document.getElementById('configSpreadBps');
+            const spreadValue = Number(spreadInput?.value);
+            if (!Number.isFinite(spreadValue) || spreadValue <= 0) {
+                showToast('Spread must be a positive percentage before saving settings.', 'error');
+                if (spreadInput) spreadInput.style.borderColor = 'var(--status-danger)';
+                setSaveConfigButtonState(false);
+                return;
+            }
             // Client-side spread warning (value is now in %)
-            const spreadPct = parseFloat(document.getElementById('configSpreadBps')?.value) || 0;
+            const spreadPct = spreadValue;
             if (spreadPct > 0 && spreadPct < 2) {
                 const proceed = await showStyledConfirm({
                     icon: '📉',
@@ -35283,6 +35338,16 @@
                 sage_set_change_address: document.getElementById('configSageChangeAddress').checked,
             };
             config = normalizeConfigForLiquidityMode(config);
+            omitInactiveBlankSettings(config);
+
+            const invalidConfigField = Object.entries(config).find(([, value]) =>
+                value == null || (typeof value === 'number' && !Number.isFinite(value))
+            );
+            if (invalidConfigField) {
+                showToast(`Cannot save: ${invalidConfigField[0].replaceAll('_', ' ')} is blank or invalid.`, 'error');
+                setSaveConfigButtonState(false);
+                return;
+            }
 
             const activeOffers = (bot_state && bot_state.offers)
                 ? (bot_state.offers.buy_count || 0) + (bot_state.offers.sell_count || 0)
@@ -40144,7 +40209,7 @@ function _bootstrapRenderStatus(payload) {
                 summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
             }
         } else {
-            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% stage target · ${remainingTime} · revision ${campaign.revision}`;
         }
         campaign._uiCooldownCount = cooldowns;
     }

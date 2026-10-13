@@ -1555,6 +1555,8 @@ def test_reload_fetches_durable_bootstrap_before_pair_state_is_hydrated(page):
     assert result["requestCount"] == 1
     assert result["campaignId"] == "campaign-live"
     assert result["globalStatus"].startswith("Bootstrap active")
+    assert "10% stage target" in result["globalStatus"]
+    assert "deployed" not in result["globalStatus"]
     assert "corridor 0.00005–0.0002 XCH/MZ" in result["dashboardStatus"]
     assert "budgets 72.8943 XCH / 351421.735 MZ" in result["dashboardStatus"]
 
@@ -1959,6 +1961,117 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
 
     assert is_dirty is False
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
+
+
+def test_blank_spread_cannot_submit_partial_settings_save(page):
+    """A blank Smart Settings spread must stop before the bulk config write."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('configSpreadBps').value = '';
+            let apiCalls = 0;
+            window.apiFetch = async () => { apiCalls++; throw Error('unexpected save'); };
+            await saveConfig();
+            return {
+                apiCalls,
+                saveLabel: document.getElementById('saveConfigBtn')?.textContent,
+            };
+        }"""
+    )
+
+    assert result["apiCalls"] == 0
+    assert "Saving" not in result["saveLabel"]
+
+
+def test_blank_loop_interval_cannot_submit_partial_settings_save(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    api_calls = page.evaluate(
+        """async () => {
+            document.getElementById('configSpreadBps').value = '7';
+            document.getElementById('configLoopSeconds').value = '';
+            let calls = 0;
+            window.apiFetch = async () => { calls++; throw Error('unexpected save'); };
+            await saveConfig();
+            return calls;
+        }"""
+    )
+
+    assert api_calls == 0
+
+
+def test_active_bootstrap_pair_loads_saved_settings_for_review(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            currentCAT = {asset_id: 'asset-a'};
+            settingsReviewed = false;
+            _freshStartBlankTierTemplates = true;
+            _resumeSessionSummary = null;
+            _bootstrapActiveCampaign = null;
+            const fresh = shouldUseFreshStartBlankTierTemplates();
+            _bootstrapActiveCampaign = {asset_id: 'asset-b', status: 'active'};
+            const otherPair = shouldUseFreshStartBlankTierTemplates();
+            _bootstrapActiveCampaign = {asset_id: 'asset-a', status: 'active'};
+            const campaignPair = shouldUseFreshStartBlankTierTemplates();
+            return {fresh, otherPair, campaignPair};
+        }"""
+    )
+
+    assert result == {"fresh": True, "otherPair": True, "campaignPair": False}
+
+
+def test_inactive_blank_settings_are_omitted_without_hiding_required_blanks(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const dbx = document.getElementById('configDbxMaxSpreadBps');
+            dbx.value = '';
+            dbx.closest('.form-group').style.display = 'none';
+            const config = {
+                loop_seconds: NaN,
+                dbx_max_spread_bps: NaN,
+                tier_enabled: false,
+                inner_size_xch: NaN,
+                auto_requote: false,
+                requote_bps: NaN,
+                dynamic_spread_enabled: false,
+                base_spread_bps: NaN,
+                inventory_enabled: false,
+                skew_intensity: NaN,
+            };
+            omitInactiveBlankSettings(config);
+            return Object.keys(config).sort();
+        }"""
+    )
+
+    assert result == [
+        "auto_requote",
+        "dynamic_spread_enabled",
+        "inventory_enabled",
+        "loop_seconds",
+        "tier_enabled",
+    ]
+
+
+def test_bulk_settings_error_shows_specific_rejected_field(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    message = page.evaluate(
+        """() => formatError({success: false, errors: [
+            'SPREAD_BPS must be a positive integer'
+        ]})"""
+    )
+
+    assert message == "SPREAD_BPS must be a positive integer"
 
 
 def test_smart_settings_snapshot_accepts_save_time_spread_floor_normalization(page):
@@ -2461,6 +2574,57 @@ def test_idle_reload_does_not_render_persisted_pair_as_selected(page):
         "competitors": "loading",
         "catRows": "none",
         "cacheCleared": True,
+    }
+
+
+def test_settings_pair_card_requires_the_same_explicit_pair_as_bootstrap_preview(page):
+    """A stopped campaign must not display a confirmed pair that Preview rejects."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            const assetId = 'ab'.repeat(32);
+            const cat = { asset_id: assetId, name: 'Monkeyzoo Token', ticker_id: 'MZ_XCH' };
+            const dash = document.getElementById('catSelector');
+            const settings = document.getElementById('configCatSelector');
+            dash.innerHTML = `<option value="${assetId}" selected>MZ</option>`;
+            settings.innerHTML = `<option value="${assetId}" selected>MZ</option>`;
+            currentCAT = { ...cat };
+            _pairDataReadyAssetId = assetId;
+            _pairSelectedByUser = false;
+            _resumeSessionSummary = null;
+            _bootstrapActiveCampaign = null;
+            bot_state = { running: false };
+
+            updateSettingsPairControl(cat);
+            const withoutSelection = {
+                previewPairSelected: getDashboardSelectedPair({ requireExplicit: true }).selected,
+                cardStatus: document.getElementById('settingsPairDisplayStatus').textContent,
+            };
+
+            _pairSelectedByUser = true;
+            updateSettingsPairControl(cat);
+            return {
+                withoutSelection,
+                withSelection: {
+                    previewPairSelected: getDashboardSelectedPair({ requireExplicit: true }).selected,
+                    cardStatus: document.getElementById('settingsPairDisplayStatus').textContent,
+                },
+            };
+        }"""
+    )
+
+    assert result == {
+        "withoutSelection": {
+            "previewPairSelected": False,
+            "cardStatus": "Waiting for pair selection",
+        },
+        "withSelection": {
+            "previewPairSelected": True,
+            "cardStatus": "App-wide trading pair confirmed",
+        },
     }
 
 

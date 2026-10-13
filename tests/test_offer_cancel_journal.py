@@ -2639,6 +2639,140 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         )
 
 
+@pytest.mark.parametrize("pre_reconcile_first", [False, True])
+@pytest.mark.parametrize("wrong_peer_scope", [False, True])
+def test_sage_bulk_cancel_settles_each_member_with_its_scoped_wallet_evidence(
+    isolated_database,
+    monkeypatch,
+    pre_reconcile_first,
+    wrong_peer_scope,
+):
+    """A confirmed bulk transaction must settle every exact Sage offer scope."""
+
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64]
+    source_coin_ids = ["d" * 64, "e" * 64, "f" * 64]
+    fee_coin_id = "1" * 64
+    transaction_id = "2" * 64
+    spend_identity = "sha256:" + "3" * 64
+    wallet_fingerprint_hash = mutation_gate.wallet_fingerprint_hash(
+        _binding().fingerprint
+    )
+    for index, (trade_id, coin_id) in enumerate(
+        zip(trade_ids, source_coin_ids), start=1
+    ):
+        _seed_task7_created_offer(
+            trade_id=trade_id,
+            coin_id=coin_id,
+            intent_seed=f"scoped-bulk-cancel-{index}",
+            wallet_fingerprint_hash=wallet_fingerprint_hash,
+        )
+
+    def batch_effect(selected_trade_ids, *_args, _identity_recheck=None, **_kwargs):
+        _identity_recheck("cancel_offers")
+        shared = cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="sage_native_cancel_offers",
+            raw_response={"success": True, "transaction_id": transaction_id},
+            transaction_id=transaction_id,
+            spend_identity=spend_identity,
+        )
+        return {trade_id: dict(shared) for trade_id in selected_trade_ids}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: pytest.fail("serial cancel is forbidden"),
+        batch_effect=batch_effect,
+        identity_count=12,
+    )
+    monkeypatch.setattr(
+        offer_manager, "get_effective_transaction_fee_mojos", lambda: 13_079_100
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(
+        reserve=lambda minimum_amount_mojos=0: fee_coin_id
+    )
+    submitted = manager.cancel_offers(trade_ids, force_storm=True)
+    assert all(
+        result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        for result in submitted.values()
+    )
+
+    whole = _confirmed_sage_bulk_cancel_evidence(
+        trade_ids=trade_ids,
+        source_coin_ids=source_coin_ids,
+        fee_coin_id=fee_coin_id,
+        transaction_id=transaction_id,
+        spend_identity=spend_identity,
+    )
+
+    def scoped_wallet_evidence(intent):
+        trade_id = intent["sage_trade_id"]
+        coin_id = source_coin_ids[trade_ids.index(trade_id)]
+        scoped = json.loads(json.dumps(whole))
+        scoped["offer_history"]["scope_trade_ids"] = trade_ids
+        scoped["transaction_history"]["scope_selected_coin_ids"] = [
+            source_coin_ids[0]
+            if wrong_peer_scope and trade_id == trade_ids[1]
+            else coin_id
+        ]
+        return scoped
+
+    monkeypatch.setattr(
+        offer_reconciliation, "load_authoritative_evidence", scoped_wallet_evidence
+    )
+    monkeypatch.setattr(
+        offer_reconciliation, "_clock_utc", lambda: whole["observed_at"]
+    )
+    monkeypatch.setattr(offer_manager.cfg, "CANCEL_MAX_WAIT_SECS", 0)
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=lambda *_args, **_kwargs: {"released": True},
+            status=lambda: {"allowed": True},
+        ),
+    )
+
+    if pre_reconcile_first:
+        # Match the live interruption: one member was committed before the
+        # reused representative scope stranded the other two behind the latch.
+        blockers = database.get_unresolved_offer_operation_blockers()
+        manifest = OfferManager._sage_bulk_cancel_manifest_for_blockers(blockers)
+        first_intent = database.get_offer_intent(manifest["members"][0]["intent_id"])
+        first_evidence = scoped_wallet_evidence(first_intent)
+        context = offer_reconciliation._derive_sage_bulk_cancel_context(
+            manifest,
+            [row["operation_id"] for row in blockers],
+            first_evidence,
+            database_module=database,
+            observed_at=whole["observed_at"],
+        )
+        assert context is not None
+        first_result = offer_reconciliation.reconcile_offer(
+            first_intent["intent_id"],
+            evidence=first_evidence,
+            cancel_context=context,
+            now=whole["observed_at"],
+        )
+        assert first_result["classification"] == "CANCELLED_PROVEN"
+        assert first_result["applied"] is True
+        assert len(database.get_unresolved_offer_operation_blockers()) == 2
+
+    if wrong_peer_scope:
+        assert manager.retry_failed_cancels() == -1
+        assert len(database.get_unresolved_offer_operation_blockers()) == 2
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        assert database.get_authoritative_terminal_record(trade_ids[1]) is None
+    else:
+        assert manager.retry_failed_cancels() == 0
+        assert database.get_unresolved_offer_operation_blockers() == []
+        assert database.get_runtime_safety_latch()["state"] == "resolved"
+        for trade_id in trade_ids:
+            assert database.get_authoritative_terminal_record(trade_id)["outcome"] == (
+                "CANCELLED_PROVEN"
+            )
+
+
 def test_startup_recovers_settled_protected_cancellation_fee_outcome(
     isolated_database,
     monkeypatch,

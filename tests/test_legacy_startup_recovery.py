@@ -519,8 +519,13 @@ def test_persisted_reconciliation_conflicts_are_rechecked_from_exact_sage_proof(
     assert {call[1] for call in calls if call[0] == "reconcile"} == set(intent_ids)
 
 
-def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart():
-    """Startup must preserve the shared Sage transaction proof for every member."""
+@pytest.mark.parametrize("first_member_already_settled", [False, True])
+@pytest.mark.parametrize("peer_scope_valid", [False, True])
+def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart(
+    first_member_already_settled,
+    peer_scope_valid,
+):
+    """Startup uses anchor proof and each unresolved member's scoped Sage view."""
     import legacy_startup_recovery
 
     trade_ids = ["a" * 64, "b" * 64]
@@ -571,8 +576,13 @@ def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart
             )
         ],
     }
-    active = set(operation_ids)
-    evidence = {"observed_at": AT}
+    active = set(operation_ids[1:] if first_member_already_settled else operation_ids)
+    evidence = {
+        intent_id: {"observed_at": AT, "scope_intent_id": intent_id}
+        for intent_id in intent_ids
+    }
+    if not peer_scope_valid:
+        evidence[intent_ids[1]]["scope_intent_id"] = intent_ids[0]
     calls = []
 
     def current_blockers():
@@ -617,7 +627,7 @@ def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart
     def derive_bulk(supplied_manifest, blocking_operation_ids, supplied, **kwargs):
         calls.append(("bulk_context", list(blocking_operation_ids), kwargs))
         assert supplied_manifest is manifest
-        assert supplied is evidence
+        assert supplied is evidence[intent_ids[0]]
         assert blocking_operation_ids == [
             operation_id for operation_id in operation_ids if operation_id in active
         ]
@@ -632,13 +642,19 @@ def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart
         EXPIRED_PROVEN="EXPIRED_PROVEN",
         CANCELLED_PROVEN="CANCELLED_PROVEN",
         FILLED_PROVEN="FILLED_PROVEN",
-        load_authoritative_evidence=lambda target, wallet_facade=None: evidence,
+        load_authoritative_evidence=lambda target, wallet_facade=None: evidence[
+            target["intent_id"]
+        ],
         _derive_single_cancel_context=lambda *_args, **_kwargs: pytest.fail(
             "native bulk cancellation must not be reduced to one member"
         ),
         _derive_sage_bulk_cancel_context=derive_bulk,
-        classify_terminal_evidence=lambda *_args, **_kwargs: {
-            "classification": "CANCELLED_PROVEN",
+        classify_terminal_evidence=lambda target, supplied, **_kwargs: {
+            "classification": (
+                "CANCELLED_PROVEN"
+                if supplied["scope_intent_id"] == target["intent_id"]
+                else "UNKNOWN"
+            ),
             "reason_code": "EXACT_CANCEL_RETURN_PROOF",
         },
         reconcile_offer=reconcile,
@@ -653,14 +669,17 @@ def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart
         config=SimpleNamespace(CAT_DECIMALS=3),
     )
 
-    assert result == {"examined": 2, "recovered": 2, "remaining": 0}
-    assert active == set()
-    assert [call[0] for call in calls] == [
-        "bulk_context",
-        "reconcile",
-        "bulk_context",
-        "reconcile",
-    ]
+    expected = len(operation_ids) - int(first_member_already_settled)
+    recovered = expected if peer_scope_valid else int(not first_member_already_settled)
+    assert result == {
+        "examined": expected,
+        "recovered": recovered,
+        "remaining": expected - recovered,
+    }
+    assert active == (set() if peer_scope_valid else {operation_ids[1]})
+    assert [call[0] for call in calls] == ["bulk_context", "reconcile"] * recovered + (
+        [] if peer_scope_valid else ["bulk_context"]
+    )
 
 
 def test_database_legacy_adoption_never_commits_publishable_state(

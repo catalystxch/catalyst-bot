@@ -374,59 +374,91 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             options["bootstrap_campaign_id"]
         )
         if approval_id is None:
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        consent = database.get_coin_prep_fee_approval_context(approval_id)
-        scope = json.loads(consent["scope_json"])
-        plan = json.loads(consent["plan_json"])
-        binding = json.loads(consent["quote_json"]).get("execution_context")
-        from coin_prep_fee_execution import (
-            cancellation_recovery_configuration_matches,
-            encode_execution_configuration,
-            validate_execution_context,
-        )
-
-        approved_revision = plan.get("campaign_revision")
-        requested_revision = options["bootstrap_campaign_revision"]
-        recovery_revision_matches = approved_revision == requested_revision or (
-            (campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(stopped))
-            and stopped.get("revision") == requested_revision
-            and type(approved_revision) is int
-            and requested_revision > approved_revision
-        )
-
-        if (
-            scope.get("campaign_id") != options["bootstrap_campaign_id"]
-            or not recovery_revision_matches
-            or options["target_seconds"] != plan.get("target_seconds")
-            or any(identity.get(key) != scope.get(key) for key in identity)
-            or binding is None
-            or type(binding.get("configuration")) is not dict
-            or not cancellation_recovery_configuration_matches(
-                encode_execution_configuration(config), binding.get("configuration")
+            # A campaign may reuse coins prepared under an earlier campaign.
+            # It then owns real offers but has no campaign-bound preparation
+            # approval to renew. For an *active* campaign only, derive a fresh
+            # recipe from its current trusted authority and freeze it solely as
+            # a cancellation-only quote. Never revive a stopped campaign from
+            # mutable settings or make this recipe eligible for preparation.
+            if type(stopped) is not dict or stopped.get("status") != "active":
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            ordinary_options = {
+                key: value
+                for key, value in options.items()
+                if key != "cancellation_recovery_action"
+            }
+            bootstrap = _active_bootstrap_coin_prep_context(ordinary_options)
+            if type(bootstrap) is not dict or bootstrap.get("campaign") != stopped:
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            recovery_recipe = build_exact_prep_economics(
+                configuration=config,
+                worker_args=bootstrap["worker_args"],
+                campaign_revision=stopped["revision"],
+                target_seconds=options["target_seconds"],
             )
-            or binding.get("receive_address") != context["receive_address"]
-        ):
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        # A stopped campaign can be recovered after startup/session projection
-        # has changed ordinary trading settings (for example, two-sided to
-        # buy-only).  Cancellation-only renewal reuses the validated frozen
-        # recipe and creates a fresh approval bound to the current wallet
-        # snapshot, so old-vs-current trading configuration equality is not an
-        # authority boundary here. Identity and receive-address equality above
-        # remain mandatory.
-        recovery_recipe = validate_execution_context(binding, scope, plan)
-        recovery_execution_context = binding
-        campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
-        if type(campaign) is not dict or campaign.get("status") not in {
-            "active",
-            "stopped",
-        }:
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        bootstrap = {
-            "campaign": campaign,
-            "worker_args": dict(recovery_recipe["worker_args"]),
-            "recovery_only": True,
-        }
+            from coin_prep_fee_execution import freeze_execution_context
+
+            recovery_execution_context = freeze_execution_context(
+                {
+                    **context,
+                    "recipe": recovery_recipe,
+                    "recovery_only": False,
+                }
+            )
+            bootstrap = {**bootstrap, "recovery_only": True}
+        else:
+            consent = database.get_coin_prep_fee_approval_context(approval_id)
+            scope = json.loads(consent["scope_json"])
+            plan = json.loads(consent["plan_json"])
+            binding = json.loads(consent["quote_json"]).get("execution_context")
+            from coin_prep_fee_execution import (
+                cancellation_recovery_configuration_matches,
+                encode_execution_configuration,
+                validate_execution_context,
+            )
+
+            approved_revision = plan.get("campaign_revision")
+            requested_revision = options["bootstrap_campaign_revision"]
+            recovery_revision_matches = approved_revision == requested_revision or (
+                (campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(stopped))
+                and stopped.get("revision") == requested_revision
+                and type(approved_revision) is int
+                and requested_revision > approved_revision
+            )
+
+            if (
+                scope.get("campaign_id") != options["bootstrap_campaign_id"]
+                or not recovery_revision_matches
+                or options["target_seconds"] != plan.get("target_seconds")
+                or any(identity.get(key) != scope.get(key) for key in identity)
+                or binding is None
+                or type(binding.get("configuration")) is not dict
+                or not cancellation_recovery_configuration_matches(
+                    encode_execution_configuration(config), binding.get("configuration")
+                )
+                or binding.get("receive_address") != context["receive_address"]
+            ):
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            # A stopped campaign can be recovered after startup/session projection
+            # has changed ordinary trading settings (for example, two-sided to
+            # buy-only).  Cancellation-only renewal reuses the validated frozen
+            # recipe and creates a fresh approval bound to the current wallet
+            # snapshot, so old-vs-current trading configuration equality is not an
+            # authority boundary here. Identity and receive-address equality above
+            # remain mandatory.
+            recovery_recipe = validate_execution_context(binding, scope, plan)
+            recovery_execution_context = binding
+            campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
+            if type(campaign) is not dict or campaign.get("status") not in {
+                "active",
+                "stopped",
+            }:
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            bootstrap = {
+                "campaign": campaign,
+                "worker_args": dict(recovery_recipe["worker_args"]),
+                "recovery_only": True,
+            }
     campaign = None
     if bootstrap is not None:
         campaign = bootstrap["campaign"]
