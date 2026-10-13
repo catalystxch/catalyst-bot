@@ -23841,6 +23841,51 @@ def _validated_offer_cancel_cohort_manifest_row(row: Any) -> Dict[str, Any]:
     return manifest
 
 
+def _replacement_claim_failed_without_effect(
+    conn: sqlite3.Connection, child: Dict[str, Any]
+) -> bool:
+    """Ignore only a child whose durable creation proof excludes an offer."""
+
+    if (
+        child["lifecycle_state"] != "creation_failed"
+        or child["sage_trade_id"] is not None
+        or child["offer_text_sha256"] is not None
+        or child["publication_identity"] is not None
+        or child["submitted_at"] is not None
+        or child["confirmed_at"] is not None
+        or child["first_visible_at"] is not None
+        or child["terminal_at"] is None
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT * FROM offer_operation_journal "
+        "WHERE intent_id=? AND operation_type='CREATE' ORDER BY sequence",
+        (child["intent_id"],),
+    ).fetchall()
+    if len(rows) != 2:
+        return False
+    try:
+        prepared, finalized = (
+            validate_offer_operation_event(dict(row)) for row in rows
+        )
+        evidence = json.loads(finalized["evidence_json"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        prepared["phase"] == "PREPARED"
+        and prepared["outcome"] == "PREPARED"
+        and finalized["phase"] == "FINALIZED"
+        and finalized["outcome"] == "FAILED"
+        and finalized["operation_id"] == prepared["operation_id"]
+        and finalized["attempt"] == prepared["attempt"]
+        and finalized["blocks_mutation"] == 0
+        and finalized["transaction_id"] is None
+        and finalized["spend_identity"] is None
+        and type(evidence) is dict
+        and evidence.get("effect_attempted") is False
+    )
+
+
 def _prepare_offer_cancel_in_transaction(
     conn: sqlite3.Connection,
     *,
@@ -23873,16 +23918,21 @@ def _prepare_offer_cancel_in_transaction(
         if registered is not None:
             child_id = registered["child_intent_id"]
             child_claims = conn.execute(
-                "SELECT intent_id FROM offer_intents WHERE parent_intent_id=?",
+                "SELECT * FROM offer_intents WHERE parent_intent_id=?",
                 (registered["intent_id"],),
             ).fetchall()
-            if child_id or child_claims:
+            active_claims = [
+                claim
+                for claim in child_claims
+                if not _replacement_claim_failed_without_effect(conn, dict(claim))
+            ]
+            if child_id or active_claims:
                 if registered["intent_id"] != intent_id:
                     raise ValueError("cancellation intent identity differs")
                 if (
                     not child_id
-                    or len(child_claims) != 1
-                    or child_claims[0]["intent_id"] != child_id
+                    or len(active_claims) != 1
+                    or active_claims[0]["intent_id"] != child_id
                 ):
                     raise ValueError("replacement child lineage is not bound")
                 _parent, child = _refresh_lineage_rows(

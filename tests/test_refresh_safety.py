@@ -113,6 +113,23 @@ def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = Fals
     )
 
 
+def _fail_creation_without_effect(intent_id: str):
+    return database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:failed",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        wallet_identity_json={
+            "fingerprint_sha256": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"effect_attempted": False},
+        reason_code="CREATE_REJECTED",
+        finalized_at="2026-08-15T12:01:00.000000Z",
+    )
+
+
 def test_refresh_planner_is_a_noop_for_an_empty_target_set():
     """Catches a refresh implementation that manufactures cancellation work."""
 
@@ -267,6 +284,113 @@ def test_cancel_prepare_rejects_provisional_unpublished_replacement_child(
     _prepare("child", parent_intent_id="parent", generation=1)
     _confirm("child")
     assert database.get_offer_intent("parent")["child_intent_id"] is None
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    with pytest.raises(ValueError, match="replacement child lineage is not bound"):
+        database.prepare_offer_cancel(
+            operation_id=operation,
+            event_id=f"{operation}:attempt:1:prepared",
+            trade_id=parent_trade,
+            intent_id="parent",
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": _sha("wallet-a"),
+                "network": "mainnet",
+            },
+            evidence_json={"trade_id": parent_trade},
+            prepared_at="2026-08-15T12:02:00.000000Z",
+        )
+    assert database.get_offer_operation_events(operation) == []
+
+
+def test_cancel_prepare_allows_parent_after_child_creation_failed_without_effect(
+    isolated_database,
+):
+    """A proven no-effect child must not strand a still-live parent."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("failed-child", parent_intent_id="parent", generation=1)
+    _fail_creation_without_effect("failed-child")
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade},
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    assert len(database.get_offer_operation_events(operation)) == 1
+
+
+def test_cancel_prepare_ignores_failed_child_before_visible_replacement_retry(
+    isolated_database,
+):
+    """A failed no-effect attempt does not obscure the exact visible retry."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("failed-child", parent_intent_id="parent", generation=1)
+    _fail_creation_without_effect("failed-child")
+    _prepare("retry-child", parent_intent_id="parent", generation=1)
+    _confirm("retry-child")
+    database.bind_refresh_lineage("parent", "retry-child")
+    database.record_offer_intent_visibility(
+        "retry-child", publication_identity="registry:retry-child"
+    )
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade},
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    assert len(database.get_offer_operation_events(operation)) == 1
+
+
+def test_cancel_prepare_rejects_failed_child_with_attempted_wallet_effect(
+    isolated_database,
+):
+    """A failed label cannot excuse a child whose wallet outcome is uncertain."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    database.finalize_offer_intent(
+        intent_id="child",
+        operation_id="create:child",
+        event_id="create:child:failed",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        wallet_identity_json={
+            "fingerprint_sha256": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"effect_attempted": True},
+        reason_code="CREATE_REJECTED",
+        finalized_at="2026-08-15T12:01:00.000000Z",
+    )
     parent_trade = _sha("trade:parent")
     operation = f"cancel:{parent_trade}"
 

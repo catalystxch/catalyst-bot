@@ -426,3 +426,21 @@ requested Take test.
   Sage-active offers and its unresolved safety latch, while Harvestr remains
   fenced. This prevention change does not resolve the already confirmed
   parent cancellation or establish public readiness.
+
+## 14:03 UTC failed-child compatibility follow-up
+
+- Independent review found that counting every child-side lineage claim
+  could also strand a parent after a child creation failed before any wallet
+  effect. A disposable-DB test reproduced the regression on the prior PR
+  head. The guard now excludes only a `creation_failed` child whose canonical
+  PREPARED and FINALIZED journal events show a failed, nonblocking,
+  no-transaction outcome with `effect_attempted: false` and no offer or
+  publication identity. Prepared, created, ambiguous and effect-attempted
+  children continue to block parent cancellation until the lineage is exact
+  and visible.
+- Focused tests prove parent cancellation after a failed no-effect child,
+  after a failed child followed by an exact visible retry, and refusal when
+  the failed child records an attempted wallet effect. The refresh-safety
+  module passed **38/38**. Full cancellation/reconciliation tests, full
+  backend suite and exact-head CI are still required for this follow-up.
+  No live app or wallet was changed.
