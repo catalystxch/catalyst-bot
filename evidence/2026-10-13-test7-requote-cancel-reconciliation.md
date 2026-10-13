@@ -444,3 +444,27 @@ requested Take test.
   module passed **38/38**. Full cancellation/reconciliation tests, full
   backend suite and exact-head CI are still required for this follow-up.
   No live app or wallet was changed.
+
+## 14:40 UTC exact prevention source verified and packaged
+
+- The final prevention source `42fc859b37cf6faf5b9cb9804e9f02de672769fc`
+  passed the four related refresh, cancellation, reconciliation and Cancel All
+  modules (**519 passed**) and the full serial Windows backend suite
+  (**7,675 passed, 279 skipped, 457 subtests passed** in 1,639.82 seconds).
+  Ruff and `git diff --check` passed. All CI jobs on this exact PR head,
+  including both unit-test jobs, completed successfully; PR #268 remains draft.
+- `python build.py` produced a clean Windows package from this exact source.
+  Its `Catalyst.exe` is 11,325,369 bytes, SHA-256
+  `EF4FBBB070675A1276157574C85FAA895F7E3679D702AA8B7923EEDB0F3A26FA`.
+  The package contains 192 files and its expected HTML and certificate assets;
+  no live `.env`, database, WAL, secret file or superlog was included. A
+  Microsoft Defender custom scan completed without a matching threat.
+  This package has **not** been launched against either original wallet;
+  isolated packaged runtime checks remain open.
+- The original TEST 7 app remains PID 188444 on the older exact source
+  `49c745e`. A read-only SQLite check still found latch generation 667 tripped
+  for `UNRESOLVED_OPERATIONS` and three database-open offers, while the last
+  authoritative Sage check found two active offers and zero pending
+  transactions. The already-confirmed first cancellation has not been
+  reclassified as resolved. No additional wallet or publication effect was
+  attempted during this verification.
