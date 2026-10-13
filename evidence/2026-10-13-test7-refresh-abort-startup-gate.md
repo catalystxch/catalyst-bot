@@ -127,4 +127,15 @@
   the trading BotLoop or starting normal owned runtime services. Both guards
   were first tested red, then green. The full first-run/bootstrap and mutation
   gate suite passed 327 tests. The flag still has no production startup
-  activation or recovery UI; original TEST 7 remains on its old fenced build.
+  activation; original TEST 7 remains on its old fenced build.
+- The restricted HTTP root now serves a separate authenticated, read-only
+  recovery page rather than the trading GUI. It displays fresh preview
+  fields through text nodes, has no trading/cancellation controls, and fails
+  closed when the preview is unavailable. Two Chromium E2E tests passed,
+  including hostile text that must not execute as HTML. Startup activation,
+  exact operator actions and packaged acceptance remain open.
+- Restricted-view/backend packaging checks passed 305 tests; Ruff and diff
+  whitespace checks passed. A clean worktree PyInstaller build completed and
+  contains `refresh_abort_recovery.html` in `dist/Catalyst/_internal/`. This
+  confirms inclusion only; the packaged original-profile runtime has not
+  been launched, and its live recovery acceptance remains open.

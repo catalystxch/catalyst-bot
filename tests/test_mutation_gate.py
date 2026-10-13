@@ -10061,14 +10061,40 @@ def test_restricted_refresh_abort_http_mode_denies_every_other_route(monkeypatch
         assert api_server.enforce_local_runtime_guard() is None
 
 
-def test_restricted_refresh_abort_mode_cannot_serve_full_trading_gui(monkeypatch):
+def test_restricted_refresh_abort_mode_serves_only_recovery_view(monkeypatch):
     import api_server
 
     monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
     with api_server.app.test_request_context("/"):
         response = api_server.serve_gui()
-    assert response.status_code == 423
-    assert b"Recovery interface unavailable" in response.data
+    assert response.status_code == 401
+    with api_server.app.test_request_context(
+        "/",
+        headers={api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN},
+    ):
+        response = api_server.serve_gui()
+    assert response.status_code == 200
+    assert b"Fenced offer recovery" in response.data
+    assert b"/api/offers/refresh_abort/preview" in response.data
+    assert b"Start Bot" not in response.data
+    assert b"Cancel All" not in response.data
+
+
+def test_restricted_refresh_abort_view_requires_native_bootstrap_cookie(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    client = api_server.app.test_client()
+    denied = client.get("/")
+    assert denied.status_code == 401
+    bootstrap = client.get("/?bootstrap=" + api_server._LOCAL_API_BOOTSTRAP_TOKEN)
+    assert bootstrap.status_code == 302
+    assert bootstrap.headers["Location"] == "/"
+    authorized = client.get("/")
+    assert authorized.status_code == 200
+    assert "no-store" in authorized.headers["Cache-Control"]
+    assert b"Fenced offer recovery" in authorized.data
+    assert b"Start Bot" not in authorized.data
 
 
 def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch):

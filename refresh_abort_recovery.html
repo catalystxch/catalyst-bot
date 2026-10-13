@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CATalyst | Fenced offer recovery</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101723; color: #f2f5fa; }
+    main { max-width: 880px; margin: 3rem auto; padding: 0 1.25rem; }
+    h1 { font-size: 1.8rem; }
+    p { line-height: 1.5; }
+    .notice { padding: 1rem; border: 1px solid #e7b44d; border-radius: .6rem; background: #332817; }
+    dl { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: .7rem; }
+    dt { color: #a9bacd; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    button { padding: .7rem 1rem; background: #385d8a; border: 0; border-radius: .4rem; color: white; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    code { overflow-wrap: anywhere; }
+    @media (max-width: 560px) { dl { grid-template-columns: 1fr; gap: .2rem; } dd { margin-bottom: .7rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fenced offer recovery</h1>
+    <p class="notice">Trading remains stopped. This page reads the exact wallet and safety state. It cannot create, cancel, or publish an offer.</p>
+    <button type="button" id="refresh">Refresh proof</button>
+    <p id="status" role="status" aria-live="polite">Reading recovery state…</p>
+    <dl>
+      <dt>Stage</dt><dd id="stage">—</dd>
+      <dt>Wallet</dt><dd id="wallet">—</dd>
+      <dt>Asset</dt><dd id="asset">—</dd>
+      <dt>Safety</dt><dd id="safety">—</dd>
+      <dt>Lease owned</dt><dd id="lease">—</dd>
+      <dt>Pending transactions</dt><dd id="pending">—</dd>
+      <dt>Sage active offers</dt><dd id="offers">—</dd>
+      <dt>Last observation</dt><dd id="observed">—</dd>
+    </dl>
+  </main>
+  <script>
+    const fields = Object.fromEntries(
+      ['stage', 'wallet', 'asset', 'safety', 'lease', 'pending', 'offers', 'observed', 'status']
+        .map(key => [key, document.getElementById(key)])
+    );
+    const button = document.getElementById('refresh');
+    const show = (key, value) => { fields[key].textContent = String(value ?? '—'); };
+    async function refreshProof() {
+      button.disabled = true;
+      show('status', 'Reading recovery state…');
+      try {
+        const response = await fetch('/api/offers/refresh_abort/preview', {
+          credentials: 'same-origin', cache: 'no-store', headers: {Accept: 'application/json'}
+        });
+        const data = await response.json();
+        if (!response.ok || data.success !== true) throw new Error('Authoritative preview unavailable');
+        show('stage', data.stage);
+        show('wallet', `${data.wallet?.fingerprint ?? '—'} · ${data.wallet?.network ?? '—'}`);
+        show('asset', data.wallet?.asset_id);
+        show('safety', `${data.safety?.state ?? '—'} · ${data.safety?.reason_code ?? '—'}`);
+        show('lease', data.safety?.lease_owned === true ? 'Yes' : 'No');
+        show('pending', data.wallet?.pending_transaction_count);
+        show('offers', Array.isArray(data.wallet?.active_trade_ids)
+          ? data.wallet.active_trade_ids.join('\n') || 'None' : 'Unavailable');
+        show('observed', data.wallet?.observed_at);
+        show('status', 'Read-only proof loaded.');
+      } catch (_) {
+        show('status', 'Recovery proof is unavailable. Trading remains stopped.');
+        for (const key of ['stage', 'wallet', 'asset', 'safety', 'lease', 'pending', 'offers', 'observed']) show(key, 'Unavailable');
+      } finally {
+        button.disabled = false;
+      }
+    }
+    button.addEventListener('click', refreshProof);
+    refreshProof();
+  </script>
+</body>
+</html>

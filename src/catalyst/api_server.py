@@ -4256,13 +4256,11 @@ def serve_gui():
         response.headers["Referrer-Policy"] = "no-referrer"
         return _bind_local_browser_cookie(response)
     if _refresh_abort_recovery_active:
-        # The restricted owner has no authority to expose the trading UI or
-        # its native bridge. Keep this closed until its separate view is ready.
-        return Response(
-            "Recovery interface unavailable",
-            status=423,
-            mimetype="text/plain",
-        )
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        response = _serve_bootstrapped_html("refresh_abort_recovery.html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
