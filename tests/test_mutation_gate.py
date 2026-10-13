@@ -183,6 +183,176 @@ def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
     )
 
 
+def test_refresh_abort_cleanup_enter_is_exact_and_keeps_general_gate_closed(
+    isolated_gate_database, monkeypatch
+):
+    """A retained abort blocker permits only its own reviewed cancellation."""
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    abort_id = "a" * 64
+    trade_id = "b" * 64
+    blocker = f"refresh-abort:{abort_id}"
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    status = gate.status()
+    assert status.allowed is False
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+
+    def authorize(**request):
+        assert request["abort_id"] == abort_id
+        assert request["trade_id"] in {trade_id, "c" * 64}
+        return {
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "intent_id": "intent-child",
+            "blocking_operation_id": blocker,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "latch_generation": status.latch_generation,
+            "lease_version": gate._lease_version,
+            "lease_acquired_at": gate._lease_acquired_at,
+            "observed_at": NOW.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+            "prepared_operation_id": request.get("prepared_operation_id"),
+        }
+
+    monkeypatch.setattr(database, "authorize_refresh_abort_cleanup_target", authorize)
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_refresh_abort_cleanup(
+            abort_id=abort_id,
+            trade_id="c" * 64,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+        )
+    permit = gate.enter_refresh_abort_cleanup(
+        abort_id=abort_id,
+        trade_id=trade_id,
+        expected_latch_generation=status.latch_generation,
+        observed_trade_ids=[trade_id],
+        observed_pending_transaction_ids=[],
+        observed_at=NOW,
+    )
+    assert gate.active_mutation_count() == 1
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_refresh_abort_cleanup_permit(
+            permit,
+            abort_id=abort_id,
+            trade_id="c" * 64,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+            prepared_operation_id=f"cancel:{trade_id}",
+        )
+    checked = gate.require_refresh_abort_cleanup_permit(
+        permit,
+        abort_id=abort_id,
+        trade_id=trade_id,
+        expected_latch_generation=status.latch_generation,
+        observed_trade_ids=[trade_id],
+        observed_pending_transaction_ids=[],
+        observed_at=NOW,
+        prepared_operation_id=f"cancel:{trade_id}",
+    )
+    assert checked["trade_id"] == trade_id
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+    assert gate.exit_mutation(permit) is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_refresh_abort_cleanup_permit(
+            permit,
+            abort_id=abort_id,
+            trade_id=trade_id,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+            prepared_operation_id=f"cancel:{trade_id}",
+        )
+
+
+def test_refresh_abort_wallet_permit_rechecks_exact_book_and_identity(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    adapter = object()
+    gate, binding = _wallet_owner(clock, adapter, run_id="cleanup-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    abort_id = "a" * 64
+    trade_id = "b" * 64
+    blocker = f"refresh-abort:{abort_id}"
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=gate.wallet_fingerprint_hash,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    status = gate.status()
+    observed_at = NOW.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    def authorize(**request):
+        if request["observed_trade_ids"] != [trade_id]:
+            raise ValueError("Sage book mismatch")
+        return {
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "blocking_operation_id": blocker,
+            "wallet_fingerprint_hash": gate.wallet_fingerprint_hash,
+            "network": "mainnet",
+            "latch_generation": status.latch_generation,
+            "lease_version": gate._lease_version,
+            "lease_acquired_at": gate._lease_acquired_at,
+            "prepared_operation_id": request.get("prepared_operation_id"),
+        }
+
+    monkeypatch.setattr(database, "authorize_refresh_abort_cleanup_target", authorize)
+    request = {
+        "abort_id": abort_id,
+        "trade_id": trade_id,
+        "expected_latch_generation": status.latch_generation,
+        "observed_trade_ids": [trade_id],
+        "observed_pending_transaction_ids": [],
+        "observed_at": observed_at,
+    }
+    permit = mutation_gate.enter_refresh_abort_cleanup_wallet_mutation(**request)
+    assert permit.mode == "refresh_abort_cleanup"
+    with pytest.raises(mutation_gate.MutationBlocked):
+        mutation_gate.enter_wallet_mutation("wallet:create_offer")
+    snapshot = _wallet_snapshot(clock, binding)
+    checked_binding, checked_adapter, decision = (
+        mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+            permit, snapshot, **request
+        )
+    )
+    assert checked_binding is binding
+    assert checked_adapter is adapter
+    assert decision["allowed"] is True
+    with pytest.raises(ValueError, match="Sage book mismatch"):
+        mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+            permit,
+            _wallet_snapshot(clock, binding),
+            **{**request, "observed_trade_ids": []},
+        )
+    assert mutation_gate.exit_wallet_mutation(permit) is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        mutation_gate.require_refresh_abort_cleanup_wallet_permit_authority(
+            permit, abort_id=abort_id, trade_id=trade_id, operation="cancel"
+        )
+
+
 def _active_delegation_row(handoff, environment, now):
     return database.get_valid_worker_delegation(
         delegation_id=handoff.delegation_id,

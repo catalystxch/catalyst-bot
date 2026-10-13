@@ -23,6 +23,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from config import cfg
 import mutation_gate
@@ -428,6 +429,8 @@ class _OfferCreationContinuationState:
         "journal",
         "operation_id",
         "permit",
+        "refresh_abort_id",
+        "refresh_latch_generation",
         "target_trade_id",
         "wallet_operation",
     )
@@ -443,6 +446,8 @@ class _OfferCreationContinuationState:
         journal,
         operation_id,
         permit,
+        refresh_abort_id,
+        refresh_latch_generation,
         target_trade_id,
         wallet_operation,
     ):
@@ -454,6 +459,8 @@ class _OfferCreationContinuationState:
         self.journal = journal
         self.operation_id = operation_id
         self.permit = permit
+        self.refresh_abort_id = refresh_abort_id
+        self.refresh_latch_generation = refresh_latch_generation
         self.target_trade_id = target_trade_id
         self.wallet_operation = wallet_operation
 
@@ -512,18 +519,52 @@ def _begin_offer_operation_continuation(
     wallet_operation: str,
     target_trade_id: str = None,
     ttl_seconds: int = 30,
+    refresh_abort_id: str = None,
+    refresh_latch_generation: int = None,
 ):
     operation = _exact_continuation_text(operation_id, "operation_id")
     intent = _exact_continuation_text(intent_id, "intent_id")
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 60:
         raise ValueError("ttl_seconds must be an exact integer from 1 to 60")
+    cleanup = refresh_abort_id is not None or refresh_latch_generation is not None
+    if cleanup and (
+        wallet_operation != "wallet:cancel_offer"
+        or target_trade_id is None
+        or type(refresh_abort_id) is not str
+        or len(refresh_abort_id) != 64
+        or any(char not in "0123456789abcdef" for char in refresh_abort_id)
+        or type(refresh_latch_generation) is not int
+        or refresh_latch_generation < 1
+    ):
+        raise ValueError("exact refresh abort cleanup authority is required")
     permit = None
     try:
-        permit = mutation_gate.enter_wallet_mutation(wallet_operation)
-        binding, adapter = mutation_gate.require_wallet_mutation_permit_authority(
-            permit,
-            f"{wallet_operation}:continuation:acquire",
-        )
+        cleanup_snapshot = _read_refresh_abort_cleanup_snapshot() if cleanup else None
+        if cleanup:
+            permit = mutation_gate.enter_refresh_abort_cleanup_wallet_mutation(
+                abort_id=refresh_abort_id,
+                trade_id=target_trade_id,
+                expected_latch_generation=refresh_latch_generation,
+                observed_trade_ids=cleanup_snapshot["trade_ids"],
+                observed_pending_transaction_ids=cleanup_snapshot[
+                    "pending_transaction_ids"
+                ],
+                observed_at=cleanup_snapshot["observed_at"],
+            )
+            binding, adapter = (
+                mutation_gate.require_refresh_abort_cleanup_wallet_permit_authority(
+                    permit,
+                    abort_id=refresh_abort_id,
+                    trade_id=target_trade_id,
+                    operation=f"{wallet_operation}:continuation:acquire",
+                )
+            )
+        else:
+            permit = mutation_gate.enter_wallet_mutation(wallet_operation)
+            binding, adapter = mutation_gate.require_wallet_mutation_permit_authority(
+                permit,
+                f"{wallet_operation}:continuation:acquire",
+            )
         if binding.backend != WALLET_TYPE or adapter is not _wallet_adapter:
             raise mutation_gate.MutationBlocked(
                 "WALLET_IDENTITY_BINDING_INVALID",
@@ -535,19 +576,43 @@ def _begin_offer_operation_continuation(
         )
         with _wallet_identity_observation_lock:
             snapshot = _identity_from_adapter(adapter)
+            if cleanup:
+                decision = (
+                    mutation_gate.require_fresh_refresh_abort_cleanup_wallet_identity(
+                        permit,
+                        snapshot,
+                        abort_id=refresh_abort_id,
+                        trade_id=target_trade_id,
+                        expected_latch_generation=refresh_latch_generation,
+                        observed_trade_ids=cleanup_snapshot["trade_ids"],
+                        observed_pending_transaction_ids=cleanup_snapshot[
+                            "pending_transaction_ids"
+                        ],
+                        observed_at=cleanup_snapshot["observed_at"],
+                    )
+                )
+            else:
+                mutation_gate.require_wallet_mutation_permit_authority(
+                    permit,
+                    f"{wallet_operation}:continuation:identity",
+                )
+                decision = mutation_gate.require_fresh_wallet_identity(
+                    binding,
+                    snapshot,
+                    f"{wallet_operation}:continuation",
+                )
+        if cleanup:
+            mutation_gate.require_refresh_abort_cleanup_wallet_permit_authority(
+                permit,
+                abort_id=refresh_abort_id,
+                trade_id=target_trade_id,
+                operation=f"{wallet_operation}:continuation:dispatch",
+            )
+        else:
             mutation_gate.require_wallet_mutation_permit_authority(
                 permit,
-                f"{wallet_operation}:continuation:identity",
+                f"{wallet_operation}:continuation:dispatch",
             )
-            decision = mutation_gate.require_fresh_wallet_identity(
-                binding,
-                snapshot,
-                f"{wallet_operation}:continuation",
-            )
-        mutation_gate.require_wallet_mutation_permit_authority(
-            permit,
-            f"{wallet_operation}:continuation:dispatch",
-        )
         binding_payload = mutation_gate.wallet_identity_binding_payload(binding)
         binding_digest = mutation_gate.wallet_identity_binding_digest(binding)
         if authority.get("binding_digest", binding_digest) != binding_digest:
@@ -587,6 +652,8 @@ def _begin_offer_operation_continuation(
             journal=journal,
             operation_id=operation,
             permit=permit,
+            refresh_abort_id=refresh_abort_id,
+            refresh_latch_generation=refresh_latch_generation,
             target_trade_id=target_trade_id,
             wallet_operation=wallet_operation,
         )
@@ -624,6 +691,8 @@ def begin_offer_cancel_continuation(
     intent_id: str,
     trade_id: str,
     ttl_seconds: int = 30,
+    refresh_abort_id: str = None,
+    refresh_latch_generation: int = None,
 ):
     """Enter cancellation authority before PREPARED and return a one-shot handle."""
 
@@ -634,6 +703,8 @@ def begin_offer_cancel_continuation(
         wallet_operation="wallet:cancel_offer",
         target_trade_id=target_trade_id,
         ttl_seconds=ttl_seconds,
+        refresh_abort_id=refresh_abort_id,
+        refresh_latch_generation=refresh_latch_generation,
     )
 
 
@@ -695,15 +766,33 @@ def refresh_offer_cancel_continuation(
     try:
         with _wallet_identity_observation_lock:
             snapshot = _identity_from_adapter(state.adapter)
-            binding, adapter, _decision = (
-                mutation_gate.require_fresh_wallet_operation_continuation(
-                    state.permit,
-                    snapshot,
-                    state.wallet_operation,
-                    operation,
-                    intent,
+            if state.refresh_abort_id is not None:
+                cleanup_snapshot = _read_refresh_abort_cleanup_snapshot()
+                binding, adapter, _decision = (
+                    mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+                        state.permit,
+                        snapshot,
+                        abort_id=state.refresh_abort_id,
+                        trade_id=state.target_trade_id,
+                        expected_latch_generation=state.refresh_latch_generation,
+                        observed_trade_ids=cleanup_snapshot["trade_ids"],
+                        observed_pending_transaction_ids=cleanup_snapshot[
+                            "pending_transaction_ids"
+                        ],
+                        observed_at=cleanup_snapshot["observed_at"],
+                        prepared_operation_id=operation,
+                    )
                 )
-            )
+            else:
+                binding, adapter, _decision = (
+                    mutation_gate.require_fresh_wallet_operation_continuation(
+                        state.permit,
+                        snapshot,
+                        state.wallet_operation,
+                        operation,
+                        intent,
+                    )
+                )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
             or mutation_gate.wallet_identity_binding_digest(binding)
@@ -777,17 +866,47 @@ def _run_offer_operation_continuation(
             or target_trade_id != state.target_trade_id
         ):
             return blocked_result()
+        if state.refresh_abort_id is not None:
+            exact_target = state.target_trade_id
+            if adapter_method == "cancel_offer":
+                exact_dispatch = callback_args[0] == exact_target
+            elif adapter_method == "cancel_offers_batch":
+                exact_dispatch = type(callback_args[0]) is list and callback_args[
+                    0
+                ] == [exact_target]
+            else:
+                exact_dispatch = False
+            if not exact_dispatch:
+                return blocked_result("REFRESH_ABORT_TARGET_MISMATCH")
         with _wallet_identity_observation_lock:
             snapshot = _identity_from_adapter(state.adapter)
-            binding, adapter, _decision = (
-                mutation_gate.require_fresh_wallet_operation_continuation(
-                    state.permit,
-                    snapshot,
-                    wallet_operation,
-                    operation,
-                    intent,
+            if state.refresh_abort_id is not None:
+                cleanup_snapshot = _read_refresh_abort_cleanup_snapshot()
+                binding, adapter, _decision = (
+                    mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+                        state.permit,
+                        snapshot,
+                        abort_id=state.refresh_abort_id,
+                        trade_id=state.target_trade_id,
+                        expected_latch_generation=state.refresh_latch_generation,
+                        observed_trade_ids=cleanup_snapshot["trade_ids"],
+                        observed_pending_transaction_ids=cleanup_snapshot[
+                            "pending_transaction_ids"
+                        ],
+                        observed_at=cleanup_snapshot["observed_at"],
+                        prepared_operation_id=operation,
+                    )
                 )
-            )
+            else:
+                binding, adapter, _decision = (
+                    mutation_gate.require_fresh_wallet_operation_continuation(
+                        state.permit,
+                        snapshot,
+                        wallet_operation,
+                        operation,
+                        intent,
+                    )
+                )
         if (
             type(binding) is not mutation_gate.WalletIdentityBinding
             or mutation_gate.wallet_identity_binding_digest(binding)
@@ -808,15 +927,33 @@ def _run_offer_operation_continuation(
             )
             with _wallet_identity_observation_lock:
                 fresh_snapshot = _identity_from_adapter(adapter)
-                checked_binding, checked_adapter, _step_decision = (
-                    mutation_gate.require_fresh_wallet_operation_continuation(
-                        state.permit,
-                        fresh_snapshot,
-                        f"{wallet_operation}:{safe_step}:identity",
-                        operation,
-                        intent,
+                if state.refresh_abort_id is not None:
+                    cleanup_snapshot = _read_refresh_abort_cleanup_snapshot()
+                    checked_binding, checked_adapter, _step_decision = (
+                        mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+                            state.permit,
+                            fresh_snapshot,
+                            abort_id=state.refresh_abort_id,
+                            trade_id=state.target_trade_id,
+                            expected_latch_generation=state.refresh_latch_generation,
+                            observed_trade_ids=cleanup_snapshot["trade_ids"],
+                            observed_pending_transaction_ids=cleanup_snapshot[
+                                "pending_transaction_ids"
+                            ],
+                            observed_at=cleanup_snapshot["observed_at"],
+                            prepared_operation_id=operation,
+                        )
                     )
-                )
+                else:
+                    checked_binding, checked_adapter, _step_decision = (
+                        mutation_gate.require_fresh_wallet_operation_continuation(
+                            state.permit,
+                            fresh_snapshot,
+                            f"{wallet_operation}:{safe_step}:identity",
+                            operation,
+                            intent,
+                        )
+                    )
             if (
                 mutation_gate.wallet_identity_binding_digest(checked_binding)
                 != mutation_gate.wallet_identity_binding_digest(binding)
@@ -1279,6 +1416,68 @@ def get_pending_transactions():
 
     callback = getattr(_wallet_adapter, "get_pending_transactions", None)
     return callback() if callable(callback) else None
+
+
+def _read_refresh_abort_cleanup_snapshot() -> dict:
+    """Read the complete Sage wallet book and pending effects for fenced cleanup."""
+
+    if WALLET_TYPE != "sage":
+        raise ValueError("refresh abort cleanup requires Sage wallet authority")
+    from offer_reconciliation import load_sage_offer_history
+
+    history = load_sage_offer_history(
+        get_all_offers=get_authoritative_offer_history,
+        include_completed=False,
+        page_size=500,
+        max_pages=20,
+    )
+    if (
+        history.get("complete") is not True
+        or history.get("read_error") is not None
+        or history.get("pagination", {}).get("authoritative_end") is not True
+    ):
+        raise ValueError("complete Sage offer book is unavailable")
+    trade_ids = []
+    for offer in history["records"]:
+        if type(offer) is not dict:
+            raise ValueError("complete Sage offer book is malformed")
+        aliases = [offer[key] for key in ("trade_id", "offer_id") if key in offer]
+        if (
+            not aliases
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in aliases
+            )
+            or len(set(aliases)) != 1
+        ):
+            raise ValueError("complete Sage offer identity is malformed")
+        trade_ids.append(aliases[0])
+    if len(trade_ids) != len(set(trade_ids)):
+        raise ValueError("complete Sage offer book has duplicate identities")
+    pending = get_pending_transactions()
+    if type(pending) is not list or len(pending) > 256:
+        raise ValueError("complete Sage pending transaction read is unavailable")
+    pending_ids = []
+    for transaction in pending:
+        if type(transaction) is not dict:
+            raise ValueError("Sage pending transaction is malformed")
+        transaction_id = transaction.get("transaction_id")
+        if (
+            type(transaction_id) is not str
+            or len(transaction_id) != 64
+            or any(char not in "0123456789abcdef" for char in transaction_id)
+        ):
+            raise ValueError("Sage pending transaction identity is malformed")
+        pending_ids.append(transaction_id)
+    return {
+        "trade_ids": sorted(trade_ids),
+        "pending_transaction_ids": sorted(pending_ids),
+        "observed_at": datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+    }
 
 
 def get_transaction_relay_outcome(transaction_id: str):

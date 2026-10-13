@@ -40,6 +40,660 @@ COIN_ID = "c" * 64
 ASSET_ID = "d" * 64
 
 
+def test_refresh_abort_cleanup_snapshot_requires_complete_sage_book(monkeypatch):
+    offer = {"trade_id": TRADE_ID, "status": 1}
+    monkeypatch.setattr(wallet, "WALLET_TYPE", "sage")
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_bounds: {"offers": [offer], "has_more": False},
+    )
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+    assert snapshot["trade_ids"] == [TRADE_ID]
+    assert snapshot["pending_transaction_ids"] == []
+    assert snapshot["observed_at"].endswith("Z")
+
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: None)
+    with pytest.raises(ValueError, match="pending"):
+        wallet._read_refresh_abort_cleanup_snapshot()
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    monkeypatch.setattr(
+        wallet,
+        "get_authoritative_offer_history",
+        lambda **_bounds: {"offers": [offer], "has_more": True},
+    )
+    with pytest.raises(ValueError, match="complete"):
+        wallet._read_refresh_abort_cleanup_snapshot()
+
+
+def test_refresh_abort_cancel_continuation_never_uses_general_gate(monkeypatch):
+    effects = []
+    checks = []
+    abort_id = "e" * 64
+    generation = 7
+
+    def effect(trade_id, secure, timeout, fee_mojos, *, _identity_recheck=None):
+        _identity_recheck("cancel_offer")
+        effects.append(trade_id)
+        return cancellation_result(
+            CANCEL_SUBMITTED_UNCONFIRMED,
+            method="single_rpc",
+            raw_response={"success": True},
+            transaction_id="1" * 64,
+        )
+
+    permit, _identities, exits, _generic_checks = _stub_cancel_continuation_authority(
+        monkeypatch, effect=effect
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_wallet_mutation",
+        lambda _operation: (_ for _ in ()).throw(AssertionError("general gate used")),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_refresh_abort_cleanup_wallet_mutation",
+        lambda **request: checks.append(("enter", request)) or permit,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_refresh_abort_cleanup_wallet_permit_authority",
+        lambda supplied, **request: (
+            checks.append(("authority", request))
+            or (_binding(), wallet._wallet_adapter)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_identity",
+        lambda supplied, snapshot, **request: (
+            checks.append(("identity", request))
+            or {
+                "allowed": True,
+                "observed_at_utc": snapshot["observed_at_utc"].replace("Z", ".000000Z"),
+            }
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_continuation",
+        lambda supplied, snapshot, **request: (
+            checks.append(("dispatch", request))
+            or (
+                _binding(),
+                wallet._wallet_adapter,
+                {"allowed": True, "observed_at_utc": snapshot["observed_at_utc"]},
+            )
+        ),
+        raising=False,
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+        refresh_abort_id=abort_id,
+        refresh_latch_generation=generation,
+    )
+    result = wallet.cancel_offer(
+        TRADE_ID,
+        _cancel_continuation=continuation,
+        _cancel_operation_id=OPERATION_ID,
+        _cancel_intent_id=INTENT_ID,
+    )
+    assert result["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert effects == [TRADE_ID]
+    assert exits == [permit]
+    assert [item[0] for item in checks].count("dispatch") == 2
+    assert checks[0][1]["abort_id"] == abort_id
+    assert checks[0][1]["trade_id"] == TRADE_ID
+
+
+def test_refresh_abort_continuation_refuses_multi_target_batch(monkeypatch):
+    effects = []
+    permit, _identities, _exits, _checks = _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *args, **kwargs: effects.append(args) or {},
+        batch_effect=lambda *args, **kwargs: effects.append(args) or {},
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID, "f" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_refresh_abort_cleanup_wallet_mutation",
+        lambda **_request: permit,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_refresh_abort_cleanup_wallet_permit_authority",
+        lambda supplied, **_request: (_binding(), wallet._wallet_adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_identity",
+        lambda supplied, snapshot, **_request: {
+            "allowed": True,
+            "observed_at_utc": snapshot["observed_at_utc"],
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_continuation",
+        lambda supplied, snapshot, **_request: (
+            _binding(),
+            wallet._wallet_adapter,
+            {"allowed": True, "observed_at_utc": snapshot["observed_at_utc"]},
+        ),
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+        refresh_abort_id="e" * 64,
+        refresh_latch_generation=7,
+    )
+    result = wallet.cancel_offers_batch(
+        [TRADE_ID, "f" * 64],
+        _cancel_continuation=continuation,
+        _cancel_operation_id=OPERATION_ID,
+        _cancel_intent_id=INTENT_ID,
+        _cancel_trade_id=TRADE_ID,
+    )
+    assert result[TRADE_ID]["outcome"] == CANCEL_UNKNOWN
+    assert effects == []
+
+
+def test_refresh_abort_continuation_dispatches_one_sealed_target(monkeypatch):
+    effects = []
+
+    def batch_effect(selected, *args, _identity_recheck=None, **kwargs):
+        _identity_recheck("cancel_offers")
+        effects.append(selected)
+        return {
+            TRADE_ID: cancellation_result(
+                CANCEL_SUBMITTED_UNCONFIRMED,
+                method="sage_native_cancel_offers",
+                raw_response={"success": True},
+                transaction_id="1" * 64,
+                spend_identity="2" * 64,
+            )
+        }
+
+    permit, _identities, exits, _checks = _stub_cancel_continuation_authority(
+        monkeypatch, effect=lambda *args, **kwargs: {}, batch_effect=batch_effect
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_refresh_abort_cleanup_wallet_mutation",
+        lambda **_request: permit,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_refresh_abort_cleanup_wallet_permit_authority",
+        lambda supplied, **_request: (_binding(), wallet._wallet_adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_identity",
+        lambda supplied, snapshot, **_request: {
+            "allowed": True,
+            "observed_at_utc": snapshot["observed_at_utc"],
+        },
+    )
+    checks = []
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_continuation",
+        lambda supplied, snapshot, **request: (
+            checks.append(request)
+            or (
+                _binding(),
+                wallet._wallet_adapter,
+                {"allowed": True, "observed_at_utc": snapshot["observed_at_utc"]},
+            )
+        ),
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+        refresh_abort_id="e" * 64,
+        refresh_latch_generation=7,
+    )
+    result = wallet.cancel_offers_batch(
+        [TRADE_ID],
+        fee_mojos=42,
+        source_coin_ids=["c" * 64],
+        fee_coin_id="d" * 64,
+        _validated_unsigned={"sealed": True},
+        _cancel_continuation=continuation,
+        _cancel_operation_id=OPERATION_ID,
+        _cancel_intent_id=INTENT_ID,
+        _cancel_trade_id=TRADE_ID,
+    )
+    assert result[TRADE_ID]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+    assert effects == [[TRADE_ID]]
+    assert len(checks) == 2
+    assert exits == [permit]
+
+
+def test_refresh_abort_continuation_renews_under_scoped_gate(monkeypatch):
+    permit, _identities, _exits, _checks = _stub_cancel_continuation_authority(
+        monkeypatch, effect=lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "enter_refresh_abort_cleanup_wallet_mutation",
+        lambda **_request: permit,
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_refresh_abort_cleanup_wallet_permit_authority",
+        lambda supplied, **_request: (_binding(), wallet._wallet_adapter),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_identity",
+        lambda supplied, snapshot, **_request: {
+            "allowed": True,
+            "observed_at_utc": snapshot["observed_at_utc"],
+        },
+    )
+    scoped = []
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_refresh_abort_cleanup_wallet_continuation",
+        lambda supplied, snapshot, **request: (
+            scoped.append(request)
+            or (
+                _binding(),
+                wallet._wallet_adapter,
+                {"allowed": True, "observed_at_utc": snapshot["observed_at_utc"]},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "require_fresh_wallet_operation_continuation",
+        lambda *args: (_ for _ in ()).throw(AssertionError("general gate used")),
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+        refresh_abort_id="e" * 64,
+        refresh_latch_generation=7,
+    )
+    assert (
+        wallet.refresh_offer_cancel_continuation(
+            continuation,
+            operation_id=OPERATION_ID,
+            intent_id=INTENT_ID,
+            trade_id=TRADE_ID,
+        )
+        is True
+    )
+    assert len(scoped) == 1
+    assert scoped[0]["prepared_operation_id"] == OPERATION_ID
+    assert wallet.close_offer_cancel_continuation(continuation) is True
+
+
+def test_refresh_abort_manager_submits_only_one_exact_remaining_target(monkeypatch):
+    abort_id = "e" * 64
+    other_trade = "f" * 64
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "get_refresh_abort",
+        lambda selected: {
+            "abort_id": selected,
+            "state": "parent_terminal",
+            "target_trade_ids_json": json.dumps([TRADE_ID, other_trade]),
+            "latch_generation": 7,
+        },
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [other_trade, TRADE_ID],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(run_id="test-owner"),
+    )
+    monkeypatch.setattr(
+        database,
+        "authorize_refresh_abort_cleanup_target",
+        lambda **request: (
+            calls.append(("proof", request))
+            or {"trade_id": TRADE_ID, "abort_id": abort_id}
+        ),
+    )
+    manager = OfferManager()
+    monkeypatch.setattr(
+        manager,
+        "cancel_offers",
+        lambda selected, **request: (
+            calls.append(("cancel", selected, request))
+            or {selected[0]: {"outcome": CANCEL_SUBMITTED_UNCONFIRMED}}
+        ),
+    )
+    result = manager.cancel_refresh_abort_targets(
+        abort_id=abort_id, expected_latch_generation=7, fee_approval_id="d" * 64
+    )
+    assert result["trade_id"] == TRADE_ID
+    assert calls[0][1]["trade_id"] == TRADE_ID
+    assert calls[1][1] == [TRADE_ID]
+    assert calls[1][2]["_refresh_abort_id"] == abort_id
+    assert calls[1][2]["_refresh_latch_generation"] == 7
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID, "b" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    with pytest.raises(ValueError, match="outside the cleanup target"):
+        manager.cancel_refresh_abort_targets(
+            abort_id=abort_id,
+            expected_latch_generation=7,
+            fee_approval_id="d" * 64,
+        )
+    assert len(calls) == 2
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID],
+            "pending_transaction_ids": ["c" * 64],
+            "observed_at": AT,
+        },
+    )
+    with pytest.raises(ValueError, match="pending wallet effects"):
+        manager.cancel_refresh_abort_targets(
+            abort_id=abort_id,
+            expected_latch_generation=7,
+            fee_approval_id="d" * 64,
+        )
+    assert len(calls) == 2
+
+
+def test_refresh_abort_completion_requires_two_empty_reads_and_postcheck(monkeypatch):
+    abort_id = "e" * 64
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "get_refresh_abort",
+        lambda _selected: {
+            "state": "parent_terminal",
+            "latch_generation": 7,
+            "blocking_operation_id": f"refresh-abort:{abort_id}",
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(run_id="test-owner"),
+    )
+    empty = {
+        "trade_ids": [],
+        "pending_transaction_ids": [],
+        "observed_at": AT,
+    }
+    snapshots = iter([empty, empty, empty])
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: next(snapshots)
+    )
+    monkeypatch.setattr(
+        database,
+        "complete_refresh_abort",
+        lambda **request: calls.append(request) or {"state": "aborted"},
+    )
+    manager = OfferManager()
+    result = manager.complete_refresh_abort_cleanup(
+        abort_id=abort_id, expected_latch_generation=7
+    )
+    assert result["state"] == "aborted"
+    assert len(calls) == 1
+    assert calls[0]["observed_trade_ids"] == []
+
+    calls.clear()
+    snapshots = iter([empty, {**empty, "trade_ids": [TRADE_ID]}])
+    with pytest.raises(ValueError, match="not empty"):
+        manager.complete_refresh_abort_cleanup(
+            abort_id=abort_id, expected_latch_generation=7
+        )
+    assert calls == []
+
+    snapshots = iter([empty, empty, {**empty, "trade_ids": [TRADE_ID]}])
+    trips = []
+    monkeypatch.setattr(
+        database,
+        "trip_runtime_safety_latch",
+        lambda **request: trips.append(request),
+    )
+    with pytest.raises(ValueError, match="wallet changed"):
+        manager.complete_refresh_abort_cleanup(
+            abort_id=abort_id, expected_latch_generation=7
+        )
+    assert len(trips) == 1
+    assert trips[0]["blocking_operation_ids"] == [f"refresh-abort:{abort_id}"]
+
+
+@pytest.mark.parametrize("effect_claimed", [True, False])
+def test_refresh_abort_fee_batch_claims_only_scoped_target_before_wallet(
+    monkeypatch, effect_claimed
+):
+    abort_id = "e" * 64
+    intent_id = "b" * 64
+    intent = offer_manager._CanonicalOfferCancelIntent(
+        trade_id=TRADE_ID, intent_id=intent_id, operation_id=OPERATION_ID
+    )
+    manifest = database.canonical_offer_cancel_cohort_manifest(
+        [
+            {
+                "trade_id": TRADE_ID,
+                "operation_id": OPERATION_ID,
+                "intent_id": intent_id,
+                "attempt": 1,
+                "prepared_event_id": f"{OPERATION_ID}:attempt:1:prepared",
+            }
+        ]
+    )
+    member_id = manifest["members"][0]["member_id"]
+    continuation = object()
+    authorities = {TRADE_ID: (continuation, {"snapshot": {}}, "a" * 64, "mainnet")}
+    calls = []
+    pricing = __import__("coin_prep_fee_cancellation")
+    monkeypatch.setattr(
+        pricing,
+        "reserve_approved_cancellation",
+        lambda **request: (
+            calls.append("fee_reserve") or {"validated_unsigned": {"sealed": True}}
+        ),
+    )
+    monkeypatch.setattr(
+        pricing,
+        "recheck_reserved_approved_cancellation",
+        lambda **request: calls.append("fee_recheck") or {},
+    )
+    monkeypatch.setattr(
+        database,
+        "trip_runtime_safety_latch",
+        lambda **request: calls.append("trip") or {},
+    )
+    monkeypatch.setattr(
+        database,
+        "claim_offer_cancel_cohort_effects",
+        lambda **request: pytest.fail("general cohort claim is forbidden"),
+    )
+    monkeypatch.setattr(
+        database,
+        "claim_refresh_abort_cleanup_cancel_effect",
+        lambda **request: calls.append("scoped_claim") or effect_claimed,
+    )
+    monkeypatch.setattr(
+        database,
+        "finalize_offer_cancel_cohort",
+        lambda **request: calls.append("finalize") or {},
+    )
+    monkeypatch.setattr(
+        database,
+        "record_coin_prep_cancellation_fee_outcome",
+        lambda manifest: calls.append("fee_settle") or {},
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [TRADE_ID],
+            "pending_transaction_ids": [],
+            "observed_at": AT,
+        },
+    )
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(run_id="test-owner"),
+    )
+    monkeypatch.setattr(
+        wallet,
+        "refresh_offer_cancel_continuation",
+        lambda *args, **kwargs: calls.append("refresh") or True,
+    )
+    submitted = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="sage_native_cancel_offers",
+        raw_response={"success": True},
+        transaction_id="1" * 64,
+        spend_identity="2" * 64,
+    )
+    monkeypatch.setattr(
+        wallet,
+        "cancel_offers_batch",
+        lambda selected, **request: (
+            calls.append("wallet")
+            or {TRADE_ID: submitted, "_catalyst_effect_attempted": True}
+        ),
+    )
+    manager = OfferManager()
+    contract = {
+        "trade_ids": [TRADE_ID],
+        "source_coin_ids": ["c" * 64],
+        "fee_coin_id": "d" * 64,
+        "fee_mojos": 42,
+    }
+    result = manager._cancel_prepared_sage_batch(
+        members=[(intent, 1, member_id)],
+        manifest=manifest,
+        authorities=authorities,
+        batch_contract=contract,
+        fee_approval_id="f" * 64,
+        priced_cancellation={"available": True},
+        fee_reservation=(SimpleNamespace(), "d" * 64, 1),
+        expected_recovery_action="cancel_all",
+        refresh_abort_id=abort_id,
+        refresh_latch_generation=7,
+    )
+    assert calls[:4] == ["fee_reserve", "fee_recheck", "trip", "scoped_claim"]
+    if effect_claimed:
+        assert result[TRADE_ID]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        assert calls[4:6] == ["refresh", "wallet"]
+        assert calls[-3:] == ["finalize", "fee_settle", "trip"]
+    else:
+        assert result[TRADE_ID]["outcome"] == CANCEL_UNKNOWN
+        assert "wallet" not in calls
+
+
+def test_protected_cancel_prices_created_intent_without_legacy_offer(
+    isolated_database, monkeypatch
+):
+    coin_id = "c" * 64
+    fee_coin_id = "e" * 64
+    intent_id = _seed_task7_created_offer(
+        trade_id=TRADE_ID,
+        coin_id=coin_id,
+        intent_seed="unpublished-refresh-child",
+        legacy_projection=False,
+    )
+    assert database.get_offer(TRADE_ID) is None
+    pool = FeeCoinPool()
+    pool.refresh([{"coin_id": fee_coin_id, "coin": {"amount": 1_000_000_000}}])
+    manager = OfferManager()
+    manager._fee_pool = pool
+    calls = []
+    pricing = __import__("coin_prep_fee_cancellation")
+
+    def price(**request):
+        calls.append(request)
+        return {
+            "available": True,
+            "trade_ids": request["trade_ids"],
+            "source_coin_ids": request["source_coin_ids"],
+            "fee_coin_id": request["fee_coin_id"],
+            "fee_mojos": 42,
+        }
+
+    monkeypatch.setattr(pricing, "price_approved_cancellation", price)
+    intent = offer_manager._CanonicalOfferCancelIntent(
+        trade_id=TRADE_ID,
+        intent_id=intent_id,
+        operation_id=OPERATION_ID,
+    )
+    contract, _priced, reservation = manager._plan_coin_prep_cancel(
+        [(intent, 1, "member")], "f" * 64, "cancel_all"
+    )
+    assert calls[0]["source_coin_ids"] == [coin_id]
+    assert contract["trade_ids"] == [TRADE_ID]
+    reservation[0].release_ticket(reservation[1], reservation[2])
+
+
 def _binding():
     return mutation_gate.WalletIdentityBinding(
         backend="sage",
@@ -294,6 +948,7 @@ def _seed_task7_created_offer(
     expires_at: str | None = None,
     wallet_fingerprint_hash: str = "f" * 64,
     purpose: str = "normal_lifecycle",
+    legacy_projection: bool = True,
 ) -> str:
     """Persist one Task 7 creation journal and its confirmed trade binding."""
 
@@ -343,17 +998,18 @@ def _seed_task7_created_offer(
         finalized_at="2026-08-16T12:00:01Z",
         finalize_selected_coin_reservations=True,
     )
-    assert database.add_offer(
-        trade_id,
-        "buy",
-        Decimal("0.001"),
-        Decimal("1"),
-        Decimal("1000"),
-        ASSET_ID,
-        tier="inner",
-        expires_at=expires_at,
-        coin_id=coin_id,
-    )
+    if legacy_projection:
+        assert database.add_offer(
+            trade_id,
+            "buy",
+            Decimal("0.001"),
+            Decimal("1"),
+            Decimal("1000"),
+            ASSET_ID,
+            tier="inner",
+            expires_at=expires_at,
+            coin_id=coin_id,
+        )
     return intent_id
 
 

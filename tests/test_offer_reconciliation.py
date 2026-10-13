@@ -8873,13 +8873,27 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
     assert database.get_coin_state(RETURN)["amount_mojos"] == 1000
 
 
+@pytest.mark.parametrize(
+    "prepared_cleanup",
+    [
+        False,
+        True,
+        "integrated",
+        "crash_after_claim",
+        "completion_extra_blocker",
+        "multi_target",
+    ],
+)
 def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     isolated_database,
     monkeypatch,
+    prepared_cleanup,
 ):
     """The on-chain parent result settles while its unpublished child stays fenced."""
 
     import mutation_gate
+
+    child_id = "a" * 64
 
     monkeypatch.setattr(database, "_stability_wall_clock", lambda: AT)
     monkeypatch.setattr(mutation_gate, "wallet_fingerprint_hash", lambda _value: WALLET)
@@ -8930,9 +8944,9 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         purpose="lifecycle",
     )
     database.prepare_offer_intent(
-        intent_id="intent-child",
-        operation_id="create:intent-child",
-        event_id="create:intent-child:prepared",
+        intent_id=child_id,
+        operation_id=f"create:{child_id}",
+        event_id=f"create:{child_id}:prepared",
         run_id="run-task9",
         wallet_fingerprint_hash=WALLET,
         network=NETWORK,
@@ -8952,9 +8966,9 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         reserve_selected_coins=True,
     )
     database.finalize_offer_intent(
-        intent_id="intent-child",
-        operation_id="create:intent-child",
-        event_id="create:intent-child:finalized",
+        intent_id=child_id,
+        operation_id=f"create:{child_id}",
+        event_id=f"create:{child_id}:finalized",
         lifecycle_state="created",
         outcome="CONFIRMED",
         sage_trade_id=OTHER_TRADE,
@@ -8964,7 +8978,62 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         finalized_at=AT,
         finalize_selected_coin_reservations=True,
     )
-    database.bind_refresh_lineage("intent-task9", "intent-child")
+    database.bind_refresh_lineage("intent-task9", child_id)
+    extra_trade = "f" * 64
+    extra_intent = "extra-cleanup-intent"
+    observed_book = [OTHER_TRADE]
+    if prepared_cleanup == "multi_target":
+        extra_coin = "e" * 64
+        assert database.upsert_coin(
+            extra_coin,
+            "xch",
+            1000,
+            tier="inner",
+            designation="tier_active",
+            assigned_tier="inner",
+            purpose="lifecycle",
+        )
+        database.prepare_offer_intent(
+            intent_id=extra_intent,
+            operation_id=f"create:{extra_intent}",
+            event_id=f"create:{extra_intent}:prepared",
+            run_id="run-task9",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            side="buy",
+            tier="inner",
+            purpose="normal_lifecycle",
+            slot_key=f"slot:{extra_intent}",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[extra_coin],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"intent": "second exact target"},
+            prepared_at=AT,
+            reserve_selected_coins=True,
+        )
+        database.finalize_offer_intent(
+            intent_id=extra_intent,
+            operation_id=f"create:{extra_intent}",
+            event_id=f"create:{extra_intent}:finalized",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=extra_trade,
+            offer_text_sha256="0" * 64,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"offer": "second target"},
+            finalized_at=AT,
+            finalize_selected_coin_reservations=True,
+        )
+        observed_book.append(extra_trade)
     _persist_cancel_result(
         CANCEL_SUBMITTED_UNCONFIRMED,
         transaction_id=TX,
@@ -8980,12 +9049,12 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     latch = database.get_runtime_safety_latch()
     abort = database.begin_refresh_abort(
         parent_intent_id="intent-task9",
-        child_intent_id="intent-child",
+        child_intent_id=child_id,
         campaign_id=campaign_id,
         expected_latch_generation=latch["generation"],
         owner_run_id="run-task9",
         expected_lease_version=lease["lease"]["lease_version"],
-        observed_trade_ids=[OTHER_TRADE],
+        observed_trade_ids=observed_book,
         observed_at=AFTER,
     )
     renewed = database.heartbeat_runtime_mutation_lease(
@@ -8995,6 +9064,29 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         lease_expires_at="2026-08-20T12:20:00.000000Z",
     )
     assert renewed["heartbeat"] is True
+    replayed_abort = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id=child_id,
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=renewed["lease"]["lease_version"],
+        observed_trade_ids=observed_book,
+        observed_at=AFTER,
+    )
+    assert replayed_abort["idempotent"] is True
+    assert replayed_abort["abort_id"] == abort["abort_id"]
+    with pytest.raises(ValueError, match="abort safety, lease"):
+        database.begin_refresh_abort(
+            parent_intent_id="intent-task9",
+            child_intent_id=child_id,
+            campaign_id=campaign_id,
+            expected_latch_generation=latch["generation"],
+            owner_run_id="run-task9",
+            expected_lease_version=lease["lease"]["lease_version"],
+            observed_trade_ids=observed_book,
+            observed_at=AFTER,
+        )
     with pytest.raises(ValueError, match="exact proven parent cancellation"):
         reconcile_offer(
             "intent-task9",
@@ -9046,16 +9138,100 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     assert applied["classification"] == CANCELLED_PROVEN
     assert applied["applied"] is True
     assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
-    child = database.get_offer_intent("intent-child")
+    child = database.get_offer_intent(child_id)
     assert child["lifecycle_state"] == "created"
     assert child["first_visible_at"] is None
     assert database.refresh_lineage_completion("intent-task9")["complete"] is False
     assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    terminal_replay = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id=child_id,
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=renewed["lease"]["lease_version"],
+        observed_trade_ids=observed_book,
+        observed_at=AFTER,
+    )
+    assert terminal_replay["idempotent"] is True
+    assert terminal_replay["state"] == "parent_terminal"
     final_latch = database.get_runtime_safety_latch()
     assert final_latch["state"] == "tripped"
     assert json.loads(final_latch["blocking_operation_ids_json"]) == [
         abort["blocking_operation_id"]
     ]
+    cleanup = database.authorize_refresh_abort_cleanup_target(
+        abort_id=abort["abort_id"],
+        trade_id=OTHER_TRADE,
+        expected_latch_generation=abort["latch_generation"],
+        owner_run_id="run-task9",
+        observed_trade_ids=observed_book,
+        observed_pending_transaction_ids=[],
+        observed_at=AFTER,
+    )
+    assert cleanup["trade_id"] == OTHER_TRADE
+    assert cleanup["intent_id"] == child_id
+    assert cleanup["blocking_operation_id"] == abort["blocking_operation_id"]
+    with pytest.raises(ValueError, match="fresh Sage"):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at="2026-08-20T11:58:00.000000Z",
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book + ["0" * 64],
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=["f" * 64],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"] + 1,
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="another-run",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
     assert database.get_coin_state(COIN)["status"] == "spent"
     assert database.get_coin_state(RETURN)["status"] == "free"
     replay = reconcile_offer(
@@ -9067,6 +9243,528 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     )
     assert replay["idempotent"] is True
     assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    if prepared_cleanup is True:
+        child_operation = f"cancel:{OTHER_TRADE}"
+        database.prepare_offer_cancel(
+            operation_id=child_operation,
+            event_id=f"{child_operation}:attempt:1:prepared",
+            trade_id=OTHER_TRADE,
+            intent_id=child_id,
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={
+                "trade_id": OTHER_TRADE,
+                "effect_claim_protocol": "durable_cohort_claim_v1",
+            },
+            prepared_at=AFTER,
+        )
+        database.trip_runtime_safety_latch(
+            reason_code="UNRESOLVED_OPERATIONS",
+            blocking_operation_ids=[child_operation],
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            tripped_at=AFTER,
+        )
+        prepared_latch = database.get_runtime_safety_latch()
+        assert prepared_latch["generation"] == abort["latch_generation"]
+        assert set(json.loads(prepared_latch["blocking_operation_ids_json"])) == {
+            abort["blocking_operation_id"],
+            child_operation,
+        }
+        prepared_authority = database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+            prepared_operation_id=child_operation,
+        )
+        assert prepared_authority["trade_id"] == OTHER_TRADE
+        effect_claim = database.claim_refresh_abort_cleanup_cancel_effect(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+        assert effect_claim is True
+        assert (
+            database.claim_refresh_abort_cleanup_cancel_effect(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+            is False
+        )
+        for changed in (
+            {"observed_trade_ids": observed_book + ["0" * 64]},
+            {"observed_pending_transaction_ids": ["f" * 64]},
+            {"owner_run_id": "another-run"},
+            {"expected_latch_generation": abort["latch_generation"] + 1},
+        ):
+            with pytest.raises(ValueError):
+                database.claim_refresh_abort_cleanup_cancel_effect(
+                    **{
+                        "abort_id": abort["abort_id"],
+                        "trade_id": OTHER_TRADE,
+                        "expected_latch_generation": abort["latch_generation"],
+                        "owner_run_id": "run-task9",
+                        "observed_trade_ids": observed_book,
+                        "observed_pending_transaction_ids": [],
+                        "observed_at": AFTER,
+                        **changed,
+                    }
+                )
+        return
+    if prepared_cleanup in {
+        "integrated",
+        "crash_after_claim",
+        "completion_extra_blocker",
+        "multi_target",
+    }:
+        # Exercise the complete manager -> durable Task 8 -> exact effect claim
+        # boundary on the same disposable incident.  The adapter and fee signer
+        # are local fakes; the journal, latch, lease and abort checks stay real.
+        import offer_manager
+        import wallet
+        from coin_manager import FeeCoinPool
+
+        fresh_clock = lambda: (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        current_lease = database.get_runtime_mutation_lease()
+        assert database.heartbeat_runtime_mutation_lease(
+            owner_run_id="run-task9",
+            expected_lease_version=current_lease["lease_version"],
+            heartbeat_at=AFTER,
+            lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        )["heartbeat"]
+        monkeypatch.setattr(database, "_stability_wall_clock", fresh_clock)
+        monkeypatch.setattr(
+            mutation_gate,
+            "current_runtime",
+            lambda: SimpleNamespace(run_id="run-task9"),
+        )
+        monkeypatch.setattr(
+            wallet,
+            "_read_refresh_abort_cleanup_snapshot",
+            lambda: {
+                "trade_ids": observed_book,
+                "pending_transaction_ids": [],
+                "observed_at": fresh_clock(),
+            },
+        )
+        monkeypatch.setattr(
+            offer_manager.OfferManager,
+            "_acquire_cancel_authority",
+            staticmethod(
+                lambda _intent, **_scope: (
+                    object(),
+                    {"snapshot_sha256": "e" * 64},
+                    WALLET,
+                    NETWORK,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            wallet, "refresh_offer_cancel_continuation", lambda *_args, **_kwargs: True
+        )
+        monkeypatch.setattr(
+            wallet, "close_offer_cancel_continuation", lambda *_args: True
+        )
+        effects = []
+        monkeypatch.setattr(
+            wallet,
+            "cancel_offers_batch",
+            lambda selected, **_request: (
+                effects.append(selected)
+                or {
+                    OTHER_TRADE: cancellation_result(
+                        CANCEL_SUBMITTED_UNCONFIRMED,
+                        method="sage_native_cancel_offers",
+                        raw_response={"success": True},
+                        transaction_id="a" * 64,
+                        spend_identity="sha256:" + "b" * 64,
+                    ),
+                    "_catalyst_effect_attempted": True,
+                }
+            ),
+        )
+        pricing = __import__("coin_prep_fee_cancellation")
+        monkeypatch.setattr(
+            pricing,
+            "price_approved_cancellation",
+            lambda **request: {
+                "available": True,
+                "trade_ids": request["trade_ids"],
+                "source_coin_ids": request["source_coin_ids"],
+                "fee_coin_id": request["fee_coin_id"],
+                "fee_mojos": 42,
+            },
+        )
+        monkeypatch.setattr(
+            pricing,
+            "reserve_approved_cancellation",
+            lambda **_request: {
+                "validated_unsigned": {"sealed": True},
+            },
+        )
+        monkeypatch.setattr(
+            pricing, "recheck_reserved_approved_cancellation", lambda **_request: {}
+        )
+        monkeypatch.setattr(
+            database, "record_coin_prep_cancellation_fee_outcome", lambda _manifest: {}
+        )
+        pool = FeeCoinPool()
+        pool.refresh([{"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}}])
+        manager = offer_manager.OfferManager()
+        manager._fee_pool = pool
+        if prepared_cleanup == "crash_after_claim":
+            monkeypatch.setattr(
+                manager,
+                "_offer_cancel_crash_boundary",
+                lambda stage, _intent: (
+                    (_ for _ in ()).throw(RuntimeError("injected after claim"))
+                    if stage == "before_wallet"
+                    else None
+                ),
+            )
+        original_finalize = database.finalize_offer_cancel_cohort
+
+        def observed_finalize(**request):
+            assert request["refresh_abort_id"] == abort["abort_id"]
+            with pytest.raises(ValueError, match="fenced by runtime recovery"):
+                original_finalize(**{**request, "refresh_abort_id": None})
+            with pytest.raises(ValueError, match="fenced by runtime recovery"):
+                original_finalize(**{**request, "refresh_abort_id": "0" * 64})
+            return original_finalize(**request)
+
+        monkeypatch.setattr(database, "finalize_offer_cancel_cohort", observed_finalize)
+        assert database.get_runtime_mutation_lease()["owner_run_id"] == "run-task9"
+        assert json.loads(
+            database.get_runtime_safety_latch()["blocking_operation_ids_json"]
+        ) == [abort["blocking_operation_id"]]
+        request = {
+            "abort_id": abort["abort_id"],
+            "expected_latch_generation": abort["latch_generation"],
+            "fee_approval_id": "d" * 64,
+        }
+        if prepared_cleanup == "crash_after_claim":
+            with pytest.raises(RuntimeError, match="injected after claim"):
+                manager.cancel_refresh_abort_targets(**request)
+            assert effects == []
+            assert [
+                event["phase"]
+                for event in database.get_offer_operation_events(
+                    f"cancel:{OTHER_TRADE}"
+                )
+            ] == ["PREPARED"]
+            assert (
+                database.get_offer_cancel_effect_claim(
+                    operation_id=f"cancel:{OTHER_TRADE}", attempt=1
+                )
+                is not None
+            )
+            with pytest.raises(ValueError, match="cleanup authority changed"):
+                manager.cancel_refresh_abort_targets(**request)
+            assert effects == []
+            return
+        submitted = manager.cancel_refresh_abort_targets(**request)
+        assert submitted["trade_id"] == OTHER_TRADE
+        assert submitted["result"]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        assert effects == [[OTHER_TRADE]]
+        assert [
+            event["phase"]
+            for event in database.get_offer_operation_events(f"cancel:{OTHER_TRADE}")
+        ] == ["PREPARED", "FINALIZED"]
+        assert (
+            database.get_offer_cancel_effect_claim(
+                operation_id=f"cancel:{OTHER_TRADE}", attempt=1
+            )
+            is not None
+        )
+        assert (
+            database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+        )
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        completion_request = {
+            "abort_id": abort["abort_id"],
+            "expected_latch_generation": abort["latch_generation"],
+            "owner_run_id": "run-task9",
+            "observed_trade_ids": [],
+            "observed_pending_transaction_ids": [],
+            "observed_at": fresh_clock(),
+        }
+        with pytest.raises(ValueError, match="completion authority changed"):
+            database.complete_refresh_abort(**completion_request)
+        child_tx = "a" * 64
+        child_spend = "sha256:" + "b" * 64
+        prepared = database.get_offer_operation_events(f"cancel:{OTHER_TRADE}")[0]
+        child_observed = (
+            (
+                datetime.fromisoformat(
+                    prepared["request_timestamp"].replace("Z", "+00:00")
+                )
+                + timedelta(seconds=2)
+            )
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        child_transaction = _transaction(
+            transaction_id=child_tx,
+            timestamp=child_observed,
+            spent=[
+                {
+                    "coin_id": OTHER_COIN,
+                    "asset_id": "xch",
+                    "amount": 1000,
+                    "address_kind": "offer",
+                },
+                {
+                    "coin_id": FEE_COIN,
+                    "asset_id": "xch",
+                    "amount": 1_000_000_000,
+                    "address_kind": "own",
+                },
+            ],
+            created=[
+                {
+                    "coin_id": OTHER_RETURN,
+                    "asset_id": "xch",
+                    "amount": 1000,
+                    "address_kind": "own",
+                },
+                {
+                    "coin_id": FEE_RETURN,
+                    "asset_id": "xch",
+                    "amount": 999_999_958,
+                    "address_kind": "own",
+                },
+            ],
+        )
+        child_transaction["spend_identity"] = child_spend
+        child_proof = _evidence(
+            observed_at=child_observed,
+            offers=[
+                _offer(
+                    status=3,
+                    trade_id=OTHER_TRADE,
+                    selected_coin_ids=[OTHER_COIN],
+                    transaction_id=child_tx,
+                )
+            ],
+            transactions=[child_transaction],
+            coins={
+                OTHER_COIN: _coin(
+                    OTHER_COIN,
+                    asset_id="xch",
+                    amount=1000,
+                    spent_height=42,
+                    transaction_id=child_tx,
+                    offer_id=OTHER_TRADE,
+                ),
+                OTHER_RETURN: _coin(
+                    OTHER_RETURN,
+                    asset_id="xch",
+                    amount=1000,
+                    created_height=42,
+                    transaction_id=child_tx,
+                ),
+                FEE_COIN: _coin(
+                    FEE_COIN,
+                    asset_id="xch",
+                    amount=1_000_000_000,
+                    spent_height=42,
+                    transaction_id=child_tx,
+                ),
+                FEE_RETURN: _coin(
+                    FEE_RETURN,
+                    asset_id="xch",
+                    amount=999_999_958,
+                    created_height=42,
+                    transaction_id=child_tx,
+                ),
+            },
+        )
+        prepared_evidence = json.loads(prepared["evidence_json"])
+        manifest = database.get_offer_cancel_cohort_manifest(
+            prepared_evidence["cohort_id"]
+        )
+        member = manifest["members"][0]
+        child_context = {
+            "cohort_id": manifest["cohort_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "members": [
+                {
+                    "intent_id": child_id,
+                    "trade_id": OTHER_TRADE,
+                    "member_id": member["member_id"],
+                    "prepared_event_id": member["prepared_event_id"],
+                    "selected_coin_ids": [OTHER_COIN],
+                    "request_timestamp": prepared["request_timestamp"],
+                    "transaction_timestamp": child_observed,
+                    "asset_id": ASSET,
+                    "side": "buy",
+                    "offered_amount_atomic": "1000",
+                    "requested_amount_atomic": "2000",
+                    "offer_text_sha256": "e" * 64,
+                    "transaction_id": child_tx,
+                    "spend_identity": child_spend,
+                }
+            ],
+            "auxiliary_coin_ids": [FEE_COIN],
+        }
+        assert reconciliation._validated_cancel_context(child_context) is not None
+        exact_child = reconciliation._exact_intent(database.get_offer_intent(child_id))
+        exact_tx = reconciliation._exact_confirmed_transaction(child_transaction)
+        assert exact_child is not None
+        assert exact_tx is not None
+        assert reconciliation._offer_summary_matches(
+            exact_child, child_proof["offer_history"]["records"][0]
+        )
+        assert reconciliation._coin_matches_flow(
+            child_proof["coin_records"]["records"][OTHER_COIN],
+            reconciliation._flow(child_transaction["spent"][0]),
+            exact_tx,
+            spent=True,
+        )
+        assert reconciliation._coin_matches_flow(
+            child_proof["coin_records"]["records"][FEE_COIN],
+            reconciliation._flow(child_transaction["spent"][1]),
+            exact_tx,
+            spent=True,
+        )
+        for created in child_transaction["created"]:
+            assert reconciliation._coin_matches_flow(
+                child_proof["coin_records"]["records"][created["coin_id"]],
+                reconciliation._flow(created),
+                exact_tx,
+                spent=False,
+            )
+        direct_cancel = reconciliation._cancel_proof(
+            exact_child,
+            child_proof["offer_history"]["records"],
+            exact_tx,
+            child_proof["coin_records"]["records"],
+            child_context,
+        )
+        assert direct_cancel is not None
+        child_applied = reconcile_offer(
+            child_id,
+            evidence=child_proof,
+            cancel_context=child_context,
+            now=child_observed,
+        )
+        assert child_applied["classification"] == CANCELLED_PROVEN
+        assert child_applied["applied"] is True
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "terminal"
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        proof_connection = database._stability_connection()
+        try:
+            assert database._refresh_abort_child_is_fenced_or_cancelled(
+                proof_connection,
+                database.get_refresh_abort(abort["abort_id"]),
+                database.get_offer_intent(child_id),
+            )
+        finally:
+            proof_connection.close()
+        assert json.loads(
+            database.get_runtime_safety_latch()["blocking_operation_ids_json"]
+        ) == [abort["blocking_operation_id"]]
+        if prepared_cleanup == "multi_target":
+            remaining = database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=extra_trade,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=[extra_trade],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+            assert remaining["intent_id"] == extra_intent
+            assert remaining["trade_id"] == extra_trade
+            with pytest.raises(ValueError, match="durable wallet book is not empty"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            with pytest.raises(ValueError, match="complete Sage book"):
+                database.authorize_refresh_abort_cleanup_target(
+                    abort_id=abort["abort_id"],
+                    trade_id=extra_trade,
+                    expected_latch_generation=abort["latch_generation"],
+                    owner_run_id="run-task9",
+                    observed_trade_ids=[extra_trade, "0" * 64],
+                    observed_pending_transaction_ids=[],
+                    observed_at=fresh_clock(),
+                )
+            return
+        if prepared_cleanup == "completion_extra_blocker":
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                blocking_operation_ids=["unexpected:operation"],
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            with pytest.raises(ValueError, match="completion authority changed"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            assert database.get_refresh_abort(abort["abort_id"])["state"] == (
+                "parent_terminal"
+            )
+            return
+        with pytest.raises(ValueError, match="zero live offers"):
+            database.complete_refresh_abort(
+                **{**completion_request, "observed_trade_ids": ["f" * 64]}
+            )
+        with pytest.raises(ValueError, match="zero live offers"):
+            database.complete_refresh_abort(
+                **{**completion_request, "observed_pending_transaction_ids": ["f" * 64]}
+            )
+        with pytest.raises(ValueError, match="generation changed"):
+            database.complete_refresh_abort(
+                **{
+                    **completion_request,
+                    "expected_latch_generation": abort["latch_generation"] + 1,
+                }
+            )
+        with pytest.raises(ValueError, match="completion authority changed"):
+            database.complete_refresh_abort(
+                **{**completion_request, "owner_run_id": "other-owner"}
+            )
+        queued_publications = database.list_publication_outbox(intent_id=child_id)
+        assert queued_publications
+        assert {row["state"] for row in queued_publications} == {"suppressed"}
+        completed = database.complete_refresh_abort(
+            **{**completion_request, "observed_at": fresh_clock()}
+        )
+        assert completed["state"] == "aborted"
+        assert completed["idempotent"] is False
+        assert database.get_runtime_safety_latch()["state"] == "resolved"
+        assert database.refresh_lineage_completion("intent-task9")["complete"] is False
+        assert {
+            row["state"] for row in database.list_publication_outbox(intent_id=child_id)
+        } == {"suppressed"}
+        replay = database.complete_refresh_abort(
+            **{**completion_request, "observed_at": fresh_clock()}
+        )
+        assert replay["idempotent"] is True
+        return
     changed_proof = json.loads(json.dumps(proof))
     changed_proof["diagnostic_note"] = "different-replay"
     with pytest.raises(
@@ -9086,6 +9784,23 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             cancel_context=_cancel_context(),
             refresh_abort_id="0" * 64,
             now=AFTER,
+        )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["unexpected:operation"],
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        tripped_at=AFTER,
+    )
+    with pytest.raises(ValueError, match="cleanup authority changed"):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
         )
 
 
