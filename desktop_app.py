@@ -952,7 +952,10 @@ def _start_owned_runtime_services() -> None:
 
     import api_server
 
-    if api_server.wallet_setup_bootstrap_active():
+    if (
+        api_server.wallet_setup_bootstrap_active()
+        or api_server._refresh_abort_recovery_active
+    ):
         return
     authorization = api_server.initialize_mutation_runtime()
     if not authorization.get("allowed"):
@@ -976,7 +979,10 @@ def start_flask_server(reservation):
     # A pristine first launch serves the wallet setup shell before any exact
     # wallet identity exists. The setup endpoint promotes this same process
     # and constructs the bot only after binding that identity.
-    if not api_server.wallet_setup_bootstrap_active():
+    if (
+        not api_server.wallet_setup_bootstrap_active()
+        and not api_server._refresh_abort_recovery_active
+    ):
         api_server.create_bot()
 
     # Wallet startup is triggered later by the GUI via POST /api/wallet/begin-startup

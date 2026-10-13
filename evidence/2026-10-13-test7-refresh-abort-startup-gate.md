@@ -123,3 +123,8 @@
   targets, and an unresolved Task 11 refresh lineage after completion. All
   ten incident variants plus the real fee-finalization test passed locally.
   This is mock-Sage evidence only; it does not approve original-profile use.
+- The restricted HTTP flag now also prevents Flask startup from constructing
+  the trading BotLoop or starting normal owned runtime services. Both guards
+  were first tested red, then green. The full first-run/bootstrap and mutation
+  gate suite passed 327 tests. The flag still has no production startup
+  activation or recovery UI; original TEST 7 remains on its old fenced build.

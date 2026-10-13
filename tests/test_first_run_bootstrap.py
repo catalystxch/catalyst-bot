@@ -785,6 +785,53 @@ def test_bootstrap_server_skips_bot_construction_until_identity_is_bound(monkeyp
     assert calls == ["database", reservation]
 
 
+def test_refresh_abort_server_never_constructs_trading_bot(monkeypatch):
+    import api_server
+    import database
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    calls = []
+    reservation = SimpleNamespace()
+    monkeypatch.setattr(api_server, "wallet_setup_bootstrap_active", lambda: False)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(database, "init_database", lambda: calls.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "create_bot",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("restricted recovery must not construct trading bot")
+        ),
+    )
+    monkeypatch.setattr(
+        api_server, "_serve_flask_app_on_reservation", lambda value: calls.append(value)
+    )
+    monkeypatch.setattr(database, "log_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        api_server, "_restore_run_history_cutoff_from_events", lambda: None
+    )
+
+    desktop_app.start_flask_server(reservation)
+
+    assert calls == ["database", reservation]
+
+
+def test_refresh_abort_server_skips_owned_trading_services(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app(monkeypatch)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(api_server, "wallet_setup_bootstrap_active", lambda: False)
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("restricted recovery must not start normal runtime")
+        ),
+    )
+
+    desktop_app._start_owned_runtime_services()
+
+
 def test_first_run_identity_binding_is_persisted_atomically(monkeypatch, tmp_path):
     import config
     import database
