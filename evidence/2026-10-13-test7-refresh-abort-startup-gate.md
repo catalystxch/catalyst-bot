@@ -139,3 +139,10 @@
   contains `refresh_abort_recovery.html` in `dist/Catalyst/_internal/`. This
   confirms inclusion only; the packaged original-profile runtime has not
   been launched, and its live recovery acceptance remains open.
+- Native desktop bridge construction is now disabled in restricted recovery
+  mode. A focused red/green test proves that `AppBridge` is never instantiated
+  there, while an ordinary desktop window retains it. This closes the native
+  trading API path from the read-only recovery page; restricted startup
+  activation and original-profile acceptance remain open. The full mutation
+  suite passed 305 tests and the Windows onedir build completed after the
+  bridge guard change.

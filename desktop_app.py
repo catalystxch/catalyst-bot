@@ -1025,6 +1025,18 @@ def start_flask_server(reservation):
     api_server._serve_flask_app_on_reservation(reservation)
 
 
+def _create_desktop_bridge():
+    """The fenced recovery window never receives the trading native API."""
+
+    import api_server
+
+    if api_server._refresh_abort_recovery_active:
+        return None
+    from app_bridge import AppBridge
+
+    return AppBridge()
+
+
 def run_desktop_mode(dev_mode: bool = False):
     """Main desktop app flow."""
     # WebKit2GTK 4.1+ runs the WebProcess inside a bubblewrap sandbox that
@@ -1171,12 +1183,13 @@ def run_desktop_mode(dev_mode: bool = False):
     if dev_mode:
         print(f"  Dev mode browser URL: {_browser_bootstrap_url()}")
 
-    # Create JS bridge for window.pywebview.api calls
+    # A restricted recovery window must not expose the full native bridge.
     try:
-        from app_bridge import AppBridge
-
-        bridge = AppBridge()
-        print("  JS bridge ready (AppBridge).")
+        bridge = _create_desktop_bridge()
+        if bridge is not None:
+            print("  JS bridge ready (AppBridge).")
+        else:
+            print("  Restricted recovery window: native bridge disabled.")
     except Exception as e:
         print(f"  Warning: JS bridge failed to load: {e}")
         bridge = None

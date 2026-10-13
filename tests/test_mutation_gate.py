@@ -10097,6 +10097,35 @@ def test_restricted_refresh_abort_view_requires_native_bootstrap_cookie(monkeypa
     assert b"Start Bot" not in authorized.data
 
 
+def test_restricted_refresh_abort_window_has_no_native_trading_bridge(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app_bridge",
+        SimpleNamespace(AppBridge=lambda: (_ for _ in ()).throw(
+            AssertionError("trading bridge constructed")
+        )),
+    )
+
+    assert desktop_app._create_desktop_bridge() is None
+
+
+def test_ordinary_desktop_window_retains_native_bridge(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    sentinel = object()
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setitem(
+        sys.modules, "app_bridge", SimpleNamespace(AppBridge=lambda: sentinel)
+    )
+
+    assert desktop_app._create_desktop_bridge() is sentinel
+
+
 def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch):
     import api_server
     import chia_node
