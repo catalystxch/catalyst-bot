@@ -1041,9 +1041,7 @@ def test_manager_adapters_drain_durable_claims_and_visibility_cannot_terminalize
     assert isolated_database.get_offer(trade_id)["status"] == "open"
 
 
-def test_splash_durable_waits_for_peer_before_local_ack(
-    isolated_database, monkeypatch
-):
+def test_splash_durable_waits_for_peer_before_local_ack(isolated_database, monkeypatch):
     intent, trade_id, _fingerprint = _prepare_and_confirm(isolated_database)
     offer_text = _offer_text(intent["intent_id"])
     _persist_offer_projection(isolated_database, trade_id, offer_text)

@@ -381,9 +381,7 @@ class SplashManager:
                 metrics = self._peer_readiness_provider()
             except Exception:
                 metrics = None
-            polled_at = (
-                metrics.get("last_polled_at") if type(metrics) is dict else None
-            )
+            polled_at = metrics.get("last_polled_at") if type(metrics) is dict else None
             started_at = metrics.get("started_at") if type(metrics) is dict else None
             fresh_peer = (
                 type(metrics) is dict
