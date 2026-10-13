@@ -113,6 +113,12 @@ def test_zero_headroom_is_preserved_in_saved_coin_prep_plan(page):
     result = page.evaluate(
         """async () => {
             document.getElementById('configCoinPrepHeadroomPct').value = '0';
+            // The static GUI starts with wallet-derived numeric fields blank.
+            // Supply valid values so saveConfig reaches the settings validator.
+            document.querySelectorAll('input[type="number"]').forEach(input => {
+                if (input.value === '') input.value = '0';
+            });
+            document.getElementById('configTradeXch').value = '0.1';
             let validated = null;
             window.showStyledConfirm = async () => true;
             window.apiFetch = async (path, options = {}) => {

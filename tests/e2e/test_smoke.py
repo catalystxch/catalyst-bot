@@ -2619,7 +2619,7 @@ def test_settings_pair_card_requires_the_same_explicit_pair_as_bootstrap_preview
     assert result == {
         "withoutSelection": {
             "previewPairSelected": False,
-            "cardStatus": "Waiting for pair selection",
+            "cardStatus": "Confirm trading pair for this run",
         },
         "withSelection": {
             "previewPairSelected": True,
