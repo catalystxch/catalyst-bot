@@ -252,3 +252,17 @@ requested Take test.
   must prove every created child either reaches an exact public identity or
   receives authoritative terminal handling. No original profile data or
   wallet state was changed for this audit.
+
+## Isolated browser and exact-head verification
+
+- The exact source commit `49c745eef6d81032e2a0ae3dd394814cc43189fb`
+  passed all 11 PR checks before the evidence-only commit. The later
+  documentation head `2e2cd6d54a641368e58deb54109064d27dc5bf5f`
+  also passed all 11 checks. Its only change from the tested source was this
+  evidence file.
+- Local `python -m pytest --e2e tests/e2e/test_smoke.py -q` passed **110/110**
+  headless Chromium smoke tests in 65.48 seconds. The tests launch a separate
+  read-only Flask shell on port 5099 with a temporary data directory and no
+  configured Sage wallet. They include the proof-only Cancel All status and
+  preflight rejection display. This is isolated GUI evidence, not a live
+  original-profile native traversal or wallet recovery pass.
