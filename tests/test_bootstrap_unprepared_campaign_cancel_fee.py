@@ -3,9 +3,32 @@
 from importlib import import_module
 
 import pytest
+from flask import Flask
 
 from bootstrap_fee_fixture import approved_bootstrap  # noqa: F401
 import fee_approval_test_utils as utils
+
+
+def test_stopped_campaign_without_offers_cannot_quote_recovery_fee(
+    approved_bootstrap, monkeypatch
+):
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+    campaign_id = approved_bootstrap["campaign_id"]
+    monkeypatch.setattr(
+        database, "get_latest_coin_prep_fee_approval_for_campaign", lambda _id: None
+    )
+    assert database.stop_bootstrap_campaign(
+        campaign_id, "manual", "2026-09-22T12:01:00Z"
+    )
+    with pytest.raises(ValueError, match="FEE_PREP_CAMPAIGN_UNAVAILABLE"):
+        runtime.read_fee_economic_snapshot(
+            {
+                "bootstrap_campaign_id": campaign_id,
+                "bootstrap_campaign_revision": 1,
+                "cancellation_recovery_action": "bootstrap_stop",
+            }
+        )
 
 
 def test_active_campaign_with_offers_can_quote_cancellation_without_prior_prep_approval(
@@ -88,13 +111,125 @@ def test_active_campaign_with_offers_can_quote_cancellation_without_prior_prep_a
     assert recovered["recovery_only"] is True
     with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ONLY"):
         runtime.read_approved_prep_fee_snapshot(approval["approval_id"])
-    assert database.stop_bootstrap_campaign(
-        campaign_id, "manual", "2026-09-22T12:01:00Z"
+    bootstrap = import_module("blueprints.bootstrap")
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    monkeypatch.setattr(
+        bootstrap,
+        "_read_bootstrap_identity",
+        lambda: {
+            key: campaign[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "asset_id",
+            )
+        },
     )
-    with pytest.raises(ValueError, match="FEE_PREP_CAMPAIGN_UNAVAILABLE"):
-        runtime.read_fee_economic_snapshot(
-            {
-                **options,
-                "bootstrap_campaign_revision": 1,
-            }
-        )
+
+    def needs_cancellation_approval(_trade_ids):
+        raise ValueError("FEE_BUDGET_APPROVAL_REQUIRED")
+
+    monkeypatch.setattr(
+        bootstrap, "_cancel_campaign_offers", needs_cancellation_approval
+    )
+    app = Flask(__name__)
+    app.register_blueprint(bootstrap.bp)
+    app.config.update(TESTING=True)
+    response = app.test_client().post(
+        "/api/bootstrap/stop", json={"campaign_id": campaign_id, "revision": 0}
+    )
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "FEE_BUDGET_APPROVAL_REQUIRED"
+    assert response.get_json()["financial_action_started"] is False
+    assert response.get_json()["cancel_targets"] == 1
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "stopped"
+    stopped_options = {
+        **options,
+        "bootstrap_campaign_revision": 1,
+        "cancellation_recovery_action": "bootstrap_stop",
+    }
+    stopped_snapshot = runtime.read_fee_economic_snapshot(stopped_options)
+    assert stopped_snapshot["recovery_only"] is True
+    assert stopped_snapshot["recipe"]["economic_plan"]["outputs"] == []
+    assert stopped_snapshot["recipe"]["economic_plan"]["campaign_revision"] == 1
+    stopped_preview = service.preview_coin_prep_fees(stopped_options)
+    assert stopped_preview["available"] is True
+    assert stopped_preview["preparation_transaction_count_min"] == 0
+    assert stopped_preview["preparation_transaction_count_max"] == 0
+    assert stopped_preview["estimated_cancellation_fee_mojos"] > 0
+    assert stopped_preview["minimum_cancellation_reserve_mojos"] > 0
+    assert stopped_preview["suggested_maximum_fee_mojos"] > 0
+    assert any(
+        stage["stage_id"] == "cancel_xch" and stage["transaction_count_max"] == 1
+        for stage in stopped_preview["stages"]
+    )
+    stop_approval = service.approve_coin_prep_fees(
+        preview_id=stopped_preview["preview_id"],
+        maximum_fee_mojos=int(stopped_preview["suggested_maximum_fee_mojos"]),
+        cancellation_reserve_mojos=int(
+            stopped_preview["minimum_cancellation_reserve_mojos"]
+        ),
+    )
+    recovered_stop = runtime.read_approved_prep_fee_snapshot(
+        stop_approval["approval_id"], expected_recovery_action="bootstrap_stop"
+    )
+    assert recovered_stop["campaign"]["campaign_id"] == campaign_id
+    assert recovered_stop["recovery_only"] is True
+    with pytest.raises(ValueError, match="FEE_APPROVAL_RECOVERY_ONLY"):
+        runtime.read_approved_prep_fee_snapshot(stop_approval["approval_id"])
+    cancellation = import_module("coin_prep_fee_cancellation")
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda trade_ids, **_kwargs: {
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 1234,
+        },
+    )
+    monkeypatch.setattr(
+        cancellation,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": 1000,
+            "expires_at": 1060,
+        },
+    )
+    priced = cancellation.price_approved_cancellation(
+        approval_id=stop_approval["approval_id"],
+        trade_ids=[trade_id],
+        source_coin_ids=["a" * 64],
+        fee_coin_id="b" * 64,
+        expected_recovery_action="bootstrap_stop",
+    )
+    assert priced["available"] is True, priced
+    assert priced["fee_mojos"] == 20
+    assert priced["approval"]["remaining_fee_mojos"] >= 20
+
+    def cancel_with_fresh_approval(trade_ids, *, fee_approval_id=None):
+        assert trade_ids == [trade_id]
+        assert fee_approval_id == stop_approval["approval_id"]
+        return {trade_id: {"outcome": "CANCEL_CONFIRMED"}}
+
+    monkeypatch.setattr(
+        bootstrap, "_cancel_campaign_offers", cancel_with_fresh_approval
+    )
+    retry = app.test_client().post(
+        "/api/bootstrap/stop",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 1,
+            "fee_approval_id": stop_approval["approval_id"],
+        },
+    )
+    assert retry.status_code == 200, retry.get_json()
+    assert retry.get_json()["cancel_results"] == {
+        trade_id: {"outcome": "CANCEL_CONFIRMED"}
+    }

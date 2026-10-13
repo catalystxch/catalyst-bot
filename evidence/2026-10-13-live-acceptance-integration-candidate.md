@@ -6,7 +6,18 @@ the nested Sage Splash offer-view classifier fix (PR #267), and the explicit
 Splash bootstrap-peer setting (PR #265). The `bot_gui.html` merge retains the
 deliberate same-pair reconfirmation requirement after a stopped campaign. Two
 older browser assertions were updated to exercise the current save and pair
-contracts; no production code was changed to satisfy those assertions.
+contracts.
+
+Independent review then found a recovery dead end: a stopped campaign that
+reused prepared coins could still own live offers but had no campaign-bound
+Coin Prep approval from which to renew its cancellation fee. The fix freezes a
+zero-output, cancellation-only economic recipe for that stopped campaign. Its
+fee preview counts the exact durable nonterminal campaign buy/sell offer IDs,
+prices their cancellation stages, and rechecks that same ID-to-asset mapping
+after pricing. It does not recreate preparation outputs or trading authority.
+The reviewer rechecked the fix and found no remaining important authority or
+fee-safety issue. The endpoint retry test mocks the cancellation manager, so
+it does not itself prove a live wallet cancellation.
 
 ## Isolated verification
 
@@ -15,13 +26,19 @@ contracts; no production code was changed to satisfy those assertions.
 - Full Chromium browser suite: **273 passed**
   (`python -m pytest tests/e2e -q --e2e --tb=short`).
 - Ruff on `src` and `tests`, and `git diff --check`: passed.
-- Clean Windows `python build.py`: passed. Combined `dist/Catalyst/Catalyst.exe`
-  SHA-256:
-  `88D36B7B91246FCA75C3ED66EE3FE6E89C10D482915B2160B259DCABF5000C27`.
-- Isolated packaged API, mock Sage RPC, native clean/duplicate/persisted/safety
-  first launches, and interrupted publication recovery smokes: passed. The
-  smokes used temporary data directories and did not replace either original
-  test-wallet process.
+- The recovery fix passed **120 related backend tests** and a focused two-test
+  red/green regression. The stopped-campaign preview has zero preparation
+  transactions, positive cancellation reserve and fee ceiling, and the exact
+  approval passes positive-fee cancellation pricing. A stopped campaign with
+  no outstanding offers cannot obtain the recovery quote.
+- Clean Windows `python build.py` after the recovery fix: passed. Final combined
+  `dist/Catalyst/Catalyst.exe` SHA-256:
+  `44C1DCB7F9B507024DD261054486F266BB9486CDFF163C61E47F8520BD2C0456`.
+- Isolated packaged API, mock Sage RPC, native clean/duplicate/persisted/
+  safety first-launch, and interrupted publication recovery smokes passed on
+  that final EXE. All
+  smokes use temporary data directories and leave both original wallet
+  profiles and active test processes untouched.
 
 ## Live acceptance boundary
 

@@ -303,6 +303,25 @@ def _campaign_is_stopped_for_fee_recovery(campaign: object) -> bool:
     )
 
 
+def _outstanding_campaign_cancel_assets(campaign_id: str) -> dict[str, str]:
+    """Bind cancellation cover to durable nonterminal campaign offer intents."""
+    from blueprints.bootstrap import _campaign_trade_ids
+
+    prefix = f"bootstrap:{campaign_id}:revision:"
+    assets = {}
+    for trade_id in _campaign_trade_ids(campaign_id):
+        intent = database.get_offer_intent_by_trade_id(trade_id)
+        if type(intent) is not dict or not str(intent.get("purpose") or "").startswith(
+            prefix
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        side = intent.get("side")
+        if side not in {"buy", "sell"}:
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        assets[trade_id] = "xch" if side == "buy" else "cat"
+    return assets
+
+
 def read_fee_economic_snapshot(request_options: dict) -> dict:
     """Read a current trusted wallet/configuration/campaign economic recipe.
 
@@ -378,20 +397,39 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         if approval_id is None:
             # A campaign may reuse coins prepared under an earlier campaign.
             # It then owns real offers but has no campaign-bound preparation
-            # approval to renew. For an *active* campaign only, derive a fresh
-            # recipe from its current trusted authority and freeze it solely as
-            # a cancellation-only quote. Never revive a stopped campaign from
-            # mutable settings or make this recipe eligible for preparation.
-            if type(stopped) is not dict or stopped.get("status") != "active":
+            # approval to renew. An active campaign can freeze its current
+            # trusted ladder. Once creation authority has stopped, quote only
+            # the still-live offer cancellations with *no* preparation outputs;
+            # mutable settings must never reconstruct a stopped ladder.
+            if type(stopped) is not dict:
                 raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-            ordinary_options = {
-                key: value
-                for key, value in options.items()
-                if key != "cancellation_recovery_action"
-            }
-            bootstrap = _active_bootstrap_coin_prep_context(ordinary_options)
-            if type(bootstrap) is not dict or bootstrap.get("campaign") != stopped:
-                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            if _campaign_is_stopped_for_fee_recovery(stopped):
+                if not campaign_has_cleanup:
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+                bootstrap = {
+                    "campaign": stopped,
+                    "worker_args": {
+                        "xch_target": 0,
+                        "cat_target": 0,
+                        "buy_tier_sizes": "",
+                        "cat_tier_sizes": "",
+                        "tier_counts_xch": "",
+                        "tier_counts_cat": "",
+                        "prep_headroom_pct": "0",
+                    },
+                    "recovery_only": True,
+                }
+            else:
+                if stopped.get("status") != "active":
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+                ordinary_options = {
+                    key: value
+                    for key, value in options.items()
+                    if key != "cancellation_recovery_action"
+                }
+                bootstrap = _active_bootstrap_coin_prep_context(ordinary_options)
+                if type(bootstrap) is not dict or bootstrap.get("campaign") != stopped:
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
             recovery_recipe = build_exact_prep_economics(
                 configuration=config,
                 worker_args=bootstrap["worker_args"],
@@ -888,6 +926,25 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         )
         for asset in ("xch", "cat")
     }
+    outstanding_cancel_assets = None
+    if recovery_only and not context["recipe"]["targets"]:
+        campaign = context.get("campaign")
+        if type(campaign) is not dict or not _campaign_is_stopped_for_fee_recovery(
+            campaign
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        outstanding_cancel_assets = _outstanding_campaign_cancel_assets(
+            campaign["campaign_id"]
+        )
+        if not outstanding_cancel_assets:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        cancellation_counts = {
+            asset: sum(
+                offered_asset == asset
+                for offered_asset in outstanding_cancel_assets.values()
+            )
+            for asset in ("xch", "cat")
+        }
     missing_native = [
         t
         for t in context["recipe"]["targets"]
@@ -1169,6 +1226,10 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         after = read_fee_economic_snapshot(context["request_options"])
     except ValueError:
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED") from None
+    if outstanding_cancel_assets is not None and outstanding_cancel_assets != (
+        _outstanding_campaign_cancel_assets(context["campaign"]["campaign_id"])
+    ):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     if any(
         after[key] != context[key]
         for key in (
