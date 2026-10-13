@@ -23,7 +23,9 @@ def test_restricted_view_escapes_wallet_data_and_has_no_trading_action(page):
             }), {status: 200, headers: {'Content-Type': 'application/json'}});
         })();"""
     )
-    page.goto((Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri())
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
 
     expect(page.locator("#status")).to_have_text("Read-only proof loaded.")
     expect(page.locator("#stage")).to_contain_text("<img src=x")
@@ -42,7 +44,9 @@ def test_restricted_view_fails_closed_when_preview_unavailable(page):
             );
         })();"""
     )
-    page.goto((Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri())
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
 
     expect(page.locator("#status")).to_have_text(
         "Recovery proof is unavailable. Trading remains stopped."

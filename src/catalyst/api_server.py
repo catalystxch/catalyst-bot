@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
 import database
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, quote
 
@@ -3992,6 +3992,109 @@ def has_exact_refresh_abort_startup_candidate() -> bool:
         )
     except Exception:
         return False
+
+
+def preflight_refresh_abort_restricted_startup() -> dict[str, Any]:
+    """Read fresh exact authority before considering fenced lease entry.
+
+    This function is diagnostic only. Its observations are rechecked at the
+    later compare-and-set lease boundary; it never grants mutation authority.
+    """
+
+    denied = {"eligible": False, "reason": "refresh_abort_startup_unproven"}
+    try:
+        if not has_exact_refresh_abort_startup_candidate():
+            return denied
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        wallet_hash, network = _configured_mutation_binding()
+        binding = _configured_wallet_identity_binding(network)
+        if (
+            str(getattr(cfg, "WALLET_TYPE", "")).lower() != "sage"
+            or type(asset_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None
+            or type(binding) is not mutation_gate.WalletIdentityBinding
+            or binding.backend != "sage"
+            or mutation_gate.wallet_fingerprint_hash(binding.fingerprint) != wallet_hash
+        ):
+            return denied
+        first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
+            wallet.get_wallet_identity
+        )
+        first_check = mutation_gate.validate_wallet_identity(binding, first_identity)
+        if first_check.get("allowed") is not True:
+            return denied
+        second_check = mutation_gate.validate_wallet_identity(
+            binding,
+            second_identity,
+            last_observed_at_utc=first_check["observed_at_utc"],
+        )
+        if second_check.get("allowed") is not True:
+            return denied
+        first_book = wallet._read_refresh_abort_cleanup_snapshot()
+        second_book = wallet._read_refresh_abort_cleanup_snapshot()
+        first_trades = first_book["trade_ids"]
+        second_trades = second_book["trade_ids"]
+        first_at = datetime.fromisoformat(
+            first_book["observed_at"].replace("Z", "+00:00")
+        )
+        second_at = datetime.fromisoformat(
+            second_book["observed_at"].replace("Z", "+00:00")
+        )
+        if (
+            type(first_trades) is not list
+            or type(second_trades) is not list
+            or first_trades != second_trades
+            or len(second_trades) != len(set(second_trades))
+            or type(first_book["pending_transaction_ids"]) is not list
+            or type(second_book["pending_transaction_ids"]) is not list
+            or first_book["pending_transaction_ids"]
+            or second_book["pending_transaction_ids"]
+            or first_at.tzinfo is None
+            or second_at.tzinfo is None
+            or second_at <= first_at
+            or not timedelta(seconds=0)
+            <= datetime.now(timezone.utc) - second_at
+            <= timedelta(seconds=30)
+        ):
+            return denied
+        candidates = database.list_fenced_refresh_abort_candidates(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        aborts = database.list_incomplete_refresh_aborts(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if len(candidates) > 1 or len(aborts) > 1 or not (candidates or aborts):
+            return denied
+        candidate = candidates[0] if candidates else None
+        abort = aborts[0] if aborts else None
+        if candidate is not None and abort is not None:
+            if candidate["parent_intent_id"] != abort["parent_intent_id"]:
+                return denied
+        if abort is not None:
+            targets = json.loads(abort["target_trade_ids_json"])
+            if type(targets) is not list or not set(second_trades).issubset(
+                set(targets)
+            ):
+                return denied
+        elif (
+            candidate["child_trade_id"] not in second_trades
+            or candidate["parent_trade_id"] in second_trades
+        ):
+            return denied
+        if not has_exact_refresh_abort_startup_candidate():
+            return denied
+        return {
+            "eligible": True,
+            "wallet_snapshot": second_book,
+            "abort_id": abort["abort_id"] if abort else None,
+            "candidate": candidate,
+        }
+    except Exception:
+        return denied
 
 
 def promote_wallet_setup_bootstrap() -> dict:

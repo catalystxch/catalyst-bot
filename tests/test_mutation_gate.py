@@ -8592,6 +8592,137 @@ def test_exact_refresh_abort_startup_discovers_incomplete_abort_without_effect(
     assert api_server.has_exact_refresh_abort_startup_candidate() is True
 
 
+@pytest.mark.parametrize(
+    "change", ["valid", "valid_abort", "identity", "book", "pending", "candidate_gone"]
+)
+def test_refresh_abort_startup_requires_two_fresh_identity_and_sage_reads(
+    monkeypatch, change
+):
+    import api_server
+    import wallet
+
+    fingerprint = 736588221
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    bound_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=fingerprint,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=bound_at.isoformat().replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    observations = []
+    for index in (1, 2):
+        identity = {
+            "success": True,
+            "backend": "sage",
+            "name": "TEST 7",
+            "fingerprint": fingerprint,
+            "network_id": "mainnet",
+            "kind": "private",
+            "has_secrets": True,
+            "observed_at_utc": (bound_at + timedelta(seconds=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        observations.append(identity)
+    if change == "identity":
+        observations[1]["fingerprint"] = 123
+    snapshots = [
+        {
+            "trade_ids": ["a" * 64, "c" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": (bound_at + timedelta(seconds=3))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        {
+            "trade_ids": ["a" * 64, "c" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": (bound_at + timedelta(seconds=4))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+    ]
+    if change == "book":
+        snapshots[1]["trade_ids"] = ["a" * 64]
+    if change == "pending":
+        snapshots[1]["pending_transaction_ids"] = ["d" * 64]
+    discovery_calls = []
+
+    def discover():
+        discovery_calls.append(True)
+        return change != "candidate_gone" or len(discovery_calls) == 1
+
+    monkeypatch.setattr(
+        api_server, "has_exact_refresh_abort_startup_candidate", discover
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(
+        api_server, "cfg", SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="f" * 64)
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: observations.pop(0))
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: snapshots.pop(0)
+    )
+    monkeypatch.setattr(
+        database,
+        "list_incomplete_refresh_aborts",
+        lambda **_kw: (
+            [
+                {
+                    "abort_id": "e" * 64,
+                    "target_trade_ids_json": json.dumps(["a" * 64, "c" * 64]),
+                }
+            ]
+            if change == "valid_abort"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kw: (
+            []
+            if change == "valid_abort"
+            else [
+                {
+                    "child_trade_id": "a" * 64,
+                    "parent_trade_id": "b" * 64,
+                    "cancel_operation_id": "cancel:" + "b" * 64,
+                }
+            ]
+        ),
+    )
+
+    if change in {"valid", "valid_abort"}:
+        assert mutation_gate.validate_wallet_identity(binding, observations[0])[
+            "allowed"
+        ]
+        assert mutation_gate.validate_wallet_identity(
+            binding,
+            observations[1],
+            last_observed_at_utc=observations[0]["observed_at_utc"],
+        )["allowed"]
+
+    result = api_server.preflight_refresh_abort_restricted_startup()
+
+    assert result["eligible"] is (change in {"valid", "valid_abort"}), result
+    if change in {"valid", "valid_abort"}:
+        assert result["wallet_snapshot"]["trade_ids"] == ["a" * 64, "c" * 64]
+        assert len(discovery_calls) == 2
+    if change == "valid_abort":
+        assert result["abort_id"] == "e" * 64
+
+
 def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
     monkeypatch,
 ):
@@ -10105,9 +10236,11 @@ def test_restricted_refresh_abort_window_has_no_native_trading_bridge(monkeypatc
     monkeypatch.setitem(
         sys.modules,
         "app_bridge",
-        SimpleNamespace(AppBridge=lambda: (_ for _ in ()).throw(
-            AssertionError("trading bridge constructed")
-        )),
+        SimpleNamespace(
+            AppBridge=lambda: (_ for _ in ()).throw(
+                AssertionError("trading bridge constructed")
+            )
+        ),
     )
 
     assert desktop_app._create_desktop_bridge() is None

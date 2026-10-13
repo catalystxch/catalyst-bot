@@ -146,3 +146,12 @@
   activation and original-profile acceptance remain open. The full mutation
   suite passed 305 tests and the Windows onedir build completed after the
   bridge guard change.
+- A separate restricted-startup preflight now requires the exact existing
+  fenced candidate, two fresh identity observations, two matching complete
+  Sage offer books, no pending transactions, and a second discovery check.
+  Six red/green parameter cases and the existing discovery checks passed
+  (16 focused tests). The full mutation suite passed 311 tests, the two
+  Chromium recovery-view tests passed, Ruff formatting/lint passed, and the
+  Windows onedir build completed. The preflight is read-only and is not yet
+  wired to an abort-scoped lease entry, so it grants no recovery or wallet
+  authority.
