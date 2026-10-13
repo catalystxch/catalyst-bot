@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import api_server  # noqa: F401 - establish blueprint import order before fixture loading
+
 
 class _Finalized(BaseException):
     """End the shared incident fixture before its separate terminal-proof phase."""
