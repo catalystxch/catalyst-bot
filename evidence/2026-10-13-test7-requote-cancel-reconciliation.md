@@ -172,3 +172,25 @@ requested Take test.
   mutate the wallet. It reinforces that the fourth original database row is
   stale; it does not resolve the latch or establish public publication of the
   replacement sell.
+
+## Proof worker exception regression, isolated only
+
+- Source inspection found a separate deterministic failure mode in the
+  proof-only Cancel All worker: an exception from reconciliation or the gate
+  read could terminate its thread without clearing `running=true`. A new
+  endpoint test reproduced this by making the exact proof read raise; it
+  failed because the status remained running, then passed after the worker
+  recorded a terminal error and kept cancellation fenced. All 63 offers
+  endpoint tests passed. This does **not** establish that an exception caused
+  the original TEST 7 incident; its live worker outcome remains unknown.
+- The new handler does not retry, release the latch, or submit a wallet
+  cancellation. It reports `cancel_proof_reconciliation_failed` and logs the
+  exception so the native progress view cannot silently spin forever.
+- The combined mutation-gate and offers-endpoint run passed **348 tests**.
+  Ruff lint/format and `git diff --check` passed. A clean Windows PyInstaller
+  build succeeded, with EXE SHA-256
+  `61408396B22284FCBD3CA71C3D422E23202E15E09D547B48F6BE094FD726ACBB`.
+  Its bundled HTML hash matched source, an isolated mock-Sage packaged API
+  smoke passed, and a Defender custom scan completed with zero detections
+  matching that EXE path. This replacement has **not** run on the original
+  TEST 7 profile; the older f034 process remains live and fenced.

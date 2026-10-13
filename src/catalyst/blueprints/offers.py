@@ -630,8 +630,24 @@ def _api_cancel_all_locked():
         )
 
         def _reconcile_existing_cancel():
-            result = durable_manager.reconcile_submitted_cancels_only()
-            refreshed = api_server.mutation_gate.read_only_status()
+            try:
+                result = durable_manager.reconcile_submitted_cancels_only()
+                refreshed = api_server.mutation_gate.read_only_status()
+            except Exception as exc:
+                _set_cancel_all_state(
+                    running=False,
+                    complete=False,
+                    error="cancel_proof_reconciliation_failed",
+                    phase="error",
+                    pending=len(blocker_ids),
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    message=(
+                        "The earlier cancellation could not be verified. "
+                        "No second cancellation was submitted."
+                    ),
+                )
+                log_event("error", "cancel_all_proof_reconciliation_failed", str(exc))
+                return
             allowed = getattr(refreshed, "allowed", False) is True
             refreshed_reason = str(
                 getattr(refreshed, "reason_code", "")

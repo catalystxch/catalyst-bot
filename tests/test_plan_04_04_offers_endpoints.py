@@ -683,6 +683,52 @@ class TestCancelAllPost(_FlaskBase):
         stopped.offer_manager.reconcile_submitted_cancels_only.assert_called_once_with()
         stopped.offer_manager.cancel_offers.assert_not_called()
 
+    def test_unresolved_cancel_all_proof_exception_finishes_with_error(self):
+        """A failed proof read must not leave the progress indicator running forever."""
+        from blueprints.offers import _reset_cancel_all_state
+
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.reconcile_submitted_cancels_only.side_effect = (
+            RuntimeError("proof read failed")
+        )
+        blocked = types.SimpleNamespace(
+            allowed=False,
+            reason_code="UNRESOLVED_OPERATIONS",
+            blocking_operation_ids=("cancel:" + "a" * 64,),
+        )
+
+        def run_now(*, target):
+            try:
+                target()
+            except RuntimeError:
+                pass  # A real Thread records the exception and keeps running the app.
+
+        _reset_cancel_all_state()
+        try:
+            with (
+                patch.object(api_server, "bot", stopped),
+                patch.object(
+                    api_server.mutation_gate,
+                    "read_only_status",
+                    return_value=blocked,
+                ),
+                patch("threading.Thread") as thread_cls,
+            ):
+                thread_cls.return_value.start.side_effect = lambda: run_now(
+                    target=thread_cls.call_args.kwargs["target"]
+                )
+                response = self._post("/api/offers/cancel_all")
+                status = self._get("/api/offers/cancel_all/status").get_json()
+
+            self.assertEqual(response.status_code, 202)
+            self.assertFalse(status["running"])
+            self.assertFalse(status["complete"])
+            self.assertEqual(status["error"], "cancel_proof_reconciliation_failed")
+            stopped.offer_manager.cancel_offers.assert_not_called()
+        finally:
+            _reset_cancel_all_state()
+
     def test_requires_token(self):
         resp = self._post("/api/offers/cancel_all", auth=False)
         self.assertEqual(resp.status_code, 401)
