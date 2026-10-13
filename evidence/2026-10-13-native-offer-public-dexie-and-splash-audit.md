@@ -157,3 +157,21 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   retained accessible logs no longer contain its startup PeerId. A complete
   known-peer LAN multiaddress for the current process therefore remains
   unverified. No node was restarted to obtain one.
+
+## Reciprocal receipt recheck at 08:27 UTC
+
+- The primary managed Splash PID 197208 still listened on `0.0.0.0:11511`,
+  `127.0.0.1:4000` and `127.0.0.1:4001`; two outbound peer connections were
+  in `SynSent`. Its direct metrics were `peers: 0`, `offers_broadcasted: 2`,
+  `offers_received: 0`, `total_connections: 0`. The original-profile
+  `%APPDATA%\Catalyst\bot.db` was opened in SQLite read-only/query-only mode:
+  `splash_incoming_offers` contained **zero rows total**. Thus no Harvestr
+  outbound offer reached this app's receive table by this check.
+- Harvestr independently rechecked its exact original-profile process, all six
+  active DB/Sage/public Dexie offer identities, unchanged wallet balances and
+  fee ledger, owned lease, and 291 contiguous clean samples through
+  08:26:44Z. Its Splash counters showed six peers, six broadcasts and 1,554
+  aggregate received offers. The two previously identified exact TEST 7
+  payload rows remain present there but marked `ignored`/unknown pair by the
+  running old parser. Aggregate traffic does not prove reciprocal receipt.
+  No Take, campaign, firewall, settings or runtime action was performed.
