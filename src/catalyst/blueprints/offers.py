@@ -759,6 +759,31 @@ def api_refresh_abort_begin():
         ), (200 if terminal else 409)
 
 
+def _exact_refresh_abort_manager(*, with_fee_inventory: bool):
+    """Use a disposable cleanup manager when the fenced view has no BotLoop.
+
+    This constructs no trading loop, worker, or Coin Prep process. The fee
+    inventory is freshly read for one reviewed target; an unavailable read
+    leaves its pool empty and cancellation fails before wallet dispatch.
+    """
+
+    bot = api_server.bot
+    if api_server._refresh_abort_recovery_active:
+        if bot is not None:
+            return None
+        from offer_manager import OfferManager
+
+        manager = OfferManager()
+        if with_fee_inventory:
+            from coin_manager import CoinManager
+
+            coins = CoinManager()
+            coins.refresh_fee_pool_from_wallet()
+            manager._fee_pool = coins.fee_pool
+        return manager
+    return bot.offer_manager if bot is not None else None
+
+
 @bp.route("/api/offers/refresh_abort/cancel_next", methods=["POST"])
 def api_refresh_abort_cancel_next():
     """Cancel only the next immutable abort target after native review."""
@@ -798,7 +823,15 @@ def api_refresh_abort_cancel_next():
         return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
     with api_server._bot_cancel_lifecycle_lock:
         bot = api_server.bot
-        if bot is None or bot.is_running() or bot.offer_manager is None:
+        if bot is not None and bot.is_running():
+            return jsonify({"success": False, "error": "stop_bot_first"}), 409
+        try:
+            manager = _exact_refresh_abort_manager(with_fee_inventory=True)
+        except Exception:
+            return jsonify(
+                {"success": False, "error": "cleanup_authority_unavailable"}
+            ), 409
+        if manager is None:
             return jsonify({"success": False, "error": "stop_bot_first"}), 409
         runtime = api_server.mutation_gate.current_runtime()
         binding = getattr(runtime, "wallet_identity_binding", None)
@@ -837,7 +870,7 @@ def api_refresh_abort_cancel_next():
                 != body["fee_approval_id"]
             ):
                 return jsonify({"success": False, "error": "fee_approval_changed"}), 409
-            result = bot.offer_manager.cancel_refresh_abort_targets(
+            result = manager.cancel_refresh_abort_targets(
                 abort_id=body["abort_id"],
                 expected_latch_generation=body["expected_latch_generation"],
                 fee_approval_id=body["fee_approval_id"],
@@ -951,10 +984,13 @@ def api_refresh_abort_complete():
         return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
     with api_server._bot_cancel_lifecycle_lock:
         bot = api_server.bot
-        if bot is None or bot.is_running() or bot.offer_manager is None:
+        if bot is not None and bot.is_running():
             return jsonify({"success": False, "error": "stop_bot_first"}), 409
         try:
-            result = bot.offer_manager.complete_refresh_abort_cleanup(
+            manager = _exact_refresh_abort_manager(with_fee_inventory=False)
+            if manager is None:
+                return jsonify({"success": False, "error": "stop_bot_first"}), 409
+            result = manager.complete_refresh_abort_cleanup(
                 abort_id=body["abort_id"],
                 expected_latch_generation=body["expected_latch_generation"],
             )

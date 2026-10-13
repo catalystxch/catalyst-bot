@@ -473,6 +473,50 @@ def test_refresh_abort_cancel_next_refuses_stale_target_before_wallet_effect(
     assert native["stage"] == "awaiting_target_proof"
     assert len(effects) == 2
 
+    # The fenced desktop intentionally has no BotLoop or native trading bridge.
+    import coin_manager
+    import offer_manager
+
+    class FeeInventory:
+        def __init__(self):
+            self.fee_pool = object()
+
+        def refresh_fee_pool_from_wallet(self):
+            effects.append("fee_inventory_read")
+
+    class CleanupManager:
+        def __init__(self):
+            self._fee_pool = None
+
+        def cancel_refresh_abort_targets(self, **request):
+            assert self._fee_pool is not None
+            effects.append(request)
+            return {
+                "trade_id": first,
+                "result": {
+                    "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                    "_catalyst_effect_attempted": True,
+                },
+            }
+
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(coin_manager, "CoinManager", FeeInventory)
+    monkeypatch.setattr(offer_manager, "OfferManager", CleanupManager)
+    restricted = client.post(
+        "/api/offers/refresh_abort/cancel_next", json=body, **request_kwargs
+    )
+    assert restricted.status_code == 200
+    assert restricted.get_json()["stage"] == "awaiting_target_proof"
+    assert effects[-2:] == [
+        "fee_inventory_read",
+        {
+            "abort_id": abort_id,
+            "expected_latch_generation": 7,
+            "fee_approval_id": approval_id,
+        },
+    ]
+
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
@@ -563,6 +607,23 @@ def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
         {"abort_id": abort_id, "expected_latch_generation": 7},
         {"abort_id": abort_id, "expected_latch_generation": 7},
     ]
+
+    import offer_manager
+
+    class CleanupManager:
+        def complete_refresh_abort_cleanup(self, **request):
+            completions.append(request)
+            return {"state": "aborted"}
+
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(offer_manager, "OfferManager", CleanupManager)
+    restricted = client.post(
+        "/api/offers/refresh_abort/complete", json=complete_body, **request_kwargs
+    )
+    assert restricted.status_code == 200
+    assert restricted.get_json()["stage"] == "aborted"
+    assert len(completions) == 3
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
