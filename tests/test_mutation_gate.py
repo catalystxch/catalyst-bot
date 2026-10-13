@@ -214,6 +214,37 @@ def test_restricted_recovery_can_own_inactive_lease_while_latch_stays_tripped(
         recovery.enter_mutation("wallet:create_offer")
 
 
+def test_generic_expired_lease_takeover_stays_blocked_during_refresh_abort(
+    isolated_gate_database,
+):
+    """A dead prior owner requires a scoped successor, not generic takeover."""
+
+    _path, clock = isolated_gate_database
+    prior = _gate(clock, run_id="prior", pid=111)
+    assert prior.acquire()["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="REFRESH_ABORT_CLEANUP",
+        blocking_operation_ids=["refresh-abort:" + "a" * 64],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    clock.advance(31)
+    successor = _gate(
+        clock,
+        run_id="candidate-successor",
+        pid=222,
+        pid_liveness=lambda _pid, _host: False,
+    )
+
+    takeover = successor.acquire()
+
+    assert takeover["acquired"] is False
+    assert takeover["reason"] == "safety_latch_tripped"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert database.get_runtime_mutation_lease()["owner_run_id"] == "prior"
+
+
 def test_refresh_abort_cleanup_enter_is_exact_and_keeps_general_gate_closed(
     isolated_gate_database, monkeypatch
 ):

@@ -81,3 +81,14 @@
   and status routes when that mode is enabled. Desktop activation, the
   restricted native page and its fee approval remain unimplemented, so the
   live app remains read-only and no recovery action has occurred.
+
+## Restart limitation found during entry design
+
+- The current abort row stores its entering run's lease owner, PID, host,
+  acquisition timestamp and version. Exact cleanup authorization compares
+  them to the current lease. Ordinary expired-owner takeover rejects a
+  tripped latch; a disposable regression confirms that a dead prior PID does
+  not make generic takeover safe. No scoped successor for this abort record
+  exists yet. Without it, a crash after abort entry could leave the profile
+  permanently fenced despite valid Sage proof. A new atomic successor path
+  and crash/replay tests are required before original-profile recovery.

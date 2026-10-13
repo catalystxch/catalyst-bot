@@ -181,3 +181,8 @@ replacement launch.
   changed Sage book, pending transaction, extra blocker and stale fee scope.
   Run full relevant backend/Chromium suites and an isolated packaged native
   replay. Obtain independent review before TEST 7 handoff.
+- [ ] Add atomic, abort-scoped lease succession for an incomplete abort after
+  a graceful close or proven-dead expired owner. Rebind the immutable abort
+  authority only after exact latch, wallet, campaign, Sage-book, effect and
+  publication checks. Keep generic takeover blocked while the latch is
+  tripped, and prove crash/replay leaves no period of trading authority.

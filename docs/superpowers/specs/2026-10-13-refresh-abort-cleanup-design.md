@@ -76,6 +76,20 @@ cancellation-only estimate and approval flow under the same wallet, campaign,
 lease and cumulative fee checks, or refuse cancellation. It must never enable
 ordinary Coin Prep or campaign setup to obtain that approval.
 
+An abort record created by `begin_refresh_abort` is bound to the entering
+run's lease owner, PID, host, acquisition timestamp and version. A later run
+cannot use that record merely by obtaining another lease. Generic expired
+lease takeover correctly refuses the tripped latch, even when the prior PID
+is dead. Restart recovery needs a separate atomic successor operation: prove
+the exact incomplete abort and latch blockers, same wallet/network/asset and
+stopped campaign, complete fresh Sage book with no pending transaction, no
+ambiguous publication or wallet effect, an expired or inactive prior lease,
+and independently proven prior-owner death when takeover is required. The
+transaction must compare-and-set the lease and rebind only that abort record
+to the new owner. Both the old and new run remain unable to create offers;
+the latch and abort target set remain unchanged. Any mismatch returns to
+read-only diagnostics, with no generic lease takeover or SQL repair.
+
 - Entry requires a stopped bot and campaign, an owned renewing lease, the
   expected latch generation with exactly the named submitted cancel blocker,
   reciprocal parent/child binding, and a complete same-wallet/network Sage
