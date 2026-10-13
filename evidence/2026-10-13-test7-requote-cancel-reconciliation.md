@@ -361,3 +361,31 @@ requested Take test.
   change the visible modal. The operator was asked to test that Close control;
   no further cancellation was submitted. The remaining two active offers,
   exact on-chain proof reconciliation and GUI recovery remain open.
+
+## 12:34 UTC isolated proof replay: unpublished replacement child
+
+- A SQLite online backup of the TEST 7 data was placed under
+  `C:\catalyst\.superpowers\test7-proof-copy-20261013`. The recovery process
+  asserted that `CMM_DATA_DIR` and `database.DB_PATH` pointed to that copy
+  before calling `OfferManager.reconcile_submitted_cancels_only()`. It made
+  read-only Sage calls and wrote only the copied database. The call returned
+  `-1`: copied latch generation 667 stayed tripped, and journal sequence
+  10154 remained `CANCEL_SUBMITTED_UNCONFIRMED`.
+- The copied reconciliation reported `REPLACEMENT_CHILD_NOT_VISIBLE` for the
+  cancelled parent. Parent intent `4afb4a8e...4135` is bound to exact child
+  intent `52de45fb...31ce`, the still-active Sage sell
+  `ab93cacc...901b`. That child is durably `created`, not `visible`. Its
+  Dexie and Splash publication discoveries both expired with no exact
+  observed identity. Its Dexie outbox is still queued with zero attempts;
+  its Splash outbox says succeeded, which records local dispatch and is not
+  reciprocal peer receipt. The source deliberately requires external
+  publication visibility before terminalizing a replaced parent.
+- The Sage transaction and coin history prove the parent cancellation's
+  wallet outcome, but they do not prove the replacement child's publication
+  visibility. The failure to reconcile is therefore a distinct lineage and
+  publication recovery problem, not evidence that the parent cancellation
+  transaction is pending. No visibility record or safety latch was changed
+  on the original profile; the two remaining Sage offers remain live.
+- The current PR head `54ed9a3c3b59dee7d6f9fde496bcffc79a504c50`
+  passed all 11 checks. This source only replay does not establish a native
+  recovery pass or public readiness.
