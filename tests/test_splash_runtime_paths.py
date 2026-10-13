@@ -420,6 +420,25 @@ def test_stopped_splash_status_marks_cached_metrics_unreachable(monkeypatch):
     assert status["metrics"]["offers_received"] == 123
 
 
+def test_splash_metrics_bind_peer_sample_to_current_process():
+    import splash_node
+
+    node = splash_node.SplashNode()
+    node._process = SimpleNamespace(poll=lambda: None)
+    node._last_start_time = 123.0
+    node._metrics = {
+        "reachable": True,
+        "peers": 1,
+        "last_polled_at": 124.0,
+    }
+
+    snapshot = node.get_metrics()
+
+    assert snapshot["process_running"] is True
+    assert snapshot["started_at"] == 123.0
+    assert snapshot["last_polled_at"] == 124.0
+
+
 def test_stopped_splash_receive_stats_do_not_publish_cached_metrics_as_live(
     monkeypatch,
 ):

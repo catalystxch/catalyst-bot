@@ -381,16 +381,28 @@ class SplashManager:
                 metrics = self._peer_readiness_provider()
             except Exception:
                 metrics = None
-            if (
+            polled_at = (
+                metrics.get("last_polled_at") if type(metrics) is dict else None
+            )
+            started_at = metrics.get("started_at") if type(metrics) is dict else None
+            fresh_peer = (
                 type(metrics) is dict
                 and metrics.get("reachable") is True
+                and metrics.get("process_running") is True
                 and type(metrics.get("peers")) is int
-                and metrics["peers"] <= 0
-            ):
+                and metrics["peers"] > 0
+                and type(polled_at) in (int, float)
+                and type(started_at) in (int, float)
+                and started_at > 0
+                and polled_at >= started_at
+                and 0 <= time.time() - polled_at <= 15.0
+            )
+            if not fresh_peer:
                 # Splash's local HTTP acknowledgement precedes its asynchronous
-                # peer broadcast. With zero peers the daemon later emits
-                # InsufficientPeers, so keep the durable claim (or local queue)
-                # untouched until the next cycle can reach a peer.
+                # peer broadcast. Missing, stale or zero-peer metrics cannot
+                # establish the current daemon's ability to relay this offer.
+                # Keep the durable claim (or local queue) untouched until a
+                # fresh sample from the running process shows a peer.
                 return {
                     "posted": 0,
                     "failed": 0,

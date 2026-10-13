@@ -1054,10 +1054,15 @@ def test_splash_durable_waits_for_peer_before_local_ack(
         now_provider=lambda: LATER,
         lease_expires_provider=lambda _now: LEASE_END,
     )
-    peer_count = {"value": 0}
-    manager.set_peer_readiness_provider(
-        lambda: {"reachable": True, "peers": peer_count["value"]}
-    )
+    observed_at = splash_manager.time.time()
+    snapshot = {"value": {}}
+
+    def peer_readiness():
+        if snapshot["value"] == "error":
+            raise RuntimeError("metrics temporarily unavailable")
+        return snapshot["value"]
+
+    manager.set_peer_readiness_provider(peer_readiness)
     posted = []
 
     def local_ack(_offer, _trade_id, _force, *, idempotency_key, request_contract):
@@ -1075,17 +1080,58 @@ def test_splash_durable_waits_for_peer_before_local_ack(
         }
 
     monkeypatch.setattr(manager, "_post_single", local_ack)
-    waiting = manager.flush_queue()
-    row = isolated_database.list_publication_outbox(
-        intent_id=intent["intent_id"], publisher="splash"
-    )[0]
-    assert waiting["deferred_no_peers"] is True
-    assert waiting["posted"] == 0
-    assert waiting["requeued"] == 0
-    assert posted == []
-    assert row["state"] == "queued"
+    blocked_snapshots = [
+        {},
+        "error",
+        {"reachable": False, "peers": 0},
+        {
+            "reachable": True,
+            "peers": 0,
+            "process_running": True,
+            "started_at": observed_at - 1,
+            "last_polled_at": observed_at,
+        },
+        {
+            "reachable": True,
+            "peers": 1,
+            "process_running": True,
+            "started_at": observed_at - 100,
+            "last_polled_at": observed_at - 60,
+        },
+        {
+            "reachable": True,
+            "peers": 1,
+            "process_running": True,
+            "started_at": observed_at,
+            "last_polled_at": observed_at - 1,
+        },
+        {
+            "reachable": True,
+            "peers": 1,
+            "process_running": False,
+            "started_at": observed_at - 1,
+            "last_polled_at": observed_at,
+        },
+    ]
+    for candidate in blocked_snapshots:
+        snapshot["value"] = candidate
+        waiting = manager.flush_queue()
+        row = isolated_database.list_publication_outbox(
+            intent_id=intent["intent_id"], publisher="splash"
+        )[0]
+        assert waiting["deferred_no_peers"] is True
+        assert waiting["posted"] == 0
+        assert waiting["requeued"] == 0
+        assert posted == []
+        assert row["state"] == "queued"
 
-    peer_count["value"] = 1
+    snapshot["value"] = {
+        "reachable": True,
+        "peers": 1,
+        "process_running": True,
+        "started_at": splash_manager.time.time() - 1,
+        "last_polled_at": splash_manager.time.time(),
+    }
     ready = manager.flush_queue()
     row = isolated_database.list_publication_outbox(
         intent_id=intent["intent_id"], publisher="splash"

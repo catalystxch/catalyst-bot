@@ -825,7 +825,10 @@ class SplashNode:
         offer-hook isn't firing.
         """
         with self._metrics_lock:
-            return dict(self._metrics)
+            snapshot = dict(self._metrics)
+        snapshot["process_running"] = self.is_running()
+        snapshot["started_at"] = float(self._last_start_time or 0.0)
+        return snapshot
 
     def _poll_metrics(self) -> None:
         """Poll splash.exe's `/metrics` endpoint into `_metrics` forever.
