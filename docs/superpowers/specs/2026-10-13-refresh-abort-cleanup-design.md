@@ -67,6 +67,15 @@ identity, Sage-book and lease checks. A crash or failed preflight releases no
 fence and returns to read-only diagnostics. Normal startup is retried only
 after the abort is durably complete and its blocker is released.
 
+The restricted view must also resolve fee authority for the exact stopped
+campaign selected for cleanup. The copied TEST 7 profile has stopped campaigns
+with approvals, but its latest stopped campaign has none in the Coin Prep
+approval lookup. An approval from another campaign cannot be reused. If the
+selected campaign has no applicable approval, the view must offer a separate
+cancellation-only estimate and approval flow under the same wallet, campaign,
+lease and cumulative fee checks, or refuse cancellation. It must never enable
+ordinary Coin Prep or campaign setup to obtain that approval.
+
 - Entry requires a stopped bot and campaign, an owned renewing lease, the
   expected latch generation with exactly the named submitted cancel blocker,
   reciprocal parent/child binding, and a complete same-wallet/network Sage

@@ -174,6 +174,9 @@ replacement launch.
 - [ ] Serve only the recovery view and its exact proof/cleanup routes. Block
   generic wallet, config, campaign, publication, update and trading writes,
   including through the native bridge. Verify no effect on page load.
+- [ ] Add an exact stopped-campaign cancellation-only fee preview and approval
+  when no applicable fee approval exists; never select an older campaign's
+  approval. Keep Coin Prep and campaign creation unavailable in this mode.
 - [ ] Test crash/restart and lost-lease behavior at each stage, wrong wallet,
   changed Sage book, pending transaction, extra blocker and stale fee scope.
   Run full relevant backend/Chromium suites and an isolated packaged native

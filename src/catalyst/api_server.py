@@ -405,6 +405,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 }
 
 _read_only_diagnostics_active = False
+_refresh_abort_recovery_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -4089,6 +4090,21 @@ def enforce_local_runtime_guard():
                 return jsonify({"error": "loopback_only"}), 403
             return Response("Loopback only", status=403, mimetype="text/plain")
 
+    if _refresh_abort_recovery_active:
+        recovery_routes = {
+            ("GET", "/"),
+            ("GET", "/api/safety/status"),
+            ("GET", "/api/offers/refresh_abort/preview"),
+            ("POST", "/api/offers/refresh_abort/begin"),
+            ("POST", "/api/offers/refresh_abort/cancel_next"),
+            ("POST", "/api/offers/refresh_abort/reconcile_target"),
+            ("POST", "/api/offers/refresh_abort/complete"),
+        }
+        if (request.method, path) not in recovery_routes:
+            return jsonify(
+                {"success": False, "error": "refresh_abort_recovery_only"}
+            ), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -4193,6 +4209,14 @@ def serve_gui():
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         return _bind_local_browser_cookie(response)
+    if _refresh_abort_recovery_active:
+        # The restricted owner has no authority to expose the trading UI or
+        # its native bridge. Keep this closed until its separate view is ready.
+        return Response(
+            "Recovery interface unavailable",
+            status=423,
+            mimetype="text/plain",
+        )
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")

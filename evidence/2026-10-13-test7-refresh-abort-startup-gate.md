@@ -51,3 +51,33 @@
   would not preserve the safety proof.
 - TEST 7 remains fenced. The two other Sage-active offers and any later
   wallet state require a fresh complete Sage/DB audit before a recovery action.
+
+## Restricted-entry investigation
+
+- A fresh disposable TEST 7 SQLite backup reproduced the one-blocker case.
+  The exact candidate discovery returned true, and the amended desktop
+  initialization left the latch at generation 667 with the same sole cancel
+  blocker. It did not run generic legacy recovery and add a second blocker.
+  Local mutation-gate and schema tests passed: **433 passed**. A separate
+  formatting correction was pushed as `00dbdb6` after CI found it.
+- On that copied profile, a separate recovery run acquired an inactive lease
+  while the durable latch stayed tripped. Its status remained
+  `UNRESOLVED_OPERATIONS`, `allowed=false`, owned by that run, with the sole
+  original cancel blocker; the copied lease was then released. An isolated
+  regression proves normal offer creation remains blocked under this state.
+  No lease was acquired against the original TEST 7 database.
+- A fresh read-only Sage identity and complete offer-book observation matched
+  the configured TEST 7 fingerprint and mainnet binding, with **two active
+  offers and zero pending transactions** at that observation. These are not
+  durable final-state claims and must be refreshed before any wallet effect.
+- The copied profile's latest stopped campaign has no applicable Coin Prep
+  fee approval in the campaign lookup. Other stopped campaigns do have
+  approvals, but using one of those for this campaign would be unsafe. The
+  restricted recovery view needs a campaign-specific cancellation-only fee
+  approval path before it can submit a remaining offer cancellation.
+- A dormant restricted HTTP guard now admits only the recovery page, bounded
+  safety status, exact preview, and four exact abort operations; a red/green
+  regression blocks ordinary bot, Coin Prep, Bootstrap, Splash, generic offers
+  and status routes when that mode is enabled. Desktop activation, the
+  restricted native page and its fee approval remain unimplemented, so the
+  live app remains read-only and no recovery action has occurred.

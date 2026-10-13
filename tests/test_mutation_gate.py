@@ -183,6 +183,37 @@ def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
     )
 
 
+def test_restricted_recovery_can_own_inactive_lease_while_latch_stays_tripped(
+    isolated_gate_database,
+):
+    """An exact cleanup owner must not need to clear the durable fence."""
+
+    _path, clock = isolated_gate_database
+    prior = _gate(clock, run_id="prior")
+    assert prior.acquire()["acquired"] is True
+    operation_id = "cancel:" + "b" * 64
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[operation_id],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    assert prior.release_lease()["released"] is True
+
+    recovery = _gate(clock, run_id="restricted-recovery")
+    assert recovery.acquire()["acquired"] is True
+    status = recovery.status()
+    assert status.allowed is False
+    assert status.reason_code == "UNRESOLVED_OPERATIONS"
+    assert status.owner_is_this_run is True
+    assert database.get_runtime_safety_latch()[
+        "blocking_operation_ids_json"
+    ] == json.dumps([operation_id])
+    with pytest.raises(mutation_gate.MutationBlocked):
+        recovery.enter_mutation("wallet:create_offer")
+
+
 def test_refresh_abort_cleanup_enter_is_exact_and_keeps_general_gate_closed(
     isolated_gate_database, monkeypatch
 ):
@@ -9892,6 +9923,48 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
         "error": "diagnostics_read_only",
         "reason": "DIAGNOSTICS_READ_ONLY",
     }
+
+
+def test_restricted_refresh_abort_http_mode_denies_every_other_route(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(
+        api_server, "_refresh_abort_recovery_active", True, raising=False
+    )
+    denied = (
+        ("GET", "/api/status"),
+        ("GET", "/api/offers"),
+        ("POST", "/api/bot/start"),
+        ("POST", "/api/offers/cancel_all"),
+        ("POST", "/api/coin-prep/trigger"),
+        ("POST", "/api/bootstrap/start"),
+        ("POST", "/api/splash/node/start"),
+    )
+    for method, path in denied:
+        with api_server.app.test_request_context(
+            path, method=method, environ_base={"REMOTE_ADDR": "127.0.0.1"}
+        ):
+            response = api_server.enforce_local_runtime_guard()
+            assert response is not None, (method, path)
+            assert response[1] == 423, (method, path)
+            assert response[0].get_json()["error"] == "refresh_abort_recovery_only"
+    with api_server.app.test_request_context(
+        "/api/offers/refresh_abort/preview",
+        method="GET",
+        headers={api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert api_server.enforce_local_runtime_guard() is None
+
+
+def test_restricted_refresh_abort_mode_cannot_serve_full_trading_gui(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    with api_server.app.test_request_context("/"):
+        response = api_server.serve_gui()
+    assert response.status_code == 423
+    assert b"Recovery interface unavailable" in response.data
 
 
 def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch):
