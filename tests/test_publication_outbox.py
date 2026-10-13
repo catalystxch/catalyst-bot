@@ -363,6 +363,8 @@ def test_offer_ui_authority_snapshot_batches_requested_trade_ids(isolated_databa
     assert set(snapshot) == {first_trade_id, second_trade_id}
     assert snapshot[first_trade_id]["intent"]["intent_id"] == first["intent_id"]
     assert snapshot[second_trade_id]["intent"]["intent_id"] == second["intent_id"]
+    assert snapshot[first_trade_id]["economics"]["requested_amount_atomic"] == "2000000"
+    assert snapshot[first_trade_id]["economics"]["cat_decimals"] == 3
     assert {row["provider"] for row in snapshot[first_trade_id]["discoveries"]} == {
         "dexie",
         "splash",

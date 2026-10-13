@@ -9407,7 +9407,7 @@
                         <span class="cc-val" id="ccLoopSecs">—</span>
                     </div>
                     <div class="cc-row">
-                        <span class="cc-label">Max Offers <span class="cc-help">?<span class="cc-tooltip">Maximum active buy and sell offers at any time.</span></span></span>
+                        <span class="cc-label"><span id="ccMaxOffersLabel">Max Offers</span> <span class="cc-help">?<span class="cc-tooltip">Follow-mode buy and sell offer limits. An active Bootstrap campaign uses its separately approved ladder; see Active Offers for the live book.</span></span></span>
                         <span class="cc-val" id="ccMaxOffers">—</span>
                     </div>
                 </div>
@@ -9641,10 +9641,10 @@
 
                 <!-- Coin breakdown -->
                 <div class="cc-group" id="coinTrackingSection" style="display: none;">
-                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">Spendable = all coins not locked in an active offer, including dedicated fee coins. Locked = committed to active offers. Total = spendable + locked.</span></span></div>
+                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">CATalyst-tracked usable coins only. Safety-protected, historically spent, and unresolved-claim coins are excluded. Spendable includes tracked free fee coins; Locked is committed to active offers; Total is their sum.</span></span></div>
                     <div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 3px 10px; font-size: 0.82em;">
                         <div style="opacity: 0.5;"></div>
-                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="All coins not locked in an active offer, including dedicated fee coins.">Spendable</span></div>
+                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="Tracked free coins available to CATalyst, including dedicated fee coins; safety-protected and historical claims are excluded.">Spendable</span></div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Locked</div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Total</div>
                         <div>XCH</div>
@@ -27204,6 +27204,8 @@
                     el('ccBuySell').innerHTML = buyBadge + ' / ' + sellBadge;
                     if (t.loop_seconds && el('ccLoopSecs')) el('ccLoopSecs').textContent = t.loop_seconds + 's';
                     if (t.max_active_buy !== undefined && el('ccMaxOffers')) {
+                        el('ccMaxOffersLabel').textContent = _bootstrapActiveCampaign?.status === 'active'
+                            ? 'Follow Limits' : 'Max Offers';
                         el('ccMaxOffers').textContent = formatSideSplitForLiquidityMode(
                             t.max_active_buy, t.max_active_sell, modeState.mode);
                     }
@@ -40141,6 +40143,9 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const maxOffersLabel = document.getElementById('ccMaxOffersLabel');
+    if (maxOffersLabel) maxOffersLabel.textContent = _bootstrapActiveCampaign?.status === 'active'
+        ? 'Follow Limits' : 'Max Offers';
     const unresolvedCreationCount = Number(_bootstrapActiveCampaign?.unresolved_creation_count || 0);
     const hasUnresolvedCreation = Number.isSafeInteger(unresolvedCreationCount)
         && unresolvedCreationCount > 0;

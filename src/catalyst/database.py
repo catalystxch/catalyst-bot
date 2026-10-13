@@ -30401,6 +30401,9 @@ def get_offer_ui_authority_by_trade_ids(
         snapshot = {
             str(row["sage_trade_id"]): {
                 "intent": dict(row),
+                "economics": _current_intent_economic_authority(
+                    conn, str(row["intent_id"])
+                ),
                 "discoveries": [],
                 "publications": [],
             }

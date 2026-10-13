@@ -279,6 +279,23 @@ def _offers_with_durable_authority(wallet_offers: list) -> list:
             item["publication"] = {}
             continue
 
+        # Display the exact CAT amount committed to the immutable Sage offer.
+        # The projected nominal size can contain a fractional CAT atom and
+        # rounding it for display can overstate the actual offer by one atom.
+        economics = snapshot.get("economics") or {}
+        side = str(item.get("side") or "").lower()
+        if side in {"buy", "sell"} and economics.get("side") == side:
+            cat_atoms = economics.get(
+                "requested_amount_atomic" if side == "buy" else "offered_amount_atomic"
+            )
+            decimals = economics.get("cat_decimals")
+            try:
+                if type(decimals) is int and 0 <= decimals <= 18:
+                    exact_cat = Decimal(int(cat_atoms)) / (Decimal(10) ** decimals)
+                    item["size_cat"] = f"{exact_cat:,.{decimals}f}"
+            except (TypeError, ValueError, ArithmeticError):
+                pass
+
         intent_id = str(intent.get("intent_id") or "")
         if not str(item.get("coin_id") or "").strip():
             try:

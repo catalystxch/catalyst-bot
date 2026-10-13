@@ -570,6 +570,19 @@ def test_dashboard_trusted_range_does_not_render_raw_decimal_precision(page):
     )
 
 
+def test_dashboard_identifies_follow_limits_during_active_bootstrap(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    page.evaluate("""() => _bootstrapRenderStatus({
+        active: true,
+        campaign: {campaign_id: 'a'.repeat(64), status: 'active', open_offer_count: 6}
+    })""")
+    expect(page.locator("#ccMaxOffersLabel")).to_have_text("Follow Limits")
+    page.evaluate("() => _bootstrapRenderStatus({active: false, campaign: null})")
+    expect(page.locator("#ccMaxOffersLabel")).to_have_text("Max Offers")
+
+
 def test_smart_advisor_accepts_confidence_capped_ladder_as_complete(page):
     """Advisor compares live depth with effective targets, not configured ceilings."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
