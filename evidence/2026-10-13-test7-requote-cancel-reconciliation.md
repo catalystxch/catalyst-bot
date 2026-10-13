@@ -197,3 +197,34 @@ requested Take test.
   bundle was copied after source commit `47526ad55eebf45c54127e3b7078b09a45f00d85`
   to `C:\catalyst\.superpowers\cancel-proof-47526ad-package\Catalyst\`;
   the pinned EXE hash matches the build output byte for byte.
+
+## Native bridge gate mismatch: root cause of the first recovery click
+
+- The original f034 native `AppBridge.cancel_all_offers` had a blanket
+  `_mutation_guard("app_bridge:cancel_all_offers")` decorator. Under the
+  live `UNRESOLVED_OPERATIONS` latch, it returned
+  `mutation_gate_blocked` **before** invoking `/api/offers/cancel_all`.
+  The backend route's purpose-built blocked-gate branch would have checked
+  the prior cancellation's Sage proof without submitting a new wallet effect,
+  but native callers could not reach it. The original runtime log had no
+  `>>> BUTTON: Cancel All Offers` route entry at the 09:27 click. This is
+  consistent with the bridge short circuit; no original route response was
+  captured, so do not infer any live reconciliation occurred.
+- A new bridge test with the gate blocked first failed because the route was
+  never called, then passed after removing that outer guard. The bridge still
+  ensures mutation runtime initialization and calls the same backend route.
+  That route alone owns both admission paths: it performs proof-only work
+  while blocked and calls `mutation_gate.enter_mutation` before any fresh
+  cancellation when allowed. Separate integrated native tests proved the
+  blocked branch invokes only the existing proof check, and the allowed
+  branch rejects cancellation if a mutation permit is denied. The mutation
+  authority inventory explicitly records Cancel All as route-guarded.
+- The combined mutation-gate and offers-endpoint run passed **351 tests**
+  after this change, with Ruff lint/format and diff checks clean. A second
+  clean Windows PyInstaller build and isolated mock-Sage packaged API smoke
+  passed. The updated EXE SHA-256 is
+  `173ED8DFC29D0A913E473694170B0802B5E1A6D0E9628212F6AA2000BADA554B`;
+  bundled HTML matches source byte for byte, and Defender's custom scan
+  completed with zero matching detections. These are isolated results; the
+  original TEST 7 process remains on f034 and its live safety latch is
+  unchanged.

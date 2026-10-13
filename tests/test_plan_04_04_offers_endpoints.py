@@ -118,6 +118,114 @@ def test_native_cancel_all_forwards_coin_prep_fee_approval_body(monkeypatch):
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_native_cancel_all_reaches_proof_only_route_while_gate_blocked(monkeypatch):
+    """The route owns the blocked-gate proof exception; the bridge must reach it."""
+    import mutation_gate
+
+    calls = []
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(
+        api_server,
+        "wallet_setup_bootstrap_allows",
+        lambda _operation: False,
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("UNRESOLVED_OPERATIONS", operation)
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "api_cancel_all",
+        lambda: (
+            calls.append("proof-only-route")
+            or {"success": False, "async": True, "reconciliation_only": True}
+        ),
+    )
+
+    result = app_bridge.AppBridge().cancel_all_offers({})
+
+    assert calls == ["proof-only-route"]
+    assert result["reconciliation_only"] is True
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_native_cancel_all_unresolved_gate_only_checks_old_proof(monkeypatch):
+    from blueprints.offers import _reset_cancel_all_state
+
+    stopped = _make_bot()
+    stopped.is_running.return_value = False
+    stopped.offer_manager.reconcile_submitted_cancels_only.return_value = 0
+    blocked = types.SimpleNamespace(
+        allowed=False,
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=("cancel:" + "a" * 64,),
+    )
+    clear = types.SimpleNamespace(allowed=True, reason_code="")
+    states = iter((blocked, clear))
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server, "bot", stopped)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "read_only_status",
+        lambda: next(states),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "enter_mutation",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("proof-only path must not enter the mutation gate")
+        ),
+    )
+    _reset_cancel_all_state()
+    try:
+        with patch("threading.Thread") as thread_cls:
+            thread_cls.return_value.start.side_effect = lambda: (
+                thread_cls.call_args.kwargs["target"]()
+            )
+            result = app_bridge.AppBridge().cancel_all_offers({})
+
+        assert result["async"] is True
+        assert result["reconciliation_only"] is True
+        stopped.offer_manager.reconcile_submitted_cancels_only.assert_called_once_with()
+        stopped.offer_manager.cancel_offers.assert_not_called()
+    finally:
+        _reset_cancel_all_state()
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_native_cancel_all_allowed_gate_still_blocks_unpermitted_cancellation(
+    monkeypatch,
+):
+    import mutation_gate
+
+    stopped = _make_bot()
+    stopped.is_running.return_value = False
+    monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
+    monkeypatch.setattr(api_server, "bot", stopped)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "read_only_status",
+        lambda: types.SimpleNamespace(allowed=True, reason_code=""),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "enter_mutation",
+        lambda operation: (_ for _ in ()).throw(
+            mutation_gate.MutationBlocked("LEASE_OWNED_BY_OTHER", operation)
+        ),
+    )
+
+    result = app_bridge.AppBridge().cancel_all_offers({})
+
+    assert result["success"] is False
+    assert result["reason"] == "LEASE_OWNED_BY_OTHER"
+    stopped.offer_manager.cancel_offers.assert_not_called()
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_history_age_label_treats_legacy_naive_utc_timestamp_as_utc():
     timestamp = (datetime.now(timezone.utc) - timedelta(days=90)).strftime(
         "%Y-%m-%d %H:%M:%S"

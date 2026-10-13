@@ -674,11 +674,11 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
-    @_mutation_guard("app_bridge:cancel_all_offers")
     def cancel_all_offers(self, body=None):
-        """Cancel all offers. Maps to POST /api/offers/cancel_all."""
+        """Use the route's gate so blocked proof-only recovery remains reachable."""
         import api_server
 
+        api_server._ensure_mutation_runtime()
         with api_server.app.test_request_context(
             "/api/offers/cancel_all",
             method="POST",
@@ -2060,6 +2060,10 @@ _APP_BRIDGE_ACCESS_SETS = (
     ("read_only", _APP_BRIDGE_READ_ONLY_METHODS),
     ("control", _APP_BRIDGE_CONTROL_METHODS),
 )
+# Cancel All must reach its own route while an old submitted cancellation is
+# fenced: that route only checks proof in the blocked branch, and enters the
+# mutation gate itself before any new wallet cancellation in the allowed branch.
+_APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS = {"cancel_all_offers"}
 _classified_bridge_methods: set[str] = set()
 _bridge_access_by_function: dict[object, str] = {}
 for _access, _names in _APP_BRIDGE_ACCESS_SETS:
@@ -2070,7 +2074,11 @@ for _access, _names in _APP_BRIDGE_ACCESS_SETS:
         _method = vars(AppBridge).get(_name)
         if not callable(_method):
             raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
-        if _access == "mutation" and _method not in _mutation_guarded_functions:
+        if (
+            _access == "mutation"
+            and _method not in _mutation_guarded_functions
+            and _name not in _APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS
+        ):
             raise RuntimeError(
                 f"AppBridge mutation callable lacks mutation guard: {_name}"
             )

@@ -3418,7 +3418,6 @@ def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
     expected = {
         "activate_boost": "app_bridge:activate_boost",
         "begin_startup": "app_bridge:begin_startup",
-        "cancel_all_offers": "app_bridge:cancel_all_offers",
         "cancel_offer": "app_bridge:cancel_offer",
         "cleanup_orphans": "app_bridge:cleanup_orphans",
         "deactivate_boost": "app_bridge:deactivate_boost",
@@ -3430,6 +3429,9 @@ def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
         name: getattr(getattr(app_bridge.AppBridge, name), "_mutation_operation", None)
         for name in expected
     } == expected
+    assert app_bridge._APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS == {
+        "cancel_all_offers"
+    }
 
     calls = []
     monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
