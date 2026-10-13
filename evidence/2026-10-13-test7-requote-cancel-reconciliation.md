@@ -133,3 +133,42 @@ requested Take test.
   rechecked afterward and remained PID 171260/port 5000. No replacement
   package was launched and no new financial action was taken. Further native
   control awaits the user's direction.
+
+## 10:15 UTC read-only book cross-check
+
+- The user said they were working on this PC and would hand it back shortly.
+  No further native input was sent. PID 171260 still owned port 5000, the
+  bot was stopped, and the exact-PID monitor still reported
+  `UNRESOLVED_OPERATIONS` with an owned renewing lease.
+- A read-only query of the **original** SQLite database showed parent buy
+  `376406...8ecf` as `status=open`, `lifecycle_state=cancel_requested`,
+  although Sage's complete history had already reported it cancelled.
+  Replacement buy `9d4f...331e`, original sell `4d9e...c8c7`, and
+  replacement sell `ab93...901b` were open in the same database.
+- Direct Dexie `/v1/offers/{id}` reads showed parent buy publication
+  `Hvcx...gX12` at numeric status `3`, completion time
+  `2026-10-13T09:10:08Z`, block `9424469`; replacement buy publication
+  `8Dzb...Epni` and original sell publication `ES23...2Vhh` were numeric
+  status `0` without completion blocks. The exact replacement-sell Sage
+  trade ID returned HTTP 404 when looked up on Dexie with or without `0x`.
+  These are point-in-time external observations, not a claim that all three
+  active offers are publicly broadcast. Dexie and Sage agree the parent is
+  terminal, while CATalyst's original durable row remains unresolved.
+- The second SQLite clone, which had been reconciled **in isolation**, marks
+  the parent cancelled; it must not be mistaken for the original database.
+  No live database, wallet, offer, or fee state was changed by these reads.
+- The original replacement-sell intent `52de45...e31ce` binds Sage trade
+  `ab93...901b` to publication identity `340027...dc06a`. Its durable
+  publication discoveries for both `dexie` and `splash` are
+  `deadline_expired` with no observed identity; their deadlines were
+  08:55:59 UTC, shortly before the safety stop. This is stronger evidence
+  than a missing local `dexie_id`: the app did not record authoritative
+  publication of that active sell. The exact trade-ID Dexie lookup also
+  returned HTTP 404. Do not count it as a public Dexie or Splash offer.
+- At 10:19 UTC a fresh read through the repository wallet facade confirmed
+  mainnet TEST 7 fingerprint `736588221`, exactly the three named active
+  Sage offers and zero pending transactions. This read used
+  `get_all_offers(include_completed=False, start=0, end=100)` and did not
+  mutate the wallet. It reinforces that the fourth original database row is
+  stale; it does not resolve the latch or establish public publication of the
+  replacement sell.
