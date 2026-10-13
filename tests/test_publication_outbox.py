@@ -1139,6 +1139,116 @@ def test_splash_durable_waits_for_peer_before_local_ack(isolated_database, monke
     assert row["state"] == "succeeded"
 
 
+def test_splash_durable_rechecks_peer_before_each_batch_post(
+    isolated_database, monkeypatch
+):
+    for index in range(2):
+        _prepare_claimable(
+            isolated_database,
+            intent_id=f"peer-batch-{index}",
+            generation=index + 1,
+        )
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    metrics = {
+        "reachable": True,
+        "peers": 1,
+        "process_running": True,
+        "started_at": splash_manager.time.time() - 1,
+        "last_polled_at": splash_manager.time.time(),
+    }
+    manager.set_peer_readiness_provider(lambda: dict(metrics))
+    posted = []
+
+    def local_ack(_offer, _trade_id, _force, *, idempotency_key, request_contract):
+        posted.append(idempotency_key)
+        metrics["last_polled_at"] = splash_manager.time.time() - 60
+        return {
+            "outcome": "acknowledged",
+            "provider": "splash",
+            "provider_response_id": None,
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                request_contract
+            ),
+            "response_sha256": _sha("local-splash-ack"),
+            "status_code": 200,
+        }
+
+    monkeypatch.setattr(manager, "_post_single", local_ack)
+    result = manager.flush_queue(flush_all=True)
+    rows = isolated_database.list_publication_outbox(publisher="splash")
+
+    assert result["posted"] == 1
+    assert result["deferred_no_peers"] is True
+    assert len(posted) == 1
+    assert sorted(row["state"] for row in rows) == ["queued", "succeeded"]
+
+
+def test_splash_durable_defers_marked_claim_if_peer_sample_stales_before_transport(
+    isolated_database, monkeypatch
+):
+    intent, _trade_id, _fingerprint = _prepare_claimable(isolated_database)
+    manager = splash_manager.SplashManager()
+    monkeypatch.setattr(splash_manager.cfg, "SPLASH_ENABLED", True, raising=False)
+    manager.enable_durable_outbox(
+        owner_run_id="worker-splash",
+        now_provider=lambda: LATER,
+        lease_expires_provider=lambda _now: LEASE_END,
+    )
+    metrics = {
+        "reachable": True,
+        "peers": 1,
+        "process_running": True,
+        "started_at": splash_manager.time.time() - 1,
+        "last_polled_at": splash_manager.time.time(),
+    }
+    manager.set_peer_readiness_provider(lambda: dict(metrics))
+    original_mark = splash_manager.mark_publication_dispatch_started
+
+    def mark_then_stale(**kwargs):
+        marked = original_mark(**kwargs)
+        metrics["last_polled_at"] = splash_manager.time.time() - 60
+        return marked
+
+    monkeypatch.setattr(
+        splash_manager, "mark_publication_dispatch_started", mark_then_stale
+    )
+    posted = []
+
+    def local_ack(_offer, _trade_id, _force, *, idempotency_key, request_contract):
+        posted.append(idempotency_key)
+        return {
+            "outcome": "acknowledged",
+            "provider": "splash",
+            "provider_response_id": None,
+            "echoed_idempotency_key": idempotency_key,
+            "request_sha256": publication_policy.publication_request_sha256(
+                request_contract
+            ),
+            "response_sha256": _sha("local-splash-ack"),
+            "status_code": 200,
+        }
+
+    monkeypatch.setattr(manager, "_post_single", local_ack)
+    result = manager.flush_queue()
+    row = isolated_database.list_publication_outbox(
+        intent_id=intent["intent_id"], publisher="splash"
+    )[0]
+
+    assert result["posted"] == 0
+    assert result["deferred_no_peers"] is True
+    assert posted == []
+    assert row["state"] == "retryable"
+    assert row["dispatch_started_at"] is None
+    assert row["request_sha256"] is None
+
+
 def test_durable_dexie_flush_stops_before_cycle_sla_budget(
     isolated_database, monkeypatch
 ):

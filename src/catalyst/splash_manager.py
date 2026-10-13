@@ -97,6 +97,29 @@ class SplashManager:
             raise TypeError("peer readiness provider must be callable")
         self._peer_readiness_provider = provider
 
+    def _has_fresh_peer(self) -> bool:
+        if self._peer_readiness_provider is None:
+            return True
+        try:
+            metrics = self._peer_readiness_provider()
+        except Exception:
+            return False
+        if type(metrics) is not dict:
+            return False
+        polled_at = metrics.get("last_polled_at")
+        started_at = metrics.get("started_at")
+        return (
+            metrics.get("reachable") is True
+            and metrics.get("process_running") is True
+            and type(metrics.get("peers")) is int
+            and metrics["peers"] > 0
+            and type(polled_at) in (int, float)
+            and type(started_at) in (int, float)
+            and started_at > 0
+            and polled_at >= started_at
+            and 0 <= time.time() - polled_at <= 15.0
+        )
+
     def enable_durable_outbox(
         self,
         *,
@@ -139,6 +162,7 @@ class SplashManager:
         posted = failed = skipped = requeued = 0
         budget_exhausted = False
         authorization_blocked = False
+        deferred_no_peers = False
         flush_started = time.monotonic()
         for index in range(max(1, limit)):
             if not flush_all and index > 0:
@@ -162,6 +186,9 @@ class SplashManager:
                         },
                     )
                     break
+            if not self._has_fresh_peer():
+                deferred_no_peers = True
+                break
             observed_at = self._durable_now_provider()
             claim = claim_publication_outbox(
                 publisher="splash",
@@ -238,6 +265,27 @@ class SplashManager:
                         data={"publication_deferred": deferred is not None},
                     )
                     break
+            if not self._has_fresh_peer():
+                deferred_no_peers = True
+                deferred = defer_publication_dispatch_before_effect(
+                    publication_id=dispatched["publication_id"],
+                    owner_run_id=dispatched["claim_owner_run_id"],
+                    claim_token=dispatched["claim_token"],
+                    claim_generation=dispatched["claim_generation"],
+                    expected_row_version=dispatched["row_version"],
+                    request_sha256=request_digest,
+                    evidence_json={
+                        "code": "SPLASH_PEER_UNREADY_BEFORE_EFFECT",
+                        "provider": "splash",
+                        "request_sha256": request_digest,
+                    },
+                    deferred_at=self._durable_now_provider(),
+                )
+                if deferred is None:
+                    failed += 1
+                else:
+                    requeued += 1
+                break
             result = self._post_single(
                 offer_bech32,
                 trade_id,
@@ -310,6 +358,7 @@ class SplashManager:
             "requeued": requeued,
             "budget_exhausted": budget_exhausted,
             "authorization_blocked": authorization_blocked,
+            "deferred_no_peers": deferred_no_peers,
         }
 
     def queue_post(self, offer_bech32: str, trade_id: str = None, force: bool = False):
@@ -376,40 +425,18 @@ class SplashManager:
             cfg, "SPLASH_ENABLED", False
         ):
             return {"posted": 0, "failed": 0, "skipped": 0, "disabled": True}
-        if self._peer_readiness_provider is not None:
-            try:
-                metrics = self._peer_readiness_provider()
-            except Exception:
-                metrics = None
-            polled_at = metrics.get("last_polled_at") if type(metrics) is dict else None
-            started_at = metrics.get("started_at") if type(metrics) is dict else None
-            fresh_peer = (
-                type(metrics) is dict
-                and metrics.get("reachable") is True
-                and metrics.get("process_running") is True
-                and type(metrics.get("peers")) is int
-                and metrics["peers"] > 0
-                and type(polled_at) in (int, float)
-                and type(started_at) in (int, float)
-                and started_at > 0
-                and polled_at >= started_at
-                and 0 <= time.time() - polled_at <= 15.0
-            )
-            if not fresh_peer:
-                # Splash's local HTTP acknowledgement precedes its asynchronous
-                # peer broadcast. Missing, stale or zero-peer metrics cannot
-                # establish the current daemon's ability to relay this offer.
-                # Keep the durable claim (or local queue) untouched until a
-                # fresh sample from the running process shows a peer.
-                return {
-                    "posted": 0,
-                    "failed": 0,
-                    "skipped": 0,
-                    "requeued": 0,
-                    "budget_exhausted": False,
-                    "authorization_blocked": False,
-                    "deferred_no_peers": True,
-                }
+        if not self._has_fresh_peer():
+            # The local HTTP ack precedes peer broadcast. Leave queued offers
+            # untouched until this daemon has a fresh positive-peer sample.
+            return {
+                "posted": 0,
+                "failed": 0,
+                "skipped": 0,
+                "requeued": 0,
+                "budget_exhausted": False,
+                "authorization_blocked": False,
+                "deferred_no_peers": True,
+            }
         if self._durable_outbox_owner is not None:
             return self._flush_durable_outbox(flush_all)
 
