@@ -2212,6 +2212,60 @@ def test_sage_exact_coin_heights_prove_fill_after_transaction_archive_cap(
     assert _classify(evidence)["classification"] == FILLED_PROVEN
 
 
+@pytest.mark.parametrize(
+    "malformed_receipt",
+    [
+        None,
+        {
+            "coin_id": RECEIVE,
+            "asset_id": None,
+            "amount": 2000,
+            "address_kind": "external",
+        },
+    ],
+)
+def test_sage_malformed_receipt_does_not_invent_coin_source_limit(
+    monkeypatch, malformed_receipt
+):
+    """An unrecognized receipt cannot prove a fill or erase exact input reads."""
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": _transaction(created=[malformed_receipt]),
+        },
+        get_coins_by_ids=lambda ids: {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            )
+        },
+    )
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert evidence["coin_records"]["read_error"] is None
+    assert evidence["coin_records"]["complete"] is True
+    assert evidence["transaction_history"]["records"][0]["created"] == [None]
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
 def test_sage_exact_coin_height_read_failure_is_not_complete(monkeypatch):
     import database
 

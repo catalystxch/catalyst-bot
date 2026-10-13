@@ -2759,6 +2759,11 @@ def load_authoritative_evidence(
                 for tx in supplemental_transactions:
                     for flow_name in ("spent", "created"):
                         for flow in tx.get(flow_name) or []:
+                            # Keep invalid flows in transaction evidence so the
+                            # terminal classifier still rejects incomplete proof.
+                            # They cannot supply authoritative coin/asset hints.
+                            if type(flow) is not dict:
+                                continue
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:
                                 required_ids.add(coin_id)
