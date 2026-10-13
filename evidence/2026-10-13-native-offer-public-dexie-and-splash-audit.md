@@ -91,3 +91,18 @@ cross-wallet offer view/take and fill, full visual GUI traversal, both final
   HTTP 401, and the browser was closed. This expected authorization boundary
   prevents that independent browser session from substituting for a visual
   check of the native window. The human physical-screen check is still open.
+
+## Native display recheck at 05:53 UTC
+
+- Windows Computer Use selected the sole running CATalyst window from its
+  returned app/window inventory. Its screenshot was entirely black both before
+  and after activation. The accessibility tree remained populated from the
+  WebView2 document and reported the Dashboard, Sage fingerprint 736588221,
+  running bot, synced wallet, two active offers (one buy and one sell), live
+  cycle activity and wallet balances. PID 171260 and its WebView2 child were
+  still alive; the backend monitor remained clean. This is a repeat of the
+  black-window observation, not proof of a process crash or a visual pass.
+- An accessibility click on the returned Offers element was rejected by the
+  computer-use tool because its mapped point was outside the 1000×700 window;
+  no tab change occurred. The current window therefore cannot support a fresh
+  full visual GUI acceptance. A physical-screen report is still pending.
