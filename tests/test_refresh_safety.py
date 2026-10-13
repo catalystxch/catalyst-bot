@@ -225,6 +225,37 @@ def test_parent_cannot_be_cancel_eligible_until_exact_confirmed_child_is_visible
     assert eligibility["child_trade_id"] == _sha("trade:child")
 
 
+def test_generic_cancel_prepare_cannot_bypass_unpublished_replacement_child(
+    isolated_database,
+):
+    """A manual Cancel All must obey the same child visibility gate as refresh."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    with pytest.raises(ValueError, match="replacement child is not visible"):
+        database.prepare_offer_cancel(
+            operation_id=operation,
+            event_id=f"{operation}:attempt:1:prepared",
+            trade_id=parent_trade,
+            intent_id="parent",
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": _sha("wallet-a"),
+                "network": "mainnet",
+            },
+            evidence_json={"trade_id": parent_trade},
+            prepared_at="2026-08-15T12:02:00.000000Z",
+        )
+    assert database.get_offer_operation_events(operation) == []
+
+
 def test_refresh_lineage_binding_is_idempotent_and_rejects_cross_lineage_rows(
     isolated_database,
 ):

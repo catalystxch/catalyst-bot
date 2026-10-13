@@ -23865,6 +23865,25 @@ def _prepare_offer_cancel_in_transaction(
     ).fetchone()
     prior_lifecycle_state = None
     if existing is None:
+        registered = conn.execute(
+            "SELECT intent_id, child_intent_id FROM offer_intents "
+            "WHERE sage_trade_id=?",
+            (safe_trade_id,),
+        ).fetchone()
+        if registered is not None:
+            child_id = registered["child_intent_id"]
+            if child_id:
+                if registered["intent_id"] != intent_id:
+                    raise ValueError("cancellation intent identity differs")
+                _parent, child = _refresh_lineage_rows(
+                    conn, registered["intent_id"], child_id
+                )
+                if (
+                    child["lifecycle_state"] != "visible"
+                    or not child["publication_identity"]
+                    or not child["first_visible_at"]
+                ):
+                    raise ValueError("replacement child is not visible")
         prior_rows = conn.execute(
             """
             SELECT * FROM offer_operation_journal
