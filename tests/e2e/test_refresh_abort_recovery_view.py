@@ -1,4 +1,4 @@
-"""The restricted page shows proof without exposing trading controls."""
+"""The restricted page shows proof without exposing broad trading controls."""
 
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.e2e
 
 
-def test_restricted_view_escapes_wallet_data_and_has_no_trading_action(page):
+def test_restricted_view_escapes_wallet_data_and_has_no_unscoped_action(page):
     page.add_init_script(
         """(() => {
             window.fetch = async () => new Response(JSON.stringify({
@@ -27,11 +27,17 @@ def test_restricted_view_escapes_wallet_data_and_has_no_trading_action(page):
         (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
     )
 
-    expect(page.locator("#status")).to_have_text("Read-only proof loaded.")
+    expect(page.locator("#status")).to_have_text(
+        "Exact proof loaded. Review the next action before proceeding."
+    )
     expect(page.locator("#stage")).to_contain_text("<img src=x")
     assert page.locator("img").count() == 0
     assert page.evaluate("window.__injected === true") is False
-    assert page.locator("button").all_text_contents() == ["Refresh proof"]
+    assert page.locator("button").all_text_contents() == [
+        "Refresh proof",
+        "Review exact recovery",
+    ]
+    expect(page.locator("#advance")).to_be_disabled()
     assert page.locator("#offers").inner_text() == "b" * 64
 
 

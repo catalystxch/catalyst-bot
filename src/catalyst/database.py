@@ -30319,8 +30319,7 @@ def adopt_refresh_abort_successor(
         if (
             parent["child_intent_id"] != child["intent_id"]
             or child["parent_intent_id"] != parent["intent_id"]
-            or child["lifecycle_state"] != "created"
-            or child["first_visible_at"] is not None
+            or not _refresh_abort_child_is_fenced_or_cancelled(conn, abort, child)
             or child["sage_trade_id"] not in json.loads(abort["target_trade_ids_json"])
             or (abort["state"] == "fenced" and parent["lifecycle_state"] != "visible")
             or (
@@ -31050,8 +31049,7 @@ def _validate_refresh_abort_commit_authority(
         or abort["child_intent_id"] != child["intent_id"]
         or parent["child_intent_id"] != child["intent_id"]
         or child["parent_intent_id"] != parent["intent_id"]
-        or child["lifecycle_state"] != "created"
-        or child["first_visible_at"] is not None
+        or not _refresh_abort_child_is_fenced_or_cancelled(conn, abort, child)
         or abort["wallet_fingerprint_hash"] != wallet_hash
         or abort["network"] != network
         or abort["asset_id"] != parent["asset_id"]

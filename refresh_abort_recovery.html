@@ -122,6 +122,10 @@
         nextAction = 'begin';
         advance.textContent = 'Verify parent cancellation';
         advance.disabled = true;
+      } else if (data.stage === 'fenced' && data.abort && data.candidate) {
+        nextAction = 'retry_parent_proof';
+        advance.textContent = 'Retry submitted parent proof';
+        advance.disabled = false;
       } else if (data.abort && data.stage === 'parent_terminal') {
         if (data.next_target_journal) {
           nextAction = 'reconcile_target';
@@ -178,13 +182,14 @@
       advance.disabled = true;
       try {
         const action = nextAction;
-        if (action === 'begin') {
-          if (!window.confirm(`Verify the submitted parent and fence only campaign ${campaignSelect.value}?`)) return;
+        if (action === 'begin' || action === 'retry_parent_proof') {
+          const campaignId = action === 'begin' ? campaignSelect.value : proof.abort.campaign_id;
+          if (!window.confirm(`Verify the submitted parent for only campaign ${campaignId}?`)) return;
           await postExact('begin', {
             confirmation: true,
             parent_intent_id: proof.candidate.parent_intent_id,
             child_intent_id: proof.candidate.child_intent_id,
-            campaign_id: campaignSelect.value,
+            campaign_id: campaignId,
             expected_latch_generation: proof.safety.generation,
             expected_trade_ids: proof.wallet.active_trade_ids
           });

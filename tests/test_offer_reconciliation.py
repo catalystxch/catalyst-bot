@@ -8913,6 +8913,7 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
         "crash_after_claim",
         "completion_extra_blocker",
         "multi_target",
+        "restart_after_child",
         "entry_unrelated_journal",
         "cleanup_unrelated_journal",
         "cleanup_active_worker",
@@ -9017,7 +9018,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     extra_trade = "f" * 64
     extra_intent = "9" * 64
     observed_book = [OTHER_TRADE]
-    if prepared_cleanup == "multi_target":
+    if prepared_cleanup in {"multi_target", "restart_after_child"}:
         extra_coin = "e" * 64
         assert database.upsert_coin(
             extra_coin,
@@ -9444,6 +9445,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         "crash_after_claim",
         "completion_extra_blocker",
         "multi_target",
+        "restart_after_child",
         "completion_unrelated_journal",
     }:
         # Exercise the complete manager -> durable Task 8 -> exact effect claim
@@ -9556,7 +9558,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
                 {"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}},
                 *(
                     [{"coin_id": "7" * 64, "coin": {"amount": 500_000_000}}]
-                    if prepared_cleanup == "multi_target"
+                    if prepared_cleanup in {"multi_target", "restart_after_child"}
                     else []
                 ),
             ]
@@ -9812,9 +9814,57 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             )
         finally:
             proof_connection.close()
+        if prepared_cleanup in {"multi_target", "restart_after_child"}:
+            # A restart may adopt the unfinished abort after the child has
+            # already obtained exact terminal cancellation proof.
+            authority_connection = database._stability_connection()
+            try:
+                checked = database._validate_refresh_abort_commit_authority(
+                    authority_connection,
+                    abort_id=abort["abort_id"],
+                    parent=database.get_offer_intent("intent-task9"),
+                    child=database.get_offer_intent(child_id),
+                    wallet_hash=WALLET,
+                    network=NETWORK,
+                    at=fresh_clock(),
+                )
+                assert checked["abort_id"] == abort["abort_id"]
+            finally:
+                authority_connection.close()
         assert json.loads(
             database.get_runtime_safety_latch()["blocking_operation_ids_json"]
         ) == [abort["blocking_operation_id"]]
+        if prepared_cleanup == "restart_after_child":
+            observed_book[:] = [extra_trade]
+            prior_lease = database.get_runtime_mutation_lease()
+            released = database.release_runtime_mutation_lease(
+                owner_run_id="run-task9",
+                expected_lease_version=prior_lease["lease_version"],
+                released_at=fresh_clock(),
+            )
+            assert released["released"] is True
+            adopted = database.adopt_refresh_abort_successor(
+                abort_id=abort["abort_id"],
+                successor_owner_run_id="run-after-child",
+                successor_owner_pid=2,
+                successor_owner_host="test-host",
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+                asset_id=ASSET,
+                expected_lease_version=released["lease"]["lease_version"],
+                lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+                prior_owner_liveness_proven_dead=False,
+                observed_trade_ids=[extra_trade],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+            assert adopted["adopted"] is True
+            assert adopted["abort"]["state"] == "parent_terminal"
+            assert adopted["abort"]["owner_run_id"] == "run-after-child"
+            assert database.get_runtime_safety_latch()["state"] == "tripped"
+            return
         if prepared_cleanup == "multi_target":
             observed_book[:] = [extra_trade]
             remaining = database.authorize_refresh_abort_cleanup_target(

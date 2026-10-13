@@ -102,6 +102,44 @@ def test_restricted_recovery_fee_flow_never_calls_coin_prep(page):
     assert calls[1]["body"]["cancellation_reserve_mojos"] == "1000000000"
 
 
+def test_restricted_recovery_retries_fenced_parent_proof(page):
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
+    page.evaluate(
+        """() => {
+          window.__recoveryCalls = [];
+          window.confirm = () => true;
+          window.fetch = async (path, options = {}) => {
+            if (options.method === 'POST') {
+              window.__recoveryCalls.push({path, body: JSON.parse(options.body)});
+              return new Response(JSON.stringify({success: true,
+                stage: 'parent_terminal'}), {status: 200});
+            }
+            return new Response(JSON.stringify({
+              success: true, stage: 'fenced',
+              candidate: {parent_intent_id: 'parent', child_intent_id: 'child'},
+              abort: {abort_id: 'a'.repeat(64), campaign_id: 'b'.repeat(64),
+                      latch_generation: 7},
+              wallet: {fingerprint: 736588221, network: 'mainnet',
+                       asset_id: 'd'.repeat(64), active_trade_ids: ['c'.repeat(64)],
+                       pending_transaction_count: 0},
+              safety: {state: 'tripped', generation: 7, lease_owned: true},
+              stopped_campaigns: [], next_target_journal: null
+            }), {status: 200});
+          };
+        }"""
+    )
+    page.locator("#refresh").click()
+    expect(page.locator("#advance")).to_have_text("Retry submitted parent proof")
+    page.locator("#advance").click()
+    page.wait_for_function("() => window.__recoveryCalls.length === 1")
+    call = page.evaluate("window.__recoveryCalls[0]")
+    assert call["path"].endswith("/refresh_abort/begin")
+    assert call["body"]["campaign_id"] == "b" * 64
+    assert call["body"]["expected_trade_ids"] == ["c" * 64]
+
+
 def test_fenced_cancel_dialog_submits_one_exact_target(page):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
     page.evaluate(
