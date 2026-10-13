@@ -615,6 +615,11 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
                 window.__feeCalls.push({path: String(path), body: options.body || null});
+                if (String(path).endsWith('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'allowed'}}), {status: 200});
+                }
                 return new Response(JSON.stringify({success: false, error: 'test stop'}), {
                     status: 400,
                     headers: {'Content-Type': 'application/json'},
@@ -634,13 +639,14 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
     )
 
     assert result == [
+        {"path": "/api/offers/refresh_abort/preview", "body": None},
         {
             "path": "/api/offers/cancel_all",
             "body": json.dumps(
                 {"source": "coin_prep", "fee_approval_id": approval_id},
                 separators=(",", ":"),
             ),
-        }
+        },
     ]
 
 
@@ -657,6 +663,11 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'allowed'}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__statusReads += 1;
                     return new Response(JSON.stringify({
@@ -734,6 +745,11 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'allowed'}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,
@@ -807,6 +823,11 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page, reason):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'allowed'}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true, running: false, complete: false,

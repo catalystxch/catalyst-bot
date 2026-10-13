@@ -698,6 +698,71 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def get_refresh_abort_preview(self):
+        """Read exact fenced recovery scope for the native operator view."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/offers/refresh_abort/preview"):
+            resp = api_server.api_refresh_abort_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def begin_refresh_abort(self, body=None):
+        """Reach the exact proof-only abort route while the safety latch holds."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/begin",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_begin()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def cancel_next_refresh_abort_offer(self, body=None):
+        """Use the route's exact fence, Task 8 journal, fee and Sage checks."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/cancel_next",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_cancel_next()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def reconcile_refresh_abort_target(self, body=None):
+        """Check one exact target through the normal authoritative proof path."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/reconcile_target",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_reconcile_target()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def complete_refresh_abort(self, body=None):
+        """Close only a proven empty exact abort without a wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/complete",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_complete()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:cancel_offer")
     def cancel_offer(self, body=None):
         """Cancel a single offer. Maps to POST /api/offers/cancel."""
@@ -1973,6 +2038,10 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "stop_bootstrap_campaign",
 }
 _APP_BRIDGE_CONTROL_METHODS = {
+    "begin_refresh_abort",
+    "cancel_next_refresh_abort_offer",
+    "reconcile_refresh_abort_target",
+    "complete_refresh_abort",
     "browse_sage_cert",
     "close_window",
     "confirm_close_window",
@@ -1999,6 +2068,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_bootstrap_partial_offer_capability",
     "get_bootstrap_status",
     "get_cancel_all_status",
+    "get_refresh_abort_preview",
     "get_cats",
     "get_coin_prep_status",
     "get_coins",

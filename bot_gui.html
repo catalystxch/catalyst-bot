@@ -12094,6 +12094,14 @@
                     <span class="v4-modal-note-icon">ⓘ</span>
                     <span>Stop the bot first, then use this for a clean restart or wallet switch. It is not needed for routine monitoring.</span>
                 </div>
+                <div id="refreshAbortPanel" class="v4-modal-panel v4-modal-panel--warning" hidden>
+                    <strong>Fenced offer recovery</strong>
+                    <p id="refreshAbortSummary" style="overflow-wrap: anywhere;"></p>
+                    <label id="refreshAbortCampaignRow" hidden>Stopped campaign
+                        <select id="refreshAbortCampaign"></select>
+                    </label>
+                    <button type="button" id="refreshAbortActionBtn" class="btn btn-cancel btn-danger">Review recovery</button>
+                </div>
                 <div class="v4-modal-actions v4-modal-actions--center">
                     <button class="btn btn-config btn-secondary" onclick="closeCancelConfirm()" style="flex: 1; max-width: 170px;">Keep Offers</button>
                     <button class="btn btn-cancel btn-danger" onclick="confirmCancelAll()" style="flex: 1; max-width: 170px;" id="cancelAllConfirmBtn">Cancel All</button>
@@ -15335,6 +15343,11 @@
             if (m === 'GET'  && clean === 'offers')             return 'get_offers';
             if (m === 'POST' && clean === 'offers/cancel_all')  return 'cancel_all_offers';
             if (m === 'GET'  && clean === 'offers/cancel_all/status') return 'get_cancel_all_status';
+            if (m === 'GET'  && clean === 'offers/refresh_abort/preview') return 'get_refresh_abort_preview';
+            if (m === 'POST' && clean === 'offers/refresh_abort/begin') return 'begin_refresh_abort';
+            if (m === 'POST' && clean === 'offers/refresh_abort/cancel_next') return 'cancel_next_refresh_abort_offer';
+            if (m === 'POST' && clean === 'offers/refresh_abort/reconcile_target') return 'reconcile_refresh_abort_target';
+            if (m === 'POST' && clean === 'offers/refresh_abort/complete') return 'complete_refresh_abort';
             if (m === 'POST' && clean === 'offers/cancel')      return 'cancel_offer';
             if (m === 'POST' && clean === 'offers/cleanup_orphans') return 'cleanup_orphans';
             if (m === 'GET'  && clean === 'offers/diagnostic')  return 'get_offers_diagnostic';
@@ -15539,6 +15552,7 @@
             LATCH_BINDING_MISMATCH: 'Safety latch binding changed',
             STARTUP_AUTHORITY_CHANGED: 'Startup authority changed',
             UNRESOLVED_OPERATIONS: 'Unresolved operations require review',
+            REFRESH_ABORT_CLEANUP: 'Confirmed refresh cancellation requires exact offer cleanup',
             RECONCILIATION_REQUIRED: 'Authoritative reconciliation is required',
             CANCEL_UNKNOWN: 'Cancellation outcome requires reconciliation',
             CREATE_UNKNOWN: 'Creation outcome requires reconciliation',
@@ -32763,6 +32777,158 @@
         }
 
         let _cancelAllContext = null;
+        let _refreshAbortPreview = null;
+
+        async function loadRefreshAbortReview() {
+            const panel = document.getElementById('refreshAbortPanel');
+            const summary = document.getElementById('refreshAbortSummary');
+            const action = document.getElementById('refreshAbortActionBtn');
+            const broad = document.getElementById('cancelAllConfirmBtn');
+            const campaignRow = document.getElementById('refreshAbortCampaignRow');
+            const campaignSelect = document.getElementById('refreshAbortCampaign');
+            panel.hidden = true;
+            campaignRow.hidden = true;
+            broad.disabled = true;
+            action.disabled = true;
+            _refreshAbortPreview = null;
+            let preview;
+            try {
+                const response = await apiFetch(`${API_URL}/offers/refresh_abort/preview`, { cache: 'no-store' });
+                preview = await response.json();
+                if (!response.ok || preview.success !== true) throw new Error(preview.error || 'preview unavailable');
+            } catch (error) {
+                panel.hidden = false;
+                summary.textContent = 'The complete Sage book and safety state could not be verified. No cancellation will be sent.';
+                action.textContent = 'Recovery unavailable';
+                return;
+            }
+            _refreshAbortPreview = preview;
+            const hasRecovery = Boolean(preview.candidate || preview.abort);
+            if (!hasRecovery && preview.safety?.state === 'allowed') {
+                broad.disabled = false;
+                return;
+            }
+            document.getElementById('cancelConfirmTitle').textContent = hasRecovery
+                ? 'Recover fenced offers' : 'Offer control is blocked';
+            document.getElementById('cancelConfirmCopy').textContent = hasRecovery
+                ? 'The earlier cancellation needs exact Sage proof. Broad Cancel All is disabled; review one recorded offer at a time.'
+                : 'The safety gate is blocking wallet actions until its cause is resolved.';
+            panel.hidden = false;
+            const trades = preview.wallet?.active_trade_ids || [];
+            const fingerprint = preview.wallet?.fingerprint || 'unavailable';
+            const scope = `Sage wallet ${fingerprint}: ${trades.length} live offer${trades.length === 1 ? '' : 's'}, ${preview.wallet?.pending_transaction_count ?? '?'} pending transaction(s).`;
+            document.getElementById('cancelOfferCount').textContent = scope;
+            if (!hasRecovery || !preview.safety?.lease_owned || preview.wallet?.pending_transaction_count !== 0) {
+                summary.textContent = `${scope} Exact recovery is unavailable; the wallet remains fenced.`;
+                action.textContent = 'Recovery blocked';
+                return;
+            }
+            if (preview.stage === 'submitted_parent_proof' || preview.stage === 'fenced') {
+                const campaigns = preview.stopped_campaigns || [];
+                campaignSelect.replaceChildren();
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = 'Choose the exact stopped campaign';
+                campaignSelect.appendChild(placeholder);
+                for (const campaign of campaigns) {
+                    const option = document.createElement('option');
+                    option.value = campaign.campaign_id;
+                    option.textContent = `${campaign.campaign_id.slice(0, 12)}… · ${campaign.fee_budget_xch} XCH fee cap`;
+                    campaignSelect.appendChild(option);
+                }
+                campaignRow.hidden = preview.stage !== 'submitted_parent_proof';
+                summary.textContent = `${scope} Parent ${preview.candidate?.parent_trade_id?.slice(0, 14) || 'recorded'} has a submitted cancellation. The replacement child must remain unpublished while parent terminal proof is checked. No new cancellation is sent at this stage.`;
+                action.textContent = 'Check parent cancellation proof';
+                action.disabled = preview.stage === 'submitted_parent_proof';
+            } else if (preview.stage === 'parent_terminal') {
+                const next = trades[0];
+                const journal = preview.next_target_journal;
+                summary.textContent = journal
+                    ? `${scope} Cancellation ${journal.trade_id} needs terminal Sage proof before another offer can be touched.`
+                    : next
+                    ? `${scope} Parent cancellation is proven. Next exact target: ${next}. One cancellation is submitted at a time, followed by Sage terminal proof.`
+                    : `${scope} All target offers must have terminal proof before this fence can close.`;
+                action.textContent = journal ? 'Check target cancellation proof'
+                    : !next ? 'Check empty-book completion' : 'Cancel this one offer';
+                action.disabled = journal?.phase === 'PREPARED';
+                if (action.disabled) summary.textContent += ' A prepared wallet effect is unresolved; no retry is allowed.';
+            } else {
+                summary.textContent = `${scope} Recovery stage ${preview.stage} requires review. No broad cancellation is allowed.`;
+                action.textContent = 'Recovery blocked';
+            }
+        }
+
+        async function runRefreshAbortAction() {
+            const preview = _refreshAbortPreview;
+            if (!preview || bot_state?.running) return;
+            const action = document.getElementById('refreshAbortActionBtn');
+            action.disabled = true;
+            const trades = preview.wallet?.active_trade_ids || [];
+            let path, body, title, message;
+            if (preview.stage === 'submitted_parent_proof' || preview.stage === 'fenced') {
+                const campaignId = preview.stage === 'fenced'
+                    ? preview.abort?.campaign_id : document.getElementById('refreshAbortCampaign').value;
+                if (!preview.candidate || !campaignId) return;
+                path = 'begin';
+                body = { confirmation: true, parent_intent_id: preview.candidate.parent_intent_id,
+                    child_intent_id: preview.candidate.child_intent_id, campaign_id: campaignId,
+                    expected_latch_generation: preview.safety.generation, expected_trade_ids: trades };
+                title = 'Check exact parent cancellation?';
+                message = 'Keep the wallet fenced while CATalyst checks authoritative cancellation proof. This does not send another wallet transaction.';
+            } else if (preview.stage === 'parent_terminal' && preview.next_target_journal) {
+                if (preview.next_target_journal.phase === 'PREPARED') return;
+                path = 'reconcile_target';
+                body = { abort_id: preview.abort.abort_id,
+                    trade_id: preview.next_target_journal.trade_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check exact offer proof?';
+                message = 'Ask Sage for terminal proof for the submitted cancellation. This does not send another cancellation.';
+            } else if (preview.stage === 'parent_terminal' && trades.length === 0) {
+                path = 'complete';
+                body = { confirmation: true, abort_id: preview.abort.abort_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check empty wallet book?';
+                message = 'Close the recovery fence only after two complete empty Sage reads and durable terminal proof for every target.';
+            } else if (preview.stage === 'parent_terminal' && trades.length > 0) {
+                const approval = (preview.stopped_campaigns || []).find(
+                    campaign => campaign.campaign_id === preview.abort.campaign_id)?.fee_approval_id;
+                if (!approval) {
+                    showToast('The exact campaign fee approval is unavailable; no cancellation was sent.', 'warning');
+                    return;
+                }
+                path = 'cancel_next';
+                body = { confirmation: true, abort_id: preview.abort.abort_id,
+                    expected_latch_generation: preview.abort.latch_generation,
+                    expected_trade_ids: trades, expected_next_trade_id: trades[0],
+                    fee_approval_id: approval };
+                title = 'Cancel one exact live offer?';
+                message = `Sage shows ${trades.length} live offer(s). Send a cancellation for ${trades[0]} only, using the stopped campaign's fee approval? The other offers remain untouched until this one is proven terminal.`;
+            } else return;
+            const confirmed = await showStyledConfirm({ icon: '⚠', title, message,
+                confirmText: path === 'cancel_next' ? 'Cancel This Offer' : 'Check Proof',
+                cancelText: 'Keep Wallet Fenced', style: 'danger' });
+            if (!confirmed) { await loadRefreshAbortReview(); return; }
+            try {
+                const response = await apiFetch(`${API_URL}/offers/refresh_abort/${path}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const result = await response.json();
+                showToast(result.success ? `Recovery: ${result.stage}` :
+                    `Recovery held: ${result.error || result.stage || 'proof incomplete'}`,
+                    result.success ? 'info' : 'warning');
+            } catch (_) {
+                showToast('Recovery request failed; the wallet remains fenced.', 'warning');
+            }
+            await loadRefreshAbortReview();
+        }
+        document.getElementById('refreshAbortActionBtn').addEventListener('click', runRefreshAbortAction);
+        document.getElementById('refreshAbortCampaign').addEventListener('change', () => {
+            if (_refreshAbortPreview?.stage === 'submitted_parent_proof') {
+                document.getElementById('refreshAbortActionBtn').disabled =
+                    !document.getElementById('refreshAbortCampaign').value;
+            }
+        });
 
         async function cancelAllOffers(context = null) {
             if (bot_state?.running) {
@@ -32823,6 +32989,7 @@
             }
             
             document.getElementById('cancelConfirmModal').classList.add('active');
+            await loadRefreshAbortReview();
         }
         
         function closeCancelConfirm({ clearContext = true } = {}) {
@@ -32858,6 +33025,11 @@
         }
 
         async function confirmCancelAll() {
+            const review = _refreshAbortPreview;
+            if (!review || review.candidate || review.abort || review.safety?.state !== 'allowed') {
+                showToast('Broad cancellation is held pending exact wallet recovery review.', 'warning');
+                return;
+            }
             if (bot_state?.running) {
                 addLogEntry('warning', 'Cancel All blocked - stop the bot first');
                 showToast('Stop the bot before cancelling all offers', 'warning');

@@ -24952,6 +24952,7 @@ def _authorize_refresh_abort_cancel_finalization(
     if row is None:
         return False
     abort = dict(row)
+    _assert_refresh_abort_effect_scope(conn, {operation_id})
     latch_row = conn.execute(
         "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
     ).fetchone()
@@ -25005,6 +25006,7 @@ def _authorize_refresh_abort_cancel_finalization(
         and lease["expires_at"] is not None
         and lease["expires_at"] > _stability_wall_clock()
         and campaign_row["status"] == "stopped"
+        and _refresh_abort_unresolved_journal_ids(conn) == {operation_id}
     )
 
 
@@ -29786,6 +29788,85 @@ def _refresh_abort_child_is_fenced_or_cancelled(
     )
 
 
+def _refresh_abort_unresolved_journal_ids(conn: sqlite3.Connection) -> set[str]:
+    """Read the latest durable operation blockers in the same DB snapshot."""
+
+    rows = conn.execute(
+        "SELECT journal.operation_id FROM offer_operation_journal AS journal "
+        "JOIN (SELECT operation_id,MAX(sequence) AS sequence "
+        "FROM offer_operation_journal GROUP BY operation_id) AS latest "
+        "ON latest.operation_id=journal.operation_id "
+        "AND latest.sequence=journal.sequence "
+        "WHERE journal.blocks_mutation=1 ORDER BY journal.operation_id LIMIT 257"
+    ).fetchall()
+    if len(rows) > 256:
+        raise ValueError("refresh abort unresolved journal set is too large")
+    return {str(row["operation_id"]) for row in rows}
+
+
+def _assert_refresh_abort_journal_scope(
+    conn: sqlite3.Connection, expected: set[str]
+) -> None:
+    if _refresh_abort_unresolved_journal_ids(conn) != expected:
+        raise ValueError("refresh abort has an unrelated durable operation")
+
+
+def _assert_refresh_abort_effect_scope(
+    conn: sqlite3.Connection, permitted_operations: set[str]
+) -> None:
+    """Reject any other retained wallet effect before granting cleanup authority."""
+
+    for query in (
+        "SELECT claim.operation_id FROM wallet_effect_claims AS claim "
+        "LEFT JOIN wallet_effect_claim_resolutions AS resolution "
+        "ON resolution.claim_token=claim.claim_token "
+        "LEFT JOIN wallet_effect_dispatches AS dispatch "
+        "ON dispatch.claim_token=claim.claim_token "
+        "LEFT JOIN coin_prep_operations AS prep "
+        "ON prep.effect_claim_token=claim.claim_token "
+        "WHERE (resolution.claim_token IS NULL "
+        "OR resolution.outcome<>'RELEASED_NO_EFFECT' "
+        "OR NOT ((dispatch.dispatch_token IS NOT NULL "
+        "AND dispatch.dispatch_token=json_extract(resolution.evidence_json, '$.dispatch_token')) "
+        "OR (dispatch.dispatch_token IS NULL "
+        "AND json_extract(resolution.evidence_json, '$.reason_code') IN "
+        "('PRE_DISPATCH_RETRY_CONTRACT_COLLISION','PRE_DISPATCH_PREP_NO_EFFECT_CONFIRMED') "
+        "AND json_extract(resolution.evidence_json, '$.effect_attempted')=0))) "
+        "AND COALESCE(NOT (prep.outcome='CONFIRMED' "
+        "OR (prep.outcome='FAILED' "
+        "AND json_extract(prep.outcome_evidence_json, '$.reason_code')="
+        "'AUTHORITATIVE_NO_EFFECT_CONFIRMED' "
+        "AND json_extract(prep.outcome_evidence_json, '$.effect_attempted')=0)),1) "
+        "LIMIT 257",
+        "SELECT reservation.operation_id FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE outcome.operation_id IS NULL LIMIT 257",
+        "SELECT operation_id FROM coin_prep_operations "
+        "WHERE outcome IN ('PREPARED','SUBMITTED_UNKNOWN') LIMIT 257",
+    ):
+        rows = conn.execute(query).fetchall()
+        if len(rows) > 256 or any(
+            str(row["operation_id"]) not in permitted_operations for row in rows
+        ):
+            raise ValueError("refresh abort has an unrelated wallet effect")
+    if (
+        conn.execute(
+            "SELECT 1 FROM publication_outbox WHERE state IN ('claimed','unresolved') "
+            "OR (dispatch_started_at IS NOT NULL "
+            "AND state NOT IN ('succeeded','suppressed')) LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("refresh abort has an unresolved publication effect")
+    if (
+        conn.execute(
+            "SELECT 1 FROM runtime_worker_delegations WHERE state='active' LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("refresh abort has an active worker delegation")
+
+
 def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
     """Read one exact abort fence without implying cleanup progress."""
 
@@ -29796,6 +29877,102 @@ def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
         .fetchone()
     )
     return dict(row) if row is not None else None
+
+
+def list_fenced_refresh_abort_candidates(
+    *, asset_id: str, wallet_fingerprint_hash: str, network: str
+) -> List[Dict[str, Any]]:
+    """List exact unpublished-child lineages with a submitted parent cancel.
+
+    This is diagnostic discovery only. A candidate has no abort or wallet
+    authority until ``begin_refresh_abort`` validates fresh Sage and lease
+    state inside its write transaction.
+    """
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    safe_wallet = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT parent.intent_id AS parent_intent_id, "
+        "child.intent_id AS child_intent_id, "
+        "parent.sage_trade_id AS parent_trade_id, "
+        "child.sage_trade_id AS child_trade_id, "
+        "parent.asset_id AS asset_id, parent.side AS side "
+        "FROM offer_intents AS parent "
+        "JOIN offer_intents AS child ON child.intent_id=parent.child_intent_id "
+        "JOIN offers AS projection ON projection.trade_id=parent.sage_trade_id "
+        "WHERE parent.wallet_fingerprint_hash=? AND parent.network=? "
+        "AND parent.asset_id=? AND parent.lifecycle_state='visible' "
+        "AND parent.first_visible_at IS NOT NULL "
+        "AND child.parent_intent_id=parent.intent_id "
+        "AND child.wallet_fingerprint_hash=parent.wallet_fingerprint_hash "
+        "AND child.network=parent.network AND child.asset_id=parent.asset_id "
+        "AND child.lifecycle_state='created' AND child.first_visible_at IS NULL "
+        "AND parent.sage_trade_id IS NOT NULL "
+        "AND child.sage_trade_id IS NOT NULL "
+        "AND projection.status='open' "
+        "AND projection.lifecycle_state='cancel_requested' "
+        "ORDER BY parent.prepared_at,parent.intent_id LIMIT 65",
+        (safe_wallet, safe_network, safe_asset),
+    ).fetchall()
+    if len(rows) > 64:
+        raise ValueError("refresh abort candidates exceed bounded review")
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        candidate = dict(row)
+        operation_id = f"cancel:{candidate['parent_trade_id']}"
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if latest_row is None:
+            continue
+        latest = validate_offer_operation_event(dict(latest_row))
+        if (
+            latest["operation_type"] != "CANCEL"
+            or latest["intent_id"] != candidate["parent_intent_id"]
+            or latest["phase"] != "FINALIZED"
+            or latest["outcome"] != "CANCEL_SUBMITTED_UNCONFIRMED"
+            or latest["blocks_mutation"] != 1
+            or not (latest["transaction_id"] or latest["spend_identity"])
+        ):
+            continue
+        result.append({**candidate, "cancel_operation_id": operation_id})
+    return result
+
+
+def list_incomplete_refresh_aborts(
+    *, asset_id: str, wallet_fingerprint_hash: str, network: str
+) -> List[Dict[str, Any]]:
+    """Read durable abort stages for native recovery after page reload."""
+
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    safe_wallet = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("refresh abort network is invalid")
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT * FROM offer_refresh_aborts WHERE asset_id=? "
+            "AND wallet_fingerprint_hash=? AND network=? "
+            "AND state IN ('fenced','parent_terminal') "
+            "ORDER BY recorded_at,abort_id LIMIT 65",
+            (safe_asset, safe_wallet, safe_network),
+        )
+        .fetchall()
+    )
+    if len(rows) > 64:
+        raise ValueError("refresh abort stages exceed bounded review")
+    return [dict(row) for row in rows]
 
 
 def authorize_refresh_abort_cleanup_target(
@@ -29923,6 +30100,12 @@ def authorize_refresh_abort_cleanup_target(
             or campaign_row["status"] != "stopped"
         ):
             raise ValueError("refresh abort cleanup authority changed")
+        _assert_refresh_abort_journal_scope(
+            conn, {safe_prepared} if safe_prepared is not None else set()
+        )
+        _assert_refresh_abort_effect_scope(
+            conn, {safe_prepared} if safe_prepared is not None else set()
+        )
         active_rows = conn.execute(
             "SELECT intent_id,sage_trade_id,asset_id FROM offer_intents WHERE "
             "wallet_fingerprint_hash=? AND network=? "
@@ -30162,6 +30345,8 @@ def complete_refresh_abort(
             or campaign_row["status"] != "stopped"
         ):
             raise ValueError("refresh abort completion authority changed")
+        _assert_refresh_abort_journal_scope(conn, set())
+        _assert_refresh_abort_effect_scope(conn, set())
         parent, child = _refresh_lineage_rows(
             conn, abort["parent_intent_id"], abort["child_intent_id"]
         )
@@ -30299,6 +30484,14 @@ def _validate_refresh_abort_commit_authority(
         expected_blockers.add(abort["cancel_operation_id"])
     elif abort["state"] != "parent_terminal":
         raise ValueError("refresh abort stage is not a parent proof stage")
+    _assert_refresh_abort_journal_scope(
+        conn,
+        {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
+    )
+    _assert_refresh_abort_effect_scope(
+        conn,
+        {abort["cancel_operation_id"]} if abort["state"] == "fenced" else set(),
+    )
     if (
         abort["parent_intent_id"] != parent["intent_id"]
         or abort["child_intent_id"] != child["intent_id"]
@@ -30384,6 +30577,8 @@ def begin_refresh_abort(
             (parent_id,),
         ).fetchone()
         if prior_row is not None and prior_row["state"] == "parent_terminal":
+            _assert_refresh_abort_journal_scope(conn, set())
+            _assert_refresh_abort_effect_scope(conn, set())
             prior = dict(prior_row)
             terminal_offer = conn.execute(
                 "SELECT status FROM offers WHERE trade_id=?", (parent_trade,)
@@ -30505,6 +30700,8 @@ def begin_refresh_abort(
             or not (latest["transaction_id"] or latest["spend_identity"])
         ):
             raise ValueError("submitted cancellation is not an exact blocker")
+        _assert_refresh_abort_journal_scope(conn, {cancel_op})
+        _assert_refresh_abort_effect_scope(conn, {cancel_op})
         db_trades = sorted(
             str(row["sage_trade_id"])
             for row in conn.execute(

@@ -485,6 +485,494 @@ def api_cancel_all_status():
     return jsonify({"success": True, **_get_cancel_all_state()})
 
 
+@bp.route("/api/offers/refresh_abort/preview")
+def api_refresh_abort_preview():
+    """Review exact fenced recovery candidates without issuing a wallet effect."""
+
+    import wallet
+
+    bot = api_server.bot
+    if bot is not None and bot.is_running():
+        return jsonify({"success": False, "error": "stop_bot_first"}), 409
+    runtime = api_server.mutation_gate.current_runtime()
+    binding = getattr(runtime, "wallet_identity_binding", None)
+    if binding is None or binding.backend != "sage":
+        return jsonify({"success": False, "error": "sage_identity_unavailable"}), 409
+    wallet_hash = api_server.mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+    asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+    if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
+        return jsonify({"success": False, "error": "exact_asset_unavailable"}), 409
+    try:
+        snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+        candidates = database.list_fenced_refresh_abort_candidates(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=binding.network_id,
+        )
+        aborts = database.list_incomplete_refresh_aborts(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=binding.network_id,
+        )
+        campaigns = database.list_stopped_bootstrap_campaigns_for_identity(
+            asset_id, binding.fingerprint, binding.network_id
+        )
+        latch = database.get_runtime_safety_latch()
+        lease = database.get_runtime_mutation_lease()
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Exact refresh abort preview unavailable",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+        return jsonify(
+            {"success": False, "error": "authoritative_preview_unavailable"}
+        ), 503
+    if len(candidates) > 1 or len(aborts) > 1:
+        return jsonify(
+            {"success": False, "error": "ambiguous_refresh_abort_scope"}
+        ), 409
+    current_abort = aborts[0] if aborts else None
+    current_candidate = candidates[0] if candidates else None
+    if current_abort is not None and current_candidate is not None:
+        if current_abort["parent_intent_id"] != current_candidate["parent_intent_id"]:
+            return jsonify(
+                {"success": False, "error": "ambiguous_refresh_abort_scope"}
+            ), 409
+    next_trade = snapshot["trade_ids"][0] if snapshot["trade_ids"] else None
+    next_event = None
+    if current_abort is not None:
+        # A submitted target can disappear from Sage's active list before its
+        # Task 9 terminal proof is durable. Keep that journal visible so the
+        # operator can reconcile it before authorizing the next cancellation.
+        for target_trade in json.loads(current_abort["target_trade_ids_json"]):
+            events = database.get_offer_operation_events(f"cancel:{target_trade}")
+            if events and events[-1]["blocks_mutation"] == 1:
+                next_trade, next_event = target_trade, events[-1]
+                break
+        if next_event is None and next_trade is not None:
+            events = database.get_offer_operation_events(f"cancel:{next_trade}")
+            next_event = events[-1] if events else None
+    return jsonify(
+        {
+            "success": True,
+            "stage": (
+                current_abort["state"]
+                if current_abort is not None
+                else "submitted_parent_proof"
+                if current_candidate is not None
+                else "no_exact_candidate"
+            ),
+            "candidate": current_candidate,
+            "abort": (
+                {
+                    "abort_id": current_abort["abort_id"],
+                    "parent_intent_id": current_abort["parent_intent_id"],
+                    "child_intent_id": current_abort["child_intent_id"],
+                    "campaign_id": current_abort["campaign_id"],
+                    "latch_generation": current_abort["latch_generation"],
+                    "target_trade_ids": json.loads(
+                        current_abort["target_trade_ids_json"]
+                    ),
+                    "state": current_abort["state"],
+                }
+                if current_abort is not None
+                else None
+            ),
+            "wallet": {
+                "fingerprint": binding.fingerprint,
+                "network": binding.network_id,
+                "asset_id": asset_id,
+                "active_trade_ids": snapshot["trade_ids"],
+                "pending_transaction_count": len(snapshot["pending_transaction_ids"]),
+                "observed_at": snapshot["observed_at"],
+            },
+            "safety": {
+                "state": latch["state"] if latch else "unavailable",
+                "generation": latch["generation"] if latch else None,
+                "blocking_operation_ids": (
+                    json.loads(latch["blocking_operation_ids_json"]) if latch else []
+                ),
+                "lease_owned": bool(
+                    lease
+                    and lease["active"] == 1
+                    and lease["owner_run_id"] == runtime.run_id
+                ),
+            },
+            "stopped_campaigns": [
+                {
+                    "campaign_id": campaign["campaign_id"],
+                    "fee_budget_xch": campaign["fee_budget_xch"],
+                    "fee_spent_mojos": database.get_bootstrap_campaign_authoritative_fee_spent_mojos(
+                        campaign["campaign_id"]
+                    ),
+                    "fee_approval_id": database.get_latest_coin_prep_fee_approval_for_campaign(
+                        campaign["campaign_id"]
+                    ),
+                }
+                for campaign in campaigns[:64]
+            ],
+            "next_target_journal": (
+                {
+                    "trade_id": next_trade,
+                    "phase": next_event["phase"],
+                    "outcome": next_event["outcome"],
+                }
+                if next_event is not None
+                else None
+            ),
+            "wallet_effect_started": False,
+        }
+    )
+
+
+@bp.route("/api/offers/refresh_abort/begin", methods=["POST"])
+def api_refresh_abort_begin():
+    """Fence one reviewed lineage and record only authoritative parent proof."""
+
+    import offer_reconciliation
+    import wallet
+
+    body = request.get_json(silent=True)
+    required = {
+        "confirmation",
+        "parent_intent_id",
+        "child_intent_id",
+        "campaign_id",
+        "expected_latch_generation",
+        "expected_trade_ids",
+    }
+    if type(body) is not dict or set(body) != required:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    expected = body["expected_trade_ids"]
+    if (
+        body["confirmation"] is not True
+        or type(body["parent_intent_id"]) is not str
+        or not body["parent_intent_id"]
+        or type(body["child_intent_id"]) is not str
+        or not body["child_intent_id"]
+        or type(body["campaign_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["campaign_id"]) is None
+        or type(body["expected_latch_generation"]) is not int
+        or body["expected_latch_generation"] < 1
+        or type(expected) is not list
+        or not 1 <= len(expected) <= 256
+        or any(
+            type(trade) is not str or re.fullmatch(r"[0-9a-f]{64}", trade) is None
+            for trade in expected
+        )
+        or expected != sorted(set(expected))
+    ):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    with api_server._bot_cancel_lifecycle_lock:
+        bot = api_server.bot
+        if bot is not None and bot.is_running():
+            return jsonify({"success": False, "error": "stop_bot_first"}), 409
+        runtime = api_server.mutation_gate.current_runtime()
+        binding = getattr(runtime, "wallet_identity_binding", None)
+        if runtime is None or binding is None or binding.backend != "sage":
+            return jsonify(
+                {"success": False, "error": "sage_identity_unavailable"}
+            ), 409
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
+            return jsonify({"success": False, "error": "exact_asset_unavailable"}), 409
+        try:
+            snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+            if snapshot["trade_ids"] != expected or snapshot["pending_transaction_ids"]:
+                return jsonify({"success": False, "error": "sage_book_changed"}), 409
+            candidates = database.list_fenced_refresh_abort_candidates(
+                asset_id=asset_id,
+                wallet_fingerprint_hash=api_server.mutation_gate.wallet_fingerprint_hash(
+                    binding.fingerprint
+                ),
+                network=binding.network_id,
+            )
+            if len(candidates) != 1 or any(
+                candidates[0][key] != body[value]
+                for key, value in (
+                    ("parent_intent_id", "parent_intent_id"),
+                    ("child_intent_id", "child_intent_id"),
+                )
+            ):
+                return jsonify({"success": False, "error": "lineage_changed"}), 409
+            lease = database.get_runtime_mutation_lease()
+            if (
+                lease is None
+                or lease["active"] != 1
+                or lease["owner_run_id"] != runtime.run_id
+            ):
+                return jsonify({"success": False, "error": "lease_not_owned"}), 409
+            abort = database.begin_refresh_abort(
+                parent_intent_id=body["parent_intent_id"],
+                child_intent_id=body["child_intent_id"],
+                campaign_id=body["campaign_id"],
+                expected_latch_generation=body["expected_latch_generation"],
+                owner_run_id=runtime.run_id,
+                expected_lease_version=lease["lease_version"],
+                observed_trade_ids=snapshot["trade_ids"],
+                observed_at=snapshot["observed_at"],
+            )
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Exact refresh abort entry refused",
+                {"error": type(exc).__name__},
+                level="warning",
+            )
+            return jsonify({"success": False, "error": "abort_authority_changed"}), 409
+        try:
+            proof = offer_reconciliation.reconcile_offer(
+                body["parent_intent_id"], refresh_abort_id=abort["abort_id"]
+            )
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Exact refresh abort awaits parent proof",
+                {"error": type(exc).__name__},
+                level="warning",
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "stage": "awaiting_parent_proof",
+                    "abort_id": abort["abort_id"],
+                    "wallet_effect_started": False,
+                }
+            ), 409
+        terminal = (
+            proof.get("classification") == "CANCELLED_PROVEN"
+            and proof.get("applied") is True
+        )
+        return jsonify(
+            {
+                "success": terminal,
+                "stage": "parent_terminal" if terminal else "awaiting_parent_proof",
+                "abort_id": abort["abort_id"],
+                "classification": proof.get("classification"),
+                "wallet_effect_started": False,
+            }
+        ), (200 if terminal else 409)
+
+
+@bp.route("/api/offers/refresh_abort/cancel_next", methods=["POST"])
+def api_refresh_abort_cancel_next():
+    """Cancel only the next immutable abort target after native review."""
+
+    import wallet
+
+    body = request.get_json(silent=True)
+    required = {
+        "confirmation",
+        "abort_id",
+        "expected_latch_generation",
+        "expected_trade_ids",
+        "expected_next_trade_id",
+        "fee_approval_id",
+    }
+    if type(body) is not dict or set(body) != required:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    expected = body["expected_trade_ids"]
+    if (
+        body["confirmation"] is not True
+        or type(body["abort_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["abort_id"]) is None
+        or type(body["fee_approval_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["fee_approval_id"]) is None
+        or type(body["expected_latch_generation"]) is not int
+        or body["expected_latch_generation"] < 1
+        or type(body["expected_next_trade_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["expected_next_trade_id"]) is None
+        or type(expected) is not list
+        or not 1 <= len(expected) <= 256
+        or any(
+            type(trade) is not str or re.fullmatch(r"[0-9a-f]{64}", trade) is None
+            for trade in expected
+        )
+        or expected != sorted(set(expected))
+    ):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    with api_server._bot_cancel_lifecycle_lock:
+        bot = api_server.bot
+        if bot is None or bot.is_running() or bot.offer_manager is None:
+            return jsonify({"success": False, "error": "stop_bot_first"}), 409
+        runtime = api_server.mutation_gate.current_runtime()
+        binding = getattr(runtime, "wallet_identity_binding", None)
+        if runtime is None or binding is None or binding.backend != "sage":
+            return jsonify(
+                {"success": False, "error": "sage_identity_unavailable"}
+            ), 409
+        try:
+            abort = database.get_refresh_abort(body["abort_id"])
+            snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+            if (
+                abort is None
+                or abort["state"] != "parent_terminal"
+                or abort["latch_generation"] != body["expected_latch_generation"]
+                or abort["wallet_fingerprint_hash"]
+                != api_server.mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+                or abort["network"] != binding.network_id
+                or abort["asset_id"] != getattr(cfg, "CAT_ASSET_ID", None)
+                or snapshot["trade_ids"] != expected
+                or snapshot["pending_transaction_ids"]
+                or not set(expected).issubset(
+                    set(json.loads(abort["target_trade_ids_json"]))
+                )
+                or body["expected_next_trade_id"] != expected[0]
+                or database.get_offer_operation_events(
+                    f"cancel:{body['expected_next_trade_id']}"
+                )
+            ):
+                return jsonify(
+                    {"success": False, "error": "cleanup_scope_changed"}
+                ), 409
+            if (
+                database.get_latest_coin_prep_fee_approval_for_campaign(
+                    abort["campaign_id"]
+                )
+                != body["fee_approval_id"]
+            ):
+                return jsonify({"success": False, "error": "fee_approval_changed"}), 409
+            result = bot.offer_manager.cancel_refresh_abort_targets(
+                abort_id=body["abort_id"],
+                expected_latch_generation=body["expected_latch_generation"],
+                fee_approval_id=body["fee_approval_id"],
+            )
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Exact refresh abort cancellation blocked",
+                {"error": type(exc).__name__},
+                level="warning",
+            )
+            return jsonify(
+                {"success": False, "error": "cleanup_authority_changed"}
+            ), 409
+        outcome = result.get("result", {}).get("outcome")
+        submitted = outcome in {"CANCEL_SUBMITTED_UNCONFIRMED", "CANCEL_UNKNOWN"}
+        return jsonify(
+            {
+                "success": submitted,
+                "stage": "awaiting_target_proof" if submitted else "cleanup_blocked",
+                "abort_id": body["abort_id"],
+                "target_trade_id": result.get("trade_id"),
+                "outcome": outcome,
+                "wallet_effect_started": (
+                    result.get("result", {}).get("_catalyst_effect_attempted") is True
+                ),
+            }
+        ), (200 if submitted else 409)
+
+
+@bp.route("/api/offers/refresh_abort/reconcile_target", methods=["POST"])
+def api_refresh_abort_reconcile_target():
+    """Check one submitted cleanup cancellation for Task 9 terminal proof."""
+
+    import offer_reconciliation
+
+    body = request.get_json(silent=True)
+    required = {"abort_id", "trade_id", "expected_latch_generation"}
+    if type(body) is not dict or set(body) != required:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    if (
+        type(body["abort_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["abort_id"]) is None
+        or type(body["trade_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["trade_id"]) is None
+        or type(body["expected_latch_generation"]) is not int
+        or body["expected_latch_generation"] < 1
+    ):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    try:
+        abort = database.get_refresh_abort(body["abort_id"])
+        if (
+            abort is None
+            or abort["state"] != "parent_terminal"
+            or abort["latch_generation"] != body["expected_latch_generation"]
+            or body["trade_id"] not in json.loads(abort["target_trade_ids_json"])
+        ):
+            return jsonify({"success": False, "error": "cleanup_scope_changed"}), 409
+        target = database.get_offer_intent_by_trade_id(body["trade_id"])
+        events = database.get_offer_operation_events(f"cancel:{body['trade_id']}")
+        if (
+            target is None
+            or target["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
+            or target["network"] != abort["network"]
+            or target["asset_id"] != abort["asset_id"]
+            or not events
+            or events[-1]["phase"] not in {"FINALIZED", "RECONCILED"}
+        ):
+            return jsonify(
+                {"success": False, "error": "target_proof_not_submitted"}
+            ), 409
+        proof = offer_reconciliation.reconcile_offer(target["intent_id"])
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Exact refresh abort target proof unavailable",
+            {"error": type(exc).__name__},
+            level="warning",
+        )
+        return jsonify({"success": False, "error": "target_proof_unavailable"}), 409
+    terminal = proof.get("classification") == "CANCELLED_PROVEN" and (
+        proof.get("applied") is True or target["lifecycle_state"] == "terminal"
+    )
+    return jsonify(
+        {
+            "success": terminal,
+            "stage": "target_terminal" if terminal else "awaiting_target_proof",
+            "abort_id": body["abort_id"],
+            "target_trade_id": body["trade_id"],
+            "classification": proof.get("classification"),
+            "wallet_effect_started": False,
+        }
+    ), (200 if terminal else 409)
+
+
+@bp.route("/api/offers/refresh_abort/complete", methods=["POST"])
+def api_refresh_abort_complete():
+    """Release only the exact abort blocker after an empty, proven wallet book."""
+
+    body = request.get_json(silent=True)
+    required = {"abort_id", "expected_latch_generation", "confirmation"}
+    if type(body) is not dict or set(body) != required:
+        return jsonify({"success": False, "error": "invalid_request"}), 400
+    if (
+        body["confirmation"] is not True
+        or type(body["abort_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["abort_id"]) is None
+        or type(body["expected_latch_generation"]) is not int
+        or body["expected_latch_generation"] < 1
+    ):
+        return jsonify({"success": False, "error": "invalid_exact_scope"}), 400
+    with api_server._bot_cancel_lifecycle_lock:
+        bot = api_server.bot
+        if bot is None or bot.is_running() or bot.offer_manager is None:
+            return jsonify({"success": False, "error": "stop_bot_first"}), 409
+        try:
+            result = bot.offer_manager.complete_refresh_abort_cleanup(
+                abort_id=body["abort_id"],
+                expected_latch_generation=body["expected_latch_generation"],
+            )
+        except Exception as exc:
+            slog(
+                "SAFETY",
+                "Exact refresh abort completion blocked",
+                {"error": type(exc).__name__},
+                level="warning",
+            )
+            return jsonify({"success": False, "error": "completion_proof_missing"}), 409
+        return jsonify(
+            {
+                "success": result.get("state") == "aborted",
+                "stage": result.get("state"),
+                "abort_id": body["abort_id"],
+                "wallet_effect_started": False,
+            }
+        )
+
+
 @bp.route("/api/offers/open_count")
 def api_open_offer_count():
     """Return the number of still-active offers in the wallet.

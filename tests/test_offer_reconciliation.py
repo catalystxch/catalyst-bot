@@ -349,6 +349,37 @@ def _evidence(
     return evidence
 
 
+def test_refresh_abort_effect_scope_excludes_confirmed_historical_prep():
+    """Settled Coin Prep history must not block exact cleanup years later."""
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    for ddl in (
+        "CREATE TABLE wallet_effect_claims(claim_token TEXT, operation_id TEXT)",
+        "CREATE TABLE wallet_effect_claim_resolutions(claim_token TEXT, outcome TEXT, evidence_json TEXT)",
+        "CREATE TABLE wallet_effect_dispatches(claim_token TEXT, dispatch_token TEXT)",
+        "CREATE TABLE coin_prep_operations(effect_claim_token TEXT, operation_id TEXT, outcome TEXT, outcome_evidence_json TEXT)",
+        "CREATE TABLE approved_fee_reservations(operation_id TEXT)",
+        "CREATE TABLE approved_fee_outcomes(operation_id TEXT)",
+        "CREATE TABLE publication_outbox(state TEXT, dispatch_started_at TEXT)",
+        "CREATE TABLE runtime_worker_delegations(state TEXT)",
+    ):
+        conn.execute(ddl)
+    conn.execute("INSERT INTO wallet_effect_claims VALUES ('old','coin-prep:old')")
+    conn.execute(
+        "INSERT INTO wallet_effect_claim_resolutions VALUES ('old','SUBMITTED','{}')"
+    )
+    conn.execute(
+        "INSERT INTO coin_prep_operations VALUES ('old','coin-prep:old','CONFIRMED','{}')"
+    )
+    database._assert_refresh_abort_effect_scope(conn, set())
+
+    conn.execute("INSERT INTO wallet_effect_claims VALUES ('new','coin-prep:new')")
+    with pytest.raises(ValueError, match="unrelated wallet effect"):
+        database._assert_refresh_abort_effect_scope(conn, set())
+    conn.close()
+
+
 @pytest.mark.parametrize(
     "skewed_clock",
     [
@@ -8882,6 +8913,10 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
         "crash_after_claim",
         "completion_extra_blocker",
         "multi_target",
+        "entry_unrelated_journal",
+        "cleanup_unrelated_journal",
+        "cleanup_active_worker",
+        "completion_unrelated_journal",
     ],
 )
 def test_fenced_abort_records_confirmed_parent_without_publishing_child(
@@ -9047,6 +9082,50 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         tripped_at=AFTER,
     )
     latch = database.get_runtime_safety_latch()
+    candidates = database.list_fenced_refresh_abort_candidates(
+        asset_id=ASSET,
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["parent_intent_id"] == "intent-task9"
+    assert candidates[0]["child_intent_id"] == child_id
+    assert candidates[0]["parent_trade_id"] == TRADE
+    assert candidates[0]["child_trade_id"] == OTHER_TRADE
+    assert candidates[0]["cancel_operation_id"] == f"cancel:{TRADE}"
+
+    def append_unrelated_blocker():
+        database.append_offer_operation_event(
+            event_id="create:unrelated-review:attempt:1:prepared",
+            operation_id="create:unrelated-review",
+            operation_type="CREATE",
+            attempt=1,
+            phase="PREPARED",
+            outcome="PREPARED",
+            request_timestamp=AFTER,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"diagnostic": "unrelated pending effect"},
+            blocks_mutation=True,
+            created_at=AFTER,
+        )
+
+    if prepared_cleanup == "entry_unrelated_journal":
+        append_unrelated_blocker()
+        with pytest.raises(ValueError, match="unrelated durable operation"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        return
     abort = database.begin_refresh_abort(
         parent_intent_id="intent-task9",
         child_intent_id=child_id,
@@ -9057,6 +9136,14 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         observed_trade_ids=observed_book,
         observed_at=AFTER,
     )
+    assert [
+        row["abort_id"]
+        for row in database.list_incomplete_refresh_aborts(
+            asset_id=ASSET,
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+        )
+    ] == [abort["abort_id"]]
     renewed = database.heartbeat_runtime_mutation_lease(
         owner_run_id="run-task9",
         expected_lease_version=lease["lease"]["lease_version"],
@@ -9172,6 +9259,43 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     assert cleanup["trade_id"] == OTHER_TRADE
     assert cleanup["intent_id"] == child_id
     assert cleanup["blocking_operation_id"] == abort["blocking_operation_id"]
+    if prepared_cleanup == "cleanup_unrelated_journal":
+        append_unrelated_blocker()
+        with pytest.raises(ValueError, match="unrelated durable operation"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+        return
+    if prepared_cleanup == "cleanup_active_worker":
+        database.issue_worker_delegation(
+            delegation_id="review-worker",
+            delegation_token_hash="e" * 64,
+            parent_run_id="run-task9",
+            operation_id="review-prep",
+            worker_id="review-worker",
+            purpose="coin-prep",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            issued_at=AFTER,
+            expires_at="2026-08-21T12:00:00.000000Z",
+        )
+        with pytest.raises(ValueError, match="active worker delegation"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+        return
     with pytest.raises(ValueError, match="fresh Sage"):
         database.authorize_refresh_abort_cleanup_target(
             abort_id=abort["abort_id"],
@@ -9332,6 +9456,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         "crash_after_claim",
         "completion_extra_blocker",
         "multi_target",
+        "completion_unrelated_journal",
     }:
         # Exercise the complete manager -> durable Task 8 -> exact effect claim
         # boundary on the same disposable incident.  The adapter and fee signer
@@ -9727,6 +9852,17 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             assert database.get_refresh_abort(abort["abort_id"])["state"] == (
                 "parent_terminal"
             )
+            return
+        if prepared_cleanup == "completion_unrelated_journal":
+            append_unrelated_blocker()
+            with pytest.raises(ValueError, match="unrelated durable operation"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            assert database.get_refresh_abort(abort["abort_id"])["state"] == (
+                "parent_terminal"
+            )
+            assert database.get_runtime_safety_latch()["state"] == "tripped"
             return
         with pytest.raises(ValueError, match="zero live offers"):
             database.complete_refresh_abort(

@@ -3312,6 +3312,12 @@ def test_coin_prep_cancel_confirmation_runs_async_recovery_end_to_end(page):
             addLogEntry = (_level, message) => window.__cancelRecovery.logs.push(message);
             apiFetch = async (path, options = {}) => {
                 const url = String(path);
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__cancelRecovery.statusCalls += 1;
                     return new Response(JSON.stringify({
@@ -3399,6 +3405,12 @@ def test_cancel_all_keeps_operation_latched_until_async_work_finishes(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,
@@ -3449,6 +3461,12 @@ def test_cancel_all_displays_proof_only_reconciliation_without_new_cancellation(
             addLogEntry = (_, message) => window.__proofOnly.logs.push(message);
             showToast = (message) => window.__proofOnly.toasts.push(message);
             apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (String(path).includes('/offers/cancel_all/status')) {
                     window.__proofOnly.statusCalls += 1;
                     return new Response(JSON.stringify({
@@ -3500,6 +3518,12 @@ def test_cancel_all_shows_preflight_rejection_to_operator(page):
             addLogEntry = () => {};
             showToast = (message) => result.toasts.push(message);
             apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (!String(path).includes('/offers/cancel_all')) throw new Error('Unexpected request');
                 result.cancelCalls += 1;
                 return new Response(JSON.stringify({
@@ -3760,6 +3784,12 @@ def test_cancel_all_clears_cached_completion_before_new_async_operation(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Promise(() => {});
                 }
@@ -3867,6 +3897,12 @@ def test_cancel_all_timeout_is_visible_and_releases_latch(page):
             addLogEntry = () => {};
             showToast = () => {};
             apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null, safety: {state: 'allowed'},
+                    }), {status: 200});
+                }
                 if (String(path).includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,

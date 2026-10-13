@@ -395,6 +395,10 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     # is unresolved.  The route acquires a normal mutation permit before it
     # can start any fresh wallet effect.
     "offers.api_cancel_all",
+    "offers.api_refresh_abort_begin",
+    "offers.api_refresh_abort_cancel_next",
+    "offers.api_refresh_abort_reconcile_target",
+    "offers.api_refresh_abort_complete",
     "system.api_console_toggle",
     "watchdog.api_watchdog_shape_fix_abort",
 }
@@ -6662,6 +6666,11 @@ from blueprints.offers import (
     bp as _offers_bp,
     api_offers,
     api_cancel_all_status,
+    api_refresh_abort_preview,
+    api_refresh_abort_begin,
+    api_refresh_abort_cancel_next,
+    api_refresh_abort_reconcile_target,
+    api_refresh_abort_complete,
     api_open_offer_count,
     api_cancel_all,
     api_cleanup_orphans,

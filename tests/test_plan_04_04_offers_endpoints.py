@@ -89,6 +89,476 @@ def _make_bot(offers=([], [], [])):
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_refresh_abort_preview_uses_complete_sage_book_not_stale_ui_count(
+    monkeypatch,
+):
+    import blueprints.offers as offers_bp
+    import database
+    import wallet
+
+    asset_id = "a" * 64
+    child_trade = "c" * 64
+    other_trades = ["d" * 64, "e" * 64]
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    monkeypatch.setattr(api_server, "bot", bot)
+    monkeypatch.setattr(offers_bp.cfg, "CAT_ASSET_ID", asset_id, raising=False)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: types.SimpleNamespace(
+            run_id="run-preview",
+            wallet_identity_binding=types.SimpleNamespace(
+                backend="sage", fingerprint=736588221, network_id="mainnet"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate, "wallet_fingerprint_hash", lambda _value: "f" * 64
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [child_trade, *other_trades],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-10-13T16:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_scope: [
+            {
+                "parent_intent_id": "parent",
+                "child_intent_id": "child",
+                "parent_trade_id": "b" * 64,
+                "child_trade_id": child_trade,
+                "cancel_operation_id": "cancel:" + "b" * 64,
+                "asset_id": asset_id,
+                "side": "sell",
+            }
+        ],
+    )
+    monkeypatch.setattr(database, "list_incomplete_refresh_aborts", lambda **_scope: [])
+    monkeypatch.setattr(
+        database,
+        "list_stopped_bootstrap_campaigns_for_identity",
+        lambda *_scope: [{"campaign_id": "1" * 64, "fee_budget_xch": "0.05"}],
+    )
+    monkeypatch.setattr(
+        database, "get_bootstrap_campaign_authoritative_fee_spent_mojos", lambda _id: 0
+    )
+    monkeypatch.setattr(
+        database, "get_latest_coin_prep_fee_approval_for_campaign", lambda _id: "2" * 64
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {
+            "state": "tripped",
+            "generation": 7,
+            "blocking_operation_ids_json": json.dumps(["cancel:" + "b" * 64]),
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_mutation_lease",
+        lambda: {"active": 1, "owner_run_id": "run-preview"},
+    )
+    result = api_server.app.test_client().get(
+        "/api/offers/refresh_abort/preview",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert result.status_code == 200
+    body = result.get_json()
+    assert body["stage"] == "submitted_parent_proof"
+    assert body["wallet"]["active_trade_ids"] == [child_trade, *other_trades]
+    assert body["wallet"]["pending_transaction_count"] == 0
+    assert body["candidate"]["child_trade_id"] == child_trade
+    assert body["safety"]["lease_owned"] is True
+    assert body["wallet_effect_started"] is False
+    native = app_bridge.AppBridge().get_refresh_abort_preview()
+    assert native["success"] is True
+    assert native["wallet"]["active_trade_ids"] == [child_trade, *other_trades]
+
+    # Sage can omit a submitted cancellation before Task 9 has written its
+    # terminal proof. The preview must keep that journal as the next action.
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": other_trades,
+            "pending_transaction_ids": [],
+            "observed_at": "2026-10-13T16:01:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "list_incomplete_refresh_aborts",
+        lambda **_scope: [
+            {
+                "abort_id": "9" * 64,
+                "parent_intent_id": "parent",
+                "child_intent_id": "child",
+                "campaign_id": "1" * 64,
+                "latch_generation": 7,
+                "target_trade_ids_json": json.dumps([child_trade, *other_trades]),
+                "state": "parent_terminal",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_offer_operation_events",
+        lambda op: (
+            [
+                {
+                    "phase": "FINALIZED",
+                    "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                    "blocks_mutation": 1,
+                }
+            ]
+            if op == f"cancel:{child_trade}"
+            else []
+        ),
+    )
+    pending = api_server.app.test_client().get(
+        "/api/offers/refresh_abort/preview",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert pending.status_code == 200
+    pending_body = pending.get_json()
+    assert pending_body["wallet"]["active_trade_ids"] == other_trades
+    assert pending_body["next_target_journal"]["trade_id"] == child_trade
+    assert pending_body["next_target_journal"]["phase"] == "FINALIZED"
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_refresh_abort_begin_rechecks_exact_preview_book_before_parent_proof(
+    monkeypatch,
+):
+    import blueprints.offers as offers_bp
+    import database
+    import wallet
+
+    parent_trade, child_trade, other_trade = "b" * 64, "c" * 64, "d" * 64
+    asset_id = "a" * 64
+    candidate = {
+        "parent_intent_id": "parent",
+        "child_intent_id": "child",
+        "parent_trade_id": parent_trade,
+        "child_trade_id": child_trade,
+        "cancel_operation_id": "cancel:" + parent_trade,
+        "asset_id": asset_id,
+        "side": "sell",
+    }
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    monkeypatch.setattr(api_server, "bot", bot)
+    monkeypatch.setattr(offers_bp.cfg, "CAT_ASSET_ID", asset_id, raising=False)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: types.SimpleNamespace(
+            run_id="run-exact",
+            wallet_identity_binding=types.SimpleNamespace(
+                backend="sage", fingerprint=736588221, network_id="mainnet"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate, "wallet_fingerprint_hash", lambda _value: "f" * 64
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [child_trade, other_trade],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-10-13T16:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_scope: [candidate],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_mutation_lease",
+        lambda: {
+            "active": 1,
+            "owner_run_id": "run-exact",
+            "lease_version": 3,
+        },
+    )
+    called = []
+    monkeypatch.setattr(
+        database,
+        "begin_refresh_abort",
+        lambda **request: (
+            called.append(("begin", request))
+            or {"abort_id": "e" * 64, "state": "fenced"}
+        ),
+    )
+    import offer_reconciliation
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda parent_id, **scope: (
+            called.append(("proof", parent_id, scope))
+            or {"classification": "CANCELLED_PROVEN", "applied": True}
+        ),
+    )
+    body = {
+        "confirmation": True,
+        "parent_intent_id": "parent",
+        "child_intent_id": "child",
+        "campaign_id": "1" * 64,
+        "expected_latch_generation": 7,
+        "expected_trade_ids": [child_trade, other_trade],
+    }
+    client = api_server.app.test_client()
+    request_kwargs = {
+        "headers": {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        "environ_base": {"REMOTE_ADDR": "127.0.0.1"},
+    }
+    rejected = client.post(
+        "/api/offers/refresh_abort/begin",
+        json={**body, "expected_trade_ids": [child_trade]},
+        **request_kwargs,
+    )
+    assert rejected.status_code == 409
+    assert called == []
+    accepted = client.post(
+        "/api/offers/refresh_abort/begin", json=body, **request_kwargs
+    )
+    assert accepted.status_code == 200
+    assert accepted.get_json()["stage"] == "parent_terminal"
+    assert called[0][0] == "begin"
+    assert called[0][1]["observed_trade_ids"] == [child_trade, other_trade]
+    assert called[1] == (
+        "proof",
+        "parent",
+        {"refresh_abort_id": "e" * 64},
+    )
+    native = app_bridge.AppBridge().begin_refresh_abort(body)
+    assert native["stage"] == "parent_terminal"
+    assert len(called) == 4
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_refresh_abort_cancel_next_refuses_stale_target_before_wallet_effect(
+    monkeypatch,
+):
+    import blueprints.offers as offers_bp
+    import database
+    import wallet
+
+    first, second = "c" * 64, "d" * 64
+    abort_id = "e" * 64
+    approval_id = "2" * 64
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    effects = []
+    bot.offer_manager.cancel_refresh_abort_targets.side_effect = lambda **request: (
+        effects.append(request)
+        or {
+            "trade_id": first,
+            "result": {
+                "outcome": "CANCEL_SUBMITTED_UNCONFIRMED",
+                "_catalyst_effect_attempted": True,
+            },
+        }
+    )
+    monkeypatch.setattr(api_server, "bot", bot)
+    monkeypatch.setattr(offers_bp.cfg, "CAT_ASSET_ID", "a" * 64, raising=False)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: types.SimpleNamespace(
+            run_id="run-exact",
+            wallet_identity_binding=types.SimpleNamespace(
+                backend="sage", fingerprint=736588221, network_id="mainnet"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [first, second],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-10-13T16:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "get_refresh_abort",
+        lambda _abort_id: {
+            "abort_id": abort_id,
+            "state": "parent_terminal",
+            "latch_generation": 7,
+            "campaign_id": "1" * 64,
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+            "asset_id": "a" * 64,
+            "target_trade_ids_json": json.dumps([first, second]),
+        },
+    )
+    monkeypatch.setattr(
+        api_server.mutation_gate, "wallet_fingerprint_hash", lambda _value: "f" * 64
+    )
+    monkeypatch.setattr(
+        database,
+        "get_latest_coin_prep_fee_approval_for_campaign",
+        lambda _id: approval_id,
+    )
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    body = {
+        "confirmation": True,
+        "abort_id": abort_id,
+        "expected_latch_generation": 7,
+        "expected_trade_ids": [first, second],
+        "expected_next_trade_id": first,
+        "fee_approval_id": approval_id,
+    }
+    client = api_server.app.test_client()
+    request_kwargs = {
+        "headers": {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        "environ_base": {"REMOTE_ADDR": "127.0.0.1"},
+    }
+    rejected = client.post(
+        "/api/offers/refresh_abort/cancel_next",
+        json={**body, "expected_next_trade_id": second},
+        **request_kwargs,
+    )
+    assert rejected.status_code == 409
+    assert effects == []
+    monkeypatch.setattr(
+        database,
+        "get_offer_operation_events",
+        lambda _id: [{"phase": "FINALIZED", "outcome": "CANCEL_UNKNOWN"}],
+    )
+    held = client.post(
+        "/api/offers/refresh_abort/cancel_next", json=body, **request_kwargs
+    )
+    assert held.status_code == 409
+    assert effects == []
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    accepted = client.post(
+        "/api/offers/refresh_abort/cancel_next", json=body, **request_kwargs
+    )
+    assert accepted.status_code == 200
+    assert accepted.get_json()["stage"] == "awaiting_target_proof"
+    assert effects == [
+        {
+            "abort_id": abort_id,
+            "expected_latch_generation": 7,
+            "fee_approval_id": approval_id,
+        }
+    ]
+    native = app_bridge.AppBridge().cancel_next_refresh_abort_offer(body)
+    assert native["stage"] == "awaiting_target_proof"
+    assert len(effects) == 2
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
+    monkeypatch,
+):
+    import database
+    import offer_reconciliation
+
+    abort_id, trade_id = "e" * 64, "c" * 64
+    abort = {
+        "abort_id": abort_id,
+        "state": "parent_terminal",
+        "latch_generation": 7,
+        "target_trade_ids_json": json.dumps([trade_id]),
+        "wallet_fingerprint_hash": "f" * 64,
+        "network": "mainnet",
+        "asset_id": "a" * 64,
+    }
+    monkeypatch.setattr(database, "get_refresh_abort", lambda _id: abort)
+    monkeypatch.setattr(
+        database,
+        "get_offer_intent_by_trade_id",
+        lambda _id: {
+            "intent_id": "child",
+            "lifecycle_state": "created",
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+            "asset_id": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "get_offer_operation_events",
+        lambda _id: [{"phase": "FINALIZED"}],
+    )
+    proofs = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda intent_id: (
+            proofs.append(intent_id)
+            or {"classification": "CANCELLED_PROVEN", "applied": True}
+        ),
+    )
+    bot = MagicMock()
+    bot.is_running.return_value = False
+    completions = []
+    bot.offer_manager.complete_refresh_abort_cleanup.side_effect = lambda **request: (
+        completions.append(request) or {"state": "aborted"}
+    )
+    monkeypatch.setattr(api_server, "bot", bot)
+    client = api_server.app.test_client()
+    request_kwargs = {
+        "headers": {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        "environ_base": {"REMOTE_ADDR": "127.0.0.1"},
+    }
+    proof_body = {
+        "abort_id": abort_id,
+        "trade_id": trade_id,
+        "expected_latch_generation": 7,
+    }
+    proof = client.post(
+        "/api/offers/refresh_abort/reconcile_target",
+        json=proof_body,
+        **request_kwargs,
+    )
+    assert proof.status_code == 200
+    assert proof.get_json()["stage"] == "target_terminal"
+    assert proofs == ["child"]
+    assert (
+        app_bridge.AppBridge().reconcile_refresh_abort_target(proof_body)["stage"]
+        == "target_terminal"
+    )
+    complete_body = {
+        "confirmation": True,
+        "abort_id": abort_id,
+        "expected_latch_generation": 7,
+    }
+    complete = client.post(
+        "/api/offers/refresh_abort/complete", json=complete_body, **request_kwargs
+    )
+    assert complete.status_code == 200
+    assert complete.get_json()["stage"] == "aborted"
+    assert app_bridge.AppBridge().complete_refresh_abort(complete_body)["stage"] == (
+        "aborted"
+    )
+    assert completions == [
+        {"abort_id": abort_id, "expected_latch_generation": 7},
+        {"abort_id": abort_id, "expected_latch_generation": 7},
+    ]
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_native_cancel_all_forwards_coin_prep_fee_approval_body(monkeypatch):
     from flask import request
 
