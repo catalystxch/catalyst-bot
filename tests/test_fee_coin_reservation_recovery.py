@@ -21,6 +21,9 @@ def test_failed_cancel_pricing_releases_unspent_fee_coin(monkeypatch):
     monkeypatch.setattr(
         database, "get_offer", lambda _trade_id: {"coin_id": source_coin_id}
     )
+    monkeypatch.setattr(
+        database, "get_offer_intent_by_trade_id", lambda _trade_id: None
+    )
 
     def wallet_unavailable(**_kwargs):
         raise ValueError("FEE_WALLET_IDENTITY_UNAVAILABLE")
