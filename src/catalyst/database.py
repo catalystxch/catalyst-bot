@@ -4089,6 +4089,9 @@ CREATE TABLE IF NOT EXISTS offer_refresh_aborts (
     latch_generation           INTEGER NOT NULL CHECK(latch_generation > 0),
     owner_run_id               TEXT NOT NULL,
     lease_version              INTEGER NOT NULL CHECK(lease_version > 0),
+    lease_acquired_at          TEXT NOT NULL,
+    lease_owner_pid            INTEGER NOT NULL CHECK(lease_owner_pid > 0),
+    lease_owner_host           TEXT NOT NULL,
     wallet_fingerprint_hash    TEXT NOT NULL,
     network                    TEXT NOT NULL,
     asset_id                   TEXT NOT NULL,
@@ -4971,6 +4974,9 @@ _STABILITY_REQUIRED_COLUMNS = {
         "latch_generation",
         "owner_run_id",
         "lease_version",
+        "lease_acquired_at",
+        "lease_owner_pid",
+        "lease_owner_host",
         "wallet_fingerprint_hash",
         "network",
         "asset_id",
@@ -28527,6 +28533,7 @@ def commit_offer_reconciliation(
     fee_mojos: int = 0,
     coin_rebindings: Any = None,
     cancel_context_json: Any = None,
+    refresh_abort_id: Optional[str] = None,
     reconciled_at: Any = None,
 ) -> Dict[str, Any]:
     """Commit one policy-authorized reconciliation in one short transaction.
@@ -28550,6 +28557,13 @@ def commit_offer_reconciliation(
         | _RECONCILE_OBSERVATION_OUTCOMES
     ):
         raise ValueError("reconciliation classification is not committable")
+    safe_refresh_abort_id = (
+        _required_stability_text(refresh_abort_id, "refresh_abort_id")
+        if refresh_abort_id is not None
+        else None
+    )
+    if safe_refresh_abort_id and safe_classification != "CANCELLED_PROVEN":
+        raise ValueError("refresh abort requires proven cancellation")
     blocking = safe_classification in _RECONCILE_BLOCKING_OUTCOMES
     phase = {
         "UNKNOWN": "UNKNOWN",
@@ -28715,6 +28729,32 @@ def commit_offer_reconciliation(
             or intent["network"] != network
         ):
             raise ValueError("reconciliation wallet binding mismatch")
+        child_id = intent.get("child_intent_id")
+        child_row = (
+            conn.execute(
+                "SELECT * FROM offer_intents WHERE intent_id=?", (child_id,)
+            ).fetchone()
+            if child_id
+            else None
+        )
+        if (
+            safe_classification in {"CANCELLED_PROVEN", "EXPIRED_PROVEN"}
+            and child_row is not None
+            and child_row["lifecycle_state"] == "created"
+            and safe_refresh_abort_id is None
+        ):
+            raise ValueError("unpublished replacement requires a fenced refresh abort")
+        refresh_abort = None
+        if safe_refresh_abort_id is not None:
+            refresh_abort = _validate_refresh_abort_commit_authority(
+                conn,
+                abort_id=safe_refresh_abort_id,
+                parent=intent,
+                child=dict(child_row) if child_row is not None else None,
+                wallet_hash=wallet_hash,
+                network=network,
+                at=when,
+            )
         immutable_economics = (
             _current_intent_economic_authority(conn, safe_intent_id)
             if safe_classification == "FILLED_PROVEN"
@@ -28817,6 +28857,11 @@ def commit_offer_reconciliation(
             (safe_operation_id,),
         ).fetchone()
         if existing_terminal is not None:
+            if (
+                refresh_abort is not None
+                and refresh_abort["state"] != "parent_terminal"
+            ):
+                raise ValueError("refresh abort terminal replay stage differs")
             existing = validate_offer_operation_event(dict(existing_terminal))
             if (
                 existing["outcome"] != safe_classification
@@ -28889,6 +28934,8 @@ def commit_offer_reconciliation(
             journal = reconciliation_journal(max(phase_attempts, default=0) + 1)
         if intent["lifecycle_state"] == "terminal":
             raise ValueError("terminal offer lacks its authoritative journal event")
+        if refresh_abort is not None and refresh_abort["state"] != "fenced":
+            raise ValueError("refresh abort parent has already reached terminal stage")
         try:
             selected_bare = json.loads(intent["selected_coin_ids_json"])
         except (TypeError, ValueError) as exc:
@@ -29274,6 +29321,14 @@ def commit_offer_reconciliation(
             blocking=False,
             additionally_resolved=resolved_operations,
         )
+        if refresh_abort is not None:
+            changed = conn.execute(
+                "UPDATE offer_refresh_aborts SET state='parent_terminal', updated_at=? "
+                "WHERE abort_id=? AND state='fenced'",
+                (when, refresh_abort["abort_id"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("refresh abort stage changed during reconciliation")
         conn.commit()
         return {
             "event": event,
@@ -29606,6 +29661,74 @@ def get_refresh_abort(abort_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
+def _validate_refresh_abort_commit_authority(
+    conn: sqlite3.Connection,
+    *,
+    abort_id: str,
+    parent: Dict[str, Any],
+    child: Optional[Dict[str, Any]],
+    wallet_hash: str,
+    network: str,
+    at: str,
+) -> Dict[str, Any]:
+    """Recheck a typed exception inside Task 9's own terminal transaction."""
+
+    row = conn.execute(
+        "SELECT * FROM offer_refresh_aborts WHERE abort_id=?", (abort_id,)
+    ).fetchone()
+    if row is None or child is None:
+        raise ValueError("fenced refresh abort or exact child is missing")
+    abort = dict(row)
+    latch_row = conn.execute(
+        "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+    ).fetchone()
+    lease_row = conn.execute(
+        "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+    ).fetchone()
+    campaign_row = conn.execute(
+        "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?",
+        (abort["campaign_id"],),
+    ).fetchone()
+    if latch_row is None or lease_row is None or campaign_row is None:
+        raise ValueError("refresh abort safety authority is missing")
+    latch, lease, campaign = dict(latch_row), dict(lease_row), dict(campaign_row)
+    expected_blockers = {abort["blocking_operation_id"]}
+    if abort["state"] == "fenced":
+        expected_blockers.add(abort["cancel_operation_id"])
+    elif abort["state"] != "parent_terminal":
+        raise ValueError("refresh abort stage is not a parent proof stage")
+    if (
+        abort["parent_intent_id"] != parent["intent_id"]
+        or abort["child_intent_id"] != child["intent_id"]
+        or parent["child_intent_id"] != child["intent_id"]
+        or child["parent_intent_id"] != parent["intent_id"]
+        or child["lifecycle_state"] != "created"
+        or child["first_visible_at"] is not None
+        or abort["wallet_fingerprint_hash"] != wallet_hash
+        or abort["network"] != network
+        or abort["asset_id"] != parent["asset_id"]
+        or abort["asset_id"] != child["asset_id"]
+        or abort["cancel_operation_id"] != f"cancel:{parent['sage_trade_id']}"
+        or child["sage_trade_id"] not in json.loads(abort["target_trade_ids_json"])
+        or latch["state"] != "tripped"
+        or latch["generation"] != abort["latch_generation"]
+        or set(json.loads(latch["blocking_operation_ids_json"])) != expected_blockers
+        or lease["active"] != 1
+        or lease["owner_run_id"] != abort["owner_run_id"]
+        or lease["lease_version"] < abort["lease_version"]
+        or lease["acquired_at"] != abort["lease_acquired_at"]
+        or lease["owner_pid"] != abort["lease_owner_pid"]
+        or lease["owner_host"] != abort["lease_owner_host"]
+        or lease["wallet_fingerprint_hash"] != wallet_hash
+        or lease["network"] != network
+        or lease["expires_at"] is None
+        or lease["expires_at"] <= max(at, _stability_wall_clock())
+        or campaign["status"] != "stopped"
+    ):
+        raise ValueError("refresh abort authority changed before terminal proof")
+    return abort
+
+
 def begin_refresh_abort(
     *,
     parent_intent_id: str,
@@ -29772,6 +29895,9 @@ def begin_refresh_abort(
             "latch_generation": generation,
             "owner_run_id": owner,
             "lease_version": lease_version,
+            "lease_acquired_at": lease["acquired_at"],
+            "lease_owner_pid": lease["owner_pid"],
+            "lease_owner_host": lease["owner_host"],
             "wallet_fingerprint_hash": wallet_hash,
             "network": network,
             "asset_id": parent["asset_id"],

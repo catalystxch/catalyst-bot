@@ -8873,6 +8873,222 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
     assert database.get_coin_state(RETURN)["amount_mojos"] == 1000
 
 
+def test_fenced_abort_records_confirmed_parent_without_publishing_child(
+    isolated_database,
+    monkeypatch,
+):
+    """The on-chain parent result settles while its unpublished child stays fenced."""
+
+    import mutation_gate
+
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: AT)
+    monkeypatch.setattr(mutation_gate, "wallet_fingerprint_hash", lambda _value: WALLET)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-task9",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        lease_expires_at="2026-08-20T12:10:00.000000Z",
+        now=AT,
+    )
+    assert lease["acquired"]
+    campaign_id = database.create_bootstrap_campaign(
+        {
+            "network": NETWORK,
+            "wallet_type": "sage",
+            "wallet_fingerprint": 736588221,
+            "wallet_id": 2,
+            "asset_id": ASSET,
+            "anchor_price": "0.01",
+            "minimum_price": "0.005",
+            "maximum_price": "0.02",
+            "xch_budget": "1",
+            "cat_budget": "200",
+            "fee_budget_xch": "0.05",
+            "subsidy_budget_xch": "0",
+            "created_at": AT,
+            "expires_at": "2026-08-21T12:00:00.000000Z",
+        }
+    )
+    assert database.stop_bootstrap_campaign(campaign_id, "manual", AFTER)
+    _persist_created_offer()
+    database.record_offer_intent_visibility(
+        "intent-task9",
+        publication_identity="registry:parent",
+        visible_at=AT,
+    )
+    # Model the historical in-flight cancel before the new pre-effect guard.
+    _persist_cancel_prepared()
+    assert database.upsert_coin(
+        OTHER_COIN,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    database.prepare_offer_intent(
+        intent_id="intent-child",
+        operation_id="create:intent-child",
+        event_id="create:intent-child:prepared",
+        run_id="run-task9",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="normal_lifecycle",
+        slot_key="slot:intent-task9",
+        generation=1,
+        parent_intent_id="intent-task9",
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[OTHER_COIN],
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
+        evidence_json={"intent": "replacement"},
+        prepared_at=AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id="intent-child",
+        operation_id="create:intent-child",
+        event_id="create:intent-child:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=OTHER_TRADE,
+        offer_text_sha256="e" * 64,
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
+        evidence_json={"offer": "confirmed"},
+        finalized_at=AT,
+        finalize_selected_coin_reservations=True,
+    )
+    database.bind_refresh_lineage("intent-task9", "intent-child")
+    _persist_cancel_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        transaction_id=TX,
+        spend_identity=SPEND,
+    )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[f"cancel:{TRADE}"],
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        tripped_at=AFTER,
+    )
+    latch = database.get_runtime_safety_latch()
+    abort = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id="intent-child",
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=lease["lease"]["lease_version"],
+        observed_trade_ids=[OTHER_TRADE],
+        observed_at=AFTER,
+    )
+    renewed = database.heartbeat_runtime_mutation_lease(
+        owner_run_id="run-task9",
+        expected_lease_version=lease["lease"]["lease_version"],
+        heartbeat_at=AFTER,
+        lease_expires_at="2026-08-20T12:20:00.000000Z",
+    )
+    assert renewed["heartbeat"] is True
+    with pytest.raises(ValueError, match="exact proven parent cancellation"):
+        reconcile_offer(
+            "intent-task9",
+            evidence=_evidence(offer_complete=False),
+            cancel_context=_cancel_context(),
+            refresh_abort_id=abort["abort_id"],
+            now=AFTER,
+        )
+    assert _journal_for("intent-task9") == []
+    proof = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+    applied = reconcile_offer(
+        "intent-task9",
+        evidence=proof,
+        cancel_context=_cancel_context(),
+        refresh_abort_id=abort["abort_id"],
+        now=AFTER,
+    )
+    assert applied["classification"] == CANCELLED_PROVEN
+    assert applied["applied"] is True
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
+    child = database.get_offer_intent("intent-child")
+    assert child["lifecycle_state"] == "created"
+    assert child["first_visible_at"] is None
+    assert database.refresh_lineage_completion("intent-task9")["complete"] is False
+    assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    final_latch = database.get_runtime_safety_latch()
+    assert final_latch["state"] == "tripped"
+    assert json.loads(final_latch["blocking_operation_ids_json"]) == [
+        abort["blocking_operation_id"]
+    ]
+    assert database.get_coin_state(COIN)["status"] == "spent"
+    assert database.get_coin_state(RETURN)["status"] == "free"
+    replay = reconcile_offer(
+        "intent-task9",
+        evidence=proof,
+        cancel_context=_cancel_context(),
+        refresh_abort_id=abort["abort_id"],
+        now=AFTER,
+    )
+    assert replay["idempotent"] is True
+    assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    changed_proof = json.loads(json.dumps(proof))
+    changed_proof["diagnostic_note"] = "different-replay"
+    with pytest.raises(
+        ValueError, match="Task 8 nonblocking cancellation result contradicts proof"
+    ):
+        reconcile_offer(
+            "intent-task9",
+            evidence=changed_proof,
+            cancel_context=_cancel_context(),
+            refresh_abort_id=abort["abort_id"],
+            now=AFTER,
+        )
+    with pytest.raises(ValueError, match="fenced refresh abort is missing"):
+        reconcile_offer(
+            "intent-task9",
+            evidence=proof,
+            cancel_context=_cancel_context(),
+            refresh_abort_id="0" * 64,
+            now=AFTER,
+        )
+
+
 @pytest.mark.parametrize("include_auxiliary_fee_coin", [False, True])
 @pytest.mark.parametrize("transaction_offset_seconds", [10, -47])
 @pytest.mark.parametrize("submitted_with_pending_txid", [False, True])

@@ -1288,6 +1288,23 @@ def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing
     )
     with pytest.raises(ValueError, match="additional safety blocker"):
         database.begin_refresh_abort(**request)
+    observation = {"source": "isolated-test"}
+    encoded = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="refresh abort requires proven cancellation"):
+        database.commit_offer_reconciliation(
+            intent_id="parent",
+            operation_id="reconcile:parent",
+            classification="UNKNOWN",
+            reason_code="INCOMPLETE_PROOF",
+            wallet_identity_json={
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": "mainnet",
+            },
+            evidence_json=observation,
+            evidence_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+            refresh_abort_id=abort["abort_id"],
+            reconciled_at="2026-08-15T12:03:02.000000Z",
+        )
 
 
 def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(

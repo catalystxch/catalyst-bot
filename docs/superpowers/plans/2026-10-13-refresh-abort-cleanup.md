@@ -76,19 +76,19 @@ list, wallet binding, status, and blocker in the existing stability schema.
 `src/catalyst/offer_reconciliation.py`, `src/catalyst/database.py`; extend
 `tests/test_refresh_abort_cleanup.py`.
 
-**Interfaces:** `reconcile_aborted_refresh_parent(abort_id: str, *,
-wallet_facade: object | None = None) -> dict` may select the exceptional
-terminal transition only for the exact Task 1 abort and Task 8 cancellation.
+**Interfaces:** `reconcile_offer(..., refresh_abort_id: str | None = None)`
+selects the exceptional terminal transition only for the exact Task 1 abort
+and Task 8 cancellation. A dedicated operator route will supply the abort ID.
 `commit_offer_reconciliation(..., refresh_abort_id: str | None = None)` must
 verify that authority again in its transaction and retain the abort blocker.
 
-- [ ] Write a failing test using complete Task 8 transaction, spent selected
+- [x] Write a failing test using complete Task 8 transaction, spent selected
   coin and owned return proof: parent becomes `CANCELLED_PROVEN` once, child
   remains `created`, Task 11 completion remains false, and the latch remains
   tripped for the abort. Add missing/changed proof and crash replay tests.
-- [ ] Run red tests; implement the narrow typed registry exception and
+- [x] Run red tests; implement the narrow typed registry exception and
   transactional DB checks without relaxing ordinary `authorize_transition`.
-- [ ] Run focused Task 8/9/11, registry and recovery suites; commit only
+- [x] Run focused Task 8/9/11, registry and recovery suites; commit only
   after normal visible-child behavior still passes.
 
 ### Task 3: Restricted cleanup cancellation authority

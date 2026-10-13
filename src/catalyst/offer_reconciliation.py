@@ -23,6 +23,7 @@ from offer_registry import (
     OfferReference,
     RegistrySnapshot,
     RegistryState,
+    RefreshAbortAuthority,
     TerminalOutcome,
     authorize_transition,
     offer_record_from_row,
@@ -4141,6 +4142,7 @@ def reconcile_offer(
     cancel_context: Any = None,
     wallet_facade: Any = None,
     now: Any = None,
+    refresh_abort_id: str | None = None,
 ) -> dict[str, Any]:
     """Authorize and persist one exact reconciliation result."""
 
@@ -4173,6 +4175,20 @@ def reconcile_offer(
         cancel_context=cancel_context,
         now=observed_at,
     )
+    refresh_abort = None
+    if refresh_abort_id is not None:
+        if result["classification"] != CANCELLED_PROVEN:
+            raise ValueError("refresh abort requires exact proven parent cancellation")
+        saved_abort = database.get_refresh_abort(refresh_abort_id)
+        if saved_abort is None:
+            raise ValueError("fenced refresh abort is missing")
+        refresh_abort = RefreshAbortAuthority(
+            abort_id=saved_abort["abort_id"],
+            parent_intent_id=saved_abort["parent_intent_id"],
+            child_intent_id=saved_abort["child_intent_id"],
+            wallet_fingerprint_hash=saved_abort["wallet_fingerprint_hash"],
+            network=saved_abort["network"],
+        )
     immutable_economics = None
     if result["classification"] == FILLED_PROVEN:
         immutable_economics = database.get_offer_intent_economic_authority(
@@ -4203,6 +4219,7 @@ def reconcile_offer(
         intent["wallet_fingerprint_hash"],
         intent["network"],
         evidence=registry_evidence,
+        refresh_abort=refresh_abort,
     )
     operation_id = f"reconcile:{intent['intent_id']}"
     if not decision.allowed:
@@ -4296,6 +4313,8 @@ def reconcile_offer(
                 raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
         evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
     except Exception:
+        if refresh_abort is not None:
+            raise RuntimeError("refresh abort proof encoding failed")
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
         fallback_destination, fallback_evidence = _registry_evidence(
             intent, encoding_result, observed_at
@@ -4394,6 +4413,7 @@ def reconcile_offer(
                 if result["classification"] == CANCELLED_PROVEN
                 else None
             ),
+            refresh_abort_id=refresh_abort_id,
             reconciled_at=observed_at,
         )
     except ValueError as exc:
