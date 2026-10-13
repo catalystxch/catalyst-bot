@@ -193,4 +193,7 @@ requested Take test.
   Its bundled HTML hash matched source, an isolated mock-Sage packaged API
   smoke passed, and a Defender custom scan completed with zero detections
   matching that EXE path. This replacement has **not** run on the original
-  TEST 7 profile; the older f034 process remains live and fenced.
+  TEST 7 profile; the older f034 process remains live and fenced. The complete
+  bundle was copied after source commit `47526ad55eebf45c54127e3b7078b09a45f00d85`
+  to `C:\catalyst\.superpowers\cancel-proof-47526ad-package\Catalyst\`;
+  the pinned EXE hash matches the build output byte for byte.
