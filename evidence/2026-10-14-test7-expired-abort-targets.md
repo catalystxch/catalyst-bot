@@ -41,7 +41,38 @@ static package tests passed. A custom Defender scan of the package exited 0
 and reported no threat detection for that package path. The EXE has not been
 launched or smoke-tested.
 
-Still required: packaged isolated and native smoke, a fresh action-time
-wallet/safety preflight, and operator-approved launch of this exact reviewed
-build before original-profile proof-only reconciliation. Do not clear the live
-latch or resume trading based on isolated tests alone.
+## Original TEST 7 recovery
+
+The operator approved the exact `6ea1ebb` EXE launch. Its isolated packaged
+API smoke and clean/duplicate/persisted/native-safety desktop smokes passed
+before original-profile use. After closing the older read-only safety window,
+the exact EXE launched as sole CATalyst PID `45820` on port 5000. The on-disk
+EXE matched the hash above; Sage PID `99004` owned port 9257. The native
+restricted recovery screen showed TEST 7 fingerprint `736588221`, mainnet,
+the exact MZ asset, zero pending or active Sage offers, the stopped campaign,
+owned renewing lease, and tripped latch generation `667`.
+
+Through that native screen, each exact target was checked separately. Sage's
+authoritative expired offer history and owned, unlocked inputs yielded durable
+`EXPIRED_PROVEN` reconciliation for `9d4f…5331e` and then `ab93…901b`.
+Both target intents became terminal, each with a `RECONCILE` terminal event
+containing no transaction ID or spend identity. The abort latch stayed tripped
+between the two checks. A fresh empty-book completion then changed only abort
+`ad81…031f7` to `aborted` and resolved the specific latch at
+`2026-10-14T11:04:01.470265Z`. The normal and restricted UI both showed no
+active Sage offers or pending transactions. The restricted startup server still
+returns 423 for normal health until the exact app is restarted, so normal
+dashboard acceptance has not been credited.
+
+Read-only poststate: no durable open offer intents; campaign `99b5…b701`
+stopped at revision 2 with `0` XCH authoritative fee spend; Sage RPC reports
+zero pending transactions and no active offers. Its exact owned and selectable
+balances match the earlier checkpoint: `138470190098731` XCH mojos and
+`780212284` MZ atomic units. No cancellation, coin preparation, publication,
+or wallet transaction was sent during this recovery.
+
+Still required: restart the same exact build into normal mode after the
+computer-use skill's fresh action-time launch confirmation, native dashboard
+and tab acceptance, renewed long-running monitoring, and the separate
+secondary-PC and Splash peer work. Do not resume trading solely because this
+specific abort latch resolved.
