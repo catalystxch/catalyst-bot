@@ -38024,24 +38024,46 @@ def claim_offer_book_improvement(
 def compact_market_provider_evidence(
     *, before: datetime, summarized_at: datetime
 ) -> Dict[str, int]:
-    """Replace detailed old evidence with non-sensitive daily counts."""
+    """Replace a bounded batch of old evidence with non-sensitive daily counts.
+
+    Housekeeping repeats this call to drain a backlog. A no-op check avoids
+    taking the SQLite writer lock when no observations have expired.
+    """
 
     cutoff = _market_evidence_timestamp(before, "before")
     summarized = _market_evidence_timestamp(summarized_at, "summarized_at")
     conn = get_connection()
+    if (
+        conn.execute(
+            "SELECT 1 FROM market_provider_observations WHERE observed_at < ? LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        is None
+    ):
+        return {"deleted": 0, "summaries_written": 0}
     try:
         conn.execute("BEGIN IMMEDIATE")
-        groups = conn.execute(
+        rows = conn.execute(
             """
-            SELECT asset_id, substr(observed_at, 1, 10) AS summary_day,
-                   provider_id, capability, quality, COUNT(*) AS observation_count
+            SELECT observation_id, asset_id, substr(observed_at, 1, 10) AS summary_day,
+                   provider_id, capability, quality
             FROM market_provider_observations
             WHERE observed_at < ?
-            GROUP BY asset_id, summary_day, provider_id, capability, quality
+            LIMIT 500
             """,
             (cutoff,),
         ).fetchall()
-        for row in groups:
+        groups: Dict[tuple, int] = {}
+        for row in rows:
+            key = (
+                row["asset_id"],
+                row["summary_day"],
+                row["provider_id"],
+                row["capability"],
+                row["quality"],
+            )
+            groups[key] = groups.get(key, 0) + 1
+        for key, observation_count in groups.items():
             conn.execute(
                 """
                 INSERT INTO market_evidence_summaries (
@@ -38053,19 +38075,18 @@ def compact_market_provider_evidence(
                     observation_count=observation_count + excluded.observation_count,
                     summarized_at=excluded.summarized_at
                 """,
-                (
-                    row["asset_id"],
-                    row["summary_day"],
-                    row["provider_id"],
-                    row["capability"],
-                    row["quality"],
-                    row["observation_count"],
-                    summarized,
-                ),
+                (*key, observation_count, summarized),
             )
-        deleted = conn.execute(
-            "DELETE FROM market_provider_observations WHERE observed_at < ?", (cutoff,)
-        ).rowcount
+        deleted = 0
+        if rows:
+            ids = [row["observation_id"] for row in rows]
+            placeholders = ",".join("?" for _ in ids)
+            deleted = conn.execute(
+                f"DELETE FROM market_provider_observations WHERE observation_id IN ({placeholders})",
+                ids,
+            ).rowcount
+            if deleted != len(rows):
+                raise RuntimeError("market evidence batch changed during compaction")
         conn.commit()
         return {"deleted": int(deleted), "summaries_written": len(groups)}
     except Exception:

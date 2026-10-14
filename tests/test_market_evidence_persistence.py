@@ -131,6 +131,57 @@ def test_evidence_compaction_keeps_daily_non_sensitive_summary(isolated_db):
     assert "raw_evidence" not in summaries[0]
 
 
+def test_evidence_compaction_without_expired_rows_does_not_take_write_lock(isolated_db):
+    persist_provider_observation(_provider_observation(NOW))
+    statements = []
+    conn = database.get_connection()
+    conn.set_trace_callback(statements.append)
+    try:
+        result = database.compact_market_provider_evidence(
+            before=NOW - timedelta(days=30), summarized_at=NOW
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert result == {"deleted": 0, "summaries_written": 0}
+    assert not any(statement.startswith("BEGIN IMMEDIATE") for statement in statements)
+    assert len(database.get_market_provider_observations(asset_id=ASSET_ID)) == 1
+
+
+def test_evidence_compaction_bounds_expired_rows_per_write_transaction(isolated_db):
+    old = NOW - timedelta(days=31)
+    for offset in range(501):
+        persist_provider_observation(
+            _provider_observation(old + timedelta(seconds=offset))
+        )
+
+    first = database.compact_market_provider_evidence(
+        before=NOW - timedelta(days=30), summarized_at=NOW
+    )
+    assert first == {"deleted": 500, "summaries_written": 1}
+    assert (
+        len(database.get_market_provider_observations(asset_id=ASSET_ID, limit=10)) == 1
+    )
+    assert (
+        database.get_market_evidence_summaries(asset_id=ASSET_ID)[0][
+            "observation_count"
+        ]
+        == 500
+    )
+
+    second = database.compact_market_provider_evidence(
+        before=NOW - timedelta(days=30), summarized_at=NOW
+    )
+    assert second == {"deleted": 1, "summaries_written": 1}
+    assert database.get_market_provider_observations(asset_id=ASSET_ID, limit=10) == []
+    assert (
+        database.get_market_evidence_summaries(asset_id=ASSET_ID)[0][
+            "observation_count"
+        ]
+        == 501
+    )
+
+
 def test_bot_housekeeping_compacts_provider_evidence_after_thirty_days(monkeypatch):
     from bot_loop import BotLoop
 
