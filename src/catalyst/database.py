@@ -4161,6 +4161,8 @@ CREATE TABLE IF NOT EXISTS market_provider_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_market_provider_observations_asset_time
     ON market_provider_observations(asset_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_provider_observations_time
+    ON market_provider_observations(observed_at);
 
 -- Immutable fill-candidate evidence.  Observed/Probable rows are diagnostic
 -- only; database checks make it impossible to mark them as economic authority.
