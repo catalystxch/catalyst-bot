@@ -155,3 +155,31 @@
   Windows onedir build completed. The preflight is read-only and is not yet
   wired to an abort-scoped lease entry, so it grants no recovery or wallet
   authority.
+
+## 2026-10-14 original-profile launch: empty Sage book, stale durable targets
+
+- The operator explicitly approved launching exact source
+  `62d8d6dcc1a1aad5d4fed63b4d153e0e3bc077ff` from
+  `C:\catalyst\.superpowers\fee-approval-62d8-build\dist\Catalyst\Catalyst.exe`
+  (SHA-256 `C6125689F0BD9776974DB484B9B78A8A7C8D217B0C4A5E548B49D786E999DFEE`).
+  The older fenced window closed with its lease inactive. The approved build
+  launched through native computer control as PID 39520, but displayed only
+  the read-only **CATalyst Startup Safety** window, reason
+  `REFRESH_ABORT_CLEANUP`, with no trading interface or mutation authority.
+- Sage's complete offer read on TEST 7 returned zero fillable offers and zero
+  pending transactions in two fresh observations. Sage marked both remaining
+  MZ targets `9d4f…5331e` and `ab93…901b` expired. No cancellation fee or
+  wallet transaction was needed or attempted in this launch.
+- The durable abort remains `parent_terminal`, latch generation 667 remains
+  tripped, its abort blocker remains exact, and the lease is inactive. The
+  database still marks the first target intent `visible` and the unpublished
+  replacement child `created`. The restricted startup preflight accepts a
+  subset of abort targets in Sage's book, but
+  `adopt_refresh_abort_successor` requires the active durable intent trade IDs
+  to equal that book. With an empty Sage book and two durable intents, lease
+  adoption fails closed and the desktop falls back to diagnostics.
+- This is a new recovery gap, not a successful cleanup. The fix must preserve
+  the latch and prove each exact target's terminal Sage status before retiring
+  either durable intent. The unpublished child and publication outbox need
+  explicit lineage checks. Only after an exact empty durable and Sage book can
+  the abort be completed; Task 11 refresh repair remains separate.
