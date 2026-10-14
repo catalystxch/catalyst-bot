@@ -734,6 +734,88 @@ def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+def test_refresh_abort_reconciles_exact_naturally_expired_target_without_cancel(
+    monkeypatch,
+):
+    import database
+    import mutation_gate
+    import offer_reconciliation
+    import wallet
+
+    abort_id, trade_id = "e" * 64, "c" * 64
+    abort = {
+        "abort_id": abort_id,
+        "state": "parent_terminal",
+        "latch_generation": 7,
+        "target_trade_ids_json": json.dumps([trade_id]),
+        "wallet_fingerprint_hash": "f" * 64,
+        "network": "mainnet",
+        "asset_id": "a" * 64,
+    }
+    target = {
+        "intent_id": "child",
+        "lifecycle_state": "created",
+        "wallet_fingerprint_hash": "f" * 64,
+        "network": "mainnet",
+        "asset_id": "a" * 64,
+    }
+    monkeypatch.setattr(database, "get_refresh_abort", lambda _id: abort)
+    monkeypatch.setattr(database, "get_offer_intent_by_trade_id", lambda _id: target)
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    authorized = []
+    monkeypatch.setattr(
+        database,
+        "authorize_refresh_abort_expiry_target",
+        lambda **kwargs: authorized.append(kwargs) or {"intent_id": "child"},
+    )
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    snapshot = {"trade_ids": [], "pending_transaction_ids": [], "observed_at": now}
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: snapshot
+    )
+    monkeypatch.setattr(
+        mutation_gate, "current_runtime", lambda: MagicMock(run_id="owner")
+    )
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _target: {"proof": "exact expiry"},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kwargs: {"classification": "EXPIRED_PROVEN"},
+    )
+    committed = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda intent_id, **kwargs: (
+            committed.append((intent_id, kwargs))
+            or {"classification": "EXPIRED_PROVEN", "applied": True}
+        ),
+    )
+    client = api_server.app.test_client()
+    response = client.post(
+        "/api/offers/refresh_abort/reconcile_target",
+        json={
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "expected_latch_generation": 7,
+        },
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["classification"] == "EXPIRED_PROVEN"
+    assert authorized[0]["trade_id"] == trade_id
+    assert authorized[0]["observed_trade_ids"] == []
+    assert committed[0][0] == "child"
+
+
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
     monkeypatch,
 ):

@@ -1092,9 +1092,50 @@ def api_refresh_abort_cancel_next():
         ), (200 if submitted else 409)
 
 
+def _prove_expired_refresh_abort_target(body: dict, target: dict) -> dict:
+    """Consume exact Sage expiry evidence without entering a wallet effect."""
+
+    import offer_reconciliation
+    import wallet
+
+    bot = api_server.bot
+    runtime = api_server.mutation_gate.current_runtime()
+    if (
+        not api_server._refresh_abort_recovery_active
+        or bot is not None
+        or runtime is None
+    ):
+        raise ValueError("restricted expiry recovery is required")
+    evidence = offer_reconciliation.load_authoritative_evidence(target)
+    first = wallet._read_refresh_abort_cleanup_snapshot()
+    second = wallet._read_refresh_abort_cleanup_snapshot()
+    if (
+        first["trade_ids"] != second["trade_ids"]
+        or first["pending_transaction_ids"] != second["pending_transaction_ids"]
+    ):
+        raise ValueError("complete Sage book changed during expiry proof")
+    database.authorize_refresh_abort_expiry_target(
+        abort_id=body["abort_id"],
+        trade_id=body["trade_id"],
+        expected_latch_generation=body["expected_latch_generation"],
+        owner_run_id=runtime.run_id,
+        observed_trade_ids=second["trade_ids"],
+        observed_pending_transaction_ids=second["pending_transaction_ids"],
+        observed_at=second["observed_at"],
+    )
+    classification = offer_reconciliation.classify_terminal_evidence(
+        target, evidence, now=second["observed_at"]
+    )
+    if classification["classification"] != "EXPIRED_PROVEN":
+        raise ValueError("target lacks authoritative natural expiry proof")
+    return offer_reconciliation.reconcile_offer(
+        target["intent_id"], evidence=evidence, now=second["observed_at"]
+    )
+
+
 @bp.route("/api/offers/refresh_abort/reconcile_target", methods=["POST"])
 def api_refresh_abort_reconcile_target():
-    """Check one submitted cleanup cancellation for Task 9 terminal proof."""
+    """Prove one exact abort target cancelled or naturally expired."""
 
     import offer_reconciliation
 
@@ -1127,9 +1168,27 @@ def api_refresh_abort_reconcile_target():
             or target["wallet_fingerprint_hash"] != abort["wallet_fingerprint_hash"]
             or target["network"] != abort["network"]
             or target["asset_id"] != abort["asset_id"]
-            or not events
-            or events[-1]["phase"] not in {"FINALIZED", "RECONCILED"}
         ):
+            return jsonify(
+                {"success": False, "error": "target_proof_not_submitted"}
+            ), 409
+        if not events:
+            with api_server._bot_cancel_lifecycle_lock:
+                proof = _prove_expired_refresh_abort_target(body, target)
+            terminal = proof.get("classification") == "EXPIRED_PROVEN" and (
+                proof.get("applied") is True or target["lifecycle_state"] == "terminal"
+            )
+            return jsonify(
+                {
+                    "success": terminal,
+                    "stage": "target_terminal" if terminal else "awaiting_target_proof",
+                    "abort_id": body["abort_id"],
+                    "target_trade_id": body["trade_id"],
+                    "classification": proof.get("classification"),
+                    "wallet_effect_started": False,
+                }
+            ), (200 if terminal else 409)
+        if events[-1]["phase"] not in {"FINALIZED", "RECONCILED"}:
             return jsonify(
                 {"success": False, "error": "target_proof_not_submitted"}
             ), 409

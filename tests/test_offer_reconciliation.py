@@ -9062,6 +9062,7 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     if prepared_cleanup in {
         "multi_target",
         "restart_after_child",
+        "restart_after_expiry",
         "published_child_restart",
     }:
         extra_coin = "e" * 64
@@ -9114,6 +9115,12 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
             finalized_at=AT,
             finalize_selected_coin_reservations=True,
         )
+        if prepared_cleanup == "restart_after_expiry":
+            database.record_offer_intent_visibility(
+                extra_intent,
+                publication_identity="registry:extra",
+                visible_at=AT,
+            )
         observed_book.append(extra_trade)
     _persist_cancel_result(
         CANCEL_SUBMITTED_UNCONFIRMED,
@@ -9508,17 +9515,113 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
         assert adopted["adopted"] is True
         assert database.get_runtime_safety_latch()["state"] == "tripped"
         assert database.get_offer_intent(child_id)["lifecycle_state"] == "created"
-        with pytest.raises(
-            ValueError, match="refresh abort lineage lacks terminal proof"
+        child_expiry = _evidence(
+            offers=[
+                _offer(
+                    status=5,
+                    trade_id=OTHER_TRADE,
+                    selected_coin_ids=[OTHER_COIN],
+                    transaction_id="",
+                )
+            ],
+            transactions=[],
+            coins={
+                OTHER_COIN: _coin(
+                    OTHER_COIN,
+                    asset_id="xch",
+                    amount=1000,
+                    offer_id=OTHER_TRADE,
+                )
+            },
+            observed_at=fresh_clock(),
+        )
+        authorized = database.authorize_refresh_abort_expiry_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert authorized["intent_id"] == child_id
+        for changed in (
+            {"observed_trade_ids": [OTHER_TRADE]},
+            {"observed_pending_transaction_ids": ["2" * 64]},
+            {"owner_run_id": "wrong-owner"},
+            {"expected_latch_generation": abort["latch_generation"] + 1},
         ):
-            database.complete_refresh_abort(
+            request = {
+                "abort_id": abort["abort_id"],
+                "trade_id": OTHER_TRADE,
+                "expected_latch_generation": abort["latch_generation"],
+                "owner_run_id": "run-after-expiry",
+                "observed_trade_ids": [],
+                "observed_pending_transaction_ids": [],
+                "observed_at": fresh_clock(),
+            }
+            with pytest.raises(ValueError):
+                database.authorize_refresh_abort_expiry_target(**(request | changed))
+        with pytest.raises(ValueError):
+            database.authorize_refresh_abort_expiry_target(
                 abort_id=abort["abort_id"],
+                trade_id="1" * 64,
                 expected_latch_generation=abort["latch_generation"],
                 owner_run_id="run-after-expiry",
                 observed_trade_ids=[],
                 observed_pending_transaction_ids=[],
                 observed_at=fresh_clock(),
             )
+        expired = reconcile_offer(child_id, evidence=child_expiry, now=fresh_clock())
+        assert expired["classification"] == EXPIRED_PROVEN
+        assert expired["applied"] is True
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "terminal"
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        extra_expiry = _evidence(
+            offers=[
+                _offer(
+                    status=5,
+                    trade_id=extra_trade,
+                    selected_coin_ids=[extra_coin],
+                    transaction_id="",
+                )
+            ],
+            transactions=[],
+            coins={
+                extra_coin: _coin(
+                    extra_coin,
+                    asset_id="xch",
+                    amount=1000,
+                    offer_id=extra_trade,
+                )
+            },
+            observed_at=fresh_clock(),
+        )
+        next_target = database.authorize_refresh_abort_expiry_target(
+            abort_id=abort["abort_id"],
+            trade_id=extra_trade,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert next_target["intent_id"] == extra_intent
+        next_expired = reconcile_offer(
+            extra_intent, evidence=extra_expiry, now=fresh_clock()
+        )
+        assert next_expired["classification"] == EXPIRED_PROVEN
+        assert next_expired["applied"] is True
+        completed = database.complete_refresh_abort(
+            abort_id=abort["abort_id"],
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert completed["state"] == "aborted"
+        assert database.get_runtime_safety_latch()["state"] == "resolved"
         return
     if prepared_cleanup is True:
         child_operation = f"cancel:{OTHER_TRADE}"
