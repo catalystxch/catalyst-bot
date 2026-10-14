@@ -848,6 +848,24 @@ def test_refresh_abort_reconciles_exact_naturally_expired_target_without_cancel(
     assert authorized[0]["observed_trade_ids"] == []
     assert committed[0][0] == "child"
 
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kwargs: {"classification": "ACTIVE_PROVEN"},
+    )
+    denied = client.post(
+        "/api/offers/refresh_abort/reconcile_target",
+        json={
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "expected_latch_generation": 7,
+        },
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert denied.status_code == 409
+    assert len(committed) == 1
+
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 def test_refresh_abort_proof_and_completion_routes_do_not_submit_wallet_effect(
