@@ -198,3 +198,11 @@
   call the reconciliation commit. This confirms a potential proof source for
   a narrowly scoped terminalization route; that route and its authorization
   tests are still missing.
+- The first subset patch failed the full Linux CI unit job at
+  `test_refresh_safety.py::test_refresh_abort_successor_rebinds_only_exact_released_owner`:
+  it also admitted an empty Sage book while the parent cancellation was still
+  in the `fenced` stage. That is unsafe ambiguity. The rule now requires exact
+  durable/Sage equality in `fenced`, permitting a subset only after the parent
+  reached `parent_terminal`. The previously failing test and the new
+  expired-target case passed; the full refresh-safety and offer-reconciliation
+  suites passed 395 tests locally. CI must re-run on this corrected head.

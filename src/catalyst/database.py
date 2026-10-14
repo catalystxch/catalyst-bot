@@ -30458,6 +30458,7 @@ def adopt_refresh_abort_successor(
             or len(durable_trades) != len(set(durable_trades))
             or not set(durable_trades).issubset(abort_targets)
             or not set(observed).issubset(set(durable_trades))
+            or (abort["state"] == "fenced" and durable_trades != observed)
         ):
             raise ValueError("complete Sage book differs from refresh abort targets")
         changed = conn.execute(
