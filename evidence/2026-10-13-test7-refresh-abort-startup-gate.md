@@ -192,3 +192,9 @@
   abort completion still rejects the unterminated replacement child. This is
   only fenced entry, not the missing target-expiry reconciliation or a live
   recovery result. The original profile remains in read-only diagnostics.
+- A separate read-only run of the existing Task 9 evidence loader and
+  classifier returned `EXPIRED_PROVEN` / `AUTHORITATIVE_EXPIRY_PROOF` for both
+  exact target intents, including owned unlocked input-coin proof. It did not
+  call the reconciliation commit. This confirms a potential proof source for
+  a narrowly scoped terminalization route; that route and its authorization
+  tests are still missing.
