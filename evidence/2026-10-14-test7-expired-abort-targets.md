@@ -25,10 +25,23 @@ owner, and wrong latch generation. `tests/test_offer_reconciliation.py`,
 Windows. The visible-target variant passed again after the test was extended.
 The normal and restricted recovery views now expose the proof-only step before
 empty-book completion; all 13 Chromium recovery UI tests and all 73 offer
-endpoint tests passed. Ruff check and formatting passed.
+endpoint tests passed. Ruff check and formatting passed. The serial local
+Windows backend suite completed with 7,760 passed, 292 skipped and 457
+subtests passed (exit 0); it started at source `d4be31e`, with the subsequent
+UI and endpoint-only changes verified by the focused tests and exact-head CI.
+All 11 checks passed on exact PR source
+`6ea1ebba7ff3c271a062416388e3c9bb7b590ecc`. Independent read-only review
+of that head found no actionable financial safety issue. Its remaining gap is
+the restricted recovery flow against real Sage RPC and the original profile.
 
-Still required: full CI on this exact PR head, independent review, clean
-package/Defender and native smoke, a fresh action-time wallet/safety preflight,
-and operator-approved launch of an exact reviewed build before original-profile
-proof-only reconciliation. Do not clear the live latch or resume trading based
-on isolated tests alone.
+A clean detached package was built from that exact source. The packaged EXE
+SHA-256 is `3ED71E414D23FBE5B3B499F253E08EF3F15690CB3B89B16C65121E84D6AFB0F7`.
+The bundled normal and restricted recovery HTML hashes match source; all six
+static package tests passed. A custom Defender scan of the package exited 0
+and reported no threat detection for that package path. The EXE has not been
+launched or smoke-tested.
+
+Still required: packaged isolated and native smoke, a fresh action-time
+wallet/safety preflight, and operator-approved launch of this exact reviewed
+build before original-profile proof-only reconciliation. Do not clear the live
+latch or resume trading based on isolated tests alone.
