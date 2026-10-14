@@ -23,7 +23,9 @@ owner, and wrong latch generation. `tests/test_offer_reconciliation.py`,
 `tests/test_refresh_safety.py`, and
 `tests/test_plan_04_04_offers_endpoints.py` passed 468 tests locally on
 Windows. The visible-target variant passed again after the test was extended.
-Ruff check and formatting passed.
+The normal and restricted recovery views now expose the proof-only step before
+empty-book completion; all 13 Chromium recovery UI tests and all 73 offer
+endpoint tests passed. Ruff check and formatting passed.
 
 Still required: full CI on this exact PR head, independent review, clean
 package/Defender and native smoke, a fresh action-time wallet/safety preflight,

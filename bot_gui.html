@@ -32846,12 +32846,16 @@
             } else if (preview.stage === 'parent_terminal') {
                 const next = trades[0];
                 const journal = preview.next_target_journal;
+                const expired = preview.next_expired_target_trade_id;
                 summary.textContent = journal
                     ? `${scope} Cancellation ${journal.trade_id} needs terminal Sage proof before another offer can be touched.`
+                    : expired
+                    ? `${scope} Offer ${expired} is missing from Sage's active book. Check its natural expiry proof before closing this fence; no cancellation will be sent.`
                     : next
                     ? `${scope} Parent cancellation is proven. Next exact target: ${next}. One cancellation is submitted at a time, followed by Sage terminal proof.`
                     : `${scope} All target offers must have terminal proof before this fence can close.`;
                 action.textContent = journal ? 'Check target cancellation proof'
+                    : expired ? 'Check target expiry proof'
                     : !next ? 'Check empty-book completion' : 'Cancel this one offer';
                 action.disabled = journal?.phase === 'PREPARED';
                 if (action.disabled) summary.textContent += ' A prepared wallet effect is unresolved; no retry is allowed.';
@@ -32887,6 +32891,13 @@
                     expected_latch_generation: preview.abort.latch_generation };
                 title = 'Check exact offer proof?';
                 message = 'Ask Sage for terminal proof for the submitted cancellation. This does not send another cancellation.';
+            } else if (preview.stage === 'parent_terminal' && preview.next_expired_target_trade_id) {
+                path = 'reconcile_target';
+                body = { abort_id: preview.abort.abort_id,
+                    trade_id: preview.next_expired_target_trade_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check natural expiry proof?';
+                message = 'Use complete Sage history and owned coin evidence to prove this exact offer expired. No cancellation or wallet transaction will be sent.';
             } else if (preview.stage === 'parent_terminal' && trades.length === 0) {
                 path = 'complete';
                 body = { confirmation: true, abort_id: preview.abort.abort_id,

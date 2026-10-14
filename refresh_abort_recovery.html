@@ -132,6 +132,9 @@
         if (data.next_target_journal) {
           nextAction = 'reconcile_target';
           advance.textContent = 'Check submitted cancellation proof';
+        } else if (data.next_expired_target_trade_id) {
+          nextAction = 'prove_expiry';
+          advance.textContent = 'Check natural expiry proof';
         } else if (trades.length === 0) {
           nextAction = 'complete';
           advance.textContent = 'Verify empty book and complete recovery';
@@ -227,6 +230,12 @@
             abort_id: proof.abort.abort_id,
             expected_latch_generation: proof.abort.latch_generation,
             trade_id: proof.next_target_journal.trade_id
+          });
+        } else if (action === 'prove_expiry') {
+          await postExact('reconcile_target', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            trade_id: proof.next_expired_target_trade_id
           });
         } else if (action === 'complete') {
           if (!window.confirm('Verify the empty Sage book and complete only this fenced recovery?')) return;

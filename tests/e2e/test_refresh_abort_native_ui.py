@@ -49,6 +49,43 @@ def test_restricted_recovery_page_only_submits_reviewed_next_target(page):
     assert call["body"]["expected_trade_ids"] == ["c" * 64]
 
 
+def test_restricted_recovery_proves_missing_expired_target_before_completion(page):
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
+    )
+    page.evaluate(
+        """() => {
+          window.__recoveryCalls = [];
+          window.confirm = () => true;
+          window.fetch = async (path, options = {}) => {
+            if (options.method === 'POST') {
+              window.__recoveryCalls.push({path, body: JSON.parse(options.body)});
+              return new Response(JSON.stringify({success: true,
+                stage: 'target_terminal'}), {status: 200});
+            }
+            return new Response(JSON.stringify({
+              success: true, stage: 'parent_terminal',
+              abort: {abort_id: 'a'.repeat(64), campaign_id: 'b'.repeat(64),
+                      latch_generation: 7},
+              wallet: {fingerprint: 736588221, network: 'mainnet',
+                       asset_id: 'd'.repeat(64), active_trade_ids: [],
+                       pending_transaction_count: 0},
+              safety: {state: 'tripped', generation: 7, lease_owned: true},
+              stopped_campaigns: [], next_target_journal: null,
+              next_expired_target_trade_id: 'c'.repeat(64)
+            }), {status: 200});
+          };
+        }"""
+    )
+    page.locator("#refresh").click()
+    expect(page.locator("#advance")).to_have_text("Check natural expiry proof")
+    page.locator("#advance").click()
+    page.wait_for_function("() => window.__recoveryCalls.length === 1")
+    call = page.evaluate("window.__recoveryCalls[0]")
+    assert call["path"].endswith("/refresh_abort/reconcile_target")
+    assert call["body"]["trade_id"] == "c" * 64
+
+
 def test_restricted_recovery_fee_flow_never_calls_coin_prep(page):
     page.goto(
         (Path(__file__).resolve().parents[2] / "refresh_abort_recovery.html").as_uri()
@@ -289,6 +326,45 @@ def test_submitted_target_removed_from_sage_book_still_checks_proof(page):
     calls = page.evaluate("window.__abortCalls")
     assert calls[0]["path"].endswith("/offers/refresh_abort/reconcile_target")
     assert calls[0]["body"]["trade_id"] == "c" * 64
+
+
+def test_expired_target_uses_proof_only_action_before_empty_book_completion(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            window.__abortCalls = [];
+            const preview = {
+                success: true, stage: 'parent_terminal',
+                abort: {abort_id: 'a'.repeat(64), campaign_id: 'b'.repeat(64),
+                        latch_generation: 2},
+                wallet: {fingerprint: 736588221, active_trade_ids: [],
+                         pending_transaction_count: 0},
+                safety: {state: 'tripped', generation: 2, lease_owned: true},
+                next_target_journal: null,
+                next_expired_target_trade_id: 'c'.repeat(64),
+            };
+            window.apiFetch = async (path, options = {}) => {
+                if (options.method === 'POST') {
+                    window.__abortCalls.push({path, body: JSON.parse(options.body)});
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'target_terminal'}), {status: 200});
+                }
+                return new Response(JSON.stringify(preview), {status: 200});
+            };
+            showStyledConfirm = async () => true;
+            await cancelAllOffers();
+        }"""
+    )
+    expect(page.locator("#refreshAbortActionBtn")).to_have_text(
+        "Check target expiry proof"
+    )
+    page.locator("#refreshAbortActionBtn").click()
+    page.wait_for_function("() => window.__abortCalls.length === 1")
+    call = page.evaluate("window.__abortCalls[0]")
+    assert call["path"].endswith("/offers/refresh_abort/reconcile_target")
+    assert call["body"]["trade_id"] == "c" * 64
 
 
 @pytest.mark.parametrize("gate_allowed", [True, False])

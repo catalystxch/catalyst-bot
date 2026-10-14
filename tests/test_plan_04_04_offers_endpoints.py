@@ -214,6 +214,9 @@ def test_refresh_abort_preview_uses_complete_sage_book_not_stale_ui_count(
                 "latch_generation": 7,
                 "target_trade_ids_json": json.dumps([child_trade, *other_trades]),
                 "state": "parent_terminal",
+                "wallet_fingerprint_hash": "f" * 64,
+                "network": "mainnet",
+                "asset_id": asset_id,
             }
         ],
     )
@@ -242,6 +245,37 @@ def test_refresh_abort_preview_uses_complete_sage_book_not_stale_ui_count(
     assert pending_body["wallet"]["active_trade_ids"] == other_trades
     assert pending_body["next_target_journal"]["trade_id"] == child_trade
     assert pending_body["next_target_journal"]["phase"] == "FINALIZED"
+
+    # Natural expiry of the unpublished child must be offered as a proof-only
+    # step before the empty-book completion button can close the fence.
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-10-13T16:02:00Z",
+        },
+    )
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _op: [])
+    monkeypatch.setattr(
+        database,
+        "get_offer_intent_by_trade_id",
+        lambda trade: {
+            "intent_id": "child" if trade == child_trade else trade,
+            "lifecycle_state": "created",
+            "asset_id": asset_id,
+            "wallet_fingerprint_hash": "f" * 64,
+            "network": "mainnet",
+        },
+    )
+    expired = api_server.app.test_client().get(
+        "/api/offers/refresh_abort/preview",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert expired.status_code == 200
+    assert expired.get_json()["next_expired_target_trade_id"] == child_trade
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")

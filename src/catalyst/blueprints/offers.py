@@ -543,6 +543,7 @@ def api_refresh_abort_preview():
             ), 409
     next_trade = snapshot["trade_ids"][0] if snapshot["trade_ids"] else None
     next_event = None
+    next_expired_trade = None
     if current_abort is not None:
         # A submitted target can disappear from Sage's active list before its
         # Task 9 terminal proof is durable. Keep that journal visible so the
@@ -555,6 +556,23 @@ def api_refresh_abort_preview():
         if next_event is None and next_trade is not None:
             events = database.get_offer_operation_events(f"cancel:{next_trade}")
             next_event = events[-1] if events else None
+        if current_abort["state"] == "parent_terminal" and next_event is None:
+            for target_trade in json.loads(current_abort["target_trade_ids_json"]):
+                if target_trade in snapshot["trade_ids"]:
+                    continue
+                if database.get_offer_operation_events(f"cancel:{target_trade}"):
+                    continue
+                target = database.get_offer_intent_by_trade_id(target_trade)
+                if (
+                    target is not None
+                    and target["lifecycle_state"] in {"created", "visible"}
+                    and target["wallet_fingerprint_hash"]
+                    == current_abort["wallet_fingerprint_hash"]
+                    and target["network"] == current_abort["network"]
+                    and target["asset_id"] == current_abort["asset_id"]
+                ):
+                    next_expired_trade = target_trade
+                    break
     return jsonify(
         {
             "success": True,
@@ -625,6 +643,7 @@ def api_refresh_abort_preview():
                 if next_event is not None
                 else None
             ),
+            "next_expired_target_trade_id": next_expired_trade,
             "wallet_effect_started": False,
         }
     )
