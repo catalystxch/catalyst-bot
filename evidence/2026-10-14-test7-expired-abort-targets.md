@@ -71,9 +71,9 @@ balances match the earlier checkpoint: `138470190098731` XCH mojos and
 `780212284` MZ atomic units. No cancellation, coin preparation, publication,
 or wallet transaction was sent during this recovery.
 
-Still required: full native tab acceptance, renewed long-running monitoring,
-and the separate secondary-PC and Splash peer work. Do not resume trading
-solely because this specific abort latch resolved.
+Still required: renewed long-running monitoring, secondary-PC recovery, and
+cross-PC Splash peer receipt. Do not resume trading solely because this
+specific abort latch resolved.
 
 ## Normal restart after recovery
 
@@ -90,10 +90,22 @@ lease, zero blocking operations, and no safety reason code. The stored abort
 remained `aborted` and its exact latch remained `resolved` before restart.
 
 The existing Splash binary was started from the native optional Splash gate;
-its local process was observed as PID `169136` with local offer submission,
-metrics, and incoming-hook endpoints. This establishes local startup only;
-reciprocal peer receipt and cross-PC offer broadcast remain unproven. No
-campaign or bot was started and no wallet transaction was sent. At this
-checkpoint, the evidence-only PR head `88a71bd` had ten CI checks passing and
-the unit-test check still pending. Normal-tab acceptance beyond Dashboard and
-Offers, renewed monitoring, and secondary-PC recovery remain open.
+its local process was observed as PID `169136` with ports `4000`, `4001`, and
+`11511` listening. The app log confirmed its incoming hook. Market Intel still
+reported `Splash offers UNAVAILABLE`, `API Status Disabled`, and zero received
+offers because Splash P2P remained off in saved trading settings. Local daemon
+startup therefore does not prove reciprocal peer receipt or cross-PC offer
+broadcast. The normal native Dashboard, Offers, P&L, Market Intel, Settings,
+Logs, Data Reset, Help, and About views were traversed read-only. Settings
+showed safety `ALLOWED`, fingerprint `736588221`, and the MZ pair; no settings
+were saved and no reset was invoked. No campaign or bot was started and no
+wallet transaction was sent. The evidence-only PR head `88a71bd` had ten CI
+checks passing and the unit-test check pending at the first post-restart
+check. A new read-only exact PID/hash 60-second monitor started at
+`2026-10-14T11:16:22.5026766Z` in
+`E:\catalyst-stability-monitor-6ea1ebb-recovered-20261014\trace-60s.jsonl`,
+PID `217064`. Its first sample showed safety allowed, owned lease, synced Sage,
+stopped bot, and Windows Backup ready. This is a new stopped-profile window;
+no 24-hour credit is due before `2026-10-15T11:16:22Z` plus a complete-trace
+and end-state audit. Secondary-PC recovery and live Splash peer receipt remain
+open.
