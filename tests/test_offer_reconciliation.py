@@ -8914,6 +8914,7 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
         "completion_extra_blocker",
         "multi_target",
         "restart_after_child",
+        "restart_after_expiry",
         "entry_unrelated_journal",
         "cleanup_unrelated_journal",
         "cleanup_active_worker",
@@ -9470,6 +9471,55 @@ def test_fenced_abort_records_confirmed_parent_without_publishing_child(
     )
     assert replay["idempotent"] is True
     assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    if prepared_cleanup == "restart_after_expiry":
+        # Sage has expired every target between runs, but the durable intents
+        # remain open. Scoped ownership may enter only the fenced recovery UI;
+        # cancellation and completion still require exact terminal proof.
+        fresh_clock = lambda: (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        monkeypatch.setattr(database, "_stability_wall_clock", fresh_clock)
+        prior = database.get_runtime_mutation_lease()
+        released = database.release_runtime_mutation_lease(
+            owner_run_id="run-task9",
+            expected_lease_version=prior["lease_version"],
+            released_at=fresh_clock(),
+        )
+        assert released["released"] is True
+        adopted = database.adopt_refresh_abort_successor(
+            abort_id=abort["abort_id"],
+            successor_owner_run_id="run-after-expiry",
+            successor_owner_pid=2,
+            successor_owner_host="test-host",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            expected_lease_version=released["lease"]["lease_version"],
+            lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            prior_owner_liveness_proven_dead=False,
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert adopted["adopted"] is True
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "created"
+        with pytest.raises(
+            ValueError, match="refresh abort lineage lacks terminal proof"
+        ):
+            database.complete_refresh_abort(
+                abort_id=abort["abort_id"],
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-after-expiry",
+                observed_trade_ids=[],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+        return
     if prepared_cleanup is True:
         child_operation = f"cancel:{OTHER_TRADE}"
         database.prepare_offer_cancel(

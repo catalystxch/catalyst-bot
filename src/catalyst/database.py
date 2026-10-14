@@ -30448,15 +30448,16 @@ def adopt_refresh_abort_successor(
             "AND intent_id<>?",
             (wallet_hash, safe_network, parent["intent_id"]),
         ).fetchall()
+        durable_trades = sorted(row["sage_trade_id"] for row in active)
+        abort_targets = set(json.loads(abort["target_trade_ids_json"]))
         if (
             any(
                 not row["sage_trade_id"] or row["asset_id"] != safe_asset
                 for row in active
             )
-            or sorted(row["sage_trade_id"] for row in active) != observed
-            or not set(observed).issubset(
-                set(json.loads(abort["target_trade_ids_json"]))
-            )
+            or len(durable_trades) != len(set(durable_trades))
+            or not set(durable_trades).issubset(abort_targets)
+            or not set(observed).issubset(set(durable_trades))
         ):
             raise ValueError("complete Sage book differs from refresh abort targets")
         changed = conn.execute(

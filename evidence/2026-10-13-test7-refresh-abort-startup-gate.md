@@ -183,3 +183,12 @@
   either durable intent. The unpublished child and publication outbox need
   explicit lineage checks. Only after an exact empty durable and Sage book can
   the abort be completed; Task 11 refresh repair remains separate.
+- Isolated red/green reproduction: the old successor rejected an empty Sage
+  book while its two exact durable targets remained open. The restricted
+  successor now admits only a subset of the unique durable abort targets;
+  unknown Sage IDs, foreign durable IDs, pending effects and the other
+  existing guards remain denied. All 15 variants of the incident fixture
+  passed after the change. The new test proves the latch stays tripped and
+  abort completion still rejects the unterminated replacement child. This is
+  only fenced entry, not the missing target-expiry reconciliation or a live
+  recovery result. The original profile remains in read-only diagnostics.
