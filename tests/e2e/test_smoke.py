@@ -1302,6 +1302,33 @@ def test_resume_start_sends_explicit_existing_offer_authority_request(page):
     assert result["body"] == '{"resume_existing_offers":true}'
 
 
+@pytest.mark.parametrize(
+    "button_id",
+    ["startupResumeContinueBtn", "startupReadyCtaBtn", "startBtn"],
+)
+@pytest.mark.parametrize("restored", [False, True])
+def test_dashboard_start_buttons_preserve_resume_intent(page, button_id, restored):
+    """Dashboard start buttons must distinguish fresh starts from restored books."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async ([buttonId, restored]) => {
+            _resumeSessionSummary = restored
+                ? { offer_count: 6, buy_count: 3, sell_count: 3 }
+                : null;
+            startBot = async options => { window.__capturedStartOptions = options; };
+            const button = document.getElementById(buttonId);
+            button.disabled = false;
+            button.click();
+            return window.__capturedStartOptions?.resumeExistingOffers === true;
+        }""",
+        [button_id, restored],
+    )
+
+    assert result is restored
+
+
 def test_red_bootstrap_labels_anchor_price_without_calling_it_trusted(page):
     """A RED Bootstrap anchor must not be presented as trusted market evidence."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

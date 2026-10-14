@@ -9131,7 +9131,7 @@
                                         <div class="dashboard-startup-cta-title" id="startupReadyCtaTitle">Start the bot now</div>
                                         <div class="dashboard-startup-cta-detail" id="startupReadyCtaDetail">Coin prep is ready for this pair. Start market making now and the startup guide will step aside for the live dashboard.</div>
                                     </div>
-                                    <button class="btn btn-start btn-primary dashboard-startup-cta-btn" id="startupReadyCtaBtn" onclick="startBot()" disabled>▶ Start Bot Now</button>
+                                    <button class="btn btn-start btn-primary dashboard-startup-cta-btn" id="startupReadyCtaBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" disabled>▶ Start Bot Now</button>
                                 </div>
                                 <div class="dashboard-startup-resume" id="startupResumeOverview">
                                     <div class="dashboard-startup-resume-header">
@@ -9163,7 +9163,7 @@
                                         </div>
                                     </div>
                                     <div class="dashboard-startup-resume-actions" style="display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap;">
-                                        <button class="btn btn-start btn-primary" id="startupResumeContinueBtn" onclick="startBot()" style="min-width: 200px;">▶ Resume Bot Now</button>
+                                        <button class="btn btn-start btn-primary" id="startupResumeContinueBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" style="min-width: 200px;">▶ Resume Bot Now</button>
                                         <button class="btn btn-config btn-secondary" id="startupResumeSettingsBtn" onclick="handleResumeSettingsChangeRequest()" style="min-width: 190px;">↺ Start Fresh for Changes</button>
                                     </div>
                                 </div>
@@ -9175,7 +9175,7 @@
                          is visible directly under the token pill) ===== -->
                     <div class="v4-toolbar v4-toolbar--primary">
                         <div class="v4-toolbar-left">
-                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot()" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
+                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
                         <button class="btn btn-cancel btn-danger" id="cancelAllBtn" onclick="cancelAllOffers()">Cancel All (<span id="cancelAllCount">0</span>) <span class="cc-help">?<span class="cc-tooltip">Cancels every active buy and sell offer — use for a clean restart or wallet switch. Stop the bot first.</span></span></button>
