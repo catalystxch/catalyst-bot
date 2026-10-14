@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -606,10 +606,21 @@ def test_real_task8_task9_completion_replays_one_exact_lineage_commit(
         assigned_tier="inner",
         purpose="lifecycle",
     )
+    assert database.upsert_coin(
+        _sha("coin:child"),
+        "xch",
+        100,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
     _prepare("parent", reserve_selected_coins=True)
     _confirm("parent", finalize_selected_coin_reservations=True)
-    _prepare("child", parent_intent_id="parent", generation=1)
-    _confirm("child")
+    _prepare(
+        "child", parent_intent_id="parent", generation=1, reserve_selected_coins=True
+    )
+    _confirm("child", finalize_selected_coin_reservations=True)
     database.bind_refresh_lineage("parent", "child")
     database.record_offer_intent_visibility(
         "child", publication_identity="registry:child"
@@ -724,6 +735,45 @@ def test_real_task8_task9_completion_replays_one_exact_lineage_commit(
     assert first_proof["complete"] is retry_proof["complete"] is True
     assert retry_proof["terminal"]["event_id"] == terminal["event"]["event_id"]
     assert database.get_refresh_lineage_commit_for_child("child") is None
+
+    # The child can naturally expire after it was visibly published but before
+    # a restarted runtime records Task 11's parent completion. Its historical
+    # visibility and exact terminal journal must still permit proof-only replay.
+    child_evidence = {"source": "task-9-child-expiry", "trade_id": _sha("trade:child")}
+    child_text = json.dumps(
+        child_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    child_visible_at = database.get_offer_intent("child")["first_visible_at"]
+    child_terminal_at = (
+        (
+            datetime.fromisoformat(child_visible_at.replace("Z", "+00:00"))
+            + timedelta(seconds=30)
+        )
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    database.commit_offer_reconciliation(
+        intent_id="child",
+        operation_id="reconcile:child",
+        classification="EXPIRED_PROVEN",
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json=child_evidence,
+        evidence_sha256=hashlib.sha256(child_text.encode("utf-8")).hexdigest(),
+        reconciled_at=child_terminal_at,
+    )
+    assert database.refresh_parent_cancel_eligibility("parent") == {
+        "eligible": False,
+        "reason": "child_not_confirmed",
+    }
+    assert database.get_pending_refresh_lineage_parent_ids(
+        asset_id=_sha("asset-a"), side="buy", limit=8
+    ) == ["parent"]
+    terminal_child_proof = database.refresh_lineage_completion("parent")
+    assert terminal_child_proof["complete"] is True, terminal_child_proof
 
     first_commit = database.commit_refresh_lineage_completion("parent")
     # Simulate loss of the successful response after the final commit, then retry.
@@ -1613,6 +1663,31 @@ def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(
     assert database.get_pending_refresh_lineage_parent_ids(
         asset_id=_sha("asset-a"), side="buy", limit=8
     ) == ["absent-parent"]
+
+
+def test_pending_lineage_excludes_a_durably_completed_abort(
+    isolated_database, monkeypatch
+):
+    """A completed abort cannot resume its terminal replacement against a new book."""
+
+    _before, _request, abort, _operation, _wallet_hash, _lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    assert database.get_pending_refresh_lineage_parent_ids(
+        asset_id=_sha("asset-a"), side="buy", limit=8
+    ) == ["parent"]
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offer_refresh_aborts SET state='aborted',completed_at=? WHERE abort_id=?",
+        ("2026-08-15T12:05:00.000000Z", abort["abort_id"]),
+    )
+    conn.commit()
+    assert (
+        database.get_pending_refresh_lineage_parent_ids(
+            asset_id=_sha("asset-a"), side="buy", limit=8
+        )
+        == []
+    )
 
 
 def test_parent_absent_completion_resume_replays_before_and_after_commit(

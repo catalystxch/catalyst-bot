@@ -31795,7 +31795,30 @@ def refresh_lineage_completion(
         parent_intent_id, require_visible=require_visible
     )
     if not eligibility["eligible"]:
-        return {"complete": False, "reason": eligibility["reason"]}
+        if eligibility["reason"] != "child_not_confirmed" or not require_visible:
+            return {"complete": False, "reason": eligibility["reason"]}
+        # A previously visible replacement may itself have reached Task 9's
+        # terminal boundary before a restarted run commits the parent edge.
+        # This is completion proof only; cancellation eligibility remains
+        # restricted to a currently visible child.
+        conn = _stability_connection()
+        try:
+            parent_row = conn.execute(
+                "SELECT child_intent_id FROM offer_intents WHERE intent_id=?",
+                (parent_intent_id,),
+            ).fetchone()
+            if parent_row is None or not parent_row["child_intent_id"]:
+                return {"complete": False, "reason": eligibility["reason"]}
+            try:
+                _parent, child = _refresh_lineage_rows(
+                    conn, parent_intent_id, parent_row["child_intent_id"]
+                )
+            except ValueError:
+                return {"complete": False, "reason": "invalid_lineage"}
+            if not _refresh_terminal_child_was_visible(conn, child):
+                return {"complete": False, "reason": eligibility["reason"]}
+        finally:
+            conn.close()
     parent = get_offer_intent(parent_intent_id)
     assert parent is not None  # checked by eligibility in the same durable DB
     trade_id = parent.get("sage_trade_id")
@@ -31816,6 +31839,36 @@ def refresh_lineage_completion(
     ):
         return {"complete": False, "reason": "cancel_resolution_missing"}
     return {"complete": True, "reason": "complete", "terminal": terminal}
+
+
+def _refresh_terminal_child_was_visible(
+    conn: sqlite3.Connection, child: Dict[str, Any]
+) -> bool:
+    """Verify historical visibility and exact terminal proof for one child."""
+
+    if (
+        child["lifecycle_state"] != "terminal"
+        or not child["publication_identity"]
+        or not child["first_visible_at"]
+        or not child["sage_trade_id"]
+        or not child["offer_text_sha256"]
+    ):
+        return False
+    row = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "AND operation_type='RECONCILE' AND phase='FINALIZED' "
+        "ORDER BY sequence DESC LIMIT 1",
+        (f"reconcile:{child['intent_id']}",),
+    ).fetchone()
+    if row is None:
+        return False
+    event = validate_offer_operation_event(dict(row))
+    return bool(
+        event["intent_id"] == child["intent_id"]
+        and event["outcome"] in _RECONCILE_TERMINAL_OUTCOMES
+        and child["terminal_at"]
+        and child["first_visible_at"] < child["terminal_at"]
+    )
 
 
 def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
@@ -31852,10 +31905,13 @@ def commit_refresh_lineage_completion(parent_intent_id: str) -> Dict[str, Any]:
         except ValueError:
             conn.commit()
             return {"committed": False, "reason": "invalid_lineage"}
-        if (
-            child["lifecycle_state"] != "visible"
-            or not child["publication_identity"]
-            or not child["first_visible_at"]
+        if not (
+            (
+                child["lifecycle_state"] == "visible"
+                and child["publication_identity"]
+                and child["first_visible_at"]
+            )
+            or _refresh_terminal_child_was_visible(conn, child)
         ):
             conn.commit()
             return {"committed": False, "reason": "child_not_visible"}
@@ -31954,9 +32010,14 @@ def get_pending_refresh_lineage_parent_ids(
         FROM offer_intents AS parent
         LEFT JOIN offer_refresh_lineage_commits AS committed
           ON committed.parent_intent_id=parent.intent_id
+        LEFT JOIN offer_refresh_aborts AS aborted
+          ON aborted.parent_intent_id=parent.intent_id
+         AND aborted.child_intent_id=parent.child_intent_id
+         AND aborted.state='aborted'
         WHERE parent.asset_id=? AND parent.side=?
           AND parent.child_intent_id IS NOT NULL
           AND committed.parent_intent_id IS NULL
+          AND aborted.abort_id IS NULL
         ORDER BY parent.updated_at, parent.intent_id
         LIMIT ?
         """,
