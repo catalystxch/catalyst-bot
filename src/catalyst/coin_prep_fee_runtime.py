@@ -319,6 +319,63 @@ def _outstanding_campaign_cancel_assets(campaign_id: str) -> dict[str, str]:
         if side not in {"buy", "sell"}:
             raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
         assets[trade_id] = "xch" if side == "buy" else "cat"
+    # A fenced refresh can outlive the campaign that created its offers. The
+    # ordinary intents can have a normal_lifecycle purpose; the append-only
+    # abort target set is the authority for their cancellation-only quote.
+    from mutation_gate import wallet_fingerprint_hash
+    import wallet
+
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    if type(campaign) is not dict or not _campaign_is_stopped_for_fee_recovery(
+        campaign
+    ):
+        return assets
+    identity_hash = wallet_fingerprint_hash(campaign["wallet_fingerprint"])
+    aborts = [
+        row
+        for row in database.list_incomplete_refresh_aborts(
+            asset_id=campaign["asset_id"],
+            wallet_fingerprint_hash=identity_hash,
+            network=campaign["network"],
+        )
+        if row["campaign_id"] == campaign_id and row["state"] == "parent_terminal"
+    ]
+    if not aborts:
+        return assets
+    if len(aborts) != 1:
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    abort = aborts[0]
+    latch = database.get_runtime_safety_latch()
+    if (
+        type(latch) is not dict
+        or latch.get("state") != "tripped"
+        or latch.get("reason_code") != "REFRESH_ABORT_CLEANUP"
+        or latch.get("generation") != abort["latch_generation"]
+    ):
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+    trades = snapshot["trade_ids"]
+    targets = json.loads(abort["target_trade_ids_json"])
+    if (
+        snapshot["pending_transaction_ids"]
+        or not trades
+        or trades != sorted(set(trades))
+        or not set(trades).issubset(targets)
+        or not set(assets).issubset(trades)
+    ):
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    for trade_id in trades:
+        intent = database.get_offer_intent_by_trade_id(trade_id)
+        if (
+            type(intent) is not dict
+            or intent.get("sage_trade_id") != trade_id
+            or intent.get("asset_id") != campaign["asset_id"]
+            or intent.get("network") != campaign["network"]
+            or intent.get("wallet_fingerprint_hash") != identity_hash
+            or intent.get("side") not in {"buy", "sell"}
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        assets[trade_id] = "xch" if intent["side"] == "buy" else "cat"
     return assets
 
 
@@ -365,10 +422,8 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             # cancellation-only renewal quote whenever cleanup is genuinely
             # outstanding. This also covers an operator pressing wallet-wide
             # Cancel All before explicitly stopping an otherwise active campaign.
-            from blueprints.bootstrap import _campaign_trade_ids
-
             campaign_has_cleanup = bool(
-                _campaign_trade_ids(options["bootstrap_campaign_id"])
+                _outstanding_campaign_cancel_assets(options["bootstrap_campaign_id"])
             )
         server_recovery_ready = campaign_has_cleanup or (
             recovery_action == "bootstrap_stop"
