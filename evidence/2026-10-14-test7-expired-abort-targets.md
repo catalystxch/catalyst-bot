@@ -1,11 +1,11 @@
 # TEST 7 natural-expiry abort recovery (isolated)
 
-The original TEST 7 profile remains fenced. The installed app is a read-only
-Startup Safety diagnostic, and this patch has **not** been run on that profile.
-Sage's complete offer book showed no fillable offers or pending transactions;
-two abort targets had naturally expired, but their durable intents were still
-open. The cancelled refresh parent was already terminal. This discrepancy
-blocked restricted startup cleanup.
+The original TEST 7 profile was fenced before this recovery. Sage's complete
+offer book showed no fillable offers or pending transactions; two abort targets
+had naturally expired, but their durable intents were still open. The
+cancelled refresh parent was already terminal. This discrepancy blocked
+restricted startup cleanup. The exact reviewed recovery build was subsequently
+run on the profile and completed the proof-only recovery described below.
 
 This patch adds a proof-only route for one exact abort target with no Task 8
 cancellation journal. It requires restricted recovery mode, stopped bot, the
@@ -38,8 +38,8 @@ A clean detached package was built from that exact source. The packaged EXE
 SHA-256 is `3ED71E414D23FBE5B3B499F253E08EF3F15690CB3B89B16C65121E84D6AFB0F7`.
 The bundled normal and restricted recovery HTML hashes match source; all six
 static package tests passed. A custom Defender scan of the package exited 0
-and reported no threat detection for that package path. The EXE has not been
-launched or smoke-tested.
+and reported no threat detection for that package path. The exact EXE was
+subsequently smoke-tested and launched as described below.
 
 ## Original TEST 7 recovery
 
@@ -71,8 +71,29 @@ balances match the earlier checkpoint: `138470190098731` XCH mojos and
 `780212284` MZ atomic units. No cancellation, coin preparation, publication,
 or wallet transaction was sent during this recovery.
 
-Still required: restart the same exact build into normal mode after the
-computer-use skill's fresh action-time launch confirmation, native dashboard
-and tab acceptance, renewed long-running monitoring, and the separate
-secondary-PC and Splash peer work. Do not resume trading solely because this
-specific abort latch resolved.
+Still required: full native tab acceptance, renewed long-running monitoring,
+and the separate secondary-PC and Splash peer work. Do not resume trading
+solely because this specific abort latch resolved.
+
+## Normal restart after recovery
+
+The operator gave fresh action-time approval to restart this same exact EXE.
+PID `45820` closed through its native window; port 5000 was free. The EXE hash
+was rechecked and the same file restarted as sole CATalyst PID `131188`, owning
+port 5000. Its normal `/api/health` returned 200 with `bot_running: false` and
+a synced Sage wallet. The native startup connected Sage TEST 7 fingerprint
+`736588221`, selected MonkeyZoo Token `MZ_XCH`, and displayed the normal
+Dashboard and Offers screens. Offers showed `Active 0`, `Buy 0`, `Sell 0`,
+`Pending Cancels 0`, and `No open offers`; the bot remained stopped. The
+read-only `/api/safety/status` returned `allowed: true`, an owned renewing
+lease, zero blocking operations, and no safety reason code. The stored abort
+remained `aborted` and its exact latch remained `resolved` before restart.
+
+The existing Splash binary was started from the native optional Splash gate;
+its local process was observed as PID `169136` with local offer submission,
+metrics, and incoming-hook endpoints. This establishes local startup only;
+reciprocal peer receipt and cross-PC offer broadcast remain unproven. No
+campaign or bot was started and no wallet transaction was sent. At this
+checkpoint, the evidence-only PR head `88a71bd` had ten CI checks passing and
+the unit-test check still pending. Normal-tab acceptance beyond Dashboard and
+Offers, renewed monitoring, and secondary-PC recovery remain open.
