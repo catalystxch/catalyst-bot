@@ -15,6 +15,7 @@ import subprocess
 import sys
 import types
 import unittest
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -519,7 +520,10 @@ def test_refresh_abort_cancel_next_refuses_stale_target_before_wallet_effect(
 
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
-def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(monkeypatch):
+@pytest.mark.parametrize("frozen_targets", [[], [{"asset": "xch", "amount": "1"}]])
+def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(
+    monkeypatch, frozen_targets
+):
     import blueprints.offers as offers_bp
     import coin_prep_fee_approval
     import coin_prep_fee_runtime
@@ -615,7 +619,7 @@ def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(monkeypatch
         lambda _options: {
             "recovery_only": True,
             "campaign": {"campaign_id": campaign_id},
-            "recipe": {"targets": []},
+            "recipe": {"targets": frozen_targets},
         },
     )
     monkeypatch.setattr(
@@ -671,6 +675,31 @@ def test_restricted_refresh_abort_fee_consent_is_exact_campaign_only(monkeypatch
             "preview_id": preview_id,
             "maximum_fee_mojos": 5000,
             "cancellation_reserve_mojos": 1000,
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_fee_economic_snapshot",
+        lambda _options: {
+            "recovery_only": False,
+            "campaign": {"campaign_id": campaign_id},
+            "recipe": {"targets": frozen_targets},
+        },
+    )
+    assert (
+        client.post(
+            "/api/offers/refresh_abort/fee_approval", json=consent, **req
+        ).status_code
+        == 409
+    )
+    assert len(effects) == 2
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_fee_economic_snapshot",
+        lambda _options: {
+            "recovery_only": True,
+            "campaign": {"campaign_id": campaign_id},
+            "recipe": {"targets": frozen_targets},
         },
     )
     book["trade_ids"] = []

@@ -954,9 +954,11 @@ def api_refresh_abort_fee_approval():
                 economics.get("recovery_only") is not True
                 or economics.get("campaign", {}).get("campaign_id")
                 != campaign["campaign_id"]
-                or economics.get("recipe", {}).get("targets")
             ):
                 raise ValueError("fee_preview_is_not_cancellation_only")
+            # An older campaign approval can retain frozen preparation targets.
+            # Recovery-only consent excludes those targets from fee funding and
+            # never grants preparation dispatch (approve_coin_prep_fees).
             result = approve_coin_prep_fees(
                 preview_id=body["preview_id"],
                 maximum_fee_mojos=int(body["maximum_fee_mojos"]),
