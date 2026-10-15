@@ -10779,6 +10779,7 @@
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapPreviewBtn" onclick="bootstrapPreviewCampaign()">Preview</button>
                                 <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileExpiredBtn" style="display:none;" disabled>Verify Expired Offers</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapRetryStoppedBtn" onclick="bootstrapStopCampaign('pending')" style="display:none;" disabled>Retry Stopped Campaign Cancellation</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapManifestExportBtn" onclick="bootstrapExportManifest()" disabled>Export / Sign Manifest</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapParticipationExportBtn" onclick="exportBootstrapParticipationProof()" disabled>Export / Sign Participation Proof</button>
@@ -15326,6 +15327,7 @@
             if (m === 'POST' && clean === 'bootstrap/preview') return 'preview_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/start') return 'start_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/stop') return 'stop_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/reconcile_expired') return 'reconcile_expired_bootstrap_offers';
             if (m === 'POST' && clean === 'bootstrap/renew') return 'renew_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/manifest/export') return 'export_bootstrap_manifest';
             if (m === 'POST' && clean === 'bootstrap/manifest/import') return 'import_bootstrap_manifest';
@@ -19173,7 +19175,9 @@
                 : 'campaign-owned offers';
             return {
                 reason: campaign.cancel_reason || 'bootstrap_expired',
-                message: `Bootstrap campaign expired — ${offerPhrase} require cancellation before restart or renewal.`,
+                message: openCount > 0
+                    ? `Bootstrap campaign expired — ${offerPhrase} require cancellation or authoritative expiry proof before restart or renewal.`
+                    : 'Bootstrap campaign expired — stop campaign before restart or renewal.',
             };
         }
 
@@ -40360,6 +40364,7 @@ function _bootstrapRenderStatus(payload) {
     const globalStatus = document.getElementById('bootstrapGlobalStatus');
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
+    const reconcileExpired = document.getElementById('bootstrapReconcileExpiredBtn');
     const stoppedRetry = document.getElementById('bootstrapRetryStoppedBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
@@ -40481,6 +40486,15 @@ function _bootstrapRenderStatus(payload) {
             : hasUnresolvedCreation ? 'Stop & Review Campaign'
                 : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
     }
+    if (reconcileExpired) {
+        const exactTrades = _bootstrapActiveCampaign?.reconciliation_trade_ids;
+        const canProve = _bootstrapActiveCampaign?.expired === true
+            && Array.isArray(exactTrades) && exactTrades.length > 0
+            && exactTrades.length === Number(_bootstrapActiveCampaign.open_offer_count)
+            && !hasUnresolvedCreation;
+        reconcileExpired.style.display = canProve ? '' : 'none';
+        reconcileExpired.disabled = !canProve || !!bot_state?.running;
+    }
     if (stoppedRetry) {
         const separateRetry = !!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry;
         stoppedRetry.style.display = separateRetry ? '' : 'none';
@@ -40596,6 +40610,50 @@ function bootstrapStopResultText(payload) {
         ? 'Campaign stopped. No campaign-owned offers needed cancellation.'
         : `Campaign stopped. ${count} campaign-owned offer cancellation(s) submitted.`;
 }
+
+async function bootstrapReconcileExpiredOffers() {
+    const campaign = _bootstrapActiveCampaign;
+    const tradeIds = campaign?.reconciliation_trade_ids;
+    if (!campaign?.expired || !Array.isArray(tradeIds) || !tradeIds.length
+        || tradeIds.length !== Number(campaign.open_offer_count) || bot_state?.running) return;
+    const approved = await showStyledConfirm({
+        icon: '🔎',
+        title: 'Verify expired offers in Sage?',
+        message: 'CATalyst will check the exact campaign offers, complete Sage offer book, pending transactions, and selected coins. Only offers proven naturally expired will be marked terminal. No wallet transaction will be sent.',
+        confirmText: 'Verify expired offers',
+        cancelText: 'Keep current state',
+        style: 'warning'
+    });
+    if (!approved) return;
+    const button = document.getElementById('bootstrapReconcileExpiredBtn');
+    if (button) button.disabled = true;
+    try {
+        const response = await apiFetch('/api/bootstrap/reconcile_expired', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                campaign_id: campaign.campaign_id,
+                revision: campaign.revision,
+                expected_trade_ids: tradeIds,
+            }),
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || 'Expired offer proof is incomplete');
+        _bootstrapText('bootstrapStatusPanel', `${Number(payload.proven_expired)} expired offer(s) verified in Sage. Review the campaign before stopping it.`);
+        showToast('Expired offers verified without a wallet transaction', 'success');
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Expired offer proof is incomplete');
+        showToast('Expired offer proof is incomplete; review the remaining campaign offers.', 'warning');
+    } finally {
+        await bootstrapRefreshStatus();
+    }
+}
+
+document.addEventListener('click', (event) => {
+    if (event.target.closest('#bootstrapReconcileExpiredBtn')) {
+        bootstrapReconcileExpiredOffers();
+    }
+});
 
 async function bootstrapStopCampaign(target = 'active') {
     const retrying = target === 'pending'

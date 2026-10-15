@@ -560,6 +560,22 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reconcile_expired_bootstrap_offers")
+    def reconcile_expired_bootstrap_offers(self, body=None):
+        """Prove exact natural expiry without a Sage wallet effect."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_expired",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_reconcile_expired()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:renew_bootstrap_campaign")
     def renew_bootstrap_campaign(self, body=None):
         """Create a freshly reviewed successor to a stopped campaign."""
@@ -2016,6 +2032,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",
+    "reconcile_expired_bootstrap_offers",
     "reload_config",
     "repost_dexie",
     "reset_coin_prep",

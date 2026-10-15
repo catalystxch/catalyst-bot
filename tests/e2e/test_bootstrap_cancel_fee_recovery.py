@@ -368,6 +368,14 @@ def test_expired_zero_offer_campaign_describes_stop_without_cancellation(page):
     )
     expect(page.locator("#bootstrapStopBtn")).to_be_enabled()
     expect(page.locator("#bootstrapStopBtn")).to_have_text("Stop Campaign")
+    assert (
+        "stop campaign"
+        in page.evaluate("getBootstrapCampaignStartBlock().message").lower()
+    )
+    assert (
+        "cancellation"
+        not in page.evaluate("getBootstrapCampaignStartBlock().message").lower()
+    )
     page.evaluate("bootstrapStopCampaign()")
     confirmation = page.evaluate("window.__zeroOfferStopConfirmation")
     assert confirmation["confirmText"] == "Stop campaign"
@@ -399,6 +407,57 @@ def test_expired_zero_offer_campaign_describes_stop_without_cancellation(page):
     }
     assert result["message"] == (
         "Campaign stopped. No campaign-owned offers needed cancellation."
+    )
+
+
+def test_expired_campaign_offers_have_separate_proof_only_control(page):
+    _open_gui(page)
+    assert (
+        page.evaluate("_apiBridgeMethod('/api/bootstrap/reconcile_expired', 'POST')")
+        == "reconcile_expired_bootstrap_offers"
+    )
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = {running: false};
+            window.__expiryProofCalls = [];
+            _bootstrapRenderStatus({success: true, active: true, campaign: {
+                campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
+                expired: true, cancel_required: true, open_offer_count: 2,
+                reconciliation_trade_ids: ['1'.repeat(64), '2'.repeat(64)],
+                asset_id: 'b8'.repeat(32), minimum_price: '0.0000375',
+                maximum_price: '0.00015',
+            }});
+            showStyledConfirm = async options => {
+                window.__expiryProofConfirmation = options;
+                return true;
+            };
+            bootstrapRefreshStatus = async () => {};
+            window.apiFetch = async (path, options) => {
+                window.__expiryProofCalls.push({path, body: JSON.parse(options.body)});
+                return new Response(JSON.stringify({success: true, proven_expired: 2}), {
+                    status: 200, headers: {'Content-Type': 'application/json'},
+                });
+            };
+        }"""
+    )
+    proof = page.locator("#bootstrapReconcileExpiredBtn")
+    assert proof.evaluate("button => button.style.display") != "none"
+    expect(proof).to_be_enabled()
+    proof.evaluate("button => button.click()")
+    page.wait_for_function("() => window.__expiryProofCalls.length === 1")
+    assert page.evaluate("window.__expiryProofCalls") == [
+        {
+            "path": "/api/bootstrap/reconcile_expired",
+            "body": {
+                "campaign_id": "c" * 64,
+                "revision": 0,
+                "expected_trade_ids": ["1" * 64, "2" * 64],
+            },
+        }
+    ]
+    assert "No wallet transaction" in page.evaluate(
+        "window.__expiryProofConfirmation.message"
     )
 
 
