@@ -22,7 +22,9 @@ campaign and stop it separately.
 - Full local backend: **7,770 passed, 301 skipped, 457 subtests passed**
   (`python -m pytest -n 2 --dist=loadfile --tb=short tests -q`).
 - Focused bootstrap API, mutation-gate, and native/browser contract checks
-  passed; the browser cancellation/recovery suite had **16 passed**.
+  passed; the browser cancellation/recovery suite had **16 passed**. The
+  complete Chromium suite later passed **300 tests**
+  (`python -m pytest tests/e2e -q --e2e --tb=short`).
 - Draft PR #268 at this exact head had **all 11 CI checks green**, including
   unit tests, lint, security scan, Semgrep, Gitleaks, and CodeQL.
 - Clean `python build.py` produced `dist/Catalyst/Catalyst.exe`, SHA-256
