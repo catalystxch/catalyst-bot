@@ -54,8 +54,49 @@ intents, safety latch generation 668 resolved, and zero authoritative
 campaign fee spend. Campaign revision 0 remained stored `active` after its
 expiry; the bot was stopped.
 
-This is evidence for a candidate recovery path, **not** a completed live
-recovery or general public-readiness gate. The exact new build still needs
-original-profile native proof, end-state audit, a reviewed campaign stop,
-another real fill/cancel/restart run, Harvestr recovery, reciprocal Splash
-peer receipt, full final-candidate 24-hour audits, and final review.
+At that checkpoint this was evidence for a candidate recovery path, **not**
+a completed live recovery or general public-readiness gate. The subsequent
+original-profile proof and end-state audit are recorded below.
+
+## Original-profile native proof (2026-10-15 16:16 UTC)
+
+After the user returned control of the primary PC and approved this exact
+launch, the old stopped CATalyst window was closed through its native shutdown
+dialog with **Cancel all currently active wallet offers** unchecked. The new
+EXE above was launched from this worktree as sole PID 218844 and sole owner of
+127.0.0.1:5000; its on-disk SHA-256 matched the package hash above. Native
+startup selected Sage TEST 7, fingerprint 736588221. Splash was skipped and
+remained off. The original bot stayed stopped.
+
+Immediately before the native proof, a separate read-only wallet facade check
+found Sage mainnet TEST 7, a complete local table of 4,123 offers with **zero
+fillable**, **zero pending transactions**, and balances of 138470190098731 XCH
+mojos and 780212284 MZ atoms. The stored campaign remained active at revision
+0 with zero authoritative fee spend, and safety latch generation 668 was
+resolved. The native Settings pane showed that exact fingerprint, MZ pair,
+ALLOWED runtime safety, six open campaign intents and the enabled **Verify
+Expired Offers** button.
+
+The operator used the native button and its confirmation, which expressly
+stated that no wallet transaction would be sent. CATalyst reported **six
+expired offers verified in Sage**. The six exact Sage trade IDs were each
+independently observed in status `expired`; the same six registry intents were
+committed `terminal` at `2026-10-15T16:16:12.293349Z`. A second complete
+Sage read found zero fillable offers and zero pending transactions, unchanged
+XCH and MZ balances, zero authoritative campaign fee spend, and latch 668
+still resolved. The native Offers view showed Active 0, Buy 0, Sell 0 and
+Pending Cancels 0. The campaign remains stored active but expired; its native
+status now says **stop campaign before renewal**. The bot remains stopped.
+
+The user then gave specific action-time approval to stop this zero-offer
+campaign. The native final dialog said no campaign-owned offers needed
+cancellation and history would remain untouched. The operator confirmed it.
+The original DB recorded campaign `stopped`, revision 1, reason `manual`, at
+`2026-10-15T16:18:22.007145Z`. A fresh complete Sage read still found zero
+fillable and zero pending offers; balances and fee spend stayed unchanged.
+All registry intents were terminal and latch 668 remained resolved.
+
+This closes the specific original-profile all-expired proof and campaign-stop
+gates. A new live fill/cancel/restart cycle, independent Harvestr recovery,
+reciprocal Splash receipt, final-candidate 24-hour audits and final review
+remain open. No general public-readiness claim follows from this proof.
