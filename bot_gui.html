@@ -32300,12 +32300,12 @@
                         <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:10px; margin-bottom:20px;">
                             <div style="background:rgba(16,185,129,0.10); border:1px solid rgba(16,185,129,0.22); border-radius:11px; padding:13px 10px; text-align:center;">
                                 <div style="font-size:10px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:var(--status-success); opacity:0.7; margin-bottom:6px;">Buy</div>
-                                <div style="font-size:22px; font-weight:700; color:var(--status-success); line-height:1;">${_rs.buy_count || 0}</div>
+                                <div id="resumeReadyBuyCount" style="font-size:22px; font-weight:700; color:var(--status-success); line-height:1;">${_rs.buy_count || 0}</div>
                                 <div style="font-size:10px; color:var(--slate-600); margin-top:4px;">offers</div>
                             </div>
                             <div style="background:rgba(248,113,113,0.10); border:1px solid rgba(248,113,113,0.22); border-radius:11px; padding:13px 10px; text-align:center;">
                                 <div style="font-size:10px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:var(--sell-color); opacity:0.7; margin-bottom:6px;">Sell</div>
-                                <div style="font-size:22px; font-weight:700; color:var(--sell-color); line-height:1;">${_rs.sell_count || 0}</div>
+                                <div id="resumeReadySellCount" style="font-size:22px; font-weight:700; color:var(--sell-color); line-height:1;">${_rs.sell_count || 0}</div>
                                 <div style="font-size:10px; color:var(--slate-600); margin-top:4px;">offers</div>
                             </div>
                             <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.09); border-radius:11px; padding:13px 10px; text-align:center;">
@@ -32321,6 +32321,7 @@
                         </div>
 
                         ${bootstrapBlock ? `<div class="v4-modal-note" style="margin-bottom:16px;">${escapeHtml(bootstrapBlock.message)} The offers remain live until Sage confirms cancellation.</div>` : ''}
+                        <div id="resumeReadyBookWarning" role="status" class="v4-modal-note" style="margin-bottom:16px; display:none;"></div>
                         <div style="display:flex; gap:10px;">
                             ${bootstrapBlock
                                 ? '<button class="btn btn-config btn-primary" onclick="closeResumeAfterLoad()" style="flex:1; padding:12px 16px;">Review Offers and Cancel All</button>'
@@ -32432,8 +32433,46 @@
 
         // Called from the "Start Bot Now" button in the post-load modal
         async function resumeStartNow() {
-            document.getElementById('resumeSessionModal').classList.remove('active');
+            const modal = document.getElementById('resumeSessionModal');
+            const warning = document.getElementById('resumeReadyBookWarning');
+            const previous = _resumeSessionSummary;
+            try {
+                if (!previous) throw new Error('Session summary unavailable');
+                const response = await apiFetch(`${API_URL}/check-resume`);
+                if (!response.ok) throw new Error('Wallet offer query failed');
+                const latest = await response.json();
+                if (latest.reason === 'wallet_offer_query_not_fresh') {
+                    throw new Error('Wallet offer query is not fresh');
+                }
+                const buyCount = Number(latest.buy_count);
+                const sellCount = Number(latest.sell_count);
+                if (!Number.isSafeInteger(buyCount) || buyCount < 0
+                    || !Number.isSafeInteger(sellCount) || sellCount < 0) {
+                    throw new Error('Wallet offer counts are invalid');
+                }
+                if (!latest.can_resume || buyCount !== previous.buy_count
+                    || sellCount !== previous.sell_count) {
+                    setResumeSessionSummary(latest);
+                    const buyEl = document.getElementById('resumeReadyBuyCount');
+                    const sellEl = document.getElementById('resumeReadySellCount');
+                    if (buyEl) buyEl.textContent = String(buyCount);
+                    if (sellEl) sellEl.textContent = String(sellCount);
+                    if (warning) {
+                        warning.style.display = 'block';
+                        warning.textContent = 'The live offer book changed while this session was stopped. Review these updated counts before starting.';
+                    }
+                    return false;
+                }
+            } catch (error) {
+                if (warning) {
+                    warning.style.display = 'block';
+                    warning.textContent = 'Live offers could not be verified. Check Sage and retry before starting.';
+                }
+                return false;
+            }
+            modal.classList.remove('active');
             await startBot({ resumeExistingOffers: true });
+            return true;
         }
 
         async function startBot(options = {}) {

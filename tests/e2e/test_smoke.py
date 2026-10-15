@@ -1270,6 +1270,10 @@ def test_resume_start_sends_explicit_existing_offer_authority_request(page):
         """async () => {
             settingsReviewed = true;
             currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            setResumeSessionSummary({
+                can_resume: true, buy_count: 3, sell_count: 3, offer_count: 6,
+                active_cat: currentCAT,
+            });
             coinPrepStatus = 'skipped-safe';
             bot_state = { running: false, offers: { buy: [], sell: [] } };
             getStartSafetyState = () => ({ allowed: true, message: '' });
@@ -1278,6 +1282,12 @@ def test_resume_start_sends_explicit_existing_offer_authority_request(page):
             updateDashboardStartupLayout = () => {};
             window.__capturedStartRequest = null;
             apiFetch = async (path, options = {}) => {
+                if (String(path).includes('/check-resume')) {
+                    return new Response(JSON.stringify({
+                        can_resume: true, buy_count: 3, sell_count: 3, offer_count: 6,
+                        active_cat: currentCAT,
+                    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
                 if (String(path).includes('/bot/start')) {
                     window.__capturedStartRequest = {
                         path: String(path),
@@ -1300,6 +1310,53 @@ def test_resume_start_sends_explicit_existing_offer_authority_request(page):
     assert result["method"] == "POST"
     assert result["contentType"] == "application/json"
     assert result["body"] == '{"resume_existing_offers":true}'
+
+
+def test_resume_start_rechecks_offer_counts_after_stopped_wallet_fill(page):
+    """A fill after the resume snapshot must require a new operator review."""
+
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """async () => {
+            currentCAT = { asset_id: 'asset-a', wallet_id: 2 };
+            setResumeSessionSummary({
+                can_resume: true, buy_count: 3, sell_count: 3, offer_count: 6,
+                active_cat: currentCAT,
+            });
+            const modal = document.getElementById('resumeSessionModal');
+            modal.classList.add('active');
+            modal.firstElementChild.innerHTML = `
+                <span id="resumeReadyBuyCount">3</span>
+                <span id="resumeReadySellCount">3</span>
+                <span id="resumeReadyBookWarning"></span>
+            `;
+            let startCalls = 0;
+            startBot = async () => { startCalls += 1; };
+            apiFetch = async path => {
+                if (!String(path).includes('/check-resume')) throw Error('Unexpected API call');
+                return new Response(JSON.stringify({
+                    can_resume: true, buy_count: 3, sell_count: 0, offer_count: 3,
+                    active_cat: currentCAT,
+                }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            };
+            await resumeStartNow();
+            return {
+                modalActive: modal.classList.contains('active'),
+                buyCount: document.getElementById('resumeReadyBuyCount')?.textContent,
+                sellCount: document.getElementById('resumeReadySellCount')?.textContent,
+                warning: document.getElementById('resumeReadyBookWarning')?.textContent,
+                startCalls,
+            };
+        }"""
+    )
+
+    assert result["modalActive"] is True
+    assert result["buyCount"] == "3"
+    assert result["sellCount"] == "0"
+    assert "changed" in result["warning"].lower()
+    assert result["startCalls"] == 0
 
 
 @pytest.mark.parametrize(
