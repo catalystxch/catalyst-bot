@@ -1410,7 +1410,9 @@ class BotLoop:
         protected_bootstrap_trade_ids: set[str] = set()
         try:
             context = self._bootstrap_campaign_context()
-            if context.get("active") is True and context.get("blocked") is False:
+            # The durable campaign and intent purpose still identify its offers
+            # when Sage temporarily cannot prove the active wallet identity.
+            if context.get("active") is True and context.get("campaign"):
                 campaign = context.get("campaign") or {}
                 expected_purpose = (
                     f"bootstrap:{campaign.get('campaign_id')}:"
@@ -12848,6 +12850,7 @@ class BotLoop:
                 "blocked": True,
                 "reason": "bootstrap_authority_ambiguous",
             }
+        campaign = campaigns[0]
         try:
             from wallet import get_wallet_identity
 
@@ -12859,6 +12862,7 @@ class BotLoop:
                 "active": True,
                 "blocked": True,
                 "reason": "bootstrap_wallet_identity_unavailable",
+                "campaign": campaign,
             }
         network_id = str(snapshot.get("network_id") or "").strip().lower()
         network = (
@@ -12875,7 +12879,6 @@ class BotLoop:
             "wallet_id": getattr(cfg, "CAT_WALLET_ID", None),
             "asset_id": asset_id,
         }
-        campaign = campaigns[0]
         if any(campaign.get(key) != identity.get(key) for key in identity):
             return {
                 "active": True,
