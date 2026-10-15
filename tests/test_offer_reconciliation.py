@@ -4462,6 +4462,9 @@ def test_terminal_journal_accepts_bounded_full_proof_digest_and_rejects_tail_cha
 
 def _persist_created_offer(
     *,
+    intent_id: str = "intent-task9",
+    trade_id: str = TRADE,
+    offer_hash: str = OFFER_HASH,
     coin_id: str = COIN,
     offered: str = "1000",
     requested: str = "2000",
@@ -4480,9 +4483,9 @@ def _persist_created_offer(
         purpose="lifecycle",
     )
     database.prepare_offer_intent(
-        intent_id="intent-task9",
-        operation_id="create:intent-task9",
-        event_id="create:intent-task9:prepared",
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
         run_id="run-task9",
         wallet_fingerprint_hash=WALLET,
         network=NETWORK,
@@ -4490,7 +4493,7 @@ def _persist_created_offer(
         side=side,
         tier=tier,
         purpose="normal_lifecycle",
-        slot_key="slot:intent-task9",
+        slot_key=f"slot:{intent_id}",
         generation=0,
         offered_amount_atomic=offered,
         requested_amount_atomic=requested,
@@ -4501,22 +4504,22 @@ def _persist_created_offer(
         reserve_selected_coins=True,
     )
     database.finalize_offer_intent(
-        intent_id="intent-task9",
-        operation_id="create:intent-task9",
-        event_id="create:intent-task9:finalized",
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
         lifecycle_state="created",
         outcome="CONFIRMED",
-        sage_trade_id=TRADE,
-        offer_text_sha256=OFFER_HASH,
+        sage_trade_id=trade_id,
+        offer_text_sha256=offer_hash,
         wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
         evidence_json={"offer": "confirmed"},
         finalized_at=AT,
         finalize_selected_coin_reservations=True,
     )
-    economics = database.get_offer_intent_economic_authority("intent-task9")
+    economics = database.get_offer_intent_economic_authority(intent_id)
     assert economics is not None
     assert database.add_offer(
-        TRADE,
+        trade_id,
         side,
         price_xch=database.Decimal(economics["price_xch"]),
         size_xch=database.Decimal(economics["size_xch"]),
@@ -4526,7 +4529,102 @@ def _persist_created_offer(
         coin_id=database.norm_coin_id(coin_id),
         fee_mojos_xch=economics["fee_mojos_xch"],
     )
-    return database.get_offer_intent("intent-task9")
+    return database.get_offer_intent(intent_id)
+
+
+def test_second_fill_receipt_sqlite_failure_preserves_first_and_allows_retry(
+    isolated_database,
+):
+    """A real late SQLite failure must not half-commit the second fill."""
+
+    _persist_created_offer()
+    first = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    assert first["classification"] == FILLED_PROVEN
+    assert first["applied"] is True
+
+    other_intent = "intent-task9-other"
+    other_transaction = "e" * 64
+    _persist_created_offer(
+        intent_id=other_intent,
+        trade_id=OTHER_TRADE,
+        offer_hash="0" * 64,
+        coin_id=OTHER_COIN,
+    )
+    other_evidence = _evidence(
+        offers=[
+            _offer(
+                trade_id=OTHER_TRADE,
+                selected_coin_ids=[OTHER_COIN],
+                transaction_id=other_transaction,
+            )
+        ],
+        transactions=[
+            _transaction(
+                transaction_id=other_transaction,
+                spent=[
+                    {
+                        "coin_id": OTHER_COIN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "offer",
+                    }
+                ],
+                created=[
+                    {
+                        "coin_id": OTHER_RETURN,
+                        "asset_id": ASSET,
+                        "amount": 2000,
+                        "address_kind": "own",
+                    }
+                ],
+            )
+        ],
+        coins={
+            OTHER_COIN: _coin(
+                OTHER_COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=other_transaction,
+                offer_id=OTHER_TRADE,
+            ),
+            OTHER_RETURN: _coin(
+                OTHER_RETURN,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=other_transaction,
+            ),
+        },
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "CREATE TRIGGER fail_second_fill_receipt "
+        "BEFORE INSERT ON fills "
+        f"WHEN NEW.trade_id='{OTHER_TRADE}' "
+        "BEGIN SELECT RAISE(ABORT, 'injected receipt write failure'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected receipt write failure"):
+        reconcile_offer(other_intent, evidence=other_evidence, now=AFTER)
+
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
+    assert database.get_fill_by_trade_id(TRADE) is not None
+    assert database.get_offer_intent(other_intent)["lifecycle_state"] == "created"
+    assert database.get_offer(OTHER_TRADE)["status"] == "open"
+    assert database.get_fill_by_trade_id(OTHER_TRADE) is None
+    assert database.get_coin_state(OTHER_COIN)["status"] == "locked"
+    assert database.get_offer_operation_events(f"reconcile:{other_intent}") == []
+
+    conn.execute("DROP TRIGGER fail_second_fill_receipt")
+    conn.commit()
+    retried = reconcile_offer(other_intent, evidence=other_evidence, now=AFTER)
+    assert retried["classification"] == FILLED_PROVEN
+    assert retried["applied"] is True
+    assert database.get_fill_by_trade_id(OTHER_TRADE) is not None
+    assert database.get_coin_state(OTHER_COIN)["status"] == "spent"
+    assert database.get_fill_by_trade_id(TRADE) is not None
 
 
 def _live_mz_rounding_evidence(*, side: str = "buy") -> dict:
