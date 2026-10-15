@@ -461,7 +461,7 @@ def test_expired_campaign_offers_have_separate_proof_only_control(page):
     )
 
 
-def test_stopped_campaign_completed_offers_require_preview_and_exact_commit(page):
+def test_stopped_expired_campaign_completed_offers_show_exact_preview_and_commit(page):
     _open_gui(page)
     assert (
         page.evaluate("_apiBridgeMethod('/api/bootstrap/preview_completed', 'POST')")
@@ -478,7 +478,7 @@ def test_stopped_campaign_completed_offers_require_preview_and_exact_commit(page
             window.__completedProofCalls = [];
             _bootstrapRenderStatus({success: true, active: true, campaign: {
                 campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
-                expired: false, open_offer_count: 6,
+                expired: true, open_offer_count: 6,
                 asset_id: 'b8'.repeat(32), minimum_price: '0.0000375',
                 maximum_price: '0.00015',
             }});
@@ -491,7 +491,10 @@ def test_stopped_campaign_completed_offers_require_preview_and_exact_commit(page
                 const body = JSON.parse(options.body);
                 window.__completedProofCalls.push({path, body});
                 const payload = path.endsWith('preview_completed')
-                    ? {success: true, expected_trade_ids: ['1'.repeat(64)], proven_completed: 1}
+                    ? {success: true, expected_trade_ids: ['1'.repeat(64)],
+                       expected_offers: [{trade_id: '1'.repeat(64), side: 'sell',
+                                         asset_id: 'b8'.repeat(32)}],
+                       asset_id: 'b8'.repeat(32), proven_completed: 1}
                     : {success: true, proven_completed: 1};
                 return new Response(JSON.stringify(payload), {
                     status: 200, headers: {'Content-Type': 'application/json'},
@@ -520,6 +523,87 @@ def test_stopped_campaign_completed_offers_require_preview_and_exact_commit(page
     assert "No wallet transaction" in page.evaluate(
         "window.__completedProofConfirmation.message"
     )
+    assert "1" * 64 in page.evaluate("window.__completedProofConfirmation.message")
+    assert "b8" * 32 in page.evaluate("window.__completedProofConfirmation.message")
+    assert "SELL" in page.evaluate("window.__completedProofConfirmation.message")
+    assert page.evaluate("window.__completedProofConfirmation.proofReview") is True
+
+
+def test_completed_offer_review_keeps_buttons_visible_with_many_exact_ids(page):
+    _open_gui(page)
+    page.set_viewport_size({"width": 900, "height": 650})
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            const ids = Array.from({length: 20}, (_, i) =>
+                `${String(i).padStart(2, '0').repeat(32)}`);
+            window.__proofModalPromise = showStyledConfirm({
+                title: 'Verify completed offers in Sage?',
+                message: ids.map(id => `SELL ${id}`).join('\\n'),
+                proofReview: true,
+            });
+        }"""
+    )
+    measurements = page.evaluate(
+        """() => {
+            const message = document.getElementById('confirmMessage');
+            const button = document.getElementById('confirmOkBtn');
+            const shell = document.querySelector('#styledConfirmOverlay .v4-modal-shell');
+            const buttonBox = button.getBoundingClientRect();
+            const shellBox = shell.getBoundingClientRect();
+            return {
+                messageScrolls: message.scrollHeight > message.clientHeight,
+                messageWraps: message.scrollWidth <= message.clientWidth,
+                buttonVisible: buttonBox.bottom <= shellBox.bottom &&
+                    buttonBox.bottom <= window.innerHeight,
+            };
+        }"""
+    )
+    assert measurements == {
+        "messageScrolls": True,
+        "messageWraps": True,
+        "buttonVisible": True,
+    }
+    page.locator("#confirmCancelBtn").click()
+
+
+def test_partial_completed_offer_commit_keeps_recovery_warning_after_refresh(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = {running: false};
+            _bootstrapActiveCampaign = {
+                campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
+                asset_id: 'b8'.repeat(32), open_offer_count: 2,
+            };
+            showStyledConfirm = async () => true;
+            bootstrapRefreshStatus = async () => {
+                _bootstrapText('bootstrapStatusPanel', 'Fresh campaign status');
+            };
+            window.apiFetch = async path => new Response(JSON.stringify(
+                path.endsWith('preview_completed')
+                    ? {success: true, expected_trade_ids: ['1'.repeat(64)],
+                       expected_offers: [{trade_id: '1'.repeat(64), side: 'sell',
+                                         asset_id: 'b8'.repeat(32)}],
+                       asset_id: 'b8'.repeat(32)}
+                    : {success: false, code: 'bootstrap_fill_commit_incomplete',
+                       commit_may_be_partial: true, fresh_preview_required: true,
+                       wallet_effect_started: false}
+            ), {status: 200, headers: {'Content-Type': 'application/json'}});
+            await bootstrapReconcileCompletedOffers();
+            const alert = document.getElementById('bootstrapCompletedProofAlert');
+            return {
+                alertVisible: getComputedStyle(alert).display !== 'none',
+                alertText: alert.textContent,
+                statusText: document.getElementById('bootstrapStatusPanel').textContent,
+            };
+        }"""
+    )
+    assert result["alertVisible"] is True
+    assert "partly reconciled" in result["alertText"]
+    assert "preview the remaining exact offers" in result["alertText"]
+    assert result["statusText"] == "Fresh campaign status"
 
 
 def test_stop_count_change_requests_new_operator_review_without_cancellation(page):

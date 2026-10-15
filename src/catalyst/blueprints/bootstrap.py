@@ -62,10 +62,13 @@ _NONTERMINAL_INTENT_STATES = frozenset(
 
 
 class BootstrapApiError(ValueError):
-    def __init__(self, code: str, status: int = 400):
+    def __init__(
+        self, code: str, status: int = 400, *, details: dict[str, Any] | None = None
+    ):
         super().__init__(code)
         self.code = code
         self.status = status
+        self.details = details or {}
 
 
 def _utcnow() -> datetime:
@@ -111,7 +114,9 @@ def _json_safe(value: Any) -> Any:
 def _error(exc: Exception):
     if isinstance(exc, BootstrapApiError):
         return (
-            jsonify({"success": False, "code": exc.code, "error": exc.code}),
+            jsonify(
+                {"success": False, "code": exc.code, "error": exc.code, **exc.details}
+            ),
             exc.status,
         )
     if isinstance(exc, ManifestError):
@@ -628,7 +633,7 @@ def _review_stopped_completed_offers(
     *,
     expected_trade_ids: list[str] | None = None,
     commit: bool = False,
-) -> tuple[list[str], int]:
+) -> tuple[list[str], int, list[dict[str, str]]]:
     """Prove one exact stopped-campaign fill cohort without a wallet effect."""
 
     import offer_reconciliation
@@ -685,6 +690,11 @@ def _review_stopped_completed_offers(
         by_trade = {row.get("sage_trade_id"): row for row in intents}
         open_rows = database.get_open_offers(cat_asset_id=identity["asset_id"])
         open_ids = {row.get("trade_id") for row in open_rows if type(row) is dict}
+        open_by_trade = {
+            row["trade_id"]: row
+            for row in open_rows
+            if type(row) is dict and type(row.get("trade_id")) is str
+        }
         if (
             not intents
             or len(intents) > 256
@@ -709,6 +719,14 @@ def _review_stopped_completed_offers(
             raise BootstrapApiError("no_completed_offers", 409)
         if expected_trade_ids is not None and completed_ids != expected_trade_ids:
             raise BootstrapApiError("bootstrap_targets_changed", 409)
+        reviewed_offers = []
+        for trade_id in completed_ids:
+            side = str(open_by_trade[trade_id].get("side") or "").lower()
+            if side not in {"buy", "sell"}:
+                raise BootstrapApiError("bootstrap_offer_side_unknown", 409)
+            reviewed_offers.append(
+                {"trade_id": trade_id, "side": side, "asset_id": identity["asset_id"]}
+            )
         evidence = {
             trade_id: offer_reconciliation.load_authoritative_evidence(
                 by_trade[trade_id]
@@ -748,18 +766,35 @@ def _review_stopped_completed_offers(
         proven = 0
         if commit:
             for trade_id in completed_ids:
-                result = offer_reconciliation.reconcile_offer(
-                    by_trade[trade_id]["intent_id"],
-                    evidence=evidence[trade_id],
-                    now=second["observed_at"],
-                )
-                if (
-                    result.get("classification") != "FILLED_PROVEN"
-                    or result.get("applied") is not True
-                ):
-                    raise BootstrapApiError("bootstrap_fill_commit_incomplete", 409)
+                try:
+                    result = offer_reconciliation.reconcile_offer(
+                        by_trade[trade_id]["intent_id"],
+                        evidence=evidence[trade_id],
+                        now=second["observed_at"],
+                    )
+                    if (
+                        result.get("classification") != "FILLED_PROVEN"
+                        or result.get("applied") is not True
+                    ):
+                        raise BootstrapApiError("bootstrap_fill_commit_incomplete", 409)
+                except Exception as exc:
+                    slog(
+                        "BOOTSTRAP",
+                        "Completed-offer reconciliation requires a fresh review",
+                        {"error_type": type(exc).__name__},
+                        level="error",
+                    )
+                    raise BootstrapApiError(
+                        "bootstrap_fill_commit_incomplete",
+                        409,
+                        details={
+                            "commit_may_be_partial": True,
+                            "fresh_preview_required": True,
+                            "wallet_effect_started": False,
+                        },
+                    ) from exc
                 proven += 1
-        return completed_ids, proven
+        return completed_ids, proven, reviewed_offers
 
 
 @bp.post("/api/bootstrap/preview_completed")
@@ -769,11 +804,13 @@ def api_bootstrap_preview_completed():
             body = _request_body()
             if set(body) != {"campaign_id", "revision"}:
                 raise BootstrapApiError("invalid_request")
-            trade_ids, _proven = _review_stopped_completed_offers(body)
+            trade_ids, _proven, reviewed_offers = _review_stopped_completed_offers(body)
             return jsonify(
                 {
                     "success": True,
                     "expected_trade_ids": trade_ids,
+                    "expected_offers": reviewed_offers,
+                    "asset_id": reviewed_offers[0]["asset_id"],
                     "proven_completed": len(trade_ids),
                     "wallet_effect_started": False,
                 }
@@ -801,7 +838,7 @@ def api_bootstrap_reconcile_completed():
                 or expected != sorted(set(expected))
             ):
                 raise BootstrapApiError("invalid_exact_scope")
-            _trade_ids, proven = _review_stopped_completed_offers(
+            _trade_ids, proven, _reviewed_offers = _review_stopped_completed_offers(
                 body, expected_trade_ids=expected, commit=True
             )
             return jsonify(

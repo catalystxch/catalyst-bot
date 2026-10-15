@@ -4757,6 +4757,25 @@
             white-space: pre-line;
             margin-bottom: 25px;
         }
+        #styledConfirmOverlay.proof-review .v4-modal-inner {
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            max-height: min(88vh, 920px);
+            overflow: hidden;
+        }
+        #styledConfirmOverlay.proof-review #confirmMessage {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-wrap: anywhere;
+            text-align: left;
+            padding-right: 8px;
+            margin-bottom: 16px;
+        }
+        #styledConfirmOverlay.proof-review .confirm-modal-buttons {
+            flex: 0 0 auto;
+        }
         .confirm-modal-buttons {
             display: flex;
             gap: 8px;
@@ -10787,6 +10806,7 @@
                                 <button type="button" class="btn btn-config btn-secondary" onclick="document.getElementById('bootstrapManifestImportInput').click()">Import Signed Manifest</button>
                                 <input id="bootstrapManifestImportInput" type="file" accept="application/json,.json" style="display:none;" onchange="bootstrapImportManifest(event)">
                             </div>
+                            <div id="bootstrapCompletedProofAlert" role="alert" style="display:none; margin-top:12px; padding:12px; border:1px solid var(--status-warning); border-radius:8px; color:var(--status-warning); white-space:pre-line;"></div>
                         </div>
                     </div>
 
@@ -19916,13 +19936,14 @@
         // =================================================================
         let _confirmResolve = null;
         
-        function showStyledConfirm({ icon = '⚠️', title = 'Confirm', message = 'Are you sure?', confirmText = 'Confirm', cancelText = 'Cancel', extraText = '', style = 'danger', allowHtml = false } = {}) {
+        function showStyledConfirm({ icon = '⚠️', title = 'Confirm', message = 'Are you sure?', confirmText = 'Confirm', cancelText = 'Cancel', extraText = '', style = 'danger', allowHtml = false, proofReview = false } = {}) {
             return new Promise((resolve) => {
                 _confirmResolve = resolve;
                 document.getElementById('confirmIcon').innerHTML = icon;
                 document.getElementById('confirmTitle').textContent = title;
                 const msgEl = document.getElementById('confirmMessage');
                 msgEl.textContent = String(message);
+                document.getElementById('styledConfirmOverlay').classList.toggle('proof-review', proofReview === true);
                 document.getElementById('confirmCancelBtn').textContent = cancelText;
                 const okBtn = document.getElementById('confirmOkBtn');
                 okBtn.textContent = confirmText;
@@ -19942,6 +19963,7 @@
         
         function resolveConfirm(result) {
             document.getElementById('styledConfirmOverlay').classList.remove('active');
+            document.getElementById('styledConfirmOverlay').classList.remove('proof-review');
             if (_confirmResolve) {
                 _confirmResolve(result);
                 _confirmResolve = null;
@@ -40582,6 +40604,13 @@ function _bootstrapRenderStatus(payload) {
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const completedProofAlert = document.getElementById('bootstrapCompletedProofAlert');
+    if (completedProofAlert?.dataset.campaignId
+        && completedProofAlert.dataset.campaignId !== (_bootstrapActiveCampaign?.campaign_id || '')) {
+        completedProofAlert.style.display = 'none';
+        completedProofAlert.textContent = '';
+        delete completedProofAlert.dataset.campaignId;
+    }
     const maxOffersLabel = document.getElementById('ccMaxOffersLabel');
     if (maxOffersLabel) maxOffersLabel.textContent = _bootstrapActiveCampaign?.status === 'active'
         ? 'Follow Limits' : 'Max Offers';
@@ -40710,7 +40739,6 @@ function _bootstrapRenderStatus(payload) {
     }
     if (reconcileCompleted) {
         const canProve = _bootstrapActiveCampaign?.status === 'active'
-            && _bootstrapActiveCampaign?.expired !== true
             && Number(_bootstrapActiveCampaign.open_offer_count) > 0
             && !hasUnresolvedCreation;
         reconcileCompleted.style.display = canProve ? '' : 'none';
@@ -40872,8 +40900,10 @@ async function bootstrapReconcileExpiredOffers() {
 
 async function bootstrapReconcileCompletedOffers() {
     const campaign = _bootstrapActiveCampaign;
-    if (campaign?.status !== 'active' || campaign.expired === true || bot_state?.running) return;
+    if (campaign?.status !== 'active' || bot_state?.running) return;
     const button = document.getElementById('bootstrapReconcileCompletedBtn');
+    const proofAlert = document.getElementById('bootstrapCompletedProofAlert');
+    let partialWarning = '';
     if (button) button.disabled = true;
     try {
         const scope = {campaign_id: campaign.campaign_id, revision: campaign.revision};
@@ -40886,13 +40916,28 @@ async function bootstrapReconcileCompletedOffers() {
             || preview.expected_trade_ids.length === 0) {
             throw new Error(preview?.code || 'No completed campaign offers could be proven');
         }
+        const reviewedOffers = preview.expected_offers;
+        const exactIds = preview.expected_trade_ids;
+        const exactAsset = String(preview.asset_id || '');
+        if (!/^[a-f0-9]{64}$/.test(exactAsset)
+            || exactAsset !== campaign.asset_id
+            || !Array.isArray(reviewedOffers)
+            || reviewedOffers.length !== exactIds.length
+            || reviewedOffers.some((offer, i) => offer?.trade_id !== exactIds[i]
+                || !/^[a-f0-9]{64}$/.test(String(offer.trade_id))
+                || !['buy', 'sell'].includes(offer.side)
+                || offer.asset_id !== exactAsset)) {
+            throw new Error('Completed offer preview changed or lacks exact offer details');
+        }
+        const offerLines = reviewedOffers.map(offer => `${offer.side.toUpperCase()} ${offer.trade_id}`);
         const approved = await showStyledConfirm({
             icon: '🔎',
             title: 'Verify completed offers in Sage?',
-            message: `CATalyst found ${preview.expected_trade_ids.length} completed campaign offer(s). It will recheck the exact Sage offer book and transaction proofs before marking these local records filled. No wallet transaction will be sent.`,
+            message: `Campaign ${campaign.campaign_id}, revision ${campaign.revision}\nAsset ${exactAsset}\n\nCompleted offers to verify:\n${offerLines.join('\n')}\n\nCATalyst will recheck the complete Sage offer book and transaction proofs before marking these exact local records filled. No wallet transaction will be sent.`,
             confirmText: 'Verify completed offers',
             cancelText: 'Keep current state',
             style: 'warning',
+            proofReview: true,
         });
         if (!approved) return;
         const response = await apiFetch('/api/bootstrap/reconcile_completed', {
@@ -40900,12 +40945,28 @@ async function bootstrapReconcileCompletedOffers() {
             body: JSON.stringify({...scope, expected_trade_ids: preview.expected_trade_ids}),
         });
         const payload = await response.json();
-        if (!payload?.success) throw new Error(payload?.code || 'Completed offer proof is incomplete');
+        if (!payload?.success) {
+            if (payload?.commit_may_be_partial === true) {
+                partialWarning = 'Completed-offer records may be partly reconciled. Refresh and preview the remaining exact offers before retrying; investigate any safety block. No wallet transaction was sent.';
+                throw new Error(partialWarning);
+            }
+            throw new Error(payload?.code || 'Completed offer proof is incomplete');
+        }
+        if (proofAlert) {
+            proofAlert.style.display = 'none';
+            proofAlert.textContent = '';
+            delete proofAlert.dataset.campaignId;
+        }
         _bootstrapText('bootstrapStatusPanel', `${Number(payload.proven_completed)} completed offer(s) verified in Sage. Review the remaining live offers before starting the bot.`);
         showToast('Completed offers verified without a wallet transaction', 'success');
     } catch (error) {
         _bootstrapText('bootstrapStatusPanel', error?.message || 'Completed offer proof is incomplete');
-        showToast('Completed offer proof is incomplete; review Sage and the campaign.', 'warning');
+        if (partialWarning && proofAlert) {
+            proofAlert.textContent = partialWarning;
+            proofAlert.dataset.campaignId = campaign.campaign_id;
+            proofAlert.style.display = '';
+        }
+        showToast(partialWarning || 'Completed offer proof is incomplete; review Sage and the campaign.', 'warning');
     } finally {
         await bootstrapRefreshStatus();
     }
