@@ -3081,12 +3081,35 @@ class OfferManager:
                     "_catalyst_intent_id": intent.intent_id,
                 }
             self._offer_creation_crash_boundary("before_wallet_call", intent)
-            require_active_bootstrap_intent_authority(
+            campaign_authority = require_active_bootstrap_intent_authority(
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
                 offer_max_time=intent.offer_max_time,
                 side=intent.side,
             )
+            if campaign_authority is not None:
+                from bootstrap_fee_authority import cancellation_fee_readiness
+
+                campaign = database.get_bootstrap_campaign(
+                    campaign_authority["campaign_id"]
+                )
+                if (
+                    type(campaign) is not dict
+                    or campaign.get("revision")
+                    != campaign_authority["campaign_revision"]
+                ):
+                    raise ValueError("Bootstrap campaign revision is no longer active")
+                fee_readiness = cancellation_fee_readiness(campaign)
+                if fee_readiness.get("ready") is not True:
+                    raise ValueError(fee_readiness["reason"])
+                # Wallet/inventory reads above can outlast a campaign transition.
+                # Keep campaign authority as the final pre-effect check.
+                require_active_bootstrap_intent_authority(
+                    purpose=intent.purpose,
+                    asset_id=intent.asset_id,
+                    offer_max_time=intent.offer_max_time,
+                    side=intent.side,
+                )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),
