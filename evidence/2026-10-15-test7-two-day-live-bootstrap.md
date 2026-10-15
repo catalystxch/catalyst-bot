@@ -19,6 +19,16 @@ The native Market Intelligence tab reported Splash connected and its node runnin
 
 An exact-PID/hash read-only monitor started at 2026-10-15T16:28:58.9305969Z: `E:\catalyst-stability-monitor-215854c-active-20261015\trace-60s.jsonl`. Its first sample recorded PID 218844 alive, bot running, Sage synced, safety allowed and lease owned. The full active-campaign 24-hour gate cannot be evaluated before 2026-10-16T16:28:58Z and then requires a full trace and independent end-state offer/fee audit. This monitor samples loopback health and safety; Sage offer-book evidence must be audited separately.
 
+## Interrupted run, 17:26–17:27Z
+
+The full monitor trace has 57 clean running samples through 17:26:04Z. Sample 58 at 17:27:05Z found PID 218844 gone and ended the trace. It cannot pass the 24-hour gate.
+
+The CATalyst log shows Sage RPC becoming unavailable at about 17:26:31Z. The market-refresh failure path attempted protective cancellation, but `cancel_offers` refused with `FEE_BUDGET_APPROVAL_REQUIRED`; the bot loop then exited cleanly. The GUI shutdown path backed up the database and closed the server by 17:26:59Z. Windows System Event 1074 records a restart initiated on behalf of the logged-in user at about 17:27:20Z, followed by further planned servicing restarts. There is no evidence here of a CATalyst crash.
+
+At 18:04Z, neither CATalyst nor Sage was running and port 5000 was closed. Read-only database integrity was `ok`; the campaign remained active at revision 0 with fee spend 0, safety latch generation 668 resolved, and all six recent intents still `visible`. The exact campaign had no `coin_prep_fee_consent` approval because Coin Prep reused prepared coins and sent no transaction. The protective cancellation code requires that approval for Bootstrap offers. This is a release-blocking consent/workflow mismatch to resolve without bypassing the fee gate.
+
+Direct read-only requests to Dexie's public `GET /v1/offers/{id}` returned `success: true`, `status: 0` (active) for all six exact offer IDs at 18:04Z. That establishes public marketplace exposure while the bot was closed; current Sage wallet status requires a fresh synced Sage read. The operator has been asked to approve reopening Sage and the exact verified CATalyst build for a proof-only audit. No restart, cancellation, or new wallet transaction was initiated by this investigation.
+
 ## Open gates
 
 - A real third-party fill with exact Sage, CATalyst, Dexie, and chain reconciliation, followed by recovery, requote, or terminal handling.
@@ -26,3 +36,4 @@ An exact-PID/hash read-only monitor started at 2026-10-15T16:28:58.9305969Z: `E:
 - Harvestr original-profile recovery and independent second-PC live acceptance; its filled-offer receipt proof is a separate case.
 - Reciprocal two-PC Splash receipt and correct MZ classification with positive peer evidence.
 - Full active final-candidate 24-hour trace, end-state audit, complete native GUI review, final CI/review, website/update/release verification.
+- Guarantee an explicit, campaign-bound cancellation fee approval before live Bootstrap offers can require protective withdrawal, including when Coin Prep needs zero transactions. Reproduce the observed failure in tests before implementing that change.
