@@ -55,7 +55,9 @@ def test_reused_coin_fee_review_records_consent_without_coin_prep(page):
     )
     assert len(result["calls"]) == 1
     assert result["calls"][0]["path"].endswith("/coin-prep/fee-preview")
-    expect(page.locator("#bootstrapFeeConsentOverlay")).to_have_class("confirm-overlay active")
+    expect(page.locator("#bootstrapFeeConsentOverlay")).to_have_class(
+        "confirm-overlay active"
+    )
     expect(page.locator("#bootstrapFeeConsentSummary")).to_contain_text(
         "0 preparation transactions"
     )
