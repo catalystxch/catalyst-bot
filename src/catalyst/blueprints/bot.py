@@ -344,6 +344,68 @@ def _bootstrap_start_block(campaign: dict[str, Any] | None) -> dict[str, Any] | 
     }
 
 
+def _bootstrap_cancellation_fee_start_readiness(
+    campaign: dict[str, Any],
+) -> dict[str, Any]:
+    """Require current, ordinary campaign consent before offers can be created.
+
+    Reusing existing denominations skips the Coin Prep worker, but it must not
+    skip the campaign's explicit cancellation budget. Recovery-only consent is
+    deliberately unusable for this trading-authority transition.
+    """
+    try:
+        from database import get_latest_coin_prep_fee_approval_for_campaign
+
+        approval_id = get_latest_coin_prep_fee_approval_for_campaign(
+            campaign["campaign_id"]
+        )
+    except Exception:
+        return {"ready": False, "reason": "bootstrap_cancellation_fee_approval_stale"}
+    if approval_id is None:
+        return {
+            "ready": False,
+            "reason": "bootstrap_cancellation_fee_approval_required",
+        }
+    try:
+        from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
+
+        context = read_approved_prep_fee_snapshot(approval_id)
+        approval = context["approval"]
+        bound_campaign = context["campaign"]
+        campaign_cap = Decimal(str(campaign["fee_budget_xch"])) * Decimal(10**12)
+        if (
+            type(bound_campaign) is not dict
+            or bound_campaign.get("campaign_id") != campaign["campaign_id"]
+            or context.get("recovery_only") is not False
+            or not campaign_cap.is_finite()
+            or campaign_cap <= 0
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        total = approval["total_fee_mojos"]
+        reserve = approval["cancellation_reserve_mojos"]
+        remaining = approval["remaining_fee_mojos"]
+        if (
+            any(type(amount) is not int for amount in (total, reserve, remaining))
+            or total <= 0
+            or total > campaign_cap
+            or reserve <= 0
+            or remaining < reserve
+        ):
+            return {
+                "ready": False,
+                "reason": "bootstrap_cancellation_fee_budget_insufficient",
+            }
+    except Exception as exc:
+        slog(
+            "SAFETY",
+            "Bootstrap cancellation fee start verification failed closed",
+            {"error": str(exc)[:256]},
+            level="warning",
+        )
+        return {"ready": False, "reason": "bootstrap_cancellation_fee_approval_stale"}
+    return {"ready": True, "approval_id": approval_id}
+
+
 def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
     """Re-run exact active-campaign Coin Prep verification before start.
 
@@ -1123,6 +1185,28 @@ def api_bot_start():
                 }
             )
         return jsonify(payload), 400
+
+    if bootstrap_campaign is not None:
+        fee_readiness = _bootstrap_cancellation_fee_start_readiness(bootstrap_campaign)
+        if fee_readiness.get("ready") is not True:
+            reason = str(
+                fee_readiness.get("reason")
+                or "bootstrap_cancellation_fee_approval_stale"
+            )
+            error = (
+                "Review and approve this campaign's cancellation fee budget "
+                "before starting live offers"
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": reason,
+                    "error": error,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 409
 
     # Cancel All may have begun after the initial is_running() check while
     # pre-start validation was reading Sage. Serialize this final transition

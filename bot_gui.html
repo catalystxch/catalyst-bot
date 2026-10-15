@@ -11759,6 +11759,24 @@
         </div>
     </div>
 
+    <div class="confirm-overlay" id="bootstrapFeeConsentOverlay" role="dialog" aria-modal="true" aria-labelledby="bootstrapFeeConsentTitle">
+        <div class="confirm-modal v4-modal-shell v4-modal-shell--warning">
+            <div class="v4-modal-inner">
+                <div class="confirm-modal-title" id="bootstrapFeeConsentTitle">Approve campaign cancellation fees</div>
+                <p class="confirm-modal-message">Your existing coins are ready. Before CATalyst creates offers, review a fee cap that protects cancellation if trading must stop. Approval alone sends no transaction and does not start the bot.</p>
+                <div id="bootstrapFeeConsentSummary" style="white-space:pre-line; text-align:left; line-height:1.6; margin:12px 0; font-variant-numeric:tabular-nums;"></div>
+                <label for="bootstrapFeeConsentMaximum">Maximum cumulative network fee (XCH)</label>
+                <input id="bootstrapFeeConsentMaximum" inputmode="decimal" autocomplete="off" style="width:100%; margin:8px 0 4px; box-sizing:border-box;">
+                <div id="bootstrapFeeConsentError" role="alert" style="min-height:1.5em; color:var(--sell-color);"></div>
+                <div class="confirm-modal-buttons">
+                    <button class="confirm-btn-cancel" type="button" onclick="closeBootstrapFeeConsentReview()">Back</button>
+                    <button class="confirm-btn-secondary" type="button" id="bootstrapFeeConsentRefresh" onclick="refreshBootstrapFeeConsentReview()">Refresh estimate</button>
+                    <button class="confirm-btn-warning" type="button" id="bootstrapFeeConsentApprove" onclick="approveBootstrapFeeConsent()" disabled>Approve fee cap</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="coin-prep-overlay" id="coinPrepConfirmOverlay">
         <div class="coin-prep-modal">
             
@@ -32514,6 +32532,15 @@
                     updateDashboardStartupLayout(bot_state);
                     // _botStarting stays true — updateUI() will clear it
                     // when it sees isRunning = true from the next status poll
+                } else if (['bootstrap_cancellation_fee_approval_required',
+                        'bootstrap_cancellation_fee_approval_stale',
+                        'bootstrap_cancellation_fee_budget_insufficient'].includes(result.reason)) {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    await openBootstrapFeeConsentReview();
                 } else if (result.needs_coin_prep) {
                     // Server detected wrong coin sizes — show coin prep modal
                     showToast(`Coins need re-splitting for ${result.target_xch} XCH offers`, 'warning');
@@ -36439,6 +36466,149 @@ function closeCtgErrorModal() {
                 options.cancellation_recovery_action = recoveryAction;
             }
             return options;
+        }
+
+        let _bootstrapFeeConsentPreview = null;
+        let _bootstrapFeeConsentCampaign = null;
+        let _bootstrapFeeConsentBusy = false;
+        let _bootstrapFeeConsentRequest = 0;
+
+        function closeBootstrapFeeConsentReview() {
+            ++_bootstrapFeeConsentRequest;
+            _bootstrapFeeConsentPreview = null;
+            _bootstrapFeeConsentCampaign = null;
+            document.getElementById('bootstrapFeeConsentOverlay')?.classList.remove('active');
+        }
+
+        async function openBootstrapFeeConsentReview() {
+            const campaign = _bootstrapActiveCampaign;
+            if (!campaign?.campaign_id || campaign.status !== 'active') {
+                showToast('The active campaign must be verified before fee approval.', 'warning');
+                return;
+            }
+            _bootstrapFeeConsentCampaign = {
+                campaign_id: String(campaign.campaign_id),
+                revision: Number(campaign.revision),
+                fee_budget_xch: String(campaign.fee_budget_xch),
+                asset_id: String(campaign.asset_id || ''),
+            };
+            _bootstrapFeeConsentPreview = null;
+            document.getElementById('bootstrapFeeConsentOverlay')?.classList.add('active');
+            await refreshBootstrapFeeConsentReview();
+        }
+
+        async function refreshBootstrapFeeConsentReview() {
+            const campaign = _bootstrapFeeConsentCampaign;
+            const summary = document.getElementById('bootstrapFeeConsentSummary');
+            const error = document.getElementById('bootstrapFeeConsentError');
+            const approve = document.getElementById('bootstrapFeeConsentApprove');
+            const refresh = document.getElementById('bootstrapFeeConsentRefresh');
+            if (!campaign || _bootstrapFeeConsentBusy) return;
+            const requestId = ++_bootstrapFeeConsentRequest;
+            _bootstrapFeeConsentPreview = null;
+            if (approve) approve.disabled = true;
+            if (refresh) refresh.disabled = true;
+            if (summary) summary.textContent = 'Checking wallet and network fees…';
+            if (error) error.textContent = '';
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/fee-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        coin_multiplier: '1', target_seconds: 300,
+                        bootstrap_campaign_id: campaign.campaign_id,
+                        bootstrap_campaign_revision: campaign.revision,
+                    }),
+                });
+                const preview = await response.json();
+                if (requestId !== _bootstrapFeeConsentRequest) return;
+                if (!response.ok || preview.success !== true || preview.available !== true
+                        || preview.funded !== true || !preview.preview_id) {
+                    throw new Error(preview.reason || 'A current funded estimate is unavailable');
+                }
+                if (String(preview.wallet?.campaign_id) !== campaign.campaign_id
+                        || !campaign.asset_id
+                        || String(preview.wallet?.asset_id) !== campaign.asset_id
+                        || String(currentCAT?.asset_id || '') !== campaign.asset_id
+                        || Number(preview.preparation_transaction_count_min) !== 0
+                        || Number(preview.preparation_transaction_count_max) !== 0) {
+                    throw new Error('The campaign or coin preparation plan changed. Return to Coin Prep before starting.');
+                }
+                const reserve = canonicalCoinPrepMojos(preview.minimum_cancellation_reserve_mojos);
+                const minimum = canonicalCoinPrepMojos(preview.minimum_cumulative_fee_mojos);
+                const campaignCap = BigInt(coinPrepXchToMojos(campaign.fee_budget_xch));
+                if (reserve <= 0n || minimum > campaignCap || Date.now() / 1000 >= Number(preview.expires_at)) {
+                    throw new Error('Cancellation protection is not covered by this campaign cap or the estimate expired.');
+                }
+                _bootstrapFeeConsentPreview = preview;
+                if (summary) summary.textContent = [
+                    `Sage ${preview.wallet.wallet_fingerprint} · wallet ${preview.wallet.wallet_id} · ${preview.wallet.network}`,
+                    `Asset: ${campaign.asset_id}`,
+                    '0 preparation transactions · existing coins reused',
+                    `Current remaining plan estimate: ${coinPrepMojosToXch(preview.estimated_total_fee_mojos)} XCH`,
+                    `Protected cancellation: ${coinPrepMojosToXch(reserve.toString())} XCH`,
+                    `Previously spent: ${coinPrepMojosToXch(preview.fee_accounting?.spent_fee_mojos ?? '0')} XCH · held: ${coinPrepMojosToXch(preview.fee_accounting?.held_fee_mojos ?? '0')} XCH`,
+                    `Campaign fee cap: ${campaign.fee_budget_xch} XCH`,
+                ].join('\n');
+                const input = document.getElementById('bootstrapFeeConsentMaximum');
+                if (input) input.value = campaign.fee_budget_xch;
+                if (approve) approve.disabled = false;
+            } catch (problem) {
+                if (requestId === _bootstrapFeeConsentRequest) {
+                    if (summary) summary.textContent = 'No fee approval was recorded. The bot remains stopped.';
+                    if (error) error.textContent = formatError(problem);
+                }
+            } finally {
+                if (requestId === _bootstrapFeeConsentRequest && refresh) refresh.disabled = false;
+            }
+        }
+
+        async function approveBootstrapFeeConsent() {
+            if (_bootstrapFeeConsentBusy) return;
+            const campaign = _bootstrapFeeConsentCampaign;
+            const preview = _bootstrapFeeConsentPreview;
+            const error = document.getElementById('bootstrapFeeConsentError');
+            const approve = document.getElementById('bootstrapFeeConsentApprove');
+            if (!campaign || !preview) return;
+            _bootstrapFeeConsentBusy = true;
+            if (approve) approve.disabled = true;
+            if (error) error.textContent = '';
+            try {
+                if (_bootstrapActiveCampaign?.campaign_id !== campaign.campaign_id
+                        || Number(_bootstrapActiveCampaign?.revision) !== campaign.revision
+                        || Date.now() / 1000 >= Number(preview.expires_at)) {
+                    throw new Error('Campaign or fee estimate changed. Refresh and review it again.');
+                }
+                const maximum = BigInt(coinPrepXchToMojos(
+                    document.getElementById('bootstrapFeeConsentMaximum')?.value
+                ));
+                const minimum = canonicalCoinPrepMojos(preview.minimum_cumulative_fee_mojos);
+                const reserve = canonicalCoinPrepMojos(preview.minimum_cancellation_reserve_mojos);
+                const campaignCap = BigInt(coinPrepXchToMojos(campaign.fee_budget_xch));
+                if (maximum < minimum || maximum < reserve || maximum > campaignCap) {
+                    throw new Error('Choose a cap covering the current estimate and cancellation reserve, within the campaign fee cap.');
+                }
+                const response = await apiFetch(`${API_URL}/coin-prep/fee-approval`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        preview_id: preview.preview_id,
+                        maximum_fee_mojos: maximum.toString(),
+                        cancellation_reserve_mojos: reserve.toString(),
+                    }),
+                });
+                const result = await response.json();
+                if (!response.ok || result.success !== true || !result.approval_id) {
+                    throw new Error(result.reason || 'Fee approval was not recorded');
+                }
+                closeBootstrapFeeConsentReview();
+                showToast('Campaign cancellation fee cap approved. No transaction was sent. Review Start Bot again.', 'success');
+            } catch (problem) {
+                if (error) error.textContent = formatError(problem);
+            } finally {
+                _bootstrapFeeConsentBusy = false;
+                if (approve) approve.disabled = !_bootstrapFeeConsentPreview;
+            }
         }
 
         function setCoinPrepFeeText(id, value) {

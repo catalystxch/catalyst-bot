@@ -3,10 +3,82 @@
 from importlib import import_module
 
 import pytest
+from chia_rs import Coin
 from flask import Flask
 
 from bootstrap_fee_fixture import approved_bootstrap  # noqa: F401
 import fee_approval_test_utils as utils
+from fee_projection_test_utils import standard_puzzles
+
+
+def test_reused_campaign_coins_quote_zero_prep_with_cancellation_cover(
+    approved_bootstrap,
+):
+    """Real executable coin roots allow consent without a prep transaction."""
+    runtime = import_module("coin_prep_fee_runtime")
+    service = import_module("coin_prep_fee_approval")
+    state = approved_bootstrap
+    options = {
+        "bootstrap_campaign_id": state["campaign_id"],
+        "bootstrap_campaign_revision": 0,
+    }
+    targets = runtime.read_fee_economic_snapshot(options)["recipe"]["targets"]
+    native_puzzle, cat_puzzle = standard_puzzles()
+    state["xch"], state["cat"] = [], []
+    for index, target in enumerate(targets, start=1):
+        puzzle = native_puzzle if target.asset == "xch" else cat_puzzle
+        parent = Coin(
+            index.to_bytes(32, "big"), puzzle.get_tree_hash(), target.amount_mojos
+        )
+        coin = (
+            parent
+            if target.asset == "xch"
+            else Coin(parent.name(), puzzle.get_tree_hash(), target.amount_mojos)
+        )
+        state["unsigned_roots"][coin.name().hex()] = (
+            coin,
+            puzzle,
+            None if target.asset == "xch" else utils.ASSET,
+        )
+        if target.asset == "cat":
+            state["unsigned_parents"][coin.name().hex()] = parent
+        row = utils._coin(index + 100, target.amount_mojos)
+        row["coin_id"] = coin.name().hex()
+        state[target.asset].append(row)
+    fee_coin = Coin(b"f" * 32, native_puzzle.get_tree_hash(), 2_000_000_000)
+    state["unsigned_roots"][fee_coin.name().hex()] = (fee_coin, native_puzzle, None)
+    fee_row = utils._coin(999, int(fee_coin.amount))
+    fee_row["coin_id"] = fee_coin.name().hex()
+    state["xch"].append(fee_row)
+    coin_ids = [row["coin_id"] for asset in ("xch", "cat") for row in state[asset]]
+    assert len(coin_ids) == len(set(coin_ids))
+    assert len(runtime._selectable_inventory(None, "mainnet")) == len(state["xch"])
+    assert len(runtime._selectable_inventory(utils.ASSET, "mainnet")) == len(
+        state["cat"]
+    )
+
+    preview = service.preview_coin_prep_fees(options)
+    assert preview["available"] is True, preview
+    assert preview["preparation_transaction_count_min"] == 0
+    assert preview["preparation_transaction_count_max"] == 0
+    assert preview["minimum_cancellation_reserve_mojos"] > 0
+    approved = service.approve_coin_prep_fees(
+        preview_id=preview["preview_id"],
+        maximum_fee_mojos=preview["suggested_maximum_fee_mojos"],
+        cancellation_reserve_mojos=preview["minimum_cancellation_reserve_mojos"],
+    )
+    from blueprints.bot import _bootstrap_cancellation_fee_start_readiness
+
+    assert _bootstrap_cancellation_fee_start_readiness(
+        runtime.read_fee_economic_snapshot(options)["campaign"]
+    ) == {"ready": True, "approval_id": approved["approval_id"]}
+    # Once offers consume their principal coins, a restart may have only the
+    # designated fee coin selectable. The prior consent still protects resume.
+    state["xch"], state["cat"] = [fee_row], []
+    assert _bootstrap_cancellation_fee_start_readiness(state["campaign"]) == {
+        "ready": True,
+        "approval_id": approved["approval_id"],
+    }
 
 
 def test_stopped_campaign_without_offers_cannot_quote_recovery_fee(

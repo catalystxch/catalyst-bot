@@ -963,6 +963,10 @@ class TestBotStart(_FlaskBase):
                 create=True,
             ),
             patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
+            patch(
                 "coin_manager.check_tier_size_drift_standalone",
                 return_value=legacy_drift,
             ) as drift_check,
@@ -973,6 +977,58 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.get_json().get("status"), "started")
         drift_check.assert_not_called()
         bot.start.assert_called_once_with()
+
+    def test_active_bootstrap_start_requires_cancellation_fee_consent(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        fake_cfg.WALLET_TYPE = "sage"
+        bot = _make_bot(running=False)
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 0,
+            "expires_at": "2099-01-01T00:00:00.000000Z",
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_fingerprint": 123456789,
+            "wallet_id": 2,
+            "wallet_type": "sage",
+            "status": "active",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "blueprints.bot._matching_active_bootstrap_campaign",
+                return_value=campaign,
+            ),
+            patch(
+                "blueprints.bot._bootstrap_coin_prep_start_readiness",
+                return_value={
+                    "ready": True,
+                    "reason": "ready",
+                    "campaign_id": campaign["campaign_id"],
+                    "campaign_revision": 0,
+                },
+            ),
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={
+                    "ready": False,
+                    "reason": "bootstrap_cancellation_fee_approval_required",
+                },
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"),
+            "bootstrap_cancellation_fee_approval_required",
+        )
+        bot.start.assert_not_called()
 
     def test_active_bootstrap_start_fails_closed_when_exact_prep_is_not_ready(self):
         """Historical completion cannot bypass current campaign readiness."""
@@ -1137,6 +1193,10 @@ class TestBotStart(_FlaskBase):
                 return_value={"ready": True, "reason": "exact_live_book"},
                 create=True,
             ) as resume_readiness,
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
         ):
             resp = self._post("/api/bot/start", {"resume_existing_offers": True})
 
