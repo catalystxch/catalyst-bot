@@ -461,6 +461,67 @@ def test_expired_campaign_offers_have_separate_proof_only_control(page):
     )
 
 
+def test_stopped_campaign_completed_offers_require_preview_and_exact_commit(page):
+    _open_gui(page)
+    assert (
+        page.evaluate("_apiBridgeMethod('/api/bootstrap/preview_completed', 'POST')")
+        == "preview_completed_bootstrap_offers"
+    )
+    assert (
+        page.evaluate("_apiBridgeMethod('/api/bootstrap/reconcile_completed', 'POST')")
+        == "reconcile_completed_bootstrap_offers"
+    )
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = {running: false};
+            window.__completedProofCalls = [];
+            _bootstrapRenderStatus({success: true, active: true, campaign: {
+                campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
+                expired: false, open_offer_count: 6,
+                asset_id: 'b8'.repeat(32), minimum_price: '0.0000375',
+                maximum_price: '0.00015',
+            }});
+            showStyledConfirm = async options => {
+                window.__completedProofConfirmation = options;
+                return true;
+            };
+            bootstrapRefreshStatus = async () => {};
+            window.apiFetch = async (path, options) => {
+                const body = JSON.parse(options.body);
+                window.__completedProofCalls.push({path, body});
+                const payload = path.endsWith('preview_completed')
+                    ? {success: true, expected_trade_ids: ['1'.repeat(64)], proven_completed: 1}
+                    : {success: true, proven_completed: 1};
+                return new Response(JSON.stringify(payload), {
+                    status: 200, headers: {'Content-Type': 'application/json'},
+                });
+            };
+        }"""
+    )
+    proof = page.locator("#bootstrapReconcileCompletedBtn")
+    expect(proof).to_be_enabled()
+    proof.evaluate("button => button.click()")
+    page.wait_for_function("() => window.__completedProofCalls.length === 2")
+    assert page.evaluate("window.__completedProofCalls") == [
+        {
+            "path": "/api/bootstrap/preview_completed",
+            "body": {"campaign_id": "c" * 64, "revision": 0},
+        },
+        {
+            "path": "/api/bootstrap/reconcile_completed",
+            "body": {
+                "campaign_id": "c" * 64,
+                "revision": 0,
+                "expected_trade_ids": ["1" * 64],
+            },
+        },
+    ]
+    assert "No wallet transaction" in page.evaluate(
+        "window.__completedProofConfirmation.message"
+    )
+
+
 def test_stop_count_change_requests_new_operator_review_without_cancellation(page):
     _open_gui(page)
     result = page.evaluate(

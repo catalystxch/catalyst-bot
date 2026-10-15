@@ -315,6 +315,7 @@ _MUTATING_API_ENDPOINTS = {
     "boost.api_boost_activate",
     "boost.api_boost_deactivate",
     "bootstrap.api_bootstrap_renew",
+    "bootstrap.api_bootstrap_reconcile_completed",
     "bootstrap.api_bootstrap_reconcile_expired",
     "bootstrap.api_bootstrap_start",
     "bootstrap.api_bootstrap_stop",
@@ -373,6 +374,7 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
     "bootstrap.api_bootstrap_manifest_import",
     "bootstrap.api_bootstrap_participation_export",
     "bootstrap.api_bootstrap_preview",
+    "bootstrap.api_bootstrap_preview_completed",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
     # remain available while a wallet effect is being reconciled and must not
@@ -7082,6 +7084,8 @@ from blueprints.bootstrap import (
     api_bootstrap_partial_offer_capability,
     api_bootstrap_participation_export,
     api_bootstrap_preview,
+    api_bootstrap_preview_completed,
+    api_bootstrap_reconcile_completed,
     api_bootstrap_reconcile_expired,
     api_bootstrap_renew,
     api_bootstrap_start,

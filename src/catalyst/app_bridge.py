@@ -576,6 +576,33 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def preview_completed_bootstrap_offers(self, body=None):
+        """Review exact completed offers without changing campaign state."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/preview_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_preview_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:reconcile_completed_bootstrap_offers")
+    def reconcile_completed_bootstrap_offers(self, body=None):
+        """Commit exact Task 9 fill proofs without a Sage wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_reconcile_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:renew_bootstrap_campaign")
     def renew_bootstrap_campaign(self, body=None):
         """Create a freshly reviewed successor to a stopped campaign."""
@@ -2033,6 +2060,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "refresh_cat",
     "renew_bootstrap_campaign",
     "reconcile_expired_bootstrap_offers",
+    "reconcile_completed_bootstrap_offers",
     "reload_config",
     "repost_dexie",
     "reset_coin_prep",
@@ -2135,6 +2163,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "export_bootstrap_manifest",
     "export_bootstrap_participation",
     "preview_bootstrap_campaign",
+    "preview_completed_bootstrap_offers",
     "refresh_balances",
     "run_doctor",
     "validate_config",

@@ -623,6 +623,198 @@ def _campaign_unresolved_creation_count(campaign_id: str) -> int:
     )
 
 
+def _review_stopped_completed_offers(
+    body: dict[str, Any],
+    *,
+    expected_trade_ids: list[str] | None = None,
+    commit: bool = False,
+) -> tuple[list[str], int]:
+    """Prove one exact stopped-campaign fill cohort without a wallet effect."""
+
+    import offer_reconciliation
+    import wallet
+
+    campaign_id = body.get("campaign_id")
+    revision = body.get("revision")
+    if (
+        type(campaign_id) is not str
+        or _ASSET_ID_RE.fullmatch(campaign_id) is None
+        or type(revision) is not int
+        or revision < 0
+    ):
+        raise BootstrapApiError("invalid_exact_scope")
+    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE") or sys.modules.get(
+        "api_server"
+    )
+    lock = getattr(owner, "_bot_cancel_lifecycle_lock", None)
+    if lock is None:
+        raise BootstrapApiError("bootstrap_lifecycle_fence_unavailable", 503)
+    with lock:
+        bot = getattr(owner, "bot", None)
+        if (
+            bot is None
+            or not callable(getattr(bot, "is_running", None))
+            or bot.is_running()
+        ):
+            raise BootstrapApiError("stop_bot_first", 409)
+        campaign = database.get_bootstrap_campaign(campaign_id)
+        identity = _read_bootstrap_identity()
+        if (
+            campaign is None
+            or campaign["status"] != "active"
+            or campaign["revision"] != revision
+            or campaign["network"] != identity["network"]
+            or campaign["wallet_fingerprint"] != identity["wallet_fingerprint"]
+            or campaign["wallet_id"] != identity["wallet_id"]
+            or campaign["asset_id"] != identity["asset_id"]
+        ):
+            raise BootstrapApiError("bootstrap_authority_changed", 409)
+        _await_campaign_creation_quiescence()
+        if _campaign_unresolved_creation_count(campaign_id):
+            raise BootstrapApiError("bootstrap_creation_unresolved", 409)
+        purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+        prefix = f"bootstrap:{campaign_id}:revision:"
+        intents = [
+            dict(row)
+            for row in database.get_offer_intents_for_registry()
+            if type(row) is dict
+            and str(row.get("purpose") or "").startswith(prefix)
+            and str(row.get("lifecycle_state") or "").lower()
+            in _NONTERMINAL_INTENT_STATES
+        ]
+        by_trade = {row.get("sage_trade_id"): row for row in intents}
+        open_rows = database.get_open_offers(cat_asset_id=identity["asset_id"])
+        open_ids = {row.get("trade_id") for row in open_rows if type(row) is dict}
+        if (
+            not intents
+            or len(intents) > 256
+            or len(by_trade) != len(intents)
+            or any(
+                row.get("purpose") != purpose
+                or row.get("lifecycle_state") not in {"created", "visible"}
+                for row in intents
+            )
+            or any(
+                type(trade_id) is not str or _ASSET_ID_RE.fullmatch(trade_id) is None
+                for trade_id in by_trade
+            )
+            or not set(by_trade).issubset(open_ids)
+        ):
+            raise BootstrapApiError("bootstrap_targets_changed", 409)
+        first = wallet._read_refresh_abort_cleanup_snapshot()
+        if first["pending_transaction_ids"]:
+            raise BootstrapApiError("sage_book_changed", 409)
+        completed_ids = sorted(set(by_trade) - set(first["trade_ids"]))
+        if not completed_ids:
+            raise BootstrapApiError("no_completed_offers", 409)
+        if expected_trade_ids is not None and completed_ids != expected_trade_ids:
+            raise BootstrapApiError("bootstrap_targets_changed", 409)
+        evidence = {
+            trade_id: offer_reconciliation.load_authoritative_evidence(
+                by_trade[trade_id]
+            )
+            for trade_id in completed_ids
+        }
+        second = wallet._read_refresh_abort_cleanup_snapshot()
+        current_intents = [
+            dict(row)
+            for row in database.get_offer_intents_for_registry()
+            if type(row) is dict
+            and str(row.get("purpose") or "").startswith(prefix)
+            and str(row.get("lifecycle_state") or "").lower()
+            in _NONTERMINAL_INTENT_STATES
+        ]
+        current_open_ids = {
+            row.get("trade_id")
+            for row in database.get_open_offers(cat_asset_id=identity["asset_id"])
+            if type(row) is dict
+        }
+        if (
+            first["trade_ids"] != second["trade_ids"]
+            or first["pending_transaction_ids"] != second["pending_transaction_ids"]
+            or second["pending_transaction_ids"]
+            or _read_bootstrap_identity() != identity
+            or database.get_bootstrap_campaign(campaign_id) != campaign
+            or current_intents != intents
+            or current_open_ids != open_ids
+        ):
+            raise BootstrapApiError("sage_book_changed", 409)
+        for trade_id in completed_ids:
+            proof = offer_reconciliation.classify_terminal_evidence(
+                by_trade[trade_id], evidence[trade_id], now=second["observed_at"]
+            )
+            if proof.get("classification") != "FILLED_PROVEN":
+                raise BootstrapApiError("bootstrap_fill_proof_incomplete", 409)
+        proven = 0
+        if commit:
+            for trade_id in completed_ids:
+                result = offer_reconciliation.reconcile_offer(
+                    by_trade[trade_id]["intent_id"],
+                    evidence=evidence[trade_id],
+                    now=second["observed_at"],
+                )
+                if (
+                    result.get("classification") != "FILLED_PROVEN"
+                    or result.get("applied") is not True
+                ):
+                    raise BootstrapApiError("bootstrap_fill_commit_incomplete", 409)
+                proven += 1
+        return completed_ids, proven
+
+
+@bp.post("/api/bootstrap/preview_completed")
+def api_bootstrap_preview_completed():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        try:
+            body = _request_body()
+            if set(body) != {"campaign_id", "revision"}:
+                raise BootstrapApiError("invalid_request")
+            trade_ids, _proven = _review_stopped_completed_offers(body)
+            return jsonify(
+                {
+                    "success": True,
+                    "expected_trade_ids": trade_ids,
+                    "proven_completed": len(trade_ids),
+                    "wallet_effect_started": False,
+                }
+            )
+        except Exception as exc:
+            return _error(exc)
+
+
+@bp.post("/api/bootstrap/reconcile_completed")
+def api_bootstrap_reconcile_completed():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        try:
+            body = _request_body()
+            if set(body) != {"campaign_id", "revision", "expected_trade_ids"}:
+                raise BootstrapApiError("invalid_request")
+            expected = body["expected_trade_ids"]
+            if (
+                type(expected) is not list
+                or not 1 <= len(expected) <= 256
+                or any(
+                    type(trade_id) is not str
+                    or _ASSET_ID_RE.fullmatch(trade_id) is None
+                    for trade_id in expected
+                )
+                or expected != sorted(set(expected))
+            ):
+                raise BootstrapApiError("invalid_exact_scope")
+            _trade_ids, proven = _review_stopped_completed_offers(
+                body, expected_trade_ids=expected, commit=True
+            )
+            return jsonify(
+                {
+                    "success": True,
+                    "proven_completed": proven,
+                    "wallet_effect_started": False,
+                }
+            )
+        except Exception as exc:
+            return _error(exc)
+
+
 @bp.post("/api/bootstrap/reconcile_expired")
 def api_bootstrap_reconcile_expired():
     with _CAMPAIGN_LIFECYCLE_LOCK:
