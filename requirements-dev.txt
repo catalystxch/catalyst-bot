@@ -1,5 +1,5 @@
 -r requirements.txt
-pytest>=9.0.3,<10
+pytest>=9.1.1,<10
 pytest-xdist>=3.8.0,<4
 pytest-cov>=7.1.0,<8
 PyYAML>=6.0.2,<7
