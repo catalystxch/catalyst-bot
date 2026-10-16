@@ -19,6 +19,7 @@ origin or token checks must preserve that invariant.
 """
 
 import os
+import socket
 import re
 import sys
 import io
@@ -71,7 +72,7 @@ if __name__ == "__main__":
 
 import database
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, quote
 
@@ -273,6 +274,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/offers/open_count",
         "/api/offers/cancel_all/status",
         "/api/offers/diagnostic",
+        "/api/offers/refresh_abort/preview",
         "/api/fills",
         "/api/fills/classified",
         "/api/fills/arb-wallets",
@@ -313,6 +315,8 @@ _MUTATING_API_ENDPOINTS = {
     "boost.api_boost_activate",
     "boost.api_boost_deactivate",
     "bootstrap.api_bootstrap_renew",
+    "bootstrap.api_bootstrap_reconcile_completed",
+    "bootstrap.api_bootstrap_reconcile_expired",
     "bootstrap.api_bootstrap_start",
     "bootstrap.api_bootstrap_stop",
     "bot.api_bot_start",
@@ -370,6 +374,7 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
     "bootstrap.api_bootstrap_manifest_import",
     "bootstrap.api_bootstrap_participation_export",
     "bootstrap.api_bootstrap_preview",
+    "bootstrap.api_bootstrap_preview_completed",
     "cat.api_balances_refresh",
     # Subprocess telemetry persists diagnostics and emits SSE only.  It must
     # remain available while a wallet effect is being reconciled and must not
@@ -395,11 +400,18 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     # is unresolved.  The route acquires a normal mutation permit before it
     # can start any fresh wallet effect.
     "offers.api_cancel_all",
+    "offers.api_refresh_abort_begin",
+    "offers.api_refresh_abort_fee_preview",
+    "offers.api_refresh_abort_fee_approval",
+    "offers.api_refresh_abort_cancel_next",
+    "offers.api_refresh_abort_reconcile_target",
+    "offers.api_refresh_abort_complete",
     "system.api_console_toggle",
     "watchdog.api_watchdog_shape_fix_abort",
 }
 
 _read_only_diagnostics_active = False
+_refresh_abort_recovery_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -3899,6 +3911,342 @@ def recover_legacy_startup_reservations() -> dict[str, int]:
     )
 
 
+def has_exact_refresh_abort_startup_candidate(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> bool:
+    """Preserve a single submitted parent blocker for scoped recovery.
+
+    The ordinary Task 9 recovery cannot terminalize this parent while its
+    replacement child is unpublished. Trying it first would add a second
+    denial blocker and prevent the exact refresh-abort path from entering.
+    This read-only check grants no lease, abort, or wallet authority.
+    """
+
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return False
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        if type(asset_id) is not str or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None:
+            return False
+        wallet_hash, network = _configured_mutation_binding()
+
+        def current_requested_owner(lease: dict[str, Any] | None) -> bool:
+            if not lease or type(allow_active_owner_run_id) is not str:
+                return False
+            if not allow_active_owner_run_id or lease.get("active") != 1:
+                return False
+            expiry = lease.get("expires_at")
+            return bool(
+                type(expiry) is str
+                and lease.get("owner_run_id") == allow_active_owner_run_id
+                and lease.get("owner_pid") == os.getpid()
+                and lease.get("owner_host") == socket.gethostname()
+                and lease.get("wallet_fingerprint_hash") == wallet_hash
+                and lease.get("network") == network
+                and datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                > datetime.now(timezone.utc)
+            )
+
+        incomplete = database.list_incomplete_refresh_aborts(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if incomplete:
+            if len(incomplete) != 1:
+                return False
+            abort = incomplete[0]
+            expected_blockers = {abort["blocking_operation_id"]}
+            expected_journal = set()
+            if abort["state"] == "fenced":
+                expected_blockers.add(abort["cancel_operation_id"])
+                expected_journal.add(abort["cancel_operation_id"])
+            elif abort["state"] != "parent_terminal":
+                return False
+            latch = database.get_runtime_safety_latch()
+            lease = database.get_runtime_mutation_lease()
+            blockers = database.get_unresolved_offer_operation_blockers()
+            expired_abort_owner = False
+            if lease and lease["active"] == 1:
+                expiry = lease.get("expires_at")
+                expired_abort_owner = bool(
+                    type(expiry) is str
+                    and datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                    <= datetime.now(timezone.utc)
+                    and lease.get("owner_run_id") == abort["owner_run_id"]
+                    and lease.get("owner_pid") == abort["lease_owner_pid"]
+                    and lease.get("owner_host") == abort["lease_owner_host"]
+                    and lease.get("acquired_at") == abort["lease_acquired_at"]
+                )
+            return bool(
+                latch
+                and latch["state"] == "tripped"
+                and latch["generation"] == abort["latch_generation"]
+                and latch["wallet_fingerprint_hash"] == wallet_hash
+                and latch["network"] == network
+                and set(json.loads(latch["blocking_operation_ids_json"]))
+                == expected_blockers
+                and abort["wallet_fingerprint_hash"] == wallet_hash
+                and abort["network"] == network
+                and abort["asset_id"] == asset_id
+                and lease
+                and (
+                    lease["active"] == 0
+                    or expired_abort_owner
+                    or (
+                        current_requested_owner(lease)
+                        and lease.get("owner_run_id") == abort["owner_run_id"]
+                        and lease.get("acquired_at") == abort["lease_acquired_at"]
+                    )
+                )
+                and {row["operation_id"] for row in blockers} == expected_journal
+            )
+        candidates = database.list_fenced_refresh_abort_candidates(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if len(candidates) != 1:
+            return False
+        operation_id = candidates[0]["cancel_operation_id"]
+        latch = database.get_runtime_safety_latch()
+        lease = database.get_runtime_mutation_lease()
+        blockers = database.get_unresolved_offer_operation_blockers()
+        return bool(
+            latch
+            and latch["state"] == "tripped"
+            and latch["reason_code"] == "UNRESOLVED_OPERATIONS"
+            and latch["wallet_fingerprint_hash"] == wallet_hash
+            and latch["network"] == network
+            and json.loads(latch["blocking_operation_ids_json"]) == [operation_id]
+            and lease
+            and (lease["active"] == 0 or current_requested_owner(lease))
+            and len(blockers) == 1
+            and blockers[0]["operation_id"] == operation_id
+        )
+    except Exception:
+        return False
+
+
+def preflight_refresh_abort_restricted_startup(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> dict[str, Any]:
+    """Read fresh exact authority before considering fenced lease entry.
+
+    This function is diagnostic only. Its observations are rechecked at the
+    later compare-and-set lease boundary; it never grants mutation authority.
+    """
+
+    denied = {"eligible": False, "reason": "refresh_abort_startup_unproven"}
+    try:
+        if not has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=allow_active_owner_run_id
+        ):
+            return denied
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        wallet_hash, network = _configured_mutation_binding()
+        binding = _configured_wallet_identity_binding(network)
+        if (
+            str(getattr(cfg, "WALLET_TYPE", "")).lower() != "sage"
+            or type(asset_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None
+            or type(binding) is not mutation_gate.WalletIdentityBinding
+            or binding.backend != "sage"
+            or mutation_gate.wallet_fingerprint_hash(binding.fingerprint) != wallet_hash
+        ):
+            return denied
+        first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
+            wallet.get_wallet_identity
+        )
+        first_check = mutation_gate.validate_wallet_identity(binding, first_identity)
+        if first_check.get("allowed") is not True:
+            return denied
+        second_check = mutation_gate.validate_wallet_identity(
+            binding,
+            second_identity,
+            last_observed_at_utc=first_check["observed_at_utc"],
+        )
+        if second_check.get("allowed") is not True:
+            return denied
+        first_book = wallet._read_refresh_abort_cleanup_snapshot()
+        second_book = wallet._read_refresh_abort_cleanup_snapshot()
+        first_trades = first_book["trade_ids"]
+        second_trades = second_book["trade_ids"]
+        first_at = datetime.fromisoformat(
+            first_book["observed_at"].replace("Z", "+00:00")
+        )
+        second_at = datetime.fromisoformat(
+            second_book["observed_at"].replace("Z", "+00:00")
+        )
+        if (
+            type(first_trades) is not list
+            or type(second_trades) is not list
+            or first_trades != second_trades
+            or len(second_trades) != len(set(second_trades))
+            or type(first_book["pending_transaction_ids"]) is not list
+            or type(second_book["pending_transaction_ids"]) is not list
+            or first_book["pending_transaction_ids"]
+            or second_book["pending_transaction_ids"]
+            or first_at.tzinfo is None
+            or second_at.tzinfo is None
+            or second_at <= first_at
+            or not timedelta(seconds=0)
+            <= datetime.now(timezone.utc) - second_at
+            <= timedelta(seconds=30)
+        ):
+            return denied
+        candidates = database.list_fenced_refresh_abort_candidates(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        aborts = database.list_incomplete_refresh_aborts(
+            asset_id=asset_id,
+            wallet_fingerprint_hash=wallet_hash,
+            network=network,
+        )
+        if len(candidates) > 1 or len(aborts) > 1 or not (candidates or aborts):
+            return denied
+        candidate = candidates[0] if candidates else None
+        abort = aborts[0] if aborts else None
+        if candidate is not None and abort is not None:
+            if candidate["parent_intent_id"] != abort["parent_intent_id"]:
+                return denied
+        if abort is not None:
+            targets = json.loads(abort["target_trade_ids_json"])
+            if type(targets) is not list or not set(second_trades).issubset(
+                set(targets)
+            ):
+                return denied
+        elif (
+            candidate["child_trade_id"] not in second_trades
+            or candidate["parent_trade_id"] in second_trades
+        ):
+            return denied
+        if not has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=allow_active_owner_run_id
+        ):
+            return denied
+        return {
+            "eligible": True,
+            "wallet_snapshot": second_book,
+            "abort_id": abort["abort_id"] if abort else None,
+            "candidate": candidate,
+        }
+    except Exception:
+        return denied
+
+
+def activate_refresh_abort_restricted_startup(authorization: Any) -> bool:
+    """Own only the fenced cleanup profile, never normal trading authority.
+
+    The first wallet proof precedes the lease compare-and-set. A second,
+    independent proof follows acquisition and must name this exact live owner
+    before the restricted HTTP view is enabled. Failure retains the latch.
+    """
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    global _refresh_abort_recovery_active, _stability_startup_status
+
+    if (
+        type(authorization) is not dict
+        or authorization.get("allowed") is not False
+        or authorization.get("reason_code")
+        not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+    ):
+        return False
+    with _mutation_runtime_init_lock:
+        if (
+            _refresh_abort_recovery_active
+            or bot is not None
+            or mutation_gate.current_runtime() is not None
+        ):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            first = preflight_refresh_abort_restricted_startup()
+            if first.get("eligible") is not True:
+                return False
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            adapter_authority = get_wallet_adapter_authority()
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=adapter_authority,
+                acquire_lease=False,
+                start_heartbeat=False,
+            )
+            abort_id = first.get("abort_id")
+            if abort_id is None:
+                runtime = mutation_gate.initialize(
+                    wallet_fingerprint_hash=wallet_hash,
+                    network=network,
+                    wallet_identity_binding=binding,
+                    wallet_adapter_authority=adapter_authority,
+                    acquire_lease=True,
+                    start_heartbeat=False,
+                )
+                acquired = runtime.last_acquire_result.get("acquired") is True
+            elif type(abort_id) is str and type(asset_id) is str:
+                snapshot = first["wallet_snapshot"]
+                acquired = (
+                    runtime.acquire_refresh_abort_successor(
+                        abort_id=abort_id,
+                        asset_id=asset_id,
+                        observed_trade_ids=snapshot["trade_ids"],
+                        observed_pending_transaction_ids=snapshot[
+                            "pending_transaction_ids"
+                        ],
+                        observed_at=snapshot["observed_at"],
+                    ).get("acquired")
+                    is True
+                )
+            if not acquired:
+                return False
+            second = preflight_refresh_abort_restricted_startup(
+                allow_active_owner_run_id=runtime.run_id
+            )
+            status = runtime.status().to_dict()
+            lease = status.get("lease") or {}
+            if (
+                second.get("eligible") is not True
+                or second.get("abort_id") != abort_id
+                or status.get("allowed") is not False
+                or status.get("reason_code")
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or status.get("source") != "durable_latch"
+                or lease.get("active") is not True
+                or lease.get("owned_by_this_run") is not True
+                or lease.get("owner_run_id") != runtime.run_id
+            ):
+                return False
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(
+                os.path.abspath(database.DB_PATH)
+            )
+            _stability_startup_status = _redacted_startup_status(status)
+            _refresh_abort_recovery_active = True
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated and runtime is not None:
+                mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
 def promote_wallet_setup_bootstrap() -> dict:
     """Promote an exact persisted Sage identity into normal owner mode."""
 
@@ -4041,6 +4389,23 @@ def enforce_local_runtime_guard():
                 return jsonify({"error": "loopback_only"}), 403
             return Response("Loopback only", status=403, mimetype="text/plain")
 
+    if _refresh_abort_recovery_active:
+        recovery_routes = {
+            ("GET", "/"),
+            ("GET", "/api/safety/status"),
+            ("GET", "/api/offers/refresh_abort/preview"),
+            ("POST", "/api/offers/refresh_abort/begin"),
+            ("POST", "/api/offers/refresh_abort/fee_preview"),
+            ("POST", "/api/offers/refresh_abort/fee_approval"),
+            ("POST", "/api/offers/refresh_abort/cancel_next"),
+            ("POST", "/api/offers/refresh_abort/reconcile_target"),
+            ("POST", "/api/offers/refresh_abort/complete"),
+        }
+        if (request.method, path) not in recovery_routes:
+            return jsonify(
+                {"success": False, "error": "refresh_abort_recovery_only"}
+            ), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -4145,6 +4510,12 @@ def serve_gui():
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         return _bind_local_browser_cookie(response)
+    if _refresh_abort_recovery_active:
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        response = _serve_bootstrapped_html("refresh_abort_recovery.html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
@@ -6662,6 +7033,11 @@ from blueprints.offers import (
     bp as _offers_bp,
     api_offers,
     api_cancel_all_status,
+    api_refresh_abort_preview,
+    api_refresh_abort_begin,
+    api_refresh_abort_cancel_next,
+    api_refresh_abort_reconcile_target,
+    api_refresh_abort_complete,
     api_open_offer_count,
     api_cancel_all,
     api_cleanup_orphans,
@@ -6708,6 +7084,9 @@ from blueprints.bootstrap import (
     api_bootstrap_partial_offer_capability,
     api_bootstrap_participation_export,
     api_bootstrap_preview,
+    api_bootstrap_preview_completed,
+    api_bootstrap_reconcile_completed,
+    api_bootstrap_reconcile_expired,
     api_bootstrap_renew,
     api_bootstrap_start,
     api_bootstrap_status,

@@ -279,9 +279,27 @@ def test_other_campaign_cancellation_does_not_consume_this_scope(approved_bootst
     assert status["unresolved_operation_count"] == 0
 
 
-def _confirm_cohort(manifest, identity):
+def _confirm_cohort(manifest, identity, *, reconciler_shape=False):
     database = import_module("database")
     for member in manifest["members"]:
+        proof = {
+            "cancel_context": {"cohort_id": manifest["cohort_id"]},
+            "classification": {
+                "classification": "CANCELLED_PROVEN",
+                "fee_mojos": 40,
+            },
+        }
+        evidence_json = {
+            "trade_id": member["trade_id"],
+            "cohort_id": manifest["cohort_id"],
+            "member_id": member["member_id"],
+            "effect_attempted": True,
+        }
+        if reconciler_shape:
+            evidence_json.update(proof)
+            evidence_json["evidence"] = {"observed_at": "2026-09-22T12:00:02Z"}
+        else:
+            evidence_json["exact_subset"] = proof
         database.append_offer_operation_event(
             event_id=f"{member['operation_id']}:attempt:1:reconciled",
             operation_id=member["operation_id"],
@@ -293,19 +311,7 @@ def _confirm_cohort(manifest, identity):
             request_timestamp="2026-09-22T12:00:02Z",
             wallet_identity_json=identity,
             transaction_id="8" * 64,
-            evidence_json={
-                "trade_id": member["trade_id"],
-                "cohort_id": manifest["cohort_id"],
-                "member_id": member["member_id"],
-                "effect_attempted": True,
-                "exact_subset": {
-                    "cancel_context": {"cohort_id": manifest["cohort_id"]},
-                    "classification": {
-                        "classification": "CANCELLED_PROVEN",
-                        "fee_mojos": 40,
-                    },
-                },
-            },
+            evidence_json=evidence_json,
             reason_code="AUTHORITATIVE_TERMINAL_PROOF",
             blocks_mutation=False,
             created_at="2026-09-22T12:00:02Z",
@@ -425,6 +431,18 @@ def test_legacy_commitment_participates_in_atomic_next_reservation_cap(
             cancellation=True,
         )
     assert utils._counts() == before
+
+
+def test_reconciler_top_level_cancel_proof_counts_fee_once(approved_bootstrap):
+    database = import_module("database")
+    manifest, identity = _seed_cancel(approved_bootstrap)
+    _confirm_cohort(manifest, identity, reconciler_shape=True)
+    assert (
+        database.get_bootstrap_campaign_authoritative_fee_spent_mojos(
+            approved_bootstrap["campaign_id"]
+        )
+        == 40
+    )
 
 
 def test_legacy_adapter_failure_is_not_no_effect_proof(approved_bootstrap):

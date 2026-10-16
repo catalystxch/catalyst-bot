@@ -141,7 +141,9 @@ while true; do sleep 1; done
         env=env,
         text=True,
         capture_output=True,
-        timeout=30,
+        # The smoke script has its own 55-second timeout. Give it time to
+        # report that result (and clean up) on a busy CI runner.
+        timeout=70,
         check=False,
     )
 

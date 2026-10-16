@@ -344,6 +344,15 @@ def _bootstrap_start_block(campaign: dict[str, Any] | None) -> dict[str, Any] | 
     }
 
 
+def _bootstrap_cancellation_fee_start_readiness(
+    campaign: dict[str, Any],
+) -> dict[str, Any]:
+    """Check current ordinary consent before enabling Bootstrap trading."""
+    from bootstrap_fee_authority import cancellation_fee_readiness
+
+    return cancellation_fee_readiness(campaign)
+
+
 def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
     """Re-run exact active-campaign Coin Prep verification before start.
 
@@ -1124,6 +1133,28 @@ def api_bot_start():
             )
         return jsonify(payload), 400
 
+    if bootstrap_campaign is not None:
+        fee_readiness = _bootstrap_cancellation_fee_start_readiness(bootstrap_campaign)
+        if fee_readiness.get("ready") is not True:
+            reason = str(
+                fee_readiness.get("reason")
+                or "bootstrap_cancellation_fee_approval_stale"
+            )
+            error = (
+                "Review and approve this campaign's cancellation fee budget "
+                "before starting live offers"
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": reason,
+                    "error": error,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 409
+
     # Cancel All may have begun after the initial is_running() check while
     # pre-start validation was reading Sage. Serialize this final transition
     # with Cancel All's stopped-book check and worker reservation.
@@ -1827,6 +1858,7 @@ def api_status():
             "loop_count": raw.get("loop_count", 0),
             "uptime_seconds": _uptime,
             "last_loop_time": raw.get("loop_duration") or raw.get("last_loop_time", 0),
+            "history_scope": db_stats.get("history_scope", "lifetime"),
             "total_fills": db_stats.get("total_fills", 0),
             "errors": db_stats.get("errors", 0),
         }

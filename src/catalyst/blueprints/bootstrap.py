@@ -18,6 +18,7 @@ import json
 import re
 import secrets
 import sys
+from threading import RLock
 from typing import Any
 
 from flask import Blueprint, current_app, jsonify, request
@@ -42,6 +43,7 @@ from super_log import slog
 
 
 bp = Blueprint("bootstrap", __name__)
+_CAMPAIGN_LIFECYCLE_LOCK = RLock()
 
 _ASSET_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,15}$")
@@ -60,10 +62,13 @@ _NONTERMINAL_INTENT_STATES = frozenset(
 
 
 class BootstrapApiError(ValueError):
-    def __init__(self, code: str, status: int = 400):
+    def __init__(
+        self, code: str, status: int = 400, *, details: dict[str, Any] | None = None
+    ):
         super().__init__(code)
         self.code = code
         self.status = status
+        self.details = details or {}
 
 
 def _utcnow() -> datetime:
@@ -109,7 +114,9 @@ def _json_safe(value: Any) -> Any:
 def _error(exc: Exception):
     if isinstance(exc, BootstrapApiError):
         return (
-            jsonify({"success": False, "code": exc.code, "error": exc.code}),
+            jsonify(
+                {"success": False, "code": exc.code, "error": exc.code, **exc.details}
+            ),
             exc.status,
         )
     if isinstance(exc, ManifestError):
@@ -412,6 +419,9 @@ def _status_campaign_view(campaign: dict[str, Any] | None) -> dict[str, Any] | N
     view["cancel_reason"] = "bootstrap_expired" if expired else None
     view["manual_restart_required"] = expired
     view["open_offer_count"] = len(trade_ids)
+    # The operator must submit the exact reviewed scope for a proof-only
+    # expiry reconciliation. The backend re-reads it under the lifecycle lock.
+    view["reconciliation_trade_ids"] = trade_ids if expired else []
     view["unresolved_creation_count"] = _campaign_unresolved_creation_count(
         str(campaign.get("campaign_id") or "")
     )
@@ -618,6 +628,367 @@ def _campaign_unresolved_creation_count(campaign_id: str) -> int:
     )
 
 
+def _review_stopped_completed_offers(
+    body: dict[str, Any],
+    *,
+    expected_trade_ids: list[str] | None = None,
+    commit: bool = False,
+) -> tuple[list[str], int, list[dict[str, str]]]:
+    """Prove one exact stopped-campaign fill cohort without a wallet effect."""
+
+    import offer_reconciliation
+    import wallet
+
+    campaign_id = body.get("campaign_id")
+    revision = body.get("revision")
+    if (
+        type(campaign_id) is not str
+        or _ASSET_ID_RE.fullmatch(campaign_id) is None
+        or type(revision) is not int
+        or revision < 0
+    ):
+        raise BootstrapApiError("invalid_exact_scope")
+    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE") or sys.modules.get(
+        "api_server"
+    )
+    lock = getattr(owner, "_bot_cancel_lifecycle_lock", None)
+    if lock is None:
+        raise BootstrapApiError("bootstrap_lifecycle_fence_unavailable", 503)
+    with lock:
+        bot = getattr(owner, "bot", None)
+        if (
+            bot is None
+            or not callable(getattr(bot, "is_running", None))
+            or bot.is_running()
+        ):
+            raise BootstrapApiError("stop_bot_first", 409)
+        campaign = database.get_bootstrap_campaign(campaign_id)
+        identity = _read_bootstrap_identity()
+        if (
+            campaign is None
+            or campaign["status"] != "active"
+            or campaign["revision"] != revision
+            or campaign["network"] != identity["network"]
+            or campaign["wallet_fingerprint"] != identity["wallet_fingerprint"]
+            or campaign["wallet_id"] != identity["wallet_id"]
+            or campaign["asset_id"] != identity["asset_id"]
+        ):
+            raise BootstrapApiError("bootstrap_authority_changed", 409)
+        _await_campaign_creation_quiescence()
+        if _campaign_unresolved_creation_count(campaign_id):
+            raise BootstrapApiError("bootstrap_creation_unresolved", 409)
+        purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+        prefix = f"bootstrap:{campaign_id}:revision:"
+        intents = [
+            dict(row)
+            for row in database.get_offer_intents_for_registry()
+            if type(row) is dict
+            and str(row.get("purpose") or "").startswith(prefix)
+            and str(row.get("lifecycle_state") or "").lower()
+            in _NONTERMINAL_INTENT_STATES
+        ]
+        by_trade = {row.get("sage_trade_id"): row for row in intents}
+        open_rows = database.get_open_offers(cat_asset_id=identity["asset_id"])
+        open_ids = {row.get("trade_id") for row in open_rows if type(row) is dict}
+        open_by_trade = {
+            row["trade_id"]: row
+            for row in open_rows
+            if type(row) is dict and type(row.get("trade_id")) is str
+        }
+        if (
+            not intents
+            or len(intents) > 256
+            or len(by_trade) != len(intents)
+            or any(
+                row.get("purpose") != purpose
+                or row.get("lifecycle_state") not in {"created", "visible"}
+                for row in intents
+            )
+            or any(
+                type(trade_id) is not str or _ASSET_ID_RE.fullmatch(trade_id) is None
+                for trade_id in by_trade
+            )
+            or not set(by_trade).issubset(open_ids)
+        ):
+            raise BootstrapApiError("bootstrap_targets_changed", 409)
+        first = wallet._read_refresh_abort_cleanup_snapshot()
+        if first["pending_transaction_ids"]:
+            raise BootstrapApiError("sage_book_changed", 409)
+        completed_ids = sorted(set(by_trade) - set(first["trade_ids"]))
+        if not completed_ids:
+            raise BootstrapApiError("no_completed_offers", 409)
+        if expected_trade_ids is not None and completed_ids != expected_trade_ids:
+            raise BootstrapApiError("bootstrap_targets_changed", 409)
+        reviewed_offers = []
+        for trade_id in completed_ids:
+            side = str(open_by_trade[trade_id].get("side") or "").lower()
+            if side not in {"buy", "sell"}:
+                raise BootstrapApiError("bootstrap_offer_side_unknown", 409)
+            reviewed_offers.append(
+                {"trade_id": trade_id, "side": side, "asset_id": identity["asset_id"]}
+            )
+        evidence = {
+            trade_id: offer_reconciliation.load_authoritative_evidence(
+                by_trade[trade_id]
+            )
+            for trade_id in completed_ids
+        }
+        second = wallet._read_refresh_abort_cleanup_snapshot()
+        current_intents = [
+            dict(row)
+            for row in database.get_offer_intents_for_registry()
+            if type(row) is dict
+            and str(row.get("purpose") or "").startswith(prefix)
+            and str(row.get("lifecycle_state") or "").lower()
+            in _NONTERMINAL_INTENT_STATES
+        ]
+        current_open_ids = {
+            row.get("trade_id")
+            for row in database.get_open_offers(cat_asset_id=identity["asset_id"])
+            if type(row) is dict
+        }
+        if (
+            first["trade_ids"] != second["trade_ids"]
+            or first["pending_transaction_ids"] != second["pending_transaction_ids"]
+            or second["pending_transaction_ids"]
+            or _read_bootstrap_identity() != identity
+            or database.get_bootstrap_campaign(campaign_id) != campaign
+            or current_intents != intents
+            or current_open_ids != open_ids
+        ):
+            raise BootstrapApiError("sage_book_changed", 409)
+        for trade_id in completed_ids:
+            proof = offer_reconciliation.classify_terminal_evidence(
+                by_trade[trade_id], evidence[trade_id], now=second["observed_at"]
+            )
+            if proof.get("classification") != "FILLED_PROVEN":
+                raise BootstrapApiError("bootstrap_fill_proof_incomplete", 409)
+        proven = 0
+        if commit:
+            for trade_id in completed_ids:
+                try:
+                    result = offer_reconciliation.reconcile_offer(
+                        by_trade[trade_id]["intent_id"],
+                        evidence=evidence[trade_id],
+                        now=second["observed_at"],
+                    )
+                    if (
+                        result.get("classification") != "FILLED_PROVEN"
+                        or result.get("applied") is not True
+                    ):
+                        raise BootstrapApiError("bootstrap_fill_commit_incomplete", 409)
+                except Exception as exc:
+                    slog(
+                        "BOOTSTRAP",
+                        "Completed-offer reconciliation requires a fresh review",
+                        {"error_type": type(exc).__name__},
+                        level="error",
+                    )
+                    raise BootstrapApiError(
+                        "bootstrap_fill_commit_incomplete",
+                        409,
+                        details={
+                            "commit_may_be_partial": True,
+                            "fresh_preview_required": True,
+                            "wallet_effect_started": False,
+                        },
+                    ) from exc
+                proven += 1
+        return completed_ids, proven, reviewed_offers
+
+
+@bp.post("/api/bootstrap/preview_completed")
+def api_bootstrap_preview_completed():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        try:
+            body = _request_body()
+            if set(body) != {"campaign_id", "revision"}:
+                raise BootstrapApiError("invalid_request")
+            trade_ids, _proven, reviewed_offers = _review_stopped_completed_offers(body)
+            return jsonify(
+                {
+                    "success": True,
+                    "expected_trade_ids": trade_ids,
+                    "expected_offers": reviewed_offers,
+                    "asset_id": reviewed_offers[0]["asset_id"],
+                    "proven_completed": len(trade_ids),
+                    "wallet_effect_started": False,
+                }
+            )
+        except Exception as exc:
+            return _error(exc)
+
+
+@bp.post("/api/bootstrap/reconcile_completed")
+def api_bootstrap_reconcile_completed():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        try:
+            body = _request_body()
+            if set(body) != {"campaign_id", "revision", "expected_trade_ids"}:
+                raise BootstrapApiError("invalid_request")
+            expected = body["expected_trade_ids"]
+            if (
+                type(expected) is not list
+                or not 1 <= len(expected) <= 256
+                or any(
+                    type(trade_id) is not str
+                    or _ASSET_ID_RE.fullmatch(trade_id) is None
+                    for trade_id in expected
+                )
+                or expected != sorted(set(expected))
+            ):
+                raise BootstrapApiError("invalid_exact_scope")
+            _trade_ids, proven, _reviewed_offers = _review_stopped_completed_offers(
+                body, expected_trade_ids=expected, commit=True
+            )
+            return jsonify(
+                {
+                    "success": True,
+                    "proven_completed": proven,
+                    "wallet_effect_started": False,
+                }
+            )
+        except Exception as exc:
+            return _error(exc)
+
+
+@bp.post("/api/bootstrap/reconcile_expired")
+def api_bootstrap_reconcile_expired():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        return _api_bootstrap_reconcile_expired_locked()
+
+
+def _api_bootstrap_reconcile_expired_locked():
+    """Prove naturally expired campaign offers while trading is stopped.
+
+    This path never calls a wallet mutation. Each exact Task 9 expiry proof is
+    checked against a stable, complete Sage offer/pending snapshot before any
+    registry transition. A failed or incomplete proof leaves campaign authority
+    unchanged so the operator can investigate it.
+    """
+
+    import offer_reconciliation
+    import wallet
+
+    try:
+        body = _request_body()
+        if set(body) != {"campaign_id", "revision", "expected_trade_ids"}:
+            raise BootstrapApiError("invalid_request")
+        campaign_id = body["campaign_id"]
+        expected = body["expected_trade_ids"]
+        if (
+            type(campaign_id) is not str
+            or _ASSET_ID_RE.fullmatch(campaign_id) is None
+            or type(body["revision"]) is not int
+            or type(expected) is not list
+            or not 1 <= len(expected) <= 256
+            or any(
+                type(trade) is not str or _ASSET_ID_RE.fullmatch(trade) is None
+                for trade in expected
+            )
+            or expected != sorted(set(expected))
+        ):
+            raise BootstrapApiError("invalid_exact_scope")
+        owner = current_app.config.get(
+            "_CATALYST_API_SERVER_MODULE"
+        ) or sys.modules.get("api_server")
+        lock = getattr(owner, "_bot_cancel_lifecycle_lock", None)
+        if lock is None:
+            raise BootstrapApiError("bootstrap_lifecycle_fence_unavailable", 503)
+        with lock:
+            bot = getattr(owner, "bot", None)
+            if (
+                bot is None
+                or not callable(getattr(bot, "is_running", None))
+                or bot.is_running()
+            ):
+                raise BootstrapApiError("stop_bot_first", 409)
+            campaign = database.get_bootstrap_campaign(campaign_id)
+            identity = _read_bootstrap_identity()
+            if (
+                campaign is None
+                or campaign["status"] != "active"
+                or campaign["revision"] != body["revision"]
+                or not _campaign_expiry_has_elapsed(campaign, _utcnow())
+                or campaign["network"] != identity["network"]
+                or campaign["wallet_fingerprint"] != identity["wallet_fingerprint"]
+                or campaign["wallet_id"] != identity["wallet_id"]
+                or campaign["asset_id"] != identity["asset_id"]
+            ):
+                raise BootstrapApiError("bootstrap_authority_changed", 409)
+            _await_campaign_creation_quiescence()
+            if _campaign_unresolved_creation_count(campaign_id):
+                raise BootstrapApiError("bootstrap_creation_unresolved", 409)
+            prefix = f"bootstrap:{campaign_id}:revision:"
+            intents = [
+                row
+                for row in database.get_offer_intents_for_registry()
+                if type(row) is dict
+                and str(row.get("purpose") or "").startswith(prefix)
+                and str(row.get("lifecycle_state") or "").lower()
+                in _NONTERMINAL_INTENT_STATES
+            ]
+            by_trade = {row.get("sage_trade_id"): row for row in intents}
+            if (
+                len(by_trade) != len(intents)
+                or sorted(by_trade) != expected
+                or any(
+                    row.get("lifecycle_state") not in {"created", "visible"}
+                    for row in intents
+                )
+            ):
+                raise BootstrapApiError("bootstrap_targets_changed", 409)
+            first = wallet._read_refresh_abort_cleanup_snapshot()
+            if first["pending_transaction_ids"] or set(expected) & set(
+                first["trade_ids"]
+            ):
+                raise BootstrapApiError("sage_book_changed", 409)
+            evidence = {}
+            for trade_id in expected:
+                row = by_trade[trade_id]
+                collected = offer_reconciliation.load_authoritative_evidence(row)
+                evidence[trade_id] = collected
+            second = wallet._read_refresh_abort_cleanup_snapshot()
+            identity_after = _read_bootstrap_identity()
+            if (
+                first["trade_ids"] != second["trade_ids"]
+                or first["pending_transaction_ids"] != second["pending_transaction_ids"]
+                or second["pending_transaction_ids"]
+                or set(expected) & set(second["trade_ids"])
+                or identity_after != identity
+            ):
+                raise BootstrapApiError("sage_book_changed", 409)
+            for trade_id in expected:
+                classification = offer_reconciliation.classify_terminal_evidence(
+                    by_trade[trade_id], evidence[trade_id], now=second["observed_at"]
+                )
+                if classification.get("classification") != "EXPIRED_PROVEN":
+                    raise BootstrapApiError("bootstrap_expiry_proof_incomplete", 409)
+            proven = 0
+            for trade_id in expected:
+                proof = offer_reconciliation.reconcile_offer(
+                    by_trade[trade_id]["intent_id"],
+                    evidence=evidence[trade_id],
+                    now=second["observed_at"],
+                )
+                if (
+                    proof.get("classification") != "EXPIRED_PROVEN"
+                    or proof.get("applied") is not True
+                ):
+                    raise BootstrapApiError("bootstrap_expiry_commit_incomplete", 409)
+                proven += 1
+            return jsonify(
+                {
+                    "success": True,
+                    "campaign_id": campaign_id,
+                    "proven_expired": proven,
+                    "wallet_effect_started": False,
+                }
+            )
+    except Exception as exc:
+        return _error(exc)
+
+
 def _campaign_cancel_manager():
     owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
     server = owner or sys.modules.get("api_server")
@@ -693,6 +1064,11 @@ def _record_campaign_cancel_attempt(
 
 @bp.post("/api/bootstrap/stop")
 def api_bootstrap_stop():
+    with _CAMPAIGN_LIFECYCLE_LOCK:
+        return _api_bootstrap_stop_locked()
+
+
+def _api_bootstrap_stop_locked():
     try:
         body = _request_body()
         campaign_id = str(body.get("campaign_id") or "").strip().lower()

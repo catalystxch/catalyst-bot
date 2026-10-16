@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 import database
+import mutation_gate
 from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
 from refresh_safety import plan_refresh
 
@@ -66,13 +69,15 @@ def _prepare(
     reserve_selected_coins: bool = False,
     slot_key: str = "asset-a:buy:inner",
     run_id: str = "run-a",
+    wallet_hash: str | None = None,
 ):
+    wallet_hash = wallet_hash or _sha("wallet-a")
     return database.prepare_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
         event_id=f"create:{intent_id}:prepared",
         run_id=run_id,
-        wallet_fingerprint_hash=_sha("wallet-a"),
+        wallet_fingerprint_hash=wallet_hash,
         network="mainnet",
         asset_id=_sha("asset-a"),
         side="buy",
@@ -85,7 +90,7 @@ def _prepare(
         requested_amount_atomic="200",
         selected_coin_ids_json=[_sha(f"coin:{intent_id}")],
         wallet_identity_json={
-            "fingerprint_sha256": _sha("wallet-a"),
+            "fingerprint_sha256": wallet_hash,
             "network": "mainnet",
         },
         evidence_json={"source": "task-11-test"},
@@ -94,7 +99,13 @@ def _prepare(
     )
 
 
-def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = False):
+def _confirm(
+    intent_id: str,
+    *,
+    finalize_selected_coin_reservations: bool = False,
+    wallet_hash: str | None = None,
+):
+    wallet_hash = wallet_hash or _sha("wallet-a")
     return database.finalize_offer_intent(
         intent_id=intent_id,
         operation_id=f"create:{intent_id}",
@@ -104,12 +115,29 @@ def _confirm(intent_id: str, *, finalize_selected_coin_reservations: bool = Fals
         sage_trade_id=_sha(f"trade:{intent_id}"),
         offer_text_sha256=_sha(f"offer:{intent_id}"),
         wallet_identity_json={
-            "fingerprint_sha256": _sha("wallet-a"),
+            "fingerprint_sha256": wallet_hash,
             "network": "mainnet",
         },
         evidence_json={"source": "task-11-test"},
         finalized_at="2026-08-15T12:01:00.000000Z",
         finalize_selected_coin_reservations=finalize_selected_coin_reservations,
+    )
+
+
+def _fail_creation_without_effect(intent_id: str):
+    return database.finalize_offer_intent(
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:failed",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        wallet_identity_json={
+            "fingerprint_sha256": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"effect_attempted": False},
+        reason_code="CREATE_REJECTED",
+        finalized_at="2026-08-15T12:01:00.000000Z",
     )
 
 
@@ -223,6 +251,175 @@ def test_parent_cannot_be_cancel_eligible_until_exact_confirmed_child_is_visible
     )
     assert eligibility["eligible"] is True
     assert eligibility["child_trade_id"] == _sha("trade:child")
+
+
+def test_generic_cancel_prepare_cannot_bypass_unpublished_replacement_child(
+    isolated_database,
+):
+    """A manual Cancel All must obey the same child visibility gate as refresh."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    database.bind_refresh_lineage("parent", "child")
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    with pytest.raises(ValueError, match="replacement child is not visible"):
+        database.prepare_offer_cancel(
+            operation_id=operation,
+            event_id=f"{operation}:attempt:1:prepared",
+            trade_id=parent_trade,
+            intent_id="parent",
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": _sha("wallet-a"),
+                "network": "mainnet",
+            },
+            evidence_json={"trade_id": parent_trade},
+            prepared_at="2026-08-15T12:02:00.000000Z",
+        )
+    assert database.get_offer_operation_events(operation) == []
+
+
+def test_cancel_prepare_rejects_provisional_unpublished_replacement_child(
+    isolated_database,
+):
+    """A crash before binding the reverse edge cannot expose the parent."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    _confirm("child")
+    assert database.get_offer_intent("parent")["child_intent_id"] is None
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    with pytest.raises(ValueError, match="replacement child lineage is not bound"):
+        database.prepare_offer_cancel(
+            operation_id=operation,
+            event_id=f"{operation}:attempt:1:prepared",
+            trade_id=parent_trade,
+            intent_id="parent",
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": _sha("wallet-a"),
+                "network": "mainnet",
+            },
+            evidence_json={"trade_id": parent_trade},
+            prepared_at="2026-08-15T12:02:00.000000Z",
+        )
+    assert database.get_offer_operation_events(operation) == []
+
+
+def test_cancel_prepare_allows_parent_after_child_creation_failed_without_effect(
+    isolated_database,
+):
+    """A proven no-effect child must not strand a still-live parent."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("failed-child", parent_intent_id="parent", generation=1)
+    _fail_creation_without_effect("failed-child")
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade},
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    assert len(database.get_offer_operation_events(operation)) == 1
+
+
+def test_cancel_prepare_ignores_failed_child_before_visible_replacement_retry(
+    isolated_database,
+):
+    """A failed no-effect attempt does not obscure the exact visible retry."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("failed-child", parent_intent_id="parent", generation=1)
+    _fail_creation_without_effect("failed-child")
+    _prepare("retry-child", parent_intent_id="parent", generation=1)
+    _confirm("retry-child")
+    database.bind_refresh_lineage("parent", "retry-child")
+    database.record_offer_intent_visibility(
+        "retry-child", publication_identity="registry:retry-child"
+    )
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade},
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    assert len(database.get_offer_operation_events(operation)) == 1
+
+
+def test_cancel_prepare_rejects_failed_child_with_attempted_wallet_effect(
+    isolated_database,
+):
+    """A failed label cannot excuse a child whose wallet outcome is uncertain."""
+
+    database.init_database()
+    _prepare("parent")
+    _confirm("parent")
+    _prepare("child", parent_intent_id="parent", generation=1)
+    database.finalize_offer_intent(
+        intent_id="child",
+        operation_id="create:child",
+        event_id="create:child:failed",
+        lifecycle_state="creation_failed",
+        outcome="FAILED",
+        wallet_identity_json={
+            "fingerprint_sha256": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json={"effect_attempted": True},
+        reason_code="CREATE_REJECTED",
+        finalized_at="2026-08-15T12:01:00.000000Z",
+    )
+    parent_trade = _sha("trade:parent")
+    operation = f"cancel:{parent_trade}"
+
+    with pytest.raises(ValueError, match="replacement child lineage is not bound"):
+        database.prepare_offer_cancel(
+            operation_id=operation,
+            event_id=f"{operation}:attempt:1:prepared",
+            trade_id=parent_trade,
+            intent_id="parent",
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": _sha("wallet-a"),
+                "network": "mainnet",
+            },
+            evidence_json={"trade_id": parent_trade},
+            prepared_at="2026-08-15T12:02:00.000000Z",
+        )
+    assert database.get_offer_operation_events(operation) == []
 
 
 def test_refresh_lineage_binding_is_idempotent_and_rejects_cross_lineage_rows(
@@ -409,10 +606,21 @@ def test_real_task8_task9_completion_replays_one_exact_lineage_commit(
         assigned_tier="inner",
         purpose="lifecycle",
     )
+    assert database.upsert_coin(
+        _sha("coin:child"),
+        "xch",
+        100,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
     _prepare("parent", reserve_selected_coins=True)
     _confirm("parent", finalize_selected_coin_reservations=True)
-    _prepare("child", parent_intent_id="parent", generation=1)
-    _confirm("child")
+    _prepare(
+        "child", parent_intent_id="parent", generation=1, reserve_selected_coins=True
+    )
+    _confirm("child", finalize_selected_coin_reservations=True)
     database.bind_refresh_lineage("parent", "child")
     database.record_offer_intent_visibility(
         "child", publication_identity="registry:child"
@@ -527,6 +735,45 @@ def test_real_task8_task9_completion_replays_one_exact_lineage_commit(
     assert first_proof["complete"] is retry_proof["complete"] is True
     assert retry_proof["terminal"]["event_id"] == terminal["event"]["event_id"]
     assert database.get_refresh_lineage_commit_for_child("child") is None
+
+    # The child can naturally expire after it was visibly published but before
+    # a restarted runtime records Task 11's parent completion. Its historical
+    # visibility and exact terminal journal must still permit proof-only replay.
+    child_evidence = {"source": "task-9-child-expiry", "trade_id": _sha("trade:child")}
+    child_text = json.dumps(
+        child_evidence, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    child_visible_at = database.get_offer_intent("child")["first_visible_at"]
+    child_terminal_at = (
+        (
+            datetime.fromisoformat(child_visible_at.replace("Z", "+00:00"))
+            + timedelta(seconds=30)
+        )
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    database.commit_offer_reconciliation(
+        intent_id="child",
+        operation_id="reconcile:child",
+        classification="EXPIRED_PROVEN",
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        wallet_identity_json={
+            "wallet_fingerprint_hash": _sha("wallet-a"),
+            "network": "mainnet",
+        },
+        evidence_json=child_evidence,
+        evidence_sha256=hashlib.sha256(child_text.encode("utf-8")).hexdigest(),
+        reconciled_at=child_terminal_at,
+    )
+    assert database.refresh_parent_cancel_eligibility("parent") == {
+        "eligible": False,
+        "reason": "child_not_confirmed",
+    }
+    assert database.get_pending_refresh_lineage_parent_ids(
+        asset_id=_sha("asset-a"), side="buy", limit=8
+    ) == ["parent"]
+    terminal_child_proof = database.refresh_lineage_completion("parent")
+    assert terminal_child_proof["complete"] is True, terminal_child_proof
 
     first_commit = database.commit_refresh_lineage_completion("parent")
     # Simulate loss of the successful response after the final commit, then retry.
@@ -888,6 +1135,516 @@ def test_replaying_task8_reconciled_cancel_waits_for_task9_proof(
     assert cancelled == []
 
 
+def _record_published_child_outbox():
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO publication_outbox (publication_id,idempotency_key,"
+        "intent_id,network,offer_fingerprint,publication_epoch,publisher,"
+        "payload_json,state,payload_sha256,queued_at,dispatch_started_at,"
+        "succeeded_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            _sha("publication:child"),
+            _sha("idempotency:child"),
+            "child",
+            "mainnet",
+            _sha("offer:child"),
+            "epoch:child",
+            "dexie",
+            "{}",
+            "succeeded",
+            _sha("{}"),
+            "2026-08-15T12:02:00.000000Z",
+            "2026-08-15T12:02:01.000000Z",
+            "2026-08-15T12:02:02.000000Z",
+            "2026-08-15T12:02:02.000000Z",
+        ),
+    )
+    conn.commit()
+
+
+def _fenced_refresh_abort_fixture(
+    isolated_database,
+    monkeypatch,
+    *,
+    published_child=False,
+):
+    """Build the exact submitted-parent/unpublished-child abort state."""
+
+    from mutation_gate import wallet_fingerprint_hash
+
+    database.init_database()
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:00:00.000000Z",
+    )
+    fingerprint = 736588221
+    wallet_hash = wallet_fingerprint_hash(fingerprint)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-a",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        now="2026-08-15T12:00:00.000000Z",
+    )
+    assert lease["acquired"] is True
+    campaign_id = database.create_bootstrap_campaign(
+        {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": fingerprint,
+            "wallet_id": 2,
+            "asset_id": _sha("asset-a"),
+            "anchor_price": "0.01",
+            "minimum_price": "0.005",
+            "maximum_price": "0.02",
+            "xch_budget": "1",
+            "cat_budget": "200",
+            "fee_budget_xch": "0.05",
+            "subsidy_budget_xch": "0",
+            "created_at": "2026-08-15T12:00:00Z",
+            "expires_at": "2026-08-16T12:00:00Z",
+        }
+    )
+    assert database.stop_bootstrap_campaign(
+        campaign_id, "manual", "2026-08-15T12:02:00.000000Z"
+    )
+    assert database.upsert_coin(
+        _sha("coin:parent"),
+        "xch",
+        100,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    _prepare("parent", reserve_selected_coins=True, wallet_hash=wallet_hash)
+    _confirm(
+        "parent",
+        finalize_selected_coin_reservations=True,
+        wallet_hash=wallet_hash,
+    )
+    database.record_offer_intent_visibility(
+        "parent",
+        publication_identity="registry:parent",
+        visible_at="2026-08-15T12:01:00.000000Z",
+    )
+    parent_trade = _sha("trade:parent")
+    assert database.add_offer(
+        parent_trade,
+        "buy",
+        Decimal("0.01"),
+        Decimal("1"),
+        Decimal("100"),
+        _sha("asset-a"),
+        tier="inner",
+    )
+    operation = f"cancel:{parent_trade}"
+    database.prepare_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:prepared",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": "mainnet",
+        },
+        evidence_json={
+            "trade_id": parent_trade,
+            "effect_claim_protocol": "durable_cohort_claim_v1",
+        },
+        prepared_at="2026-08-15T12:02:00.000000Z",
+    )
+    _prepare("child", parent_intent_id="parent", generation=1, wallet_hash=wallet_hash)
+    _confirm("child", wallet_hash=wallet_hash)
+    database.bind_refresh_lineage("parent", "child")
+    assert database.claim_offer_cancel_effect(
+        operation_id=operation,
+        trade_id=parent_trade,
+        attempt=1,
+        claimed_at="2026-08-15T12:02:00.000000Z",
+    )
+    cancel_result = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="legacy_cancel_all",
+        raw_response={"success": True},
+        transaction_id=_sha("cancel-transaction"),
+        spend_identity=_sha("cancel-spend"),
+    )
+    database.finalize_offer_cancel(
+        operation_id=operation,
+        event_id=f"{operation}:attempt:1:finalized",
+        trade_id=parent_trade,
+        intent_id="parent",
+        attempt=1,
+        cancel_result=cancel_result,
+        wallet_identity_json={
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": "mainnet",
+        },
+        evidence_json={"trade_id": parent_trade, "cancel_result": cancel_result},
+        finalized_at="2026-08-15T12:02:30.000000Z",
+    )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[operation],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at="2026-08-15T12:02:31.000000Z",
+    )
+    before = database.get_runtime_safety_latch()
+    assert before["state"] == "tripped"
+    assert database.get_offer_intent("child")["first_visible_at"] is None
+    assert database.get_offer_intent("parent")["lifecycle_state"] == "visible"
+    assert database.get_offer(parent_trade)["lifecycle_state"] == "cancel_requested"
+    assert database.get_offer_intent("child")["lifecycle_state"] == "created"
+
+    request = dict(
+        parent_intent_id="parent",
+        child_intent_id="child",
+        campaign_id=campaign_id,
+        expected_latch_generation=before["generation"],
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        observed_trade_ids=[_sha("trade:child")],
+        observed_at="2026-08-15T12:03:00.000000Z",
+    )
+    if published_child:
+        _record_published_child_outbox()
+    abort = database.begin_refresh_abort(**request)
+    return before, request, abort, operation, wallet_hash, lease
+
+
+def test_confirmed_cancel_with_unpublished_child_records_abort_without_unfencing(
+    isolated_database,
+    monkeypatch,
+):
+    """The exact Cancel All incident needs a durable stop before Task 9 settles."""
+
+    before, request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+
+    after = database.get_runtime_safety_latch()
+    assert abort["state"] == "fenced"
+    assert abort["parent_intent_id"] == "parent"
+    assert abort["child_intent_id"] == "child"
+    assert after["state"] == "tripped"
+    assert operation in json.loads(after["blocking_operation_ids_json"])
+    assert abort["blocking_operation_id"] in json.loads(
+        after["blocking_operation_ids_json"]
+    )
+    assert database.get_offer_intent("child")["lifecycle_state"] == "created"
+    assert database.refresh_lineage_completion("parent")["complete"] is False
+    assert database.begin_refresh_abort(**request)["idempotent"] is True
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "expected_latch_generation": before["generation"] + 1,
+            }
+        )
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "observed_trade_ids": [_sha("unknown-trade")],
+            }
+        )
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "owner_run_id": "another-run",
+            }
+        )
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "child_intent_id": "unrelated-child",
+            }
+        )
+    with pytest.raises(ValueError):
+        database.begin_refresh_abort(
+            **{
+                **request,
+                "expected_lease_version": lease["lease"]["lease_version"] + 1,
+            }
+        )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["another:operation"],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at="2026-08-15T12:03:01.000000Z",
+    )
+    with pytest.raises(ValueError, match="additional safety blocker"):
+        database.begin_refresh_abort(**request)
+    observation = {"source": "isolated-test"}
+    encoded = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="refresh abort requires proven cancellation"):
+        database.commit_offer_reconciliation(
+            intent_id="parent",
+            operation_id="reconcile:parent",
+            classification="UNKNOWN",
+            reason_code="INCOMPLETE_PROOF",
+            wallet_identity_json={
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": "mainnet",
+            },
+            evidence_json=observation,
+            evidence_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+            refresh_abort_id=abort["abort_id"],
+            reconciled_at="2026-08-15T12:03:02.000000Z",
+        )
+
+
+def test_refresh_abort_successor_rebinds_only_exact_released_owner(
+    isolated_database, monkeypatch
+):
+    """A restart may resume one fenced abort without opening general trading."""
+
+    _before, _request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    released = database.release_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        released_at="2026-08-15T12:04:00.000000Z",
+    )
+    assert released["released"] is True
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    request = dict(
+        abort_id=abort["abort_id"],
+        successor_owner_run_id="run-b",
+        successor_owner_pid=2,
+        successor_owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        asset_id=_sha("asset-a"),
+        expected_lease_version=released["lease"]["lease_version"],
+        lease_expires_at="2026-08-15T12:10:00.000000Z",
+        prior_owner_liveness_proven_dead=False,
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:05:00.000000Z",
+    )
+    for changed in (
+        {"observed_trade_ids": []},
+        {"observed_pending_transaction_ids": [_sha("pending")]},
+        {"asset_id": _sha("wrong-asset")},
+    ):
+        with pytest.raises(ValueError):
+            database.adopt_refresh_abort_successor(**{**request, **changed})
+        assert database.get_runtime_mutation_lease()["active"] == 0
+    assert database.list_refresh_abort_successions(abort["abort_id"]) == []
+    adopted = database.adopt_refresh_abort_successor(**request)
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-b"
+    assert adopted["abort"]["owner_run_id"] == "run-b"
+    assert adopted["abort"]["lease_version"] == adopted["lease"]["lease_version"]
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert set(
+        json.loads(database.get_runtime_safety_latch()["blocking_operation_ids_json"])
+    ) == {operation, abort["blocking_operation_id"]}
+    successions = database.list_refresh_abort_successions(abort["abort_id"])
+    assert len(successions) == 1
+    assert successions[0]["prior_owner_run_id"] == "run-a"
+    assert successions[0]["successor_owner_run_id"] == "run-b"
+    assert successions[0]["prior_lease_version"] == released["lease"]["lease_version"]
+    assert (
+        successions[0]["successor_lease_version"] == adopted["lease"]["lease_version"]
+    )
+    assert (
+        successions[0]["proof_sha256"]
+        == hashlib.sha256(successions[0]["proof_json"].encode("utf-8")).hexdigest()
+    )
+    with pytest.raises(sqlite3.DatabaseError):
+        database.get_connection().execute(
+            "UPDATE offer_refresh_abort_successions SET successor_owner_run_id=? "
+            "WHERE succession_id=?",
+            ("tampered", successions[0]["succession_id"]),
+        )
+    conn = database.get_connection()
+    conn.execute("DROP TRIGGER offer_refresh_abort_successions_no_update")
+    conn.execute(
+        "UPDATE offer_refresh_abort_successions SET proof_sha256=? "
+        "WHERE succession_id=?",
+        ("0" * 64, successions[0]["succession_id"]),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="succession proof digest"):
+        database.list_refresh_abort_successions(abort["abort_id"])
+
+
+def test_refresh_abort_successor_requires_expiry_and_dead_owner_proof(
+    isolated_database, monkeypatch
+):
+    """An active predecessor cannot be replaced by a generic stale-owner guess."""
+
+    _before, _request, abort, operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    request = dict(
+        abort_id=abort["abort_id"],
+        successor_owner_run_id="run-b",
+        successor_owner_pid=2,
+        successor_owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        asset_id=_sha("asset-a"),
+        expected_lease_version=lease["lease"]["lease_version"],
+        lease_expires_at="2026-08-15T12:16:00.000000Z",
+        prior_owner_liveness_proven_dead=True,
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:05:00.000000Z",
+    )
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    with pytest.raises(ValueError, match="not proven stopped"):
+        database.adopt_refresh_abort_successor(**request)
+    assert database.get_runtime_mutation_lease()["owner_run_id"] == "run-a"
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:11:00.000000Z",
+    )
+    expired_request = {
+        **request,
+        "observed_at": "2026-08-15T12:11:00.000000Z",
+        "prior_owner_liveness_proven_dead": False,
+    }
+    with pytest.raises(ValueError, match="not proven stopped"):
+        database.adopt_refresh_abort_successor(**expired_request)
+    adopted = database.adopt_refresh_abort_successor(
+        **{**expired_request, "prior_owner_liveness_proven_dead": True}
+    )
+    assert adopted["adopted"] is True
+    assert adopted["lease"]["owner_run_id"] == "run-b"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert set(
+        json.loads(database.get_runtime_safety_latch()["blocking_operation_ids_json"])
+    ) == {operation, abort["blocking_operation_id"]}
+
+
+def test_refresh_abort_successor_gate_keeps_offer_creation_closed(
+    isolated_database, monkeypatch
+):
+    """A successor lease is only an exact cleanup authority, never a bot start."""
+
+    _before, _request, abort, _operation, wallet_hash, _lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    now = datetime(2026, 8, 15, 12, 11, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:11:00.000000Z",
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=736588221,
+        network_id="mainnet",
+        kind="bls",
+        has_secrets=True,
+        bound_at_utc="2026-08-15T12:11:00.000000Z",
+        maximum_age_seconds=30,
+    )
+    gate = mutation_gate.MutationGate(
+        run_id="run-b",
+        owner_pid=2,
+        owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        lease_seconds=300,
+        clock=lambda: now,
+        pid_liveness=lambda _pid, _host: False,
+        wallet_identity_binding=binding,
+    )
+    adopted = gate.acquire_refresh_abort_successor(
+        abort_id=abort["abort_id"],
+        asset_id=_sha("asset-a"),
+        observed_trade_ids=[_sha("trade:child")],
+        observed_pending_transaction_ids=[],
+        observed_at="2026-08-15T12:11:00.000000Z",
+    )
+    assert adopted["acquired"] is True
+    assert gate.status().allowed is False
+    assert gate.status().owner_is_this_run is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+
+
+def test_refresh_abort_successor_rejects_published_child_without_local_visibility(
+    isolated_database, monkeypatch
+):
+    """An external publish cannot be treated as an unpublished replacement."""
+
+    _before, _request, abort, _operation, wallet_hash, lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    _record_published_child_outbox()
+    released = database.release_runtime_mutation_lease(
+        owner_run_id="run-a",
+        expected_lease_version=lease["lease"]["lease_version"],
+        released_at="2026-08-15T12:04:00.000000Z",
+    )
+    monkeypatch.setattr(
+        database,
+        "_stability_wall_clock",
+        lambda: "2026-08-15T12:05:00.000000Z",
+    )
+    with pytest.raises(ValueError, match="publication"):
+        database.adopt_refresh_abort_successor(
+            abort_id=abort["abort_id"],
+            successor_owner_run_id="run-b",
+            successor_owner_pid=2,
+            successor_owner_host="test-host",
+            wallet_fingerprint_hash=wallet_hash,
+            network="mainnet",
+            asset_id=_sha("asset-a"),
+            expected_lease_version=released["lease"]["lease_version"],
+            lease_expires_at="2026-08-15T12:10:00.000000Z",
+            prior_owner_liveness_proven_dead=False,
+            observed_trade_ids=[_sha("trade:child")],
+            observed_pending_transaction_ids=[],
+            observed_at="2026-08-15T12:05:00.000000Z",
+        )
+    assert database.get_runtime_mutation_lease()["active"] == 0
+
+
+def test_refresh_abort_entry_rejects_already_published_child(
+    isolated_database, monkeypatch
+):
+    """The abort cannot claim an unpublished replacement already broadcast."""
+
+    with pytest.raises(ValueError, match="publication"):
+        _fenced_refresh_abort_fixture(
+            isolated_database, monkeypatch, published_child=True
+        )
+    assert (
+        database.list_incomplete_refresh_aborts(
+            asset_id=_sha("asset-a"),
+            wallet_fingerprint_hash=mutation_gate.wallet_fingerprint_hash(736588221),
+            network="mainnet",
+        )
+        == []
+    )
+
+
 def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(
     isolated_database,
 ):
@@ -906,6 +1663,31 @@ def test_pending_lineage_query_finds_parent_when_only_its_live_child_remains(
     assert database.get_pending_refresh_lineage_parent_ids(
         asset_id=_sha("asset-a"), side="buy", limit=8
     ) == ["absent-parent"]
+
+
+def test_pending_lineage_excludes_a_durably_completed_abort(
+    isolated_database, monkeypatch
+):
+    """A completed abort cannot resume its terminal replacement against a new book."""
+
+    _before, _request, abort, _operation, _wallet_hash, _lease = (
+        _fenced_refresh_abort_fixture(isolated_database, monkeypatch)
+    )
+    assert database.get_pending_refresh_lineage_parent_ids(
+        asset_id=_sha("asset-a"), side="buy", limit=8
+    ) == ["parent"]
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE offer_refresh_aborts SET state='aborted',completed_at=? WHERE abort_id=?",
+        ("2026-08-15T12:05:00.000000Z", abort["abort_id"]),
+    )
+    conn.commit()
+    assert (
+        database.get_pending_refresh_lineage_parent_ids(
+            asset_id=_sha("asset-a"), side="buy", limit=8
+        )
+        == []
+    )
 
 
 def test_parent_absent_completion_resume_replays_before_and_after_commit(

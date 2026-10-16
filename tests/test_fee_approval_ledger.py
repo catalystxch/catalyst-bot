@@ -323,6 +323,16 @@ def test_exact_pr218_schema_upgrades_without_losing_pending_fee(ledger):
     assert (
         ledger.get_fee_approval(approval["approval_id"])["committed_fee_mojos"] == 123
     )
+    wallet_guard = (
+        ledger.get_connection()
+        .execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='wallet_effect_claim_resolutions_guard'"
+        )
+        .fetchone()
+    )
+    assert wallet_guard is not None
+    assert "approved_fee_reservations" in wallet_guard[0]
     with pytest.raises(sqlite3.IntegrityError):
         ledger.get_connection().execute("DELETE FROM approved_fee_reservations")
     ledger.get_connection().rollback()

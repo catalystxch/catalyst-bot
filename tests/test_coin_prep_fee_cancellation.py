@@ -257,6 +257,83 @@ def test_prepared_coin_prep_cancel_reserves_exact_protected_fee(approved):
     assert hold["dispatch_authorized"] is False
 
 
+def test_refresh_abort_admits_only_its_own_prepared_cancellation_fee_hold(approved):
+    manifest, contract, quote = _prepared_cancel_cohort(approved, member_count=1)
+    hold = _reserve_cancel(approved, manifest, contract, quote)
+    member = manifest["members"][0]
+    preview = database.get_coin_prep_fee_preview(approved["preview"]["preview_id"])
+    campaign_id = json.loads(preview["scope_json"])["campaign_id"]
+
+    conn = database._stability_read_only_connection()
+    try:
+        exact_hold = database._refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=member["operation_id"],
+            trade_id=member["trade_id"],
+            intent_id=member["intent_id"],
+            campaign_id=campaign_id,
+        )
+        assert exact_hold == hold["operation_id"]
+        database._assert_refresh_abort_effect_scope(
+            conn, {member["operation_id"]}, exact_hold
+        )
+        with pytest.raises(ValueError, match="unrelated wallet effect"):
+            database._assert_refresh_abort_effect_scope(conn, {member["operation_id"]})
+        with pytest.raises(ValueError, match="hold differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id="f" * 64,
+            )
+    finally:
+        conn.close()
+
+
+def test_refresh_abort_admits_exact_submitted_parent_fee_hold(approved):
+    manifest, contract, quote = _prepared_cancel_cohort(approved, member_count=1)
+    hold = _reserve_cancel(approved, manifest, contract, quote)
+    _finalize_submitted(manifest)
+    member = manifest["members"][0]
+    preview = database.get_coin_prep_fee_preview(approved["preview"]["preview_id"])
+    campaign_id = json.loads(preview["scope_json"])["campaign_id"]
+
+    conn = database._stability_read_only_connection()
+    try:
+        with pytest.raises(ValueError, match="fee journal differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id=campaign_id,
+            )
+        exact_hold = database._refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=member["operation_id"],
+            trade_id=member["trade_id"],
+            intent_id=member["intent_id"],
+            campaign_id=campaign_id,
+            allow_submitted_parent=True,
+        )
+        assert exact_hold == hold["operation_id"]
+        database._assert_refresh_abort_effect_scope(
+            conn, {member["operation_id"]}, exact_hold
+        )
+        with pytest.raises(ValueError, match="hold differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id="f" * 64,
+                allow_submitted_parent=True,
+            )
+    finally:
+        conn.close()
+
+
 def test_unrelated_cancel_cannot_charge_coin_prep_approval(approved):
     manifest, contract, quote = _prepared_cancel_cohort(
         approved, reason="manual_cancel_all"

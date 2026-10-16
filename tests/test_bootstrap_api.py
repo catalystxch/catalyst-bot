@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from threading import RLock
 
 from flask import Flask
 import pytest
@@ -553,6 +554,538 @@ def test_expired_campaign_without_offers_stops_without_wallet_cancellation(
     assert campaign["status"] == "stopped"
     assert campaign["revision"] == 1
     assert client.get("/api/bootstrap/status").get_json()["active"] is False
+
+
+@pytest.mark.parametrize(
+    ("second_classification", "identity_change", "expected_status", "expected_commits"),
+    [
+        ("EXPIRED_PROVEN", False, 200, ["intent-0", "intent-1"]),
+        ("UNKNOWN", False, 409, []),
+        ("EXPIRED_PROVEN", True, 409, []),
+    ],
+)
+def test_expired_campaign_proves_exact_sage_expiry_without_wallet_effect(
+    isolated_db,
+    bootstrap_api,
+    monkeypatch,
+    second_classification,
+    identity_change,
+    expected_status,
+    expected_commits,
+):
+    from blueprints import bootstrap
+    import offer_reconciliation
+    import wallet
+
+    bootstrap, client, identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_utcnow",
+        lambda: datetime(2026, 9, 12, 12, 1, 1, tzinfo=timezone.utc),
+    )
+    trade_ids = ["11" * 32, "22" * 32]
+    rows = [
+        {
+            "intent_id": f"intent-{index}",
+            "sage_trade_id": trade_id,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "visible",
+            "network": identity["network"],
+            "asset_id": identity["asset_id"],
+            "wallet_fingerprint_hash": "aa" * 32,
+        }
+        for index, trade_id in enumerate(trade_ids)
+    ]
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: rows)
+    snapshots = iter(
+        [
+            {
+                "trade_ids": [],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:01:01Z",
+            },
+            {
+                "trade_ids": [],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:01:02Z",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: next(snapshots)
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda row: {"trade_id": row["sage_trade_id"]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda row, evidence, **_kw: {
+            "classification": (
+                second_classification
+                if row["intent_id"] == "intent-1"
+                else "EXPIRED_PROVEN"
+            )
+        },
+    )
+    committed = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda intent_id, **_kw: (
+            committed.append(intent_id)
+            or {"classification": "EXPIRED_PROVEN", "applied": True}
+        ),
+    )
+    manager = SimpleNamespace(wait_for_offer_creation_quiescence=lambda: None)
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(is_running=lambda: False, offer_manager=manager),
+        _bot_cancel_lifecycle_lock=RLock(),
+    )
+    if identity_change:
+        identities = iter(
+            [dict(identity), {**identity, "wallet_fingerprint": 3702373391}]
+        )
+        monkeypatch.setattr(
+            bootstrap, "_read_bootstrap_identity", lambda: next(identities)
+        )
+    monkeypatch.setattr(
+        bootstrap,
+        "_campaign_cancel_manager",
+        lambda: pytest.fail("wallet cancellation called"),
+    )
+
+    response = client.post(
+        "/api/bootstrap/reconcile_expired",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": trade_ids,
+        },
+    )
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.get_json()["proven_expired"] == 2
+    assert committed == expected_commits
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+
+
+@pytest.mark.parametrize("changed_after_first", [False, True])
+def test_expired_campaign_refuses_partial_sage_evidence_before_any_commit(
+    isolated_db, bootstrap_api, monkeypatch, changed_after_first
+):
+    from blueprints import bootstrap
+    import offer_reconciliation
+    import wallet
+
+    bootstrap, client, _identity = bootstrap_api
+    request = _request(expires_in_seconds=60)
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    monkeypatch.setattr(
+        bootstrap,
+        "_utcnow",
+        lambda: datetime(2026, 9, 12, 12, 1, 1, tzinfo=timezone.utc),
+    )
+    trade_id = "11" * 32
+    monkeypatch.setattr(
+        database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "intent_id": "intent-0",
+                "sage_trade_id": trade_id,
+                "purpose": f"bootstrap:{campaign_id}:revision:0",
+                "lifecycle_state": "visible",
+            }
+        ],
+    )
+    snapshots = iter(
+        [
+            {
+                "trade_ids": [] if changed_after_first else [trade_id],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:01:01Z",
+            },
+            {
+                "trade_ids": [trade_id],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:01:02Z",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: next(snapshots)
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda _row: {"complete": True},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda *_a, **_kw: pytest.fail("partial evidence committed"),
+    )
+    manager = SimpleNamespace(wait_for_offer_creation_quiescence=lambda: None)
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(is_running=lambda: False, offer_manager=manager),
+        _bot_cancel_lifecycle_lock=RLock(),
+    )
+
+    response = client.post(
+        "/api/bootstrap/reconcile_expired",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": [trade_id],
+        },
+    )
+
+    assert response.status_code == 409
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+
+
+def test_stopped_campaign_previews_then_proves_completed_offers_without_wallet_effect(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    from blueprints import bootstrap
+    import offer_reconciliation
+    import wallet
+
+    bootstrap, client, identity = bootstrap_api
+    request = _request()
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    completed_ids = ["11" * 32, "22" * 32]
+    live_id = "33" * 32
+    rows = [
+        {
+            "intent_id": f"intent-{i}",
+            "sage_trade_id": trade_id,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "visible",
+            "network": identity["network"],
+            "asset_id": identity["asset_id"],
+        }
+        for i, trade_id in enumerate([*completed_ids, live_id])
+    ]
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: rows)
+    monkeypatch.setattr(
+        database,
+        "get_open_offers",
+        lambda **_kw: [
+            {"trade_id": row["sage_trade_id"], "side": "sell"} for row in rows
+        ],
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [live_id],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-09-12T12:00:01Z",
+        },
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda row: {"trade_id": row["sage_trade_id"]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda row, _evidence, **_kw: {
+            "classification": "FILLED_PROVEN",
+            "reason_code": "EXACT_FILL_PROOF",
+        },
+    )
+    committed = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda intent_id, **_kw: (
+            committed.append(intent_id)
+            or {"classification": "FILLED_PROVEN", "applied": True}
+        ),
+    )
+    manager = SimpleNamespace(wait_for_offer_creation_quiescence=lambda: None)
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(is_running=lambda: False, offer_manager=manager),
+        _bot_cancel_lifecycle_lock=RLock(),
+    )
+
+    reviewed = client.post(
+        "/api/bootstrap/preview_completed",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.get_json()["expected_trade_ids"] == completed_ids
+    assert reviewed.get_json()["expected_offers"] == [
+        {"trade_id": trade_id, "side": "sell", "asset_id": identity["asset_id"]}
+        for trade_id in completed_ids
+    ]
+    assert committed == []
+
+    verified = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": completed_ids,
+        },
+    )
+    assert verified.status_code == 200
+    assert verified.get_json()["proven_completed"] == 2
+    assert committed == ["intent-0", "intent-1"]
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+
+    rows.append(
+        {
+            **rows[0],
+            "intent_id": "unresolved-intent",
+            "sage_trade_id": "44" * 32,
+            "lifecycle_state": "unknown",
+        }
+    )
+    unresolved = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": completed_ids,
+        },
+    )
+    assert unresolved.status_code == 409
+    assert committed == ["intent-0", "intent-1"]
+    rows.pop()
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kw: {"classification": "UNKNOWN"},
+    )
+    incomplete = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": completed_ids,
+        },
+    )
+    assert incomplete.status_code == 409
+    assert committed == ["intent-0", "intent-1"]
+
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kw: {"classification": "FILLED_PROVEN"},
+    )
+    snapshots = iter(
+        [
+            {
+                "trade_ids": [live_id],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:00:01Z",
+            },
+            {
+                "trade_ids": [live_id, completed_ids[0]],
+                "pending_transaction_ids": [],
+                "observed_at": "2026-09-12T12:00:02Z",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: next(snapshots)
+    )
+    changed = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": completed_ids,
+        },
+    )
+    assert changed.status_code == 409
+    assert committed == ["intent-0", "intent-1"]
+
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [live_id],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-09-12T12:00:03Z",
+        },
+    )
+
+    def change_local_intent(row):
+        rows[0]["lifecycle_state"] = "filled"
+        return {"trade_id": row["sage_trade_id"]}
+
+    monkeypatch.setattr(
+        offer_reconciliation, "load_authoritative_evidence", change_local_intent
+    )
+    local_change = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": completed_ids,
+        },
+    )
+    assert local_change.status_code == 409
+    assert committed == ["intent-0", "intent-1"]
+
+
+def test_completed_offer_commit_failure_reports_partial_and_requires_new_exact_preview(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    from blueprints import bootstrap
+    import offer_reconciliation
+    import wallet
+
+    bootstrap, client, identity = bootstrap_api
+    request = _request()
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    trade_ids = ["11" * 32, "22" * 32]
+    rows = [
+        {
+            "intent_id": f"intent-{i}",
+            "sage_trade_id": trade_id,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "visible",
+            "network": identity["network"],
+            "asset_id": identity["asset_id"],
+        }
+        for i, trade_id in enumerate(trade_ids)
+    ]
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: rows)
+    monkeypatch.setattr(
+        database,
+        "get_open_offers",
+        lambda **_kw: [
+            {"trade_id": row["sage_trade_id"], "side": "sell"}
+            for row in rows
+            if row["lifecycle_state"] == "visible"
+        ],
+    )
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": [],
+            "pending_transaction_ids": [],
+            "observed_at": "2026-09-12T12:00:01Z",
+        },
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda row: {"trade_id": row["sage_trade_id"]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kw: {"classification": "FILLED_PROVEN"},
+    )
+
+    def commit_one_then_fail(intent_id, **_kw):
+        if intent_id == "intent-0":
+            rows[0]["lifecycle_state"] = "filled"
+            return {"classification": "FILLED_PROVEN", "applied": True}
+        raise RuntimeError("injected second commit failure")
+
+    monkeypatch.setattr(offer_reconciliation, "reconcile_offer", commit_one_then_fail)
+    manager = SimpleNamespace(wait_for_offer_creation_quiescence=lambda: None)
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(is_running=lambda: False, offer_manager=manager),
+        _bot_cancel_lifecycle_lock=RLock(),
+    )
+
+    failed = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": trade_ids,
+        },
+    )
+    assert failed.status_code == 409
+    assert failed.get_json()["code"] == "bootstrap_fill_commit_incomplete"
+    assert failed.get_json()["commit_may_be_partial"] is True
+    assert failed.get_json()["fresh_preview_required"] is True
+    assert failed.get_json()["wallet_effect_started"] is False
+    assert database.get_bootstrap_campaign(campaign_id)["status"] == "active"
+
+    reviewed = client.post(
+        "/api/bootstrap/preview_completed",
+        json={"campaign_id": campaign_id, "revision": 0},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.get_json()["expected_trade_ids"] == [trade_ids[1]]
+    stale = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": trade_ids,
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "bootstrap_targets_changed"
+
+    def commit_remaining(intent_id, **_kw):
+        assert intent_id == "intent-1"
+        rows[1]["lifecycle_state"] = "filled"
+        return {"classification": "FILLED_PROVEN", "applied": True}
+
+    monkeypatch.setattr(offer_reconciliation, "reconcile_offer", commit_remaining)
+    recovered = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 0,
+            "expected_trade_ids": reviewed.get_json()["expected_trade_ids"],
+        },
+    )
+    assert recovered.status_code == 200
+    assert recovered.get_json()["proven_completed"] == 1
 
 
 def test_stop_collects_offers_after_in_flight_creation_finishes(

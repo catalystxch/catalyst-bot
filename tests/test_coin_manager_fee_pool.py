@@ -260,6 +260,30 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         self.assertEqual(self.manager.fee_pool.reserve(), authoritative_id)
         self.assertIsNone(self.manager.fee_pool.reserve())
 
+    def test_quick_refresh_keeps_durable_reserves_when_fee_tier_disabled(self):
+        """Cancellation may use an existing reserve after the fee tier is disabled."""
+        sys.modules["config"].cfg.FEE_PREP_COUNT = 0
+        sys.modules["config"].cfg.FEE_COIN_SIZE_XCH = Decimal("0")
+        reserve_id = "0x" + "dd" * 32
+        ordinary_id = "0x" + "ee" * 32
+        sys.modules["database"].get_free_coins = lambda wallet_type: [
+            {"coin_id": reserve_id, "purpose": "fee_reserve"},
+            {"coin_id": ordinary_id, "purpose": None},
+        ]
+        self.coin_manager.get_exact_spendable_coins_rpc = lambda wallet_id: {
+            "success": True,
+            "records": [
+                {"coin_id": reserve_id, "coin": {"amount": 1_000_000_000}},
+                {"coin_id": ordinary_id, "coin": {"amount": 1_000_000_000}},
+            ],
+        }
+
+        self.manager.refresh_fee_pool_from_wallet()
+
+        self.assertEqual(self.manager.fee_pool.available_count, 1)
+        self.assertEqual(self.manager.fee_pool.reserve(), reserve_id)
+        self.assertIsNone(self.manager.fee_pool.reserve())
+
 
 if __name__ == "__main__":
     unittest.main()

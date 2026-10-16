@@ -811,6 +811,26 @@ def test_parameterized_safety_record_requires_local_credential():
         handler.assert_called_once()
 
 
+def test_refresh_abort_preview_requires_local_credential():
+    client, loopback = _api_client()
+    rule = next(
+        rule
+        for rule in api_server.app.url_map.iter_rules()
+        if rule.rule == "/api/offers/refresh_abort/preview"
+    )
+    handler = MagicMock(return_value={"probe": True})
+    with patch.dict(api_server.app.view_functions, {rule.endpoint: handler}):
+        assert client.get(rule.rule, environ_base=loopback).status_code == 401
+        handler.assert_not_called()
+        allowed = client.get(
+            rule.rule,
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert allowed.status_code == 200
+        handler.assert_called_once()
+
+
 def test_runtime_health_get_cannot_trigger_auto_repair():
     client, loopback = _api_client()
     auth = {"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN}

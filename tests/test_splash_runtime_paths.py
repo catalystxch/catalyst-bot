@@ -420,6 +420,25 @@ def test_stopped_splash_status_marks_cached_metrics_unreachable(monkeypatch):
     assert status["metrics"]["offers_received"] == 123
 
 
+def test_splash_metrics_bind_peer_sample_to_current_process():
+    import splash_node
+
+    node = splash_node.SplashNode()
+    node._process = SimpleNamespace(poll=lambda: None)
+    node._last_start_time = 123.0
+    node._metrics = {
+        "reachable": True,
+        "peers": 1,
+        "last_polled_at": 124.0,
+    }
+
+    snapshot = node.get_metrics()
+
+    assert snapshot["process_running"] is True
+    assert snapshot["started_at"] == 123.0
+    assert snapshot["last_polled_at"] == 124.0
+
+
 def test_stopped_splash_receive_stats_do_not_publish_cached_metrics_as_live(
     monkeypatch,
 ):
@@ -777,6 +796,48 @@ def test_splash_node_offer_hook_uses_actual_flask_port(
         assert "http://localhost:5000/api/splash/incoming" not in captured["cmd"]
     else:
         assert "--offer-hook" not in captured["cmd"]
+
+
+def test_splash_node_can_bootstrap_from_explicit_lan_peer(monkeypatch):
+    """The optional known peer reaches Splash as one complete multiaddress."""
+    import splash_node
+    from config import cfg
+
+    peer = (
+        "/ip4/192.168.1.130/tcp/11511/p2p/"
+        "12D3KooWEDjR2wjqoroJxcMToEj2wvCo5ybSnKaodkWh9XU6Ri1j"
+    )
+    launched = []
+
+    class FakeProcess:
+        pid = 12345
+        stdout = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(cfg, "SPLASH_KNOWN_PEER", peer, raising=False)
+    monkeypatch.setattr(
+        splash_node.subprocess,
+        "Popen",
+        lambda cmd, **kwargs: launched.append(cmd) or FakeProcess(),
+    )
+    monkeypatch.setattr(splash_node.threading, "Thread", FakeThread)
+    node = splash_node.SplashNode()
+    node._binary_path = "splash.exe"
+    monkeypatch.setattr(node, "_managed_submit_port", lambda: 4000)
+    monkeypatch.setattr(node, "_require_free_submit_port", lambda port: None)
+
+    node._launch_process()
+
+    assert launched[0][launched[0].index("--known-peer") + 1] == peer
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process ownership regression")

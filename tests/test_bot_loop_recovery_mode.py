@@ -182,11 +182,17 @@ class _DummySplashManager:
     def queue_post(self, *args, **kwargs):
         pass
 
+    def set_peer_readiness_provider(self, provider):
+        self.peer_readiness_provider = provider
+
     def get_stats(self):
         return {}
 
 
 class _DummySplashNode:
+    def get_metrics(self):
+        return {"reachable": False, "peers": 0}
+
     def get_status(self):
         return {}
 

@@ -80,6 +80,7 @@ _ALLOWED_REASON_CODES = frozenset(
         "MUTATION_SHUTTING_DOWN",
         "OPERATION_UNKNOWN",
         "RECONCILIATION_REQUIRED",
+        "REFRESH_ABORT_CLEANUP",
         "RUNTIME_DISCONTINUITY",
         "UNRESOLVED_OPERATIONS",
         "WORKER_DELEGATION_INVALID",
@@ -113,6 +114,7 @@ _REASON_DESCRIPTIONS = {
     "MUTATION_SHUTTING_DOWN": "Mutation runtime is shutting down",
     "OPERATION_UNKNOWN": "Operation outcome requires reconciliation",
     "RECONCILIATION_REQUIRED": "Authoritative reconciliation is required",
+    "REFRESH_ABORT_CLEANUP": "Confirmed refresh cancellation requires exact offer cleanup",
     "RUNTIME_DISCONTINUITY": "Runtime clock discontinuity requires recovery",
     "UNRESOLVED_OPERATIONS": "Unresolved operation journal entries block mutation",
     "WORKER_DELEGATION_INVALID": "Worker mutation delegation is invalid",
@@ -1356,6 +1358,7 @@ class MutationGate:
         self._mutation_condition = threading.Condition(self._lock)
         self._active_mutations: dict[str, str] = {}
         self._active_wallet_mutations: set[str] = set()
+        self._refresh_abort_cleanup_permits: dict[str, tuple[str, str, int]] = {}
         self._exclusive_mutation_permit: Optional[str] = None
         self._wallet_lifecycle_transitioning = False
         self._quiescing = False
@@ -1608,6 +1611,90 @@ class MutationGate:
                     "acquired": False,
                     "reason": "durable_state_unavailable",
                 }
+                self.last_acquire_result = result
+                return result
+
+    @_stop_callback_boundary
+    def acquire_refresh_abort_successor(
+        self,
+        *,
+        abort_id: str,
+        asset_id: str,
+        observed_trade_ids: list[str],
+        observed_pending_transaction_ids: list[str],
+        observed_at: Any,
+    ) -> dict[str, Any]:
+        """Own only a proven fenced abort after its prior lease stops."""
+
+        with self._lock:
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                return {"acquired": False, "reason": "active_wallet_mutations"}
+            try:
+                authorization = self._authorization_snapshot()
+                current = authorization.get("lease")
+                if type(current) is not dict:
+                    raise ValueError("refresh abort lease authority is unavailable")
+                now = self._now()
+                prior_dead = False
+                if bool(current.get("active")):
+                    if current.get("owner_run_id") == self.run_id:
+                        return {"acquired": False, "reason": "already_owned"}
+                    if _as_utc(current.get("expires_at")) > now:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_refresh_abort_owner_active",
+                            "lease": current,
+                        }
+                    prior_dead = (
+                        self._pid_liveness(
+                            int(current.get("owner_pid") or 0),
+                            str(current.get("owner_host") or ""),
+                        )
+                        is False
+                    )
+                    if not prior_dead:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_owner_liveness_unproven",
+                            "lease": current,
+                        }
+                adopted = database.adopt_refresh_abort_successor(
+                    abort_id=abort_id,
+                    successor_owner_run_id=self.run_id,
+                    successor_owner_pid=self.owner_pid,
+                    successor_owner_host=self.owner_host,
+                    wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+                    network=self.network,
+                    asset_id=asset_id,
+                    expected_lease_version=int(current["lease_version"]),
+                    lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    prior_owner_liveness_proven_dead=prior_dead,
+                    observed_trade_ids=observed_trade_ids,
+                    observed_pending_transaction_ids=observed_pending_transaction_ids,
+                    observed_at=observed_at,
+                )
+                lease = adopted["lease"]
+                result = {
+                    "acquired": adopted.get("adopted") is True,
+                    "reason": "refresh_abort_adopted",
+                    "lease": lease,
+                    "abort": adopted["abort"],
+                }
+                if result["acquired"] and _as_utc(lease["expires_at"]) <= self._now():
+                    self._set_local_block("LEASE_EXPIRED")
+                    result["acquired"] = False
+                    result["reason"] = "lease_expired"
+                if result["acquired"]:
+                    self._lease_version = int(lease["lease_version"])
+                    self._lease_acquired_at = str(lease["acquired_at"])
+                    self._read_only = False
+                    if not _rotate_owner_identity_authority(self):
+                        self._set_local_block("WALLET_IDENTITY_BINDING_INVALID")
+                    self.status()
+                self.last_acquire_result = _lease_public_result(result)
+                return self.last_acquire_result
+            except Exception:
+                result = {"acquired": False, "reason": "durable_state_unavailable"}
                 self.last_acquire_result = result
                 return result
 
@@ -2013,6 +2100,131 @@ class MutationGate:
             self._active_mutations[permit] = safe_operation
             return permit
 
+    @_stop_callback_boundary
+    def enter_refresh_abort_cleanup(
+        self,
+        *,
+        abort_id: str,
+        trade_id: str,
+        expected_latch_generation: int,
+        observed_trade_ids: list[str],
+        observed_pending_transaction_ids: list[str],
+        observed_at: Any,
+    ) -> str:
+        """Enter one fenced, exact-target cleanup without opening normal mutation."""
+
+        operation = "wallet:cancel_offer:refresh_abort_cleanup"
+        with self._lock:
+            if (
+                self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit is not None
+            ):
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", operation)
+            status = self.status()
+            if (
+                status.source != "durable_latch"
+                or status.reason_code
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or self._local_reason_code
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or status.latch_generation != expected_latch_generation
+                or not status.owner_is_this_run
+                or self._lease_version is None
+            ):
+                raise MutationBlocked(status.reason_code, operation)
+            proof = database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort_id,
+                trade_id=trade_id,
+                expected_latch_generation=expected_latch_generation,
+                owner_run_id=self.run_id,
+                observed_trade_ids=observed_trade_ids,
+                observed_pending_transaction_ids=observed_pending_transaction_ids,
+                observed_at=observed_at,
+            )
+            if (
+                proof["abort_id"] != abort_id
+                or proof["trade_id"] != trade_id
+                or proof["blocking_operation_id"] != f"refresh-abort:{abort_id}"
+                or proof["wallet_fingerprint_hash"] != self.wallet_fingerprint_hash
+                or proof["network"] != self.network
+                or proof["latch_generation"] != expected_latch_generation
+                or proof["lease_version"] != self._lease_version
+                or proof["lease_acquired_at"] != self._lease_acquired_at
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            token = str(uuid.uuid4())
+            self._active_mutations[token] = operation
+            self._active_wallet_mutations.add(token)
+            self._refresh_abort_cleanup_permits[token] = (
+                abort_id,
+                trade_id,
+                expected_latch_generation,
+            )
+            return token
+
+    @_stop_callback_boundary
+    def require_refresh_abort_cleanup_permit(
+        self,
+        permit: str,
+        *,
+        abort_id: str,
+        trade_id: str,
+        expected_latch_generation: int,
+        observed_trade_ids: list[str],
+        observed_pending_transaction_ids: list[str],
+        observed_at: Any,
+        prepared_operation_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Recheck a held exact-target permit before each cleanup wallet step."""
+
+        operation = "wallet:cancel_offer:refresh_abort_cleanup"
+        with self._lock:
+            self.require_active_wallet_mutation_permit(permit, operation)
+            if (
+                self._refresh_abort_cleanup_permits.get(permit)
+                != (abort_id, trade_id, expected_latch_generation)
+                or self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit not in {None, permit}
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            status = self.status()
+            if (
+                status.source != "durable_latch"
+                or status.reason_code
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or self._local_reason_code
+                not in {"UNRESOLVED_OPERATIONS", "REFRESH_ABORT_CLEANUP"}
+                or status.latch_generation != expected_latch_generation
+                or not status.owner_is_this_run
+                or self._lease_version is None
+            ):
+                raise MutationBlocked(status.reason_code, operation)
+            proof = database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort_id,
+                trade_id=trade_id,
+                expected_latch_generation=expected_latch_generation,
+                owner_run_id=self.run_id,
+                observed_trade_ids=observed_trade_ids,
+                observed_pending_transaction_ids=observed_pending_transaction_ids,
+                observed_at=observed_at,
+                prepared_operation_id=prepared_operation_id,
+            )
+            if (
+                proof["abort_id"] != abort_id
+                or proof["trade_id"] != trade_id
+                or proof["blocking_operation_id"] != f"refresh-abort:{abort_id}"
+                or proof["wallet_fingerprint_hash"] != self.wallet_fingerprint_hash
+                or proof["network"] != self.network
+                or proof["latch_generation"] != expected_latch_generation
+                or proof["lease_version"] != self._lease_version
+                or proof["lease_acquired_at"] != self._lease_acquired_at
+                or proof.get("prepared_operation_id") != prepared_operation_id
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            return proof
+
     def register_wallet_mutation_permit(self, permit: str, operation: str) -> None:
         """Bind an active generic token to wallet lifecycle coordination."""
 
@@ -2068,6 +2280,7 @@ class MutationGate:
             return False
         with self._mutation_condition:
             self._active_wallet_mutations.discard(permit)
+            self._refresh_abort_cleanup_permits.pop(permit, None)
             removed = self._active_mutations.pop(permit, None) is not None
             if removed:
                 if self._exclusive_mutation_permit == permit:
@@ -2871,6 +3084,9 @@ class WalletMutationPermit:
     authority_generation: Any = None
     wallet_identity_binding: Optional[WalletIdentityBinding] = None
     wallet_adapter_authority: Any = None
+    refresh_abort_id: Optional[str] = None
+    refresh_trade_id: Optional[str] = None
+    refresh_latch_generation: Optional[int] = None
 
 
 def install_worker_authority_environment(
@@ -3120,6 +3336,142 @@ def enter_wallet_mutation(operation: str) -> WalletMutationPermit:
     )
 
 
+def enter_refresh_abort_cleanup_wallet_mutation(
+    *,
+    abort_id: str,
+    trade_id: str,
+    expected_latch_generation: int,
+    observed_trade_ids: list[str],
+    observed_pending_transaction_ids: list[str],
+    observed_at: Any,
+) -> WalletMutationPermit:
+    """Enter only the owner runtime's exact, fenced cancel target."""
+
+    operation = "wallet:cancel_offer:refresh_abort_cleanup"
+    with _runtime_lock:
+        runtime = _runtime
+        if runtime is None:
+            raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+        binding = runtime.require_wallet_identity_authority(operation)
+        authority = _registered_owner_identity_authority(runtime)
+        if (
+            type(authority) is not _OwnerIdentityAuthority
+            or authority.binding is not binding
+            or authority.wallet_adapter_authority is None
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        token = runtime.enter_refresh_abort_cleanup(
+            abort_id=abort_id,
+            trade_id=trade_id,
+            expected_latch_generation=expected_latch_generation,
+            observed_trade_ids=observed_trade_ids,
+            observed_pending_transaction_ids=observed_pending_transaction_ids,
+            observed_at=observed_at,
+        )
+        return WalletMutationPermit(
+            mode="refresh_abort_cleanup",
+            permit=token,
+            runtime_authority=runtime,
+            authority_generation=authority,
+            wallet_identity_binding=binding,
+            wallet_adapter_authority=authority.wallet_adapter_authority,
+            refresh_abort_id=abort_id,
+            refresh_trade_id=trade_id,
+            refresh_latch_generation=expected_latch_generation,
+        )
+
+
+def require_refresh_abort_cleanup_wallet_permit_authority(
+    permit: Any, *, abort_id: str, trade_id: str, operation: str
+) -> tuple[WalletIdentityBinding, Any]:
+    """Check the held owner generation without opening generic mutation."""
+
+    if (
+        type(permit) is not WalletMutationPermit
+        or permit.mode != "refresh_abort_cleanup"
+        or permit.refresh_abort_id != abort_id
+        or permit.refresh_trade_id != trade_id
+        or type(permit.refresh_latch_generation) is not int
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime = permit.runtime_authority
+    authority = permit.authority_generation
+    if (
+        type(runtime) is not MutationGate
+        or type(authority) is not _OwnerIdentityAuthority
+        or current_runtime() is not runtime
+        or _registered_owner_identity_authority(runtime) is not authority
+        or authority.binding is not permit.wallet_identity_binding
+        or authority.wallet_adapter_authority is not permit.wallet_adapter_authority
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime.require_active_wallet_mutation_permit(permit.permit, operation)
+    with runtime._lock:
+        if runtime._refresh_abort_cleanup_permits.get(permit.permit) != (
+            abort_id,
+            trade_id,
+            permit.refresh_latch_generation,
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime.require_wallet_identity_authority(operation)
+    runtime.require_wallet_adapter_authority(permit.wallet_adapter_authority, operation)
+    return permit.wallet_identity_binding, permit.wallet_adapter_authority
+
+
+def require_fresh_refresh_abort_cleanup_wallet_continuation(
+    permit: Any,
+    snapshot: Any,
+    *,
+    abort_id: str,
+    trade_id: str,
+    expected_latch_generation: int,
+    observed_trade_ids: list[str],
+    observed_pending_transaction_ids: list[str],
+    observed_at: Any,
+    prepared_operation_id: Optional[str] = None,
+) -> tuple[WalletIdentityBinding, Any, dict[str, Any]]:
+    """Recheck exact DB, Sage book, lease, and wallet identity at each step."""
+
+    operation = "wallet:cancel_offer:refresh_abort_cleanup"
+    binding, adapter = require_refresh_abort_cleanup_wallet_permit_authority(
+        permit, abort_id=abort_id, trade_id=trade_id, operation=operation
+    )
+    if expected_latch_generation != permit.refresh_latch_generation:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime = permit.runtime_authority
+    with runtime._lock:
+        runtime.require_refresh_abort_cleanup_permit(
+            permit.permit,
+            abort_id=abort_id,
+            trade_id=trade_id,
+            expected_latch_generation=expected_latch_generation,
+            observed_trade_ids=observed_trade_ids,
+            observed_pending_transaction_ids=observed_pending_transaction_ids,
+            observed_at=observed_at,
+            prepared_operation_id=prepared_operation_id,
+        )
+        decision = validate_wallet_identity(
+            binding,
+            snapshot,
+            now=runtime._now(),
+            last_observed_at_utc=runtime._last_wallet_identity_observed_at_utc,
+        )
+        if decision.get("allowed") is not True:
+            raise MutationBlocked(decision.get("reason"), operation)
+        runtime._last_wallet_identity_observed_at_utc = str(decision["observed_at_utc"])
+    return binding, adapter, decision
+
+
+def require_fresh_refresh_abort_cleanup_wallet_identity(
+    permit: Any, snapshot: Any, **request: Any
+) -> dict[str, Any]:
+    """Return the scoped fresh identity decision for journal preparation."""
+
+    return require_fresh_refresh_abort_cleanup_wallet_continuation(
+        permit, snapshot, **request
+    )[2]
+
+
 def require_wallet_mutation_permit_authority(
     permit: Any, operation: str
 ) -> tuple[WalletIdentityBinding, Any]:
@@ -3197,9 +3549,17 @@ def wallet_mutation_permit_journal_authority(
 ) -> dict[str, Any]:
     """Return the exact non-secret authority generation held by one permit."""
 
-    binding, _adapter = require_wallet_mutation_permit_authority(permit, operation)
+    if type(permit) is WalletMutationPermit and permit.mode == "refresh_abort_cleanup":
+        binding, _adapter = require_refresh_abort_cleanup_wallet_permit_authority(
+            permit,
+            abort_id=permit.refresh_abort_id,
+            trade_id=permit.refresh_trade_id,
+            operation=operation,
+        )
+    else:
+        binding, _adapter = require_wallet_mutation_permit_authority(permit, operation)
     binding_digest = wallet_identity_binding_digest(binding)
-    if permit.mode == "runtime":
+    if permit.mode in {"runtime", "refresh_abort_cleanup"}:
         runtime = permit.runtime_authority
         authority = permit.authority_generation
         with runtime._lock:
@@ -3427,7 +3787,7 @@ def exit_wallet_mutation(permit: Any) -> bool:
             _worker_active_wallet_mutations.pop(permit.permit, None)
             return True
     if (
-        permit.mode != "runtime"
+        permit.mode not in {"runtime", "refresh_abort_cleanup"}
         or permit.permit is None
         or type(permit.runtime_authority) is not MutationGate
     ):

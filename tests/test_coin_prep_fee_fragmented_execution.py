@@ -1,6 +1,7 @@
 """Real approved pricing/holds/worker must complete disclosed XCH prerequisites."""
 
 import json
+import copy
 from importlib import import_module
 
 import pytest
@@ -15,13 +16,16 @@ from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
 @pytest.mark.parametrize(
-    "mode,root_count,amount,expected_batches,estimate,maximum_fee,reserve",
+    "mode,root_count,amount,expected_batches,estimate,maximum_fee,reserve,fragment_asset,restart_after_first",
     [
-        ("two_sided", 61, 2_000_000_000, 3, 100, 100, 40),
-        ("two_sided", 153, 800_000_000, 4, 140, 140, 40),
+        ("two_sided", 61, 2_000_000_000, 3, 100, 100, 40, "xch", False),
+        ("two_sided", 153, 800_000_000, 4, 140, 140, 40, "xch", False),
         # The fixture has prior two-sided consent: its 40-mojo protection remains.
-        ("buy_only", 61, 2_000_000_000, 2, 60, 80, 40),
-        ("buy_only", 153, 800_000_000, 3, 100, 120, 40),
+        ("buy_only", 61, 2_000_000_000, 2, 60, 80, 40, "xch", False),
+        ("buy_only", 153, 800_000_000, 3, 100, 120, 40, "xch", False),
+        ("two_sided", 55, 200, 3, 100, 100, 40, "cat", False),
+        ("two_sided", 153, 80, 4, 140, 140, 40, "cat", False),
+        ("two_sided", 55, 200, 3, 100, 100, 40, "cat", True),
     ],
 )
 def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
@@ -34,6 +38,8 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
     estimate,
     maximum_fee,
     reserve,
+    fragment_asset,
+    restart_after_first,
 ):
     # This would fail if pricing or hold reconstruction refused the very
     # prerequisite the public preview already charged/obtained consent for.
@@ -47,14 +53,27 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
     monkeypatch.setattr(utils, "ADDRESS", address)
     monkeypatch.setattr(unsigned_utils, "ADDRESS", address)
     state["config"].LIQUIDITY_MODE = mode
-    state["xch"] = []
+    state[fragment_asset] = []
     for index in range(root_count):
-        coin = Coin(index.to_bytes(32, "big"), native.get_tree_hash(), amount)
+        parent = Coin(index.to_bytes(32, "big"), cat.get_tree_hash(), amount)
+        coin = (
+            Coin(parent.name(), cat.get_tree_hash(), amount)
+            if fragment_asset == "cat"
+            else Coin(index.to_bytes(32, "big"), native.get_tree_hash(), amount)
+        )
         row = utils._coin(index, str(amount))
         row["coin_id"] = coin.name().hex()
-        state["xch"].append(row)
-        state["unsigned_roots"][coin.name().hex()] = (coin, native, None)
-        database.upsert_coin(coin.name().hex(), "xch", amount, purpose="replacement")
+        state[fragment_asset].append(row)
+        state["unsigned_roots"][coin.name().hex()] = (
+            coin,
+            cat if fragment_asset == "cat" else native,
+            utils.ASSET if fragment_asset == "cat" else None,
+        )
+        if fragment_asset == "cat":
+            state["unsigned_parents"][coin.name().hex()] = parent
+        database.upsert_coin(
+            coin.name().hex(), fragment_asset, amount, purpose="replacement"
+        )
     preview = service.preview_coin_prep_fees({})
     assert preview["available"] is True, preview
     assert preview["estimated_total_fee_mojos"] == estimate
@@ -80,6 +99,15 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
         assert account["spent_fee_mojos"] == 20 * len(sent)
         assert account["remaining_preparation_fee_mojos"] >= 0
         assert unsigned["_catalyst_executable_effect_bound"] is True
+        if fragment_asset == "cat":
+            competitor = copy.copy(state["worker"])
+            competitor.status = copy.copy(state["worker"].status)
+            with pytest.raises(ValueError, match="FEE_EFFECT_RECOVERY_REQUIRED"):
+                competitor._run_direct_batch_prep()
+            assert (
+                database.get_fee_approval(approval["approval_id"])["held_fee_mojos"]
+                == 20
+            )
         sent.append(unsigned)
         return {"success": True, "transaction_id": len(sent).to_bytes(32, "big").hex()}
 
@@ -112,6 +140,10 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
                 native if asset == "xch" else cat,
                 None if asset == "xch" else utils.ASSET,
             )
+            if asset == "cat":
+                state["unsigned_parents"][coin.name().hex()] = state["unsigned_roots"][
+                    parents[output["coin_id"]]
+                ][0]
         observations.append(operation)
         return {
             "expected_outputs": outputs,
@@ -130,10 +162,30 @@ def test_disclosed_fragmented_stages_execute_with_exact_holds_and_confirmation(
     worker._wait_for_coin_prep_post_effect = observe
     worker._submitted_split_verify_timeout_seconds = lambda: 1
     worker.log = lambda message: state.setdefault("logs", []).append(message)
+    if restart_after_first:
+        dispatch = import_module("coin_prep_fee_dispatch")
+        price = dispatch.price_approved_prep_batch
+        interrupted = []
+
+        def interrupt_after_confirmed(approval_id):
+            if len(sent) == 1 and not interrupted:
+                interrupted.append(True)
+                raise RuntimeError("simulated restart after confirmed prerequisite")
+            return price(approval_id)
+
+        monkeypatch.setattr(
+            dispatch, "price_approved_prep_batch", interrupt_after_confirmed
+        )
+        with pytest.raises(RuntimeError, match="simulated restart"):
+            worker._run_direct_batch_prep()
+        assert len(sent) == 1 and len(observations) == 1
+        assert database.get_fee_approval(approval["approval_id"])["held_fee_mojos"] == 0
+        worker = copy.copy(worker)
+        worker.status = copy.copy(worker.status)
     assert worker._run_direct_batch_prep() is True, state.get("logs")
     assert len(sent) == expected_batches
     assert len(observations) == expected_batches
-    assert worker.status.batch_confirmed == expected_batches
+    assert worker.status.batch_confirmed == expected_batches - int(restart_after_first)
     account = database.get_fee_approval(approval["approval_id"])
     assert account["spent_fee_mojos"] == 20 * expected_batches
     assert account["held_fee_mojos"] == 0

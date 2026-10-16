@@ -279,6 +279,18 @@ def test_different_operation_cannot_inherit_valid_unsigned_fee(exact_journal):
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
+def test_different_attempt_cannot_inherit_prepared_journal_fee(exact_journal):
+    boundary = import_module("coin_prep_fee_dispatch").reserve_approved_prep_dispatch
+    with pytest.raises(ValueError, match="FEE_DISPATCH_PLAN_MISMATCH"):
+        boundary(
+            approval_id=exact_journal["approval"]["approval_id"],
+            operation_id=exact_journal["operation_id"],
+            priced_batch=exact_journal["priced"],
+            attempt_id="1" * 32,
+        )
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
 def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journal):
     account = exact_journal["approval"]
     database.reserve_approved_fee(

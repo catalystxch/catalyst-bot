@@ -663,6 +663,34 @@ def recover_legacy_sage_reservations(
             bulk_manifest = _native_bulk_cancel_manifest(blocker, database_module)
             external_recovery_context = False
             if bulk_manifest is not None:
+                # The shared transaction proof is anchored to the first
+                # immutable manifest member.  The current blocker can be a
+                # later member after an earlier Task 9 commit, while Sage's
+                # offer and coin histories remain scoped to each intent.
+                anchor_member = bulk_manifest["members"][0]
+                anchor_intent = database_module.get_offer_intent(
+                    anchor_member["intent_id"]
+                )
+                if (
+                    type(anchor_intent) is not dict
+                    or anchor_intent.get("sage_trade_id") != anchor_member["trade_id"]
+                    or anchor_intent.get("wallet_fingerprint_hash") != wallet_hash
+                    or str(anchor_intent.get("network") or "").strip().lower()
+                    != safe_network
+                ):
+                    raise ValueError("bulk cancel anchor binding is invalid")
+                anchor_evidence = (
+                    evidence
+                    if anchor_member["intent_id"] == intent_id
+                    else reconciliation_module.load_authoritative_evidence(
+                        anchor_intent, wallet_facade=wallet_facade
+                    )
+                )
+                anchor_observed_at = (
+                    anchor_evidence.get("observed_at")
+                    if type(anchor_evidence) is dict
+                    else None
+                )
                 manifest_operation_ids = {
                     member["operation_id"] for member in bulk_manifest["members"]
                 }
@@ -679,9 +707,9 @@ def recover_legacy_sage_reservations(
                 cancel_context = reconciliation_module._derive_sage_bulk_cancel_context(
                     bulk_manifest,
                     blocking_operation_ids,
-                    evidence,
+                    anchor_evidence,
                     database_module=database_module,
-                    observed_at=observed_at,
+                    observed_at=anchor_observed_at,
                 )
                 if type(cancel_context) is not dict:
                     result["remaining"] += 1
