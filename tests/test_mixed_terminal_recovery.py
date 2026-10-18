@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -164,3 +166,230 @@ def test_mixed_cohort_allowed_latch_accepts_only_supported_open_roots():
     intents[0]["lifecycle_state"] = "unknown"
     with pytest.raises(ValueError):
         validate_mixed_terminal_cohort(campaign, intents, offers, [], {}, latch)
+
+
+def test_mixed_proof_digest_excludes_observation_clock_only():
+    from mixed_terminal_recovery import _stable_proof_fields
+
+    first = {
+        "collection_started_at": "earlier",
+        "offer_history": {
+            "observed_at": "earlier",
+            "source_observed_at_all": ["earlier"],
+            "records": [{"trade_id": "a" * 64, "status": "expired"}],
+        },
+    }
+    later = {
+        "collection_started_at": "later",
+        "offer_history": {
+            "observed_at": "later",
+            "source_observed_at_all": ["later"],
+            "records": [{"trade_id": "a" * 64, "status": "expired"}],
+        },
+    }
+    assert _stable_proof_fields(first) == _stable_proof_fields(later)
+    later["offer_history"]["records"][0]["status"] = "filled"
+    assert _stable_proof_fields(first) != _stable_proof_fields(later)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "valid",
+        "normal_allowed",
+        "live_offer",
+        "pending_transaction",
+        "changed_root",
+        "changed_owner",
+        "sync_loss",
+        "unknown_unproven",
+    ],
+)
+def test_mixed_preview_reproves_complete_sage_cohort_without_writes(
+    monkeypatch, change
+):
+    import api_server
+    import database
+    import mixed_terminal_recovery
+    import mutation_gate
+    import offer_reconciliation
+    import wallet
+    from config import cfg
+
+    campaign, intents, offers, blockers, latch = _cohort()
+    now = datetime.now(timezone.utc)
+    stamp = lambda seconds: (
+        (now + timedelta(seconds=seconds))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    campaign.update(
+        wallet_id=2,
+        wallet_fingerprint=3702373391,
+        expires_at=stamp(-3600),
+    )
+    monkeypatch.setattr(cfg, "CAT_ASSET_ID", ASSET_ID)
+    monkeypatch.setattr(cfg, "CAT_WALLET_ID", 2)
+    normal = change == "normal_allowed"
+    if normal:
+        intents[0]["lifecycle_state"] = "visible"
+        blockers.clear()
+        latch.update(
+            state="resolved",
+            reason_code=None,
+            blocking_operation_ids_json="[]",
+        )
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", not normal)
+    monkeypatch.setattr(
+        api_server,
+        "bot",
+        SimpleNamespace(
+            is_running=lambda: False,
+            offer_manager=SimpleNamespace(
+                wait_for_offer_creation_quiescence=lambda: None
+            ),
+        )
+        if normal
+        else None,
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Harvestr",
+        fingerprint=3702373391,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=stamp(-10),
+        maximum_age_seconds=60,
+    )
+
+    class Authority:
+        run_id = "recovery-owner"
+        owner_pid = 111
+        owner_host = "test-host"
+        _lease_acquired_at = stamp(-10)
+        wallet_fingerprint_hash = WALLET_HASH
+        network = "mainnet"
+
+        def status(self):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "allowed": normal,
+                    "reason_code": "ALLOWED" if normal else "REGISTRY_BLOCKED",
+                    "lease": {"owned_by_this_run": True, "active": True},
+                }
+            )
+
+        def require_wallet_identity_authority(self, _operation):
+            return binding
+
+    authority = Authority()
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: authority)
+    lease = {
+        "active": 1,
+        "owner_run_id": authority.run_id,
+        "owner_pid": authority.owner_pid,
+        "owner_host": authority.owner_host,
+        "acquired_at": authority._lease_acquired_at,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "lease_version": 11,
+        "expires_at": stamp(60),
+    }
+    monkeypatch.setattr(database, "get_bootstrap_campaign", lambda _id: campaign)
+    reads = []
+
+    def read_intents():
+        reads.append("intents")
+        if change == "changed_root" and len(reads) == 2:
+            return [{**intents[0], "side": "sell"}, *intents[1:]]
+        return intents
+
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", read_intents)
+    monkeypatch.setattr(database, "get_open_offers", lambda **_kw: offers)
+    monkeypatch.setattr(
+        database, "get_unresolved_offer_operation_blockers", lambda: blockers
+    )
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
+    lease_reads = []
+
+    def read_lease():
+        lease_reads.append(True)
+        if change == "changed_owner" and len(lease_reads) == 2:
+            return {**lease, "owner_run_id": "other-owner"}
+        return lease
+
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", read_lease)
+    monkeypatch.setattr(database, "get_authoritative_terminal_records", lambda _ids: {})
+    monkeypatch.setattr(
+        database, "list_active_bootstrap_campaigns_for_asset", lambda _asset: [campaign]
+    )
+    monkeypatch.setattr(
+        database,
+        "_stability_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("preview wrote the database")),
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: {"success": True})
+    sync_reads = []
+
+    def read_sync():
+        sync_reads.append(True)
+        return {"synced": not (change == "sync_loss" and len(sync_reads) == 2)}
+
+    monkeypatch.setattr(wallet, "get_wallet_sync_status", read_sync)
+    identity_times = iter([stamp(-2), stamp(-1)])
+    monkeypatch.setattr(
+        mutation_gate,
+        "validate_wallet_identity",
+        lambda *_args, **_kw: {
+            "allowed": True,
+            "observed_at_utc": next(identity_times),
+        },
+    )
+    books = iter(
+        [
+            {"trade_ids": [], "pending_transaction_ids": [], "observed_at": stamp(-2)},
+            {
+                "trade_ids": ["a" * 64] if change == "live_offer" else [],
+                "pending_transaction_ids": (
+                    ["b" * 64] if change == "pending_transaction" else []
+                ),
+                "observed_at": stamp(-1),
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: next(books)
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda row, **_kw: {"witness": row["sage_trade_id"]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda row, _evidence, **_kw: {
+            "classification": (
+                "UNKNOWN"
+                if change == "unknown_unproven" and row["lifecycle_state"] == "unknown"
+                else "FILLED_PROVEN"
+                if row["lifecycle_state"] == "unknown"
+                else "EXPIRED_PROVEN"
+            ),
+            "reason_code": "AUTHORITATIVE_PROOF",
+        },
+    )
+    if change in {"valid", "normal_allowed"}:
+        result = mixed_terminal_recovery.preview_terminal_offers(
+            CAMPAIGN_ID, 0, authority
+        )
+        assert len(result["offers"]) == 6
+        assert sum(
+            row["classification"] == "FILLED_PROVEN" for row in result["offers"]
+        ) == (0 if normal else 1)
+        assert result["wallet_effect_started"] is False
+        assert result["sage_live_offers"] == 0
+    else:
+        with pytest.raises(ValueError):
+            mixed_terminal_recovery.preview_terminal_offers(CAMPAIGN_ID, 0, authority)

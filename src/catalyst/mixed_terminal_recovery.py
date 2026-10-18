@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -185,3 +187,284 @@ def validate_mixed_terminal_cohort(
         ):
             raise ValueError("mixed terminal durable proof differs")
     return [dict(row) for row in sorted(roots, key=lambda row: row["intent_id"])]
+
+
+def _utc(value: Any) -> datetime:
+    if type(value) is not str:
+        raise ValueError("mixed terminal time is missing")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError("mixed terminal time is not UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def _lease_epoch(lease: Any, authority: Any) -> tuple[str, int, str, str, int]:
+    if (
+        type(lease) is not dict
+        or lease.get("active") != 1
+        or lease.get("owner_run_id") != authority.run_id
+        or lease.get("owner_pid") != authority.owner_pid
+        or lease.get("owner_host") != authority.owner_host
+        or lease.get("acquired_at") != authority._lease_acquired_at
+        or lease.get("wallet_fingerprint_hash") != authority.wallet_fingerprint_hash
+        or lease.get("network") != authority.network
+        or type(lease.get("lease_version")) is not int
+        or _utc(lease.get("expires_at")) <= datetime.now(timezone.utc)
+    ):
+        raise ValueError("mixed terminal lease authority changed")
+    return (
+        lease["owner_run_id"],
+        lease["owner_pid"],
+        lease["owner_host"],
+        lease["acquired_at"],
+        lease["lease_version"],
+    )
+
+
+def _read_book(wallet_module: Any) -> dict[str, Any]:
+    book = wallet_module._read_refresh_abort_cleanup_snapshot()
+    if (
+        type(book) is not dict
+        or type(book.get("trade_ids")) is not list
+        or type(book.get("pending_transaction_ids")) is not list
+        or book["trade_ids"]
+        or book["pending_transaction_ids"]
+        or not timedelta(seconds=0)
+        <= datetime.now(timezone.utc) - _utc(book.get("observed_at"))
+        <= timedelta(seconds=30)
+    ):
+        raise ValueError("mixed terminal Sage book is not complete and empty")
+    return book
+
+
+def _stable_proof_fields(value: Any) -> Any:
+    """Drop observation-clock metadata while retaining source witness values."""
+
+    volatile = {
+        "observed_at",
+        "observed_at_utc",
+        "source_observed_at",
+        "source_observed_at_all",
+        "read_observed_at",
+        "collection_started_at",
+        "collection_finished_at",
+        "read_at",
+        "read_at_utc",
+    }
+    if type(value) is dict:
+        return {
+            key: _stable_proof_fields(item)
+            for key, item in value.items()
+            if key not in volatile
+        }
+    if type(value) is list:
+        return [_stable_proof_fields(item) for item in value]
+    return value
+
+
+def _capture_context(database_module: Any, campaign_id: str, asset_id: str):
+    campaign = database_module.get_bootstrap_campaign(campaign_id)
+    intents = database_module.get_offer_intents_for_registry()
+    offers = database_module.get_open_offers(cat_asset_id=asset_id)
+    blockers = database_module.get_unresolved_offer_operation_blockers()
+    latch = database_module.get_runtime_safety_latch()
+    lease = database_module.get_runtime_mutation_lease()
+    purpose = (
+        f"bootstrap:{campaign_id}:revision:{campaign['revision']}"
+        if type(campaign) is dict and type(campaign.get("revision")) is int
+        else None
+    )
+    terminal_ids = [
+        row["sage_trade_id"]
+        for row in intents
+        if type(row) is dict
+        and row.get("purpose") == purpose
+        and row.get("lifecycle_state") == "terminal"
+        and type(row.get("sage_trade_id")) is str
+    ]
+    if len(terminal_ids) > 256:
+        raise ValueError("mixed terminal historical proof scope exceeds bound")
+    terminal = database_module.get_authoritative_terminal_records(terminal_ids)
+    return campaign, intents, offers, blockers, terminal, latch, lease
+
+
+def preview_terminal_offers(
+    campaign_id: str, revision: int, authority: object
+) -> dict[str, Any]:
+    """Read and classify a complete stopped campaign without any DB write."""
+
+    import api_server
+    import database
+    import mutation_gate
+    import offer_reconciliation
+    import wallet
+    from blueprints import bootstrap
+    from config import cfg
+
+    if not _hex_identity(campaign_id) or type(revision) is not int or revision < 0:
+        raise ValueError("mixed terminal scope is invalid")
+    if authority is not mutation_gate.current_runtime():
+        raise ValueError("mixed terminal runtime authority is unavailable")
+    status = authority.status().to_dict()
+    restricted = bool(api_server._registry_terminal_recovery_active)
+    if (
+        status.get("lease", {}).get("owned_by_this_run") is not True
+        or status.get("lease", {}).get("active") is not True
+        or (restricted and status.get("reason_code") != "REGISTRY_BLOCKED")
+        or (not restricted and status.get("allowed") is not True)
+    ):
+        raise ValueError("mixed terminal recovery authority is not active")
+    bot = api_server.bot
+    if restricted:
+        if bot is not None:
+            raise ValueError("mixed terminal restricted runtime constructed a bot")
+    elif (
+        bot is None
+        or not callable(getattr(bot, "is_running", None))
+        or bot.is_running()
+    ):
+        raise ValueError("mixed terminal bot must be stopped")
+    binding = authority.require_wallet_identity_authority("mixed_terminal_preview")
+    if (
+        type(binding) is not mutation_gate.WalletIdentityBinding
+        or binding.backend != "sage"
+    ):
+        raise ValueError("mixed terminal Sage identity binding is unavailable")
+    with bootstrap._CAMPAIGN_LIFECYCLE_LOCK, api_server._bot_cancel_lifecycle_lock:
+        if not restricted:
+            manager = getattr(bot, "offer_manager", None)
+            wait = getattr(manager, "wait_for_offer_creation_quiescence", None)
+            if not callable(wait):
+                raise ValueError("mixed terminal creation fence is unavailable")
+            wait()
+        before = _capture_context(database, campaign_id, cfg.CAT_ASSET_ID)
+        campaign, intents, offers, blockers, terminal, latch, lease = before
+        if (
+            type(campaign) is not dict
+            or campaign.get("revision") != revision
+            or campaign.get("asset_id") != cfg.CAT_ASSET_ID
+            or campaign.get("wallet_id") != cfg.CAT_WALLET_ID
+            or campaign.get("wallet_fingerprint") != binding.fingerprint
+            or campaign.get("network") != binding.network_id
+            or _utc(campaign.get("expires_at")) > datetime.now(timezone.utc)
+        ):
+            raise ValueError("mixed terminal campaign authority changed")
+        active_campaigns = database.list_active_bootstrap_campaigns_for_asset(
+            cfg.CAT_ASSET_ID
+        )
+        if (
+            len(active_campaigns) != 1
+            or active_campaigns[0].get("campaign_id") != campaign_id
+        ):
+            raise ValueError("mixed terminal active campaign is not unique")
+        first_epoch = _lease_epoch(lease, authority)
+        roots = validate_mixed_terminal_cohort(
+            campaign, intents, offers, blockers, terminal, latch
+        )
+        first_identity = wallet.get_wallet_identity()
+        first_check = mutation_gate.validate_wallet_identity(binding, first_identity)
+        if first_check.get("allowed") is not True:
+            raise ValueError("mixed terminal wallet identity is unavailable")
+        first_sync = wallet.get_wallet_sync_status()
+        if type(first_sync) is not dict or first_sync.get("synced") is not True:
+            raise ValueError("mixed terminal Sage wallet is not synced")
+        first_book = _read_book(wallet)
+        wallet_ids = tuple(sorted({1, campaign["wallet_id"]}))
+        evidence = {
+            row["intent_id"]: offer_reconciliation.load_authoritative_evidence(
+                row, offer_scope="exact_intent", wallet_ids=wallet_ids
+            )
+            for row in roots
+            if row["lifecycle_state"] != "terminal"
+        }
+        second_identity = wallet.get_wallet_identity()
+        second_check = mutation_gate.validate_wallet_identity(
+            binding,
+            second_identity,
+            last_observed_at_utc=first_check["observed_at_utc"],
+        )
+        second_sync = wallet.get_wallet_sync_status()
+        second_book = _read_book(wallet)
+        after = _capture_context(database, campaign_id, cfg.CAT_ASSET_ID)
+        after_epoch = _lease_epoch(after[-1], authority)
+        if (
+            second_check.get("allowed") is not True
+            or type(second_sync) is not dict
+            or second_sync.get("synced") is not True
+            or _utc(second_book["observed_at"]) <= _utc(first_book["observed_at"])
+            or before[:-1] != after[:-1]
+            or cfg.CAT_ASSET_ID != campaign["asset_id"]
+            or cfg.CAT_WALLET_ID != campaign["wallet_id"]
+            or first_epoch[:4] != after_epoch[:4]
+            or after_epoch[4] < first_epoch[4]
+            or authority.status().to_dict().get("lease", {}).get("owned_by_this_run")
+            is not True
+            or (
+                restricted
+                and authority.status().to_dict().get("reason_code")
+                != "REGISTRY_BLOCKED"
+            )
+            or (
+                not restricted
+                and authority.status().to_dict().get("allowed") is not True
+            )
+        ):
+            raise ValueError("mixed terminal proof changed during preview")
+        vector = []
+        for row in roots:
+            if row["lifecycle_state"] == "terminal":
+                proof = terminal[row["sage_trade_id"]]
+                classification = proof["outcome"]
+                proof_digest = proof["evidence_sha256"]
+            else:
+                source = evidence[row["intent_id"]]
+                outcome = offer_reconciliation.classify_terminal_evidence(
+                    row, source, now=second_book["observed_at"]
+                )
+                classification = outcome.get("classification")
+                if classification not in _TERMINAL_OUTCOMES or (
+                    row["lifecycle_state"] == "unknown"
+                    and classification != "FILLED_PROVEN"
+                ):
+                    raise ValueError("mixed terminal root lacks conclusive proof")
+                _encoded, proof_digest = (
+                    offer_reconciliation.canonical_evidence_and_digest(
+                        {
+                            "classification": outcome,
+                            "source": _stable_proof_fields(source),
+                        }
+                    )
+                )
+            vector.append(
+                {
+                    "intent_id": row["intent_id"],
+                    "trade_id": row["sage_trade_id"],
+                    "side": row["side"],
+                    "tier": row["tier"],
+                    "classification": classification,
+                    "proof_digest": proof_digest,
+                    "already_terminal": row["lifecycle_state"] == "terminal",
+                }
+            )
+        binding_data = {
+            "campaign_id": campaign_id,
+            "revision": revision,
+            "asset_id": campaign["asset_id"],
+            "network": campaign["network"],
+            "wallet_fingerprint_hash": authority.wallet_fingerprint_hash,
+            "lease_owner_run_id": first_epoch[0],
+            "lease_owner_pid": first_epoch[1],
+            "lease_owner_host": first_epoch[2],
+            "lease_acquired_at": first_epoch[3],
+            "latch_generation": latch["generation"],
+            "blocking_operation_ids": json.loads(latch["blocking_operation_ids_json"]),
+            "offers": vector,
+        }
+        encoded = json.dumps(binding_data, sort_keys=True, separators=(",", ":"))
+        return {
+            **binding_data,
+            "proof_digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            "sage_live_offers": 0,
+            "sage_pending_transactions": 0,
+            "wallet_effect_started": False,
+        }
