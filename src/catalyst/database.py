@@ -30393,7 +30393,7 @@ def fence_mixed_terminal_commit(
     safe_pid = _exact_integer(owner_pid, "owner_pid", minimum=1)
     safe_host = _required_stability_text(owner_host, "owner_host")
     safe_acquired = _stability_timestamp(acquired_at, "acquired_at")
-    safe_generation = _exact_integer(latch_generation, "latch_generation", minimum=1)
+    safe_generation = _exact_integer(latch_generation, "latch_generation")
     safe_proof_at = _stability_timestamp(proof_observed_at, "proof_observed_at")
     safe_target = _required_stability_text(target_intent_id, "target_intent_id")
     safe_version = _exact_integer(target_row_version, "target_row_version")
@@ -30497,13 +30497,21 @@ def fence_mixed_terminal_commit(
         # Restricted recovery consumes exact blockers. A normally stopped
         # campaign begins with a resolved latch and no blockers.
         restricted = bool(expected_blockers)
+        latch_binding_matches = (
+            latch["wallet_fingerprint_hash"] == safe_wallet
+            and latch["network"] == safe_network
+            if restricted or safe_generation > 0
+            else latch["wallet_fingerprint_hash"] is None and latch["network"] is None
+        )
         latch_matches = (
-            latch["state"] == "tripped"
+            safe_generation > 0
+            and latch["state"] == "tripped"
             and latch["reason_code"] == "REGISTRY_BLOCKED"
             and set(latch_ids) == open_ids
             and open_ids.issubset(set(expected_blockers))
             if restricted
             else latch["state"] == "resolved"
+            and latch["reason_code"] is None
             and not latch_ids
             and not unknown_ids
             and not journal
@@ -30527,8 +30535,7 @@ def fence_mixed_terminal_commit(
             or heartbeat_at < earliest_heartbeat
             or not latch_matches
             or latch["generation"] != safe_generation
-            or latch["wallet_fingerprint_hash"] != safe_wallet
-            or latch["network"] != safe_network
+            or not latch_binding_matches
             or f"reconcile:{safe_target}" not in open_ids
             or not 1 <= len(roots) <= 256
             or other_root is not None

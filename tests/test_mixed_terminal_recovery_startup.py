@@ -724,6 +724,29 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
                 database.fence_mixed_terminal_commit(**allowed_fence)["lease_version"]
                 == 11
             )
+            # A clean profile starts resolved at generation zero, with no
+            # historical wallet or network binding in the latch.
+            conn.execute(
+                "UPDATE runtime_safety_latch SET generation=0,"
+                "wallet_fingerprint_hash=NULL,network=NULL WHERE singleton_id=1"
+            )
+            conn.commit()
+            assert (
+                database.fence_mixed_terminal_commit(
+                    **{**allowed_fence, "latch_generation": 0}
+                )["lease_version"]
+                == 11
+            )
+            conn.execute(
+                "UPDATE runtime_safety_latch SET wallet_fingerprint_hash=? "
+                "WHERE singleton_id=1",
+                (wallet_hash,),
+            )
+            conn.commit()
+            with pytest.raises(ValueError, match="authority changed"):
+                database.fence_mixed_terminal_commit(
+                    **{**allowed_fence, "latch_generation": 0}
+                )
     else:
         with pytest.raises(ValueError):
             database.adopt_registry_terminal_successor(**request)
