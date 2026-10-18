@@ -83,7 +83,7 @@ def test_signing_preflight_fails_closed_without_required_configuration():
     assert workflow["permissions"]["contents"] == "write"
     assert workflow["jobs"]["build"]["timeout-minutes"] == 360
 
-    version = named_step("Resolve release version")
+    version = named_step("Validate exact protected-main release tag")
     assert version["id"] == "release-version"
     assert "GITHUB_OUTPUT" in version["run"]
 
@@ -136,7 +136,7 @@ def test_installer_signing_uses_pinned_action_and_evidence_request_ids():
     assert upload["id"] == "upload-unsigned-installer"
     assert upload["with"] == {
         "name": "catalyst-windows-installer-${{ github.run_id }}-${{ github.run_attempt }}",
-        "path": "Catalyst-Setup-${{ github.ref_name }}.exe",
+        "path": "Catalyst-Setup-${{ inputs.tag }}.exe",
         "archive": False,
     }
 

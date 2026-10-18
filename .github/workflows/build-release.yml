@@ -1,10 +1,13 @@
 name: Build Release
 
-# Triggers when you push a version tag (e.g. v1.0.0, v1.1.0)
+# Signed releases are explicitly dispatched after their exact tag is reviewed.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Protected-main release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -14,7 +17,7 @@ permissions:
 jobs:
   build:
     # The v1.4.0 unsigned beta has a separate, opt-in prerelease workflow.
-    if: github.ref_name != 'v1.4.0'
+    if: inputs.tag != 'v1.4.0'
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +36,34 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
+          ref: main
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate exact protected-main release tag
+        id: release-version
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_REF -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tag must be vMAJOR.MINOR.PATCH"
+          }
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "refs/tags/$($env:RELEASE_REF):refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to fetch exact release tag" }
+          $tagCommit = (git rev-list -n 1 "refs/tags/$($env:RELEASE_REF)").Trim()
+          $mainCommit = (git rev-parse origin/main).Trim()
+          if ($tagCommit -notmatch '^[0-9a-f]{40}$' -or $mainCommit -notmatch '^[0-9a-f]{40}$') {
+            throw "Release source identity is invalid"
+          }
+          git merge-base --is-ancestor $tagCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) { throw "Release tag is not on protected main" }
+          git checkout --detach $tagCommit
+          if ($LASTEXITCODE -ne 0 -or (git rev-parse HEAD).Trim() -cne $tagCommit) {
+            throw "Unable to check out the exact release tag commit"
+          }
+          "version=$($env:RELEASE_REF.Substring(1))" >> $env:GITHUB_OUTPUT
+          "source_commit=$tagCommit" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -64,18 +94,6 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             python -m pip install -r requirements-linux.txt
           fi
-
-      - name: Resolve release version
-        id: release-version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must be vMAJOR.MINOR.PATCH" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Sync release metadata to tag
         shell: bash
@@ -177,7 +195,7 @@ jobs:
         shell: pwsh
         env:
           ARTIFACT_NAME: ${{ matrix.artifact }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           PACKAGE_EXT: ${{ matrix.ext }}
         run: |
           $package = "${env:ARTIFACT_NAME}-${env:RELEASE_REF}${env:PACKAGE_EXT}"
@@ -186,7 +204,7 @@ jobs:
       - name: Build Windows installer from signed application
         if: matrix.os == 'windows-latest'
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Install Inno Setup
@@ -214,7 +232,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: catalyst-windows-installer-${{ github.run_id }}-${{ github.run_attempt }}
-          path: Catalyst-Setup-${{ github.ref_name }}.exe
+          path: Catalyst-Setup-${{ inputs.tag }}.exe
           archive: false
 
       - name: Sign Windows installer with SignPath
@@ -239,10 +257,10 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
           SOURCE_REPOSITORY: ${{ github.repository }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ steps.release-version.outputs.source_commit }}
           GITHUB_SERVER: ${{ github.server_url }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
           APPLICATION_SIGNING_REQUEST_ID: ${{ steps.sign-application.outputs.signing-request-id }}
@@ -272,7 +290,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           CATALYST_UPDATE_SIGNING_KEY_B64: ${{ secrets.CATALYST_UPDATE_SIGNING_KEY_B64 }}
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
@@ -298,7 +316,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           RELEASE_VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           $installer = Resolve-Path "Catalyst-Setup-$($env:RELEASE_REF).exe"
@@ -445,7 +463,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         env:
           ARTIFACT_NAME: ${{ matrix.artifact }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           PACKAGE_EXT: ${{ matrix.ext }}
         run: |
           # Add .desktop file for Linux desktop integration
@@ -465,13 +483,13 @@ jobs:
       - name: Package Linux AppImage and deb
         if: matrix.os == 'ubuntu-latest'
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
         run: scripts/package_linux.sh "$RELEASE_REF"
 
       - name: Smoke test Linux packages
         if: matrix.os == 'ubuntu-latest'
         env:
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
         run: |
           appimage_path="Catalyst-linux-${RELEASE_REF}-x86_64.AppImage"
           deb_path="catalyst_${RELEASE_REF}_amd64.deb"
@@ -488,8 +506,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REF: ${{ github.ref_name }}
-          RELEASE_ASSET: ${{ matrix.artifact }}-${{ github.ref_name }}${{ matrix.ext }}
+          RELEASE_REF: ${{ inputs.tag }}
+          RELEASE_ASSET: ${{ matrix.artifact }}-${{ inputs.tag }}${{ matrix.ext }}
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_REF" >/dev/null 2>&1; then
@@ -514,7 +532,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_REF" >/dev/null 2>&1; then
@@ -545,7 +563,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
         run: |
           gh release view "$($env:RELEASE_REF)" *> $null
           if ($LASTEXITCODE -ne 0) {
@@ -582,7 +600,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
           if (-not $env:GH_TOKEN) {
@@ -609,7 +627,7 @@ jobs:
           }
 
   publish-release:
-    if: github.ref_name != 'v1.4.0'
+    if: inputs.tag != 'v1.4.0'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -617,7 +635,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_REF: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           gh release edit "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" --draft=false --latest

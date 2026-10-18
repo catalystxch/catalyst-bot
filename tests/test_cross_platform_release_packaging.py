@@ -124,7 +124,7 @@ def test_release_workflow_keeps_github_context_out_of_shell_scripts():
         encoding="utf-8"
     )
 
-    assert "RELEASE_REF: ${{ github.ref_name }}" in workflow
+    assert "RELEASE_REF: ${{ inputs.tag }}" in workflow
     assert 'appimage_path="Catalyst-linux-${RELEASE_REF}-x86_64.AppImage"' in workflow
     assert 'deb_path="catalyst_${RELEASE_REF}_amd64.deb"' in workflow
 
