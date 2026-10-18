@@ -14,7 +14,7 @@
 
 - This operation is database-only: no wallet mutation, fee, offer creation/cancellation, marketplace publication, notification, BoostManager, SweepCoordinator or Splash dispatch.
 - Campaign must be active but elapsed, bot stopped, Sage synced to exact network/fingerprint/wallet/asset, with zero live/fillable offers and zero pending transactions.
-- Accept only the exact `REGISTRY_BLOCKED` generation and `reconcile:<intent_id>` blockers for the campaign; deny any extra blocker or unrelated unresolved creation.
+- For restricted startup, require the exact `REGISTRY_BLOCKED` generation and `reconcile:<intent_id>` blockers for the campaign. The normal stopped-bot view may also operate with an allowed latch, subject to the same wallet, campaign and proof checks. Deny an extra blocker or unrelated unresolved creation in either mode.
 - Preview is read-only. Commit re-proves the entire cohort, exact owner/acquisition epoch, current heartbeat version, immutable digest and classifications before the first terminal write.
 - Keep campaign status, budgets and fee ledger unchanged. Keep the bot stopped and all ordinary mutation guards closed.
 - A partial commit retains the latch and is retried with fresh proof; already-terminal roots are displayed but never reapplied.
@@ -32,13 +32,13 @@
 
 ### Task 1: Restricted lease and recovery authority
 
-**Files:** Modify `src/catalyst/api_server.py`, `src/catalyst/database.py`, `src/catalyst/runtime_recovery.py`, `src/catalyst/mutation_gate.py`; test `tests/test_mutation_gate.py` and a new `tests/test_mixed_terminal_recovery_startup.py`.
+**Files:** Modify root `desktop_app.py`, `src/catalyst/api_server.py`, `src/catalyst/database.py`, `src/catalyst/runtime_recovery.py`, `src/catalyst/mutation_gate.py`; test `tests/test_mutation_gate.py` and a new `tests/test_mixed_terminal_recovery_startup.py`.
 
 **Interfaces:** Produce `preflight_registry_terminal_restricted_startup()` and `activate_registry_terminal_restricted_startup(authorization)` analogous to the existing refresh-abort path, with a typed authority record binding campaign/revision, network/wallet/asset, run ID/PID/host, acquisition epoch, latch generation/blockers and book digest. Produce a database compare-and-set lease adoption restricted to a proven dead prior owner. The service in Task 2 consumes this record.
 
-- [ ] **Step 1: Add failing tests.** Exact elapsed campaign, two stable complete Sage snapshots and dead prior owner allow restricted adoption; active/uncertain owner, changed blocker, changed identity/book, or extra campaign deny it. Assert the resulting process runs only heartbeat and restricted view; direct normal mutation routes remain denied.
+- [ ] **Step 1: Add failing tests.** Exact elapsed campaign, two stable complete Sage snapshots and dead prior owner allow restricted adoption; active/uncertain owner, changed blocker, changed identity/book, or extra campaign deny it. Exercise the actual root `desktop_app.py` startup dispatcher on `REGISTRY_BLOCKED` and prove it reaches only heartbeat and restricted view. Direct normal mutation routes and existing refresh-abort fee approval/cancellation routes and bridge calls remain denied. Test the allowed-latch normal stopped-bot path separately.
 - [ ] **Step 2: Run** `python -m pytest tests/test_mixed_terminal_recovery_startup.py tests/test_mutation_gate.py -q`; verify new tests fail for missing authority.
-- [ ] **Step 3: Implement** the narrow preflight, dead-owner compare-and-set and post-acquisition reproof. Release only the newly owned lease on failure. Fence run ID/PID/host and acquisition epoch while permitting heartbeat version advancement when its current value is read and compared at commit.
+- [ ] **Step 3: Implement** the narrow preflight, dead-owner compare-and-set, root desktop startup dispatch and post-acquisition reproof. Release only the newly owned lease on failure. Fence run ID/PID/host and acquisition epoch while permitting heartbeat version advancement when its current value is read and compared at commit.
 - [ ] **Step 4: Repeat Step 2 and verify the new tests pass.**
 - [ ] **Step 5: Commit** the restricted authority and tests.
 
@@ -48,7 +48,7 @@
 
 **Interfaces:** Produce `preview_terminal_offers(campaign_id: str, revision: int, authority: object) -> dict` returning the sorted intent/trade/side/tier/classification/proof-digest vector plus authority binding, latch generation and Sage live/pending counts. The preview is read-only. HTTP and bridge entrypoints call the same service and scoped guard.
 
-- [ ] **Step 1: Add failing tests.** Prove the exact one-fill/five-expiry cohort including the journal-matched `unknown` fill. Reject unsupported unknown, duplicate/missing trade ID, more than 256 roots, wrong asset/side/tier/revision, parent/child lineage, unrelated root, unresolved creation, live offer, pending transaction and changed first/second snapshot.
+- [ ] **Step 1: Add failing tests.** Prove the exact one-fill/five-expiry cohort including the journal-matched `unknown` fill under both the restricted `REGISTRY_BLOCKED` mode and the allowed-latch normal stopped-bot mode. Reject unsupported unknown, duplicate/missing trade ID, more than 256 roots, wrong asset/side/tier/revision, parent/child lineage, unrelated root, unresolved creation, live offer, pending transaction and changed first/second snapshot.
 - [ ] **Step 2: Run** `python -m pytest tests/test_mixed_terminal_recovery.py tests/test_bootstrap_api.py tests/test_bootstrap_mutation_gate.py -q`; verify missing preview fails.
 - [ ] **Step 3: Implement** complete cohort collection and two-snapshot classification through `classify_terminal_evidence`. Canonicalize immutable proof fields and authority bindings for the digest; exclude observation time. Make HTTP and direct bridge calls share the restricted proof guard without opening generic mutations.
 - [ ] **Step 4: Repeat Step 2 and verify green; assert preview makes zero DB writes and wallet mutations.**
@@ -80,13 +80,13 @@
 
 ### Task 5: Native review, package verification and Harvestr handoff
 
-**Files:** Modify `bot_gui.html` and relevant UI contract tests; update the draft PR description and local verification ledger.
+**Files:** Modify `bot_gui.html`, `src/catalyst/api_server.py`, `catalyst.spec`; create `terminal_offer_recovery.html` and `tests/test_mixed_terminal_recovery_ui.py`; update the draft PR description and local verification ledger.
 
 **Interfaces:** Restricted and normal stopped-bot views expose `Verify Terminal Offers`: preview exact cohort, show per-root result and wallet/latch binding, require an explicit database-only confirmation, then show terminal counts, pending hooks, blockers, Sage counts and campaign/bot state.
 
-- [ ] **Step 1: Add failing UI tests.** Button disabled until a complete preview; confirmation includes every outcome and no trading promise; partial failure stays in restricted view and requires a fresh preview. Existing completed/expired controls retain behavior.
+- [ ] **Step 1: Add failing UI tests.** Root desktop startup serves the actual restricted HTML when `REGISTRY_BLOCKED`; its preview/commit control is reachable through the packaged native window. The normal stopped-bot dashboard also exposes it with an allowed latch. Button disabled until a complete preview; confirmation includes every outcome and no trading promise; partial failure stays in restricted view and requires a fresh preview. Existing completed/expired controls retain behavior.
 - [ ] **Step 2: Run** `python -m pytest tests/test_bootstrap_ui_contract.py -q` and relevant Chromium UI tests; verify new assertions fail.
-- [ ] **Step 3: Implement** native presentation and wire it to the scoped preview/commit service; escape server data and use event delegation.
+- [ ] **Step 3: Implement** restricted page and normal-view presentation, route allowlist, PyInstaller asset inclusion and native startup wiring to the scoped preview/commit service; escape server data and use event delegation. Keep existing refresh-abort fee approval and cancellation controls inaccessible from this recovery mode.
 - [ ] **Step 4: Run** focused and full backend/frontend suites, Ruff, clean package and Defender; obtain independent review and run isolated packaged smoke on a disposable online copy. Resolve all material findings and repeat exact-head gates.
 - [ ] **Step 5: Before original-profile use, recheck source/hash/PID, Sage identity/balances/full offers/pending, campaign, fee ledger, lease/latch and GUI. Obtain required Windows action-time confirmation, then verify native Harvestr outcome and keep the PR draft.**
 
