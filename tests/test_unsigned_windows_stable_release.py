@@ -44,6 +44,7 @@ def test_unsigned_stable_gates_precede_publication():
         "Prove installer identity and unsigned status",
         "Install and smoke test the downloaded release",
         "Generate signed update metadata",
+        "Verify staged unsigned stable bytes",
         "Publish unsigned stable update channel",
     ]
     assert [names.index(name) for name in ordered] == sorted(
@@ -101,6 +102,10 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     assert "--channel beta" not in metadata["run"]
     assert "latest.json.sig" in metadata["run"]
     assert "unsigned windows release" in metadata["run"].lower()
+    final_check = step(steps, "Verify staged unsigned stable bytes")["run"]
+    assert "verify_unsigned_stable_assets.py" in final_check
+    assert "--source-commit $env:SOURCE_COMMIT" in final_check
+    assert 'Status -ne "NotSigned"' in final_check
     publication = step(steps, "Publish unsigned stable update channel")
     assert publication["env"]["GH_TOKEN"] == (
         "${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}"

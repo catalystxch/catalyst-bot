@@ -242,6 +242,32 @@ jobs:
           Copy-Item latest.json "update-manifest-$($env:RELEASE_REF).json"
           Copy-Item latest.json.sig "update-manifest-$($env:RELEASE_REF).json.sig"
 
+      - name: Verify staged unsigned stable bytes
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
+        run: |
+          $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne "NotSigned") {
+            throw "Final unsigned installer status changed to $($signature.Status)"
+          }
+          python scripts/verify_unsigned_stable_assets.py `
+            --installer $installer `
+            --sidecar "$installer.sha256" `
+            --manifest latest.json `
+            --signature latest.json.sig `
+            --versioned-manifest "update-manifest-$($env:RELEASE_REF).json" `
+            --versioned-signature "update-manifest-$($env:RELEASE_REF).json.sig" `
+            --release-ref $env:RELEASE_REF `
+            --source-commit $env:SOURCE_COMMIT `
+            --release-channel-repository $env:RELEASE_CHANNEL_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Final unsigned stable asset verification failed"
+          }
+
       - name: Publish unsigned stable update channel
         shell: pwsh
         env:
