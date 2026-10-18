@@ -1000,7 +1000,7 @@ def _fill_proof(
         flow
         for flow in created
         if flow
-        and flow[3] != "external"
+        and flow[3] in (None, "own")
         and flow[1] == requested_asset
         and flow[2] == intent["requested_amount"]
     ]
@@ -2610,7 +2610,7 @@ def load_authoritative_evidence(
             for entry in flows:
                 flow = _flow(entry)
                 if flow:
-                    if flow_name == "created" and flow[3] == "external":
+                    if flow[3] == "external":
                         continue
                     if (
                         flow[0] not in required_ids
@@ -2774,10 +2774,7 @@ def load_authoritative_evidence(
                             # They cannot supply authoritative coin/asset hints.
                             if type(flow) is not dict:
                                 continue
-                            if (
-                                flow_name == "created"
-                                and flow.get("address_kind") == "external"
-                            ):
+                            if flow.get("address_kind") == "external":
                                 continue
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:

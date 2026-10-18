@@ -2289,7 +2289,22 @@ def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
     """An unrelated external output cannot erase an exact owned fill receipt."""
     monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
     external_coin = "e" * 64
+    external_spent_coin = "0" * 64
     transaction = _transaction(
+        spent=[
+            {
+                "coin_id": COIN,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            },
+            {
+                "coin_id": external_spent_coin,
+                "asset_id": "xch",
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ],
         created=[
             {
                 "coin_id": RECEIVE,
@@ -2303,7 +2318,7 @@ def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
                 "amount": 123,
                 "address_kind": "external",
             },
-        ]
+        ],
     )
     coin_rows = {
         COIN: _coin(
@@ -2352,8 +2367,95 @@ def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
         _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
     )
     assert external_coin not in requested_coin_ids
+    assert external_spent_coin not in requested_coin_ids
     assert evidence["coin_records"]["complete"] is True
     assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
+def test_grouped_three_buy_transaction_proves_only_two_owned_receipts():
+    """A grouped spend cannot assign one external output to a missing CAT receipt."""
+    trades = (TRADE, OTHER_TRADE, "d" * 64)
+    inputs = (COIN, OTHER_COIN, FEE_COIN)
+    requested = (2000, 2100, 2200)
+    received = (RECEIVE, OTHER_RETURN)
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": coin_id,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            }
+            for coin_id in inputs
+        ],
+        created=[
+            {
+                "coin_id": coin_id,
+                "asset_id": ASSET,
+                "amount": amount,
+                "address_kind": "own",
+            }
+            for coin_id, amount in zip(received, requested[:2])
+        ]
+        + [
+            {
+                "coin_id": "e" * 64,
+                "asset_id": "xch",
+                "amount": requested[2],
+                "address_kind": "external",
+            }
+        ],
+    )
+    coins = {
+        coin_id: _coin(
+            coin_id,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=trade_id,
+        )
+        for coin_id, trade_id in zip(inputs, trades)
+    }
+    coins.update(
+        {
+            coin_id: _coin(
+                coin_id,
+                asset_id=ASSET,
+                amount=amount,
+                created_height=42,
+                transaction_id=TX,
+            )
+            for coin_id, amount in zip(received, requested[:2])
+        }
+    )
+    offers = [
+        _offer(
+            trade_id=trade_id,
+            selected_coin_ids=[coin_id],
+            requested=amount,
+        )
+        for trade_id, coin_id, amount in zip(trades, inputs, requested)
+    ]
+    results = [
+        _classify(
+            _evidence(offers=offers, transactions=[transaction], coins=coins),
+            intent=_intent(
+                trade_id=trade_id,
+                intent_id=f"grouped-{index}",
+                coin_ids=(coin_id,),
+                requested=str(amount),
+            ),
+        )
+        for index, (trade_id, coin_id, amount) in enumerate(
+            zip(trades, inputs, requested)
+        )
+    ]
+    assert [result["classification"] for result in results] == [
+        FILLED_PROVEN,
+        FILLED_PROVEN,
+        UNKNOWN,
+    ], results
 
 
 @pytest.mark.parametrize(
@@ -2421,7 +2523,10 @@ def test_sage_malformed_receipt_does_not_invent_coin_source_limit(
     assert _classify(evidence)["classification"] == UNKNOWN
 
 
-def test_external_output_matching_requested_asset_is_never_a_fill_receipt():
+@pytest.mark.parametrize("address_kind", ["external", "offer"])
+def test_undelivered_output_matching_requested_asset_is_never_a_fill_receipt(
+    address_kind,
+):
     external_coin = "e" * 64
     evidence = _evidence(
         transactions=[
@@ -2431,7 +2536,7 @@ def test_external_output_matching_requested_asset_is_never_a_fill_receipt():
                         "coin_id": external_coin,
                         "asset_id": ASSET,
                         "amount": 2000,
-                        "address_kind": "external",
+                        "address_kind": address_kind,
                     }
                 ]
             )
