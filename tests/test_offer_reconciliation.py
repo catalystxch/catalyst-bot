@@ -553,6 +553,46 @@ def test_exact_zero_fee_cancel_return_flow_is_proven():
     ]
 
 
+def test_external_return_cannot_prove_cancel_even_with_spoofed_owned_coin_record():
+    evidence = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "external",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    assert (
+        _classify(evidence, cancel_context=_cancel_context())["classification"]
+        == UNKNOWN
+    )
+
+
 def test_exact_post_expiry_cancel_return_proof_overrides_expired_wallet_label():
     """A cancel submitted after expiry still has an exact on-chain effect."""
 
@@ -2243,6 +2283,79 @@ def test_sage_exact_coin_heights_prove_fill_after_transaction_archive_cap(
     assert _classify(evidence)["classification"] == FILLED_PROVEN
 
 
+def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
+    monkeypatch,
+):
+    """An unrelated external output cannot erase an exact owned fill receipt."""
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    external_coin = "e" * 64
+    transaction = _transaction(
+        created=[
+            {
+                "coin_id": RECEIVE,
+                "asset_id": ASSET,
+                "amount": 2000,
+                "address_kind": "own",
+            },
+            {
+                "coin_id": external_coin,
+                "asset_id": None,
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ]
+    )
+    coin_rows = {
+        COIN: _coin(
+            COIN,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=TRADE,
+        ),
+        RECEIVE: _coin(
+            RECEIVE,
+            asset_id=ASSET,
+            amount=2000,
+            created_height=42,
+            transaction_id=TX,
+        ),
+    }
+    requested_coin_ids = []
+
+    def read_coins(ids):
+        requested_coin_ids.extend(ids)
+        return {coin_id: coin_rows[coin_id] for coin_id in ids if coin_id in coin_rows}
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": transaction,
+        },
+        get_coins_by_ids=read_coins,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert external_coin not in requested_coin_ids
+    assert evidence["coin_records"]["complete"] is True
+    assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
 @pytest.mark.parametrize(
     "malformed_receipt",
     [
@@ -2293,7 +2406,54 @@ def test_sage_malformed_receipt_does_not_invent_coin_source_limit(
     )
     assert evidence["coin_records"]["read_error"] is None
     assert evidence["coin_records"]["complete"] is True
-    assert evidence["transaction_history"]["records"][0]["created"] == [None]
+    created = evidence["transaction_history"]["records"][0]["created"]
+    if malformed_receipt is None:
+        assert created == [None]
+    else:
+        assert created == [
+            {
+                "coin_id": RECEIVE,
+                "asset_id": "xch",
+                "amount": 2000,
+                "address_kind": "external",
+            }
+        ]
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
+def test_external_output_matching_requested_asset_is_never_a_fill_receipt():
+    external_coin = "e" * 64
+    evidence = _evidence(
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": external_coin,
+                        "asset_id": ASSET,
+                        "amount": 2000,
+                        "address_kind": "external",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            external_coin: _coin(
+                external_coin,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
     assert _classify(evidence)["classification"] == UNKNOWN
 
 

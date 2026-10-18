@@ -845,7 +845,7 @@ def _flow(entry: Any) -> tuple[str, str, int, str, str, str] | None:
         not coin_id
         or not asset_id
         or amount is None
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
         or (raw_parent is not None and not parent_coin_id)
         or (raw_condition is not None and not spend_condition_id)
     ):
@@ -980,7 +980,9 @@ def _fill_proof(
     ]
     if {flow[0] for flow in selected_flows} != set(intent["selected_coin_ids"]):
         return None
-    if any(flow[1] != offered_asset for flow in selected_flows):
+    if any(
+        flow[1] != offered_asset or flow[3] == "external" for flow in selected_flows
+    ):
         return None
     if sum(flow[2] for flow in selected_flows) < intent["offered_amount"]:
         return None
@@ -997,7 +999,10 @@ def _fill_proof(
     receipts = [
         flow
         for flow in created
-        if flow and flow[1] == requested_asset and flow[2] == intent["requested_amount"]
+        if flow
+        and flow[3] != "external"
+        and flow[1] == requested_asset
+        and flow[2] == intent["requested_amount"]
     ]
     if len(receipts) != 1:
         return None
@@ -1249,6 +1254,8 @@ def _cancel_proof(
     spent = [_flow(entry) for entry in tx["spent"]]
     created = [_flow(entry) for entry in tx["created"]]
     if any(flow is None for flow in spent) or any(flow is None for flow in created):
+        return None
+    if any(flow[3] == "external" for flow in (*spent, *created)):
         return None
     spent_by_id = {flow[0]: flow for flow in spent if flow}
     if len(spent_by_id) != len(spent) or set(spent_by_id) != (
@@ -2139,7 +2146,7 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
         or not asset_present
         or not asset_id
         or not amount_text
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
     ):
         return None
     normalized = {
@@ -2603,6 +2610,8 @@ def load_authoritative_evidence(
             for entry in flows:
                 flow = _flow(entry)
                 if flow:
+                    if flow_name == "created" and flow[3] == "external":
+                        continue
                     if (
                         flow[0] not in required_ids
                         and len(required_ids) >= _MAX_COIN_RECORDS
@@ -2764,6 +2773,11 @@ def load_authoritative_evidence(
                             # terminal classifier still rejects incomplete proof.
                             # They cannot supply authoritative coin/asset hints.
                             if type(flow) is not dict:
+                                continue
+                            if (
+                                flow_name == "created"
+                                and flow.get("address_kind") == "external"
+                            ):
                                 continue
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:
