@@ -111,7 +111,9 @@ def test_exact_unsigned_bytes_defender_and_packaged_smokes():
     assert "dist/Catalyst/Catalyst.exe" in smoke
     assert "installed Catalyst.exe hash does not match unsigned bundle" in smoke
     assert "Existing-install upgrade" in smoke
-    assert "legacy executable" in smoke
+    assert "gh release download $previousTag" in smoke
+    assert "Previous release installer SHA-256 sidecar does not match" in smoke
+    assert "Previous release version must be older" in smoke
     assert "Upgraded Catalyst.exe hash does not match unsigned bundle" in smoke
 
 

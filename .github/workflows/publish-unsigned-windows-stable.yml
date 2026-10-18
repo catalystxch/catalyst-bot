@@ -156,8 +156,10 @@ jobs:
       - name: Install and smoke test the downloaded release
         shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_REF: ${{ inputs.tag }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_CHANNEL_REPOSITORY: Lowestofttim/catalyst-releases
         run: |
           $installer = Resolve-Path -LiteralPath "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
           $installDir = Join-Path $env:RUNNER_TEMP "CatalystUnsignedStable"
@@ -220,11 +222,40 @@ jobs:
           }
 
           Write-Host "Smoke test Windows Existing-install upgrade"
+          $previousJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect previous public stable release for upgrade smoke"
+          }
+          $previous = ConvertFrom-Json -InputObject ($previousJson -join "`n")
+          $previousTag = [string]$previous.tag_name
+          if ($previous.draft -or $previous.prerelease -or $previousTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Previous public stable release identity is invalid"
+          }
+          if ([version]$previousTag.Substring(1) -ge [version]$env:RELEASE_VERSION) {
+            throw "Previous release version must be older than candidate"
+          }
+          $previousDir = Join-Path $env:RUNNER_TEMP "CATalystPreviousStable"
+          New-Item -ItemType Directory -Path $previousDir -ErrorAction Stop | Out-Null
+          $previousName = "Catalyst-Setup-$previousTag.exe"
+          gh release download $previousTag `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --pattern "$previousName*" `
+            --dir $previousDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download previous public stable installer"
+          }
+          $previousInstaller = Join-Path $previousDir $previousName
+          $previousSidecar = Join-Path $previousDir "$previousName.sha256"
+          $previousDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $previousInstaller).Hash.ToLowerInvariant()
+          $previousExpected = (Get-Content -Raw -LiteralPath $previousSidecar).TrimEnd("`r", "`n")
+          if ($previousExpected -cne "$previousDigest  $previousName") {
+            throw "Previous release installer SHA-256 sidecar does not match"
+          }
           $upgradeDir = Join-Path $env:LOCALAPPDATA "Programs/CATalyst"
           if (Test-Path -LiteralPath $upgradeDir) {
             throw "Existing-install smoke target unexpectedly exists: $upgradeDir"
           }
-          $bootstrap = Start-Process -FilePath $installer -ArgumentList @(
+          $bootstrap = Start-Process -FilePath $previousInstaller -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
             "/CURRENTUSER", "/DIR=$upgradeDir"
           ) -Wait -PassThru
@@ -232,7 +263,10 @@ jobs:
             throw "Initial same-user install exited with code $($bootstrap.ExitCode)"
           }
           $upgradedExe = Join-Path $upgradeDir "Catalyst.exe"
-          Set-Content -LiteralPath $upgradedExe -Value "legacy executable"
+          $installedPreviousVersion = (Get-Item -LiteralPath $upgradedExe).VersionInfo.ProductVersion.Trim()
+          if ($installedPreviousVersion -cne $previousTag.Substring(1)) {
+            throw "Previous stable installer left unexpected version $installedPreviousVersion"
+          }
           $upgrade = Start-Process -FilePath $installer -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER"
           ) -Wait -PassThru
