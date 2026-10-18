@@ -265,6 +265,16 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             throw "Release channel tag already exists; unsigned stable releases are immutable"
           }
+          $tagRefsJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/git/matching-refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify whether the release channel tag exists"
+          }
+          $tagRefs = ConvertFrom-Json -InputObject ($tagRefsJson -join "`n")
+          foreach ($tagRef in @($tagRefs)) {
+            if ($null -ne $tagRef -and $tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)") {
+              throw "Release channel tag already exists without a release"
+            }
+          }
           gh release create $env:RELEASE_REF `
             --repo $env:RELEASE_CHANNEL_REPOSITORY `
             --title "CATalyst $($env:RELEASE_REF)" `

@@ -108,6 +108,10 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     script = publication["run"]
     assert "IsNullOrWhiteSpace" in script
     assert "Release channel tag already exists" in script
+    assert "git/matching-refs/tags/$($env:RELEASE_REF)" in script
+    assert "Release channel tag already exists without a release" in script
+    assert "Unable to verify whether the release channel tag exists" in script
+    assert '$tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)"' in script
     assert "--clobber" not in script
     assert "windows-signature" not in script
     for asset in (
@@ -122,6 +126,7 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     assert "--prerelease=false" in script
     assert "--latest=true" in script
     assert script.index("gh release view") < script.index("gh release create")
+    assert script.index("git/matching-refs") < script.index("gh release create")
     assert script.index("gh release create") < script.index("gh release upload")
     assert script.index("gh release upload") < script.index("--draft=false")
 
