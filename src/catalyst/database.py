@@ -30429,6 +30429,9 @@ def fence_mixed_terminal_commit(
             datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
             - timedelta(seconds=30)
         ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # Task 9 removes one latch blocker with each terminal root. The
+        # reviewed vector is the ceiling; the latch must equal the roots
+        # still open at this particular serialized write boundary.
         if (
             campaign["status"] != "active"
             or campaign["revision"] != safe_revision
@@ -30451,7 +30454,7 @@ def fence_mixed_terminal_commit(
             or latch["generation"] != safe_generation
             or latch["wallet_fingerprint_hash"] != safe_wallet
             or latch["network"] != safe_network
-            or set(latch_ids) != set(expected_blockers)
+            or set(latch_ids) != open_ids
             or not open_ids.issubset(set(expected_blockers))
             or f"reconcile:{safe_target}" not in open_ids
             or not 1 <= len(roots) <= 256
