@@ -955,6 +955,7 @@ def _start_owned_runtime_services() -> None:
     if (
         api_server.wallet_setup_bootstrap_active()
         or api_server._refresh_abort_recovery_active
+        or api_server._registry_terminal_recovery_active
     ):
         return
     authorization = api_server.initialize_mutation_runtime()
@@ -982,6 +983,7 @@ def start_flask_server(reservation):
     if (
         not api_server.wallet_setup_bootstrap_active()
         and not api_server._refresh_abort_recovery_active
+        and not api_server._registry_terminal_recovery_active
     ):
         api_server.create_bot()
 
@@ -1030,7 +1032,10 @@ def _create_desktop_bridge():
 
     import api_server
 
-    if api_server._refresh_abort_recovery_active:
+    if (
+        api_server._refresh_abort_recovery_active
+        or api_server._registry_terminal_recovery_active
+    ):
         return None
     from app_bridge import AppBridge
 
@@ -2050,6 +2055,13 @@ def _authorize_desktop_startup() -> bool:
                 "UNRESOLVED_OPERATIONS",
                 "REFRESH_ABORT_CLEANUP",
             } and api_server.activate_refresh_abort_restricted_startup(authorization):
+                return True
+            if (
+                authorization.get("reason_code") == "REGISTRY_BLOCKED"
+                and api_server.activate_registry_terminal_restricted_startup(
+                    authorization
+                )
+            ):
                 return True
             if api_server.activate_wallet_setup_bootstrap(authorization):
                 return True

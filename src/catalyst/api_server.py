@@ -412,6 +412,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 
 _read_only_diagnostics_active = False
 _refresh_abort_recovery_active = False
+_registry_terminal_recovery_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -4028,6 +4029,223 @@ def has_exact_refresh_abort_startup_candidate(
         return False
 
 
+def has_exact_registry_terminal_startup_candidate(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> bool:
+    """Find only a blocked, elapsed Sage campaign with exact reconcile roots.
+
+    Discovery is read-only. The later lease compare-and-set must recheck all
+    durable fields and independently prove a prior active process dead.
+    """
+
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return False
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        raw_fingerprint = getattr(cfg, "SAGE_FINGERPRINT", None)
+        if (
+            type(asset_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None
+            or type(raw_fingerprint) is not str
+            or not raw_fingerprint.isascii()
+            or not raw_fingerprint.isdigit()
+            or str(int(raw_fingerprint)) != raw_fingerprint
+        ):
+            return False
+        fingerprint = int(raw_fingerprint)
+        wallet_hash, network = _configured_mutation_binding()
+        if mutation_gate.wallet_fingerprint_hash(fingerprint) != wallet_hash:
+            return False
+        campaign = database.get_active_bootstrap_campaign(
+            asset_id, fingerprint, network
+        )
+        campaigns = database.list_active_bootstrap_campaigns_for_asset(asset_id)
+        if (
+            type(campaign) is not dict
+            or len(campaigns) != 1
+            or campaigns[0].get("campaign_id") != campaign.get("campaign_id")
+            or campaign.get("status") != "active"
+            or campaign.get("wallet_id")
+            != getattr(cfg, "CAT_WALLET_ID", campaign.get("wallet_id"))
+            or campaign.get("asset_id") != asset_id
+            or campaign.get("network") != network
+            or campaign.get("wallet_fingerprint") != fingerprint
+            or type(campaign.get("revision")) is not int
+            or campaign["revision"] < 0
+        ):
+            return False
+        expiry = datetime.fromisoformat(
+            str(campaign["expires_at"]).replace("Z", "+00:00")
+        )
+        if expiry.tzinfo is None or expiry > datetime.now(timezone.utc):
+            return False
+        purpose = f"bootstrap:{campaign['campaign_id']}:revision:{campaign['revision']}"
+        all_intents = database.get_offer_intents_for_registry()
+        roots = [row for row in all_intents if row.get("purpose") == purpose]
+        if not 1 <= len(roots) <= 256:
+            return False
+        ids = [row.get("intent_id") for row in roots]
+        trades = [row.get("sage_trade_id") for row in roots]
+        if (
+            any(type(value) is not str or not value for value in ids + trades)
+            or len(ids) != len(set(ids))
+            or len(trades) != len(set(trades))
+        ):
+            return False
+        nonterminal = {"created", "visible", "unknown"}
+        for row in roots:
+            if (
+                row.get("wallet_fingerprint_hash") != wallet_hash
+                or row.get("network") != network
+                or row.get("asset_id") != asset_id
+                or row.get("lifecycle_state") not in nonterminal | {"terminal"}
+                or row.get("parent_intent_id") is not None
+                or row.get("child_intent_id") is not None
+            ):
+                return False
+        for row in all_intents:
+            if (
+                row.get("purpose") != purpose
+                and row.get("wallet_fingerprint_hash") == wallet_hash
+                and row.get("network") == network
+                and row.get("asset_id") == asset_id
+                and row.get("lifecycle_state") != "terminal"
+            ):
+                return False
+        expected = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] != "terminal"
+        }
+        latch = database.get_runtime_safety_latch()
+        lease = database.get_runtime_mutation_lease()
+        blockers = database.get_unresolved_offer_operation_blockers()
+        latch_ids = json.loads(latch["blocking_operation_ids_json"])
+        if (
+            not expected
+            or latch.get("state") != "tripped"
+            or latch.get("reason_code") != "REGISTRY_BLOCKED"
+            or type(latch.get("generation")) is not int
+            or latch["generation"] < 1
+            or latch.get("wallet_fingerprint_hash") != wallet_hash
+            or latch.get("network") != network
+            or type(latch_ids) is not list
+            or len(latch_ids) != len(set(latch_ids))
+            or set(latch_ids) != expected
+            or {row.get("operation_id") for row in blockers} != expected
+            or type(lease) is not dict
+            or lease.get("wallet_fingerprint_hash", wallet_hash) != wallet_hash
+            or lease.get("network", network) != network
+        ):
+            return False
+        if lease.get("active") == 0:
+            return True
+        if lease.get("active") != 1:
+            return False
+        lease_expiry = datetime.fromisoformat(
+            str(lease["expires_at"]).replace("Z", "+00:00")
+        )
+        if lease_expiry.tzinfo is None:
+            return False
+        if lease_expiry <= datetime.now(timezone.utc):
+            return True
+        return bool(
+            type(allow_active_owner_run_id) is str
+            and allow_active_owner_run_id
+            and lease.get("owner_run_id") == allow_active_owner_run_id
+            and lease.get("owner_pid") == os.getpid()
+            and lease.get("owner_host") == socket.gethostname()
+        )
+    except Exception:
+        return False
+
+
+def preflight_registry_terminal_restricted_startup(
+    *, allow_active_owner_run_id: Optional[str] = None
+) -> dict[str, Any]:
+    """Read two fresh Sage observations before any restricted lease attempt."""
+
+    denied = {"eligible": False, "reason": "registry_terminal_startup_unproven"}
+    try:
+        if not has_exact_registry_terminal_startup_candidate(
+            allow_active_owner_run_id=allow_active_owner_run_id
+        ):
+            return denied
+        asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+        wallet_hash, network = _configured_mutation_binding()
+        binding = _configured_wallet_identity_binding(network)
+        if (
+            str(getattr(cfg, "WALLET_TYPE", "")).lower() != "sage"
+            or type(asset_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None
+            or type(binding) is not mutation_gate.WalletIdentityBinding
+            or binding.backend != "sage"
+            or mutation_gate.wallet_fingerprint_hash(binding.fingerprint) != wallet_hash
+        ):
+            return denied
+        first_identity, second_identity = _read_distinct_wallet_identity_snapshots(
+            wallet.get_wallet_identity
+        )
+        first_check = mutation_gate.validate_wallet_identity(binding, first_identity)
+        if first_check.get("allowed") is not True:
+            return denied
+        second_check = mutation_gate.validate_wallet_identity(
+            binding,
+            second_identity,
+            last_observed_at_utc=first_check["observed_at_utc"],
+        )
+        if second_check.get("allowed") is not True:
+            return denied
+        first_book = wallet._read_refresh_abort_cleanup_snapshot()
+        second_book = wallet._read_refresh_abort_cleanup_snapshot()
+        first_at = datetime.fromisoformat(
+            first_book["observed_at"].replace("Z", "+00:00")
+        )
+        second_at = datetime.fromisoformat(
+            second_book["observed_at"].replace("Z", "+00:00")
+        )
+        if (
+            type(first_book.get("trade_ids")) is not list
+            or type(second_book.get("trade_ids")) is not list
+            or first_book["trade_ids"]
+            or second_book["trade_ids"]
+            or type(first_book.get("pending_transaction_ids")) is not list
+            or type(second_book.get("pending_transaction_ids")) is not list
+            or first_book["pending_transaction_ids"]
+            or second_book["pending_transaction_ids"]
+            or first_at.tzinfo is None
+            or second_at.tzinfo is None
+            or second_at <= first_at
+            or not timedelta(seconds=0)
+            <= datetime.now(timezone.utc) - second_at
+            <= timedelta(seconds=30)
+        ):
+            return denied
+        campaign = database.get_active_bootstrap_campaign(
+            asset_id, binding.fingerprint, network
+        )
+        latch = database.get_runtime_safety_latch()
+        if (
+            type(campaign) is not dict
+            or type(latch) is not dict
+            or type(latch.get("generation")) is not int
+            or not has_exact_registry_terminal_startup_candidate(
+                allow_active_owner_run_id=allow_active_owner_run_id
+            )
+        ):
+            return denied
+        return {
+            "eligible": True,
+            "campaign_id": campaign["campaign_id"],
+            "revision": campaign["revision"],
+            "latch_generation": latch["generation"],
+            "blocking_operation_ids": json.loads(latch["blocking_operation_ids_json"]),
+            "wallet_snapshot": second_book,
+        }
+    except Exception:
+        return denied
+
+
 def preflight_refresh_abort_restricted_startup(
     *, allow_active_owner_run_id: Optional[str] = None
 ) -> dict[str, Any]:
@@ -4406,6 +4624,16 @@ def enforce_local_runtime_guard():
                 {"success": False, "error": "refresh_abort_recovery_only"}
             ), 423
 
+    if _registry_terminal_recovery_active:
+        recovery_routes = {
+            ("GET", "/"),
+            ("GET", "/api/safety/status"),
+        }
+        if (request.method, path) not in recovery_routes:
+            return jsonify(
+                {"success": False, "error": "registry_terminal_recovery_only"}
+            ), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -4516,6 +4744,15 @@ def serve_gui():
         response = _serve_bootstrapped_html("refresh_abort_recovery.html")
         response.headers["Cache-Control"] = "no-store"
         return response
+    if _registry_terminal_recovery_active:
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        return Response(
+            "Terminal offer recovery view is unavailable",
+            status=503,
+            mimetype="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
