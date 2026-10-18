@@ -539,6 +539,7 @@ def commit_terminal_offers(
                 "acquired_at": fresh["lease_acquired_at"],
                 "latch_generation": fresh["latch_generation"],
                 "blocking_operation_ids": fresh["blocking_operation_ids"],
+                "proof_observed_at": observed_at,
                 "target_intent_id": row["intent_id"],
                 "target_row_version": row["row_version"],
                 "target_lifecycle_state": row["lifecycle_state"],

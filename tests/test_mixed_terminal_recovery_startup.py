@@ -627,6 +627,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
             acquired_at=adopted["lease"]["acquired_at"],
             latch_generation=150,
             blocking_operation_ids=latch_blockers,
+            proof_observed_at=at,
             target_intent_id=intent_id,
             target_row_version=target["row_version"],
             target_lifecycle_state="unknown",
@@ -646,6 +647,8 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
             database.fence_mixed_terminal_commit(
                 **{**fence, "blocking_operation_ids": ["reconcile:unrelated"]}
             )
+        with pytest.raises(ValueError, match="proof.*stale"):
+            database.fence_mixed_terminal_commit(**{**fence, "proof_observed_at": old})
         if change == "mixed_visible_without_journal":
             visible_id = latch_blockers[1].removeprefix("reconcile:")
             conn.execute(
@@ -667,6 +670,53 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         conn.commit()
         with pytest.raises(ValueError, match="authority changed"):
             database.fence_mixed_terminal_commit(**fence)
+        if change == "valid":
+            # A normal stopped campaign may have an allowed latch and no
+            # reconcile blockers. It still needs the exact target/lease fence.
+            conn.execute(
+                "UPDATE runtime_mutation_lease SET heartbeat_at=? WHERE singleton_id=1",
+                (at,),
+            )
+            conn.execute(
+                "INSERT INTO offer_operation_journal (event_id,operation_id,intent_id,"
+                "operation_type,attempt,phase,outcome,request_timestamp,evidence_json,"
+                "evidence_sha256,blocks_mutation,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "registry-blocker-closed",
+                    blocker,
+                    intent_id,
+                    "RECONCILE",
+                    1,
+                    "COMPLETED",
+                    "EXPIRED_PROVEN",
+                    at,
+                    evidence,
+                    hashlib.sha256(evidence.encode()).hexdigest(),
+                    0,
+                    at,
+                ),
+            )
+            conn.execute(
+                "UPDATE offer_intents SET lifecycle_state='visible',row_version=row_version+1 "
+                "WHERE intent_id=?",
+                (intent_id,),
+            )
+            conn.execute(
+                "UPDATE runtime_safety_latch SET state='resolved',reason_code=NULL,"
+                "blocking_operation_ids_json='[]' WHERE singleton_id=1"
+            )
+            conn.commit()
+            visible = database.get_offer_intent(intent_id)
+            allowed_fence = {
+                **fence,
+                "blocking_operation_ids": [],
+                "target_row_version": visible["row_version"],
+                "target_lifecycle_state": "visible",
+            }
+            assert (
+                database.fence_mixed_terminal_commit(**allowed_fence)["lease_version"]
+                == 11
+            )
     else:
         with pytest.raises(ValueError):
             database.adopt_registry_terminal_successor(**request)

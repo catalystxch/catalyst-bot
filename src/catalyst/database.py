@@ -30345,6 +30345,7 @@ def fence_mixed_terminal_commit(
     acquired_at: Any,
     latch_generation: int,
     blocking_operation_ids: Any,
+    proof_observed_at: Any,
     target_intent_id: str,
     target_row_version: int,
     target_lifecycle_state: str,
@@ -30366,14 +30367,12 @@ def fence_mixed_terminal_commit(
     safe_host = _required_stability_text(owner_host, "owner_host")
     safe_acquired = _stability_timestamp(acquired_at, "acquired_at")
     safe_generation = _exact_integer(latch_generation, "latch_generation", minimum=1)
+    safe_proof_at = _stability_timestamp(proof_observed_at, "proof_observed_at")
     safe_target = _required_stability_text(target_intent_id, "target_intent_id")
     safe_version = _exact_integer(target_row_version, "target_row_version")
     if target_lifecycle_state not in {"created", "visible", "unknown"}:
         raise ValueError("mixed terminal target state is invalid")
-    if (
-        type(blocking_operation_ids) is not list
-        or not 1 <= len(blocking_operation_ids) <= 256
-    ):
+    if type(blocking_operation_ids) is not list or len(blocking_operation_ids) > 256:
         raise ValueError("mixed terminal blocker list is missing")
     expected_blockers = [
         _required_stability_text(value, "blocking operation id")
@@ -30387,6 +30386,11 @@ def fence_mixed_terminal_commit(
         if owns_transaction:
             conn.execute("BEGIN IMMEDIATE")
         locked_at = _stability_wall_clock()
+        proof_age = datetime.fromisoformat(
+            locked_at.replace("Z", "+00:00")
+        ) - datetime.fromisoformat(safe_proof_at.replace("Z", "+00:00"))
+        if not timedelta(seconds=-5) <= proof_age <= timedelta(seconds=30):
+            raise ValueError("mixed terminal proof is stale")
         campaign_row = conn.execute(
             "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_campaign,)
         ).fetchone()
@@ -30450,7 +30454,7 @@ def fence_mixed_terminal_commit(
         latch_ids = json.loads(latch["blocking_operation_ids_json"])
         if (
             type(latch_ids) is not list
-            or not 1 <= len(latch_ids) <= 256
+            or len(latch_ids) > 256
             or any(type(value) is not str for value in latch_ids)
             or len(latch_ids) != len(set(latch_ids))
         ):
@@ -30462,9 +30466,20 @@ def fence_mixed_terminal_commit(
             datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
             - timedelta(seconds=30)
         ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        # Task 9 removes one latch blocker with each terminal root. The
-        # reviewed vector is the ceiling; the latch must equal the roots
-        # still open at this particular serialized write boundary.
+        # Restricted recovery consumes exact blockers. A normally stopped
+        # campaign begins with a resolved latch and no blockers.
+        restricted = bool(expected_blockers)
+        latch_matches = (
+            latch["state"] == "tripped"
+            and latch["reason_code"] == "REGISTRY_BLOCKED"
+            and set(latch_ids) == open_ids
+            and open_ids.issubset(set(expected_blockers))
+            if restricted
+            else latch["state"] == "resolved"
+            and not latch_ids
+            and not unknown_ids
+            and not journal
+        )
         if (
             campaign["status"] != "active"
             or campaign["revision"] != safe_revision
@@ -30482,13 +30497,10 @@ def fence_mixed_terminal_commit(
             or lease["network"] != safe_network
             or lease["expires_at"] <= locked_at
             or heartbeat_at < earliest_heartbeat
-            or latch["state"] != "tripped"
-            or latch["reason_code"] != "REGISTRY_BLOCKED"
+            or not latch_matches
             or latch["generation"] != safe_generation
             or latch["wallet_fingerprint_hash"] != safe_wallet
             or latch["network"] != safe_network
-            or set(latch_ids) != open_ids
-            or not open_ids.issubset(set(expected_blockers))
             or f"reconcile:{safe_target}" not in open_ids
             or not 1 <= len(roots) <= 256
             or other_root is not None
