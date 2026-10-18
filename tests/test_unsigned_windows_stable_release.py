@@ -132,6 +132,10 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     script = publication["run"]
     assert "IsNullOrWhiteSpace" in script
     assert "Release channel tag already exists" in script
+    assert "gh api --include" in script
+    assert "releases/tags/$($env:RELEASE_REF)" in script
+    assert "HTTP/\\S+ 404" in script
+    assert "Unable to verify whether the release channel release exists" in script
     assert "git/matching-refs/tags/$($env:RELEASE_REF)" in script
     assert "Release channel tag already exists without a release" in script
     assert "Unable to verify whether the release channel tag exists" in script
@@ -149,7 +153,7 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     assert "--draft=false" in script
     assert "--prerelease=false" in script
     assert "--latest=true" in script
-    assert script.index("gh release view") < script.index("gh release create")
+    assert script.index("releases/tags/") < script.index("gh release create")
     assert script.index("git/matching-refs") < script.index("gh release create")
     assert script.index("gh release create") < script.index("gh release upload")
     assert script.index("gh release upload") < script.index("--draft=false")

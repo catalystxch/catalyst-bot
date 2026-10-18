@@ -300,9 +300,14 @@ jobs:
             "update-manifest-$($env:RELEASE_REF).json",
             "update-manifest-$($env:RELEASE_REF).json.sig"
           )
-          gh release view $env:RELEASE_REF --repo $env:RELEASE_CHANNEL_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseLookup = @(gh api --include "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tags/$($env:RELEASE_REF)" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          $releaseStatus = [string]($releaseLookup | Select-Object -First 1)
+          if ($releaseStatus -match '^HTTP/\S+ 200(?:\s|$)') {
             throw "Release channel tag already exists; unsigned stable releases are immutable"
+          }
+          if ($releaseStatus -notmatch '^HTTP/\S+ 404(?:\s|$)' -or $releaseExit -eq 0) {
+            throw "Unable to verify whether the release channel release exists"
           }
           $tagRefsJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/git/matching-refs/tags/$($env:RELEASE_REF)"
           if ($LASTEXITCODE -ne 0) {

@@ -226,6 +226,10 @@ def test_installer_pe_metadata_matches_signature_verifier_contract():
 def test_signed_publisher_cannot_replace_existing_release_channel_tag():
     publication = named_step("Publish verified public update channel")["run"]
     assert "Release channel tag already exists" in publication
+    assert "gh api --include" in publication
+    assert "releases/tags/$($env:RELEASE_REF)" in publication
+    assert "HTTP/\\S+ 404" in publication
+    assert "Unable to verify whether the release channel release exists" in publication
     assert "git/matching-refs/tags/" in publication
     assert "--clobber" not in publication
 
@@ -235,6 +239,9 @@ def test_signed_publisher_rejects_existing_channel_before_build_or_source_upload
         "Set up Python"
     )
     preflight = named_step("Preflight immutable release channel")["run"]
-    assert "gh release view" in preflight
+    assert "gh api --include" in preflight
+    assert "releases/tags/$($env:RELEASE_REF)" in preflight
+    assert "HTTP/\\S+ 404" in preflight
+    assert "Unable to verify whether the release channel release exists" in preflight
     assert "git/matching-refs/tags/" in preflight
     assert "Release channel tag already exists" in preflight

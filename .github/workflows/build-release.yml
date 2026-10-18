@@ -72,9 +72,14 @@ jobs:
           RELEASE_REF: ${{ inputs.tag }}
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
-          gh release view "$($env:RELEASE_REF)" --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseLookup = @(gh api --include "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/tags/$($env:RELEASE_REF)" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          $releaseStatus = [string]($releaseLookup | Select-Object -First 1)
+          if ($releaseStatus -match '^HTTP/\S+ 200(?:\s|$)') {
             throw "Release channel tag already exists; signed releases cannot replace published assets"
+          }
+          if ($releaseStatus -notmatch '^HTTP/\S+ 404(?:\s|$)' -or $releaseExit -eq 0) {
+            throw "Unable to verify whether the release channel release exists"
           }
           $tagRefsJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/git/matching-refs/tags/$($env:RELEASE_REF)"
           if ($LASTEXITCODE -ne 0) {
@@ -637,9 +642,14 @@ jobs:
             "update-manifest-$($env:RELEASE_REF).json",
             "update-manifest-$($env:RELEASE_REF).json.sig"
           )
-          gh release view "$($env:RELEASE_REF)" --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseLookup = @(gh api --include "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/tags/$($env:RELEASE_REF)" 2>&1)
+          $releaseExit = $LASTEXITCODE
+          $releaseStatus = [string]($releaseLookup | Select-Object -First 1)
+          if ($releaseStatus -match '^HTTP/\S+ 200(?:\s|$)') {
             throw "Release channel tag already exists; signed releases cannot replace published assets"
+          }
+          if ($releaseStatus -notmatch '^HTTP/\S+ 404(?:\s|$)' -or $releaseExit -eq 0) {
+            throw "Unable to verify whether the release channel release exists"
           }
           $tagRefsJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/git/matching-refs/tags/$($env:RELEASE_REF)"
           if ($LASTEXITCODE -ne 0) {
