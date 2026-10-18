@@ -108,6 +108,11 @@ def test_exact_unsigned_bytes_defender_and_packaged_smokes():
         assert script in smoke
     assert 'Status -ne "NotSigned"' in smoke
     assert "MpCmdRun.exe" in smoke
+    assert "dist/Catalyst/Catalyst.exe" in smoke
+    assert "installed Catalyst.exe hash does not match unsigned bundle" in smoke
+    assert "Existing-install upgrade" in smoke
+    assert "legacy executable" in smoke
+    assert "Upgraded Catalyst.exe hash does not match unsigned bundle" in smoke
 
 
 def test_signed_stable_manifest_and_immutable_latest_publication():
@@ -154,6 +159,11 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
         assert asset in script
     assert "--draft `" in script
     assert "gh release upload" in script
+    assert "gh release download" in script
+    assert "Get-FileHash" in script
+    assert "Draft release asset" in script
+    assert "releases/latest" in script
+    assert "older than or equal to current stable latest" in script
     assert "--draft=false" in script
     assert "--prerelease=false" in script
     assert "--latest=true" in script
@@ -161,6 +171,7 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     assert script.index("git/matching-refs") < script.index("gh release create")
     assert script.index("gh release create") < script.index("gh release upload")
     assert script.index("gh release upload") < script.index("--draft=false")
+    assert script.index("gh release download") < script.index("--draft=false")
 
 
 def test_unsigned_stable_manifest_binds_exact_source_commit(tmp_path):

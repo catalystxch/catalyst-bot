@@ -173,6 +173,7 @@ jobs:
             throw "Installer exited with code $($install.ExitCode)"
           }
           $installedExe = Join-Path $installDir "Catalyst.exe"
+          $bundleExe = "dist/Catalyst/Catalyst.exe"
           $version = (Get-Item -LiteralPath $installedExe).VersionInfo.ProductVersion.Trim()
           if ($version -ne $env:RELEASE_VERSION) {
             throw "Installed product version $version does not match $($env:RELEASE_VERSION)"
@@ -180,6 +181,11 @@ jobs:
           $signature = Get-AuthenticodeSignature -LiteralPath $installedExe
           if ($signature.Status -ne "NotSigned") {
             throw "Unsigned stable payload requires NotSigned status; found $($signature.Status)"
+          }
+          $bundleHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $bundleExe).Hash
+          $installedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedExe).Hash
+          if ($installedHash -cne $bundleHash) {
+            throw "installed Catalyst.exe hash does not match unsigned bundle"
           }
           $defender = @(
             (Join-Path $env:ProgramFiles "Windows Defender/MpCmdRun.exe")
@@ -202,6 +208,67 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Packaged desktop smoke failed" }
           python scripts/packaged_upgrade_publication_recovery_smoke.py --exe $installedExe
           if ($LASTEXITCODE -ne 0) { throw "Packaged upgrade recovery smoke failed" }
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (-not (Test-Path -LiteralPath $uninstaller)) {
+            throw "Clean install did not create an uninstaller"
+          }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Clean install uninstall exited with code $($uninstall.ExitCode)"
+          }
+
+          Write-Host "Smoke test Windows Existing-install upgrade"
+          $upgradeDir = Join-Path $env:LOCALAPPDATA "Programs/CATalyst"
+          if (Test-Path -LiteralPath $upgradeDir) {
+            throw "Existing-install smoke target unexpectedly exists: $upgradeDir"
+          }
+          $bootstrap = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            "/CURRENTUSER", "/DIR=$upgradeDir"
+          ) -Wait -PassThru
+          if ($bootstrap.ExitCode -ne 0) {
+            throw "Initial same-user install exited with code $($bootstrap.ExitCode)"
+          }
+          $upgradedExe = Join-Path $upgradeDir "Catalyst.exe"
+          Set-Content -LiteralPath $upgradedExe -Value "legacy executable"
+          $upgrade = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER"
+          ) -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) {
+            throw "Existing-install upgrade exited with code $($upgrade.ExitCode)"
+          }
+          $upgradedVersion = (Get-Item -LiteralPath $upgradedExe).VersionInfo.ProductVersion.Trim()
+          if ($upgradedVersion -ne $env:RELEASE_VERSION) {
+            throw "Existing-install upgrade left version $upgradedVersion"
+          }
+          $upgradedSignature = Get-AuthenticodeSignature -LiteralPath $upgradedExe
+          if ($upgradedSignature.Status -ne "NotSigned") {
+            throw "Existing-install upgrade payload is not unsigned"
+          }
+          $upgradedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $upgradedExe).Hash
+          if ($upgradedHash -cne $bundleHash) {
+            throw "Upgraded Catalyst.exe hash does not match unsigned bundle"
+          }
+          $shortcutPath = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/CATalyst.lnk"
+          if (-not (Test-Path -LiteralPath $shortcutPath)) {
+            throw "Existing-install upgrade did not refresh the Start Menu shortcut"
+          }
+          $shortcutTarget = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath).TargetPath
+          if ($shortcutTarget -cne $upgradedExe) {
+            throw "Existing-install shortcut targets $shortcutTarget; expected $upgradedExe"
+          }
+          $upgradeUninstaller = Join-Path $upgradeDir "unins000.exe"
+          if (-not (Test-Path -LiteralPath $upgradeUninstaller)) {
+            throw "Existing-install upgrade did not create an uninstaller"
+          }
+          $uninstall = Start-Process -FilePath $upgradeUninstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Upgrade uninstall exited with code $($uninstall.ExitCode)"
+          }
 
       - name: Generate signed update metadata
         shell: pwsh
@@ -304,6 +371,18 @@ jobs:
               throw "Release channel tag already exists as a draft or published release"
             }
           }
+          $candidateVersion = [version]$env:RELEASE_REF.Substring(1)
+          $latestJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Current stable latest release identity is invalid"
+          }
+          if ($candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
+          }
           $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
           $assets = @(
             $installer,
@@ -346,6 +425,53 @@ jobs:
             --repo $env:RELEASE_CHANNEL_REPOSITORY
           if ($LASTEXITCODE -ne 0) {
             throw "Unsigned Windows stable asset upload failed; the release remains a draft"
+          }
+          $stagedJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect staged unsigned release"
+          }
+          $staged = ConvertFrom-Json -InputObject ($stagedJson -join "`n")
+          if (-not $staged.draft -or $staged.prerelease -or $staged.tag_name -cne $env:RELEASE_REF) {
+            throw "Staged unsigned release is not the expected draft"
+          }
+          $expectedNames = @($assets | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
+          $remoteNames = @($staged.assets | ForEach-Object { $_.name } | Sort-Object)
+          if (@(Compare-Object $expectedNames $remoteNames).Count -ne 0 -or $remoteNames.Count -ne $assets.Count) {
+            throw "Draft release asset names or count differ from the verified local assets"
+          }
+          $downloadDir = Join-Path $env:RUNNER_TEMP "unsigned-stable-draft-$($env:RELEASE_REF)"
+          New-Item -ItemType Directory -Path $downloadDir -ErrorAction Stop | Out-Null
+          gh release download $env:RELEASE_REF `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --dir $downloadDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download staged unsigned release assets"
+          }
+          $downloadedNames = @(Get-ChildItem -LiteralPath $downloadDir -File | ForEach-Object { $_.Name } | Sort-Object)
+          if (@(Compare-Object $expectedNames $downloadedNames).Count -ne 0 -or $downloadedNames.Count -ne $assets.Count) {
+            throw "Draft release asset downloads differ from the verified local assets"
+          }
+          foreach ($asset in $assets) {
+            $name = Split-Path -Leaf $asset
+            $remote = @($staged.assets | Where-Object { $_.name -ceq $name })
+            $downloaded = Join-Path $downloadDir $name
+            if ($remote.Count -ne 1 -or $remote[0].size -ne (Get-Item -LiteralPath $asset).Length) {
+              throw "Draft release asset metadata differs for $name"
+            }
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash
+            $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloaded).Hash
+            if ($localHash -cne $downloadedHash) {
+              throw "Draft release asset bytes differ for $name"
+            }
+          }
+          $latestJson = gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to recheck current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$' -or
+              $candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
           }
           gh release edit $env:RELEASE_REF `
             --repo $env:RELEASE_CHANNEL_REPOSITORY `
