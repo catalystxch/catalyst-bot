@@ -221,3 +221,10 @@ def test_installer_pe_metadata_matches_signature_verifier_contract():
     assert "VersionInfoProductName={#MyAppName}" in installer
     assert "VersionInfoProductVersion={#MyAppVersion}" in installer
     assert "VersionInfoVersion={#MyAppVersion}" in installer
+
+
+def test_signed_publisher_cannot_replace_existing_release_channel_tag():
+    publication = named_step("Publish verified public update channel")["run"]
+    assert "Release channel tag already exists" in publication
+    assert "git/matching-refs/tags/" in publication
+    assert "--clobber" not in publication

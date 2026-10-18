@@ -69,6 +69,19 @@ jobs:
           "version=$($env:RELEASE_REF.TrimStart('v'))" >> $env:GITHUB_OUTPUT
           "source_commit=$tagCommit" >> $env:GITHUB_OUTPUT
 
+      - name: Stage trusted stable verification tooling
+        shell: pwsh
+        run: |
+          $trusted = Join-Path $env:RUNNER_TEMP "stable-release-tooling"
+          New-Item -ItemType Directory -Force -Path (Join-Path $trusted "scripts") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $trusted "src/catalyst") | Out-Null
+          Copy-Item -LiteralPath "scripts/verify_unsigned_stable_assets.py" `
+            -Destination (Join-Path $trusted "scripts/verify_unsigned_stable_assets.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "scripts/sign_update_manifest.py" `
+            -Destination (Join-Path $trusted "scripts/sign_update_manifest.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "src/catalyst/app_update.py" `
+            -Destination (Join-Path $trusted "src/catalyst/app_update.py") -ErrorAction Stop
+
       - name: Build unsigned Windows installer from exact release tag
         shell: pwsh
         env:
@@ -226,7 +239,7 @@ jobs:
             Set-Content -Encoding utf8 release_notes_unsigned_stable.md
           $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
           $sidecar = "$installer.sha256"
-          python scripts/sign_update_manifest.py `
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/sign_update_manifest.py") `
             --version $env:RELEASE_REF `
             --source-commit $env:SOURCE_COMMIT `
             --installer $installer `
@@ -254,7 +267,7 @@ jobs:
           if ($signature.Status -ne "NotSigned") {
             throw "Final unsigned installer status changed to $($signature.Status)"
           }
-          python scripts/verify_unsigned_stable_assets.py `
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/verify_unsigned_stable_assets.py") `
             --installer $installer `
             --sidecar "$installer.sha256" `
             --manifest latest.json `

@@ -617,13 +617,25 @@ jobs:
           )
           gh release view "$($env:RELEASE_REF)" --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload "$($env:RELEASE_REF)" @assets --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" --clobber
-          } else {
-            gh release create "$($env:RELEASE_REF)" @assets `
-              --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" `
-              --title "CATalyst $($env:RELEASE_REF)" `
-              --notes-file release_notes.md `
-              --latest
+            throw "Release channel tag already exists; signed releases cannot replace published assets"
+          }
+          $tagRefsJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/git/matching-refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify whether the release channel tag exists"
+          }
+          $tagRefs = ConvertFrom-Json -InputObject ($tagRefsJson -join "`n")
+          foreach ($tagRef in @($tagRefs)) {
+            if ($null -ne $tagRef -and $tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)") {
+              throw "Release channel tag already exists without a release"
+            }
+          }
+          gh release create "$($env:RELEASE_REF)" @assets `
+            --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" `
+            --title "CATalyst $($env:RELEASE_REF)" `
+            --notes-file release_notes.md `
+            --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to create signed public update channel release"
           }
 
   publish-release:

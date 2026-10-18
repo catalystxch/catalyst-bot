@@ -35,6 +35,25 @@ def test_unsigned_stable_release_requires_manual_exact_tag():
     assert workflow["permissions"]["contents"] == "read"
 
 
+def test_final_verifier_uses_trusted_main_tooling_after_tag_checkout():
+    _, steps = workflow_and_steps()
+    names = [item.get("name") for item in steps]
+    assert names.index("Stage trusted stable verification tooling") < names.index(
+        "Build unsigned Windows installer from exact release tag"
+    )
+    staging = step(steps, "Stage trusted stable verification tooling")["run"]
+    assert "verify_unsigned_stable_assets.py" in staging
+    assert "sign_update_manifest.py" in staging
+    assert "app_update.py" in staging
+    verification = step(steps, "Verify staged unsigned stable bytes")["run"]
+    assert (
+        "stable-release-tooling/scripts/verify_unsigned_stable_assets.py"
+        in verification
+    )
+    signing = step(steps, "Generate signed update metadata")["run"]
+    assert "stable-release-tooling/scripts/sign_update_manifest.py" in signing
+
+
 def test_unsigned_stable_gates_precede_publication():
     _, steps = workflow_and_steps()
     names = [item.get("name") for item in steps]
