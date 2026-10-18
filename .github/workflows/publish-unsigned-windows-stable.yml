@@ -77,6 +77,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $trusted "src/catalyst") | Out-Null
           Copy-Item -LiteralPath "scripts/verify_unsigned_stable_assets.py" `
             -Destination (Join-Path $trusted "scripts/verify_unsigned_stable_assets.py") -ErrorAction Stop
+          Copy-Item -LiteralPath "scripts/verify_previous_stable_installer.py" `
+            -Destination (Join-Path $trusted "scripts/verify_previous_stable_installer.py") -ErrorAction Stop
           Copy-Item -LiteralPath "scripts/sign_update_manifest.py" `
             -Destination (Join-Path $trusted "scripts/sign_update_manifest.py") -ErrorAction Stop
           Copy-Item -LiteralPath "src/catalyst/app_update.py" `
@@ -244,12 +246,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to download previous public stable installer"
           }
+          gh release download $previousTag `
+            --repo $env:RELEASE_CHANNEL_REPOSITORY `
+            --pattern "update-manifest-$previousTag.json*" `
+            --dir $previousDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download previous signed stable update manifest"
+          }
           $previousInstaller = Join-Path $previousDir $previousName
           $previousSidecar = Join-Path $previousDir "$previousName.sha256"
           $previousDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $previousInstaller).Hash.ToLowerInvariant()
           $previousExpected = (Get-Content -Raw -LiteralPath $previousSidecar).TrimEnd("`r", "`n")
           if ($previousExpected -cne "$previousDigest  $previousName") {
             throw "Previous release installer SHA-256 sidecar does not match"
+          }
+          python (Join-Path $env:RUNNER_TEMP "stable-release-tooling/scripts/verify_previous_stable_installer.py") `
+            --installer $previousInstaller `
+            --sidecar $previousSidecar `
+            --manifest (Join-Path $previousDir "update-manifest-$previousTag.json") `
+            --signature (Join-Path $previousDir "update-manifest-$previousTag.json.sig") `
+            --release-ref $previousTag
+          if ($LASTEXITCODE -ne 0) {
+            throw "Previous release installer failed signed manifest verification"
           }
           $upgradeDir = Join-Path $env:LOCALAPPDATA "Programs/CATalyst"
           if (Test-Path -LiteralPath $upgradeDir) {

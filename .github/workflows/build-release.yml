@@ -111,6 +111,18 @@ jobs:
               throw "Release channel tag already exists without a release"
             }
           }
+          $candidateVersion = [version]$env:RELEASE_REF.Substring(1)
+          $latestJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Current stable latest release identity is invalid"
+          }
+          if ($candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
+          }
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -693,6 +705,18 @@ jobs:
             if ($null -ne $tagRef -and $tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)") {
               throw "Release channel tag already exists without a release"
             }
+          }
+          $candidateVersion = [version]$env:RELEASE_REF.Substring(1)
+          $latestJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/latest"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to recheck current stable latest release"
+          }
+          $latest = ConvertFrom-Json -InputObject ($latestJson -join "`n")
+          if ($latest.draft -or $latest.prerelease -or $latest.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Current stable latest release identity is invalid"
+          }
+          if ($candidateVersion -le [version]$latest.tag_name.Substring(1)) {
+            throw "Candidate is older than or equal to current stable latest $($latest.tag_name)"
           }
           gh release create "$($env:RELEASE_REF)" @assets `
             --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" `

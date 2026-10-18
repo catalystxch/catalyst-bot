@@ -256,3 +256,15 @@ def test_signed_publisher_rejects_existing_channel_before_build_or_source_upload
     assert "Unable to verify whether the release channel release exists" in preflight
     assert "git/matching-refs/tags/" in preflight
     assert "Release channel tag already exists" in preflight
+
+
+def test_signed_publisher_rejects_older_version_at_preflight_and_publication():
+    preflight = named_step("Preflight immutable release channel")["run"]
+    publication = named_step("Publish verified public update channel")["run"]
+    for script in (preflight, publication):
+        assert "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/latest" in script
+        assert "$candidateVersion -le [version]$latest.tag_name.Substring(1)" in script
+        assert "Candidate is older than or equal to current stable latest" in script
+    assert publication.index("$candidateVersion -le") < publication.index(
+        "gh release create"
+    )

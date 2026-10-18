@@ -117,6 +117,19 @@ def test_exact_unsigned_bytes_defender_and_packaged_smokes():
     assert "Upgraded Catalyst.exe hash does not match unsigned bundle" in smoke
 
 
+def test_upgrade_smoke_authenticates_previous_installer_before_execution():
+    _, steps = workflow_and_steps()
+    staging = step(steps, "Stage trusted stable verification tooling")["run"]
+    smoke = step(steps, "Install and smoke test the downloaded release")["run"]
+    assert "verify_previous_stable_installer.py" in staging
+    assert "update-manifest-$previousTag.json" in smoke
+    assert "update-manifest-$previousTag.json.sig" in smoke
+    assert "stable-release-tooling/scripts/verify_previous_stable_installer.py" in smoke
+    assert smoke.index("verify_previous_stable_installer.py") < smoke.index(
+        "Start-Process -FilePath $previousInstaller"
+    )
+
+
 def test_signed_stable_manifest_and_immutable_latest_publication():
     _, steps = workflow_and_steps()
     metadata = step(steps, "Generate signed update metadata")
