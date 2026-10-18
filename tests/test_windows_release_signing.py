@@ -225,6 +225,10 @@ def test_installer_pe_metadata_matches_signature_verifier_contract():
 
 def test_signed_publisher_cannot_replace_existing_release_channel_tag():
     publication = named_step("Publish verified public update channel")["run"]
+    assert "gh api --paginate" in publication
+    assert "releases?per_page=100" in publication
+    assert ".permissions.push" in publication
+    assert "$releaseTag -ceq $env:RELEASE_REF" in publication
     assert "Release channel tag already exists" in publication
     assert "gh api --include" in publication
     assert "releases/tags/$($env:RELEASE_REF)" in publication
@@ -239,6 +243,13 @@ def test_signed_publisher_rejects_existing_channel_before_build_or_source_upload
         "Set up Python"
     )
     preflight = named_step("Preflight immutable release channel")["run"]
+    assert named_step("Preflight immutable release channel")["env"]["GH_TOKEN"] == (
+        "${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}"
+    )
+    assert "gh api --paginate" in preflight
+    assert "releases?per_page=100" in preflight
+    assert ".permissions.push" in preflight
+    assert "$releaseTag -ceq $env:RELEASE_REF" in preflight
     assert "gh api --include" in preflight
     assert "releases/tags/$($env:RELEASE_REF)" in preflight
     assert "HTTP/\\S+ 404" in preflight

@@ -13,6 +13,10 @@ permissions:
   actions: read
   contents: write
 
+concurrency:
+  group: catalyst-stable-release-channel
+  cancel-in-progress: false
+
 
 jobs:
   build:
@@ -68,10 +72,26 @@ jobs:
       - name: Preflight immutable release channel
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}
           RELEASE_REF: ${{ inputs.tag }}
           CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
+          $channelPush = @(gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)" --jq '.permissions.push')
+          if ($LASTEXITCODE -ne 0 -or [string]($channelPush | Select-Object -First 1) -cne 'true') {
+            throw "Release channel token must have push access to inspect draft releases"
+          }
+          $releaseTags = @(gh api --paginate --jq '.[].tag_name' "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases?per_page=100")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate release channel drafts and published releases"
+          }
+          foreach ($releaseTag in $releaseTags) {
+            if ($releaseTag -ceq $env:RELEASE_REF) {
+              throw "Release channel tag already exists as a draft or published release"
+            }
+          }
           $releaseLookup = @(gh api --include "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/tags/$($env:RELEASE_REF)" 2>&1)
           $releaseExit = $LASTEXITCODE
           $releaseStatus = [string]($releaseLookup | Select-Object -First 1)
@@ -632,6 +652,19 @@ jobs:
         run: |
           if (-not $env:GH_TOKEN) {
             throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
+          $channelPush = @(gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)" --jq '.permissions.push')
+          if ($LASTEXITCODE -ne 0 -or [string]($channelPush | Select-Object -First 1) -cne 'true') {
+            throw "Release channel token must have push access to inspect draft releases"
+          }
+          $releaseTags = @(gh api --paginate --jq '.[].tag_name' "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases?per_page=100")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate release channel drafts and published releases"
+          }
+          foreach ($releaseTag in $releaseTags) {
+            if ($releaseTag -ceq $env:RELEASE_REF) {
+              throw "Release channel tag already exists as a draft or published release"
+            }
           }
           $assets = @(
             "Catalyst-Setup-$($env:RELEASE_REF).exe",

@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-unsigned-windows-stable
+  group: catalyst-stable-release-channel
   cancel-in-progress: false
 
 jobs:
@@ -290,6 +290,19 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
             throw "CATALYST_RELEASE_CHANNEL_TOKEN is required"
+          }
+          $channelPush = @(gh api "repos/$($env:RELEASE_CHANNEL_REPOSITORY)" --jq '.permissions.push')
+          if ($LASTEXITCODE -ne 0 -or [string]($channelPush | Select-Object -First 1) -cne 'true') {
+            throw "Release channel token must have push access to inspect draft releases"
+          }
+          $releaseTags = @(gh api --paginate --jq '.[].tag_name' "repos/$($env:RELEASE_CHANNEL_REPOSITORY)/releases?per_page=100")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to enumerate release channel drafts and published releases"
+          }
+          foreach ($releaseTag in $releaseTags) {
+            if ($releaseTag -ceq $env:RELEASE_REF) {
+              throw "Release channel tag already exists as a draft or published release"
+            }
           }
           $installer = "release/Catalyst-Setup-$($env:RELEASE_REF).exe"
           $assets = @(

@@ -131,6 +131,10 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     )
     script = publication["run"]
     assert "IsNullOrWhiteSpace" in script
+    assert "gh api --paginate" in script
+    assert "releases?per_page=100" in script
+    assert ".permissions.push" in script
+    assert "$releaseTag -ceq $env:RELEASE_REF" in script
     assert "Release channel tag already exists" in script
     assert "gh api --include" in script
     assert "releases/tags/$($env:RELEASE_REF)" in script
