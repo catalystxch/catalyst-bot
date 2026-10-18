@@ -70,9 +70,14 @@ def test_signed_release_requires_manual_exact_main_tag_before_signpath():
     assert "inputs.tag" in text
     assert "+refs/heads/main:refs/remotes/origin/main" in validation
     signed_evidence = next(
-        step for step in steps if step.get("name") == "Replace and verify signed Windows installer"
+        step
+        for step in steps
+        if step.get("name") == "Replace and verify signed Windows installer"
     )
-    assert signed_evidence["env"]["SOURCE_COMMIT"] == "${{ steps.release-version.outputs.source_commit }}"
+    assert (
+        signed_evidence["env"]["SOURCE_COMMIT"]
+        == "${{ steps.release-version.outputs.source_commit }}"
+    )
 
 
 def test_unsigned_bytes_are_proven_and_smoked_before_manifest_signing():

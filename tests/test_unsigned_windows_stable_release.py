@@ -55,7 +55,9 @@ def test_source_and_wallet_effect_gates_fail_closed():
     assert "gh release view" in validation
     assert "isDraft" in validation and "isPrerelease" in validation
     assert "tagName" in validation and "throw" in validation
-    build = step(steps, "Build unsigned Windows installer from exact release tag")["run"]
+    build = step(steps, "Build unsigned Windows installer from exact release tag")[
+        "run"
+    ]
     assert "git checkout --detach" in build
     assert "git rev-parse HEAD" in build
     assert "python build.py" in build and "ISCC.exe" in build
