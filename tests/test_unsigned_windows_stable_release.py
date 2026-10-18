@@ -1,8 +1,13 @@
-"""Static release gates for the opt-in unsigned stable Windows workflow."""
+"""Release gates for the opt-in unsigned stable Windows workflow."""
 
+import hashlib
+from argparse import Namespace
 from pathlib import Path
 
+import pytest
 import yaml
+
+from scripts.sign_update_manifest import build_manifest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +124,35 @@ def test_signed_stable_manifest_and_immutable_latest_publication():
     assert script.index("gh release view") < script.index("gh release create")
     assert script.index("gh release create") < script.index("gh release upload")
     assert script.index("gh release upload") < script.index("--draft=false")
+
+
+def test_unsigned_stable_manifest_binds_exact_source_commit(tmp_path):
+    installer = tmp_path / "Catalyst-Setup-v1.5.0.exe"
+    installer.write_bytes(b"unsigned stable installer fixture")
+    digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+    sidecar = tmp_path / f"{installer.name}.sha256"
+    sidecar.write_text(f"{digest}  {installer.name}\n", encoding="utf-8")
+    args = Namespace(
+        version="v1.5.0",
+        channel="stable",
+        installer=installer,
+        sha256_file=sidecar,
+        download_base_url="https://github.com/Lowestofttim/catalyst-releases/releases/download/v1.5.0",
+        release_url="https://github.com/Lowestofttim/catalyst-releases/releases/tag/v1.5.0",
+        release_notes_file=None,
+        expires_days=90,
+        source_commit="a" * 40,
+    )
+
+    manifest = build_manifest(args)
+
+    assert manifest["channel"] == "stable"
+    assert manifest["source_commit"] == "a" * 40
+    assert manifest["platforms"]["windows-x64"]["installer"]["sha256"] == digest
+
+    args.source_commit = "b" * 39
+    with pytest.raises(ValueError, match="source commit"):
+        build_manifest(args)
 
 
 def test_signing_policy_explains_unsigned_stable_path():
