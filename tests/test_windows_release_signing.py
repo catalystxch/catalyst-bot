@@ -228,3 +228,13 @@ def test_signed_publisher_cannot_replace_existing_release_channel_tag():
     assert "Release channel tag already exists" in publication
     assert "git/matching-refs/tags/" in publication
     assert "--clobber" not in publication
+
+
+def test_signed_publisher_rejects_existing_channel_before_build_or_source_upload():
+    assert step_index("Preflight immutable release channel") < step_index(
+        "Set up Python"
+    )
+    preflight = named_step("Preflight immutable release channel")["run"]
+    assert "gh release view" in preflight
+    assert "git/matching-refs/tags/" in preflight
+    assert "Release channel tag already exists" in preflight

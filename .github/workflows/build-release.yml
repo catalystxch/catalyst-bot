@@ -65,6 +65,28 @@ jobs:
           "version=$($env:RELEASE_REF.Substring(1))" >> $env:GITHUB_OUTPUT
           "source_commit=$tagCommit" >> $env:GITHUB_OUTPUT
 
+      - name: Preflight immutable release channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.tag }}
+          CATALYST_RELEASE_CHANNEL_REPO: ${{ vars.CATALYST_RELEASE_CHANNEL_REPO || 'Lowestofttim/catalyst-releases' }}
+        run: |
+          gh release view "$($env:RELEASE_REF)" --repo "$($env:CATALYST_RELEASE_CHANNEL_REPO)" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release channel tag already exists; signed releases cannot replace published assets"
+          }
+          $tagRefsJson = gh api "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/git/matching-refs/tags/$($env:RELEASE_REF)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to verify whether the release channel tag exists"
+          }
+          $tagRefs = ConvertFrom-Json -InputObject ($tagRefsJson -join "`n")
+          foreach ($tagRef in @($tagRefs)) {
+            if ($null -ne $tagRef -and $tagRef.ref -ceq "refs/tags/$($env:RELEASE_REF)") {
+              throw "Release channel tag already exists without a release"
+            }
+          }
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
