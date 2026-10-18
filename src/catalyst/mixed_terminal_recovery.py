@@ -567,7 +567,10 @@ def commit_terminal_offers(
                 result["expired"] += 1
         latch = database.get_runtime_safety_latch()
         result["latch_state"] = latch["state"] if latch else None
-        result["remaining_blockers"] = len(
+        result["remaining_blockers"] = (
+            len(json.loads(latch["blocking_operation_ids_json"])) if latch else None
+        )
+        result["unresolved_journals"] = len(
             database.get_unresolved_offer_operation_blockers()
         )
         return result

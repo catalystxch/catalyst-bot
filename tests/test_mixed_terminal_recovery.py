@@ -184,10 +184,19 @@ def test_mixed_commit_reproves_then_applies_fill_before_expiry(
     monkeypatch.setattr(mixed_terminal_recovery, "_verified_terminal_proof", verified)
     monkeypatch.setattr(offer_reconciliation, "reconcile_offer", reconcile)
     monkeypatch.setattr(
-        database, "get_runtime_safety_latch", lambda: {"state": "tripped"}
+        database,
+        "get_runtime_safety_latch",
+        lambda: {
+            "state": "tripped" if failure_after_fill else "resolved",
+            "blocking_operation_ids_json": json.dumps(
+                [f"reconcile:{expiry_id}"] if failure_after_fill else []
+            ),
+        },
     )
     monkeypatch.setattr(
-        database, "get_unresolved_offer_operation_blockers", lambda: [{}]
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [],
     )
     with pytest.raises(ValueError, match="reviewed proof changed"):
         mixed_terminal_recovery.commit_terminal_offers(
@@ -200,7 +209,9 @@ def test_mixed_commit_reproves_then_applies_fill_before_expiry(
     assert result["expired"] == (0 if failure_after_fill else 1)
     assert result["pending_hooks"] == 1
     assert result["partial_commit"] is failure_after_fill
-    assert result["latch_state"] == "tripped"
+    assert result["latch_state"] == ("tripped" if failure_after_fill else "resolved")
+    assert result["remaining_blockers"] == (1 if failure_after_fill else 0)
+    assert result["unresolved_journals"] == 0
 
 
 def _cohort():
