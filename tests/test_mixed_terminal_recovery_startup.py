@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -283,3 +284,398 @@ def test_registry_startup_preflight_requires_two_stable_sage_reads(monkeypatch, 
         assert result["campaign_id"] == campaign_id
         assert result["revision"] == 0
         assert result["latch_generation"] == 150
+
+
+@pytest.mark.parametrize("prior", ["dead", "active", "uncertain"])
+def test_registry_successor_requires_expired_dead_prior_owner(monkeypatch, prior):
+    import database
+    import mutation_gate
+
+    now = datetime(2026, 10, 18, 8, 0, tzinfo=timezone.utc)
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(3702373391)
+    gate = mutation_gate.MutationGate(
+        run_id="new-recovery-owner",
+        owner_pid=111,
+        owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        lease_seconds=30,
+        clock=lambda: now,
+        pid_liveness=lambda _pid, _host: None if prior == "uncertain" else False,
+    )
+    current = {
+        "active": 1,
+        "lease_version": 10,
+        "owner_run_id": "prior-owner",
+        "owner_pid": 222,
+        "owner_host": "test-host",
+        "expires_at": (
+            now
+            + (timedelta(seconds=30) if prior == "active" else -timedelta(seconds=1))
+        ).isoformat(),
+    }
+    monkeypatch.setattr(gate, "_authorization_snapshot", lambda: {"lease": current})
+    monkeypatch.setattr(
+        mutation_gate, "_rotate_owner_identity_authority", lambda _gate: True
+    )
+    calls = []
+
+    def adopt(**kwargs):
+        calls.append(kwargs)
+        return {
+            "adopted": True,
+            "lease": {
+                **current,
+                "active": 1,
+                "lease_version": 11,
+                "owner_run_id": gate.run_id,
+                "acquired_at": now.isoformat(),
+                "expires_at": (now + timedelta(seconds=30)).isoformat(),
+            },
+        }
+
+    monkeypatch.setattr(
+        database, "adopt_registry_terminal_successor", adopt, raising=False
+    )
+    result = gate.acquire_registry_terminal_successor(
+        campaign_id="a" * 64,
+        revision=0,
+        asset_id="b" * 64,
+        latch_generation=150,
+        blocking_operation_ids=["reconcile:" + "c" * 64],
+        observed_trade_ids=[],
+        observed_pending_transaction_ids=[],
+        observed_at=now.isoformat(),
+    )
+    assert result["acquired"] is (prior == "dead")
+    assert len(calls) == (1 if prior == "dead" else 0)
+    if calls:
+        assert calls[0]["prior_owner_liveness_proven_dead"] is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "valid",
+        "live_owner",
+        "pid_changed",
+        "wrong_generation",
+        "extra_blocker",
+        "pending",
+        "other_root",
+    ],
+)
+def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change):
+    import database
+    import mutation_gate
+
+    database.close_connection()
+
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "registry-cas.db"))
+    database._db_initialized = False
+    database._db_initialized_path = None
+    database.init_database()
+    now = datetime.now(timezone.utc)
+    at = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    old = (
+        (now - timedelta(minutes=2))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+    campaign_id = "a" * 64
+    asset = "b" * 64
+    intent_id = "c" * 64
+    trade_id = "d" * 64
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(3702373391)
+    blocker = f"reconcile:{intent_id}"
+    coins = json.dumps(["e" * 64], separators=(",", ":"))
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO bootstrap_campaigns (campaign_id,network,wallet_type,"
+        "wallet_fingerprint,wallet_id,asset_id,anchor_price,minimum_price,"
+        "maximum_price,xch_budget,cat_budget,fee_budget_xch,subsidy_budget_xch,"
+        "created_at,expires_at,current_anchor_price,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            campaign_id,
+            "mainnet",
+            "sage",
+            3702373391,
+            2,
+            asset,
+            "0.01",
+            "0.005",
+            "0.02",
+            "10",
+            "100000",
+            "0.05",
+            "0",
+            old,
+            old,
+            "0.01",
+            old,
+        ),
+    )
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    conn.execute(
+        "INSERT INTO offer_intents (intent_id,run_id,wallet_fingerprint_hash,"
+        "network,asset_id,side,tier,purpose,offered_amount_atomic,"
+        "requested_amount_atomic,selected_coin_ids_json,selected_coin_ids_sha256,"
+        "sage_trade_id,lifecycle_state,prepared_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            intent_id,
+            "prior-owner",
+            wallet_hash,
+            "mainnet",
+            asset,
+            "buy",
+            "inner",
+            purpose,
+            "1000",
+            "2000",
+            coins,
+            hashlib.sha256(coins.encode()).hexdigest(),
+            trade_id,
+            "unknown",
+            old,
+            old,
+        ),
+    )
+    evidence = "{}"
+    conn.execute(
+        "INSERT INTO offer_operation_journal (event_id,operation_id,intent_id,"
+        "operation_type,attempt,phase,outcome,request_timestamp,evidence_json,"
+        "evidence_sha256,blocks_mutation,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "registry-blocker",
+            blocker,
+            intent_id,
+            "RECONCILE",
+            1,
+            "PREPARED",
+            "UNKNOWN",
+            old,
+            evidence,
+            hashlib.sha256(evidence.encode()).hexdigest(),
+            1,
+            old,
+        ),
+    )
+    conn.execute(
+        "UPDATE runtime_mutation_lease SET lease_version=10,active=1,"
+        "owner_run_id='prior-owner',owner_pid=222,owner_host='test-host',"
+        "wallet_fingerprint_hash=?,network='mainnet',acquired_at=?,"
+        "heartbeat_at=?,expires_at=?,updated_at=? WHERE singleton_id=1",
+        (wallet_hash, old, old, old, old),
+    )
+    conn.execute(
+        "UPDATE runtime_safety_latch SET generation=150,state='tripped',"
+        "reason_code='REGISTRY_BLOCKED',blocking_operation_ids_json=?,"
+        "wallet_fingerprint_hash=?,network='mainnet',tripped_at=?,updated_at=? "
+        "WHERE singleton_id=1",
+        (json.dumps([blocker]), wallet_hash, old, old),
+    )
+    if change == "live_owner":
+        conn.execute(
+            "UPDATE runtime_mutation_lease SET expires_at=? WHERE singleton_id=1",
+            ((now + timedelta(minutes=1)).isoformat(),),
+        )
+    elif change == "pid_changed":
+        conn.execute(
+            "UPDATE runtime_mutation_lease SET owner_pid=333 WHERE singleton_id=1"
+        )
+    elif change == "extra_blocker":
+        conn.execute(
+            "UPDATE runtime_safety_latch SET blocking_operation_ids_json=? "
+            "WHERE singleton_id=1",
+            (json.dumps([blocker, "unrelated"]),),
+        )
+    elif change == "other_root":
+        conn.execute(
+            "INSERT INTO offer_intents (intent_id,run_id,wallet_fingerprint_hash,"
+            "network,asset_id,side,tier,purpose,offered_amount_atomic,"
+            "requested_amount_atomic,selected_coin_ids_json,selected_coin_ids_sha256,"
+            "sage_trade_id,lifecycle_state,prepared_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "f" * 64,
+                "prior-owner",
+                wallet_hash,
+                "mainnet",
+                asset,
+                "sell",
+                "inner",
+                "unrelated",
+                "1000",
+                "2000",
+                coins,
+                hashlib.sha256(coins.encode()).hexdigest(),
+                "1" * 64,
+                "created",
+                old,
+                old,
+            ),
+        )
+    conn.commit()
+    before = dict(database.get_runtime_mutation_lease())
+    request = dict(
+        campaign_id=campaign_id,
+        revision=0,
+        asset_id=asset,
+        latch_generation=151 if change == "wrong_generation" else 150,
+        blocking_operation_ids=[blocker],
+        successor_owner_run_id="new-owner",
+        successor_owner_pid=111,
+        successor_owner_host="test-host",
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        expected_lease_version=10,
+        expected_prior_owner_run_id="prior-owner",
+        expected_prior_owner_pid=222,
+        expected_prior_owner_host="test-host",
+        expected_prior_acquired_at=old,
+        expected_prior_expires_at=(
+            (now + timedelta(minutes=1)).isoformat() if change == "live_owner" else old
+        ),
+        expected_prior_released_at=None,
+        lease_expires_at=now + timedelta(minutes=1),
+        prior_owner_liveness_proven_dead=True,
+        observed_trade_ids=[],
+        observed_pending_transaction_ids=["2" * 64] if change == "pending" else [],
+        observed_at=at,
+    )
+    if change == "valid":
+        adopted = database.adopt_registry_terminal_successor(**request)
+        assert adopted["adopted"] is True
+        assert adopted["lease"]["owner_run_id"] == "new-owner"
+        assert adopted["lease"]["lease_version"] == 11
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+    else:
+        with pytest.raises(ValueError):
+            database.adopt_registry_terminal_successor(**request)
+        assert dict(database.get_runtime_mutation_lease()) == before
+    database.close_connection()
+
+
+@pytest.mark.parametrize("change", ["stable", "changed_blocker", "heartbeat_failed"])
+def test_registry_restricted_activation_rechecks_and_releases_on_failure(
+    monkeypatch, change
+):
+    import api_server
+    import mutation_gate
+
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(3702373391)
+    asset = "b" * 64
+    blocker = "reconcile:" + "c" * 64
+    proof = {
+        "eligible": True,
+        "campaign_id": "a" * 64,
+        "revision": 0,
+        "latch_generation": 150,
+        "blocking_operation_ids": [blocker],
+        "wallet_snapshot": {
+            "trade_ids": [],
+            "pending_transaction_ids": [],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", False)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(CAT_ASSET_ID=asset))
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, "mainnet")
+    )
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="Harvestr",
+        fingerprint=3702373391,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _net: binding
+    )
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", lambda: object())
+    reads = []
+
+    def preflight(**kwargs):
+        reads.append(kwargs)
+        if len(reads) == 2 and change == "changed_blocker":
+            return {**proof, "blocking_operation_ids": ["reconcile:" + "d" * 64]}
+        return proof
+
+    monkeypatch.setattr(
+        api_server, "preflight_registry_terminal_restricted_startup", preflight
+    )
+    events = []
+
+    class Runtime:
+        run_id = "new-owner"
+        owner_pid = 111
+        owner_host = "test-host"
+        _lease_acquired_at = "2026-10-18T08:00:00.000000Z"
+
+        def acquire_registry_terminal_successor(self, **kwargs):
+            events.append(("adopt", kwargs))
+            return {"acquired": True}
+
+        def status(self):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "allowed": False,
+                    "reason_code": "REGISTRY_BLOCKED",
+                    "source": "durable_latch",
+                    "lease": {
+                        "active": True,
+                        "owned_by_this_run": True,
+                        "owner_run_id": self.run_id,
+                        "version": 11,
+                    },
+                }
+            )
+
+        def register_stop_handler(self, _handler):
+            events.append(("stop_handler", None))
+
+        def start_heartbeat(self):
+            events.append(("heartbeat", None))
+            return change != "heartbeat_failed"
+
+    runtime = Runtime()
+    monkeypatch.setattr(
+        api_server.database,
+        "get_runtime_mutation_lease",
+        lambda: {
+            "owner_run_id": runtime.run_id,
+            "owner_pid": runtime.owner_pid,
+            "owner_host": runtime.owner_host,
+            "acquired_at": runtime._lease_acquired_at,
+            "lease_version": 11,
+        },
+    )
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: None)
+    monkeypatch.setattr(mutation_gate, "initialize", lambda **_kw: runtime)
+    monkeypatch.setattr(
+        mutation_gate,
+        "shutdown_runtime",
+        lambda **kw: events.append(("shutdown", kw)),
+    )
+    allowed = api_server.activate_registry_terminal_restricted_startup(
+        {"allowed": False, "reason_code": "REGISTRY_BLOCKED"}
+    )
+    assert allowed is (change == "stable")
+    assert len(reads) == 2
+    assert events[0][0] == "adopt"
+    assert (
+        ("shutdown", {"release_owned_lease": True}) in events if not allowed else True
+    )
+    assert api_server._registry_terminal_recovery_active is allowed
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", False)
+    monkeypatch.setattr(api_server, "_mutation_runtime", None)
+    monkeypatch.setattr(api_server, "_mutation_runtime_db_path", None)

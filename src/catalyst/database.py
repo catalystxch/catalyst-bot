@@ -30289,6 +30289,261 @@ def list_refresh_abort_successions(abort_id: str) -> List[Dict[str, Any]]:
     return result
 
 
+def adopt_registry_terminal_successor(
+    *,
+    campaign_id: str,
+    revision: int,
+    asset_id: str,
+    latch_generation: int,
+    blocking_operation_ids: Any,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    wallet_fingerprint_hash: str,
+    network: str,
+    expected_lease_version: int,
+    expected_prior_owner_run_id: str,
+    expected_prior_owner_pid: int,
+    expected_prior_owner_host: str,
+    expected_prior_acquired_at: Any,
+    expected_prior_expires_at: Any,
+    expected_prior_released_at: Any,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_trade_ids: Any,
+    observed_pending_transaction_ids: Any,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """Adopt only an expired registry-blocked campaign for proof-only recovery.
+
+    The lease moves in one transaction after all durable authority is checked.
+    The campaign, latch, offers and fee ledger are never changed here.
+    """
+
+    safe_campaign = _reconciliation_coin_identity(campaign_id, "campaign_id")[0]
+    safe_revision = _exact_integer(revision, "revision")
+    safe_asset = _reconciliation_coin_identity(asset_id, "asset_id")[0]
+    generation = _exact_integer(latch_generation, "latch_generation", minimum=1)
+    owner = _required_stability_text(successor_owner_run_id, "successor owner")
+    pid = _exact_integer(successor_owner_pid, "successor_owner_pid", minimum=1)
+    host = _required_stability_text(successor_owner_host, "successor owner host")
+    wallet_hash = _reconciliation_coin_identity(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )[0]
+    safe_network = _required_stability_text(network, "network").lower()
+    if safe_network not in {"mainnet", "testnet"}:
+        raise ValueError("registry terminal network is invalid")
+    version = _exact_integer(
+        expected_lease_version, "expected_lease_version", minimum=1
+    )
+    prior_owner = _required_stability_text(
+        expected_prior_owner_run_id, "expected prior owner"
+    )
+    prior_pid = _exact_integer(
+        expected_prior_owner_pid, "expected_prior_owner_pid", minimum=1
+    )
+    prior_host = _required_stability_text(
+        expected_prior_owner_host, "expected prior owner host"
+    )
+    prior_acquired = _stability_timestamp(
+        expected_prior_acquired_at, "expected_prior_acquired_at"
+    )
+    prior_expires = (
+        _stability_timestamp(expected_prior_expires_at, "expected_prior_expires_at")
+        if expected_prior_expires_at is not None
+        else None
+    )
+    prior_released = (
+        _stability_timestamp(expected_prior_released_at, "expected_prior_released_at")
+        if expected_prior_released_at is not None
+        else None
+    )
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise TypeError("prior owner liveness proof must be an exact bool")
+    if (
+        type(blocking_operation_ids) is not list
+        or not 1 <= len(blocking_operation_ids) <= 256
+    ):
+        raise ValueError("complete registry blocker set is required")
+    blockers = sorted(
+        _required_stability_text(value, "blocking operation id")
+        for value in blocking_operation_ids
+    )
+    if len(blockers) != len(set(blockers)):
+        raise ValueError("duplicate registry blockers")
+    if type(observed_trade_ids) is not list or observed_trade_ids:
+        raise ValueError("registry terminal recovery requires an empty Sage offer book")
+    if (
+        type(observed_pending_transaction_ids) is not list
+        or observed_pending_transaction_ids
+    ):
+        raise ValueError(
+            "registry terminal recovery requires zero pending transactions"
+        )
+    at = _stability_timestamp(observed_at, "observed_at")
+    expiry = _stability_timestamp(lease_expires_at, "lease_expires_at")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        locked_at = _stability_wall_clock()
+        age = datetime.fromisoformat(
+            locked_at.replace("Z", "+00:00")
+        ) - datetime.fromisoformat(at.replace("Z", "+00:00"))
+        if not timedelta(seconds=-5) <= age <= timedelta(seconds=30):
+            raise ValueError("fresh Sage offer book is required")
+        if expiry <= max(at, locked_at):
+            raise ValueError("successor lease expiry is stale")
+        campaign_row = conn.execute(
+            "SELECT * FROM bootstrap_campaigns WHERE campaign_id=?", (safe_campaign,)
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if campaign_row is None or lease_row is None or latch_row is None:
+            raise ValueError("registry terminal authority is missing")
+        campaign, lease, latch = dict(campaign_row), dict(lease_row), dict(latch_row)
+        from mutation_gate import wallet_fingerprint_hash as hash_fingerprint
+
+        if (
+            campaign["status"] != "active"
+            or campaign["revision"] != safe_revision
+            or _stability_timestamp(campaign["expires_at"], "campaign expires_at")
+            > locked_at
+            or campaign["asset_id"] != safe_asset
+            or campaign["network"] != safe_network
+            or campaign["wallet_type"] != "sage"
+            or hash_fingerprint(campaign["wallet_fingerprint"]) != wallet_hash
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "REGISTRY_BLOCKED"
+            or latch["generation"] != generation
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != safe_network
+            or lease["lease_version"] != version
+            or lease["owner_run_id"] != prior_owner
+            or lease["owner_pid"] != prior_pid
+            or lease["owner_host"] != prior_host
+            or lease["acquired_at"] != prior_acquired
+            or lease["expires_at"] != prior_expires
+            or lease["released_at"] != prior_released
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != safe_network
+            or lease["owner_run_id"] == owner
+        ):
+            raise ValueError("registry terminal authority changed")
+        if lease["active"] == 1:
+            if (
+                lease["expires_at"] is None
+                or lease["expires_at"] > max(at, locked_at)
+                or lease["released_at"] is not None
+                or not prior_owner_liveness_proven_dead
+            ):
+                raise ValueError("prior registry owner is not proven stopped")
+        elif lease["active"] == 0:
+            if lease["expires_at"] is not None or lease["released_at"] is None:
+                raise ValueError("prior registry release proof is invalid")
+        else:
+            raise ValueError("prior registry lease state is invalid")
+        purpose = f"bootstrap:{safe_campaign}:revision:{safe_revision}"
+        roots = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM offer_intents WHERE purpose=? ORDER BY intent_id",
+                (purpose,),
+            ).fetchall()
+        ]
+        if not 1 <= len(roots) <= 256:
+            raise ValueError("registry terminal cohort is incomplete")
+        expected = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] != "terminal"
+        }
+        if (
+            not expected
+            or len(expected)
+            != len([row for row in roots if row["lifecycle_state"] != "terminal"])
+            or any(
+                row["wallet_fingerprint_hash"] != wallet_hash
+                or row["network"] != safe_network
+                or row["asset_id"] != safe_asset
+                or row["lifecycle_state"]
+                not in {"created", "visible", "unknown", "terminal"}
+                or row["parent_intent_id"] is not None
+                or row["child_intent_id"] is not None
+                or not row["sage_trade_id"]
+                for row in roots
+            )
+            or len({row["sage_trade_id"] for row in roots}) != len(roots)
+            or set(blockers) != expected
+            or len(json.loads(latch["blocking_operation_ids_json"])) != len(expected)
+            or set(json.loads(latch["blocking_operation_ids_json"])) != expected
+        ):
+            raise ValueError("registry terminal cohort or blockers changed")
+        other = conn.execute(
+            "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? AND network=? "
+            "AND asset_id=? AND purpose<>? AND lifecycle_state<>'terminal' LIMIT 1",
+            (wallet_hash, safe_network, safe_asset, purpose),
+        ).fetchone()
+        other_campaign = conn.execute(
+            "SELECT 1 FROM bootstrap_campaigns WHERE status='active' AND asset_id=? "
+            "AND campaign_id<>? LIMIT 1",
+            (safe_asset, safe_campaign),
+        ).fetchone()
+        journal = {
+            row["operation_id"]
+            for row in conn.execute(
+                "SELECT j.operation_id FROM offer_operation_journal j JOIN ("
+                "SELECT operation_id,MAX(sequence) sequence FROM offer_operation_journal "
+                "GROUP BY operation_id) latest ON latest.operation_id=j.operation_id "
+                "AND latest.sequence=j.sequence WHERE j.blocks_mutation=1"
+            ).fetchall()
+        }
+        if other is not None or other_campaign is not None or journal != expected:
+            raise ValueError("unrelated registry authority remains unresolved")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1,active=1,"
+            "owner_run_id=?,owner_pid=?,owner_host=?,acquired_at=?,heartbeat_at=?,"
+            "expires_at=?,released_at=NULL,updated_at=? WHERE singleton_id=1 "
+            "AND lease_version=? AND owner_run_id=?",
+            (
+                owner,
+                pid,
+                host,
+                locked_at,
+                locked_at,
+                expiry,
+                locked_at,
+                version,
+                lease["owner_run_id"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("registry lease compare-and-set failed")
+        if lease["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked', "
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (locked_at, locked_at, lease["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("registry successor lease expired during adoption")
+        successor = dict(
+            conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+        )
+        conn.commit()
+        return {"adopted": True, "lease": successor}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def adopt_refresh_abort_successor(
     *,
     abort_id: str,

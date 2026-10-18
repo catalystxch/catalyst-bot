@@ -1699,6 +1699,97 @@ class MutationGate:
                 return result
 
     @_stop_callback_boundary
+    def acquire_registry_terminal_successor(
+        self,
+        *,
+        campaign_id: str,
+        revision: int,
+        asset_id: str,
+        latch_generation: int,
+        blocking_operation_ids: list[str],
+        observed_trade_ids: list[str],
+        observed_pending_transaction_ids: list[str],
+        observed_at: Any,
+    ) -> dict[str, Any]:
+        """Adopt only an exact elapsed, blocked cohort with a dead prior owner."""
+
+        with self._lock:
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                return {"acquired": False, "reason": "active_wallet_mutations"}
+            try:
+                current = self._authorization_snapshot().get("lease")
+                if type(current) is not dict:
+                    raise ValueError("registry terminal lease authority is unavailable")
+                now = self._now()
+                prior_dead = False
+                if bool(current.get("active")):
+                    if current.get("owner_run_id") == self.run_id:
+                        return {"acquired": False, "reason": "already_owned"}
+                    if _as_utc(current.get("expires_at")) > now:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_registry_owner_active",
+                        }
+                    prior_dead = (
+                        self._pid_liveness(
+                            int(current.get("owner_pid") or 0),
+                            str(current.get("owner_host") or ""),
+                        )
+                        is False
+                    )
+                    if not prior_dead:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_owner_liveness_unproven",
+                        }
+                adopted = database.adopt_registry_terminal_successor(
+                    campaign_id=campaign_id,
+                    revision=revision,
+                    asset_id=asset_id,
+                    latch_generation=latch_generation,
+                    blocking_operation_ids=blocking_operation_ids,
+                    successor_owner_run_id=self.run_id,
+                    successor_owner_pid=self.owner_pid,
+                    successor_owner_host=self.owner_host,
+                    wallet_fingerprint_hash=self.wallet_fingerprint_hash,
+                    network=self.network,
+                    expected_lease_version=int(current["lease_version"]),
+                    expected_prior_owner_run_id=current.get("owner_run_id"),
+                    expected_prior_owner_pid=current.get("owner_pid"),
+                    expected_prior_owner_host=current.get("owner_host"),
+                    expected_prior_acquired_at=current.get("acquired_at"),
+                    expected_prior_expires_at=current.get("expires_at"),
+                    expected_prior_released_at=current.get("released_at"),
+                    lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    prior_owner_liveness_proven_dead=prior_dead,
+                    observed_trade_ids=observed_trade_ids,
+                    observed_pending_transaction_ids=observed_pending_transaction_ids,
+                    observed_at=observed_at,
+                )
+                lease = adopted["lease"]
+                result = {
+                    "acquired": adopted.get("adopted") is True,
+                    "reason": "registry_terminal_adopted",
+                    "lease": lease,
+                }
+                if result["acquired"] and _as_utc(lease["expires_at"]) <= self._now():
+                    self._set_local_block("LEASE_EXPIRED")
+                    result["acquired"] = False
+                    result["reason"] = "lease_expired"
+                if result["acquired"]:
+                    self._lease_version = int(lease["lease_version"])
+                    self._lease_acquired_at = str(lease["acquired_at"])
+                    self._read_only = False
+                    if not _rotate_owner_identity_authority(self):
+                        self._set_local_block("WALLET_IDENTITY_BINDING_INVALID")
+                self.last_acquire_result = _lease_public_result(result)
+                return self.last_acquire_result
+            except Exception:
+                result = {"acquired": False, "reason": "durable_state_unavailable"}
+                self.last_acquire_result = result
+                return result
+
+    @_stop_callback_boundary
     def acquire_recovery_successor(self, recovery_epoch: Any) -> dict[str, Any]:
         """Acquire only as an append-only successor to one frozen recovery."""
 

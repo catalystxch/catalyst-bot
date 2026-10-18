@@ -4355,6 +4355,114 @@ def preflight_refresh_abort_restricted_startup(
         return denied
 
 
+def activate_registry_terminal_restricted_startup(authorization: Any) -> bool:
+    """Adopt only one fenced terminal cohort after two independent Sage proofs."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    global _registry_terminal_recovery_active, _stability_startup_status
+
+    if (
+        type(authorization) is not dict
+        or authorization.get("allowed") is not False
+        or authorization.get("reason_code") != "REGISTRY_BLOCKED"
+    ):
+        return False
+    with _mutation_runtime_init_lock:
+        if (
+            _registry_terminal_recovery_active
+            or bot is not None
+            or mutation_gate.current_runtime() is not None
+        ):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            first = preflight_registry_terminal_restricted_startup()
+            if first.get("eligible") is not True:
+                return False
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            asset_id = getattr(cfg, "CAT_ASSET_ID", None)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            adapter_authority = get_wallet_adapter_authority()
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=adapter_authority,
+                acquire_lease=False,
+                start_heartbeat=False,
+            )
+            snapshot = first["wallet_snapshot"]
+            acquired = (
+                runtime.acquire_registry_terminal_successor(
+                    campaign_id=first["campaign_id"],
+                    revision=first["revision"],
+                    asset_id=asset_id,
+                    latch_generation=first["latch_generation"],
+                    blocking_operation_ids=first["blocking_operation_ids"],
+                    observed_trade_ids=snapshot["trade_ids"],
+                    observed_pending_transaction_ids=snapshot[
+                        "pending_transaction_ids"
+                    ],
+                    observed_at=snapshot["observed_at"],
+                ).get("acquired")
+                is True
+            )
+            if not acquired:
+                return False
+            second = preflight_registry_terminal_restricted_startup(
+                allow_active_owner_run_id=runtime.run_id
+            )
+            status = runtime.status().to_dict()
+            lease = status.get("lease") or {}
+            durable_lease = database.get_runtime_mutation_lease()
+            if (
+                second.get("eligible") is not True
+                or second.get("campaign_id") != first["campaign_id"]
+                or second.get("revision") != first["revision"]
+                or second.get("latch_generation") != first["latch_generation"]
+                or sorted(second.get("blocking_operation_ids", []))
+                != sorted(first["blocking_operation_ids"])
+                or second.get("wallet_snapshot", {}).get("trade_ids") != []
+                or second.get("wallet_snapshot", {}).get("pending_transaction_ids")
+                != []
+                or status.get("allowed") is not False
+                or status.get("reason_code") != "REGISTRY_BLOCKED"
+                or status.get("source") != "durable_latch"
+                or lease.get("active") is not True
+                or lease.get("owned_by_this_run") is not True
+                or lease.get("owner_run_id") != runtime.run_id
+                or type(durable_lease) is not dict
+                or durable_lease.get("acquired_at") != runtime._lease_acquired_at
+                or durable_lease.get("owner_run_id") != runtime.run_id
+                or durable_lease.get("owner_pid") != runtime.owner_pid
+                or durable_lease.get("owner_host") != runtime.owner_host
+                or durable_lease.get("lease_version") != lease.get("version")
+            ):
+                return False
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(
+                os.path.abspath(database.DB_PATH)
+            )
+            _stability_startup_status = _redacted_startup_status(status)
+            _registry_terminal_recovery_active = True
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated and runtime is not None:
+                mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
 def activate_refresh_abort_restricted_startup(authorization: Any) -> bool:
     """Own only the fenced cleanup profile, never normal trading authority.
 
