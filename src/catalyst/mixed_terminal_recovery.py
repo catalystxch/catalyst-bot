@@ -563,9 +563,11 @@ def commit_terminal_offers(
             classification = vector[row["intent_id"]]["classification"]
             if classification == "FILLED_PROVEN":
                 result["filled"] += 1
-                result["pending_hooks"] += len(applied.get("post_fill_hooks", {}))
             else:
                 result["expired"] += 1
+        result["pending_hooks"] = database.get_campaign_deferred_fill_hook_count(
+            campaign_id, revision
+        )
         latch = database.get_runtime_safety_latch()
         result["latch_state"] = latch["state"] if latch else None
         result["remaining_blockers"] = (

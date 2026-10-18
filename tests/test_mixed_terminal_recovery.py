@@ -198,6 +198,12 @@ def test_mixed_commit_reproves_then_applies_fill_before_expiry(
         "get_unresolved_offer_operation_blockers",
         lambda: [],
     )
+    monkeypatch.setattr(
+        database,
+        "get_campaign_deferred_fill_hook_count",
+        lambda campaign_id, revision: 4,
+        raising=False,
+    )
     with pytest.raises(ValueError, match="reviewed proof changed"):
         mixed_terminal_recovery.commit_terminal_offers(
             {**proof, "proof_digest": "e" * 64}, object()
@@ -207,7 +213,7 @@ def test_mixed_commit_reproves_then_applies_fill_before_expiry(
     assert calls == ["prove", "prove", fill_id, expiry_id]
     assert result["filled"] == 1
     assert result["expired"] == (0 if failure_after_fill else 1)
-    assert result["pending_hooks"] == 1
+    assert result["pending_hooks"] == 4
     assert result["partial_commit"] is failure_after_fill
     assert result["latch_state"] == ("tripped" if failure_after_fill else "resolved")
     assert result["remaining_blockers"] == (1 if failure_after_fill else 0)

@@ -14530,6 +14530,33 @@ def get_campaign_deferred_fill_hook_ids(campaign_id: str, revision: int) -> List
     return [int(row["fill_id"]) for row in rows]
 
 
+def get_campaign_deferred_fill_hook_count(campaign_id: str, revision: int) -> int:
+    """Count durable pending hook rows for exact authoritative campaign fills."""
+
+    fill_ids = get_campaign_deferred_fill_hook_ids(campaign_id, revision)
+    if not fill_ids:
+        return 0
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "post-fill outbox clock", require_timezone=True
+    )
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    placeholders = ",".join("?" for _ in fill_ids)
+    row = (
+        get_connection()
+        .execute(
+            f"SELECT COUNT(*) AS pending FROM offer_fill_hook_outbox "
+            f"WHERE fill_id IN ({placeholders}) "
+            "AND last_error_code IS NOT 'AUTHORITATIVE_FILL_PROOF_LOST' "
+            "AND (state='pending' OR (state='running' AND claimed_at<=?))",
+            (*fill_ids, abandoned_before),
+        )
+        .fetchone()
+    )
+    return int(row["pending"])
+
+
 def _offer_fill_hook_acknowledgement(
     fill_id: int,
     hook_name: str,
