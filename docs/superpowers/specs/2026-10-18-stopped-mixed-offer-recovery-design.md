@@ -1,6 +1,6 @@
 # Stopped campaign mixed terminal offer recovery
 
-Status: design for review. This work does not authorize a live wallet action or a public release.
+Status: approved design; implementation remains a draft. This work does not authorize a live wallet action or a public release.
 
 ## Intent and observed case
 

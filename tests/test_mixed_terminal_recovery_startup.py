@@ -101,7 +101,9 @@ def test_registry_recovery_cannot_show_normal_dashboard(monkeypatch):
         "/", headers={api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN}
     ):
         response = api_server.serve_gui()
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert b"Verify Terminal Offers" in response.data
+    assert b"Start Bot Now" not in response.data
     assert b"Bot" not in response.data
 
 

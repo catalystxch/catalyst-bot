@@ -237,6 +237,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/coin-prep/verify",
         "/api/bootstrap/status",
         "/api/bootstrap/preview_terminal",
+        "/api/bootstrap/terminal_recovery_scope",
         "/api/bootstrap/walletconnect/config",
         "/api/bootstrap/partial-capability",
         "/api/bootstrap/capabilities/partial-offers",
@@ -4762,6 +4763,7 @@ def enforce_local_runtime_guard():
         recovery_routes = {
             ("GET", "/"),
             ("GET", "/api/safety/status"),
+            ("GET", "/api/bootstrap/terminal_recovery_scope"),
             ("GET", "/api/bootstrap/preview_terminal"),
             ("POST", "/api/bootstrap/commit_terminal"),
         }
@@ -4883,12 +4885,9 @@ def serve_gui():
     if _registry_terminal_recovery_active:
         if not _has_valid_local_token():
             return Response("Unauthorized", status=401, mimetype="text/plain")
-        return Response(
-            "Terminal offer recovery view is unavailable",
-            status=503,
-            mimetype="text/plain",
-            headers={"Cache-Control": "no-store"},
-        )
+        response = _serve_bootstrapped_html("terminal_offer_recovery.html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")

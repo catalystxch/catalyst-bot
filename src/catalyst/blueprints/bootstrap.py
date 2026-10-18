@@ -819,6 +819,31 @@ def api_bootstrap_preview_completed():
             return _error(exc)
 
 
+@bp.get("/api/bootstrap/terminal_recovery_scope")
+def api_bootstrap_terminal_recovery_scope():
+    """Expose only the current fenced campaign scope to the restricted page."""
+    import api_server
+    import mutation_gate
+
+    if not api_server._registry_terminal_recovery_active:
+        return _error(BootstrapApiError("terminal_recovery_not_restricted", 423))
+    runtime = mutation_gate.current_runtime()
+    candidate = api_server.preflight_registry_terminal_restricted_startup(
+        allow_active_owner_run_id=getattr(runtime, "run_id", None)
+    )
+    if candidate.get("eligible") is not True:
+        return _error(BootstrapApiError("terminal_recovery_scope_unavailable", 409))
+    return jsonify(
+        {
+            "success": True,
+            "campaign_id": candidate["campaign_id"],
+            "revision": candidate["revision"],
+            "latch_generation": candidate["latch_generation"],
+            "blocking_count": len(candidate["blocking_operation_ids"]),
+        }
+    )
+
+
 @bp.get("/api/bootstrap/preview_terminal")
 def api_bootstrap_preview_terminal():
     """Review the exact stopped mixed cohort using current Sage evidence."""
