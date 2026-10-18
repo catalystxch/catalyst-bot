@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -297,10 +298,9 @@ def _capture_context(database_module: Any, campaign_id: str, asset_id: str):
     return campaign, intents, offers, blockers, terminal, latch, lease
 
 
-def preview_terminal_offers(
-    campaign_id: str, revision: int, authority: object
-) -> dict[str, Any]:
-    """Read and classify a complete stopped campaign without any DB write."""
+@contextmanager
+def _verified_terminal_proof(campaign_id: str, revision: int, authority: object):
+    """Hold both lifecycle locks around a complete current Sage proof."""
 
     import api_server
     import database
@@ -470,10 +470,20 @@ def preview_terminal_offers(
             "offers": vector,
         }
         encoded = json.dumps(binding_data, sort_keys=True, separators=(",", ":"))
-        return {
+        proof = {
             **binding_data,
             "proof_digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
             "sage_live_offers": 0,
             "sage_pending_transactions": 0,
             "wallet_effect_started": False,
         }
+        yield proof, evidence, roots, second_book["observed_at"]
+
+
+def preview_terminal_offers(
+    campaign_id: str, revision: int, authority: object
+) -> dict[str, Any]:
+    """Read and classify a complete stopped campaign without any DB write."""
+
+    with _verified_terminal_proof(campaign_id, revision, authority) as verified:
+        return verified[0]
