@@ -819,6 +819,36 @@ def api_bootstrap_preview_completed():
             return _error(exc)
 
 
+@bp.get("/api/bootstrap/preview_terminal")
+def api_bootstrap_preview_terminal():
+    """Review the exact stopped mixed cohort using current Sage evidence."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        if set(request.args) != {"campaign_id", "revision"}:
+            raise BootstrapApiError("invalid_exact_scope")
+        campaign_ids = request.args.getlist("campaign_id")
+        revisions = request.args.getlist("revision")
+        if (
+            len(campaign_ids) != 1
+            or len(revisions) != 1
+            or _ASSET_ID_RE.fullmatch(campaign_ids[0]) is None
+            or re.fullmatch(r"[0-9]{1,10}", revisions[0]) is None
+        ):
+            raise BootstrapApiError("invalid_exact_scope")
+        proof = mixed_terminal_recovery.preview_terminal_offers(
+            campaign_ids[0], int(revisions[0]), mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **proof})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_preview_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
 @bp.post("/api/bootstrap/reconcile_completed")
 def api_bootstrap_reconcile_completed():
     with _CAMPAIGN_LIFECYCLE_LOCK:

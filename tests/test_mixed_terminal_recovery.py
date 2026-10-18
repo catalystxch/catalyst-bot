@@ -9,6 +9,65 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_mixed_preview_http_requires_token_and_exact_scope(monkeypatch):
+    import api_server
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    authority = object()
+    calls = []
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: authority)
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", True)
+    monkeypatch.setattr(
+        mixed_terminal_recovery,
+        "preview_terminal_offers",
+        lambda campaign_id, revision, runtime: (
+            calls.append((campaign_id, revision, runtime))
+            or {"proof_digest": "b" * 64, "wallet_effect_started": False}
+        ),
+    )
+    client = api_server.app.test_client()
+    path = f"/api/bootstrap/preview_terminal?campaign_id={'a' * 64}&revision=0"
+    assert client.get(path).status_code == 401
+    headers = {api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN}
+    assert (
+        client.get(
+            "/api/bootstrap/preview_terminal?campaign_id=bad&revision=0",
+            headers=headers,
+        ).status_code
+        == 400
+    )
+    response = client.get(path, headers=headers)
+    assert response.status_code == 200
+    assert response.get_json()["proof_digest"] == "b" * 64
+    assert calls == [("a" * 64, 0, authority)]
+    assert client.get("/api/offers", headers=headers).status_code == 423
+
+
+def test_mixed_preview_bridge_uses_same_proof_service(monkeypatch):
+    import app_bridge
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    authority = object()
+    calls = []
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: authority)
+    monkeypatch.setattr(
+        mixed_terminal_recovery,
+        "preview_terminal_offers",
+        lambda campaign_id, revision, runtime: (
+            calls.append((campaign_id, revision, runtime)) or {"proof_digest": "c" * 64}
+        ),
+    )
+    result = app_bridge.AppBridge().preview_terminal_offers(
+        {"campaign_id": "a" * 64, "revision": 0}
+    )
+    assert result["success"] is True
+    assert result["proof_digest"] == "c" * 64
+    assert calls == [("a" * 64, 0, authority)]
+    assert "preview_terminal_offers" in app_bridge._APP_BRIDGE_READ_ONLY_METHODS
+
+
 CAMPAIGN_ID = "a" * 64
 ASSET_ID = "b" * 64
 WALLET_HASH = "f" * 64

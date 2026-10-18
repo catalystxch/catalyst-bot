@@ -589,6 +589,19 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    def preview_terminal_offers(self, body=None):
+        """Read exact mixed terminal proof through the native bridge."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"campaign_id", "revision"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        proof = mixed_terminal_recovery.preview_terminal_offers(
+            body["campaign_id"], body["revision"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **proof}
+
+    @_safe
     @_mutation_guard("app_bridge:reconcile_completed_bootstrap_offers")
     def reconcile_completed_bootstrap_offers(self, body=None):
         """Commit exact Task 9 fill proofs without a Sage wallet effect."""
@@ -2164,6 +2177,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "export_bootstrap_participation",
     "preview_bootstrap_campaign",
     "preview_completed_bootstrap_offers",
+    "preview_terminal_offers",
     "refresh_balances",
     "run_doctor",
     "validate_config",

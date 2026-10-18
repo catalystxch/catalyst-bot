@@ -236,6 +236,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/coins",
         "/api/coin-prep/verify",
         "/api/bootstrap/status",
+        "/api/bootstrap/preview_terminal",
         "/api/bootstrap/walletconnect/config",
         "/api/bootstrap/partial-capability",
         "/api/bootstrap/capabilities/partial-offers",
@@ -4736,6 +4737,7 @@ def enforce_local_runtime_guard():
         recovery_routes = {
             ("GET", "/"),
             ("GET", "/api/safety/status"),
+            ("GET", "/api/bootstrap/preview_terminal"),
         }
         if (request.method, path) not in recovery_routes:
             return jsonify(
