@@ -845,7 +845,7 @@ def _flow(entry: Any) -> tuple[str, str, int, str, str, str] | None:
         not coin_id
         or not asset_id
         or amount is None
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
         or (raw_parent is not None and not parent_coin_id)
         or (raw_condition is not None and not spend_condition_id)
     ):
@@ -980,7 +980,9 @@ def _fill_proof(
     ]
     if {flow[0] for flow in selected_flows} != set(intent["selected_coin_ids"]):
         return None
-    if any(flow[1] != offered_asset for flow in selected_flows):
+    if any(
+        flow[1] != offered_asset or flow[3] == "external" for flow in selected_flows
+    ):
         return None
     if sum(flow[2] for flow in selected_flows) < intent["offered_amount"]:
         return None
@@ -997,7 +999,10 @@ def _fill_proof(
     receipts = [
         flow
         for flow in created
-        if flow and flow[1] == requested_asset and flow[2] == intent["requested_amount"]
+        if flow
+        and flow[3] in (None, "own")
+        and flow[1] == requested_asset
+        and flow[2] == intent["requested_amount"]
     ]
     if len(receipts) != 1:
         return None
@@ -1249,6 +1254,8 @@ def _cancel_proof(
     spent = [_flow(entry) for entry in tx["spent"]]
     created = [_flow(entry) for entry in tx["created"]]
     if any(flow is None for flow in spent) or any(flow is None for flow in created):
+        return None
+    if any(flow[3] == "external" for flow in (*spent, *created)):
         return None
     spent_by_id = {flow[0]: flow for flow in spent if flow}
     if len(spent_by_id) != len(spent) or set(spent_by_id) != (
@@ -2139,7 +2146,7 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
         or not asset_present
         or not asset_id
         or not amount_text
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
     ):
         return None
     normalized = {
@@ -2603,6 +2610,8 @@ def load_authoritative_evidence(
             for entry in flows:
                 flow = _flow(entry)
                 if flow:
+                    if flow[3] == "external":
+                        continue
                     if (
                         flow[0] not in required_ids
                         and len(required_ids) >= _MAX_COIN_RECORDS
@@ -2764,6 +2773,8 @@ def load_authoritative_evidence(
                             # terminal classifier still rejects incomplete proof.
                             # They cannot supply authoritative coin/asset hints.
                             if type(flow) is not dict:
+                                continue
+                            if flow.get("address_kind") == "external":
                                 continue
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:
@@ -3305,7 +3316,12 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
     }
 
 
-def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str, str]:
+def _run_post_fill_hooks(
+    fill: dict[str, Any],
+    *,
+    completed_at: str,
+    authority_check: Callable[[], None] | None = None,
+) -> dict[str, str]:
     """Run post-commit hooks without allowing failures to undo proof."""
 
     import database
@@ -3318,6 +3334,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         database.block_offer_fill_hook_authority_loss(fill_id)
         return {name: "blocked" for name in database._AUTHORITATIVE_FILL_HOOKS}
     fill = current_fill
+    if authority_check is not None:
+        authority_check()
     try:
         callbacks = _post_fill_hook_callbacks(fill)
     except Exception:
@@ -3340,6 +3358,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             pass
         return results
     for hook_name, callback in callbacks.items():
+        if authority_check is not None:
+            authority_check()
         try:
             claim = database.claim_offer_fill_hook(int(fill["fill_id"]), hook_name)
         except Exception:
@@ -3405,6 +3425,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         heartbeat_thread.start()
         effect_boundary = False
         try:
+            if authority_check is not None:
+                authority_check()
             acknowledgement = callback(
                 current_fill,
                 claim_token=claim_token,
@@ -4148,8 +4170,13 @@ def reconcile_offer(
     wallet_facade: Any = None,
     now: Any = None,
     refresh_abort_id: str | None = None,
+    defer_post_fill_hooks: bool = False,
+    recovery_fence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Authorize and persist one exact reconciliation result."""
+
+    if type(defer_post_fill_hooks) is not bool:
+        raise TypeError("defer_post_fill_hooks must be an exact bool")
 
     import database
 
@@ -4180,6 +4207,11 @@ def reconcile_offer(
         cancel_context=cancel_context,
         now=observed_at,
     )
+    if recovery_fence is not None and result["classification"] not in {
+        FILLED_PROVEN,
+        EXPIRED_PROVEN,
+    }:
+        raise ValueError("mixed terminal recovery proof is not fill or expiry")
     refresh_abort = None
     if refresh_abort_id is not None:
         if result["classification"] != CANCELLED_PROVEN:
@@ -4228,6 +4260,8 @@ def reconcile_offer(
     )
     operation_id = f"reconcile:{intent['intent_id']}"
     if not decision.allowed:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery registry authority denied")
         _trip_denial_latch(
             intent,
             operation_id,
@@ -4318,6 +4352,8 @@ def reconcile_offer(
                 raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
         evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
     except Exception:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery proof encoding failed") from None
         if refresh_abort is not None:
             raise RuntimeError("refresh abort proof encoding failed")
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
@@ -4420,6 +4456,7 @@ def reconcile_offer(
             ),
             refresh_abort_id=refresh_abort_id,
             reconciled_at=observed_at,
+            recovery_fence=recovery_fence,
         )
     except ValueError as exc:
         if result["classification"] == CANCELLED_PROVEN and "Task 8" in str(exc):
@@ -4470,8 +4507,10 @@ def reconcile_offer(
                 "authoritative fill commit lost its durable fill identity"
             )
         response["fill_id"] = int(fill_id)
-        response["post_fill_hooks"] = _run_post_fill_hooks(
-            fill, completed_at=observed_at
+        response["post_fill_hooks"] = (
+            {name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS}
+            if defer_post_fill_hooks
+            else _run_post_fill_hooks(fill, completed_at=observed_at)
         )
     return response
 

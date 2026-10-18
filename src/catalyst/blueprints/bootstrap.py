@@ -819,6 +819,105 @@ def api_bootstrap_preview_completed():
             return _error(exc)
 
 
+@bp.get("/api/bootstrap/terminal_recovery_scope")
+def api_bootstrap_terminal_recovery_scope():
+    """Expose only the current fenced campaign scope to the restricted page."""
+    import api_server
+    import mutation_gate
+
+    if not api_server._registry_terminal_recovery_active:
+        return _error(BootstrapApiError("terminal_recovery_not_restricted", 423))
+    runtime = mutation_gate.current_runtime()
+    candidate = api_server.preflight_registry_terminal_restricted_startup(
+        allow_active_owner_run_id=getattr(runtime, "run_id", None)
+    )
+    if candidate.get("eligible") is not True:
+        return _error(BootstrapApiError("terminal_recovery_scope_unavailable", 409))
+    return jsonify(
+        {
+            "success": True,
+            "campaign_id": candidate["campaign_id"],
+            "revision": candidate["revision"],
+            "latch_generation": candidate["latch_generation"],
+            "blocking_count": len(candidate["blocking_operation_ids"]),
+        }
+    )
+
+
+@bp.get("/api/bootstrap/preview_terminal")
+def api_bootstrap_preview_terminal():
+    """Review the exact stopped mixed cohort using current Sage evidence."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        if set(request.args) != {"campaign_id", "revision"}:
+            raise BootstrapApiError("invalid_exact_scope")
+        campaign_ids = request.args.getlist("campaign_id")
+        revisions = request.args.getlist("revision")
+        if (
+            len(campaign_ids) != 1
+            or len(revisions) != 1
+            or _ASSET_ID_RE.fullmatch(campaign_ids[0]) is None
+            or re.fullmatch(r"[0-9]{1,10}", revisions[0]) is None
+        ):
+            raise BootstrapApiError("invalid_exact_scope")
+        proof = mixed_terminal_recovery.preview_terminal_offers(
+            campaign_ids[0], int(revisions[0]), mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **proof})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_preview_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
+@bp.post("/api/bootstrap/commit_terminal")
+def api_bootstrap_commit_terminal():
+    """Commit only a freshly reverified stopped mixed-terminal cohort."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        body = _request_body()
+        if set(body) != {"reviewed"} or type(body["reviewed"]) is not dict:
+            raise BootstrapApiError("invalid_request")
+        result = mixed_terminal_recovery.commit_terminal_offers(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **result})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_commit_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
+@bp.post("/api/bootstrap/drain_terminal_hooks")
+def api_bootstrap_drain_terminal_hooks():
+    """Deliver exact deferred fill hooks after normal authority is restored."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        body = _request_body()
+        if set(body) != {"reviewed"} or type(body["reviewed"]) is not dict:
+            raise BootstrapApiError("invalid_request")
+        result = mixed_terminal_recovery.drain_deferred_terminal_hooks(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **result})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_hook_drain_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
 @bp.post("/api/bootstrap/reconcile_completed")
 def api_bootstrap_reconcile_completed():
     with _CAMPAIGN_LIFECYCLE_LOCK:

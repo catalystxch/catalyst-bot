@@ -553,6 +553,46 @@ def test_exact_zero_fee_cancel_return_flow_is_proven():
     ]
 
 
+def test_external_return_cannot_prove_cancel_even_with_spoofed_owned_coin_record():
+    evidence = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "external",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    assert (
+        _classify(evidence, cancel_context=_cancel_context())["classification"]
+        == UNKNOWN
+    )
+
+
 def test_exact_post_expiry_cancel_return_proof_overrides_expired_wallet_label():
     """A cancel submitted after expiry still has an exact on-chain effect."""
 
@@ -2243,6 +2283,181 @@ def test_sage_exact_coin_heights_prove_fill_after_transaction_archive_cap(
     assert _classify(evidence)["classification"] == FILLED_PROVEN
 
 
+def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
+    monkeypatch,
+):
+    """An unrelated external output cannot erase an exact owned fill receipt."""
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    external_coin = "e" * 64
+    external_spent_coin = "0" * 64
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": COIN,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            },
+            {
+                "coin_id": external_spent_coin,
+                "asset_id": "xch",
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ],
+        created=[
+            {
+                "coin_id": RECEIVE,
+                "asset_id": ASSET,
+                "amount": 2000,
+                "address_kind": "own",
+            },
+            {
+                "coin_id": external_coin,
+                "asset_id": None,
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ],
+    )
+    coin_rows = {
+        COIN: _coin(
+            COIN,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=TRADE,
+        ),
+        RECEIVE: _coin(
+            RECEIVE,
+            asset_id=ASSET,
+            amount=2000,
+            created_height=42,
+            transaction_id=TX,
+        ),
+    }
+    requested_coin_ids = []
+
+    def read_coins(ids):
+        requested_coin_ids.extend(ids)
+        return {coin_id: coin_rows[coin_id] for coin_id in ids if coin_id in coin_rows}
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": transaction,
+        },
+        get_coins_by_ids=read_coins,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert external_coin not in requested_coin_ids
+    assert external_spent_coin not in requested_coin_ids
+    assert evidence["coin_records"]["complete"] is True
+    assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
+def test_grouped_three_buy_transaction_proves_only_two_owned_receipts():
+    """A grouped spend cannot assign one external output to a missing CAT receipt."""
+    trades = (TRADE, OTHER_TRADE, "d" * 64)
+    inputs = (COIN, OTHER_COIN, FEE_COIN)
+    requested = (2000, 2100, 2200)
+    received = (RECEIVE, OTHER_RETURN)
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": coin_id,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            }
+            for coin_id in inputs
+        ],
+        created=[
+            {
+                "coin_id": coin_id,
+                "asset_id": ASSET,
+                "amount": amount,
+                "address_kind": "own",
+            }
+            for coin_id, amount in zip(received, requested[:2])
+        ]
+        + [
+            {
+                "coin_id": "e" * 64,
+                "asset_id": "xch",
+                "amount": requested[2],
+                "address_kind": "external",
+            }
+        ],
+    )
+    coins = {
+        coin_id: _coin(
+            coin_id,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=trade_id,
+        )
+        for coin_id, trade_id in zip(inputs, trades)
+    }
+    coins.update(
+        {
+            coin_id: _coin(
+                coin_id,
+                asset_id=ASSET,
+                amount=amount,
+                created_height=42,
+                transaction_id=TX,
+            )
+            for coin_id, amount in zip(received, requested[:2])
+        }
+    )
+    offers = [
+        _offer(
+            trade_id=trade_id,
+            selected_coin_ids=[coin_id],
+            requested=amount,
+        )
+        for trade_id, coin_id, amount in zip(trades, inputs, requested)
+    ]
+    results = [
+        _classify(
+            _evidence(offers=offers, transactions=[transaction], coins=coins),
+            intent=_intent(
+                trade_id=trade_id,
+                intent_id=f"grouped-{index}",
+                coin_ids=(coin_id,),
+                requested=str(amount),
+            ),
+        )
+        for index, (trade_id, coin_id, amount) in enumerate(
+            zip(trades, inputs, requested)
+        )
+    ]
+    assert [result["classification"] for result in results] == [
+        FILLED_PROVEN,
+        FILLED_PROVEN,
+        UNKNOWN,
+    ], results
+
+
 @pytest.mark.parametrize(
     "malformed_receipt",
     [
@@ -2293,7 +2508,57 @@ def test_sage_malformed_receipt_does_not_invent_coin_source_limit(
     )
     assert evidence["coin_records"]["read_error"] is None
     assert evidence["coin_records"]["complete"] is True
-    assert evidence["transaction_history"]["records"][0]["created"] == [None]
+    created = evidence["transaction_history"]["records"][0]["created"]
+    if malformed_receipt is None:
+        assert created == [None]
+    else:
+        assert created == [
+            {
+                "coin_id": RECEIVE,
+                "asset_id": "xch",
+                "amount": 2000,
+                "address_kind": "external",
+            }
+        ]
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
+@pytest.mark.parametrize("address_kind", ["external", "offer"])
+def test_undelivered_output_matching_requested_asset_is_never_a_fill_receipt(
+    address_kind,
+):
+    external_coin = "e" * 64
+    evidence = _evidence(
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": external_coin,
+                        "asset_id": ASSET,
+                        "amount": 2000,
+                        "address_kind": address_kind,
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            external_coin: _coin(
+                external_coin,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
     assert _classify(evidence)["classification"] == UNKNOWN
 
 
@@ -5606,7 +5871,11 @@ def _commit_fill_without_draining_hooks(monkeypatch, *, tier: str = "inner") -> 
 
 
 def _insert_authoritative_test_fill(
-    trade_id: str, *, block_height: int = 42, side: str = "buy"
+    trade_id: str,
+    *,
+    block_height: int = 42,
+    side: str = "buy",
+    purpose: str = "authoritative_test_fill",
 ) -> dict:
     assert side in {"buy", "sell"}
     identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
@@ -5640,7 +5909,7 @@ def _insert_authoritative_test_fill(
         asset_id=ASSET,
         side=side,
         tier="inner",
-        purpose="authoritative_test_fill",
+        purpose=purpose,
         slot_key=f"slot:{intent_id}",
         generation=0,
         offered_amount_atomic=str(offered_amount),
@@ -5750,6 +6019,80 @@ def _insert_authoritative_test_fill(
     fill = database.get_authoritative_fill_by_id(committed["fill_id"])
     assert fill is not None
     return fill
+
+
+def test_campaign_deferred_hook_selector_excludes_other_fill_cohorts(
+    isolated_database,
+):
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == [
+        scoped["fill_id"]
+    ]
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+
+
+def test_campaign_deferred_hook_drain_delivers_real_callbacks_once(
+    isolated_database, monkeypatch
+):
+    from contextlib import contextmanager
+
+    import api_server
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    unrelated = _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+    proof = {
+        "campaign_id": campaign_id,
+        "revision": 0,
+        "offers": [
+            {"intent_id": scoped["intent_id"], "classification": "FILLED_PROVEN"}
+        ],
+    }
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            to_dict=lambda: {"allowed": True, "lease": {"owned_by_this_run": True}}
+        )
+    )
+
+    @contextmanager
+    def verified(*_args):
+        yield (
+            proof,
+            {},
+            [{"intent_id": scoped["intent_id"], "lifecycle_state": "terminal"}],
+            None,
+        )
+
+    monkeypatch.setattr(mixed_terminal_recovery, "_verified_terminal_proof", verified)
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", False)
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {"state": "resolved", "blocking_operation_ids_json": "[]"},
+    )
+
+    first = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert first["fill_ids"] == [scoped["fill_id"]]
+    assert first["hooks"][scoped["fill_id"]] == {
+        name: "completed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer_fill_hook_receipts(scoped["fill_id"]) == list(
+        database._AUTHORITATIVE_FILL_HOOKS
+    )
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == []
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+    assert database.get_authoritative_fill_by_id(unrelated["fill_id"]) is not None
+    assert unrelated["fill_id"] in database.get_offer_fill_hook_outbox_work()
+    second = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert second["fill_ids"] == []
 
 
 def _boost_materialization(
@@ -6090,6 +6433,40 @@ def test_callback_construction_failure_is_contained_after_proof_commit(
         (row["hook_name"], row["state"], row["last_error_code"]) for row in rows
     ] == [
         (name, "pending", "CALLBACK_CONSTRUCTION_FAILED")
+        for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
+    ]
+
+
+def test_recovery_fill_defers_all_post_fill_hooks_without_claiming(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: (_ for _ in ()).throw(AssertionError("hook constructed")),
+    )
+    result = reconcile_offer(
+        "intent-task9", evidence=_evidence(), now=AFTER, defer_post_fill_hooks=True
+    )
+    assert result["classification"] == FILLED_PROVEN
+    assert result["post_fill_hooks"] == {
+        name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state, attempt, claim_token FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? ORDER BY hook_name",
+            (result["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert [
+        (row["hook_name"], row["state"], row["attempt"], row["claim_token"])
+        for row in rows
+    ] == [
+        (name, "pending", 0, None)
         for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
     ]
 
@@ -8427,6 +8804,39 @@ def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
     assert {(row["hook_name"], row["state"]) for row in restored} == {
         (name, "completed") for name in database._AUTHORITATIVE_FILL_HOOKS
     }
+
+
+def test_deferred_hook_authority_loss_prevents_callback_construction(
+    isolated_database, monkeypatch
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("callback constructed")),
+    )
+
+    with pytest.raises(ValueError, match="normal authority lost"):
+        reconciliation._run_post_fill_hooks(
+            fill,
+            completed_at=AFTER,
+            authority_check=lambda: (_ for _ in ()).throw(
+                ValueError("normal authority lost")
+            ),
+        )
+
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name,state,attempt FROM offer_fill_hook_outbox WHERE fill_id=?",
+            (fill["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert len(rows) == len(database._AUTHORITATIVE_FILL_HOOKS)
+    assert all(row["state"] == "pending" and row["attempt"] == 0 for row in rows)
 
 
 def test_durable_pending_outbox_has_explicit_wallet_free_drain_contract(
