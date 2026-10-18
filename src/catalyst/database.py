@@ -30461,6 +30461,11 @@ def adopt_registry_terminal_successor(
             for row in roots
             if row["lifecycle_state"] != "terminal"
         }
+        expected_journal = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
+        }
         if (
             not expected
             or len(expected)
@@ -30492,16 +30497,33 @@ def adopt_registry_terminal_successor(
             "AND campaign_id<>? LIMIT 1",
             (safe_asset, safe_campaign),
         ).fetchone()
-        journal = {
-            row["operation_id"]
+        journal_rows = [
+            dict(row)
             for row in conn.execute(
-                "SELECT j.operation_id FROM offer_operation_journal j JOIN ("
+                "SELECT j.* FROM offer_operation_journal j JOIN ("
                 "SELECT operation_id,MAX(sequence) sequence FROM offer_operation_journal "
                 "GROUP BY operation_id) latest ON latest.operation_id=j.operation_id "
                 "AND latest.sequence=j.sequence WHERE j.blocks_mutation=1"
             ).fetchall()
+        ]
+        journal = {row["operation_id"]: row for row in journal_rows}
+        unknown_by_operation = {
+            f"reconcile:{row['intent_id']}": row
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
         }
-        if other is not None or other_campaign is not None or journal != expected:
+        if (
+            other is not None
+            or other_campaign is not None
+            or len(journal) != len(journal_rows)
+            or set(journal) != expected_journal
+            or any(
+                journal[operation_id]["intent_id"] != root["intent_id"]
+                or journal[operation_id]["operation_type"] != "RECONCILE"
+                or journal[operation_id]["outcome"] != "UNKNOWN"
+                for operation_id, root in unknown_by_operation.items()
+            )
+        ):
             raise ValueError("unrelated registry authority remains unresolved")
         changed = conn.execute(
             "UPDATE runtime_mutation_lease SET lease_version=lease_version+1,active=1,"

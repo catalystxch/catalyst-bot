@@ -4118,9 +4118,15 @@ def has_exact_registry_terminal_startup_candidate(
             for row in roots
             if row["lifecycle_state"] != "terminal"
         }
+        expected_journal = {
+            f"reconcile:{row['intent_id']}"
+            for row in roots
+            if row["lifecycle_state"] == "unknown"
+        }
         latch = database.get_runtime_safety_latch()
         lease = database.get_runtime_mutation_lease()
         blockers = database.get_unresolved_offer_operation_blockers()
+        blocker_by_operation = {row.get("operation_id"): row for row in blockers}
         latch_ids = json.loads(latch["blocking_operation_ids_json"])
         if (
             not expected
@@ -4133,7 +4139,24 @@ def has_exact_registry_terminal_startup_candidate(
             or type(latch_ids) is not list
             or len(latch_ids) != len(set(latch_ids))
             or set(latch_ids) != expected
-            or {row.get("operation_id") for row in blockers} != expected
+            or len(blocker_by_operation) != len(blockers)
+            or {row.get("operation_id") for row in blockers} != expected_journal
+            or any(
+                blocker_by_operation[f"reconcile:{row['intent_id']}"].get("intent_id")
+                != row["intent_id"]
+                or blocker_by_operation[f"reconcile:{row['intent_id']}"].get(
+                    "operation_type"
+                )
+                != "RECONCILE"
+                or blocker_by_operation[f"reconcile:{row['intent_id']}"].get("outcome")
+                != "UNKNOWN"
+                or blocker_by_operation[f"reconcile:{row['intent_id']}"].get(
+                    "blocks_mutation"
+                )
+                != 1
+                for row in roots
+                if row["lifecycle_state"] == "unknown"
+            )
             or type(lease) is not dict
             or lease.get("wallet_fingerprint_hash", wallet_hash) != wallet_hash
             or lease.get("network", network) != network

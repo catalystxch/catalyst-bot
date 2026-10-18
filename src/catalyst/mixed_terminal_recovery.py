@@ -107,6 +107,11 @@ def validate_mixed_terminal_cohort(
         raise ValueError("mixed terminal root identity differs")
     open_roots = [row for row in roots if row["lifecycle_state"] in _OPEN_STATES]
     expected_blockers = {f"reconcile:{row['intent_id']}" for row in open_roots}
+    expected_journal = {
+        f"reconcile:{row['intent_id']}"
+        for row in open_roots
+        if row["lifecycle_state"] == "unknown"
+    }
     if len(expected_blockers) != len(open_roots):
         raise ValueError("mixed terminal blockers are duplicated")
     if any(type(row) is not dict for row in unresolved_blockers):
@@ -130,7 +135,7 @@ def validate_mixed_terminal_cohort(
             or latch.get("network") != network
             or not expected_blockers
             or set(latch_ids) != expected_blockers
-            or set(journal) != expected_blockers
+            or set(journal) != expected_journal
         ):
             raise ValueError("mixed terminal restricted blocker set differs")
     elif latch.get("state") == "resolved":
@@ -144,12 +149,16 @@ def validate_mixed_terminal_cohort(
         raise ValueError("mixed terminal latch state is unsupported")
     for row in open_roots:
         blocker = journal.get(f"reconcile:{row['intent_id']}")
-        if restricted and (
-            blocker is None
-            or blocker.get("intent_id") != row["intent_id"]
-            or blocker.get("operation_type") != "RECONCILE"
-            or blocker.get("outcome") != "UNKNOWN"
-            or blocker.get("blocks_mutation") != 1
+        if (
+            restricted
+            and row["lifecycle_state"] == "unknown"
+            and (
+                blocker is None
+                or blocker.get("intent_id") != row["intent_id"]
+                or blocker.get("operation_type") != "RECONCILE"
+                or blocker.get("outcome") != "UNKNOWN"
+                or blocker.get("blocks_mutation") != 1
+            )
         ):
             raise ValueError("mixed terminal journal does not match the root")
     projected = {

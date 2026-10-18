@@ -112,16 +112,17 @@ def _cohort():
                 "status": "open",
             }
         )
-        blockers.append(
-            {
-                "operation_id": f"reconcile:{intent_id}",
-                "intent_id": intent_id,
-                "operation_type": "RECONCILE",
-                "phase": "PREPARED",
-                "outcome": "UNKNOWN",
-                "blocks_mutation": 1,
-            }
-        )
+        if state == "unknown":
+            blockers.append(
+                {
+                    "operation_id": f"reconcile:{intent_id}",
+                    "intent_id": intent_id,
+                    "operation_type": "RECONCILE",
+                    "phase": "PREPARED",
+                    "outcome": "UNKNOWN",
+                    "blocks_mutation": 1,
+                }
+            )
     latch = {
         "state": "tripped",
         "reason_code": "REGISTRY_BLOCKED",
@@ -144,6 +145,7 @@ def _cohort():
         "duplicate_trade",
         "missing_projection",
         "extra_blocker",
+        "unexpected_visible_journal",
         "wrong_asset",
         "lineage",
     ],
@@ -162,6 +164,14 @@ def test_mixed_cohort_requires_exact_six_roots(change):
         offers.pop()
     elif change == "extra_blocker":
         blockers.append({**blockers[0], "operation_id": "other"})
+    elif change == "unexpected_visible_journal":
+        blockers.append(
+            {
+                **blockers[0],
+                "operation_id": f"reconcile:{intents[1]['intent_id']}",
+                "intent_id": intents[1]["intent_id"],
+            }
+        )
     elif change == "wrong_asset":
         offers[0]["cat_asset_id"] = "d" * 64
     elif change == "lineage":
@@ -191,7 +201,7 @@ def test_mixed_cohort_retry_includes_proven_terminal_without_reapplying():
     offers.pop(0)
     blockers.pop(0)
     latch["blocking_operation_ids_json"] = json.dumps(
-        [row["operation_id"] for row in blockers]
+        [f"reconcile:{row['intent_id']}" for row in intents[1:]]
     )
     proof = {
         completed["sage_trade_id"]: {

@@ -15,6 +15,7 @@
 - This operation is database-only: no wallet mutation, fee, offer creation/cancellation, marketplace publication, notification, BoostManager, SweepCoordinator or Splash dispatch.
 - Campaign must be active but elapsed, bot stopped, Sage synced to exact network/fingerprint/wallet/asset, with zero live/fillable offers and zero pending transactions.
 - For restricted startup, require the exact `REGISTRY_BLOCKED` generation and `reconcile:<intent_id>` blockers for the campaign. The normal stopped-bot view may also operate with an allowed latch, subject to the same wallet, campaign and proof checks. Deny an extra blocker or unrelated unresolved creation in either mode.
+- The latch names every open root, but the unresolved journal is required only for an `unknown` root. The five `visible` Harvestr expiry roots have latch blockers without unresolved journal rows; an extra or mismatched journal still denies recovery.
 - Preview is read-only. Commit re-proves the entire cohort, exact owner/acquisition epoch, current heartbeat version, immutable digest and classifications before the first terminal write.
 - Keep campaign status, budgets and fee ledger unchanged. Keep the bot stopped and all ordinary mutation guards closed.
 - A partial commit retains the latch and is retried with fresh proof; already-terminal roots are displayed but never reapplied.

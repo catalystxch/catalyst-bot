@@ -107,7 +107,15 @@ def test_registry_recovery_cannot_show_normal_dashboard(monkeypatch):
 
 @pytest.mark.parametrize(
     "change",
-    ["valid", "extra_blocker", "wrong_asset", "not_elapsed", "other_campaign"],
+    [
+        "valid",
+        "mixed_visible_without_journal",
+        "wrong_unknown_journal",
+        "extra_blocker",
+        "wrong_asset",
+        "not_elapsed",
+        "other_campaign",
+    ],
 )
 def test_registry_startup_candidate_requires_exact_elapsed_cohort(monkeypatch, change):
     import api_server
@@ -142,6 +150,17 @@ def test_registry_startup_candidate_requires_exact_elapsed_cohort(monkeypatch, c
         "child_intent_id": None,
     }
     blockers = [f"reconcile:{intent_id}"]
+    intents = [intent]
+    if change == "mixed_visible_without_journal":
+        for index in range(5):
+            visible = {
+                **intent,
+                "intent_id": f"{index + 1:064x}",
+                "sage_trade_id": f"{index + 11:064x}",
+                "lifecycle_state": "visible",
+            }
+            intents.append(visible)
+            blockers.append(f"reconcile:{visible['intent_id']}")
     if change == "extra_blocker":
         blockers.append("create:other")
     latch = {
@@ -176,7 +195,7 @@ def test_registry_startup_candidate_requires_exact_elapsed_cohort(monkeypatch, c
             else [campaign]
         ),
     )
-    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: [intent])
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: intents)
     monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
     monkeypatch.setattr(
         database,
@@ -186,11 +205,21 @@ def test_registry_startup_candidate_requires_exact_elapsed_cohort(monkeypatch, c
     monkeypatch.setattr(
         database,
         "get_unresolved_offer_operation_blockers",
-        lambda: [{"operation_id": value} for value in blockers],
+        lambda: [
+            {
+                "operation_id": f"reconcile:{intent_id}",
+                "intent_id": intent_id,
+                "operation_type": "RECONCILE",
+                "outcome": "CONFLICT"
+                if change == "wrong_unknown_journal"
+                else "UNKNOWN",
+                "blocks_mutation": 1,
+            }
+        ],
     )
 
     result = api_server.has_exact_registry_terminal_startup_candidate()
-    assert result is (change == "valid")
+    assert result is (change in {"valid", "mixed_visible_without_journal"})
 
 
 @pytest.mark.parametrize("change", ["valid", "pending", "book_changed", "stale"])
@@ -357,6 +386,8 @@ def test_registry_successor_requires_expired_dead_prior_owner(monkeypatch, prior
     "change",
     [
         "valid",
+        "mixed_visible_without_journal",
+        "wrong_unknown_journal",
         "live_owner",
         "pid_changed",
         "wrong_generation",
@@ -388,6 +419,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
     trade_id = "d" * 64
     wallet_hash = mutation_gate.wallet_fingerprint_hash(3702373391)
     blocker = f"reconcile:{intent_id}"
+    latch_blockers = [blocker]
     coins = json.dumps(["e" * 64], separators=(",", ":"))
     conn = database.get_connection()
     conn.execute(
@@ -454,7 +486,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
             "RECONCILE",
             1,
             "PREPARED",
-            "UNKNOWN",
+            "CONFLICT" if change == "wrong_unknown_journal" else "UNKNOWN",
             old,
             evidence,
             hashlib.sha256(evidence.encode()).hexdigest(),
@@ -462,6 +494,35 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
             old,
         ),
     )
+    if change == "mixed_visible_without_journal":
+        for index in range(5):
+            visible_id = f"{index + 1:064x}"
+            latch_blockers.append(f"reconcile:{visible_id}")
+            conn.execute(
+                "INSERT INTO offer_intents (intent_id,run_id,wallet_fingerprint_hash,"
+                "network,asset_id,side,tier,purpose,offered_amount_atomic,"
+                "requested_amount_atomic,selected_coin_ids_json,selected_coin_ids_sha256,"
+                "sage_trade_id,lifecycle_state,prepared_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    visible_id,
+                    "prior-owner",
+                    wallet_hash,
+                    "mainnet",
+                    asset,
+                    "sell",
+                    "inner",
+                    purpose,
+                    "1000",
+                    "2000",
+                    coins,
+                    hashlib.sha256(coins.encode()).hexdigest(),
+                    f"{index + 11:064x}",
+                    "visible",
+                    old,
+                    old,
+                ),
+            )
     conn.execute(
         "UPDATE runtime_mutation_lease SET lease_version=10,active=1,"
         "owner_run_id='prior-owner',owner_pid=222,owner_host='test-host',"
@@ -474,7 +535,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         "reason_code='REGISTRY_BLOCKED',blocking_operation_ids_json=?,"
         "wallet_fingerprint_hash=?,network='mainnet',tripped_at=?,updated_at=? "
         "WHERE singleton_id=1",
-        (json.dumps([blocker]), wallet_hash, old, old),
+        (json.dumps(latch_blockers), wallet_hash, old, old),
     )
     if change == "live_owner":
         conn.execute(
@@ -524,7 +585,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         revision=0,
         asset_id=asset,
         latch_generation=151 if change == "wrong_generation" else 150,
-        blocking_operation_ids=[blocker],
+        blocking_operation_ids=latch_blockers,
         successor_owner_run_id="new-owner",
         successor_owner_pid=111,
         successor_owner_host="test-host",
@@ -545,7 +606,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         observed_pending_transaction_ids=["2" * 64] if change == "pending" else [],
         observed_at=at,
     )
-    if change == "valid":
+    if change in {"valid", "mixed_visible_without_journal"}:
         adopted = database.adopt_registry_terminal_successor(**request)
         assert adopted["adopted"] is True
         assert adopted["lease"]["owner_run_id"] == "new-owner"
