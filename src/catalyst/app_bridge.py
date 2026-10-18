@@ -617,6 +617,21 @@ class AppBridge:
         return {"success": True, **result}
 
     @_safe
+    def drain_deferred_terminal_hooks(self, body=None):
+        """Deliver reviewed fill hooks only after normal authority returns."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = mixed_terminal_recovery.drain_deferred_terminal_hooks(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **result}
+
+    @_safe
     @_mutation_guard("app_bridge:reconcile_completed_bootstrap_offers")
     def reconcile_completed_bootstrap_offers(self, body=None):
         """Commit exact Task 9 fill proofs without a Sage wallet effect."""
@@ -2113,6 +2128,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
 _APP_BRIDGE_CONTROL_METHODS = {
     "begin_refresh_abort",
     "commit_terminal_offers",
+    "drain_deferred_terminal_hooks",
     "cancel_next_refresh_abort_offer",
     "reconcile_refresh_abort_target",
     "complete_refresh_abort",

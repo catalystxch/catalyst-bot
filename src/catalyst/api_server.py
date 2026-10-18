@@ -395,6 +395,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     "api_open_data_folder",
     "api_open_external",
     "bootstrap.api_bootstrap_commit_terminal",
+    "bootstrap.api_bootstrap_drain_terminal_hooks",
     "bot.api_bot_stop",
     "bot.api_shutdown",
     "coin_prep.api_coin_prep_cancel",

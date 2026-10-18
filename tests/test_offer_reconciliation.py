@@ -5606,7 +5606,11 @@ def _commit_fill_without_draining_hooks(monkeypatch, *, tier: str = "inner") -> 
 
 
 def _insert_authoritative_test_fill(
-    trade_id: str, *, block_height: int = 42, side: str = "buy"
+    trade_id: str,
+    *,
+    block_height: int = 42,
+    side: str = "buy",
+    purpose: str = "authoritative_test_fill",
 ) -> dict:
     assert side in {"buy", "sell"}
     identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
@@ -5640,7 +5644,7 @@ def _insert_authoritative_test_fill(
         asset_id=ASSET,
         side=side,
         tier="inner",
-        purpose="authoritative_test_fill",
+        purpose=purpose,
         slot_key=f"slot:{intent_id}",
         generation=0,
         offered_amount_atomic=str(offered_amount),
@@ -5750,6 +5754,80 @@ def _insert_authoritative_test_fill(
     fill = database.get_authoritative_fill_by_id(committed["fill_id"])
     assert fill is not None
     return fill
+
+
+def test_campaign_deferred_hook_selector_excludes_other_fill_cohorts(
+    isolated_database,
+):
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == [
+        scoped["fill_id"]
+    ]
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+
+
+def test_campaign_deferred_hook_drain_delivers_real_callbacks_once(
+    isolated_database, monkeypatch
+):
+    from contextlib import contextmanager
+
+    import api_server
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    unrelated = _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+    proof = {
+        "campaign_id": campaign_id,
+        "revision": 0,
+        "offers": [
+            {"intent_id": scoped["intent_id"], "classification": "FILLED_PROVEN"}
+        ],
+    }
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            to_dict=lambda: {"allowed": True, "lease": {"owned_by_this_run": True}}
+        )
+    )
+
+    @contextmanager
+    def verified(*_args):
+        yield (
+            proof,
+            {},
+            [{"intent_id": scoped["intent_id"], "lifecycle_state": "terminal"}],
+            None,
+        )
+
+    monkeypatch.setattr(mixed_terminal_recovery, "_verified_terminal_proof", verified)
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", False)
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {"state": "resolved", "blocking_operation_ids_json": "[]"},
+    )
+
+    first = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert first["fill_ids"] == [scoped["fill_id"]]
+    assert first["hooks"][scoped["fill_id"]] == {
+        name: "completed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer_fill_hook_receipts(scoped["fill_id"]) == list(
+        database._AUTHORITATIVE_FILL_HOOKS
+    )
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == []
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+    assert database.get_authoritative_fill_by_id(unrelated["fill_id"]) is not None
+    assert unrelated["fill_id"] in database.get_offer_fill_hook_outbox_work()
+    second = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert second["fill_ids"] == []
 
 
 def _boost_materialization(
@@ -8461,6 +8539,39 @@ def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
     assert {(row["hook_name"], row["state"]) for row in restored} == {
         (name, "completed") for name in database._AUTHORITATIVE_FILL_HOOKS
     }
+
+
+def test_deferred_hook_authority_loss_prevents_callback_construction(
+    isolated_database, monkeypatch
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("callback constructed")),
+    )
+
+    with pytest.raises(ValueError, match="normal authority lost"):
+        reconciliation._run_post_fill_hooks(
+            fill,
+            completed_at=AFTER,
+            authority_check=lambda: (_ for _ in ()).throw(
+                ValueError("normal authority lost")
+            ),
+        )
+
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name,state,attempt FROM offer_fill_hook_outbox WHERE fill_id=?",
+            (fill["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert len(rows) == len(database._AUTHORITATIVE_FILL_HOOKS)
+    assert all(row["state"] == "pending" and row["attempt"] == 0 for row in rows)
 
 
 def test_durable_pending_outbox_has_explicit_wallet_free_drain_contract(

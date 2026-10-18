@@ -574,3 +574,76 @@ def commit_terminal_offers(
             database.get_unresolved_offer_operation_blockers()
         )
         return result
+
+
+def drain_deferred_terminal_hooks(
+    reviewed: dict[str, Any], authority: object
+) -> dict[str, Any]:
+    """Deliver only campaign fill hooks under restored normal authority."""
+
+    import api_server
+    import database
+    import mutation_gate
+    import offer_reconciliation
+
+    def require_normal_authority() -> None:
+        status = (
+            authority.status().to_dict()
+            if authority is mutation_gate.current_runtime()
+            else {}
+        )
+        if (
+            api_server._registry_terminal_recovery_active
+            or status.get("allowed") is not True
+            or status.get("lease", {}).get("owned_by_this_run") is not True
+        ):
+            raise ValueError("mixed terminal normal authority changed before hook")
+
+    if type(reviewed) is not dict:
+        raise ValueError("mixed terminal reviewed proof is invalid")
+    with _verified_terminal_proof(
+        reviewed.get("campaign_id"), reviewed.get("revision"), authority
+    ) as verified:
+        fresh, _evidence, roots, _observed_at = verified
+        if reviewed != fresh:
+            raise ValueError("mixed terminal reviewed proof changed")
+        latch = database.get_runtime_safety_latch()
+        if (
+            type(latch) is not dict
+            or latch.get("state") != "resolved"
+            or latch.get("blocking_operation_ids_json") != "[]"
+            or any(row["lifecycle_state"] != "terminal" for row in roots)
+        ):
+            raise ValueError("mixed terminal normal authority is not restored")
+        filled_intent_ids = {
+            row["intent_id"]
+            for row in fresh["offers"]
+            if row["classification"] == "FILLED_PROVEN"
+        }
+        require_normal_authority()
+        fill_ids = database.get_campaign_deferred_fill_hook_ids(
+            fresh["campaign_id"], fresh["revision"]
+        )
+    if type(fill_ids) is not list or len(fill_ids) > 256:
+        raise ValueError("mixed terminal deferred hook scope is invalid")
+    delivered: dict[int, dict[str, str]] = {}
+    for fill_id in fill_ids:
+        require_normal_authority()
+        fill = database.get_authoritative_fill_by_id(fill_id)
+        if fill is None:
+            database.block_offer_fill_hook_authority_loss(fill_id)
+            raise ValueError("mixed terminal fill hook authority is missing")
+        if fill["intent_id"] not in filled_intent_ids:
+            raise ValueError("mixed terminal fill hook scope differs")
+        delivered[fill_id] = offer_reconciliation._run_post_fill_hooks(
+            fill,
+            completed_at=str(fill["filled_at"]),
+            authority_check=require_normal_authority,
+        )
+    return {
+        "campaign_id": fresh["campaign_id"],
+        "revision": fresh["revision"],
+        "fill_ids": fill_ids,
+        "hooks": delivered,
+        "effects_attempted": bool(delivered),
+    }

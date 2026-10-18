@@ -3305,7 +3305,12 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
     }
 
 
-def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str, str]:
+def _run_post_fill_hooks(
+    fill: dict[str, Any],
+    *,
+    completed_at: str,
+    authority_check: Callable[[], None] | None = None,
+) -> dict[str, str]:
     """Run post-commit hooks without allowing failures to undo proof."""
 
     import database
@@ -3318,6 +3323,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         database.block_offer_fill_hook_authority_loss(fill_id)
         return {name: "blocked" for name in database._AUTHORITATIVE_FILL_HOOKS}
     fill = current_fill
+    if authority_check is not None:
+        authority_check()
     try:
         callbacks = _post_fill_hook_callbacks(fill)
     except Exception:
@@ -3340,6 +3347,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             pass
         return results
     for hook_name, callback in callbacks.items():
+        if authority_check is not None:
+            authority_check()
         try:
             claim = database.claim_offer_fill_hook(int(fill["fill_id"]), hook_name)
         except Exception:
@@ -3405,6 +3414,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         heartbeat_thread.start()
         effect_boundary = False
         try:
+            if authority_check is not None:
+                authority_check()
             acknowledgement = callback(
                 current_fill,
                 claim_token=claim_token,

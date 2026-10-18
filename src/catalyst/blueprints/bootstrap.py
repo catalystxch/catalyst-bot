@@ -871,6 +871,28 @@ def api_bootstrap_commit_terminal():
         return _error(exc)
 
 
+@bp.post("/api/bootstrap/drain_terminal_hooks")
+def api_bootstrap_drain_terminal_hooks():
+    """Deliver exact deferred fill hooks after normal authority is restored."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        body = _request_body()
+        if set(body) != {"reviewed"} or type(body["reviewed"]) is not dict:
+            raise BootstrapApiError("invalid_request")
+        result = mixed_terminal_recovery.drain_deferred_terminal_hooks(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **result})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_hook_drain_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
 @bp.post("/api/bootstrap/reconcile_completed")
 def api_bootstrap_reconcile_completed():
     with _CAMPAIGN_LIFECYCLE_LOCK:

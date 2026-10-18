@@ -14497,6 +14497,39 @@ def get_offer_fill_hook_outbox_work(limit: int = 32) -> List[int]:
         conn.close()
 
 
+def get_campaign_deferred_fill_hook_ids(campaign_id: str, revision: int) -> List[int]:
+    """List only pending post-fill work bound to one exact campaign revision."""
+
+    safe_campaign = _reconciliation_coin_identity(campaign_id, "campaign_id")[0]
+    safe_revision = _exact_integer(revision, "revision")
+    purpose = f"bootstrap:{safe_campaign}:revision:{safe_revision}"
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "post-fill outbox clock", require_timezone=True
+    )
+    abandoned_before = (
+        now - timedelta(seconds=_AUTHORITATIVE_FILL_HOOK_LEASE_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    rows = (
+        get_connection()
+        .execute(
+            "SELECT DISTINCT receipt.fill_id FROM authoritative_fill_receipts AS receipt "
+            "JOIN offer_intents AS intent ON intent.intent_id=receipt.intent_id "
+            "AND intent.sage_trade_id=receipt.trade_id "
+            "JOIN offer_fill_hook_outbox AS outbox ON outbox.fill_id=receipt.fill_id "
+            "WHERE intent.purpose=? AND intent.lifecycle_state='terminal' "
+            "AND outbox.last_error_code IS NOT 'AUTHORITATIVE_FILL_PROOF_LOST' "
+            "AND (outbox.state='pending' OR "
+            "(outbox.state='running' AND outbox.claimed_at<=?)) "
+            "ORDER BY receipt.fill_id LIMIT 257",
+            (purpose, abandoned_before),
+        )
+        .fetchall()
+    )
+    if len(rows) > 256:
+        raise ValueError("mixed terminal deferred hook scope exceeds bound")
+    return [int(row["fill_id"]) for row in rows]
+
+
 def _offer_fill_hook_acknowledgement(
     fill_id: int,
     hook_name: str,
