@@ -396,6 +396,7 @@ def test_registry_successor_requires_expired_dead_prior_owner(monkeypatch, prior
         "extra_blocker",
         "pending",
         "other_root",
+        "creation_failed_other_root",
     ],
 )
 def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change):
@@ -554,7 +555,7 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
             "WHERE singleton_id=1",
             (json.dumps([blocker, "unrelated"]),),
         )
-    elif change == "other_root":
+    elif change in {"other_root", "creation_failed_other_root"}:
         conn.execute(
             "INSERT INTO offer_intents (intent_id,run_id,wallet_fingerprint_hash,"
             "network,asset_id,side,tier,purpose,offered_amount_atomic,"
@@ -575,7 +576,9 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
                 coins,
                 hashlib.sha256(coins.encode()).hexdigest(),
                 "1" * 64,
-                "created",
+                "creation_failed"
+                if change == "creation_failed_other_root"
+                else "created",
                 old,
                 old,
             ),
@@ -608,7 +611,11 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         observed_pending_transaction_ids=["2" * 64] if change == "pending" else [],
         observed_at=at,
     )
-    if change in {"valid", "mixed_visible_without_journal"}:
+    if change in {
+        "valid",
+        "mixed_visible_without_journal",
+        "creation_failed_other_root",
+    }:
         adopted = database.adopt_registry_terminal_successor(**request)
         assert adopted["adopted"] is True
         assert adopted["lease"]["owner_run_id"] == "new-owner"

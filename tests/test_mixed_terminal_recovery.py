@@ -281,6 +281,7 @@ def _cohort():
     "change",
     [
         "valid",
+        "historical_creation_failed",
         "unsupported_unknown",
         "unrelated_root",
         "duplicate_trade",
@@ -295,7 +296,17 @@ def test_mixed_cohort_requires_exact_six_roots(change):
     from mixed_terminal_recovery import validate_mixed_terminal_cohort
 
     campaign, intents, offers, blockers, latch = _cohort()
-    if change == "unsupported_unknown":
+    if change == "historical_creation_failed":
+        intents.append(
+            {
+                **intents[0],
+                "intent_id": "e" * 64,
+                "purpose": "historical:failed-creation",
+                "lifecycle_state": "creation_failed",
+                "sage_trade_id": None,
+            }
+        )
+    elif change == "unsupported_unknown":
         blockers[0]["outcome"] = "CREATED"
     elif change == "unrelated_root":
         intents.append({**intents[0], "intent_id": "e" * 64, "purpose": "unrelated"})
@@ -317,12 +328,14 @@ def test_mixed_cohort_requires_exact_six_roots(change):
         offers[0]["cat_asset_id"] = "d" * 64
     elif change == "lineage":
         intents[0]["parent_intent_id"] = "d" * 64
-    if change == "valid":
+    if change in {"valid", "historical_creation_failed"}:
         result = validate_mixed_terminal_cohort(
             campaign, intents, offers, blockers, {}, latch
         )
         assert [row["intent_id"] for row in result] == sorted(
-            row["intent_id"] for row in intents
+            row["intent_id"]
+            for row in intents
+            if row["purpose"] == intents[0]["purpose"]
         )
         assert result[0]["lifecycle_state"] == "unknown"
     else:

@@ -30423,7 +30423,8 @@ def fence_mixed_terminal_commit(
         ]
         other_root = conn.execute(
             "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? AND network=? "
-            "AND asset_id=? AND purpose<>? AND lifecycle_state<>'terminal' LIMIT 1",
+            "AND asset_id=? AND purpose<>? "
+            "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
             (safe_wallet, safe_network, safe_asset, purpose),
         ).fetchone()
         other_campaign = conn.execute(
@@ -30759,7 +30760,8 @@ def adopt_registry_terminal_successor(
             raise ValueError("registry terminal cohort or blockers changed")
         other = conn.execute(
             "SELECT 1 FROM offer_intents WHERE wallet_fingerprint_hash=? AND network=? "
-            "AND asset_id=? AND purpose<>? AND lifecycle_state<>'terminal' LIMIT 1",
+            "AND asset_id=? AND purpose<>? "
+            "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
             (wallet_hash, safe_network, safe_asset, purpose),
         ).fetchone()
         other_campaign = conn.execute(

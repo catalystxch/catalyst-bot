@@ -73,7 +73,7 @@ def validate_mixed_terminal_cohort(
     wallet_hash = next(iter(wallet_hashes))
     if any(
         row.get("purpose") != purpose
-        and row.get("lifecycle_state") != "terminal"
+        and row.get("lifecycle_state") not in {"terminal", "creation_failed"}
         and (
             str(row.get("purpose") or "").startswith(prefix)
             or (
