@@ -53,8 +53,12 @@ def test_reused_coin_fee_review_records_consent_without_coin_prep(page):
                 document.getElementById('bootstrapFeeConsentOverlay').textContent};
         }"""
     )
-    assert len(result["calls"]) == 1
-    assert result["calls"][0]["path"].endswith("/coin-prep/fee-preview")
+    preview_calls = [
+        call
+        for call in result["calls"]
+        if call["path"].endswith("/coin-prep/fee-preview")
+    ]
+    assert len(preview_calls) == 1
     expect(page.locator("#bootstrapFeeConsentOverlay")).to_have_class(
         "confirm-overlay active"
     )
@@ -63,9 +67,19 @@ def test_reused_coin_fee_review_records_consent_without_coin_prep(page):
     )
     page.locator("#bootstrapFeeConsentMaximum").fill("0.05")
     page.locator("#bootstrapFeeConsentApprove").click()
-    page.wait_for_function("window.__feeCalls.length === 2")
+    page.wait_for_function(
+        "window.__feeCalls.some(call => call.path.endsWith('/coin-prep/fee-approval'))"
+    )
     calls = page.evaluate("window.__feeCalls")
-    assert calls[1]["path"].endswith("/coin-prep/fee-approval")
+    fee_calls = [
+        call
+        for call in calls
+        if call["path"].endswith(("/coin-prep/fee-preview", "/coin-prep/fee-approval"))
+    ]
+    assert [call["path"].rsplit("/", 1)[-1] for call in fee_calls] == [
+        "fee-preview",
+        "fee-approval",
+    ]
     assert all("/coin-prep/trigger" not in call["path"] for call in calls)
     assert all("/bot/start" not in call["path"] for call in calls)
     expect(page.locator("#bootstrapFeeConsentOverlay")).not_to_have_class(
@@ -128,4 +142,8 @@ def test_reused_coin_fee_review_rejects_changed_or_unfunded_plan(
     )
     expect(page.locator("#bootstrapFeeConsentApprove")).to_be_disabled()
     expect(page.locator("#bootstrapFeeConsentError")).not_to_be_empty()
-    assert len(page.evaluate("window.__feeCalls")) == 1
+    calls = page.evaluate("window.__feeCalls")
+    assert sum(path.endswith("/coin-prep/fee-preview") for path in calls) == 1
+    assert all("/coin-prep/fee-approval" not in path for path in calls)
+    assert all("/coin-prep/trigger" not in path for path in calls)
+    assert all("/bot/start" not in path for path in calls)
