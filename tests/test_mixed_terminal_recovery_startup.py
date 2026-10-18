@@ -558,7 +558,10 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
     database.close_connection()
 
 
-@pytest.mark.parametrize("change", ["stable", "changed_blocker", "heartbeat_failed"])
+@pytest.mark.parametrize(
+    "change",
+    ["stable", "changed_blocker", "changed_book", "changed_owner", "heartbeat_failed"],
+)
 def test_registry_restricted_activation_rechecks_and_releases_on_failure(
     monkeypatch, change
 ):
@@ -608,6 +611,14 @@ def test_registry_restricted_activation_rechecks_and_releases_on_failure(
         reads.append(kwargs)
         if len(reads) == 2 and change == "changed_blocker":
             return {**proof, "blocking_operation_ids": ["reconcile:" + "d" * 64]}
+        if len(reads) == 2 and change == "changed_book":
+            return {
+                **proof,
+                "wallet_snapshot": {
+                    **proof["wallet_snapshot"],
+                    "trade_ids": ["d" * 64],
+                },
+            }
         return proof
 
     monkeypatch.setattr(
@@ -652,7 +663,9 @@ def test_registry_restricted_activation_rechecks_and_releases_on_failure(
         api_server.database,
         "get_runtime_mutation_lease",
         lambda: {
-            "owner_run_id": runtime.run_id,
+            "owner_run_id": "other-owner"
+            if change == "changed_owner"
+            else runtime.run_id,
             "owner_pid": runtime.owner_pid,
             "owner_host": runtime.owner_host,
             "acquired_at": runtime._lease_acquired_at,
