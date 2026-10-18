@@ -4148,8 +4148,12 @@ def reconcile_offer(
     wallet_facade: Any = None,
     now: Any = None,
     refresh_abort_id: str | None = None,
+    defer_post_fill_hooks: bool = False,
 ) -> dict[str, Any]:
     """Authorize and persist one exact reconciliation result."""
+
+    if type(defer_post_fill_hooks) is not bool:
+        raise TypeError("defer_post_fill_hooks must be an exact bool")
 
     import database
 
@@ -4470,8 +4474,10 @@ def reconcile_offer(
                 "authoritative fill commit lost its durable fill identity"
             )
         response["fill_id"] = int(fill_id)
-        response["post_fill_hooks"] = _run_post_fill_hooks(
-            fill, completed_at=observed_at
+        response["post_fill_hooks"] = (
+            {name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS}
+            if defer_post_fill_hooks
+            else _run_post_fill_hooks(fill, completed_at=observed_at)
         )
     return response
 

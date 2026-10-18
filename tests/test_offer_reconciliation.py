@@ -6094,6 +6094,40 @@ def test_callback_construction_failure_is_contained_after_proof_commit(
     ]
 
 
+def test_recovery_fill_defers_all_post_fill_hooks_without_claiming(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: (_ for _ in ()).throw(AssertionError("hook constructed")),
+    )
+    result = reconcile_offer(
+        "intent-task9", evidence=_evidence(), now=AFTER, defer_post_fill_hooks=True
+    )
+    assert result["classification"] == FILLED_PROVEN
+    assert result["post_fill_hooks"] == {
+        name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state, attempt, claim_token FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? ORDER BY hook_name",
+            (result["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert [
+        (row["hook_name"], row["state"], row["attempt"], row["claim_token"])
+        for row in rows
+    ] == [
+        (name, "pending", 0, None)
+        for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
+    ]
+
+
 def test_production_classification_and_sweep_preserve_authoritative_block_42(
     isolated_database,
     monkeypatch,
