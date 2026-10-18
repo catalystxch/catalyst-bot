@@ -394,6 +394,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
     "api_safety_quarantine_resolve",
     "api_open_data_folder",
     "api_open_external",
+    "bootstrap.api_bootstrap_commit_terminal",
     "bot.api_bot_stop",
     "bot.api_shutdown",
     "coin_prep.api_coin_prep_cancel",
@@ -4761,6 +4762,7 @@ def enforce_local_runtime_guard():
             ("GET", "/"),
             ("GET", "/api/safety/status"),
             ("GET", "/api/bootstrap/preview_terminal"),
+            ("POST", "/api/bootstrap/commit_terminal"),
         }
         if (request.method, path) not in recovery_routes:
             return jsonify(

@@ -4149,6 +4149,7 @@ def reconcile_offer(
     now: Any = None,
     refresh_abort_id: str | None = None,
     defer_post_fill_hooks: bool = False,
+    recovery_fence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Authorize and persist one exact reconciliation result."""
 
@@ -4184,6 +4185,11 @@ def reconcile_offer(
         cancel_context=cancel_context,
         now=observed_at,
     )
+    if recovery_fence is not None and result["classification"] not in {
+        FILLED_PROVEN,
+        EXPIRED_PROVEN,
+    }:
+        raise ValueError("mixed terminal recovery proof is not fill or expiry")
     refresh_abort = None
     if refresh_abort_id is not None:
         if result["classification"] != CANCELLED_PROVEN:
@@ -4232,6 +4238,8 @@ def reconcile_offer(
     )
     operation_id = f"reconcile:{intent['intent_id']}"
     if not decision.allowed:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery registry authority denied")
         _trip_denial_latch(
             intent,
             operation_id,
@@ -4322,6 +4330,8 @@ def reconcile_offer(
                 raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
         evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
     except Exception:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery proof encoding failed") from None
         if refresh_abort is not None:
             raise RuntimeError("refresh abort proof encoding failed")
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
@@ -4424,6 +4434,7 @@ def reconcile_offer(
             ),
             refresh_abort_id=refresh_abort_id,
             reconciled_at=observed_at,
+            recovery_fence=recovery_fence,
         )
     except ValueError as exc:
         if result["classification"] == CANCELLED_PROVEN and "Task 8" in str(exc):

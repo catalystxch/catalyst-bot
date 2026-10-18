@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -68,9 +69,138 @@ def test_mixed_preview_bridge_uses_same_proof_service(monkeypatch):
     assert "preview_terminal_offers" in app_bridge._APP_BRIDGE_READ_ONLY_METHODS
 
 
+def test_mixed_commit_http_is_exact_scoped_and_restricted(monkeypatch):
+    import api_server
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    authority = object()
+    proof = {"campaign_id": "a" * 64, "revision": 0, "proof_digest": "d" * 64}
+    calls = []
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: authority)
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", True)
+    monkeypatch.setattr(
+        mixed_terminal_recovery,
+        "commit_terminal_offers",
+        lambda reviewed, runtime: (
+            calls.append((reviewed, runtime))
+            or {"filled": 1, "expired": 5, "wallet_effect_started": False}
+        ),
+    )
+    client = api_server.app.test_client()
+    path = "/api/bootstrap/commit_terminal"
+    assert client.post(path, json={"reviewed": proof}).status_code == 401
+    headers = {api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN}
+    assert (
+        client.post(path, json={"reviewed": proof}, headers=headers).status_code == 200
+    )
+    assert calls == [(proof, authority)]
+    assert (
+        client.post(
+            path, json={"reviewed": proof, "extra": 1}, headers=headers
+        ).status_code
+        == 400
+    )
+    assert client.post("/api/bot/start", json={}, headers=headers).status_code == 423
+
+
+def test_mixed_commit_native_bridge_uses_same_scoped_service(monkeypatch):
+    import app_bridge
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    authority = object()
+    proof = {"campaign_id": "a" * 64, "revision": 0, "proof_digest": "d" * 64}
+    calls = []
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: authority)
+    monkeypatch.setattr(
+        mixed_terminal_recovery,
+        "commit_terminal_offers",
+        lambda reviewed, runtime: (
+            calls.append((reviewed, runtime)) or {"wallet_effect_started": False}
+        ),
+    )
+    result = app_bridge.AppBridge().commit_terminal_offers({"reviewed": proof})
+    assert result["success"] is True
+    assert calls == [(proof, authority)]
+    assert "commit_terminal_offers" in app_bridge._APP_BRIDGE_CONTROL_METHODS
+
+
 CAMPAIGN_ID = "a" * 64
 ASSET_ID = "b" * 64
 WALLET_HASH = "f" * 64
+
+
+@pytest.mark.parametrize("failure_after_fill", [False, True])
+def test_mixed_commit_reproves_then_applies_fill_before_expiry(
+    monkeypatch, failure_after_fill
+):
+    import database
+    import mixed_terminal_recovery
+    import offer_reconciliation
+
+    fill_id, expiry_id = "1" * 64, "2" * 64
+    proof = {
+        "campaign_id": CAMPAIGN_ID,
+        "revision": 0,
+        "asset_id": ASSET_ID,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "lease_owner_run_id": "run",
+        "lease_owner_pid": 123,
+        "lease_owner_host": "host",
+        "lease_acquired_at": "2026-10-18T09:00:00.000000Z",
+        "latch_generation": 150,
+        "blocking_operation_ids": [f"reconcile:{fill_id}", f"reconcile:{expiry_id}"],
+        "proof_digest": "d" * 64,
+        "offers": [
+            {"intent_id": expiry_id, "classification": "EXPIRED_PROVEN"},
+            {"intent_id": fill_id, "classification": "FILLED_PROVEN"},
+        ],
+    }
+    roots = [
+        {"intent_id": expiry_id, "row_version": 2, "lifecycle_state": "visible"},
+        {"intent_id": fill_id, "row_version": 3, "lifecycle_state": "unknown"},
+    ]
+    calls = []
+
+    @contextmanager
+    def verified(*_args):
+        calls.append("prove")
+        yield proof, {fill_id: {}, expiry_id: {}}, roots, "2026-10-18T09:01:00Z"
+
+    def reconcile(intent_id, **kwargs):
+        calls.append(intent_id)
+        assert kwargs["defer_post_fill_hooks"] is True
+        assert kwargs["recovery_fence"]["target_intent_id"] == intent_id
+        if intent_id == expiry_id and failure_after_fill:
+            raise ValueError("changed")
+        return {
+            "applied": True,
+            "idempotent": False,
+            "post_fill_hooks": {"one": "pending"} if intent_id == fill_id else {},
+        }
+
+    monkeypatch.setattr(mixed_terminal_recovery, "_verified_terminal_proof", verified)
+    monkeypatch.setattr(offer_reconciliation, "reconcile_offer", reconcile)
+    monkeypatch.setattr(
+        database, "get_runtime_safety_latch", lambda: {"state": "tripped"}
+    )
+    monkeypatch.setattr(
+        database, "get_unresolved_offer_operation_blockers", lambda: [{}]
+    )
+    with pytest.raises(ValueError, match="reviewed proof changed"):
+        mixed_terminal_recovery.commit_terminal_offers(
+            {**proof, "proof_digest": "e" * 64}, object()
+        )
+    assert calls == ["prove"]
+    result = mixed_terminal_recovery.commit_terminal_offers(proof, object())
+    assert calls == ["prove", "prove", fill_id, expiry_id]
+    assert result["filled"] == 1
+    assert result["expired"] == (0 if failure_after_fill else 1)
+    assert result["pending_hooks"] == 1
+    assert result["partial_commit"] is failure_after_fill
+    assert result["latch_state"] == "tripped"
 
 
 def _cohort():

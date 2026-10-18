@@ -849,6 +849,28 @@ def api_bootstrap_preview_terminal():
         return _error(exc)
 
 
+@bp.post("/api/bootstrap/commit_terminal")
+def api_bootstrap_commit_terminal():
+    """Commit only a freshly reverified stopped mixed-terminal cohort."""
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    try:
+        body = _request_body()
+        if set(body) != {"reviewed"} or type(body["reviewed"]) is not dict:
+            raise BootstrapApiError("invalid_request")
+        result = mixed_terminal_recovery.commit_terminal_offers(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return jsonify({"success": True, **result})
+    except BootstrapApiError as exc:
+        return _error(exc)
+    except ValueError:
+        return _error(BootstrapApiError("mixed_terminal_commit_refused", 409))
+    except Exception as exc:
+        return _error(exc)
+
+
 @bp.post("/api/bootstrap/reconcile_completed")
 def api_bootstrap_reconcile_completed():
     with _CAMPAIGN_LIFECYCLE_LOCK:

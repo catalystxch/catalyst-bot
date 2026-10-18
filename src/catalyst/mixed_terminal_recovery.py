@@ -487,3 +487,87 @@ def preview_terminal_offers(
 
     with _verified_terminal_proof(campaign_id, revision, authority) as verified:
         return verified[0]
+
+
+def commit_terminal_offers(
+    reviewed: dict[str, Any], authority: object
+) -> dict[str, Any]:
+    """Apply only freshly reverified terminal roots under the scoped DB fence."""
+
+    import database
+    import offer_reconciliation
+
+    if type(reviewed) is not dict:
+        raise ValueError("mixed terminal reviewed proof is invalid")
+    campaign_id = reviewed.get("campaign_id")
+    revision = reviewed.get("revision")
+    with _verified_terminal_proof(campaign_id, revision, authority) as verified:
+        fresh, evidence, roots, observed_at = verified
+        if reviewed != fresh:
+            raise ValueError("mixed terminal reviewed proof changed")
+        vector = {row["intent_id"]: row for row in fresh["offers"]}
+        pending = [row for row in roots if row["lifecycle_state"] != "terminal"]
+        pending.sort(
+            key=lambda row: (
+                0
+                if vector[row["intent_id"]]["classification"] == "FILLED_PROVEN"
+                else 1,
+                row["intent_id"],
+            )
+        )
+        result: dict[str, Any] = {
+            "campaign_id": campaign_id,
+            "revision": revision,
+            "reviewed_proof_digest": fresh["proof_digest"],
+            "filled": 0,
+            "expired": 0,
+            "already_terminal": len(roots) - len(pending),
+            "pending_hooks": 0,
+            "partial_commit": False,
+            "wallet_effect_started": False,
+        }
+        for row in pending:
+            fence = {
+                "campaign_id": campaign_id,
+                "revision": revision,
+                "asset_id": fresh["asset_id"],
+                "wallet_fingerprint_hash": fresh["wallet_fingerprint_hash"],
+                "network": fresh["network"],
+                "owner_run_id": fresh["lease_owner_run_id"],
+                "owner_pid": fresh["lease_owner_pid"],
+                "owner_host": fresh["lease_owner_host"],
+                "acquired_at": fresh["lease_acquired_at"],
+                "latch_generation": fresh["latch_generation"],
+                "blocking_operation_ids": fresh["blocking_operation_ids"],
+                "target_intent_id": row["intent_id"],
+                "target_row_version": row["row_version"],
+                "target_lifecycle_state": row["lifecycle_state"],
+            }
+            try:
+                applied = offer_reconciliation.reconcile_offer(
+                    row["intent_id"],
+                    evidence=evidence[row["intent_id"]],
+                    now=observed_at,
+                    defer_post_fill_hooks=True,
+                    recovery_fence=fence,
+                )
+                if applied.get("applied") is not True or applied.get("idempotent"):
+                    raise ValueError("mixed terminal root did not apply exactly once")
+            except Exception as exc:
+                if result["filled"] + result["expired"] == 0:
+                    raise
+                result["partial_commit"] = True
+                result["failure"] = type(exc).__name__
+                break
+            classification = vector[row["intent_id"]]["classification"]
+            if classification == "FILLED_PROVEN":
+                result["filled"] += 1
+                result["pending_hooks"] += len(applied.get("post_fill_hooks", {}))
+            else:
+                result["expired"] += 1
+        latch = database.get_runtime_safety_latch()
+        result["latch_state"] = latch["state"] if latch else None
+        result["remaining_blockers"] = len(
+            database.get_unresolved_offer_operation_blockers()
+        )
+        return result

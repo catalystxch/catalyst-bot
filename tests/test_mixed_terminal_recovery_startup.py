@@ -612,6 +612,59 @@ def test_registry_successor_database_cas_is_exact(tmp_path, monkeypatch, change)
         assert adopted["lease"]["owner_run_id"] == "new-owner"
         assert adopted["lease"]["lease_version"] == 11
         assert database.get_runtime_safety_latch()["state"] == "tripped"
+        target = database.get_offer_intent(intent_id)
+        fence = dict(
+            campaign_id=campaign_id,
+            revision=0,
+            asset_id=asset,
+            wallet_fingerprint_hash=wallet_hash,
+            network="mainnet",
+            owner_run_id="new-owner",
+            owner_pid=111,
+            owner_host="test-host",
+            acquired_at=adopted["lease"]["acquired_at"],
+            latch_generation=150,
+            blocking_operation_ids=latch_blockers,
+            target_intent_id=intent_id,
+            target_row_version=target["row_version"],
+            target_lifecycle_state="unknown",
+        )
+        proof = database.fence_mixed_terminal_commit(**fence)
+        assert proof["lease_version"] == 11
+        assert database.get_runtime_mutation_lease()["lease_version"] == 11
+        with pytest.raises(ValueError):
+            database.fence_mixed_terminal_commit(
+                **{**fence, "owner_run_id": "unrelated-owner"}
+            )
+        with pytest.raises(ValueError):
+            database.fence_mixed_terminal_commit(
+                **{**fence, "target_row_version": target["row_version"] + 1}
+            )
+        with pytest.raises(ValueError):
+            database.fence_mixed_terminal_commit(
+                **{**fence, "blocking_operation_ids": ["reconcile:unrelated"]}
+            )
+        if change == "mixed_visible_without_journal":
+            visible_id = latch_blockers[1].removeprefix("reconcile:")
+            conn.execute(
+                "UPDATE offer_intents SET asset_id=? WHERE intent_id=?",
+                ("c" * 64, visible_id),
+            )
+            conn.commit()
+            with pytest.raises(ValueError, match="authority changed"):
+                database.fence_mixed_terminal_commit(**fence)
+            conn.execute(
+                "UPDATE offer_intents SET asset_id=? WHERE intent_id=?",
+                (asset, visible_id),
+            )
+            conn.commit()
+        conn.execute(
+            "UPDATE runtime_mutation_lease SET heartbeat_at=? WHERE singleton_id=1",
+            (old,),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="authority changed"):
+            database.fence_mixed_terminal_commit(**fence)
     else:
         with pytest.raises(ValueError):
             database.adopt_registry_terminal_successor(**request)
