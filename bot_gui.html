@@ -39351,9 +39351,9 @@ function startupPollUntilReady() {
             }
 
             if (status.phase === 'error') {
-                startupSetPhase('error', 'Sage startup failed', 'Check Sage and retry wallet selection', '');
+                startupSetPhase('error', 'Sage startup failed', 'Check Sage and retry', '');
                 document.getElementById('startupStartingFeedback').style.display = 'none';
-                startupShowError('Sage wallet startup failed. Retry wallet selection.');
+                startupShowError('Sage startup failed. Check Sage and retry.');
                 return;
             }
 

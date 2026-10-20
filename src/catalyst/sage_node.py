@@ -1451,7 +1451,7 @@ def get_startup_status() -> Dict:
                 pass
         elif sp == "error":
             phase = "error"
-            message = "Sage wallet login failed"
+            message = "Sage startup failed"
         else:
             phase = "starting"
             message = f"Sage startup: {sp}"

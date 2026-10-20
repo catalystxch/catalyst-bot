@@ -27,3 +27,4 @@ def test_failed_sage_login_shows_retry_instead_of_polling_forever(page):
 
     expect(page.locator("#startupError")).to_be_visible()
     expect(page.locator("#startupProgressTrack")).to_be_hidden()
+    assert page.evaluate("_startupPollTimer === null")
