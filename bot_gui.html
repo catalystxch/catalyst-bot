@@ -39350,6 +39350,13 @@ function startupPollUntilReady() {
                 return;
             }
 
+            if (status.phase === 'error') {
+                startupSetPhase('error', 'Sage startup failed', 'Check Sage and retry wallet selection', '');
+                document.getElementById('startupStartingFeedback').style.display = 'none';
+                startupShowError('Sage wallet startup failed. Retry wallet selection.');
+                return;
+            }
+
             if (status.phase === 'ready') {
                 debugLog('[STARTUP POLL] Ready! Dismissing modal.');
                 startupSetPhase('done', 'Connected!', _startupWalletLabel + ' wallet is healthy and ready', '');
