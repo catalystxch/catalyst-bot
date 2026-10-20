@@ -34278,10 +34278,15 @@
                 if (!stopResp.ok || stopResult.error) {
                     throw new Error(stopResult.error || 'Could not request bot stop.');
                 }
-                setShutdownStep('Stop', 'active', 'Stop requested. Waiting for the bot to report completion.');
-                await waitForShutdownBotStop();
-                setShutdownStep('Stop', 'done', 'Bot reports stop complete. Server shutdown will separately verify remaining cleanup.');
-                addLogEntry('success', '   Bot reports stop complete; server shutdown will verify remaining cleanup');
+                if (stopResult.status === 'stopped' && stopResult.bot_initialized === false && stopResult.running === false) {
+                    setShutdownStep('Stop', 'done', 'No bot was initialised. Server shutdown will verify remaining cleanup.');
+                    addLogEntry('success', '   No bot was initialised; server shutdown will verify remaining cleanup');
+                } else {
+                    setShutdownStep('Stop', 'active', 'Stop requested. Waiting for the bot to report completion.');
+                    await waitForShutdownBotStop();
+                    setShutdownStep('Stop', 'done', 'Bot reports stop complete. Server shutdown will separately verify remaining cleanup.');
+                    addLogEntry('success', '   Bot reports stop complete; server shutdown will verify remaining cleanup');
+                }
 
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {

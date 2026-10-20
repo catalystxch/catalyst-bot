@@ -1462,10 +1462,14 @@ class TestBotStop(_FlaskBase):
         resp = self._post("/api/bot/stop", auth=False)
         self.assertEqual(resp.status_code, 401)
 
-    def test_bot_none_returns_500(self):
+    def test_bot_none_is_already_stopped_for_pre_wallet_shutdown(self):
         with patch.object(api_server, "bot", None):
             resp = self._post("/api/bot/stop")
-        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {"status": "stopped", "running": False, "bot_initialized": False},
+        )
 
     def test_bot_running_stop_returns_200(self):
         bot = _make_bot(running=True)

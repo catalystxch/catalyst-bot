@@ -1222,7 +1222,12 @@ def api_bot_stop():
     bot = server.bot
     slog("GUI_ACTION", ">>> BUTTON: Stop Bot")
     if not bot:
-        return jsonify({"error": "Bot not initialised"}), 500
+        # Wallet setup can display the desktop shell before a BotLoop exists.
+        # In that state there is no bot work to stop. The later shutdown route
+        # still proves mutation quiescence before it closes the process.
+        return jsonify(
+            {"status": "stopped", "running": False, "bot_initialized": False}
+        )
 
     bot.stop(wait=False)
     try:

@@ -2965,6 +2965,39 @@ def test_shutdown_waits_for_reported_stopped_state_and_retries_only_bot_stopping
     assert any("retry" in str(item["detail"]).lower() for item in result["progress"])
 
 
+def test_shutdown_before_wallet_connection_skips_absent_bot_poll(page):
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """async () => {
+            const calls = [];
+            document.getElementById('shutdownCancelOffers').checked = false;
+            addLogEntry = () => {};
+            startupWaitForBackendShutdown = async () => true;
+            closeDesktopWindowAfterShutdown = async () => true;
+            apiFetch = async (path) => {
+                calls.push(path);
+                if (path.endsWith('/bot/stop')) {
+                    return new Response(JSON.stringify({
+                        status: 'stopped', running: false, bot_initialized: false
+                    }), {status: 200});
+                }
+                if (path.endsWith('/shutdown')) {
+                    return new Response(JSON.stringify({success: true}), {status: 200});
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+            await confirmShutdown();
+            return {
+                calls,
+                title: document.getElementById('shutdownProgressTitle').textContent
+            };
+        }"""
+    )
+    assert result["calls"] == ["/api/bot/stop", "/api/shutdown"]
+    assert result["title"] == "Shutdown complete"
+
+
 def test_shutdown_does_not_close_native_window_while_backend_is_alive(page):
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
     page.goto(gui.as_uri(), wait_until="domcontentloaded")
