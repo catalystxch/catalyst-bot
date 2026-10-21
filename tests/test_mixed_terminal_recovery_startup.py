@@ -59,6 +59,28 @@ def test_registry_blocked_desktop_attempts_only_restricted_recovery(monkeypatch)
     assert events == ["registry_recovery", "arbiter_released"]
 
 
+def test_registry_blocked_startup_does_not_reconcile_before_operator_review(
+    monkeypatch,
+):
+    import api_server
+    import database
+
+    desktop = _desktop(monkeypatch)
+    denied = {"allowed": False, "reason_code": "REGISTRY_BLOCKED"}
+    recovered = []
+    monkeypatch.setattr(database, "init_database", lambda: None)
+    monkeypatch.setattr(desktop, "_retire_expired_dead_startup_lease", lambda: None)
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", lambda: denied)
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: recovered.append(True) or {"recovered": 6, "remaining": 0},
+    )
+
+    assert desktop._initialize_startup_ownership() == denied
+    assert recovered == []
+
+
 def test_registry_recovery_window_has_no_trading_bridge(monkeypatch):
     import api_server
 

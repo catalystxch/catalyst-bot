@@ -1959,12 +1959,14 @@ def _initialize_startup_ownership() -> dict:
             # unchanged unspent inputs and an absent pending transaction are
             # all required. Any ambiguity preserves the original blocker.
             pass
+    # REGISTRY_BLOCKED belongs to the explicit restricted terminal-offer
+    # review. Legacy startup recovery would commit its offers and hooks before
+    # that review is shown.
     legacy_recovery_reasons = {
         "RESERVATION_RECONCILIATION_REQUIRED",
         "PUBLICATION_CLAIM_RECOVERY_REQUIRED",
         "UNRESOLVED_OPERATIONS",
         "TASK8_BINDING_CONFLICT",
-        "REGISTRY_BLOCKED",
     }
     if (
         authorization.get("allowed") is False
