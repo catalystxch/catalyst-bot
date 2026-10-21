@@ -9034,10 +9034,10 @@ def test_refresh_abort_startup_requires_two_fresh_identity_and_sage_reads(
         assert result["abort_id"] == "e" * 64
 
 
-def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
+def test_desktop_retries_startup_after_legacy_binding_conflict(
     monkeypatch,
 ):
-    """A corrected reconciler must recheck its old fail-closed conflict on restart."""
+    """Legacy binding recovery still rechecks startup authority after proof."""
     import api_server
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
@@ -9046,7 +9046,7 @@ def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
         [
             {
                 "allowed": False,
-                "reason_code": "REGISTRY_BLOCKED",
+                "reason_code": "TASK8_BINDING_CONFLICT",
                 "failed_check": "unresolved_operations",
             },
             {"allowed": True, "reason_code": "", "failed_check": None},
