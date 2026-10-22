@@ -53,6 +53,9 @@ class TestBuildPostBuild(unittest.TestCase):
             (internal / "refresh_abort_recovery.html").write_text(
                 "<html></html>", encoding="utf-8"
             )
+            (internal / "cancel_latch_recovery.html").write_text(
+                "<html></html>", encoding="utf-8"
+            )
             certifi_dir = internal / "certifi"
             certifi_dir.mkdir()
             (certifi_dir / "cacert.pem").write_text("test CA bundle", encoding="utf-8")
@@ -90,6 +93,9 @@ class TestBuildPostBuild(unittest.TestCase):
             )
             (internal / "bot_gui.html").write_text("<html></html>", encoding="utf-8")
             (internal / "refresh_abort_recovery.html").write_text(
+                "<html></html>", encoding="utf-8"
+            )
+            (internal / "cancel_latch_recovery.html").write_text(
                 "<html></html>", encoding="utf-8"
             )
             env_example = root / ".env.example"
