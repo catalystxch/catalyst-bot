@@ -420,7 +420,9 @@ def _bootstrap_existing_offer_resume_readiness(
     are locked by the campaign's already-live offers.  That is safe to bypass
     only for an explicit resume request, and only when durable intent, local
     open-book, and a fresh complete Sage snapshot agree on the exact nonempty
-    trade-id set for the current campaign revision.
+    trade-id set for one campaign revision. Policy-only campaign revisions
+    do not change the identity of offers already published under an earlier
+    revision.
     """
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     campaign_id = str(campaign.get("campaign_id") or "").strip()
@@ -433,10 +435,14 @@ def _bootstrap_existing_offer_resume_readiness(
     ):
         return {"ready": False, "reason": "campaign_identity_invalid"}
 
-    purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+    purpose_prefix = f"bootstrap:{campaign_id}:revision:"
     active_states = {"created", "visible"}
     try:
-        from database import get_offer_intents_for_registry, get_open_offers
+        from database import (
+            bootstrap_campaign_immutable_authority_valid,
+            get_offer_intents_for_registry,
+            get_open_offers,
+        )
         from wallet import (
             classify_offers_from_list,
             get_authoritative_offer_history,
@@ -444,17 +450,38 @@ def _bootstrap_existing_offer_resume_readiness(
 
         intents = get_offer_intents_for_registry()
         db_offers = get_open_offers(cat_asset_id=asset_id)
-        history = get_authoritative_offer_history(
-            include_completed=False, start=0, end=500
-        )
         if type(intents) is not list or type(db_offers) is not list:
             raise ValueError("Durable offer authority is unavailable")
         if any(type(row) is not dict for row in [*intents, *db_offers]):
             raise ValueError("Durable offer authority is malformed")
 
         current_intents = [
-            row for row in intents if str(row.get("purpose") or "") == purpose
+            row
+            for row in intents
+            if str(row.get("purpose") or "").startswith(purpose_prefix)
         ]
+        intent_revisions = set()
+        for row in current_intents:
+            suffix = str(row["purpose"])[len(purpose_prefix) :]
+            if not suffix.isdecimal() or str(int(suffix)) != suffix:
+                raise ValueError("Campaign intent revision is malformed")
+            intent_revision = int(suffix)
+            if intent_revision > revision:
+                raise ValueError("Campaign intent revision exceeds current authority")
+            if str(row.get("lifecycle_state") or "").strip().lower() in active_states:
+                intent_revisions.add(intent_revision)
+        if len(intent_revisions) != 1:
+            raise ValueError("Campaign active offer revisions are incomplete or mixed")
+        active_revision = next(iter(intent_revisions))
+        if active_revision < revision and (
+            campaign.get("status") != "active"
+            or campaign.get("stage")
+            not in {"bootstrap", "discovery_25", "discovery_50", "established"}
+            or not bootstrap_campaign_immutable_authority_valid(campaign)
+        ):
+            raise ValueError(
+                "Earlier offer revision lacks immutable campaign authority"
+            )
         if any(
             str(row.get("asset_id") or "").strip().lower() != asset_id
             for row in current_intents
@@ -465,7 +492,7 @@ def _bootstrap_existing_offer_resume_readiness(
             not in active_states | {"terminal"}
             for row in current_intents
         ):
-            raise ValueError("Current campaign revision has unresolved offer intents")
+            raise ValueError("Campaign has unresolved offer intents")
         active_intents = [
             row
             for row in current_intents
@@ -485,6 +512,10 @@ def _bootstrap_existing_offer_resume_readiness(
             or len(set(db_ids)) != len(db_ids)
         ):
             raise ValueError("Campaign offer identities are incomplete or duplicated")
+
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
 
         if type(history) is dict:
             wallet_offers = history.get("offers")
