@@ -198,6 +198,16 @@ def _post_build():
         raise SystemExit(1)
 
     if not any(
+        os.path.isfile(os.path.join(root, "cancel_latch_recovery.html"))
+        for root in data_roots
+    ):
+        print("\n  ERROR: cancel_latch_recovery.html not found in the bundle.")
+        print(
+            "  Confirmed-cancellation review would be unavailable to a fenced profile."
+        )
+        raise SystemExit(1)
+
+    if not any(
         os.path.isfile(os.path.join(root, "certifi", "cacert.pem"))
         for root in data_roots
     ):

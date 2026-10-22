@@ -419,6 +419,7 @@ _CONTROL_WRITE_API_ENDPOINTS = {
 _read_only_diagnostics_active = False
 _refresh_abort_recovery_active = False
 _registry_terminal_recovery_active = False
+_cancel_latch_review_recovery_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -3918,6 +3919,36 @@ def recover_legacy_startup_reservations() -> dict[str, int]:
     )
 
 
+def has_exact_cancel_latch_review_startup_candidate() -> bool:
+    """Reserve exact cancellation blockers for a native, proof-bound review."""
+
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return False
+        wallet_hash, network = _configured_mutation_binding()
+        latch = database.get_runtime_safety_latch()
+        if type(latch) is not dict:
+            return False
+        operation_ids = json.loads(latch.get("blocking_operation_ids_json", ""))
+        return bool(
+            latch.get("state") == "tripped"
+            and latch.get("reason_code") == "UNRESOLVED_OPERATIONS"
+            and latch.get("wallet_fingerprint_hash") == wallet_hash
+            and latch.get("network") == network
+            and type(latch.get("generation")) is int
+            and type(operation_ids) is list
+            and 1 <= len(operation_ids) <= 32
+            and len(set(operation_ids)) == len(operation_ids)
+            and all(
+                type(operation_id) is str
+                and re.fullmatch(r"cancel:[0-9a-f]{64}", operation_id) is not None
+                for operation_id in operation_ids
+            )
+        )
+    except Exception:
+        return False
+
+
 def has_exact_refresh_abort_startup_candidate(
     *, allow_active_owner_run_id: Optional[str] = None
 ) -> bool:
@@ -4384,6 +4415,104 @@ def preflight_refresh_abort_restricted_startup(
         return denied
 
 
+def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
+    """Own only a twice-proven cancellation review with trading disabled."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    global _cancel_latch_review_recovery_active, _stability_startup_status
+
+    if (
+        type(authorization) is not dict
+        or authorization.get("allowed") is not False
+        or authorization.get("reason_code") != "UNRESOLVED_OPERATIONS"
+    ):
+        return False
+    with _mutation_runtime_init_lock:
+        if (
+            _cancel_latch_review_recovery_active
+            or bot is not None
+            or mutation_gate.current_runtime() is not None
+        ):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            if not has_exact_cancel_latch_review_startup_candidate():
+                return False
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            adapter_authority = get_wallet_adapter_authority()
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=adapter_authority,
+                acquire_lease=False,
+                start_heartbeat=False,
+            )
+            from cancel_latch_review import review
+
+            first = review(bot=None)
+            if first.get("ready") is not True:
+                return False
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=adapter_authority,
+                acquire_lease=True,
+                start_heartbeat=False,
+            )
+            acquired = runtime.last_acquire_result.get("acquired") is True
+            if not acquired:
+                return False
+            second = review(bot=None)
+            status = runtime.status().to_dict()
+            lease = status.get("lease") or {}
+            durable_lease = database.get_runtime_mutation_lease()
+            if (
+                second.get("ready") is not True
+                or second.get("review_digest") != first.get("review_digest")
+                or second.get("generation") != first.get("generation")
+                or second.get("operation_ids") != first.get("operation_ids")
+                or status.get("allowed") is not False
+                or status.get("reason_code") != "UNRESOLVED_OPERATIONS"
+                or status.get("source") != "durable_latch"
+                or lease.get("active") is not True
+                or lease.get("owned_by_this_run") is not True
+                or lease.get("owner_run_id") != runtime.run_id
+                or type(durable_lease) is not dict
+                or durable_lease.get("active") != 1
+                or durable_lease.get("acquired_at") != runtime._lease_acquired_at
+                or durable_lease.get("owner_run_id") != runtime.run_id
+                or durable_lease.get("owner_pid") != runtime.owner_pid
+                or durable_lease.get("owner_host") != runtime.owner_host
+                or durable_lease.get("lease_version") != lease.get("version")
+            ):
+                return False
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(
+                os.path.abspath(database.DB_PATH)
+            )
+            _stability_startup_status = _redacted_startup_status(status)
+            _cancel_latch_review_recovery_active = True
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated and runtime is not None:
+                mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
 def activate_registry_terminal_restricted_startup(authorization: Any) -> bool:
     """Adopt only one fenced terminal cohort after two independent Sage proofs."""
 
@@ -4774,6 +4903,16 @@ def enforce_local_runtime_guard():
                 {"success": False, "error": "registry_terminal_recovery_only"}
             ), 423
 
+    if _cancel_latch_review_recovery_active:
+        recovery_routes = {
+            ("GET", "/"),
+            ("GET", "/api/safety/status"),
+            ("GET", "/api/safety/cancel-latch-review"),
+            ("POST", "/api/safety/confirm-cancel-latch-review"),
+        }
+        if (request.method, path) not in recovery_routes:
+            return jsonify({"success": False, "error": "cancel_latch_review_only"}), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -4888,6 +5027,12 @@ def serve_gui():
         if not _has_valid_local_token():
             return Response("Unauthorized", status=401, mimetype="text/plain")
         response = _serve_bootstrapped_html("terminal_offer_recovery.html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    if _cancel_latch_review_recovery_active:
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        response = _serve_bootstrapped_html("cancel_latch_recovery.html")
         response.headers["Cache-Control"] = "no-store"
         return response
     if not _has_valid_local_token():

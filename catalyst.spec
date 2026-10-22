@@ -65,6 +65,7 @@ _html_files = [
     (os.path.join(_HERE, 'splash.html'), '.'),
     (os.path.join(_HERE, 'refresh_abort_recovery.html'), '.'),
     (os.path.join(_HERE, 'terminal_offer_recovery.html'), '.'),
+    (os.path.join(_HERE, 'cancel_latch_recovery.html'), '.'),
 ]
 
 # Brand / UI assets (now in assets/ subfolder)

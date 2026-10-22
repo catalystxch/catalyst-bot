@@ -956,6 +956,7 @@ def _start_owned_runtime_services() -> None:
         api_server.wallet_setup_bootstrap_active()
         or api_server._refresh_abort_recovery_active
         or api_server._registry_terminal_recovery_active
+        or api_server._cancel_latch_review_recovery_active
     ):
         return
     authorization = api_server.initialize_mutation_runtime()
@@ -984,6 +985,7 @@ def start_flask_server(reservation):
         not api_server.wallet_setup_bootstrap_active()
         and not api_server._refresh_abort_recovery_active
         and not api_server._registry_terminal_recovery_active
+        and not api_server._cancel_latch_review_recovery_active
     ):
         api_server.create_bot()
 
@@ -1035,6 +1037,7 @@ def _create_desktop_bridge():
     if (
         api_server._refresh_abort_recovery_active
         or api_server._registry_terminal_recovery_active
+        or api_server._cancel_latch_review_recovery_active
     ):
         return None
     from app_bridge import AppBridge
@@ -1938,10 +1941,16 @@ def _initialize_startup_ownership() -> dict:
             # app in diagnostics mode with its durable reason intact.
             pass
     authorization = _recover_startup_publication_claims(api_server, authorization)
+    exact_cancel_review = (
+        authorization.get("allowed") is False
+        and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+        and api_server.has_exact_cancel_latch_review_startup_candidate()
+    )
     if (
         authorization.get("allowed") is False
         and authorization.get("failed_check") == "unresolved_operations"
         and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+        and not exact_cancel_review
     ):
         try:
             from offer_manager import (
@@ -1971,6 +1980,7 @@ def _initialize_startup_ownership() -> dict:
     if (
         authorization.get("allowed") is False
         and authorization.get("reason_code") in legacy_recovery_reasons
+        and not exact_cancel_review
     ):
         exact_abort_candidate = (
             authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
@@ -2057,6 +2067,13 @@ def _authorize_desktop_startup() -> bool:
                 "UNRESOLVED_OPERATIONS",
                 "REFRESH_ABORT_CLEANUP",
             } and api_server.activate_refresh_abort_restricted_startup(authorization):
+                return True
+            if (
+                authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+                and api_server.activate_cancel_latch_review_restricted_startup(
+                    authorization
+                )
+            ):
                 return True
             if (
                 authorization.get("reason_code") == "REGISTRY_BLOCKED"
