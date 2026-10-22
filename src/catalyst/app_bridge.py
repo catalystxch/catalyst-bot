@@ -1586,6 +1586,29 @@ class AppBridge:
         return result
 
     @_safe
+    def get_cancel_latch_review(self):
+        """Read the exact cancellation proof shown by the native review."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/safety/cancel-latch-review"):
+            return _unwrap_flask_response(api_server.api_safety_cancel_latch_review())
+
+    @_safe
+    def confirm_cancel_latch_review(self, body=None):
+        """Reprove and release only the reviewed exact latch generation."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/safety/confirm-cancel-latch-review",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            return _unwrap_flask_response(
+                api_server.api_safety_confirm_cancel_latch_review()
+            )
+
+    @_safe
     def get_fingerprints(self):
         """List wallet fingerprints. Maps to GET /api/sage/fingerprints."""
         import api_server
@@ -2126,6 +2149,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "stop_bootstrap_campaign",
 }
 _APP_BRIDGE_CONTROL_METHODS = {
+    "confirm_cancel_latch_review",
     "begin_refresh_abort",
     "commit_terminal_offers",
     "drain_deferred_terminal_hooks",
@@ -2148,6 +2172,7 @@ _APP_BRIDGE_CONTROL_METHODS = {
     "toggle_console",
 }
 _APP_BRIDGE_READ_ONLY_METHODS = {
+    "get_cancel_latch_review",
     "check_resume",
     "check_splash_setup",
     "check_update",

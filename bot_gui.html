@@ -11063,6 +11063,12 @@
                                     <span class="safety-diagnostics-value" id="safetyDiagnosticsAction">Review safety diagnostics</span>
                                 </div>
                             </div>
+                            <div id="cancelLatchReviewPanel" style="margin-top: 12px;">
+                                <button type="button" class="btn btn-secondary" data-safety-action="review-cancellations">Review resolved cancellations</button>
+                                <p id="cancelLatchReviewStatus" class="safety-diagnostics-error"></p>
+                                <pre id="cancelLatchReviewProof" style="white-space: pre-wrap; overflow-wrap: anywhere;"></pre>
+                                <button type="button" class="btn btn-secondary" id="cancelLatchConfirm" data-safety-action="confirm-cancellations" disabled>Confirm database-only latch release</button>
+                            </div>
                         </section>
                         <!-- Buy/sell side controls remain user-facing.
                              Developer-only dry run stays hidden in .env. -->
@@ -15382,6 +15388,8 @@
             if (m === 'GET'  && clean === 'risk/spreads')       return 'get_risk_spreads';
             if (m === 'GET'  && clean === 'stats')              return 'get_stats';
             if (m === 'GET'  && clean === 'safety/status')      return 'get_safety_status';
+            if (m === 'GET'  && clean === 'safety/cancel-latch-review') return 'get_cancel_latch_review';
+            if (m === 'POST' && clean === 'safety/confirm-cancel-latch-review') return 'confirm_cancel_latch_review';
 
             // --- Offers ---
             if (m === 'GET'  && clean === 'offers')             return 'get_offers';
@@ -15647,6 +15655,57 @@
         let _safetyDiagnosticsActionHandler = null;
         let _safetyDiagnosticsGeneration = 0;
         let _safetyDiagnosticsRequestInFlight = false;
+        let _cancelLatchReview = null;
+
+        async function reviewResolvedCancellations() {
+            _cancelLatchReview = null;
+            const confirmButton = document.getElementById('cancelLatchConfirm');
+            if (confirmButton) confirmButton.disabled = true;
+            safetyDiagnosticsText('cancelLatchReviewStatus', 'Checking the exact wallet, pending transactions, journal, and Sage offers…');
+            safetyDiagnosticsText('cancelLatchReviewProof', '');
+            try {
+                const response = await apiFetch(`${API_URL}/safety/cancel-latch-review`);
+                const payload = await response.json();
+                const review = payload && payload.review;
+                if (!response.ok || payload.success !== true || !review || review.ready !== true) {
+                    safetyDiagnosticsText('cancelLatchReviewStatus', `Release unavailable: ${review && review.reason_code || 'REVIEW_UNAVAILABLE'}`);
+                    return;
+                }
+                _cancelLatchReview = review;
+                const lines = review.proofs.map(proof =>
+                    `${proof.trade_id} · ${proof.outcome} · Sage ${proof.sage_status} · evidence ${proof.evidence_sha256}`
+                );
+                safetyDiagnosticsText('cancelLatchReviewStatus',
+                    `Wallet ${review.wallet_fingerprint} · ${review.network} · latch generation ${review.generation} · ${lines.length} exact cancellations proven · zero pending transactions. Trading remains stopped.`);
+                safetyDiagnosticsText('cancelLatchReviewProof', lines.join('\n'));
+                if (confirmButton) confirmButton.disabled = false;
+            } catch (_error) {
+                safetyDiagnosticsText('cancelLatchReviewStatus', 'Release unavailable: review failed.');
+            }
+        }
+
+        async function confirmResolvedCancellations() {
+            const review = _cancelLatchReview;
+            if (!review || review.ready !== true) return;
+            if (!window.confirm(`Release only latch generation ${review.generation} for ${review.operation_ids.length} proven cancelled offers? This does not start trading or send a wallet transaction.`)) return;
+            _cancelLatchReview = null;
+            const confirmButton = document.getElementById('cancelLatchConfirm');
+            if (confirmButton) confirmButton.disabled = true;
+            try {
+                const response = await apiFetch(`${API_URL}/safety/confirm-cancel-latch-review`, {
+                    method: 'POST',
+                    body: JSON.stringify({expected_generation: review.generation, review_digest: review.review_digest})
+                });
+                const result = await response.json();
+                safetyDiagnosticsText('cancelLatchReviewStatus', result.success === true && result.released === true
+                    ? 'The exact resolved latch was released. Trading remains stopped.'
+                    : `Release refused: ${result.reason_code || 'REVIEW_STALE_OR_INCOMPLETE'}. Review again.`);
+                safetyDiagnosticsText('cancelLatchReviewProof', '');
+                await refreshSafetyDiagnosticsStatus();
+            } catch (_error) {
+                safetyDiagnosticsText('cancelLatchReviewStatus', 'Release refused: fresh proof could not be checked.');
+            }
+        }
 
         function safetyDiagnosticsCount(value) {
             return Number.isInteger(value) && value >= 0 && value <= 2147483647
@@ -15891,6 +15950,10 @@
                 if (!button || !panel.contains(button)) return;
                 if (button.getAttribute('data-safety-action') === 'refresh') {
                     refreshSafetyDiagnosticsStatus();
+                } else if (button.getAttribute('data-safety-action') === 'review-cancellations') {
+                    reviewResolvedCancellations();
+                } else if (button.getAttribute('data-safety-action') === 'confirm-cancellations') {
+                    confirmResolvedCancellations();
                 }
             };
             panel.addEventListener('click', _safetyDiagnosticsActionHandler);

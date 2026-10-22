@@ -517,7 +517,11 @@ def test_panel_is_semantic_blocked_while_unknown_and_has_only_fixed_actions():
         "safetyDiagnosticsAction",
         "safetyDiagnosticsError",
     } <= parser.ids
-    assert parser.data_actions == ["refresh"]
+    assert parser.data_actions == [
+        "refresh",
+        "review-cancellations",
+        "confirm-cancellations",
+    ]
     assert all(
         name == "data-safety-action"
         for attrs in parser.descendant_attrs

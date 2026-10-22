@@ -391,6 +391,7 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
 
 _CONTROL_WRITE_API_ENDPOINTS = {
     "api_safety_release_resolved",
+    "api_safety_confirm_cancel_latch_review",
     "api_safety_quarantine",
     "api_safety_quarantine_resolve",
     "api_open_data_folder",
@@ -4911,6 +4912,62 @@ def api_safety_status():
                 },
             }
         ), 503
+
+
+@app.route("/api/safety/cancel-latch-review")
+def api_safety_cancel_latch_review():
+    """Review exact, completed cancellation blockers without changing state."""
+
+    from cancel_latch_review import review
+
+    result = review(bot=bot)
+    return jsonify({"success": True, "review": result})
+
+
+@app.route("/api/safety/confirm-cancel-latch-review", methods=["POST"])
+def api_safety_confirm_cancel_latch_review():
+    """Reprove a native review, then CAS only its exact resolved latch."""
+
+    if request.content_length is not None and request.content_length > 512:
+        return jsonify(
+            {"success": False, "reason_code": "REVIEW_REQUEST_TOO_LARGE"}
+        ), 413
+    payload = request.get_json(silent=True)
+    if (
+        type(payload) is not dict
+        or set(payload) != {"expected_generation", "review_digest"}
+        or type(payload.get("expected_generation")) is not int
+        or payload["expected_generation"] < 1
+        or type(payload.get("review_digest")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["review_digest"]) is None
+    ):
+        return jsonify(
+            {"success": False, "reason_code": "REVIEW_REQUEST_MALFORMED"}
+        ), 400
+
+    from cancel_latch_review import review
+
+    fresh = review(bot=bot)
+    if (
+        fresh.get("ready") is not True
+        or fresh.get("generation") != payload["expected_generation"]
+        or not hmac.compare_digest(fresh["review_digest"], payload["review_digest"])
+    ):
+        return jsonify(
+            {"success": False, "reason_code": "REVIEW_STALE_OR_INCOMPLETE"}
+        ), 409
+    runtime = mutation_gate.current_runtime()
+    if runtime is None:
+        return jsonify(
+            {"success": False, "reason_code": "RUNTIME_NOT_INITIALIZED"}
+        ), 503
+    try:
+        released = runtime.release_resolved(fresh["generation"], fresh["operation_ids"])
+    except Exception:
+        released = None
+    if type(released) is not dict or released.get("released") is not True:
+        return jsonify({"success": False, "reason_code": "LATCH_RELEASE_REJECTED"}), 409
+    return jsonify({"success": True, "released": True, "reason_code": "RELEASED"})
 
 
 @app.route("/api/safety/release-resolved", methods=["POST"])
