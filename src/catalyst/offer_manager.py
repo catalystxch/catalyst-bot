@@ -7184,7 +7184,12 @@ class OfferManager:
                     latch_binding=(wallet_hash, network),
                     authoritative=False,
                 )
-            finalized = events[-1]
+            terminal_confirmed = (
+                len(events) == 3
+                and events[2]["phase"] == "RECONCILED"
+                and events[2]["outcome"] == CANCEL_CONFIRMED
+            )
+            finalized = events[1] if terminal_confirmed else events[-1]
             final_evidence = json.loads(finalized["evidence_json"])
             if type(final_evidence) is not dict:
                 raise ValueError("cancellation final evidence is not exact")
@@ -7260,6 +7265,52 @@ class OfferManager:
                 )
             ):
                 raise ValueError("cancellation final event is not exact")
+            if terminal_confirmed:
+                confirmed = events[2]
+                terminal = database.get_authoritative_terminal_record(intent.trade_id)
+                proof = json.loads(confirmed["evidence_json"])
+                classification = (
+                    proof.get("classification") if type(proof) is dict else None
+                )
+                cancel_context = (
+                    proof.get("cancel_context") if type(proof) is dict else None
+                )
+                if (
+                    result["outcome"]
+                    not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+                    or finalized["blocks_mutation"] != 1
+                    or type(terminal) is not dict
+                    or terminal.get("outcome") != "CANCELLED_PROVEN"
+                    or terminal.get("intent_id") != intent.intent_id
+                    or terminal.get("evidence_sha256") != confirmed["evidence_sha256"]
+                    or confirmed["event_id"]
+                    != f"{intent.operation_id}:attempt:{latest_attempt}:reconciled"
+                    or confirmed["operation_id"] != intent.operation_id
+                    or confirmed["intent_id"] != intent.intent_id
+                    or confirmed["operation_type"] != "CANCEL"
+                    or confirmed["attempt"] != latest_attempt
+                    or confirmed["reason_code"] != "AUTHORITATIVE_TERMINAL_PROOF"
+                    or confirmed["blocks_mutation"] != 0
+                    or json.loads(confirmed["wallet_identity_json"])
+                    != {"wallet_fingerprint_hash": wallet_hash, "network": network}
+                    or type(classification) is not dict
+                    or classification.get("classification") != "CANCELLED_PROVEN"
+                    or classification.get("transaction_id")
+                    != confirmed["transaction_id"]
+                    or classification.get("spend_identity")
+                    != confirmed["spend_identity"]
+                    or type(cancel_context) is not dict
+                    or cancel_context.get("cohort_id") != cohort_id
+                ):
+                    raise ValueError("cancellation terminal proof is not exact")
+                result = cancellation_result(
+                    CANCEL_CONFIRMED,
+                    method="task9_authoritative",
+                    raw_response={"evidence_sha256": confirmed["evidence_sha256"]},
+                    transaction_id=confirmed["transaction_id"] or "",
+                    spend_identity=confirmed["spend_identity"] or "",
+                )
+                expected_blocks = 0
             result["_catalyst_effect_attempted"] = False
             result["_catalyst_idempotent_replay"] = True
             result["_catalyst_operation_id"] = intent.operation_id

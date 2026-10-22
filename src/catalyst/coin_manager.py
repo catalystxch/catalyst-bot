@@ -5414,6 +5414,12 @@ class CoinManager:
         # Don't re-scan during active topup/prep (would interfere)
         if not (self._prep_running or self._topup_running):
             self.update_coin_counts()
+            if reason == "startup":
+                # The normal tier scan can omit durable fee_reserve outputs when
+                # new fee-coin preparation is disabled. Restore the exact
+                # spendable reserves before startup market safety may need to
+                # cancel an existing offer.
+                self.refresh_fee_pool_from_wallet()
 
         # --- Coin change detection ---
         self._detect_coin_changes(reason)

@@ -284,6 +284,27 @@ class CoinManagerFeePoolTests(unittest.TestCase):
         self.assertEqual(self.manager.fee_pool.reserve(), reserve_id)
         self.assertIsNone(self.manager.fee_pool.reserve())
 
+    def test_startup_snapshot_restores_durable_fee_reserve_before_cancellation(self):
+        """A resumed book needs its approved fee input before market checks."""
+        sys.modules["config"].cfg.FEE_PREP_COUNT = 0
+        sys.modules["config"].cfg.FEE_COIN_SIZE_XCH = Decimal("0")
+        reserve_id = "0x" + "ab" * 32
+        sys.modules["database"].get_free_coins = lambda wallet_type: [
+            {"coin_id": reserve_id, "purpose": "fee_reserve"}
+        ]
+        self.coin_manager.get_exact_spendable_coins_rpc = lambda wallet_id: {
+            "success": True,
+            "records": [{"coin_id": reserve_id, "coin": {"amount": 1_000_000_000}}],
+        }
+        self.manager.update_coin_counts = lambda: self.manager.fee_pool.refresh([])
+        self.manager._detect_coin_changes = lambda reason: None
+        self.manager.log_inventory = lambda reason: None
+        self.manager.get_inventory_summary = lambda: {}
+
+        self.manager.snapshot_coins("startup")
+
+        self.assertEqual(self.manager.fee_pool.reserve(), reserve_id)
+
 
 if __name__ == "__main__":
     unittest.main()

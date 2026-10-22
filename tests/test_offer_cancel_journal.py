@@ -3413,6 +3413,23 @@ def test_sage_bulk_cancel_settles_each_member_with_its_scoped_wallet_evidence(
         assert first_result["classification"] == "CANCELLED_PROVEN"
         assert first_result["applied"] is True
         assert len(database.get_unresolved_offer_operation_blockers()) == 2
+        # A later revision fence may encounter this same terminal trade.
+        # Its result reader must recognize the Task 9 proof without retripping
+        # the latch or attempting another wallet cancellation.
+        terminal_authority = manager.get_cancel_result_authority(trade_ids[0])
+        assert terminal_authority is not None
+        assert terminal_authority["outcome"] == CANCEL_CONFIRMED
+        terminal_reader = database.get_authoritative_terminal_record
+        with monkeypatch.context() as altered:
+            altered.setattr(
+                database,
+                "get_authoritative_terminal_record",
+                lambda trade_id: {
+                    **terminal_reader(trade_id),
+                    "evidence_sha256": "0" * 64,
+                },
+            )
+            assert manager.get_cancel_result_authority(trade_ids[0]) is None
 
     if wrong_peer_scope:
         assert manager.retry_failed_cancels() == -1
