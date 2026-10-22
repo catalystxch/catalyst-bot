@@ -93,6 +93,31 @@ def test_real_native_cancellation_cost_and_fee_are_bound_without_submission(
     assert int(conditions.removal_amount) - int(conditions.addition_amount) == fee
 
 
+@pytest.mark.parametrize(
+    "fee,component,expected_stage",
+    [
+        (0, "cancel", "cancel_component"),
+        (25, "cancel", "cancel_component"),
+        (25, "fee", "fee_component"),
+    ],
+)
+def test_unsigned_cancel_refusal_identifies_component(
+    adapter, monkeypatch, fee, component, expected_stage
+):
+    cancel = native_bundle(ROOT, 0)
+    fee_bundle = native_bundle(FEE_ROOT, fee)
+    rejected = {"success": False, "error": "private Sage response"}
+    if component == "cancel":
+        cancel = rejected
+    else:
+        fee_bundle = rejected
+
+    result = build(adapter, monkeypatch, fee, cancel, fee_bundle)
+
+    assert result["success"] is False
+    assert result["_catalyst_cancel_pricing_stage"] == expected_stage
+
+
 @pytest.mark.parametrize("fee,component", [(0, "cancel"), (25, "cancel"), (25, "fee")])
 @pytest.mark.parametrize("mismatch", ["amount", "destination"])
 def test_cancel_builder_refuses_executable_summary_disagreement(

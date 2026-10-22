@@ -6526,6 +6526,15 @@ class OfferManager:
                 expected_recovery_action=expected_recovery_action,
             )
             if priced.get("available") is not True:
+                if priced.get("reason") == "FEE_UNSIGNED_COST_UNAVAILABLE":
+                    stage = priced.get("diagnostic_stage")
+                    if type(stage) is str:
+                        log_event(
+                            "warning",
+                            "fee_cancel_unsigned_refusal",
+                            "Unsigned cancellation could not be validated",
+                            data={"stage": stage},
+                        )
                 raise ValueError(
                     str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE")
                 )

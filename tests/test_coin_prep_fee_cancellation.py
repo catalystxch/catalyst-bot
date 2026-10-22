@@ -128,6 +128,49 @@ def test_cancellation_price_fails_closed_when_guidance_is_unavailable(
     assert calls == [0]
 
 
+def test_cancellation_price_reports_unsigned_refusal_stage_without_rpc_details(
+    approved, monkeypatch
+):
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+            "_catalyst_cancel_pricing_stage": "cancel_component",
+            "coin_spends": ["private unsigned bundle"],
+        },
+    )
+
+    result = _price(approved)
+
+    assert result["available"] is False
+    assert result["reason"] == "FEE_UNSIGNED_COST_UNAVAILABLE"
+    assert result["diagnostic_stage"] == "cancel_component"
+    assert "coin_spends" not in result
+
+
+def test_cancellation_price_ignores_untrusted_unsigned_refusal_stage(
+    approved, monkeypatch
+):
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "_catalyst_cancel_pricing_stage": ["private Sage response"],
+        },
+    )
+
+    result = _price(approved)
+
+    assert result["available"] is False
+    assert result["reason"] == "FEE_UNSIGNED_COST_UNAVAILABLE"
+    assert "diagnostic_stage" not in result
+
+
 def test_context_change_during_cancellation_pricing_invalidates_result(
     approved, monkeypatch
 ):

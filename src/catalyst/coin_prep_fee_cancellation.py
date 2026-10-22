@@ -16,6 +16,15 @@ import wallet
 
 
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_UNSIGNED_REFUSAL_STAGES = frozenset(
+    {
+        "cancel_component",
+        "cancel_cost",
+        "fee_component",
+        "combined_component",
+        "combined_cost",
+    }
+)
 _CONTEXT_KEYS = (
     "identity",
     "configuration",
@@ -93,7 +102,20 @@ def price_approved_cancellation(
             else None
         )
         if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
-            return _unavailable(context, "FEE_UNSIGNED_COST_UNAVAILABLE")
+            stage = (
+                built.get("_catalyst_cancel_pricing_stage")
+                if type(built) is dict
+                else None
+            )
+            return _unavailable(
+                context,
+                "FEE_UNSIGNED_COST_UNAVAILABLE",
+                **(
+                    {"diagnostic_stage": stage}
+                    if type(stage) is str and stage in _UNSIGNED_REFUSAL_STAGES
+                    else {}
+                ),
+            )
         try:
             quote = quote_fee(cost, target_seconds=target_seconds)
         except Exception:
