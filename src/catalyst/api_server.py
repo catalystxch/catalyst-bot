@@ -253,6 +253,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/doctor",
         "/api/self-test",
         "/api/alerts",
+        "/api/safety/cancel-latch-review",
         "/api/token_overview",
         "/api/risk/spreads",
         "/api/settings/defaults",
