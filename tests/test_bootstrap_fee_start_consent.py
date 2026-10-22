@@ -32,7 +32,7 @@ def test_start_fee_readiness_rejects_recovery_only_or_stale_approval(monkeypatch
         lambda _id: "b" * 64,
     )
 
-    def rejected(_id):
+    def rejected(_id, **_kwargs):
         raise ValueError("FEE_APPROVAL_RECOVERY_ONLY")
 
     monkeypatch.setattr(runtime, "read_approved_prep_fee_snapshot", rejected)
@@ -56,7 +56,7 @@ def test_start_fee_readiness_requires_remaining_cancellation_cover(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "read_approved_prep_fee_snapshot",
-        lambda _id: {
+        lambda _id, **_kwargs: {
             "campaign": campaign,
             "recovery_only": False,
             "approval": {
@@ -86,7 +86,7 @@ def test_start_fee_readiness_accepts_current_campaign_consent(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "read_approved_prep_fee_snapshot",
-        lambda _id: {
+        lambda _id, **_kwargs: {
             "campaign": campaign,
             "recovery_only": False,
             "approval": {
@@ -116,7 +116,7 @@ def test_start_fee_readiness_rejects_superseded_campaign_revision(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "read_approved_prep_fee_snapshot",
-        lambda _id: {
+        lambda _id, **_kwargs: {
             "campaign": {**campaign, "revision": 0},
             "recovery_only": False,
             "approval": {

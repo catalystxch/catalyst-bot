@@ -39104,6 +39104,18 @@ def get_bootstrap_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def bootstrap_campaign_immutable_authority_valid(campaign: Dict[str, Any]) -> bool:
+    """Verify that the fixed campaign terms still hash to its durable ID."""
+    if type(campaign) is not dict:
+        return False
+    try:
+        authority = {key: campaign[key] for key in _BOOTSTRAP_CAMPAIGN_FIELDS}
+        _, derived_id = _bootstrap_campaign_material(authority)
+        return derived_id == campaign.get("campaign_id")
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def get_bootstrap_campaign_authoritative_fee_spent_mojos(campaign_id: str) -> int:
     """Return exact confirmed fees attributable to one Bootstrap campaign.
 

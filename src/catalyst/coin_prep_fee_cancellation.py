@@ -73,7 +73,9 @@ def price_approved_cancellation(
         context = {"approval": accounting}
         return _unavailable(context, "FEE_EFFECT_RECOVERY_REQUIRED")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
     fee = 0
@@ -100,7 +102,9 @@ def price_approved_cancellation(
             return _unavailable(context, "FEE_ESTIMATE_UNAVAILABLE")
         if quote["fee_mojos"] == fee:
             after = read_approved_prep_fee_snapshot(
-                approval_id, expected_recovery_action=expected_recovery_action
+                approval_id,
+                expected_recovery_action=expected_recovery_action,
+                allow_policy_only_revision=True,
             )
             if any(after[key] != context[key] for key in _CONTEXT_KEYS):
                 raise ValueError("FEE_APPROVAL_STALE")
@@ -171,7 +175,9 @@ def reserve_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
@@ -233,7 +239,9 @@ def recheck_reserved_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")

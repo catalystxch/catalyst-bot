@@ -616,7 +616,10 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
 
 
 def read_approved_prep_fee_snapshot(
-    approval_id: str, *, expected_recovery_action: str | None = None
+    approval_id: str,
+    *,
+    expected_recovery_action: str | None = None,
+    allow_policy_only_revision: bool = False,
 ) -> dict:
     """Read fresh selectable inventory under immutable approved economics.
 
@@ -625,7 +628,9 @@ def read_approved_prep_fee_snapshot(
     price a bundle, claim inputs or authorize signing. Dispatch must inspect its
     exact executable effect, use authoritative operation evidence and reserve
     its fresh final fee. Changed configuration/identity/address/campaign requires
-    new consent rather than silently substituting a new recipe.
+    new consent rather than silently substituting a new recipe. Preparation
+    dispatch remains bound to the exact campaign revision. Protected cancellation
+    may opt into later policy-only revisions of the same immutable campaign.
     """
     from coin_prep_fee_approval import canonical_fee_contract, validate_fee_consent
     from coin_prep_fee_execution import (
@@ -740,8 +745,23 @@ def read_approved_prep_fee_snapshot(
             and type(campaign.get("revision")) is int
             and campaign.get("revision") > approved_revision
         )
+        ordinary_policy_revision = (
+            # Bot policy evidence advances revision after Start Bot without
+            # changing the fixed campaign terms or the approved prep recipe.
+            # Only cancellation/readiness callers opt in; prep dispatch stays
+            # exact-revision and stopped/unsafe policy never gains authority.
+            allow_policy_only_revision is True
+            and not allow_campaign_fee_recovery
+            and type(approved_revision) is int
+            and type(campaign) is dict
+            and type(campaign.get("revision")) is int
+            and campaign["revision"] >= approved_revision
+            and campaign.get("stage")
+            in {"bootstrap", "discovery_25", "discovery_50", "established"}
+        )
         if (
             type(campaign) is not dict
+            or not database.bootstrap_campaign_immutable_authority_valid(campaign)
             or campaign.get("status")
             not in (
                 ("active", "stopped") if allow_campaign_fee_recovery else ("active",)
@@ -749,6 +769,7 @@ def read_approved_prep_fee_snapshot(
             or (
                 campaign.get("revision") != approved_revision
                 and not cleanup_recovery_revision
+                and not ordinary_policy_revision
             )
             or any(
                 campaign.get(key) != scope[key]

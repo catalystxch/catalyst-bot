@@ -156,6 +156,172 @@ def test_bootstrap_campaign_resolves_its_latest_explicit_fee_approval(
     assert approval_id == approved_bootstrap["approval"]["approval_id"]
 
 
+def test_ordinary_fee_consent_survives_policy_only_campaign_revision(
+    approved_bootstrap,
+):
+    """A live evidence update must not strand the approved cancellation reserve."""
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+    from bootstrap_fee_authority import cancellation_fee_readiness
+
+    campaign = database.get_bootstrap_campaign(approved_bootstrap["campaign_id"])
+    state_fields = (
+        "stage",
+        "deployment_fraction",
+        "current_anchor_price",
+        "stable_since",
+        "confirmed_fills",
+        "settlement_clusters",
+        "independent_depth_sides",
+        "suspected_linked_activity",
+        "adverse_fill_times",
+        "fee_spent_xch",
+        "realized_loss_xch",
+        "marked_inventory_loss_xch",
+        "updated_at",
+    )
+    revision = database.update_bootstrap_campaign_state(
+        campaign["campaign_id"],
+        expected_revision=0,
+        record={key: campaign[key] for key in state_fields},
+    )
+    assert revision == 1
+
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        runtime.read_approved_prep_fee_snapshot(
+            approved_bootstrap["approval"]["approval_id"]
+        )
+    context = runtime.read_approved_prep_fee_snapshot(
+        approved_bootstrap["approval"]["approval_id"],
+        allow_policy_only_revision=True,
+    )
+    assert context["campaign"]["revision"] == 1
+    assert cancellation_fee_readiness(
+        database.get_bootstrap_campaign(campaign["campaign_id"])
+    ) == {
+        "ready": True,
+        "approval_id": approved_bootstrap["approval"]["approval_id"],
+    }
+
+
+def test_ordinary_fee_consent_rejects_changed_immutable_campaign_budget(
+    approved_bootstrap, monkeypatch
+):
+    """A matching campaign ID cannot authorize a changed principal budget."""
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+    original = database.get_bootstrap_campaign(approved_bootstrap["campaign_id"])
+    monkeypatch.setattr(
+        database,
+        "get_bootstrap_campaign",
+        lambda _campaign_id: {**original, "xch_budget": "2"},
+    )
+
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        runtime.read_approved_prep_fee_snapshot(
+            approved_bootstrap["approval"]["approval_id"],
+            allow_policy_only_revision=True,
+        )
+
+
+def test_cancellation_pricing_keeps_protected_consent_after_policy_revision(
+    approved_bootstrap, monkeypatch
+):
+    """Policy evidence alone must not strand an exact unsigned cancellation."""
+    database = import_module("database")
+    service = import_module("coin_prep_fee_cancellation")
+    wallet = import_module("wallet")
+    campaign = database.get_bootstrap_campaign(approved_bootstrap["campaign_id"])
+    state_fields = (
+        "stage",
+        "deployment_fraction",
+        "current_anchor_price",
+        "stable_since",
+        "confirmed_fills",
+        "settlement_clusters",
+        "independent_depth_sides",
+        "suspected_linked_activity",
+        "adverse_fill_times",
+        "fee_spent_xch",
+        "realized_loss_xch",
+        "marked_inventory_loss_xch",
+        "updated_at",
+    )
+    database.update_bootstrap_campaign_state(
+        campaign["campaign_id"],
+        expected_revision=0,
+        record={key: campaign[key] for key in state_fields},
+    )
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 123_456,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": approved_bootstrap["now"],
+            "expires_at": approved_bootstrap["now"] + 60,
+        },
+    )
+
+    result = service.price_approved_cancellation(
+        approval_id=approved_bootstrap["approval"]["approval_id"],
+        trade_ids=["a" * 64],
+        source_coin_ids=["b" * 64],
+        fee_coin_id="c" * 64,
+    )
+
+    assert result["available"] is True
+    assert result["fee_mojos"] == 20
+    assert result["campaign"]["revision"] == 1
+    assert result["dispatch_authorized"] is False
+
+
+def test_policy_revision_allowance_does_not_revive_stopped_campaign(
+    approved_bootstrap,
+):
+    """A policy stop requires a new action-bound recovery approval."""
+    database = import_module("database")
+    runtime = import_module("coin_prep_fee_runtime")
+    campaign = database.get_bootstrap_campaign(approved_bootstrap["campaign_id"])
+    state_fields = (
+        "stage",
+        "deployment_fraction",
+        "current_anchor_price",
+        "stable_since",
+        "confirmed_fills",
+        "settlement_clusters",
+        "independent_depth_sides",
+        "suspected_linked_activity",
+        "adverse_fill_times",
+        "fee_spent_xch",
+        "realized_loss_xch",
+        "marked_inventory_loss_xch",
+        "updated_at",
+    )
+    state = {key: campaign[key] for key in state_fields}
+    state.update(stage="stopped", deployment_fraction="0")
+    database.update_bootstrap_campaign_state(
+        campaign["campaign_id"], expected_revision=0, record=state
+    )
+
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        runtime.read_approved_prep_fee_snapshot(
+            approved_bootstrap["approval"]["approval_id"],
+            allow_policy_only_revision=True,
+        )
+
+
 def test_campaign_renewal_discloses_journal_fees_missing_from_approval_ledger(
     approved_bootstrap, monkeypatch
 ):

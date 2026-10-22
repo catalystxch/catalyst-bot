@@ -24,7 +24,9 @@ def cancellation_fee_readiness(campaign: dict[str, Any]) -> dict[str, Any]:
     try:
         from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
 
-        context = read_approved_prep_fee_snapshot(approval_id)
+        context = read_approved_prep_fee_snapshot(
+            approval_id, allow_policy_only_revision=True
+        )
         approval = context["approval"]
         bound_campaign = context["campaign"]
         campaign_cap = Decimal(str(campaign["fee_budget_xch"])) * Decimal(10**12)
