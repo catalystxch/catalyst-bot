@@ -323,7 +323,12 @@ def _derive_preview(body: dict[str, Any], identity: dict[str, Any]) -> dict[str,
         expires_at=now + timedelta(seconds=reviewed["expires_in_seconds"]),
     )
     decision = evaluate_bootstrap_campaign(campaign, BootstrapEvidence(), now=now)
-    plan = derive_bootstrap_plan(campaign, decision, balances)
+    plan = derive_bootstrap_plan(
+        campaign,
+        decision,
+        balances,
+        cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+    )
     # Coin Prep can prepare every replacement wave, so retain the full market
     # budget as principal even though the first offer deployment is smaller.
     fee_principal = sum(

@@ -377,8 +377,8 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     assert args == {
         "xch_target": 9,
         "cat_target": 3,
-        "buy_tier_sizes": "inner=0.03333333333333333333333333333,mid=0.03333333333333333333333333333,outer=0.03333333333333333333333333334,fees=0.001",
-        "cat_tier_sizes": "inner=33.33333333333333333333333333,mid=33.33333333333333333333333333,outer=33.33333333333333333333333334",
+        "buy_tier_sizes": "inner=0.033333333334,mid=0.033333333333,outer=0.033333333333,fees=0.001",
+        "cat_tier_sizes": "inner=33.334,mid=33.333,outer=33.333",
         "tier_counts_xch": "inner=1,mid=1,outer=1,fees=6",
         "tier_counts_cat": "inner=1,mid=1,outer=1",
         "prep_headroom_pct": "0",
@@ -391,13 +391,13 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     prepared_xch = {
         tier: precision_worker._apply_prep_headroom_xch(amount)
         for tier, amount in {
-            "inner": Decimal("0.03333333333333333333333333333"),
-            "mid": Decimal("0.03333333333333333333333333333"),
-            "outer": Decimal("0.03333333333333333333333333334"),
+            "inner": Decimal("0.033333333334"),
+            "mid": Decimal("0.033333333333"),
+            "outer": Decimal("0.033333333333"),
         }.items()
     }
     assert prepared_xch == {
-        "inner": Decimal("0.033333333333"),
+        "inner": Decimal("0.033333333334"),
         "mid": Decimal("0.033333333333"),
         "outer": Decimal("0.033333333333"),
     }
@@ -405,9 +405,9 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
         int(prepared_xch[tier] * Decimal("1000000000000"))
         >= int(live_size * Decimal("1000000000000"))
         for tier, live_size in {
-            "inner": Decimal("0.03333333333333333333333333333"),
-            "mid": Decimal("0.03333333333333333333333333333"),
-            "outer": Decimal("0.03333333333333333333333333334"),
+            "inner": Decimal("0.033333333334"),
+            "mid": Decimal("0.033333333333"),
+            "outer": Decimal("0.033333333333"),
         }.items()
     )
 

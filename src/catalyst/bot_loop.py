@@ -13127,6 +13127,7 @@ class BotLoop:
         balances = {
             "xch_available": xch_available,
             "cat_available": cat_available,
+            "cat_decimals": int(getattr(cfg, "CAT_DECIMALS", 3)),
             "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
             "subsidy_spent_xch": Decimal("0"),
             "network_fee_xch": Decimal(get_effective_transaction_fee_mojos())

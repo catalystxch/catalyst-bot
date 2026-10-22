@@ -416,6 +416,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
     balances = {
         "xch_available": Decimal(xch_balance_mojos) / Decimal(10**12),
         "cat_available": Decimal(cat_balance_mojos) / Decimal(10**cat_decimals),
+        "cat_decimals": cat_decimals,
         "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
         "subsidy_spent_xch": Decimal("0"),
         "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),

@@ -9,7 +9,11 @@ from bootstrap_campaign import (
     CampaignStage,
 )
 import api_server  # noqa: F401 - initializes blueprint imports in app order
-from blueprints.coin_prep import bootstrap_coin_prep_requirements
+from blueprints.coin_prep import (
+    bootstrap_coin_prep_requirements,
+    bootstrap_coin_prep_worker_args,
+)
+from coin_prep_economics import build_exact_prep_economics
 from offer_book_policy import derive_bootstrap_plan
 from offer_manager import bootstrap_offer_specs
 
@@ -72,6 +76,47 @@ def _balances(**overrides):
     }
     values.update(overrides)
     return values
+
+
+def test_bootstrap_sell_levels_split_market_budget_into_atomic_mz_amounts():
+    campaign = _campaign(xch_budget=Decimal("61"), cat_budget=Decimal("725000"))
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+        ),
+        cat_decimals=3,
+    )
+
+    assert plan["authorized"] is True
+    assert [level["cat_amount"] for level in plan["sides"]["sell"]["levels"]] == [
+        Decimal("24166.667"),
+        Decimal("24166.667"),
+        Decimal("24166.666"),
+    ]
+    assert sum(
+        level["cat_amount"] for level in plan["sides"]["sell"]["levels"]
+    ) == Decimal("72500")
+    worker_args = bootstrap_coin_prep_worker_args(
+        plan, replacement_waves={"buy": 10, "sell": 10}
+    )
+    exact = build_exact_prep_economics(
+        configuration={
+            "CAT_DECIMALS": 3,
+            "LIQUIDITY_MODE": "two_sided",
+            "XCH_RESERVE": Decimal("0"),
+            "CAT_RESERVE": Decimal("0"),
+        },
+        worker_args=worker_args,
+        campaign_revision=0,
+    )
+    assert (
+        sum(output.amount_mojos for output in exact["targets"] if output.asset == "cat")
+        == 725_000_000
+    )
 
 
 def test_below_floor_quote_requires_the_exact_separate_subsidy_shortfall():
