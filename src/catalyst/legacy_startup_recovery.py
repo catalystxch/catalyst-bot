@@ -306,6 +306,11 @@ def _resolve_cleared_startup_latch(database_module: Any) -> bool:
         or any(type(value) is not str or not value for value in operation_ids)
     ):
         return False
+    # Terminal journal rows alone do not prove the current Sage offer book,
+    # wallet identity, or pending transactions. Cancellation latches require
+    # the native proof-bound review and its explicit final confirmation.
+    if any(operation_id.startswith("cancel:") for operation_id in operation_ids):
+        return False
     resolved = resolver(
         expected_generation=generation,
         resolved_operation_ids=operation_ids,

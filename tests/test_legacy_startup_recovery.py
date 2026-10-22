@@ -519,6 +519,36 @@ def test_persisted_reconciliation_conflicts_are_rechecked_from_exact_sage_proof(
     assert {call[1] for call in calls if call[0] == "reconcile"} == set(intent_ids)
 
 
+def test_legacy_recovery_does_not_auto_clear_cancel_latch_from_journal_alone():
+    """A terminal cancel journal still needs the native Sage-bound review."""
+    import legacy_startup_recovery
+
+    operation_ids = ["cancel:" + "a" * 64, "cancel:" + "b" * 64]
+    calls = []
+    database = SimpleNamespace(
+        get_legacy_startup_reservation_candidates=lambda limit=128: [],
+        get_unresolved_offer_operation_blockers=lambda: [],
+        get_runtime_safety_latch=lambda: {
+            "state": "tripped",
+            "generation": 154,
+            "blocking_operation_ids_json": json.dumps(operation_ids),
+        },
+        resolve_runtime_safety_latch=lambda **kwargs: calls.append(kwargs),
+    )
+
+    result = legacy_startup_recovery.recover_legacy_sage_reservations(
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        wallet_facade=SimpleNamespace(),
+        database_module=database,
+        reconciliation_module=SimpleNamespace(),
+        config=SimpleNamespace(CAT_DECIMALS=3),
+    )
+
+    assert result == {"examined": 0, "recovered": 0, "remaining": 0}
+    assert calls == []
+
+
 @pytest.mark.parametrize("first_member_already_settled", [False, True])
 @pytest.mark.parametrize("peer_scope_valid", [False, True])
 def test_submitted_native_bulk_cancel_is_recovered_as_one_manifest_after_restart(
