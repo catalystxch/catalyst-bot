@@ -1,4 +1,5 @@
 """Saved campaign review must not save blank settings or resume old cancels."""
+
 import pytest
 from .test_coin_prep_fee_approval import _open_gui
 
@@ -9,7 +10,8 @@ CAMPAIGN = "128976c99d666d4469ccb3e5d16848bdb18e2ab5989f27029730c7856b56a2b1"
 
 def prepare(page, failure=""):
     _open_gui(page)
-    page.evaluate("""({asset,id,failure}) => {
+    page.evaluate(
+        """({asset,id,failure}) => {
         document.getElementById('startupOverlay').style.display='none';
         document.querySelectorAll('.v4-view').forEach(v=>v.classList.remove('active'));
         document.getElementById('v4View-settings').classList.add('active');
@@ -58,74 +60,111 @@ def prepare(page, failure=""):
             throw new Error('Unexpected request '+url);
         };
         _bootstrapRenderStatus({active:true,campaign:_bootstrapActiveCampaign});
-    }""", {"asset": ASSET, "id": CAMPAIGN, "failure": failure})
+    }""",
+        {"asset": ASSET, "id": CAMPAIGN, "failure": failure},
+    )
 
 
 def test_saved_campaign_review_preserves_settings_and_rechecks_current_coins(page):
     prepare(page)
-    button = page.locator('#bootstrapPrepReviewBtn')
-    assert button.count() == 1, 'Saved campaigns need a native preparation review entry'
+    button = page.locator("#bootstrapPrepReviewBtn")
+    assert button.count() == 1, "Saved campaigns need a native preparation review entry"
     button.click()
-    page.wait_for_function("window.__calls.some(c=>c.url.includes('/coin-prep/verify?'))")
+    page.wait_for_function(
+        "window.__calls.some(c=>c.url.includes('/coin-prep/verify?'))"
+    )
     page.wait_for_function("coinPrepStatus==='done'")
-    calls = page.evaluate('window.__calls')
-    assert all(c['method'] == 'GET' for c in calls)
-    verify = next(c['url'] for c in calls if '/coin-prep/verify?' in c['url'])
-    assert 'bootstrap_campaign_id=' + CAMPAIGN in verify
-    assert 'bootstrap_campaign_revision=0' in verify
-    assert 'xch_reserve=23.5' in verify and 'cat_reserve=300000' in verify
-    assert page.evaluate('settingsReviewed') is False
-    assert page.evaluate("localStorage.getItem('settingsReviewed')") == 'false'
-    assert page.locator('#configFeePrepCount').input_value() == ''
-    assert page.locator('#configFeeCoinSizeXch').input_value() == ''
-    assert page.evaluate('isSettingsReviewedForCurrentPair()') is True
-    assert page.evaluate('_coinPrepFeeRecoveryIntent') is None
-    options = page.evaluate('buildCoinPrepFeePreviewOptions()')
-    assert options['bootstrap_campaign_id'] == CAMPAIGN
-    assert 'cancellation_recovery_action' not in options
-    page.evaluate('_bootstrapActiveCampaign.revision=1')
-    assert page.evaluate('isSettingsReviewedForCurrentPair()') is False
+    calls = page.evaluate("window.__calls")
+    assert all(c["method"] == "GET" for c in calls)
+    verify = next(c["url"] for c in calls if "/coin-prep/verify?" in c["url"])
+    assert "bootstrap_campaign_id=" + CAMPAIGN in verify
+    assert "bootstrap_campaign_revision=0" in verify
+    assert "xch_reserve=23.5" in verify and "cat_reserve=300000" in verify
+    assert page.evaluate("settingsReviewed") is False
+    assert page.evaluate("localStorage.getItem('settingsReviewed')") == "false"
+    assert page.locator("#configFeePrepCount").input_value() == ""
+    assert page.locator("#configFeeCoinSizeXch").input_value() == ""
+    assert page.evaluate("isSettingsReviewedForCurrentPair()") is True
+    assert page.evaluate("_coinPrepFeeRecoveryIntent") is None
+    options = page.evaluate("buildCoinPrepFeePreviewOptions()")
+    assert options["bootstrap_campaign_id"] == CAMPAIGN
+    assert "cancellation_recovery_action" not in options
+    page.evaluate("_bootstrapActiveCampaign.revision=1")
+    assert page.evaluate("isSettingsReviewedForCurrentPair()") is False
 
 
-@pytest.mark.parametrize('failure', [
-    'running','revision','asset','stopped','expired','unavailable','fee_pool',
-    'fee_size','missing_reserve',
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "running",
+        "revision",
+        "asset",
+        "stopped",
+        "expired",
+        "unavailable",
+        "fee_pool",
+        "fee_size",
+        "missing_reserve",
+    ],
+)
 def test_saved_campaign_review_refuses_drift_or_missing_fee_pool(page, failure):
     prepare(page, failure)
-    button = page.locator('#bootstrapPrepReviewBtn')
+    button = page.locator("#bootstrapPrepReviewBtn")
     assert button.count() == 1
-    if failure == 'running':
+    if failure == "running":
         assert button.is_disabled()
         return
     button.click()
-    page.wait_for_function("!document.getElementById('bootstrapPrepReviewBtn').disabled")
-    assert not any('/coin-prep/verify?' in c['url'] for c in page.evaluate('window.__calls'))
-    assert page.evaluate('isSettingsReviewedForCurrentPair()') is False
-    assert page.evaluate('settingsReviewed') is False
+    page.wait_for_function(
+        "!document.getElementById('bootstrapPrepReviewBtn').disabled"
+    )
+    assert not any(
+        "/coin-prep/verify?" in c["url"] for c in page.evaluate("window.__calls")
+    )
+    assert page.evaluate("isSettingsReviewedForCurrentPair()") is False
+    assert page.evaluate("settingsReviewed") is False
 
 
-@pytest.mark.parametrize('failure', [
-    'verify_failure','async_drift','missing_revision','missing_balance',
-])
-def test_changed_or_failed_coin_verification_cannot_mark_campaign_reviewed(page, failure):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "verify_failure",
+        "async_drift",
+        "missing_revision",
+        "missing_balance",
+    ],
+)
+def test_changed_or_failed_coin_verification_cannot_mark_campaign_reviewed(
+    page, failure
+):
     prepare(page, failure)
-    page.locator('#bootstrapPrepReviewBtn').click()
-    page.wait_for_function("!document.getElementById('bootstrapPrepReviewBtn').disabled")
-    assert page.evaluate('isSettingsReviewedForCurrentPair()') is False
-    assert page.evaluate('coinPrepStatus') == 'none'
-    assert all(c['method'] == 'GET' for c in page.evaluate('window.__calls'))
+    page.locator("#bootstrapPrepReviewBtn").click()
+    page.wait_for_function(
+        "!document.getElementById('bootstrapPrepReviewBtn').disabled"
+    )
+    assert page.evaluate("isSettingsReviewedForCurrentPair()") is False
+    assert page.evaluate("coinPrepStatus") == "none"
+    assert all(c["method"] == "GET" for c in page.evaluate("window.__calls"))
 
 
 def test_needed_preparation_opens_new_campaign_fee_review_without_writes(page):
-    prepare(page, 'needs_prep')
-    page.locator('#bootstrapPrepReviewBtn').click()
-    page.wait_for_function("window.__calls.some(c=>c.url.endsWith('/coin-prep/fee-preview'))")
-    calls = page.evaluate('window.__calls')
-    assert all(c['method'] == 'GET' or (
-        c['method'] == 'POST' and c['url'].endswith('/coin-prep/fee-preview')
-    ) for c in calls)
-    assert page.locator('#coinPrepConfirmOverlay').evaluate("el=>el.classList.contains('active')")
-    assert page.evaluate('_coinPrepFeePreviewOptions.bootstrap_campaign_id') == CAMPAIGN
-    assert page.evaluate('_coinPrepFeePreviewOptions.cancellation_recovery_action || null') is None
-    assert page.evaluate('settingsReviewed') is False
+    prepare(page, "needs_prep")
+    page.locator("#bootstrapPrepReviewBtn").click()
+    page.wait_for_function(
+        "window.__calls.some(c=>c.url.endsWith('/coin-prep/fee-preview'))"
+    )
+    calls = page.evaluate("window.__calls")
+    assert all(
+        c["method"] == "GET"
+        or (c["method"] == "POST" and c["url"].endswith("/coin-prep/fee-preview"))
+        for c in calls
+    )
+    assert page.locator("#coinPrepConfirmOverlay").evaluate(
+        "el=>el.classList.contains('active')"
+    )
+    assert page.evaluate("_coinPrepFeePreviewOptions.bootstrap_campaign_id") == CAMPAIGN
+    assert (
+        page.evaluate("_coinPrepFeePreviewOptions.cancellation_recovery_action || null")
+        is None
+    )
+    assert page.evaluate("settingsReviewed") is False
