@@ -965,6 +965,138 @@ def test_stopped_campaign_previews_then_proves_completed_offers_without_wallet_e
     assert committed == ["intent-0", "intent-1"]
 
 
+def test_completed_offer_review_accepts_one_prior_policy_revision_and_preserves_live_offers(
+    isolated_db, bootstrap_api, monkeypatch
+):
+    from blueprints import bootstrap
+    import offer_reconciliation
+    import wallet
+
+    bootstrap, client, identity = bootstrap_api
+    request = _request()
+    preview = client.post("/api/bootstrap/preview", json=request).get_json()
+    campaign_id = client.post(
+        "/api/bootstrap/start",
+        json={
+            **request,
+            "preview_digest": preview["preview_digest"],
+            "exact_asset_warning_accepted": True,
+        },
+    ).get_json()["campaign_id"]
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    state = {key: campaign[key] for key in database._BOOTSTRAP_STATE_FIELDS}
+    state["updated_at"] = "2026-09-12T12:00:01Z"
+    assert (
+        database.update_bootstrap_campaign_state(
+            campaign_id, expected_revision=0, record=state
+        )
+        == 1
+    )
+    state = {
+        key: database.get_bootstrap_campaign(campaign_id)[key]
+        for key in database._BOOTSTRAP_STATE_FIELDS
+    }
+    state["updated_at"] = "2026-09-12T12:00:02Z"
+    assert (
+        database.update_bootstrap_campaign_state(
+            campaign_id, expected_revision=1, record=state
+        )
+        == 2
+    )
+
+    filled_ids = ["11" * 32, "22" * 32]
+    live_ids = ["33" * 32, "44" * 32]
+    rows = [
+        {
+            "intent_id": f"intent-{index}",
+            "sage_trade_id": trade_id,
+            "purpose": f"bootstrap:{campaign_id}:revision:1",
+            "lifecycle_state": "visible",
+            "network": identity["network"],
+            "asset_id": identity["asset_id"],
+        }
+        for index, trade_id in enumerate([*filled_ids, *live_ids])
+    ]
+    open_rows = [
+        {"trade_id": row["sage_trade_id"], "side": "buy" if index < 2 else "sell"}
+        for index, row in enumerate(rows)
+    ]
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: rows)
+    monkeypatch.setattr(database, "get_open_offers", lambda **_kw: open_rows)
+    monkeypatch.setattr(
+        wallet,
+        "_read_refresh_abort_cleanup_snapshot",
+        lambda: {
+            "trade_ids": live_ids,
+            "pending_transaction_ids": [],
+            "observed_at": "2026-09-12T12:00:02Z",
+        },
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "load_authoritative_evidence",
+        lambda row: {"trade_id": row["sage_trade_id"]},
+    )
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "classify_terminal_evidence",
+        lambda *_args, **_kw: {"classification": "FILLED_PROVEN"},
+    )
+    committed = []
+    monkeypatch.setattr(
+        offer_reconciliation,
+        "reconcile_offer",
+        lambda intent_id, **_kw: (
+            committed.append(intent_id)
+            or {"classification": "FILLED_PROVEN", "applied": True}
+        ),
+    )
+    manager = SimpleNamespace(wait_for_offer_creation_quiescence=lambda: None)
+    client.application.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(is_running=lambda: False, offer_manager=manager),
+        _bot_cancel_lifecycle_lock=RLock(),
+    )
+
+    reviewed = client.post(
+        "/api/bootstrap/preview_completed",
+        json={"campaign_id": campaign_id, "revision": 2},
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.get_json()["expected_trade_ids"] == filled_ids
+    assert committed == []
+
+    committed_result = client.post(
+        "/api/bootstrap/reconcile_completed",
+        json={
+            "campaign_id": campaign_id,
+            "revision": 2,
+            "expected_trade_ids": filled_ids,
+        },
+    )
+    assert committed_result.status_code == 200
+    assert committed_result.get_json()["proven_completed"] == 2
+    assert committed == ["intent-0", "intent-1"]
+    assert database.get_bootstrap_campaign(campaign_id)["revision"] == 2
+    assert [row["sage_trade_id"] for row in rows[2:]] == live_ids
+
+    rows[3]["purpose"] = f"bootstrap:{campaign_id}:revision:2"
+    mixed = client.post(
+        "/api/bootstrap/preview_completed",
+        json={"campaign_id": campaign_id, "revision": 2},
+    )
+    assert mixed.status_code == 409
+    rows[3]["purpose"] = f"bootstrap:{campaign_id}:revision:1"
+
+    for row in rows:
+        row["purpose"] = f"bootstrap:{campaign_id}:revision:3"
+    future = client.post(
+        "/api/bootstrap/preview_completed",
+        json={"campaign_id": campaign_id, "revision": 2},
+    )
+    assert future.status_code == 409
+    assert committed == ["intent-0", "intent-1"]
+
+
 def test_completed_offer_commit_failure_reports_partial_and_requires_new_exact_preview(
     isolated_db, bootstrap_api, monkeypatch
 ):

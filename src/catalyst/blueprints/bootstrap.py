@@ -682,7 +682,6 @@ def _review_stopped_completed_offers(
         _await_campaign_creation_quiescence()
         if _campaign_unresolved_creation_count(campaign_id):
             raise BootstrapApiError("bootstrap_creation_unresolved", 409)
-        purpose = f"bootstrap:{campaign_id}:revision:{revision}"
         prefix = f"bootstrap:{campaign_id}:revision:"
         intents = [
             dict(row)
@@ -700,13 +699,30 @@ def _review_stopped_completed_offers(
             for row in open_rows
             if type(row) is dict and type(row.get("trade_id")) is str
         }
+        # A policy-state update increments the campaign revision without
+        # changing the immutable authority of offers created earlier.  Accept
+        # one exact historical offer cohort, while refusing mixed/future
+        # revisions and rechecking the current campaign before any commit.
+        purposes = {row.get("purpose") for row in intents}
+        cohort_revision = None
+        if len(purposes) == 1:
+            cohort_purpose = next(iter(purposes))
+            if type(cohort_purpose) is str and cohort_purpose.startswith(prefix):
+                suffix = cohort_purpose[len(prefix) :]
+                if (
+                    len(suffix) <= 19
+                    and re.fullmatch(r"0|[1-9][0-9]*", suffix) is not None
+                ):
+                    cohort_revision = int(suffix)
         if (
             not intents
             or len(intents) > 256
             or len(by_trade) != len(intents)
+            or cohort_revision is None
+            or cohort_revision > revision
+            or not database.bootstrap_campaign_immutable_authority_valid(campaign)
             or any(
-                row.get("purpose") != purpose
-                or row.get("lifecycle_state") not in {"created", "visible"}
+                row.get("lifecycle_state") not in {"created", "visible"}
                 for row in intents
             )
             or any(
