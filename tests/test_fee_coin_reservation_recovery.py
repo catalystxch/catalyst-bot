@@ -3,11 +3,44 @@
 from types import SimpleNamespace
 
 import pytest
+from flask import Flask
 
 import coin_prep_fee_cancellation
 import database
+from blueprints import bootstrap
 from coin_manager import FeeCoinPool
 from offer_manager import OfferManager
+
+
+def test_stopped_campaign_cancel_hydrates_cold_fee_pool_before_planning():
+    """A stopped bot has no trading cycle to populate its fee reserves."""
+    fee_coin_id = "e" * 64
+    trade_id = "a" * 64
+    pool = FeeCoinPool()
+    assert pool.reserve_largest_with_ticket() is None
+
+    class Coins:
+        def refresh_fee_pool_from_wallet(self):
+            pool.refresh([{"coin_id": fee_coin_id, "coin": {"amount": 1_000_000_000}}])
+
+    class Manager:
+        def cancel_offers(self, trade_ids, **_options):
+            assert trade_ids == [trade_id]
+            reserved = pool.reserve_largest_with_ticket()
+            assert reserved is not None, "campaign cancellation used an empty fee pool"
+            assert reserved[0].removeprefix("0x") == fee_coin_id
+            assert reserved[1] == 1_000_000_000
+            pool.release_ticket(reserved[0], reserved[2])
+            return {trade_id: {"outcome": "CANCEL_CONFIRMED"}}
+
+    app = Flask(__name__)
+    app.config["_CATALYST_API_SERVER_MODULE"] = SimpleNamespace(
+        bot=SimpleNamespace(coin_manager=Coins(), offer_manager=Manager())
+    )
+    with app.app_context():
+        assert bootstrap._cancel_campaign_offers([trade_id]) == {
+            trade_id: {"outcome": "CANCEL_CONFIRMED"}
+        }
 
 
 def test_failed_cancel_pricing_releases_unspent_fee_coin(monkeypatch):

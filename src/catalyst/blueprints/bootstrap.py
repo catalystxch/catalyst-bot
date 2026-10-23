@@ -1136,6 +1136,15 @@ def _cancel_campaign_offers(
     if not trade_ids:
         return {}
     manager = _campaign_cancel_manager()
+    # A stopped bot has no trading cycle to populate its in-memory fee pool.
+    # Use the same authoritative wallet refresh as stopped-bot Cancel All
+    # immediately before the protected cancellation planner reserves a coin.
+    owner = current_app.config.get("_CATALYST_API_SERVER_MODULE")
+    server = owner or sys.modules.get("api_server")
+    coin_manager = getattr(getattr(server, "bot", None), "coin_manager", None)
+    refresh_fee_pool = getattr(coin_manager, "refresh_fee_pool_from_wallet", None)
+    if callable(refresh_fee_pool):
+        refresh_fee_pool()
     cancel_options = {
         "reason": "bootstrap_manual_stop",
         "force_storm": True,
