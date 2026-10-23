@@ -44,7 +44,7 @@ def test_cancel_latch_recovery_requires_proof_and_posts_only_digest(page):
     expect(page.locator("#proofs li")).to_have_count(2)
     assert page.locator("button").all_text_contents() == [
         "Refresh exact proof",
-        "Check submitted cancellations",
+        "Confirm database-only cancellation recovery",
         "Confirm database-only latch release",
     ]
     page.on("dialog", lambda dialog: dialog.accept())
@@ -83,6 +83,9 @@ def test_restricted_view_checks_exact_submitted_scope_before_release(page):
                 if (String(path).includes('check-submitted-cancellations')) {
                     window.__posted.push(JSON.parse(options.body));
                     window.__settled = true;
+                    return new Response(JSON.stringify({success: true,
+                        recovered: true, generation: 155}),
+                        {status: 200, headers: {'Content-Type': 'application/json'}});
                 }
                 const review = window.__settled
                     ? {ready: true, generation: 155, operation_ids: ids,
@@ -104,9 +107,12 @@ def test_restricted_view_checks_exact_submitted_scope_before_release(page):
     expect(page.locator("#checkSubmitted")).to_be_enabled()
     expect(page.locator("#confirm")).to_be_disabled()
     page.locator("#checkSubmitted").click()
-    expect(page.locator("#confirm")).to_be_enabled()
+    expect(page.locator("#confirm")).to_be_disabled()
+    expect(page.locator("#status")).to_contain_text("safety latch resolved")
     assert page.evaluate("window.__posted") == [
-        {"expected_generation": 155,
-         "operation_ids": ["cancel:" + "a" * 64, "cancel:" + "b" * 64],
-         "scope_digest": "c" * 64}
+        {
+            "expected_generation": 155,
+            "operation_ids": ["cancel:" + "a" * 64, "cancel:" + "b" * 64],
+            "scope_digest": "c" * 64,
+        }
     ]

@@ -5091,10 +5091,11 @@ def api_safety_cancel_latch_review():
 
 @app.route("/api/safety/check-submitted-cancellations", methods=["POST"])
 def api_safety_check_submitted_cancellations():
-    """Settle only the exact submitted cancel cohort in restricted startup.
+    """Commit only exact submitted-cancel proof after a native final click.
 
-    This never retries cancellation or submits a new wallet transaction. The
-    final latch release remains a separate, proof-bound native click.
+    Task 9 atomically resolves the final local latch when all its named
+    blockers become terminal. This path never retries or sends a wallet
+    cancellation, and it verifies that exact database transition afterward.
     """
 
     if not _cancel_latch_review_recovery_active:
@@ -5148,17 +5149,38 @@ def api_safety_check_submitted_cancellations():
             return jsonify(
                 {"success": False, "reason_code": "CANCELLATION_PROOF_PENDING"}
             ), 409
-    after = review(bot=bot)
+    latch = database.get_runtime_safety_latch()
+    blockers = database.get_unresolved_offer_operation_blockers()
+    trade_ids = [
+        operation_id.split(":", 1)[1] for operation_id in payload["operation_ids"]
+    ]
+    terminal = database.get_authoritative_terminal_records(trade_ids)
     if (
-        after.get("ready") is not True
-        or after.get("generation") != payload["expected_generation"]
-        or after.get("operation_ids") != payload["operation_ids"]
-        or after.get("scope_digest") != payload["scope_digest"]
+        type(latch) is not dict
+        or latch.get("generation") != payload["expected_generation"]
+        or latch.get("state") != "resolved"
+        or blockers
+        or type(terminal) is not dict
+        or set(terminal) != set(trade_ids)
+        or any(
+            type(terminal[trade_id]) is not dict
+            or terminal[trade_id].get("sage_trade_id") != trade_id
+            or terminal[trade_id].get("outcome") != "CANCELLED_PROVEN"
+            for trade_id in trade_ids
+        )
     ):
         return jsonify(
             {"success": False, "reason_code": "CANCELLATION_PROOF_INCOMPLETE"}
         ), 409
-    return jsonify({"success": True, "review": after})
+    return jsonify(
+        {
+            "success": True,
+            "recovered": True,
+            "generation": payload["expected_generation"],
+            "operation_ids": payload["operation_ids"],
+            "trading_stopped": True,
+        }
+    )
 
 
 @app.route("/api/safety/confirm-cancel-latch-review", methods=["POST"])

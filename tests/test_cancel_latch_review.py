@@ -254,6 +254,22 @@ def test_restricted_check_settles_exact_scope_without_wallet_cancel(monkeypatch)
     monkeypatch.setattr(
         offer_manager.OfferManager, "reconcile_submitted_cancels_only", settle
     )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_runtime_safety_latch",
+        lambda: {"generation": 155, "state": "resolved"},
+    )
+    monkeypatch.setattr(
+        api_server.database, "get_unresolved_offer_operation_blockers", lambda: []
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_authoritative_terminal_records",
+        lambda trade_ids: {
+            trade_id: {"sage_trade_id": trade_id, "outcome": "CANCELLED_PROVEN"}
+            for trade_id in trade_ids
+        },
+    )
     body = {
         "expected_generation": 155,
         "operation_ids": ids,
@@ -264,6 +280,7 @@ def test_restricted_check_settles_exact_scope_without_wallet_cancel(monkeypatch)
     ):
         response = api_server.api_safety_check_submitted_cancellations()
     assert response.json["success"] is True
+    assert response.json["recovered"] is True
     assert state["calls"] == 1
 
     state["settled"] = False
