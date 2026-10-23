@@ -41,12 +41,16 @@ def test_fee_pool_save_sends_only_two_fields_even_when_other_settings_are_presen
     page.locator("#configFeePrepCount").fill("50")
     page.locator("#saveFeePoolOnlyBtn").click()
     page.wait_for_function("window.__feeSaveCalls.some(c => c.method === 'POST')")
-    writes = [c for c in page.evaluate("window.__feeSaveCalls") if c["method"] == "POST"]
-    assert writes == [{
-        "path": "/api/config",
-        "method": "POST",
-        "body": {"fee_prep_count": 50, "fee_coin_size_xch": "0.001"},
-    }]
+    writes = [
+        c for c in page.evaluate("window.__feeSaveCalls") if c["method"] == "POST"
+    ]
+    assert writes == [
+        {
+            "path": "/api/config",
+            "method": "POST",
+            "body": {"fee_prep_count": 50, "fee_coin_size_xch": "0.001"},
+        }
+    ]
     assert page.locator("#configTransactionFeeEnabled").is_checked() is False
     assert page.locator("#configSageChangeAddress").is_checked() is True
 
@@ -56,7 +60,9 @@ def test_fee_pool_save_refuses_invalid_values_without_writing(page):
     page.locator("#configFeeCoinSizeXch").fill("0")
     page.locator("#configFeePrepCount").fill("50")
     page.locator("#saveFeePoolOnlyBtn").click()
-    assert not any(c["method"] == "POST" for c in page.evaluate("window.__feeSaveCalls"))
+    assert not any(
+        c["method"] == "POST" for c in page.evaluate("window.__feeSaveCalls")
+    )
 
 
 def test_fee_pool_save_refuses_running_bot(page):
@@ -65,4 +71,6 @@ def test_fee_pool_save_refuses_running_bot(page):
     page.locator("#configFeeCoinSizeXch").fill("0.001")
     page.locator("#configFeePrepCount").fill("50")
     page.locator("#saveFeePoolOnlyBtn").click()
-    assert not any(c["method"] == "POST" for c in page.evaluate("window.__feeSaveCalls"))
+    assert not any(
+        c["method"] == "POST" for c in page.evaluate("window.__feeSaveCalls")
+    )

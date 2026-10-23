@@ -246,9 +246,12 @@ class TestConfigPost(_FlaskBase):
         fake_cfg.MAX_ACTIVE_BUY_OFFERS = 3
         fake_cfg.MAX_ACTIVE_SELL_OFFERS = 3
         fake_cfg.SAGE_SET_CHANGE_ADDRESS = True
-        with patch.object(api_server, "cfg", fake_cfg), patch(
-            "blueprints.config_bp._apply_sage_change_address_setting"
-        ) as change_address:
+        with (
+            patch.object(api_server, "cfg", fake_cfg),
+            patch(
+                "blueprints.config_bp._apply_sage_change_address_setting"
+            ) as change_address,
+        ):
             resp = self._post_json(
                 "/api/config", {"fee_prep_count": 50, "fee_coin_size_xch": "0.001"}
             )
