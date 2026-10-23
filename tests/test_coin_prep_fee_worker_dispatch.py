@@ -12,6 +12,35 @@ import fee_approval_test_utils as utils
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
+def test_worker_logs_bounded_pricing_failure_before_any_claim(
+    active_worker, monkeypatch
+):
+    state = active_worker
+    pricing = import_module("coin_prep_fee_pricing")
+    monkeypatch.setattr(
+        pricing,
+        "quote_fee",
+        lambda *_args, **_kwargs: {
+            "available": False,
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+            "raw": "private provider response",
+        },
+    )
+    messages = []
+    state["worker"].log = messages.append
+    with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):
+        state["worker"]._run_direct_batch_prep()
+    assert any(
+        "unsigned_pricing" in message and "fee_provider_rate_limited" in message
+        for message in messages
+    )
+    assert "private provider response" not in str(messages)
+    assert utils._counts()["wallet_effect_claims"] == 0
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
 @pytest.fixture
 def active_worker(approved, monkeypatch):
     database = import_module("database")

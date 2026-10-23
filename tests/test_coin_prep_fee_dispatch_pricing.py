@@ -121,6 +121,62 @@ def test_manual_fee_mode_cannot_bypass_unavailable_network_estimate(
     assert utils._counts()["coin_prep_operations"] == 0
 
 
+def test_unavailable_pricing_identifies_provider_failure_without_raw_details(
+    approved, monkeypatch
+):
+    monkeypatch.setattr(
+        import_module("coin_prep_fee_pricing"),
+        "quote_fee",
+        lambda *_args, **_kwargs: {
+            "available": False,
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+            "raw": "private provider response",
+        },
+    )
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["diagnostic_stage"] == "unsigned_pricing"
+    assert result["provider_failures"] == [
+        {
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+        }
+    ]
+    assert "private provider response" not in str(result)
+    assert utils._counts()["wallet_effect_claims"] == 0
+
+
+def test_quote_expiry_after_inventory_recheck_has_distinct_diagnostic(
+    approved, monkeypatch
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1060
+        return result
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert result["diagnostic_stage"] == "post_inventory_quote_recheck"
+    assert result["quote_timing"] == {
+        "observed_at": 1000,
+        "expires_at": 1060,
+        "checked_at": 1060,
+    }
+    assert utils._counts()["wallet_effect_claims"] == 0
+
+
 def test_configuration_changed_while_building_unsigned_bundle_cannot_be_priced(
     approved, monkeypatch
 ):

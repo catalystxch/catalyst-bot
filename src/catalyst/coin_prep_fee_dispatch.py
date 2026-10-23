@@ -7,6 +7,7 @@ the existing wallet-effect fence. No manual fee/price/plan override is accepted.
 
 from coin_prep_fee_funding import prepare_fee_inventory
 from coin_prep_fee_pricing import is_current_fee_quote, price_next_prep_batch
+import coin_prep_fee_pricing
 from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
 from fee_estimation import fee_failure_diagnostics
 from super_log import slog
@@ -124,6 +125,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         return _paused(
             context,
             pricing["reason"],
+            diagnostic_stage="unsigned_pricing",
             provider_failures=fee_failure_diagnostics(pricing),
         )
     if pricing["transaction_required"] is True:
@@ -131,7 +133,17 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         if not is_current_fee_quote(
             pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]
         ):
-            return _paused(context, "FEE_ESTIMATE_UNAVAILABLE")
+            quote = pricing["quote"]
+            return _paused(
+                context,
+                "FEE_ESTIMATE_UNAVAILABLE",
+                diagnostic_stage="post_inventory_quote_recheck",
+                quote_timing={
+                    "observed_at": quote.get("observed_at"),
+                    "expires_at": quote.get("expires_at"),
+                    "checked_at": coin_prep_fee_pricing._now(),
+                },
+            )
         if fee > context["approval"]["remaining_preparation_fee_mojos"]:
             return _paused(context, "FEE_BUDGET_EXCEEDED", required_fee_mojos=fee)
         if fee > funding["fee_funding_mojos"]:
