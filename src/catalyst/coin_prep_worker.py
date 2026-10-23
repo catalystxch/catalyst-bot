@@ -351,9 +351,9 @@ def get_recoverable_coin_prep_operations(*args, **kwargs):
 
 
 def get_coin_reconciliation_protected_ids(*args, **kwargs):
-    """Load durable coin fences without widening DB bootstrap coupling."""
+    """Load preparation fences while retaining the worker's patchable seam."""
 
-    from database import get_coin_reconciliation_protected_ids as repository_call
+    from database import get_coin_preparation_protected_ids as repository_call
 
     return repository_call(*args, **kwargs)
 
