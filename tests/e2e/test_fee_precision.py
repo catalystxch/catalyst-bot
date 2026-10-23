@@ -55,6 +55,13 @@ def test_fee_pool_controls_remain_available_when_manual_fee_is_off(page):
     page.route("http://**/*", lambda route: route.abort())
     page.route("https://**/*", lambda route: route.abort())
     page.goto(GUI.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            document.querySelectorAll('.v4-view').forEach(view => view.classList.remove('active'));
+            document.getElementById('v4View-settings').classList.add('active');
+        }"""
+    )
     result = page.evaluate(
         """() => {
             const toggle = document.getElementById('configTransactionFeeEnabled');
@@ -73,6 +80,8 @@ def test_fee_pool_controls_remain_available_when_manual_fee_is_off(page):
         "sizeOutsideManual": True,
         "countOutsideManual": True,
     }
+    expect(page.locator("#configFeeCoinSizeXch")).to_be_visible()
+    expect(page.locator("#configFeePrepCount")).to_be_visible()
 
 
 @pytest.mark.parametrize("enabled", [False, True])
