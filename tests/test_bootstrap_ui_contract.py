@@ -168,7 +168,7 @@ def test_coin_prep_preview_shows_campaign_caps_instead_of_legacy_wallet_plan():
 
 
 def test_coin_prep_verify_has_bounded_client_wait_and_safe_fallback():
-    start = GUI.index("async function checkIfCoinPrepNeeded(config)")
+    start = GUI.index("async function checkIfCoinPrepNeeded(config")
     end = GUI.index("function showCoinPrepConfirm(config", start)
     block = GUI[start:end]
 
@@ -191,7 +191,7 @@ def test_settings_warning_is_not_hidden_behind_preopened_coin_prep():
 
 
 def test_bootstrap_coin_prep_preflight_sends_exact_campaign_authority():
-    start = GUI.index("async function checkIfCoinPrepNeeded(config)")
+    start = GUI.index("async function checkIfCoinPrepNeeded(config")
     end = GUI.index("function showCoinPrepConfirm(config", start)
     block = GUI[start:end]
 
