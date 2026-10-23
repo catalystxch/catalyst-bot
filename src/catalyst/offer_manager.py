@@ -6462,6 +6462,69 @@ class OfferManager:
         }
         return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
 
+    def _reserve_protected_cancel_fee_source(
+        self, expected_recovery_action: Optional[str]
+    ) -> tuple[Any, str, int, int] | None:
+        """Prefer prepared fees; use exact selectable top-up collateral only for UI recovery."""
+        fee_pool = self._fee_pool
+        if fee_pool is None:
+            return None
+        prepared = fee_pool.reserve_largest_with_ticket()
+        if prepared is not None:
+            coin_id, amount, ticket = prepared
+            return fee_pool, coin_id, ticket, amount
+        if expected_recovery_action not in {"cancel_all", "bootstrap_stop"}:
+            return None
+
+        # Coin Prep normally makes dedicated fee outputs. An older ladder can
+        # exhaust them while its offers are still live, so full re-prep cannot
+        # start (it would first cancel those offers). Restrict this recovery
+        # input to durable top-up collateral that Sage currently says is
+        # selectable. The final exact unsigned quote and approved fee ceiling
+        # are still checked by price_approved_cancellation below.
+        from coin_manager import (
+            _coin_amount,
+            _coin_id_from_record,
+            _extract_coin_records,
+        )
+
+        wallet_result = get_exact_spendable_coins_rpc(cfg.WALLET_ID_XCH)
+        if type(wallet_result) is not dict or wallet_result.get("success") is not True:
+            return None
+        wallet_records = _extract_coin_records(wallet_result)
+        selectable = {}
+        for record in wallet_records:
+            coin_id = str(_coin_id_from_record(record) or "").lower().removeprefix("0x")
+            if len(coin_id) != 64 or any(
+                ch not in "0123456789abcdef" for ch in coin_id
+            ):
+                return None
+            if coin_id in selectable:
+                return None
+            selectable[coin_id] = _coin_amount(record)
+
+        candidates = []
+        for row in database.get_free_coins("xch"):
+            if row.get("purpose") != "top_up" or row.get("designation") not in {
+                "unknown",
+                "reserve",
+            }:
+                continue
+            coin_id = str(row.get("coin_id") or "").lower().removeprefix("0x")
+            amount = row.get("amount_mojos")
+            if (
+                type(amount) is int
+                and 0 < amount <= 100_000_000_000
+                and selectable.get(coin_id) == amount
+            ):
+                candidates.append((amount, coin_id))
+        for amount, coin_id in sorted(candidates, reverse=True):
+            reserved = fee_pool.reserve_external_recovery_with_ticket(coin_id, amount)
+            if reserved is not None:
+                reserved_id, reserved_amount, ticket = reserved
+                return fee_pool, reserved_id, ticket, reserved_amount
+        return None
+
     def _plan_coin_prep_cancel(
         self,
         members: list[tuple],
@@ -6511,11 +6574,10 @@ class OfferManager:
             source_coin_ids.append(coin_id)
         from coin_prep_fee_cancellation import price_approved_cancellation
 
-        fee_pool = self._fee_pool
-        largest = fee_pool.reserve_largest_with_ticket()
-        if largest is None:
+        reserved = self._reserve_protected_cancel_fee_source(expected_recovery_action)
+        if reserved is None:
             raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
-        reserved_coin_id, fee_coin_amount, ticket = largest
+        fee_pool, reserved_coin_id, ticket, fee_coin_amount = reserved
         fee_coin_id = str(reserved_coin_id).strip().lower().removeprefix("0x")
         try:
             priced = price_approved_cancellation(

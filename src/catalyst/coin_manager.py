@@ -725,6 +725,7 @@ class FeeCoinPool:
         self._available: list = []  # [(coin_id, amount_mojos), ...]
         self._reserved: set = set()  # coin IDs handed out this cycle
         self._reservation_tickets: dict[str, int] = {}
+        self._external_recovery_ids: set[str] = set()
         self._next_reservation_ticket = 0
         self._lock = threading.Lock()
 
@@ -736,6 +737,7 @@ class FeeCoinPool:
             self._available = []
             self._reserved = set()
             self._reservation_tickets = {}
+            self._external_recovery_ids = set()
             for rec in fee_coin_records:
                 cid = _coin_id_from_record(rec)
                 if cid:
@@ -794,6 +796,30 @@ class FeeCoinPool:
             self._reservation_tickets[coin_id] = ticket
             return coin_id, amount, ticket
 
+    def reserve_external_recovery_with_ticket(
+        self, coin_id: str, amount_mojos: int
+    ) -> tuple[str, int, int] | None:
+        """Reserve one separately verified recovery input without exposing it to normal offers."""
+        if (
+            type(coin_id) is not str
+            or len(coin_id) != 64
+            or any(ch not in "0123456789abcdef" for ch in coin_id)
+            or type(amount_mojos) is not int
+            or amount_mojos <= 0
+        ):
+            return None
+        with self._lock:
+            if coin_id in self._reserved or any(
+                cid == coin_id for cid, _ in self._available
+            ):
+                return None
+            self._next_reservation_ticket += 1
+            ticket = self._next_reservation_ticket
+            self._reserved.add(coin_id)
+            self._reservation_tickets[coin_id] = ticket
+            self._external_recovery_ids.add(coin_id)
+            return coin_id, amount_mojos, ticket
+
     def release_ticket(self, coin_id: str, ticket: int) -> bool:
         """Release only the same in-memory reservation, never a newer one."""
         with self._lock:
@@ -801,6 +827,7 @@ class FeeCoinPool:
                 return False
             del self._reservation_tickets[coin_id]
             self._reserved.discard(coin_id)
+            self._external_recovery_ids.discard(coin_id)
             return True
 
     # ---- introspection ----
