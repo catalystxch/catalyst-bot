@@ -50,6 +50,31 @@ def test_zero_manual_transaction_fee_keeps_configured_fee_reserve_pool(page):
     assert result == {"inputs": True, "saved": True}
 
 
+def test_fee_pool_controls_remain_available_when_manual_fee_is_off(page):
+    """A user can configure protected-cancel reserves without enabling a manual fee."""
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
+    page.goto(GUI.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """() => {
+            const toggle = document.getElementById('configTransactionFeeEnabled');
+            toggle.checked = false;
+            toggle.dispatchEvent(new Event('change', {bubbles: true}));
+            const manual = document.getElementById('transactionFeeManualWrap');
+            return {
+                manualHidden: manual.style.display === 'none',
+                sizeOutsideManual: !manual.contains(document.getElementById('configFeeCoinSizeXch')),
+                countOutsideManual: !manual.contains(document.getElementById('configFeePrepCount'))
+            };
+        }"""
+    )
+    assert result == {
+        "manualHidden": True,
+        "sizeOutsideManual": True,
+        "countOutsideManual": True,
+    }
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("supports_auto_estimate", [False, True])
 def test_manual_fee_toggle_does_not_describe_prep_as_manual_or_free(

@@ -11575,27 +11575,22 @@
                             </label>
                         </div>
                         <div id="transactionFeeManualWrap" style="display: none;">
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                                <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
-                                    <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
-                                </div>
+                            <div class="form-group" style="margin-bottom: 10px;">
+                                <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
+                                <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Coin Size (XCH) <span class="cc-help">?<span class="cc-tooltip">The size of coin that the bot will prepare for fee coins.</span></span></label>
                                     <input type="number" id="configFeeCoinSizeXch" value="0.0001" step="0.00000001" min="0" oninput="updateFeeSettingsUi(); updateCoinPrepPreview();">
                                 </div>
-                            </div>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Coin Count</label>
                                     <input type="number" id="configFeePrepCount" value="20" step="1" min="0" oninput="updateFeeSettingsUi(); updateCoinPrepPreview();">
                                 </div>
-                                <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Fee Pool Use</label>
-                                    <div class="v4-settings-hint" style="margin: 0; color: var(--slate-400);">Bigger fee coins are fine. Change returns to the fee pool.</div>
-                                </div>
-                            </div>
                         </div>
+                        <div class="v4-settings-hint" style="margin-bottom: 10px; color: var(--slate-400);">Fee coins fund protected cancellations; unused change stays in the wallet.</div>
                         <div class="v4-settings-hint" id="feeStatusHint" style="margin-bottom: 10px; color: var(--slate-400);">
                             Fee status loading...
                         </div>
