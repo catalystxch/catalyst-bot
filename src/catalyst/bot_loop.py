@@ -13180,6 +13180,13 @@ class BotLoop:
             live_trade_ids=current_buy_ids | current_sell_ids,
         )
         if superseded:
+            # Earlier cancellations may have spent the pool's reserved coin.
+            # Refresh against Sage before planning another protected cancel.
+            refresh_fee_pool = getattr(
+                self.coin_manager, "refresh_fee_pool_from_wallet", None
+            )
+            if callable(refresh_fee_pool):
+                refresh_fee_pool()
             self.offer_manager.cancel_offers(
                 list(superseded),
                 reason="bootstrap_revision_superseded",
@@ -13209,6 +13216,11 @@ class BotLoop:
                 }
             )
             if trade_ids:
+                refresh_fee_pool = getattr(
+                    self.coin_manager, "refresh_fee_pool_from_wallet", None
+                )
+                if callable(refresh_fee_pool):
+                    refresh_fee_pool()
                 self.offer_manager.cancel_offers(
                     trade_ids,
                     reason=runtime["transition"]["cancel_reason"],

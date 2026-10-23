@@ -1900,6 +1900,77 @@ def test_superseded_revision_trade_ids_are_fenced_before_replacement():
     ) == ("01" * 32, "02" * 32)
 
 
+@pytest.mark.parametrize("intent_revision, transition", [(1, False), (2, True)])
+def test_live_bootstrap_refreshes_fee_reserve_before_cancel(
+    monkeypatch, intent_revision, transition
+):
+    """A prior cancel can spend the in-memory fee coin before later cleanup."""
+    import tx_fees
+    import wallet
+
+    trade_id = "01" * 32
+    campaign = {
+        "campaign_id": "ab" * 32,
+        "revision": 2,
+        "fee_spent_xch": "0",
+    }
+    order = []
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_balance",
+        lambda _wallet_id: {
+            "success": True,
+            "wallet_balance": {"confirmed_wallet_balance": 1_000_000_000_000},
+        },
+    )
+    monkeypatch.setattr(tx_fees, "get_effective_transaction_fee_mojos", lambda: 0)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "sage_trade_id": trade_id,
+                "purpose": f"bootstrap:{campaign['campaign_id']}:revision:{intent_revision}",
+                "lifecycle_state": "created",
+            }
+        ],
+    )
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._publication_discovery_pending = 0
+    loop._market_confidence_result = None
+    loop.coin_manager = SimpleNamespace(
+        is_busy=lambda: False,
+        refresh_fee_pool_from_wallet=lambda: order.append("refresh"),
+    )
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda *_args, **_kwargs: order.append("cancel")
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": campaign,
+        "identity": {},
+    }
+    loop._refresh_bootstrap_campaign_evidence = lambda **_kwargs: {
+        "campaign": campaign,
+        "runtime": {
+            "transition": {
+                "cancel_required": True,
+                "cancel_reason": "bootstrap_market_withdrawal",
+            }
+        }
+        if transition
+        else None,
+        "changed": False,
+    }
+
+    result = loop._route_bootstrap_creation_if_active(
+        current_buy_ids={trade_id}, current_sell_ids=set()
+    )
+    assert result == {"buy": set(), "sell": set()}
+    assert order == ["refresh", "cancel"]
+
+
 def test_live_bot_materializes_authoritative_stage_before_creating(
     bootstrap_app, monkeypatch
 ):
