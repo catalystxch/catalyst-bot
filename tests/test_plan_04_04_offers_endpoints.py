@@ -1678,6 +1678,130 @@ class TestCancelAllPost(_FlaskBase):
         stopped.offer_manager.reconcile_submitted_cancels_only.assert_called_once_with()
         stopped.offer_manager.cancel_offers.assert_not_called()
 
+    def test_explicit_proof_only_reconciles_exact_latch_without_wallet_cancel(self):
+        """A native proof click binds the observed generation and blockers."""
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        operation_id = "cancel:" + "a" * 64
+        blocked = types.SimpleNamespace(
+            allowed=False,
+            reason_code="UNRESOLVED_OPERATIONS",
+            blocking_operation_ids=(operation_id,),
+        )
+        cleared = types.SimpleNamespace(allowed=True, reason_code="")
+        states = iter((blocked, blocked, cleared))
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch.object(
+                api_server.mutation_gate,
+                "read_only_status",
+                side_effect=lambda: next(states),
+            ),
+            patch(
+                "database.get_runtime_safety_latch", return_value={"generation": 155}
+            ),
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value.start.side_effect = lambda: (
+                thread_cls.call_args.kwargs["target"]()
+            )
+            response = self._post(
+                "/api/offers/cancel_all",
+                {
+                    "reconciliation_only": True,
+                    "expected_latch_generation": 155,
+                    "expected_operation_ids": [operation_id],
+                },
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["reconciliation_only"])
+        stopped.offer_manager.reconcile_submitted_cancels_only.assert_called_once_with()
+        stopped.offer_manager.cancel_offers.assert_not_called()
+
+    def test_explicit_proof_only_refuses_cleared_gate_and_stale_generation(self):
+        """A raced or stale review cannot fall through to broad cancellation."""
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        operation_id = "cancel:" + "a" * 64
+        request = {
+            "reconciliation_only": True,
+            "expected_latch_generation": 155,
+            "expected_operation_ids": [operation_id],
+        }
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch.object(
+                api_server.mutation_gate,
+                "read_only_status",
+                return_value=types.SimpleNamespace(allowed=True, reason_code=""),
+            ),
+        ):
+            cleared = self._post("/api/offers/cancel_all", request)
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch.object(
+                api_server.mutation_gate,
+                "read_only_status",
+                return_value=types.SimpleNamespace(
+                    allowed=False,
+                    reason_code="UNRESOLVED_OPERATIONS",
+                    blocking_operation_ids=(operation_id,),
+                ),
+            ),
+            patch(
+                "database.get_runtime_safety_latch", return_value={"generation": 156}
+            ),
+        ):
+            stale = self._post("/api/offers/cancel_all", request)
+        self.assertEqual(cleared.status_code, 409)
+        self.assertEqual(stale.status_code, 409)
+        stopped.offer_manager.cancel_offers.assert_not_called()
+        stopped.offer_manager.reconcile_submitted_cancels_only.assert_not_called()
+
+    def test_explicit_proof_only_worker_refuses_latch_drift(self):
+        """An accepted click cannot reconcile a different latch after threading."""
+        from blueprints.offers import _get_cancel_all_state
+
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        operation_id = "cancel:" + "a" * 64
+        blocked = types.SimpleNamespace(
+            allowed=False,
+            reason_code="UNRESOLVED_OPERATIONS",
+            blocking_operation_ids=(operation_id,),
+        )
+        states = iter((blocked, blocked))
+        latches = iter(({"generation": 155}, {"generation": 156}))
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch.object(
+                api_server.mutation_gate,
+                "read_only_status",
+                side_effect=lambda: next(states),
+            ),
+            patch(
+                "database.get_runtime_safety_latch", side_effect=lambda: next(latches)
+            ),
+            patch("threading.Thread") as thread_cls,
+        ):
+            thread_cls.return_value.start.side_effect = lambda: (
+                thread_cls.call_args.kwargs["target"]()
+            )
+            response = self._post(
+                "/api/offers/cancel_all",
+                {
+                    "reconciliation_only": True,
+                    "expected_latch_generation": 155,
+                    "expected_operation_ids": [operation_id],
+                },
+            )
+        self.assertEqual(response.status_code, 202)
+        stopped.offer_manager.reconcile_submitted_cancels_only.assert_not_called()
+        stopped.offer_manager.cancel_offers.assert_not_called()
+        self.assertEqual(_get_cancel_all_state()["error"], "proof_scope_changed")
+
     def test_unresolved_cancel_all_proof_exception_finishes_with_error(self):
         """A failed proof read must not leave the progress indicator running forever."""
         from blueprints.offers import _reset_cancel_all_state

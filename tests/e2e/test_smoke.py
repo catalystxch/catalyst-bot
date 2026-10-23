@@ -3623,6 +3623,56 @@ def test_cancel_all_displays_proof_only_reconciliation_without_new_cancellation(
     assert message in page.locator("#cancelProgressSummary").inner_text()
 
 
+def test_native_cancel_review_exposes_exact_proof_only_action(page):
+    """A stopped, fenced wallet can request proof without enabling broad cancel."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    operation_id = "cancel:" + "a" * 64
+    page.evaluate(
+        """async (operationId) => {
+            window.__proofRequest = null;
+            document.getElementById('startupOverlay').style.display = 'none';
+            bot_state = { running: false, offers: { buy: [], sell: [] } };
+            addLogEntry = () => {};
+            showToast = () => {};
+            showStyledConfirm = async () => true;
+            apiFetch = async (path, options) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null,
+                        wallet: { fingerprint: 3702373391, pending_transaction_count: 0,
+                            active_trade_ids: [] },
+                        safety: { allowed: false, reason_code: 'UNRESOLVED_OPERATIONS',
+                            generation: 155, lease_owned: true,
+                            blocking_operation_ids: [operationId] },
+                    }), { status: 200 });
+                }
+                if (String(path).endsWith('/offers/cancel_all')) {
+                    window.__proofRequest = JSON.parse(options.body);
+                    return new Response(JSON.stringify({ success: false,
+                        error: 'proof_scope_changed' }), { status: 409 });
+                }
+                throw new Error(`Unexpected test request: ${path}`);
+            };
+            await cancelAllOffers();
+        }""",
+        operation_id,
+    )
+
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
+    proof_button = page.locator("#refreshAbortActionBtn")
+    expect(proof_button).to_be_enabled()
+    expect(proof_button).to_contain_text("Check submitted cancellations")
+    proof_button.click()
+    page.wait_for_function("window.__proofRequest !== null")
+    assert page.evaluate("window.__proofRequest") == {
+        "reconciliation_only": True,
+        "expected_latch_generation": 155,
+        "expected_operation_ids": [operation_id],
+    }
+
+
 def test_cancel_all_shows_preflight_rejection_to_operator(page):
     """A stopped-process guard failure must be visible without another click."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

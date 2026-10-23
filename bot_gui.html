@@ -32977,6 +32977,19 @@
             const fingerprint = preview.wallet?.fingerprint || 'unavailable';
             const scope = `Sage wallet ${fingerprint}: ${trades.length} live offer${trades.length === 1 ? '' : 's'}, ${preview.wallet?.pending_transaction_count ?? '?'} pending transaction(s).`;
             document.getElementById('cancelOfferCount').textContent = scope;
+            const proofIds = preview.safety?.blocking_operation_ids;
+            const exactCancelProof = !hasRecovery
+                && preview.safety?.reason_code === 'UNRESOLVED_OPERATIONS'
+                && Number.isInteger(preview.safety?.generation)
+                && Array.isArray(proofIds) && proofIds.length > 0
+                && proofIds.every(id => /^cancel:[0-9a-f]{64}$/.test(id));
+            if (exactCancelProof && preview.safety.lease_owned
+                    && preview.wallet?.pending_transaction_count === 0) {
+                summary.textContent = `${scope} Check Sage proof for ${proofIds.length} previously submitted cancellation${proofIds.length === 1 ? '' : 's'}. No new cancellation will be sent.`;
+                action.textContent = 'Check submitted cancellations';
+                action.disabled = false;
+                return;
+            }
             if (!hasRecovery || !preview.safety?.lease_owned || preview.wallet?.pending_transaction_count !== 0) {
                 summary.textContent = `${scope} Exact recovery is unavailable; the wallet remains fenced.`;
                 action.textContent = 'Recovery blocked';
@@ -33029,6 +33042,53 @@
             if (!preview || bot_state?.running) return;
             const action = document.getElementById('refreshAbortActionBtn');
             action.disabled = true;
+            const proofIds = preview.safety?.blocking_operation_ids;
+            if (!preview.candidate && !preview.abort
+                    && preview.safety?.reason_code === 'UNRESOLVED_OPERATIONS'
+                    && preview.safety?.lease_owned
+                    && preview.wallet?.pending_transaction_count === 0
+                    && Number.isInteger(preview.safety?.generation)
+                    && Array.isArray(proofIds) && proofIds.length > 0
+                    && proofIds.every(id => /^cancel:[0-9a-f]{64}$/.test(id))) {
+                const confirmed = await showStyledConfirm({ icon: '⚠',
+                    title: 'Check submitted cancellation proof?',
+                    message: `Check Sage for terminal proof of ${proofIds.length} exact submitted cancellation${proofIds.length === 1 ? '' : 's'}? No new cancellation or wallet transaction will be sent.`,
+                    confirmText: 'Check Proof', cancelText: 'Keep Wallet Fenced', style: 'danger' });
+                if (!confirmed) { await loadRefreshAbortReview(); return; }
+                try {
+                    const response = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reconciliation_only: true,
+                            expected_latch_generation: preview.safety.generation,
+                            expected_operation_ids: proofIds }),
+                    });
+                    const result = await response.json();
+                    if (response.ok && result.reconciliation_only && result.async) {
+                        showToast('Checking existing cancellation proof. No new cancellation was sent.', 'info');
+                        for (let attempt = 0; attempt < 90; attempt++) {
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            const statusResponse = await apiFetch(`${API_URL}/offers/cancel_all/status`,
+                                { cache: 'no-store' });
+                            if (!statusResponse.ok) continue;
+                            const status = await statusResponse.json();
+                            if (status.running) continue;
+                            showToast(status.message || (status.phase === 'reconciled'
+                                ? 'Submitted cancellations have terminal Sage proof.'
+                                : 'Cancellation proof is still incomplete; the wallet remains fenced.'),
+                                status.phase === 'reconciled' ? 'success' : 'warning');
+                            await loadRefreshAbortReview();
+                            return;
+                        }
+                        showToast('Proof check is still running. Reopen this review to check again.', 'warning');
+                    } else {
+                        showToast(`Proof check held: ${result.error || 'scope changed'}`, 'warning');
+                    }
+                } catch (_) {
+                    showToast('Proof check failed; no new cancellation was sent.', 'warning');
+                }
+                await loadRefreshAbortReview();
+                return;
+            }
             const trades = preview.wallet?.active_trade_ids || [];
             let path, body, title, message;
             if (preview.stage === 'submitted_parent_proof' || preview.stage === 'fenced') {

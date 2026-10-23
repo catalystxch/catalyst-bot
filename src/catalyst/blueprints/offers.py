@@ -1317,18 +1317,48 @@ def _api_cancel_all_locked():
         body = {}
     if type(body) is not dict:
         return jsonify({"success": False, "error": "invalid_request"}), 400
-    fee_approval_id = body.get("fee_approval_id")
-    if fee_approval_id is None:
-        if body:
-            return jsonify({"success": False, "error": "invalid_request"}), 400
-    elif (
-        set(body) != {"source", "fee_approval_id"}
-        or body.get("source") != "coin_prep"
-        or type(fee_approval_id) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
-    ):
-        return jsonify({"success": False, "error": "invalid_fee_approval"}), 400
-    slog("GUI_ACTION", ">>> BUTTON: Cancel All Offers")
+    proof_only_request = body.get("reconciliation_only") is True
+    if proof_only_request:
+        expected_ids = body.get("expected_operation_ids")
+        expected_generation = body.get("expected_latch_generation")
+        if (
+            set(body)
+            != {
+                "reconciliation_only",
+                "expected_latch_generation",
+                "expected_operation_ids",
+            }
+            or type(expected_generation) is not int
+            or expected_generation < 1
+            or type(expected_ids) is not list
+            or not 1 <= len(expected_ids) <= 500
+            or any(
+                type(operation_id) is not str
+                or re.fullmatch(r"cancel:[0-9a-f]{64}", operation_id) is None
+                for operation_id in expected_ids
+            )
+            or len(set(expected_ids)) != len(expected_ids)
+        ):
+            return jsonify({"success": False, "error": "invalid_proof_scope"}), 400
+        fee_approval_id = None
+    else:
+        fee_approval_id = body.get("fee_approval_id")
+        if fee_approval_id is None:
+            if body:
+                return jsonify({"success": False, "error": "invalid_request"}), 400
+        elif (
+            set(body) != {"source", "fee_approval_id"}
+            or body.get("source") != "coin_prep"
+            or type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            return jsonify({"success": False, "error": "invalid_fee_approval"}), 400
+    slog(
+        "GUI_ACTION",
+        ">>> BUTTON: Check Submitted Cancellation Proof"
+        if proof_only_request
+        else ">>> BUTTON: Cancel All Offers",
+    )
     cancelled = 0
     failed = 0
 
@@ -1378,6 +1408,11 @@ def _api_cancel_all_locked():
             ), 409
 
     gate_status = api_server.mutation_gate.read_only_status()
+    if proof_only_request and (
+        getattr(gate_status, "allowed", False) is True
+        or getattr(gate_status, "reason_code", None) != "UNRESOLVED_OPERATIONS"
+    ):
+        return jsonify({"success": False, "error": "proof_scope_changed"}), 409
     if getattr(gate_status, "allowed", False) is not True:
         reason = str(getattr(gate_status, "reason_code", "") or "MUTATION_GATE_BLOCKED")
         durable_manager = (
@@ -1410,6 +1445,14 @@ def _api_cancel_all_locked():
             )
 
         blocker_ids = tuple(getattr(gate_status, "blocking_operation_ids", ()) or ())
+        if proof_only_request:
+            latch = database.get_runtime_safety_latch()
+            if (
+                latch is None
+                or latch.get("generation") != expected_generation
+                or set(blocker_ids) != set(expected_ids)
+            ):
+                return jsonify({"success": False, "error": "proof_scope_changed"}), 409
         _reset_cancel_all_state(
             running=True,
             complete=False,
@@ -1427,6 +1470,30 @@ def _api_cancel_all_locked():
 
         def _reconcile_existing_cancel():
             try:
+                if proof_only_request:
+                    current_gate = api_server.mutation_gate.read_only_status()
+                    current_latch = database.get_runtime_safety_latch()
+                    if (
+                        getattr(current_gate, "allowed", False) is not False
+                        or getattr(current_gate, "reason_code", None)
+                        != "UNRESOLVED_OPERATIONS"
+                        or current_latch is None
+                        or current_latch.get("generation") != expected_generation
+                        or set(
+                            getattr(current_gate, "blocking_operation_ids", ()) or ()
+                        )
+                        != set(expected_ids)
+                    ):
+                        _set_cancel_all_state(
+                            running=False,
+                            complete=False,
+                            error="proof_scope_changed",
+                            phase="error",
+                            pending=len(blocker_ids),
+                            finished_at=datetime.now(timezone.utc).isoformat(),
+                            message="Cancellation proof scope changed; no new transaction was submitted.",
+                        )
+                        return
                 result = durable_manager.reconcile_submitted_cancels_only()
                 refreshed = api_server.mutation_gate.read_only_status()
             except Exception as exc:
