@@ -393,6 +393,7 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
 _CONTROL_WRITE_API_ENDPOINTS = {
     "api_safety_release_resolved",
     "api_safety_confirm_cancel_latch_review",
+    "api_safety_check_submitted_cancellations",
     "api_safety_quarantine",
     "api_safety_quarantine_resolve",
     "api_open_data_folder",
@@ -4415,6 +4416,23 @@ def preflight_refresh_abort_restricted_startup(
         return denied
 
 
+def _cancel_review_startup_scope_matches(result: Any) -> bool:
+    """Allow a fenced owner before Task 9 commits local terminal proof."""
+
+    return bool(
+        type(result) is dict
+        and (
+            result.get("ready") is True
+            or result.get("reason_code") == "CANCELLATION_PROOF_INCOMPLETE"
+        )
+        and type(result.get("generation")) is int
+        and type(result.get("operation_ids")) is list
+        and 1 <= len(result["operation_ids"]) <= 32
+        and type(result.get("scope_digest")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", result["scope_digest"]) is not None
+    )
+
+
 def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
     """Own only a twice-proven cancellation review with trading disabled."""
 
@@ -4456,7 +4474,7 @@ def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
             from cancel_latch_review import review
 
             first = review(bot=None)
-            if first.get("ready") is not True:
+            if not _cancel_review_startup_scope_matches(first):
                 return False
             runtime = mutation_gate.initialize(
                 wallet_fingerprint_hash=wallet_hash,
@@ -4474,8 +4492,8 @@ def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
             lease = status.get("lease") or {}
             durable_lease = database.get_runtime_mutation_lease()
             if (
-                second.get("ready") is not True
-                or second.get("review_digest") != first.get("review_digest")
+                not _cancel_review_startup_scope_matches(second)
+                or second.get("scope_digest") != first.get("scope_digest")
                 or second.get("generation") != first.get("generation")
                 or second.get("operation_ids") != first.get("operation_ids")
                 or status.get("allowed") is not False
@@ -4908,6 +4926,7 @@ def enforce_local_runtime_guard():
             ("GET", "/"),
             ("GET", "/api/safety/status"),
             ("GET", "/api/safety/cancel-latch-review"),
+            ("POST", "/api/safety/check-submitted-cancellations"),
             ("POST", "/api/safety/confirm-cancel-latch-review"),
         }
         if (request.method, path) not in recovery_routes:
@@ -5068,6 +5087,78 @@ def api_safety_cancel_latch_review():
 
     result = review(bot=bot)
     return jsonify({"success": True, "review": result})
+
+
+@app.route("/api/safety/check-submitted-cancellations", methods=["POST"])
+def api_safety_check_submitted_cancellations():
+    """Settle only the exact submitted cancel cohort in restricted startup.
+
+    This never retries cancellation or submits a new wallet transaction. The
+    final latch release remains a separate, proof-bound native click.
+    """
+
+    if not _cancel_latch_review_recovery_active:
+        return jsonify(
+            {"success": False, "reason_code": "RESTRICTED_REVIEW_REQUIRED"}
+        ), 423
+    if request.content_length is not None and request.content_length > 2048:
+        return jsonify(
+            {"success": False, "reason_code": "REVIEW_REQUEST_TOO_LARGE"}
+        ), 413
+    payload = request.get_json(silent=True)
+    if (
+        type(payload) is not dict
+        or set(payload) != {"expected_generation", "operation_ids", "scope_digest"}
+        or type(payload.get("expected_generation")) is not int
+        or payload["expected_generation"] < 1
+        or type(payload.get("operation_ids")) is not list
+        or not 1 <= len(payload["operation_ids"]) <= 32
+        or any(
+            type(operation_id) is not str
+            or re.fullmatch(r"cancel:[0-9a-f]{64}", operation_id) is None
+            for operation_id in payload["operation_ids"]
+        )
+        or len(set(payload["operation_ids"])) != len(payload["operation_ids"])
+        or type(payload.get("scope_digest")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["scope_digest"]) is None
+    ):
+        return jsonify(
+            {"success": False, "reason_code": "REVIEW_REQUEST_MALFORMED"}
+        ), 400
+    from cancel_latch_review import review
+
+    before = review(bot=bot)
+    if (
+        not _cancel_review_startup_scope_matches(before)
+        or before["generation"] != payload["expected_generation"]
+        or before["operation_ids"] != payload["operation_ids"]
+        or not hmac.compare_digest(before["scope_digest"], payload["scope_digest"])
+    ):
+        return jsonify({"success": False, "reason_code": "REVIEW_SCOPE_CHANGED"}), 409
+    runtime = mutation_gate.current_runtime()
+    if runtime is None or (
+        (runtime.status().to_dict().get("lease") or {}).get("owned_by_this_run")
+        is not True
+    ):
+        return jsonify({"success": False, "reason_code": "REVIEW_OWNER_LOST"}), 423
+    if before.get("ready") is not True:
+        from offer_manager import OfferManager
+
+        if OfferManager().reconcile_submitted_cancels_only() != 0:
+            return jsonify(
+                {"success": False, "reason_code": "CANCELLATION_PROOF_PENDING"}
+            ), 409
+    after = review(bot=bot)
+    if (
+        after.get("ready") is not True
+        or after.get("generation") != payload["expected_generation"]
+        or after.get("operation_ids") != payload["operation_ids"]
+        or after.get("scope_digest") != payload["scope_digest"]
+    ):
+        return jsonify(
+            {"success": False, "reason_code": "CANCELLATION_PROOF_INCOMPLETE"}
+        ), 409
+    return jsonify({"success": True, "review": after})
 
 
 @app.route("/api/safety/confirm-cancel-latch-review", methods=["POST"])

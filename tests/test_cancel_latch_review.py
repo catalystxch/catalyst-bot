@@ -156,6 +156,31 @@ def test_review_rejects_running_bot_and_wrong_wallet(monkeypatch):
     )
 
 
+def test_cancelled_sage_offers_with_missing_local_terminals_have_startup_scope(
+    monkeypatch,
+):
+    _install_proven_review(monkeypatch)
+    monkeypatch.setattr(
+        cancel_latch_review.database,
+        "get_authoritative_terminal_records",
+        lambda _ids: {},
+    )
+    incomplete = cancel_latch_review.review(bot=None)
+    assert incomplete["ready"] is False
+    assert incomplete["reason_code"] == "CANCELLATION_PROOF_INCOMPLETE"
+    assert incomplete["generation"] == 154
+    assert len(incomplete["operation_ids"]) == 2
+    assert len(incomplete["scope_digest"]) == 64
+    assert incomplete["review_digest"] is None
+
+    monkeypatch.setattr(
+        cancel_latch_review.wallet, "get_pending_transactions", lambda: [{}]
+    )
+    pending = cancel_latch_review.review(bot=None)
+    assert pending["reason_code"] == "PENDING_TRANSACTIONS_OR_READ_FAILURE"
+    assert pending["scope_digest"] is None
+
+
 def test_final_click_rechecks_proof_and_cannot_release_stale_review(monkeypatch):
     runtime = _install_proven_review(monkeypatch)
     released = []
@@ -187,3 +212,67 @@ def test_final_click_rechecks_proof_and_cannot_release_stale_review(monkeypatch)
     assert code == 409
     assert response.json["reason_code"] == "REVIEW_STALE_OR_INCOMPLETE"
     assert len(released) == 1
+
+
+def test_restricted_check_settles_exact_scope_without_wallet_cancel(monkeypatch):
+    import offer_manager
+
+    ids = ["cancel:" + "a" * 64, "cancel:" + "b" * 64]
+    state = {"settled": False, "calls": 0}
+    monkeypatch.setattr(api_server, "_cancel_latch_review_recovery_active", True)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(
+        api_server.mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            status=lambda: SimpleNamespace(
+                to_dict=lambda: {"lease": {"owned_by_this_run": True}}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_latch_review,
+        "review",
+        lambda *, bot: {
+            "ready": state["settled"],
+            "reason_code": (
+                "CANCELLATIONS_PROVEN"
+                if state["settled"]
+                else "CANCELLATION_PROOF_INCOMPLETE"
+            ),
+            "generation": 155,
+            "operation_ids": ids,
+            "scope_digest": "c" * 64,
+        },
+    )
+
+    def settle(_self):
+        state["calls"] += 1
+        state["settled"] = True
+        return 0
+
+    monkeypatch.setattr(
+        offer_manager.OfferManager, "reconcile_submitted_cancels_only", settle
+    )
+    body = {
+        "expected_generation": 155,
+        "operation_ids": ids,
+        "scope_digest": "c" * 64,
+    }
+    with api_server.app.test_request_context(
+        "/api/safety/check-submitted-cancellations", method="POST", json=body
+    ):
+        response = api_server.api_safety_check_submitted_cancellations()
+    assert response.json["success"] is True
+    assert state["calls"] == 1
+
+    state["settled"] = False
+    with api_server.app.test_request_context(
+        "/api/safety/check-submitted-cancellations",
+        method="POST",
+        json={**body, "scope_digest": "d" * 64},
+    ):
+        response, code = api_server.api_safety_check_submitted_cancellations()
+    assert code == 409
+    assert response.json["reason_code"] == "REVIEW_SCOPE_CHANGED"
+    assert state["calls"] == 1

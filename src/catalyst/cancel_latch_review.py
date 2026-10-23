@@ -29,6 +29,7 @@ def _not_ready(reason: str) -> dict[str, Any]:
         "operation_ids": [],
         "proofs": [],
         "review_digest": None,
+        "scope_digest": None,
     }
 
 
@@ -105,7 +106,17 @@ def review(*, bot: Any = None) -> dict[str, Any]:
         ):
             return _not_ready("SAGE_EXACT_OFFER_READ_INCOMPLETE")
         records = database.get_authoritative_terminal_records(trade_ids)
+        scope = {
+            "generation": generation,
+            "operation_ids": operation_ids,
+            "wallet_fingerprint": fingerprint,
+            "network": network.lower(),
+        }
+        scope_digest = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         proofs = []
+        local_proof_incomplete = False
         for operation_id, trade_id, sage_offer in zip(
             operation_ids, trade_ids, sage["offers"]
         ):
@@ -117,6 +128,12 @@ def review(*, bot: Any = None) -> dict[str, Any]:
                 sage_status.strip().lower() if type(sage_status) is str else sage_status
             )
             if (
+                type(sage_offer) is not dict
+                or sage_offer.get("trade_id") != trade_id
+                or normalized_status not in _CANCELLED_SAGE_STATUSES
+            ):
+                return _not_ready("CANCELLATION_PROOF_INCOMPLETE")
+            if (
                 intent.operation_id != operation_id
                 or projection.authoritative is not True
                 or type(projection.result) is not dict
@@ -126,11 +143,9 @@ def review(*, bot: Any = None) -> dict[str, Any]:
                 or terminal.get("intent_id") != intent.intent_id
                 or terminal.get("outcome") != "CANCELLED_PROVEN"
                 or terminal.get("terminal_state") != "cancelled"
-                or type(sage_offer) is not dict
-                or sage_offer.get("trade_id") != trade_id
-                or normalized_status not in _CANCELLED_SAGE_STATUSES
             ):
-                return _not_ready("CANCELLATION_PROOF_INCOMPLETE")
+                local_proof_incomplete = True
+                continue
             proofs.append(
                 {
                     "operation_id": operation_id,
@@ -140,6 +155,12 @@ def review(*, bot: Any = None) -> dict[str, Any]:
                     "evidence_sha256": terminal["evidence_sha256"],
                 }
             )
+        if local_proof_incomplete:
+            return {
+                **_not_ready("CANCELLATION_PROOF_INCOMPLETE"),
+                **scope,
+                "scope_digest": scope_digest,
+            }
         canonical = {
             "generation": generation,
             "operation_ids": operation_ids,
@@ -159,6 +180,7 @@ def review(*, bot: Any = None) -> dict[str, Any]:
             "network": network.lower(),
             "proofs": proofs,
             "review_digest": digest,
+            "scope_digest": scope_digest,
         }
     except Exception:
         return _not_ready("CANCELLATION_REVIEW_UNAVAILABLE")

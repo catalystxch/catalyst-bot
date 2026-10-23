@@ -141,8 +141,9 @@ def test_cancel_latch_candidate_requires_only_exact_cancel_blockers(monkeypatch)
 
 
 @pytest.mark.parametrize("post_match", [True, False])
+@pytest.mark.parametrize("proof_ready", [True, False])
 def test_cancel_latch_restricted_owner_rechecks_proof_after_lease(
-    monkeypatch, post_match
+    monkeypatch, post_match, proof_ready
 ):
     import api_server
     import cancel_latch_review
@@ -230,10 +231,16 @@ def test_cancel_latch_restricted_owner_rechecks_proof_after_lease(
     def review(*, bot):
         events.append("review")
         return {
-            "ready": True,
+            "ready": proof_ready,
+            "reason_code": (
+                "CANCELLATIONS_PROVEN"
+                if proof_ready
+                else "CANCELLATION_PROOF_INCOMPLETE"
+            ),
             "generation": 154,
             "operation_ids": ["cancel:" + "a" * 64, "cancel:" + "b" * 64],
             "review_digest": state["digest"],
+            "scope_digest": state["digest"],
         }
 
     monkeypatch.setattr(cancel_latch_review, "review", review)
@@ -247,6 +254,36 @@ def test_cancel_latch_restricted_owner_rechecks_proof_after_lease(
     assert api_server._cancel_latch_review_recovery_active is post_match
     if not post_match:
         assert ("shutdown", True) in events
+
+
+def test_cancel_latch_restricted_owner_accepts_exact_incomplete_local_proof(
+    monkeypatch,
+):
+    """A submitted cancellation needs an owner before Task 9 can settle it."""
+    import api_server
+    import cancel_latch_review
+
+    incomplete = {
+        "ready": False,
+        "reason_code": "CANCELLATION_PROOF_INCOMPLETE",
+        "generation": 155,
+        "operation_ids": ["cancel:" + "a" * 64, "cancel:" + "b" * 64],
+        "scope_digest": "c" * 64,
+    }
+    monkeypatch.setattr(cancel_latch_review, "review", lambda *, bot: incomplete)
+    # The full owner setup is exercised above; this regression fixes its
+    # acceptance predicate without weakening the lease and scope checks.
+    assert api_server._cancel_review_startup_scope_matches(incomplete) is True
+    assert (
+        api_server._cancel_review_startup_scope_matches(
+            {
+                "ready": False,
+                "reason_code": "WALLET_BINDING_MISMATCH",
+                "scope_digest": "c" * 64,
+            }
+        )
+        is False
+    )
 
 
 def test_cancel_latch_restricted_owner_rejects_ineligible_latch(monkeypatch):

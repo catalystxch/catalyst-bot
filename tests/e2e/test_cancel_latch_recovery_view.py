@@ -44,6 +44,7 @@ def test_cancel_latch_recovery_requires_proof_and_posts_only_digest(page):
     expect(page.locator("#proofs li")).to_have_count(2)
     assert page.locator("button").all_text_contents() == [
         "Refresh exact proof",
+        "Check submitted cancellations",
         "Confirm database-only latch release",
     ]
     page.on("dialog", lambda dialog: dialog.accept())
@@ -69,3 +70,43 @@ def test_cancel_latch_recovery_refuses_incomplete_proof(page):
     expect(page.locator("#confirm")).to_be_disabled()
     expect(page.locator("#status")).to_contain_text("Review refused")
     expect(page.locator("#proofs li")).to_have_count(0)
+
+
+def test_restricted_view_checks_exact_submitted_scope_before_release(page):
+    page.add_init_script(
+        """(() => {
+            const ids = ['cancel:' + 'a'.repeat(64), 'cancel:' + 'b'.repeat(64)];
+            window.__posted = [];
+            window.__settled = false;
+            window.confirm = () => true;
+            window.fetch = async (path, options = {}) => {
+                if (String(path).includes('check-submitted-cancellations')) {
+                    window.__posted.push(JSON.parse(options.body));
+                    window.__settled = true;
+                }
+                const review = window.__settled
+                    ? {ready: true, generation: 155, operation_ids: ids,
+                       wallet_fingerprint: 3702373391, network: 'mainnet',
+                       review_digest: 'd'.repeat(64),
+                       proofs: ids.map(operation_id => ({operation_id,
+                           outcome: 'CANCELLED_PROVEN', sage_status: 'cancelled',
+                           evidence_sha256: 'e'.repeat(64)}))}
+                    : {ready: false, reason_code: 'CANCELLATION_PROOF_INCOMPLETE',
+                       generation: 155, operation_ids: ids,
+                       wallet_fingerprint: 3702373391, network: 'mainnet',
+                       scope_digest: 'c'.repeat(64)};
+                return new Response(JSON.stringify({success: true, review}),
+                    {status: 200, headers: {'Content-Type': 'application/json'}});
+            };
+        })();"""
+    )
+    page.goto(PAGE, wait_until="domcontentloaded")
+    expect(page.locator("#checkSubmitted")).to_be_enabled()
+    expect(page.locator("#confirm")).to_be_disabled()
+    page.locator("#checkSubmitted").click()
+    expect(page.locator("#confirm")).to_be_enabled()
+    assert page.evaluate("window.__posted") == [
+        {"expected_generation": 155,
+         "operation_ids": ["cancel:" + "a" * 64, "cancel:" + "b" * 64],
+         "scope_digest": "c" * 64}
+    ]
