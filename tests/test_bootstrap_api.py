@@ -1084,7 +1084,8 @@ def test_completed_offer_review_accepts_one_prior_policy_revision_and_preserves_
         "/api/bootstrap/preview_completed",
         json={"campaign_id": campaign_id, "revision": 2},
     )
-    assert mixed.status_code == 409
+    assert mixed.status_code == 200
+    assert mixed.get_json()["expected_trade_ids"] == filled_ids
     rows[3]["purpose"] = f"bootstrap:{campaign_id}:revision:1"
 
     for row in rows:

@@ -699,30 +699,30 @@ def _review_stopped_completed_offers(
             for row in open_rows
             if type(row) is dict and type(row.get("trade_id")) is str
         }
-        # A policy-state update increments the campaign revision without
-        # changing the immutable authority of offers created earlier.  Accept
-        # one exact historical offer cohort, while refusing mixed/future
-        # revisions and rechecking the current campaign before any commit.
-        purposes = {row.get("purpose") for row in intents}
-        cohort_revision = None
-        if len(purposes) == 1:
-            cohort_purpose = next(iter(purposes))
-            if type(cohort_purpose) is str and cohort_purpose.startswith(prefix):
-                suffix = cohort_purpose[len(prefix) :]
-                if (
-                    len(suffix) <= 19
-                    and re.fullmatch(r"0|[1-9][0-9]*", suffix) is not None
-                ):
-                    cohort_revision = int(suffix)
+
+        # Policy-state updates increment the campaign revision without changing
+        # the immutable authority of offers created earlier.  Several valid
+        # revisions can coexist in the offer book during a long run; validate
+        # each exact historical purpose and recheck current authority before
+        # committing proof for only the completed trade IDs.
+        def authorized_purpose(value: Any) -> bool:
+            if type(value) is not str or not value.startswith(prefix):
+                return False
+            suffix = value[len(prefix) :]
+            return bool(
+                len(suffix) <= 19
+                and re.fullmatch(r"0|[1-9][0-9]*", suffix) is not None
+                and int(suffix) <= revision
+            )
+
         if (
             not intents
             or len(intents) > 256
             or len(by_trade) != len(intents)
-            or cohort_revision is None
-            or cohort_revision > revision
             or not database.bootstrap_campaign_immutable_authority_valid(campaign)
             or any(
-                row.get("lifecycle_state") not in {"created", "visible"}
+                not authorized_purpose(row.get("purpose"))
+                or row.get("lifecycle_state") not in {"created", "visible"}
                 for row in intents
             )
             or any(
