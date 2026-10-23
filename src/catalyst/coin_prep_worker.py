@@ -2733,6 +2733,20 @@ class CoinPrepWorker:
         for batch_number in range(1, MAX_PREP_BATCHES + 1):
             priced = price_approved_prep_batch(approval_id)
             if priced["available"] is not True:
+                from fee_estimation import fee_failure_diagnostics
+
+                self.log(
+                    "Approved batch pricing unavailable: "
+                    + json.dumps(
+                        {
+                            "reason": priced["reason"],
+                            "stage": priced.get("diagnostic_stage"),
+                            "provider_failures": fee_failure_diagnostics(priced),
+                            "quote_timing": priced.get("quote_timing"),
+                        },
+                        sort_keys=True,
+                    )
+                )
                 raise ValueError(priced["reason"])
             plan = priced["pricing"]["plan"]
             targets = priced["recipe"]["targets"]
