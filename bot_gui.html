@@ -10797,6 +10797,7 @@
                             <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:12px;">
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapPreviewBtn" onclick="bootstrapPreviewCampaign()">Preview</button>
                                 <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapPrepReviewBtn" onclick="reviewBootstrapCampaignCoinPrep()" style="display:none" disabled>Review Campaign Coin Prep</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileExpiredBtn" style="display:none;" disabled>Verify Expired Offers</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileTerminalBtn" style="display:none;" disabled>Verify Terminal Offers</button>
@@ -18296,6 +18297,7 @@
         }
 
         function isSettingsReviewedForCurrentPair() {
+            if (hasReviewedBootstrapSetup()) return true;
             if (!settingsReviewed) return false;
             const storedAssetId = getStoredSettingsReviewedAssetId();
             const currentAssetId = currentCAT?.asset_id || '';
@@ -18307,6 +18309,28 @@
         // setSettingsReviewedState(false), so a truly fresh pair still starts
         // blank while a saved Smart Settings run survives page reloads.
         let settingsReviewed = readStoredSettingsReviewed();
+        let _bootstrapSetupReviewScope = '';
+        let _bootstrapPrepReviewBusy = false;
+
+        function bootstrapSetupScope(campaign) {
+            if (!campaign || campaign.status !== 'active' || campaign.expired === true
+                || !/^[a-f0-9]{64}$/.test(String(campaign.campaign_id || ''))
+                || !Number.isSafeInteger(campaign.revision) || campaign.revision < 0
+                || campaign.asset_id !== currentCAT?.asset_id
+                || !/^[a-f0-9]{64}$/.test(String(campaign.asset_id || ''))
+                || campaign.network !== 'mainnet' || !campaign.wallet_fingerprint
+                || !Number.isFinite(Date.parse(campaign.expires_at))
+                || Date.parse(campaign.expires_at) <= Date.now()) return '';
+            return JSON.stringify([campaign.campaign_id, campaign.revision, campaign.asset_id,
+                campaign.wallet_fingerprint, campaign.network, campaign.xch_budget,
+                campaign.cat_budget, campaign.fee_budget_xch, campaign.anchor_price,
+                campaign.minimum_price, campaign.maximum_price, campaign.expires_at]);
+        }
+
+        function hasReviewedBootstrapSetup() {
+            return !!_bootstrapSetupReviewScope
+                && _bootstrapSetupReviewScope === bootstrapSetupScope(_bootstrapActiveCampaign);
+        }
         let userHasSavedSettings = settingsReviewed; // Only populate trade fields from .env after first save
         let coinPrepStatus = 'none'; // 'none' | 'done' | 'skipped'
         
@@ -19527,6 +19551,7 @@
         }
 
         function updateStartupChecklist(data = bot_state) {
+            const setupReviewed = isSettingsReviewedForCurrentPair();
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const health = data && data.chia_health ? data.chia_health : {};
             const walletReachable = !!(
@@ -19564,17 +19589,19 @@
 
             setStartupStepState(
                 'startupStepSettings',
-                settingsReviewed ? 'ready' : 'action',
-                settingsReviewed
+                setupReviewed ? 'ready' : 'action',
+                setupReviewed
                     ? (_resumeSessionSummary
                         ? 'Previous session settings were restored. Core settings are locked while resuming live offers. Use Live Controls for safe live tweaks, or Start Fresh to reconfigure.'
-                        : 'Settings have been saved and confirmed for this run.')
+                        : hasReviewedBootstrapSetup()
+                            ? 'Saved campaign and existing settings reviewed; general settings were not overwritten.'
+                            : 'Settings have been saved and confirmed for this run.')
                     : 'Use Review Settings and save your setup for this run.'
             );
 
             const reviewBtn = document.getElementById('startupReviewSettingsBtn');
             if (reviewBtn) {
-                const shouldPulse = _pairSelectedByUser && !settingsReviewed && !(data && data.running);
+                const shouldPulse = _pairSelectedByUser && !setupReviewed && !(data && data.running);
                 reviewBtn.classList.toggle('btn-pulse-glow', shouldPulse);
             }
 
@@ -19617,7 +19644,7 @@
                 || (
                     startSafety.allowed && walletReachable
                     && pair.selected
-                    && settingsReviewed
+                    && setupReviewed
                     && coinPrepStatus !== 'checking'
                     && (coinPrepStatus === 'done' || coinPrepStatus === 'skipped-safe' || restoredBookIsPrepared)
                 );
@@ -19638,7 +19665,7 @@
             } else if (!pair.selected) {
                 startState = 'action';
                 startDetail = 'Choose a trading pair first.';
-            } else if (!settingsReviewed) {
+            } else if (!setupReviewed) {
                 startState = 'action';
                 startDetail = 'Save your settings to unlock the start path.';
             } else if (coinPrepStatus === 'checking') {
@@ -36192,7 +36219,7 @@ function closeCtgErrorModal() {
         // the requested config. If everything matches we close the modal and
         // mark coin prep as done; otherwise we open the confirm view so the
         // user can decide whether to run prep.
-        async function checkIfCoinPrepNeeded(config) {
+        async function checkIfCoinPrepNeeded(config, { strictCampaignReview = false } = {}) {
             try {
                 config = normalizeConfigForLiquidityMode(config || {});
                 const bootstrapCampaign = _bootstrapActiveCampaign?.campaign_id
@@ -36389,6 +36416,14 @@ function closeCtgErrorModal() {
                     if (verifyTimeoutId !== null) clearTimeout(verifyTimeoutId);
                 }
                 const result = await resp.json();
+                if (strictCampaignReview && (!resp.ok || result?.success !== true
+                    || result.bootstrap_campaign_id !== bootstrapCampaign?.campaign_id
+                    || !Number.isSafeInteger(result.bootstrap_campaign_revision)
+                    || result.bootstrap_campaign_revision !== bootstrapCampaign?.revision
+                    || typeof result.all_sufficient !== 'boolean'
+                    || typeof result.balance_sufficient !== 'boolean')) {
+                    throw new Error('Exact saved campaign coin verification is unavailable or changed.');
+                }
                 debugLog('[COIN-PREP] verify result:', result);
 
                 // The verify endpoint returns sufficient/all_sufficient/insufficient
@@ -36403,7 +36438,7 @@ function closeCtgErrorModal() {
                     dismissCoinPrepConfirmLoading();
                     setCoinPrepStatus('done');
                     showToast('Coin prep skipped — wallet already has the right coins.', 'success');
-                    return;
+                    return true;
                 }
 
                 // Need prep — switch the modal from "loading" state into the
@@ -36414,7 +36449,13 @@ function closeCtgErrorModal() {
                     || result?.message
                     || 'Your wallet needs to be split into the right coin sizes for the new settings.';
                 showCoinPrepConfirm(config, reason, reasonMessage, result);
+                return true;
             } catch (err) {
+                if (strictCampaignReview) {
+                    dismissCoinPrepConfirmLoading();
+                    setCoinPrepStatus('none');
+                    throw err;
+                }
                 debugWarn('[COIN-PREP] checkIfCoinPrepNeeded failed:', err);
                 // On error, fall back to showing the confirm view so the user
                 // can choose to run prep manually rather than getting stuck.
@@ -40726,6 +40767,7 @@ function syncBootstrapCampaignPairIntoSelectors(payload) {
 }
 
 function _bootstrapRenderStatus(payload) {
+    const prepReview = document.getElementById('bootstrapPrepReviewBtn');
     const globalStatus = document.getElementById('bootstrapGlobalStatus');
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
@@ -40890,6 +40932,11 @@ function _bootstrapRenderStatus(payload) {
         stoppedRetry.disabled = !separateRetry;
     }
     if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
+    if (prepReview) {
+        const canReview = !!bootstrapSetupScope(_bootstrapActiveCampaign);
+        prepReview.style.display = canReview ? '' : 'none';
+        prepReview.disabled = !canReview || !!bot_state?.running || _bootstrapPrepReviewBusy;
+    }
     const proofExporter = document.getElementById('bootstrapParticipationExportBtn');
     if (proofExporter) proofExporter.disabled = !_bootstrapActiveCampaign;
 }
@@ -40962,6 +41009,72 @@ async function bootstrapPreviewCampaign() {
         showToast(error?.message || 'Bootstrap preview failed', 'error');
     } finally {
         if (button) { button.disabled = false; button.textContent = 'Preview'; }
+    }
+}
+
+async function reviewBootstrapCampaignCoinPrep() {
+    if (_bootstrapPrepReviewBusy || bot_state?.running) return;
+    const expected = bootstrapSetupScope(_bootstrapActiveCampaign);
+    if (!expected) return;
+    _bootstrapPrepReviewBusy = true;
+    _bootstrapSetupReviewScope = '';
+    const button = document.getElementById('bootstrapPrepReviewBtn');
+    if (button) button.disabled = true;
+    try {
+        const response = await apiFetch('/api/bootstrap/status', {cache: 'no-store'});
+        const status = await response.json();
+        if (!response.ok || status?.success !== true || status.active !== true
+            || expected !== bootstrapSetupScope(status.campaign)
+            || expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            throw new Error('Saved campaign changed or is unavailable. Review its exact scope again.');
+        }
+        const configResponse = await apiFetch(`${API_URL}/config`, {cache: 'no-store'});
+        const raw = await configResponse.json();
+        const get = key => raw?.[key] ?? raw?.[key.toLowerCase()];
+        const count = Number(get('FEE_PREP_COUNT'));
+        const size = Number(get('FEE_COIN_SIZE_XCH'));
+        const reserves = ['XCH_RESERVE', 'CAT_RESERVE'].map(get);
+        if (!configResponse.ok || !Number.isSafeInteger(count) || count < 1
+            || !Number.isFinite(size) || size <= 0
+            || reserves.some(value => value == null || value === ''
+                || !Number.isFinite(Number(value)) || Number(value) < 0)) {
+            throw new Error('Existing configured fee pool is unavailable. Review fee funding before preparation.');
+        }
+        if (expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            throw new Error('Campaign changed during review. Review again.');
+        }
+        const config = {
+            liquidity_mode: 'two_sided',
+            xch_reserve: get('XCH_RESERVE') ?? 0,
+            cat_reserve: get('CAT_RESERVE') ?? 0,
+            coin_prep_multiplier: get('COIN_PREP_MULTIPLIER') ?? 1,
+            fee_prep_count: count,
+            fee_coin_size_xch: get('FEE_COIN_SIZE_XCH'),
+        };
+        // This is a new campaign review, never a continuation of the old
+        // cancellation-only UI intent. Durable approvals are not modified here.
+        _coinPrepFeeRecoveryIntent = null;
+        _coinPrepFeePreview = null;
+        _coinPrepFeePreviewOptions = null;
+        setCoinPrepStatus('checking');
+        showCoinPrepConfirmLoading(config);
+        await checkIfCoinPrepNeeded(config, {strictCampaignReview: true});
+        if (expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            dismissCoinPrepConfirmLoading();
+            document.getElementById('coinPrepConfirmOverlay')?.classList.remove('active');
+            _coinPrepFeePreview = null;
+            setCoinPrepStatus('none');
+            throw new Error('Campaign changed during coin verification. Review again.');
+        }
+        _bootstrapSetupReviewScope = expected;
+        checkSettingsReviewed();
+    } catch (error) {
+        _bootstrapSetupReviewScope = '';
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Campaign preparation review failed.');
+        showToast(error?.message || 'Campaign preparation review failed.', 'warning');
+    } finally {
+        _bootstrapPrepReviewBusy = false;
+        if (button) button.disabled = !!bot_state?.running || !bootstrapSetupScope(_bootstrapActiveCampaign);
     }
 }
 
