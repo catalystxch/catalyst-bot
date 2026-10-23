@@ -11592,6 +11592,8 @@
                                 </div>
                         </div>
                         <div class="v4-settings-hint" style="margin-bottom: 10px; color: var(--slate-400);">Fee coins fund protected cancellations; unused change stays in the wallet.</div>
+                        <button type="button" class="btn btn-secondary" id="saveFeePoolOnlyBtn" onclick="saveFeePoolOnly()">Save Fee Pool Only</button>
+                        <div class="v4-settings-hint" style="margin: 6px 0 10px; color: var(--slate-400);">Saves only the fee coin count and size. It does not save the other Setup fields, prepare coins, or start trading.</div>
                         <div class="v4-settings-hint" id="feeStatusHint" style="margin-bottom: 10px; color: var(--slate-400);">
                             Fee status loading...
                         </div>
@@ -21521,6 +21523,44 @@
             if (feeMode) feeMode.value = 'manual';
             if (manualWrap) manualWrap.style.display = enabled ? 'block' : 'none';
             renderFeeStatusHint();
+        }
+
+        async function saveFeePoolOnly() {
+            const button = document.getElementById('saveFeePoolOnlyBtn');
+            if (bot_state?.running) {
+                showToast('Stop the bot before changing its fee coin pool.', 'error');
+                return;
+            }
+            const countText = document.getElementById('configFeePrepCount')?.value?.trim() ?? '';
+            const sizeText = document.getElementById('configFeeCoinSizeXch')?.value?.trim() ?? '';
+            const count = Number(countText);
+            const size = Number(sizeText);
+            if (!/^\d+$/.test(countText) || !Number.isSafeInteger(count) || count > 10000
+                || !/^(?:\d+)(?:\.\d{1,12})?$/.test(sizeText)
+                || !Number.isFinite(size) || size > 9223372
+                || (count > 0 && size <= 0)) {
+                showToast('Enter a valid fee coin count and size before saving.', 'error');
+                return;
+            }
+            button.disabled = true;
+            try {
+                const response = await apiFetch(`${API_URL}/config`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({fee_prep_count: count, fee_coin_size_xch: sizeText})
+                });
+                const result = await response.json();
+                if (!response.ok || result.success !== true) {
+                    showToast('Fee coin pool was not saved: ' + formatError(result), 'error');
+                    return;
+                }
+                showToast('Fee coin pool saved. Review the saved campaign Coin Prep before trading.', 'success');
+                refreshFeeStatusPreview();
+            } catch (error) {
+                showToast('Fee coin pool was not saved: ' + formatError(error), 'error');
+            } finally {
+                button.disabled = false;
+            }
         }
 
         async function refreshFeeStatusPreview() {

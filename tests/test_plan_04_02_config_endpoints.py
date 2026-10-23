@@ -238,6 +238,27 @@ class TestConfigPost(_FlaskBase):
         self.assertEqual(written["TOXICITY_THROTTLE_SECS"], "180")
         self.assertEqual(written["TOXICITY_MAX_SPREAD_MULTIPLIER"], "2.0")
 
+    def test_fee_pool_only_payload_preserves_other_settings_and_wallet_address(self):
+        fake_cfg = MagicMock()
+        fake_cfg.update.return_value = True
+        fake_cfg.LIQUIDITY_MODE = "two_sided"
+        fake_cfg.SNIPER_ENABLED = False
+        fake_cfg.MAX_ACTIVE_BUY_OFFERS = 3
+        fake_cfg.MAX_ACTIVE_SELL_OFFERS = 3
+        fake_cfg.SAGE_SET_CHANGE_ADDRESS = True
+        with patch.object(api_server, "cfg", fake_cfg), patch(
+            "blueprints.config_bp._apply_sage_change_address_setting"
+        ) as change_address:
+            resp = self._post_json(
+                "/api/config", {"fee_prep_count": 50, "fee_coin_size_xch": "0.001"}
+            )
+        self.assertTrue(resp.get_json()["success"])
+        self.assertEqual(
+            {call.args[0] for call in fake_cfg.update.call_args_list},
+            {"FEE_PREP_COUNT", "FEE_COIN_SIZE_XCH"},
+        )
+        change_address.assert_not_called()
+
     def test_bulk_trade_sizes_raise_hidden_max_trade_bound(self):
         fake_cfg = MagicMock()
         fake_cfg.update.return_value = True
