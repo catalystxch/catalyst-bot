@@ -12,6 +12,11 @@ from sage_offer_wire import decode_wallet_puzzle_hash
 
 
 _CANCELLATION_RECOVERY_DRIFT_KEYS = {
+    # An operator can replenish the dedicated fee pool after the original
+    # preparation approval while its offers remain live. Cancellation-only
+    # renewal freezes no new trading outputs and prices the current fee input.
+    "FEE_PREP_COUNT",
+    "FEE_COIN_SIZE_XCH",
     "LIQUIDITY_MODE",
     "MAX_ACTIVE_BUY_OFFERS",
     "MAX_ACTIVE_SELL_OFFERS",
