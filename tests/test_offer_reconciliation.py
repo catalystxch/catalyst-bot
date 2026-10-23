@@ -12356,6 +12356,7 @@ def test_exact_expiry_proof_persists_terminal_and_releases_selected_coin(
 
 def test_released_expiry_coin_reappears_from_authoritative_wallet_snapshot(
     isolated_database,
+    monkeypatch,
 ):
     """Released terminal proof must not strand a selectable coin as gone.
 
@@ -12395,6 +12396,23 @@ def test_released_expiry_coin_reappears_from_authoritative_wallet_snapshot(
     coin = database.get_coin_state(COIN)
     assert coin["status"] == "free"
     assert coin["trade_id"] is None
+
+    # A legacy mutation fence still preserves immutable terminal history,
+    # but a freshly selectable, proven-released input may fund preparation.
+    canonical = database.norm_coin_id(COIN)
+    assert canonical in database.get_coin_reconciliation_protected_ids([COIN])
+    assert database.get_coin_preparation_protected_ids([COIN]) == []
+    for fence in ("_active_wallet_effect_coin_ids", "_nonterminal_registry_coin_ids"):
+        with monkeypatch.context() as patch:
+            patch.setattr(database, fence, lambda _conn: {canonical})
+            assert database.get_coin_preparation_protected_ids([COIN]) == [canonical]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            database,
+            "_authoritative_coin_outcome",
+            lambda _conn, _id: {"disposition": "spent"},
+        )
+        assert database.get_coin_preparation_protected_ids([COIN]) == [canonical]
 
 
 def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(

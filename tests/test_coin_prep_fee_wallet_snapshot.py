@@ -74,7 +74,7 @@ def test_reconciliation_claim_is_not_misclassified_as_permanent_reserve(
     )
     patch.setattr(
         database,
-        "get_coin_reconciliation_protected_ids",
+        "get_coin_preparation_protected_ids",
         lambda _ids: [protected_prefix + coin_id] if recon else [],
     )
     coin = next(
@@ -131,7 +131,7 @@ def test_malformed_reconciliation_protection_cannot_supply_inventory(
     live_reads, protected_id
 ):
     live_reads["monkeypatch"].setattr(
-        database, "get_coin_reconciliation_protected_ids", lambda _ids: [protected_id]
+        database, "get_coin_preparation_protected_ids", lambda _ids: [protected_id]
     )
     with pytest.raises(ValueError, match="noncanonical coin identity"):
         _collect(live_reads)

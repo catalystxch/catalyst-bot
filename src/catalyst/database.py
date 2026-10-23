@@ -12718,7 +12718,10 @@ def _coin_terminal_mutation_is_protected(
 
 
 def _batch_coin_terminal_mutation_protection(
-    conn: sqlite3.Connection, coin_ids: list[str]
+    conn: sqlite3.Connection,
+    coin_ids: list[str],
+    *,
+    include_released_outcomes: bool = True,
 ) -> set[str]:
     """Snapshot every mutation fence once for a wallet coin batch.
 
@@ -12742,7 +12745,10 @@ def _batch_coin_terminal_mutation_protection(
         if row["coin_id"]
     }
     for coin_id in requested & outcome_candidates:
-        if _authoritative_coin_outcome(conn, coin_id) is not None:
+        outcome = _authoritative_coin_outcome(conn, coin_id)
+        if outcome is not None and (
+            include_released_outcomes or outcome["disposition"] == "spent"
+        ):
             protected.add(coin_id)
 
     protected.update(
@@ -12804,6 +12810,24 @@ def get_coin_reconciliation_protected_ids(coin_ids: Any) -> List[str]:
     database mutations without opening the private SQL projection to callers.
     """
 
+    return _get_coin_protected_ids(coin_ids, include_released_outcomes=True)
+
+
+def get_coin_preparation_protected_ids(coin_ids: Any) -> List[str]:
+    """Fence preparation inputs without stranding proven-released coins.
+
+    Callers must independently require fresh authoritative selectable coins.
+    Released terminal history alone is not a spend or an active reservation.
+    Active wallet effects, nonterminal intents, live offer links and permanent
+    spends still dominate release evidence. This read changes no durable state;
+    legacy reconciliation mutation guards deliberately remain stricter.
+    """
+    return _get_coin_protected_ids(coin_ids, include_released_outcomes=False)
+
+
+def _get_coin_protected_ids(
+    coin_ids: Any, *, include_released_outcomes: bool
+) -> List[str]:
     if type(coin_ids) not in {list, tuple, set}:
         raise ValueError("coin_ids must be a bounded collection")
     if len(coin_ids) > 2048:
@@ -12814,7 +12838,11 @@ def get_coin_reconciliation_protected_ids(coin_ids: Any) -> List[str]:
     if not normalized:
         return []
     conn = get_connection()
-    return sorted(_batch_coin_terminal_mutation_protection(conn, normalized))
+    return sorted(
+        _batch_coin_terminal_mutation_protection(
+            conn, normalized, include_released_outcomes=include_released_outcomes
+        )
+    )
 
 
 def free_unreserved_locked_coin_for_reconciliation(coin_id: str) -> bool:
