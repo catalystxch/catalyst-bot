@@ -2112,6 +2112,7 @@ def _api_cancel_all_locked():
                         "FEE_BUDGET_APPROVAL_REQUIRED",
                         "FEE_BUDGET_EXCEEDED",
                         "FEE_CAMPAIGN_BUDGET_EXCEEDED",
+                        "FEE_PREP_FUNDING_INSUFFICIENT",
                     }
                     _reason_code = next(
                         (code for code in _fee_reason_codes if code in str(_e).upper()),

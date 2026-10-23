@@ -1920,6 +1920,40 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["phase"], "error")
         self.assertEqual(status["reason_code"], "FEE_CAMPAIGN_BUDGET_EXCEEDED")
 
+    def test_stopped_cancel_all_exposes_fee_funding_failure_for_native_review(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.side_effect = ValueError(
+            "FEE_PREP_FUNDING_INSUFFICIENT"
+        )
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch(
+                "database.get_offer_intent_by_trade_id",
+                return_value={"purpose": f"bootstrap:{'c' * 64}:revision:1"},
+            ),
+            patch("wallet.is_offer_time_expired", return_value=False),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(status["reason_code"], "FEE_PREP_FUNDING_INSUFFICIENT")
+
     def test_stopped_cancel_all_exposes_stale_fee_approval_for_recovery(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False

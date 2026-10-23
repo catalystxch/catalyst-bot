@@ -33439,7 +33439,7 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
-                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED', 'FEE_PREP_FUNDING_INSUFFICIENT'].includes(String(st.reason_code || ''))) {
                                         await reviewCancelAllFeeBudgetFailure(st);
                                     }
                                 }

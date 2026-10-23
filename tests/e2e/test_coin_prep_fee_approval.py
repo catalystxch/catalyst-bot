@@ -734,12 +734,21 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
     assert "new cumulative maximum" in result["banner"]
 
 
-def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
+@pytest.mark.parametrize(
+    ("reason_code", "expected_banner"),
+    [
+        ("FEE_CAMPAIGN_BUDGET_EXCEEDED", "new cumulative maximum"),
+        ("FEE_PREP_FUNDING_INSUFFICIENT", "funding is insufficient"),
+    ],
+)
+def test_generic_cancel_budget_failure_opens_campaign_fee_review(
+    page, reason_code, expected_banner
+):
     _open_gui(page)
     preview = _preview()
 
     result = page.evaluate(
-        """async preview => {
+        """async ({preview, reasonCode}) => {
             bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
@@ -756,8 +765,8 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
                         running: false,
                         complete: false,
                         phase: 'error',
-                        reason_code: 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
-                        message: 'Cancel all failed: FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                        reason_code: reasonCode,
+                        message: `Cancel all failed: ${reasonCode}`,
                     }), {status: 200, headers: {'Content-Type': 'application/json'}});
                 }
                 if (url.includes('/coin-prep/fee-preview')) {
@@ -786,7 +795,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
                 banner: document.getElementById('cpReasonBanner').textContent,
             };
         }""",
-        preview,
+        {"preview": preview, "reasonCode": reason_code},
     )
 
     cancel_calls = [
@@ -800,7 +809,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
     assert len(cancel_calls) == 1
     assert len(preview_calls) == 1
     assert result["overlay"] is True
-    assert "new cumulative maximum" in result["banner"]
+    assert expected_banner in result["banner"]
 
 
 @pytest.mark.parametrize(
