@@ -391,7 +391,9 @@ def fee_pool_configured() -> bool:
 
 
 def fee_pool_enabled() -> bool:
-    return get_effective_transaction_fee_mojos() > 0 and fee_pool_configured()
+    # A zero manual fee does not make network-priced offer cancellations free.
+    # Preserve dedicated fee collateral whenever the user configured it.
+    return fee_pool_configured()
 
 
 def get_fee_tier_name() -> str:

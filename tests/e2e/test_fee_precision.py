@@ -30,6 +30,26 @@ def test_fee_status_hint_preserves_all_meaningful_xch_decimals(page):
     expect(page.locator("#feeStatusHint")).to_contain_text("0.0000130791 XCH")
 
 
+def test_zero_manual_transaction_fee_keeps_configured_fee_reserve_pool(page):
+    page.route("http://**/*", lambda route: route.abort())
+    page.route("https://**/*", lambda route: route.abort())
+    page.goto(GUI.as_uri(), wait_until="domcontentloaded")
+    result = page.evaluate(
+        """() => {
+            document.getElementById('configTransactionFeeEnabled').checked = false;
+            document.getElementById('configTransactionFeeXch').value = '0';
+            document.getElementById('configFeeCoinSizeXch').value = '0.001';
+            document.getElementById('configFeePrepCount').value = '20';
+            return {
+                inputs: getFeeOptionsFromInputs().feePoolEnabled,
+                saved: getFeeOptionsFromConfig({transaction_fee_xch: 0,
+                    fee_coin_size_xch: 0.001, fee_prep_count: 20}).feePoolEnabled
+            };
+        }"""
+    )
+    assert result == {"inputs": True, "saved": True}
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("supports_auto_estimate", [False, True])
 def test_manual_fee_toggle_does_not_describe_prep_as_manual_or_free(

@@ -21449,7 +21449,7 @@
                 transactionFeeEnabled: enabled,
                 transactionFeeMode: 'manual',
                 transactionFeeXch: manualFeeXch,
-                feePoolEnabled: enabled && feeCount > 0 && feeCoinSizeXch > 0 && effectiveFeeXch > 0,
+                feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
                 feeCount,
                 effectiveFeeXch
@@ -21465,7 +21465,7 @@
                 transactionFeeEnabled: enabled,
                 transactionFeeMode: 'manual',
                 transactionFeeXch: manualFeeXch,
-                feePoolEnabled: enabled && feeCount > 0 && feeCoinSizeXch > 0,
+                feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
                 feeCount,
                 effectiveFeeXch: enabled ? manualFeeXch : 0
