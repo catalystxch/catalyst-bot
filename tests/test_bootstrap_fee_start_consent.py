@@ -70,6 +70,10 @@ def test_start_fee_readiness_requires_remaining_cancellation_cover(monkeypatch):
     assert bot._bootstrap_cancellation_fee_start_readiness(campaign) == {
         "ready": False,
         "reason": "bootstrap_cancellation_fee_budget_insufficient",
+        "action_required": "review_cancellation_fee_budget",
+        "remaining_fee_mojos": 0,
+        "required_cancellation_reserve_mojos": 1000,
+        "shortfall_mojos": 1000,
     }
 
 

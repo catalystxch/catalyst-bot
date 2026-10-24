@@ -48,11 +48,22 @@ def cancellation_fee_readiness(campaign: dict[str, Any]) -> dict[str, Any]:
             or total <= 0
             or total > campaign_cap
             or reserve <= 0
-            or remaining < reserve
         ):
             return {
                 "ready": False,
                 "reason": "bootstrap_cancellation_fee_budget_insufficient",
+            }
+        if remaining < reserve:
+            # Consumed cancellation fees do not refund capacity for replacement
+            # offers. Keep the full reserve protected and expose the consent
+            # renewal needed, rather than hiding this as a creation exception.
+            return {
+                "ready": False,
+                "reason": "bootstrap_cancellation_fee_budget_insufficient",
+                "action_required": "review_cancellation_fee_budget",
+                "remaining_fee_mojos": remaining,
+                "required_cancellation_reserve_mojos": reserve,
+                "shortfall_mojos": reserve - remaining,
             }
     except Exception as exc:
         slog(

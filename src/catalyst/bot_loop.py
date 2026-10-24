@@ -13312,6 +13312,22 @@ class BotLoop:
             len(plan["sides"][side]["levels"]) for side in allowed_sides
         ):
             return empty
+        from bootstrap_fee_authority import cancellation_fee_readiness
+
+        fee_readiness = cancellation_fee_readiness(campaign)
+        if fee_readiness.get("ready") is not True:
+            signature = (campaign["revision"], repr(sorted(fee_readiness.items())))
+            if getattr(self, "_bootstrap_fee_readiness_block", None) != signature:
+                log_event(
+                    "warning",
+                    "bootstrap_cancellation_fee_review_required",
+                    "Bootstrap replacement offers paused: review cancellation "
+                    "fee consent before adding exposure; no wallet call was made",
+                    data=fee_readiness,
+                )
+                self._bootstrap_fee_readiness_block = signature
+            return empty
+        self._bootstrap_fee_readiness_block = None
         created = self.offer_manager.create_bootstrap_plan(
             plan,
             campaign_authority=campaign,

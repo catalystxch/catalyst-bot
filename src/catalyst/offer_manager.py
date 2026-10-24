@@ -3101,7 +3101,30 @@ class OfferManager:
                     raise ValueError("Bootstrap campaign revision is no longer active")
                 fee_readiness = cancellation_fee_readiness(campaign)
                 if fee_readiness.get("ready") is not True:
-                    raise ValueError(fee_readiness["reason"])
+                    database.finalize_offer_intent(
+                        intent_id=intent.intent_id,
+                        operation_id=intent.operation_id,
+                        event_id=f"{intent.operation_id}:finalized:fee-readiness",
+                        lifecycle_state="creation_failed",
+                        outcome="FAILED",
+                        wallet_identity_json=journal,
+                        evidence_json={
+                            "canonical_intent_sha256": intent.canonical_intent_sha256,
+                            "effect_attempted": False,
+                            "fee_readiness": fee_readiness,
+                        },
+                        reason_code="BOOTSTRAP_CANCELLATION_FEE_NOT_READY",
+                        finalized_at=datetime.now(timezone.utc).isoformat(),
+                        finalize_selected_coin_reservations=True,
+                    )
+                    return {
+                        "success": False,
+                        "error": "Bootstrap cancellation fee consent needs review",
+                        "reason": "BOOTSTRAP_CANCELLATION_FEE_NOT_READY",
+                        "fee_readiness": fee_readiness,
+                        "_catalyst_effect_attempted": False,
+                        "_catalyst_intent_id": intent.intent_id,
+                    }
                 # Wallet/inventory reads above can outlast a campaign transition.
                 # Keep campaign authority as the final pre-effect check.
                 require_active_bootstrap_intent_authority(
