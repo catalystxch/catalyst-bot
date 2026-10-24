@@ -1357,6 +1357,16 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     )
     loop._emit_coin_update = lambda reason: created_call.setdefault("emit", reason)
 
+    # This isolated publication test stubs creation itself. Model the explicit
+    # fee-consent precondition; readiness failures have independent coverage.
+    import bootstrap_fee_authority
+
+    monkeypatch.setattr(
+        bootstrap_fee_authority,
+        "cancellation_fee_readiness",
+        lambda campaign: {"ready": True, "approval_id": "b" * 64},
+    )
+
     result = loop._route_bootstrap_creation_if_active(
         current_buy_ids=set(), current_sell_ids=set()
     )
