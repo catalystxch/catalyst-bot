@@ -40944,7 +40944,7 @@ function _bootstrapRenderStatus(payload) {
     }
     if (reconcileExpired) {
         const exactTrades = _bootstrapActiveCampaign?.reconciliation_trade_ids;
-        const canProve = _bootstrapActiveCampaign?.expired === true
+        const canProve = _bootstrapActiveCampaign?.status === 'active'
             && Array.isArray(exactTrades) && exactTrades.length > 0
             && exactTrades.length === Number(_bootstrapActiveCampaign.open_offer_count)
             && !hasUnresolvedCreation;
@@ -41227,12 +41227,12 @@ async function bootstrapReconcileTerminalOffers() {
 async function bootstrapReconcileExpiredOffers() {
     const campaign = _bootstrapActiveCampaign;
     const tradeIds = campaign?.reconciliation_trade_ids;
-    if (!campaign?.expired || !Array.isArray(tradeIds) || !tradeIds.length
+    if (campaign?.status !== 'active' || !Array.isArray(tradeIds) || !tradeIds.length
         || tradeIds.length !== Number(campaign.open_offer_count) || bot_state?.running) return;
     const approved = await showStyledConfirm({
         icon: '🔎',
         title: 'Verify expired offers in Sage?',
-        message: 'CATalyst will check the exact campaign offers, complete Sage offer book, pending transactions, and selected coins. Only offers proven naturally expired will be marked terminal. No wallet transaction will be sent.',
+        message: `CATalyst will check these exact campaign offers against the complete Sage book and pending transactions:\n${tradeIds.join('\n')}\n\nOnly offers proven naturally expired will be marked terminal. The campaign can remain active. No wallet transaction will be sent.`,
         confirmText: 'Verify expired offers',
         cancelText: 'Keep current state',
         style: 'warning'

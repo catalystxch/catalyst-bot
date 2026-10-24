@@ -426,7 +426,10 @@ def _status_campaign_view(campaign: dict[str, Any] | None) -> dict[str, Any] | N
     view["open_offer_count"] = len(trade_ids)
     # The operator must submit the exact reviewed scope for a proof-only
     # expiry reconciliation. The backend re-reads it under the lifecycle lock.
-    view["reconciliation_trade_ids"] = trade_ids if expired else []
+    # Individual offers can expire before the campaign authority does. Keep
+    # the exact local scope available for proof-only reconciliation while the
+    # bot is stopped; the POST still requires every trade to be expired in Sage.
+    view["reconciliation_trade_ids"] = trade_ids
     view["unresolved_creation_count"] = _campaign_unresolved_creation_count(
         str(campaign.get("campaign_id") or "")
     )
@@ -1029,7 +1032,6 @@ def _api_bootstrap_reconcile_expired_locked():
                 campaign is None
                 or campaign["status"] != "active"
                 or campaign["revision"] != body["revision"]
-                or not _campaign_expiry_has_elapsed(campaign, _utcnow())
                 or campaign["network"] != identity["network"]
                 or campaign["wallet_fingerprint"] != identity["wallet_fingerprint"]
                 or campaign["wallet_id"] != identity["wallet_id"]

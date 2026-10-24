@@ -410,7 +410,10 @@ def test_expired_zero_offer_campaign_describes_stop_without_cancellation(page):
     )
 
 
-def test_expired_campaign_offers_have_separate_proof_only_control(page):
+@pytest.mark.parametrize("campaign_expired", [False, True])
+def test_expired_campaign_offers_have_separate_proof_only_control(
+    page, campaign_expired
+):
     _open_gui(page)
     assert (
         page.evaluate("_apiBridgeMethod('/api/bootstrap/reconcile_expired', 'POST')")
@@ -423,7 +426,7 @@ def test_expired_campaign_offers_have_separate_proof_only_control(page):
             window.__expiryProofCalls = [];
             _bootstrapRenderStatus({success: true, active: true, campaign: {
                 campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
-                expired: true, cancel_required: true, open_offer_count: 2,
+                expired: false, cancel_required: false, open_offer_count: 2,
                 reconciliation_trade_ids: ['1'.repeat(64), '2'.repeat(64)],
                 asset_id: 'b8'.repeat(32), minimum_price: '0.0000375',
                 maximum_price: '0.00015',
@@ -441,6 +444,16 @@ def test_expired_campaign_offers_have_separate_proof_only_control(page):
             };
         }"""
     )
+    if campaign_expired:
+        page.evaluate(
+            """() => _bootstrapRenderStatus({success: true, active: true, campaign: {
+                campaign_id: 'c'.repeat(64), revision: 0, status: 'active',
+                expired: true, cancel_required: true, open_offer_count: 2,
+                reconciliation_trade_ids: ['1'.repeat(64), '2'.repeat(64)],
+                asset_id: 'b8'.repeat(32), minimum_price: '0.0000375',
+                maximum_price: '0.00015',
+            }})"""
+        )
     proof = page.locator("#bootstrapReconcileExpiredBtn")
     assert proof.evaluate("button => button.style.display") != "none"
     expect(proof).to_be_enabled()
@@ -459,6 +472,7 @@ def test_expired_campaign_offers_have_separate_proof_only_control(page):
     assert "No wallet transaction" in page.evaluate(
         "window.__expiryProofConfirmation.message"
     )
+    assert "1" * 64 in page.evaluate("window.__expiryProofConfirmation.message")
 
 
 def test_stopped_expired_campaign_completed_offers_show_exact_preview_and_commit(page):

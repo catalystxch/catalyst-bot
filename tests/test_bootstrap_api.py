@@ -557,11 +557,18 @@ def test_expired_campaign_without_offers_stops_without_wallet_cancellation(
 
 
 @pytest.mark.parametrize(
-    ("second_classification", "identity_change", "expected_status", "expected_commits"),
+    (
+        "second_classification",
+        "identity_change",
+        "campaign_expired",
+        "expected_status",
+        "expected_commits",
+    ),
     [
-        ("EXPIRED_PROVEN", False, 200, ["intent-0", "intent-1"]),
-        ("UNKNOWN", False, 409, []),
-        ("EXPIRED_PROVEN", True, 409, []),
+        ("EXPIRED_PROVEN", False, True, 200, ["intent-0", "intent-1"]),
+        ("EXPIRED_PROVEN", False, False, 200, ["intent-0", "intent-1"]),
+        ("UNKNOWN", False, False, 409, []),
+        ("EXPIRED_PROVEN", True, False, 409, []),
     ],
 )
 def test_expired_campaign_proves_exact_sage_expiry_without_wallet_effect(
@@ -570,6 +577,7 @@ def test_expired_campaign_proves_exact_sage_expiry_without_wallet_effect(
     monkeypatch,
     second_classification,
     identity_change,
+    campaign_expired,
     expected_status,
     expected_commits,
 ):
@@ -591,7 +599,15 @@ def test_expired_campaign_proves_exact_sage_expiry_without_wallet_effect(
     monkeypatch.setattr(
         bootstrap,
         "_utcnow",
-        lambda: datetime(2026, 9, 12, 12, 1, 1, tzinfo=timezone.utc),
+        lambda: datetime(
+            2026,
+            9,
+            12,
+            12,
+            1 if campaign_expired else 0,
+            1 if campaign_expired else 30,
+            tzinfo=timezone.utc,
+        ),
     )
     trade_ids = ["11" * 32, "22" * 32]
     rows = [
@@ -607,6 +623,13 @@ def test_expired_campaign_proves_exact_sage_expiry_without_wallet_effect(
         for index, trade_id in enumerate(trade_ids)
     ]
     monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: rows)
+    monkeypatch.setattr(
+        bootstrap, "_campaign_trade_ids", lambda _campaign_id: trade_ids
+    )
+    if not campaign_expired:
+        status = client.get("/api/bootstrap/status").get_json()
+        assert status["campaign"]["expired"] is False
+        assert status["campaign"]["reconciliation_trade_ids"] == trade_ids
     snapshots = iter(
         [
             {
