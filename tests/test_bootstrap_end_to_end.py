@@ -603,13 +603,18 @@ def test_bootstrap_coin_prep_reduces_only_the_filled_campaign_side_capacity(
     assert counts == {"buy": 9, "sell": 10}
 
 
+@pytest.mark.parametrize("effective_fee_mojos", [0, 10_000_000])
 def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
-    bootstrap_app, monkeypatch
+    bootstrap_app, monkeypatch, effective_fee_mojos
 ):
     from blueprints import coin_prep
     import tx_fees
     import wallet
 
+    monkeypatch.setattr(coin_prep.cfg, "FEE_PREP_COUNT", 50, raising=False)
+    monkeypatch.setattr(
+        coin_prep.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"), raising=False
+    )
     _bootstrap, client, _identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
     started = client.post(
@@ -643,7 +648,7 @@ def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
         },
     )
     monkeypatch.setattr(
-        tx_fees, "get_effective_transaction_fee_mojos", lambda: 10_000_000
+        tx_fees, "get_effective_transaction_fee_mojos", lambda: effective_fee_mojos
     )
     monkeypatch.setattr(coin_prep, "get_fills", lambda **_kwargs: [])
     monkeypatch.setattr(coin_prep, "get_offer_intents_for_registry", lambda: [])

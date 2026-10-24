@@ -192,6 +192,9 @@ def derive_bootstrap_plan(
     network_fee = _bootstrap_decimal(balances, "network_fee_xch")
     minimum_profit = _bootstrap_decimal(balances, "minimum_profit_xch")
     fee_coin_size = _bootstrap_decimal(balances, "fee_coin_size_xch")
+    fee_pool_enabled = balances.get("fee_pool_enabled", False)
+    if type(fee_pool_enabled) is not bool:
+        raise ValueError("fee_pool_enabled must be a boolean")
     expected_cancel_requotes = balances.get("expected_cancel_requotes", 0)
     if type(expected_cancel_requotes) is not int or expected_cancel_requotes < 0:
         raise ValueError("expected_cancel_requotes must be nonnegative")
@@ -419,7 +422,7 @@ def derive_bootstrap_plan(
                 "amount_xch": fee_coin_size,
             }
             for level in all_levels
-            if network_fee > 0
+            if network_fee > 0 or fee_pool_enabled
         ],
         "excluded_xch": {
             "campaign_undeployed_xch": campaign.xch_budget - xch_deployment,

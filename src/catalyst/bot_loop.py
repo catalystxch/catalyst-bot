@@ -13095,7 +13095,7 @@ class BotLoop:
             )
             return empty
 
-        from tx_fees import get_effective_transaction_fee_mojos
+        from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
         from wallet import get_wallet_balance
 
         try:
@@ -13138,6 +13138,7 @@ class BotLoop:
             "fee_coin_size_xch": Decimal(
                 str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0")))
             ),
+            "fee_pool_enabled": fee_pool_enabled(),
             "expected_cancel_requotes": int(
                 getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
             ),

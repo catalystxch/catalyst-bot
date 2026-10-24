@@ -380,7 +380,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         derive_bootstrap_coin_prep_wave_counts,
         derive_bootstrap_runtime,
     )
-    from tx_fees import get_effective_transaction_fee_mojos
+    from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
     from wallet import get_wallet_balance
 
     try:
@@ -426,6 +426,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         "fee_coin_size_xch": Decimal(
             str(getattr(cfg, "FEE_COIN_SIZE_XCH", "0.001") or "0.001")
         ),
+        "fee_pool_enabled": fee_pool_enabled(),
         "expected_cancel_requotes": int(
             getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 1) or 1
         ),

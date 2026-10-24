@@ -175,6 +175,47 @@ def test_coin_prep_projection_contains_only_staged_purpose_separated_outputs():
     }
 
 
+def test_manual_zero_fee_still_prepares_configured_protected_fee_pool():
+    campaign = _campaign(xch_budget=Decimal("61"), cat_budget=Decimal("725000"))
+    plan = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+            network_fee_xch=Decimal("0"),
+            fee_pool_enabled=True,
+        ),
+        cat_decimals=3,
+    )
+
+    assert plan["authorized"] is True
+    assert plan["creation_fee_required_xch"] == Decimal("0")
+    assert len(plan["coin_prep"]["fee_coins"]) == 6
+    assert all(
+        coin["amount_xch"] == Decimal("0.001")
+        for coin in plan["coin_prep"]["fee_coins"]
+    )
+    worker_args = bootstrap_coin_prep_worker_args(plan)
+    assert "fees=0.001" in worker_args["buy_tier_sizes"]
+    assert "fees=6" in worker_args["tier_counts_xch"]
+
+    without_pool = derive_bootstrap_plan(
+        campaign,
+        _decision(campaign),
+        _balances(
+            xch_available=Decimal("138"),
+            cat_available=Decimal("1089357"),
+            minimum_profit_xch=Decimal("0"),
+            network_fee_xch=Decimal("0"),
+            fee_pool_enabled=False,
+        ),
+        cat_decimals=3,
+    )
+    assert without_pool["coin_prep"]["fee_coins"] == []
+
+
 def test_offer_specs_preserve_exact_bootstrap_level_purpose_and_amounts():
     campaign = _campaign(subsidy=Decimal("0.0004"))
     plan = derive_bootstrap_plan(campaign, _decision(campaign), _balances())

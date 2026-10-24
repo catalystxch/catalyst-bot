@@ -40,6 +40,7 @@ from providers.registry import ProviderRegistry
 from providers.sage import SageAuthorityProvider
 from providers.splash import SplashOfferProvider
 from super_log import slog
+from tx_fees import fee_pool_enabled
 
 
 bp = Blueprint("bootstrap", __name__)
@@ -249,6 +250,7 @@ def _campaign_inputs(
             "fee_coin_size_xch",
         )
     }
+    balances["fee_pool_enabled"] = fee_pool_enabled()
     expected_requotes = balances_raw.get("expected_cancel_requotes")
     if type(expected_requotes) is not int or expected_requotes < 0:
         raise BootstrapApiError("invalid_expected_cancel_requotes")
