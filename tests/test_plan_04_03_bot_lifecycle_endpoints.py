@@ -224,6 +224,145 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(result["reason"], "exact_live_book")
         self.assertEqual(result["offer_count"], 3)
 
+    def test_bootstrap_resume_accepts_policy_only_revision_of_exact_live_book(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        trade_ids = ["01" * 32, "02" * 32]
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        original_purpose = f"bootstrap:{campaign['campaign_id']}:revision:0"
+        intents = [
+            {
+                "asset_id": asset_id,
+                "purpose": original_purpose,
+                "lifecycle_state": "visible",
+                "sage_trade_id": trade_id,
+            }
+            for trade_id in trade_ids
+        ]
+        wallet_offers = [
+            {
+                "trade_id": trade_id,
+                "status": 0,
+                "summary": {
+                    "offered": {asset_id: 5_000_000},
+                    "requested": {"xch": 550_000_000_000},
+                },
+            }
+            for trade_id in trade_ids
+        ]
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=intents),
+            patch(
+                "database.get_open_offers",
+                return_value=[{"trade_id": trade_id} for trade_id in trade_ids],
+            ),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=True,
+            ),
+            patch(
+                "wallet.get_authoritative_offer_history",
+                return_value={
+                    "success": True,
+                    "offers": wallet_offers,
+                    "end_of_history": True,
+                },
+            ),
+            patch(
+                "wallet.classify_offers_from_list", return_value=([], wallet_offers, [])
+            ),
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                fake_cfg, campaign
+            )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["reason"], "exact_live_book")
+        self.assertEqual(result["offer_count"], 2)
+
+    def test_bootstrap_resume_rejects_mixed_intent_revisions(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        trade_ids = ["01" * 32, "02" * 32]
+        intents = [
+            {
+                "asset_id": asset_id,
+                "purpose": f"bootstrap:{campaign['campaign_id']}:revision:{revision}",
+                "lifecycle_state": "visible",
+                "sage_trade_id": trade_id,
+            }
+            for trade_id, revision in zip(trade_ids, (0, 1))
+        ]
+        fake_cfg = _fake_cfg(cat_asset_id=asset_id)
+
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=intents),
+            patch(
+                "database.get_open_offers",
+                return_value=[{"trade_id": trade_id} for trade_id in trade_ids],
+            ),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=True,
+            ),
+            patch("wallet.get_authoritative_offer_history") as history,
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                fake_cfg, campaign
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
+        history.assert_not_called()
+
+    def test_bootstrap_resume_rejects_older_book_without_immutable_authority(self):
+        from blueprints import bot as bot_blueprint
+
+        asset_id = "ab" * 32
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 1,
+            "status": "active",
+            "stage": "bootstrap",
+        }
+        intent = {
+            "asset_id": asset_id,
+            "purpose": f"bootstrap:{campaign['campaign_id']}:revision:0",
+            "lifecycle_state": "visible",
+            "sage_trade_id": "01" * 32,
+        }
+        with (
+            patch("database.get_offer_intents_for_registry", return_value=[intent]),
+            patch("database.get_open_offers", return_value=[{"trade_id": "01" * 32}]),
+            patch(
+                "database.bootstrap_campaign_immutable_authority_valid",
+                return_value=False,
+            ),
+            patch("wallet.get_authoritative_offer_history") as history,
+        ):
+            result = bot_blueprint._bootstrap_existing_offer_resume_readiness(
+                _fake_cfg(cat_asset_id=asset_id), campaign
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reason"], "existing_offer_resume_proof_unavailable")
+        history.assert_not_called()
+
     def test_bootstrap_resume_readiness_fails_closed_on_db_wallet_mismatch(self):
         from blueprints import bot as bot_blueprint
 
@@ -963,6 +1102,10 @@ class TestBotStart(_FlaskBase):
                 create=True,
             ),
             patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
+            patch(
                 "coin_manager.check_tier_size_drift_standalone",
                 return_value=legacy_drift,
             ) as drift_check,
@@ -973,6 +1116,58 @@ class TestBotStart(_FlaskBase):
         self.assertEqual(resp.get_json().get("status"), "started")
         drift_check.assert_not_called()
         bot.start.assert_called_once_with()
+
+    def test_active_bootstrap_start_requires_cancellation_fee_consent(self):
+        fake_cfg = _fake_cfg()
+        fake_cfg.CAT_WALLET_ID = 2
+        fake_cfg.WALLET_TYPE = "sage"
+        bot = _make_bot(running=False)
+        campaign = {
+            "campaign_id": "cd" * 32,
+            "revision": 0,
+            "expires_at": "2099-01-01T00:00:00.000000Z",
+            "asset_id": fake_cfg.CAT_ASSET_ID,
+            "network": "mainnet",
+            "wallet_fingerprint": 123456789,
+            "wallet_id": 2,
+            "wallet_type": "sage",
+            "status": "active",
+        }
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", fake_cfg),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "blueprints.bot._matching_active_bootstrap_campaign",
+                return_value=campaign,
+            ),
+            patch(
+                "blueprints.bot._bootstrap_coin_prep_start_readiness",
+                return_value={
+                    "ready": True,
+                    "reason": "ready",
+                    "campaign_id": campaign["campaign_id"],
+                    "campaign_revision": 0,
+                },
+            ),
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={
+                    "ready": False,
+                    "reason": "bootstrap_cancellation_fee_approval_required",
+                },
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"),
+            "bootstrap_cancellation_fee_approval_required",
+        )
+        bot.start.assert_not_called()
 
     def test_active_bootstrap_start_fails_closed_when_exact_prep_is_not_ready(self):
         """Historical completion cannot bypass current campaign readiness."""
@@ -1137,6 +1332,10 @@ class TestBotStart(_FlaskBase):
                 return_value={"ready": True, "reason": "exact_live_book"},
                 create=True,
             ) as resume_readiness,
+            patch(
+                "blueprints.bot._bootstrap_cancellation_fee_start_readiness",
+                return_value={"ready": True, "approval_id": "a" * 64},
+            ),
         ):
             resp = self._post("/api/bot/start", {"resume_existing_offers": True})
 
@@ -1402,10 +1601,14 @@ class TestBotStop(_FlaskBase):
         resp = self._post("/api/bot/stop", auth=False)
         self.assertEqual(resp.status_code, 401)
 
-    def test_bot_none_returns_500(self):
+    def test_bot_none_is_already_stopped_for_pre_wallet_shutdown(self):
         with patch.object(api_server, "bot", None):
             resp = self._post("/api/bot/stop")
-        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {"status": "stopped", "running": False, "bot_initialized": False},
+        )
 
     def test_bot_running_stop_returns_200(self):
         bot = _make_bot(running=True)

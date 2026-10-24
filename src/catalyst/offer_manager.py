@@ -3081,12 +3081,58 @@ class OfferManager:
                     "_catalyst_intent_id": intent.intent_id,
                 }
             self._offer_creation_crash_boundary("before_wallet_call", intent)
-            require_active_bootstrap_intent_authority(
+            campaign_authority = require_active_bootstrap_intent_authority(
                 purpose=intent.purpose,
                 asset_id=intent.asset_id,
                 offer_max_time=intent.offer_max_time,
                 side=intent.side,
             )
+            if campaign_authority is not None:
+                from bootstrap_fee_authority import cancellation_fee_readiness
+
+                campaign = database.get_bootstrap_campaign(
+                    campaign_authority["campaign_id"]
+                )
+                if (
+                    type(campaign) is not dict
+                    or campaign.get("revision")
+                    != campaign_authority["campaign_revision"]
+                ):
+                    raise ValueError("Bootstrap campaign revision is no longer active")
+                fee_readiness = cancellation_fee_readiness(campaign)
+                if fee_readiness.get("ready") is not True:
+                    database.finalize_offer_intent(
+                        intent_id=intent.intent_id,
+                        operation_id=intent.operation_id,
+                        event_id=f"{intent.operation_id}:finalized:fee-readiness",
+                        lifecycle_state="creation_failed",
+                        outcome="FAILED",
+                        wallet_identity_json=journal,
+                        evidence_json={
+                            "canonical_intent_sha256": intent.canonical_intent_sha256,
+                            "effect_attempted": False,
+                            "fee_readiness": fee_readiness,
+                        },
+                        reason_code="BOOTSTRAP_CANCELLATION_FEE_NOT_READY",
+                        finalized_at=datetime.now(timezone.utc).isoformat(),
+                        finalize_selected_coin_reservations=True,
+                    )
+                    return {
+                        "success": False,
+                        "error": "Bootstrap cancellation fee consent needs review",
+                        "reason": "BOOTSTRAP_CANCELLATION_FEE_NOT_READY",
+                        "fee_readiness": fee_readiness,
+                        "_catalyst_effect_attempted": False,
+                        "_catalyst_intent_id": intent.intent_id,
+                    }
+                # Wallet/inventory reads above can outlast a campaign transition.
+                # Keep campaign authority as the final pre-effect check.
+                require_active_bootstrap_intent_authority(
+                    purpose=intent.purpose,
+                    asset_id=intent.asset_id,
+                    offer_max_time=intent.offer_max_time,
+                    side=intent.side,
+                )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),
@@ -6205,12 +6251,17 @@ class OfferManager:
     @staticmethod
     def _acquire_cancel_authority(
         intent: _CanonicalOfferCancelIntent,
+        *,
+        refresh_abort_id: Optional[str] = None,
+        refresh_latch_generation: Optional[int] = None,
     ) -> tuple[Any, dict, str, str]:
         continuation = wallet.begin_offer_cancel_continuation(
             operation_id=intent.operation_id,
             intent_id=intent.intent_id,
             trade_id=intent.trade_id,
             ttl_seconds=60,
+            refresh_abort_id=refresh_abort_id,
+            refresh_latch_generation=refresh_latch_generation,
         )
         try:
             journal = wallet.offer_cancel_continuation_journal(continuation)
@@ -6434,6 +6485,69 @@ class OfferManager:
         }
         return contract if self._is_exact_cancel_wallet_effect(wallet_effect) else None
 
+    def _reserve_protected_cancel_fee_source(
+        self, expected_recovery_action: Optional[str]
+    ) -> tuple[Any, str, int, int] | None:
+        """Prefer prepared fees; use exact selectable top-up collateral only for UI recovery."""
+        fee_pool = self._fee_pool
+        if fee_pool is None:
+            return None
+        prepared = fee_pool.reserve_largest_with_ticket()
+        if prepared is not None:
+            coin_id, amount, ticket = prepared
+            return fee_pool, coin_id, ticket, amount
+        if expected_recovery_action not in {"cancel_all", "bootstrap_stop"}:
+            return None
+
+        # Coin Prep normally makes dedicated fee outputs. An older ladder can
+        # exhaust them while its offers are still live, so full re-prep cannot
+        # start (it would first cancel those offers). Restrict this recovery
+        # input to durable top-up collateral that Sage currently says is
+        # selectable. The final exact unsigned quote and approved fee ceiling
+        # are still checked by price_approved_cancellation below.
+        from coin_manager import (
+            _coin_amount,
+            _coin_id_from_record,
+            _extract_coin_records,
+        )
+
+        wallet_result = get_exact_spendable_coins_rpc(cfg.WALLET_ID_XCH)
+        if type(wallet_result) is not dict or wallet_result.get("success") is not True:
+            return None
+        wallet_records = _extract_coin_records(wallet_result)
+        selectable = {}
+        for record in wallet_records:
+            coin_id = str(_coin_id_from_record(record) or "").lower().removeprefix("0x")
+            if len(coin_id) != 64 or any(
+                ch not in "0123456789abcdef" for ch in coin_id
+            ):
+                return None
+            if coin_id in selectable:
+                return None
+            selectable[coin_id] = _coin_amount(record)
+
+        candidates = []
+        for row in database.get_free_coins("xch"):
+            if row.get("purpose") != "top_up" or row.get("designation") not in {
+                "unknown",
+                "reserve",
+            }:
+                continue
+            coin_id = str(row.get("coin_id") or "").lower().removeprefix("0x")
+            amount = row.get("amount_mojos")
+            if (
+                type(amount) is int
+                and 0 < amount <= 100_000_000_000
+                and selectable.get(coin_id) == amount
+            ):
+                candidates.append((amount, coin_id))
+        for amount, coin_id in sorted(candidates, reverse=True):
+            reserved = fee_pool.reserve_external_recovery_with_ticket(coin_id, amount)
+            if reserved is not None:
+                reserved_id, reserved_amount, ticket = reserved
+                return fee_pool, reserved_id, ticket, reserved_amount
+        return None
+
     def _plan_coin_prep_cancel(
         self,
         members: list[tuple],
@@ -6448,8 +6562,31 @@ class OfferManager:
         source_coin_ids = []
         for intent, _attempt, _member_id in members:
             offer = database.get_offer(intent.trade_id)
+            canonical_intent = database.get_offer_intent_by_trade_id(intent.trade_id)
+            canonical_coin_id = None
+            if type(canonical_intent) is dict:
+                try:
+                    selected = json.loads(canonical_intent["selected_coin_ids_json"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("FEE_CANCELLATION_PLAN_INVALID") from exc
+                if (
+                    canonical_intent.get("intent_id") != intent.intent_id
+                    or canonical_intent.get("sage_trade_id") != intent.trade_id
+                    or canonical_intent.get("lifecycle_state")
+                    not in {"created", "visible", "cancel_requested"}
+                    or type(selected) is not list
+                    or len(selected) != 1
+                ):
+                    raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+                canonical_coin_id = selected[0]
             raw_coin_id = offer.get("coin_id") if type(offer) is dict else None
+            if raw_coin_id is None:
+                raw_coin_id = canonical_coin_id
             coin_id = str(raw_coin_id or "").strip().lower().removeprefix("0x")
+            if canonical_coin_id is not None and coin_id != str(
+                canonical_coin_id
+            ).strip().lower().removeprefix("0x"):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
             try:
                 valid = len(coin_id) == 64 and bool(bytes.fromhex(coin_id))
             except ValueError:
@@ -6460,11 +6597,10 @@ class OfferManager:
             source_coin_ids.append(coin_id)
         from coin_prep_fee_cancellation import price_approved_cancellation
 
-        fee_pool = self._fee_pool
-        largest = fee_pool.reserve_largest_with_ticket()
-        if largest is None:
+        reserved = self._reserve_protected_cancel_fee_source(expected_recovery_action)
+        if reserved is None:
             raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
-        reserved_coin_id, fee_coin_amount, ticket = largest
+        fee_pool, reserved_coin_id, ticket, fee_coin_amount = reserved
         fee_coin_id = str(reserved_coin_id).strip().lower().removeprefix("0x")
         try:
             priced = price_approved_cancellation(
@@ -6475,6 +6611,15 @@ class OfferManager:
                 expected_recovery_action=expected_recovery_action,
             )
             if priced.get("available") is not True:
+                if priced.get("reason") == "FEE_UNSIGNED_COST_UNAVAILABLE":
+                    stage = priced.get("diagnostic_stage")
+                    if type(stage) is str:
+                        log_event(
+                            "warning",
+                            "fee_cancel_unsigned_refusal",
+                            "Unsigned cancellation could not be validated",
+                            data={"stage": stage},
+                        )
                 raise ValueError(
                     str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE")
                 )
@@ -7133,7 +7278,12 @@ class OfferManager:
                     latch_binding=(wallet_hash, network),
                     authoritative=False,
                 )
-            finalized = events[-1]
+            terminal_confirmed = (
+                len(events) == 3
+                and events[2]["phase"] == "RECONCILED"
+                and events[2]["outcome"] == CANCEL_CONFIRMED
+            )
+            finalized = events[1] if terminal_confirmed else events[-1]
             final_evidence = json.loads(finalized["evidence_json"])
             if type(final_evidence) is not dict:
                 raise ValueError("cancellation final evidence is not exact")
@@ -7209,6 +7359,52 @@ class OfferManager:
                 )
             ):
                 raise ValueError("cancellation final event is not exact")
+            if terminal_confirmed:
+                confirmed = events[2]
+                terminal = database.get_authoritative_terminal_record(intent.trade_id)
+                proof = json.loads(confirmed["evidence_json"])
+                classification = (
+                    proof.get("classification") if type(proof) is dict else None
+                )
+                cancel_context = (
+                    proof.get("cancel_context") if type(proof) is dict else None
+                )
+                if (
+                    result["outcome"]
+                    not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
+                    or finalized["blocks_mutation"] != 1
+                    or type(terminal) is not dict
+                    or terminal.get("outcome") != "CANCELLED_PROVEN"
+                    or terminal.get("intent_id") != intent.intent_id
+                    or terminal.get("evidence_sha256") != confirmed["evidence_sha256"]
+                    or confirmed["event_id"]
+                    != f"{intent.operation_id}:attempt:{latest_attempt}:reconciled"
+                    or confirmed["operation_id"] != intent.operation_id
+                    or confirmed["intent_id"] != intent.intent_id
+                    or confirmed["operation_type"] != "CANCEL"
+                    or confirmed["attempt"] != latest_attempt
+                    or confirmed["reason_code"] != "AUTHORITATIVE_TERMINAL_PROOF"
+                    or confirmed["blocks_mutation"] != 0
+                    or json.loads(confirmed["wallet_identity_json"])
+                    != {"wallet_fingerprint_hash": wallet_hash, "network": network}
+                    or type(classification) is not dict
+                    or classification.get("classification") != "CANCELLED_PROVEN"
+                    or classification.get("transaction_id")
+                    != confirmed["transaction_id"]
+                    or classification.get("spend_identity")
+                    != confirmed["spend_identity"]
+                    or type(cancel_context) is not dict
+                    or cancel_context.get("cohort_id") != cohort_id
+                ):
+                    raise ValueError("cancellation terminal proof is not exact")
+                result = cancellation_result(
+                    CANCEL_CONFIRMED,
+                    method="task9_authoritative",
+                    raw_response={"evidence_sha256": confirmed["evidence_sha256"]},
+                    transaction_id=confirmed["transaction_id"] or "",
+                    spend_identity=confirmed["spend_identity"] or "",
+                )
+                expected_blocks = 0
             result["_catalyst_effect_attempted"] = False
             result["_catalyst_idempotent_replay"] = True
             result["_catalyst_operation_id"] = intent.operation_id
@@ -7515,6 +7711,8 @@ class OfferManager:
         priced_cancellation: Optional[dict] = None,
         fee_reservation: Optional[tuple] = None,
         expected_recovery_action: Optional[str] = None,
+        refresh_abort_id: Optional[str] = None,
+        refresh_latch_generation: Optional[int] = None,
     ) -> Dict[str, dict]:
         """Run one manifest-bound Sage bulk cancellation wallet effect."""
 
@@ -7608,7 +7806,36 @@ class OfferManager:
                 database.record_coin_prep_cancellation_fee_outcome(manifest)
                 release_proven_unattempted_fee_input(results)
                 return results
-        claim = database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+        if refresh_abort_id is not None:
+            if len(members) != 1 or refresh_latch_generation is None:
+                raise ValueError("refresh abort cleanup requires one exact target")
+            cleanup_intent = members[0][0]
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Exact refresh abort cleanup cancellation is prepared",
+                blocking_operation_ids=[cleanup_intent.operation_id],
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            cleanup_snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+            effect_claimed = database.claim_refresh_abort_cleanup_cancel_effect(
+                abort_id=refresh_abort_id,
+                trade_id=cleanup_intent.trade_id,
+                expected_latch_generation=refresh_latch_generation,
+                owner_run_id=mutation_gate.current_runtime().run_id,
+                observed_trade_ids=cleanup_snapshot["trade_ids"],
+                observed_pending_transaction_ids=cleanup_snapshot[
+                    "pending_transaction_ids"
+                ],
+                observed_at=cleanup_snapshot["observed_at"],
+            )
+            claim = {
+                "cohort_id": manifest["cohort_id"],
+                "effect_claimed": effect_claimed,
+                "member_count": 1,
+            }
+        else:
+            claim = database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
         if claim != {
             "cohort_id": manifest["cohort_id"],
             "effect_claimed": True,
@@ -7734,6 +7961,7 @@ class OfferManager:
             database.finalize_offer_cancel_cohort(
                 manifest_json=manifest,
                 member_requests_json=requests,
+                refresh_abort_id=refresh_abort_id,
             )
         except Exception:
             database.trip_runtime_safety_latch(
@@ -7785,6 +8013,132 @@ class OfferManager:
             results[intent.trade_id] = result
         return results
 
+    def cancel_refresh_abort_targets(
+        self,
+        *,
+        abort_id: str,
+        expected_latch_generation: int,
+        fee_approval_id: str,
+    ) -> dict:
+        """Submit at most one reviewed target; require proof before the next."""
+
+        if (
+            type(abort_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", abort_id) is None
+            or type(expected_latch_generation) is not int
+            or expected_latch_generation < 1
+            or type(fee_approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", fee_approval_id) is None
+        ):
+            raise ValueError("exact refresh abort cleanup request is required")
+        abort = database.get_refresh_abort(abort_id)
+        if (
+            type(abort) is not dict
+            or abort.get("abort_id") != abort_id
+            or abort.get("state") != "parent_terminal"
+            or abort.get("latch_generation") != expected_latch_generation
+        ):
+            raise ValueError("refresh abort cleanup stage changed")
+        try:
+            targets = json.loads(abort["target_trade_ids_json"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("refresh abort cleanup targets are invalid") from exc
+        if (
+            type(targets) is not list
+            or not targets
+            or len(targets) != len(set(targets))
+            or any(
+                type(trade) is not str or re.fullmatch(r"[0-9a-f]{64}", trade) is None
+                for trade in targets
+            )
+        ):
+            raise ValueError("refresh abort cleanup targets are invalid")
+        snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+        active = snapshot["trade_ids"]
+        if snapshot["pending_transaction_ids"]:
+            raise ValueError("refresh abort cleanup has pending wallet effects")
+        if not active:
+            return {
+                "abort_id": abort_id,
+                "trade_id": None,
+                "stage": "awaiting_empty_book_terminal_proof",
+            }
+        if not set(active).issubset(set(targets)):
+            raise ValueError("Sage has an offer outside the cleanup target set")
+        runtime = mutation_gate.current_runtime()
+        if runtime is None:
+            raise ValueError("refresh abort cleanup requires owner runtime")
+        trade_id = sorted(active)[0]
+        proof = database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort_id,
+            trade_id=trade_id,
+            expected_latch_generation=expected_latch_generation,
+            owner_run_id=runtime.run_id,
+            observed_trade_ids=active,
+            observed_pending_transaction_ids=snapshot["pending_transaction_ids"],
+            observed_at=snapshot["observed_at"],
+        )
+        if proof["abort_id"] != abort_id or proof["trade_id"] != trade_id:
+            raise ValueError("refresh abort cleanup proof changed")
+        result = self.cancel_offers(
+            [trade_id],
+            reason="coin_prep_cancel_all",
+            force_storm=True,
+            fee_approval_id=fee_approval_id,
+            _refresh_abort_id=abort_id,
+            _refresh_latch_generation=expected_latch_generation,
+        )
+        return {
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "result": result[trade_id],
+        }
+
+    def complete_refresh_abort_cleanup(
+        self, *, abort_id: str, expected_latch_generation: int
+    ) -> dict:
+        """Require two complete empty Sage reads before releasing the abort fence."""
+
+        abort = database.get_refresh_abort(abort_id)
+        if (
+            type(abort) is not dict
+            or abort.get("state") != "parent_terminal"
+            or abort.get("latch_generation") != expected_latch_generation
+        ):
+            raise ValueError("refresh abort cleanup stage changed")
+        runtime = mutation_gate.current_runtime()
+        if runtime is None:
+            raise ValueError("refresh abort cleanup requires owner runtime")
+        first = wallet._read_refresh_abort_cleanup_snapshot()
+        second = wallet._read_refresh_abort_cleanup_snapshot()
+        if any(
+            snapshot["trade_ids"] or snapshot["pending_transaction_ids"]
+            for snapshot in (first, second)
+        ):
+            raise ValueError("refresh abort cleanup wallet book is not empty")
+        completed = database.complete_refresh_abort(
+            abort_id=abort_id,
+            expected_latch_generation=expected_latch_generation,
+            owner_run_id=runtime.run_id,
+            observed_trade_ids=second["trade_ids"],
+            observed_pending_transaction_ids=second["pending_transaction_ids"],
+            observed_at=second["observed_at"],
+        )
+        try:
+            post = wallet._read_refresh_abort_cleanup_snapshot()
+            if post["trade_ids"] or post["pending_transaction_ids"]:
+                raise ValueError("wallet changed after refresh abort completion")
+        except Exception:
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Refresh abort post-completion Sage read needs review",
+                blocking_operation_ids=[abort["blocking_operation_id"]],
+                wallet_fingerprint_hash=abort["wallet_fingerprint_hash"],
+                network=abort["network"],
+            )
+            raise
+        return completed
+
     def cancel_offers(
         self,
         trade_ids: List[str],
@@ -7793,6 +8147,8 @@ class OfferManager:
         skip_confirmation: bool = False,
         _retry_failed_attempts: Optional[Dict[str, int]] = None,
         fee_approval_id: Optional[str] = None,
+        _refresh_abort_id: Optional[str] = None,
+        _refresh_latch_generation: Optional[int] = None,
     ) -> Dict:
         """Cancel a list of offers.
 
@@ -7812,6 +8168,36 @@ class OfferManager:
         del skip_confirmation
         if not trade_ids:
             return {}
+        refresh_cleanup = (
+            _refresh_abort_id is not None or _refresh_latch_generation is not None
+        )
+        if refresh_cleanup and (
+            type(_refresh_abort_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", _refresh_abort_id) is None
+            or type(_refresh_latch_generation) is not int
+            or _refresh_latch_generation < 1
+            or type(trade_ids) is not list
+            or len(trade_ids) != 1
+            or fee_approval_id is None
+            or reason != "coin_prep_cancel_all"
+        ):
+            raise ValueError("refresh abort cleanup requires one approved target")
+        if refresh_cleanup:
+            runtime = mutation_gate.current_runtime()
+            if runtime is None:
+                raise ValueError("refresh abort cleanup requires owner runtime")
+            cleanup_snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=_refresh_abort_id,
+                trade_id=trade_ids[0],
+                expected_latch_generation=_refresh_latch_generation,
+                owner_run_id=runtime.run_id,
+                observed_trade_ids=cleanup_snapshot["trade_ids"],
+                observed_pending_transaction_ids=cleanup_snapshot[
+                    "pending_transaction_ids"
+                ],
+                observed_at=cleanup_snapshot["observed_at"],
+            )
         if fee_approval_id is not None:
             if (
                 type(fee_approval_id) is not str
@@ -7901,7 +8287,8 @@ class OfferManager:
             reason = "coin_prep_cancel_all"
         elif fee_approval_id is not None and reason != "coin_prep_cancel_all":
             raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
-        self._recover_persisted_cancel_cohorts()
+        if not refresh_cleanup:
+            self._recover_persisted_cancel_cohorts()
         unique_intents = []
         seen_trade_ids = set()
         for intent in canonical_intents:
@@ -8099,9 +8486,16 @@ class OfferManager:
                     existing_results[intent.trade_id] is None
                     and intent.trade_id not in recoverable_contexts
                 ) or retry_eligible[intent.trade_id]:
-                    authorities[intent.trade_id] = self._acquire_cancel_authority(
-                        intent
-                    )
+                    if refresh_cleanup:
+                        authorities[intent.trade_id] = self._acquire_cancel_authority(
+                            intent,
+                            refresh_abort_id=_refresh_abort_id,
+                            refresh_latch_generation=_refresh_latch_generation,
+                        )
+                    else:
+                        authorities[intent.trade_id] = self._acquire_cancel_authority(
+                            intent
+                        )
 
             if is_cohort:
                 if manifest is not None:
@@ -8211,6 +8605,8 @@ class OfferManager:
                     priced_cancellation=priced_cancellation,
                     fee_reservation=fee_reservation,
                     expected_recovery_action=expected_recovery_action,
+                    refresh_abort_id=_refresh_abort_id,
+                    refresh_latch_generation=_refresh_latch_generation,
                 )
                 for intent, attempt, _member_id in members:
                     result = batch_results[intent.trade_id]
@@ -9295,7 +9691,10 @@ class OfferManager:
                     member["operation_id"]: member
                     for member in exact_manifest["members"]
                 }
-                representative_member = members_by_operation[current_ids[0]]
+                # Cohort proof is anchored to the first immutable manifest
+                # member, even when that member was already reconciled before
+                # this recovery run and is no longer a blocker.
+                representative_member = exact_manifest["members"][0]
                 representative_intent = database.get_offer_intent(
                     representative_member["intent_id"]
                 )
@@ -9336,11 +9735,29 @@ class OfferManager:
                         raise ValueError(
                             "native bulk cancellation intent binding changed"
                         )
+                    member_evidence = evidence
+                    member_observed_at = observed_at
+                    if intent_row["intent_id"] != representative_intent[
+                        "intent_id"
+                    ] and (
+                        evidence["offer_history"].get("scope_trade_ids") is not None
+                        or evidence["transaction_history"].get(
+                            "scope_selected_coin_ids"
+                        )
+                        is not None
+                    ):
+                        # Sage scopes each transaction/coin view to one intent.
+                        # Reuse the cohort proof, but collect each peer's own
+                        # exact view before classifying or committing it.
+                        member_evidence = (
+                            offer_reconciliation.load_authoritative_evidence(intent_row)
+                        )
+                        member_observed_at = offer_reconciliation._clock_utc()
                     classification = offer_reconciliation.classify_terminal_evidence(
                         intent_row,
-                        evidence,
+                        member_evidence,
                         cancel_context=cancel_context,
-                        now=observed_at,
+                        now=member_observed_at,
                     )
                     if (
                         classification.get("classification")
@@ -9349,9 +9766,9 @@ class OfferManager:
                         raise ValueError("native bulk cancellation proof is incomplete")
                     reconciled = offer_reconciliation.reconcile_offer(
                         intent_row["intent_id"],
-                        evidence=evidence,
+                        evidence=member_evidence,
                         cancel_context=cancel_context,
-                        now=observed_at,
+                        now=member_observed_at,
                     )
                     if (
                         reconciled.get("classification")

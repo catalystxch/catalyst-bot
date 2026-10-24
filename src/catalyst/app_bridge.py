@@ -283,15 +283,20 @@ class AppBridge:
 
     @_safe
     @_mutation_guard("app_bridge:start_bot")
-    def start_bot(self, _body=None):
+    def start_bot(self, body=None):
         """Start the bot loop. Maps to POST /api/bot/start.
         Delegates fully to api_server.api_bot_start() which runs all pre-start
         validation (CAT_ASSET_ID, wallet sync, spread sanity, etc.).
         """
         import api_server
 
+        payload = (
+            {"resume_existing_offers": True}
+            if type(body) is dict and body.get("resume_existing_offers") is True
+            else {}
+        )
         with api_server.app.test_request_context(
-            "/api/bot/start", method="POST", content_type="application/json", data="{}"
+            "/api/bot/start", method="POST", json=payload
         ):
             resp = api_server.api_bot_start()
         return _unwrap_flask_response(resp)
@@ -555,6 +560,92 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reconcile_expired_bootstrap_offers")
+    def reconcile_expired_bootstrap_offers(self, body=None):
+        """Prove exact natural expiry without a Sage wallet effect."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_expired",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_reconcile_expired()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def preview_completed_bootstrap_offers(self, body=None):
+        """Review exact completed offers without changing campaign state."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/preview_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_preview_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def preview_terminal_offers(self, body=None):
+        """Read exact mixed terminal proof through the native bridge."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"campaign_id", "revision"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        proof = mixed_terminal_recovery.preview_terminal_offers(
+            body["campaign_id"], body["revision"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **proof}
+
+    @_safe
+    def commit_terminal_offers(self, body=None):
+        """Apply a freshly reverified, database-only terminal cohort."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = mixed_terminal_recovery.commit_terminal_offers(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **result}
+
+    @_safe
+    def drain_deferred_terminal_hooks(self, body=None):
+        """Deliver reviewed fill hooks only after normal authority returns."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = mixed_terminal_recovery.drain_deferred_terminal_hooks(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **result}
+
+    @_safe
+    @_mutation_guard("app_bridge:reconcile_completed_bootstrap_offers")
+    def reconcile_completed_bootstrap_offers(self, body=None):
+        """Commit exact Task 9 fill proofs without a Sage wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_reconcile_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:renew_bootstrap_campaign")
     def renew_bootstrap_campaign(self, body=None):
         """Create a freshly reviewed successor to a stopped campaign."""
@@ -669,11 +760,11 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
-    @_mutation_guard("app_bridge:cancel_all_offers")
     def cancel_all_offers(self, body=None):
-        """Cancel all offers. Maps to POST /api/offers/cancel_all."""
+        """Use the route's gate so blocked proof-only recovery remains reachable."""
         import api_server
 
+        api_server._ensure_mutation_runtime()
         with api_server.app.test_request_context(
             "/api/offers/cancel_all",
             method="POST",
@@ -690,6 +781,71 @@ class AppBridge:
 
         with api_server.app.test_request_context("/api/offers/cancel_all/status"):
             resp = api_server.api_cancel_all_status()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def get_refresh_abort_preview(self):
+        """Read exact fenced recovery scope for the native operator view."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/offers/refresh_abort/preview"):
+            resp = api_server.api_refresh_abort_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def begin_refresh_abort(self, body=None):
+        """Reach the exact proof-only abort route while the safety latch holds."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/begin",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_begin()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def cancel_next_refresh_abort_offer(self, body=None):
+        """Use the route's exact fence, Task 8 journal, fee and Sage checks."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/cancel_next",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_cancel_next()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def reconcile_refresh_abort_target(self, body=None):
+        """Check one exact target through the normal authoritative proof path."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/reconcile_target",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_reconcile_target()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def complete_refresh_abort(self, body=None):
+        """Close only a proven empty exact abort without a wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/complete",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_complete()
         return _unwrap_flask_response(resp)
 
     @_safe
@@ -1430,6 +1586,29 @@ class AppBridge:
         return result
 
     @_safe
+    def get_cancel_latch_review(self):
+        """Read the exact cancellation proof shown by the native review."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/safety/cancel-latch-review"):
+            return _unwrap_flask_response(api_server.api_safety_cancel_latch_review())
+
+    @_safe
+    def confirm_cancel_latch_review(self, body=None):
+        """Reprove and release only the reviewed exact latch generation."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/safety/confirm-cancel-latch-review",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            return _unwrap_flask_response(
+                api_server.api_safety_confirm_cancel_latch_review()
+            )
+
+    @_safe
     def get_fingerprints(self):
         """List wallet fingerprints. Maps to GET /api/sage/fingerprints."""
         import api_server
@@ -1946,6 +2125,8 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",
+    "reconcile_expired_bootstrap_offers",
+    "reconcile_completed_bootstrap_offers",
     "reload_config",
     "repost_dexie",
     "reset_coin_prep",
@@ -1968,6 +2149,13 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "stop_bootstrap_campaign",
 }
 _APP_BRIDGE_CONTROL_METHODS = {
+    "confirm_cancel_latch_review",
+    "begin_refresh_abort",
+    "commit_terminal_offers",
+    "drain_deferred_terminal_hooks",
+    "cancel_next_refresh_abort_offer",
+    "reconcile_refresh_abort_target",
+    "complete_refresh_abort",
     "browse_sage_cert",
     "close_window",
     "confirm_close_window",
@@ -1984,6 +2172,7 @@ _APP_BRIDGE_CONTROL_METHODS = {
     "toggle_console",
 }
 _APP_BRIDGE_READ_ONLY_METHODS = {
+    "get_cancel_latch_review",
     "check_resume",
     "check_splash_setup",
     "check_update",
@@ -1994,6 +2183,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_bootstrap_partial_offer_capability",
     "get_bootstrap_status",
     "get_cancel_all_status",
+    "get_refresh_abort_preview",
     "get_cats",
     "get_coin_prep_status",
     "get_coins",
@@ -2043,6 +2233,8 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "export_bootstrap_manifest",
     "export_bootstrap_participation",
     "preview_bootstrap_campaign",
+    "preview_completed_bootstrap_offers",
+    "preview_terminal_offers",
     "refresh_balances",
     "run_doctor",
     "validate_config",
@@ -2055,6 +2247,10 @@ _APP_BRIDGE_ACCESS_SETS = (
     ("read_only", _APP_BRIDGE_READ_ONLY_METHODS),
     ("control", _APP_BRIDGE_CONTROL_METHODS),
 )
+# Cancel All must reach its own route while an old submitted cancellation is
+# fenced: that route only checks proof in the blocked branch, and enters the
+# mutation gate itself before any new wallet cancellation in the allowed branch.
+_APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS = {"cancel_all_offers"}
 _classified_bridge_methods: set[str] = set()
 _bridge_access_by_function: dict[object, str] = {}
 for _access, _names in _APP_BRIDGE_ACCESS_SETS:
@@ -2065,7 +2261,11 @@ for _access, _names in _APP_BRIDGE_ACCESS_SETS:
         _method = vars(AppBridge).get(_name)
         if not callable(_method):
             raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
-        if _access == "mutation" and _method not in _mutation_guarded_functions:
+        if (
+            _access == "mutation"
+            and _method not in _mutation_guarded_functions
+            and _name not in _APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS
+        ):
             raise RuntimeError(
                 f"AppBridge mutation callable lacks mutation guard: {_name}"
             )

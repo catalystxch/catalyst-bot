@@ -96,7 +96,7 @@ def _fake_bot_running():
                 "inventory": {},
             },
             "risk": {"circuit_breaker_tripped": False},
-            "stats": {"total_fills": 5, "errors": 0},
+            "stats": {"total_fills": 5, "history_scope": "fresh_run", "errors": 0},
             "fills": {"recent": [], "counts": {"total": 5}},
             "sniper": {"total_snipes": 1},
             "market_intel": {},
@@ -290,6 +290,14 @@ class TestBotPriceContract(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestStatusEndpointSmoke(_FlaskBase):
+    def test_status_fills_include_their_history_scope(self):
+        with patch.object(api_server, "bot", _fake_bot_running()):
+            response = self.client.get("/api/status", environ_base=self._LOOPBACK)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["stats"]["total_fills"], 5)
+        self.assertEqual(response.get_json()["stats"]["history_scope"], "fresh_run")
+
     def test_status_hides_risk_inventory_exception_details(self):
         bot = _fake_bot_stopped()
 

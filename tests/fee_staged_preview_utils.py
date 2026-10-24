@@ -21,6 +21,7 @@ def prepare_unsigned_wallet(state, monkeypatch):
         for coin, puzzle, asset in ((native_coin, native, None), (cat_coin, cat, ASSET))
     }
     state["unsigned_roots"] = roots
+    state["unsigned_parents"] = {cat_coin.name().hex(): cat_parent}
     for asset, coin in (("xch", native_coin), ("cat", cat_coin)):
         row = _coin(1, str(coin.amount))
         row["coin_id"] = coin.name().hex()
@@ -32,6 +33,9 @@ def prepare_unsigned_wallet(state, monkeypatch):
         fee = sum(int(a["amount"]) for a in actions if a["type"] == "fee")
         spends, summaries = [], []
         assigned_assets = set()
+        cat_ring = [item[0] for item in selected if item[2] is not None]
+        cat_index = 0
+        cat_subtotal = 0
         for coin, puzzle, asset in selected:
             first_for_asset = asset not in assigned_assets
             assigned_assets.add(asset)
@@ -107,23 +111,33 @@ def prepare_unsigned_wallet(state, monkeypatch):
             if asset is None and fee and first_for_asset:
                 conditions.append([52, fee])
             inner_solution = [[], (1, conditions), []]
+            lineage_parent = state["unsigned_parents"].get(
+                coin.name().hex(), cat_parent
+            )
             solution = (
                 inner_solution
                 if asset is None
                 else [
                     inner_solution,
                     [
-                        cat_parent.parent_coin_info,
+                        lineage_parent.parent_coin_info,
                         native.get_tree_hash(),
-                        cat_parent.amount,
+                        lineage_parent.amount,
                     ],
-                    coin.name(),
+                    cat_ring[(cat_index - 1) % len(cat_ring)].name(),
                     [coin.parent_coin_info, coin.puzzle_hash, coin.amount],
-                    [coin.parent_coin_info, native.get_tree_hash(), coin.amount],
-                    0,
+                    [
+                        cat_ring[(cat_index + 1) % len(cat_ring)].parent_coin_info,
+                        native.get_tree_hash(),
+                        cat_ring[(cat_index + 1) % len(cat_ring)].amount,
+                    ],
+                    cat_subtotal,
                     0,
                 ]
             )
+            if asset is not None:
+                cat_subtotal += coin.amount - sum(int(a["amount"]) for a in sends)
+                cat_index += 1
             spends.append(CoinSpend(coin, puzzle, Program.to(solution)))
             spends += ephemeral_spends
             summaries.append(

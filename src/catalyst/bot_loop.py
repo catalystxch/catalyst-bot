@@ -506,6 +506,7 @@ class BotLoop:
         self.dexie_manager = DexieManager()
         self.splash_manager = SplashManager()
         self.splash_node = SplashNode()
+        self.splash_manager.set_peer_readiness_provider(self.splash_node.get_metrics)
         self.coinset_client = CoinsetClient()
         self.market_toxicity_guard = MarketToxicityGuard()
         self._market_runtime_required = True
@@ -1409,7 +1410,9 @@ class BotLoop:
         protected_bootstrap_trade_ids: set[str] = set()
         try:
             context = self._bootstrap_campaign_context()
-            if context.get("active") is True and context.get("blocked") is False:
+            # The durable campaign and intent purpose still identify its offers
+            # when Sage temporarily cannot prove the active wallet identity.
+            if context.get("active") is True and context.get("campaign"):
                 campaign = context.get("campaign") or {}
                 expected_purpose = (
                     f"bootstrap:{campaign.get('campaign_id')}:"
@@ -12847,6 +12850,7 @@ class BotLoop:
                 "blocked": True,
                 "reason": "bootstrap_authority_ambiguous",
             }
+        campaign = campaigns[0]
         try:
             from wallet import get_wallet_identity
 
@@ -12858,6 +12862,7 @@ class BotLoop:
                 "active": True,
                 "blocked": True,
                 "reason": "bootstrap_wallet_identity_unavailable",
+                "campaign": campaign,
             }
         network_id = str(snapshot.get("network_id") or "").strip().lower()
         network = (
@@ -12874,7 +12879,6 @@ class BotLoop:
             "wallet_id": getattr(cfg, "CAT_WALLET_ID", None),
             "asset_id": asset_id,
         }
-        campaign = campaigns[0]
         if any(campaign.get(key) != identity.get(key) for key in identity):
             return {
                 "active": True,
@@ -13020,6 +13024,7 @@ class BotLoop:
         revision = database.update_bootstrap_campaign_state(
             campaign["campaign_id"],
             expected_revision=campaign["revision"],
+            expected_state_revision=campaign["state_revision"],
             record=state_update,
         )
         occurred_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -13030,6 +13035,8 @@ class BotLoop:
                 "occurred_at": occurred_at,
                 "data": {
                     "revision": revision,
+                    "state_revision": campaign["state_revision"] + 1,
+                    "offer_authority_changed": revision != campaign["revision"],
                     "stage": state_update["stage"],
                     "deployment_fraction": state_update["deployment_fraction"],
                     "confirmed_fills": state_update["confirmed_fills"],
@@ -13040,12 +13047,17 @@ class BotLoop:
             }
         )
         refreshed = database.get_bootstrap_campaign(campaign["campaign_id"])
-        if type(refreshed) is not dict or refreshed.get("revision") != revision:
+        if (
+            type(refreshed) is not dict
+            or refreshed.get("revision") != revision
+            or refreshed.get("state_revision") != campaign["state_revision"] + 1
+        ):
             raise RuntimeError("Bootstrap evidence update could not be reloaded")
         log_event(
             "info",
             "bootstrap_authoritative_evidence_materialized",
-            f"Market Bootstrap advanced to {refreshed['stage']} at revision {revision}",
+            f"Market Bootstrap materialized {refreshed['stage']} evidence at "
+            f"offer revision {revision}, state revision {refreshed['state_revision']}",
             data={
                 "campaign_id": campaign["campaign_id"],
                 "confirmed_fills": refreshed["confirmed_fills"],
@@ -13091,7 +13103,7 @@ class BotLoop:
             )
             return empty
 
-        from tx_fees import get_effective_transaction_fee_mojos
+        from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
         from wallet import get_wallet_balance
 
         try:
@@ -13123,6 +13135,7 @@ class BotLoop:
         balances = {
             "xch_available": xch_available,
             "cat_available": cat_available,
+            "cat_decimals": int(getattr(cfg, "CAT_DECIMALS", 3)),
             "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
             "subsidy_spent_xch": Decimal("0"),
             "network_fee_xch": Decimal(get_effective_transaction_fee_mojos())
@@ -13133,6 +13146,7 @@ class BotLoop:
             "fee_coin_size_xch": Decimal(
                 str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0")))
             ),
+            "fee_pool_enabled": fee_pool_enabled(),
             "expected_cancel_requotes": int(
                 getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
             ),
@@ -13175,6 +13189,13 @@ class BotLoop:
             live_trade_ids=current_buy_ids | current_sell_ids,
         )
         if superseded:
+            # Earlier cancellations may have spent the pool's reserved coin.
+            # Refresh against Sage before planning another protected cancel.
+            refresh_fee_pool = getattr(
+                self.coin_manager, "refresh_fee_pool_from_wallet", None
+            )
+            if callable(refresh_fee_pool):
+                refresh_fee_pool()
             self.offer_manager.cancel_offers(
                 list(superseded),
                 reason="bootstrap_revision_superseded",
@@ -13204,6 +13225,11 @@ class BotLoop:
                 }
             )
             if trade_ids:
+                refresh_fee_pool = getattr(
+                    self.coin_manager, "refresh_fee_pool_from_wallet", None
+                )
+                if callable(refresh_fee_pool):
+                    refresh_fee_pool()
                 self.offer_manager.cancel_offers(
                     trade_ids,
                     reason=runtime["transition"]["cancel_reason"],
@@ -13286,6 +13312,22 @@ class BotLoop:
             len(plan["sides"][side]["levels"]) for side in allowed_sides
         ):
             return empty
+        from bootstrap_fee_authority import cancellation_fee_readiness
+
+        fee_readiness = cancellation_fee_readiness(campaign)
+        if fee_readiness.get("ready") is not True:
+            signature = (campaign["revision"], repr(sorted(fee_readiness.items())))
+            if getattr(self, "_bootstrap_fee_readiness_block", None) != signature:
+                log_event(
+                    "warning",
+                    "bootstrap_cancellation_fee_review_required",
+                    "Bootstrap replacement offers paused: review cancellation "
+                    "fee consent before adding exposure; no wallet call was made",
+                    data=fee_readiness,
+                )
+                self._bootstrap_fee_readiness_block = signature
+            return empty
+        self._bootstrap_fee_readiness_block = None
         created = self.offer_manager.create_bootstrap_plan(
             plan,
             campaign_authority=campaign,

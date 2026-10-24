@@ -113,6 +113,12 @@ def test_zero_headroom_is_preserved_in_saved_coin_prep_plan(page):
     result = page.evaluate(
         """async () => {
             document.getElementById('configCoinPrepHeadroomPct').value = '0';
+            // The static GUI starts with wallet-derived numeric fields blank.
+            // Supply valid values so saveConfig reaches the settings validator.
+            document.querySelectorAll('input[type="number"]').forEach(input => {
+                if (input.value === '') input.value = '0';
+            });
+            document.getElementById('configTradeXch').value = '0.1';
             let validated = null;
             window.showStyledConfirm = async () => true;
             window.apiFetch = async (path, options = {}) => {
@@ -540,6 +546,53 @@ def test_quote_expiring_during_history_choice_does_not_record_approval(page):
     assert result["disabled"] is True
 
 
+@pytest.mark.parametrize("history_failure", ["expired", "exception"])
+def test_failed_history_review_restores_fee_review_without_wallet_effect(
+    page, history_failure
+):
+    _open_gui(page)
+    result = page.evaluate(
+        """async ({preview, historyFailure}) => {
+            const originalNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            const calls = [];
+            window.apiFetch = async path => {
+                calls.push(String(path));
+                if (!String(path).endsWith('/fee-preview')) throw new Error('Unexpected wallet effect');
+                return new Response(JSON.stringify(preview), {status: 200});
+            };
+            document.getElementById('coinPrepConfirmView').style.display = 'block';
+            window.askPrepHistoryChoice = async () => {
+                if (historyFailure === 'exception') throw new Error('History unavailable');
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {}};
+            };
+            let escaped = false;
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                try { await startCoinPrepFromModal(); } catch (_) { escaped = true; }
+                const btn = document.getElementById('cpConfirmBtn');
+                const failed = {busy: _coinPrepFeeConfirmBusy, label: btn.textContent,
+                    disabled: btn.disabled};
+                Date.now = originalNow;
+                preview.expires_at = now + 60;
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                return {failed, escaped, calls, retryEnabled: !btn.disabled};
+            } finally { Date.now = originalNow; }
+        }""",
+        {"preview": _preview(), "historyFailure": history_failure},
+    )
+    assert result["escaped"] is False
+    assert result["failed"]["busy"] is False
+    assert result["failed"]["label"] == "Yes, Prepare Coins"
+    if history_failure == "expired":
+        assert result["failed"]["disabled"] is True
+    assert result["retryEnabled"] is True
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * 2
+
+
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):
     _open_gui(page)
     assert (
@@ -562,6 +615,11 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
                 window.__feeCalls.push({path: String(path), body: options.body || null});
+                if (String(path).endsWith('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 return new Response(JSON.stringify({success: false, error: 'test stop'}), {
                     status: 400,
                     headers: {'Content-Type': 'application/json'},
@@ -581,13 +639,14 @@ def test_coin_prep_cancel_all_forwards_the_confirmed_approval_context(page):
     )
 
     assert result == [
+        {"path": "/api/offers/refresh_abort/preview", "body": None},
         {
             "path": "/api/offers/cancel_all",
             "body": json.dumps(
                 {"source": "coin_prep", "fee_approval_id": approval_id},
                 separators=(",", ":"),
             ),
-        }
+        },
     ]
 
 
@@ -604,6 +663,11 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     window.__statusReads += 1;
                     return new Response(JSON.stringify({
@@ -670,25 +734,39 @@ def test_async_cancel_budget_failure_opens_fresh_fee_review_without_retry(page):
     assert "new cumulative maximum" in result["banner"]
 
 
-def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
+@pytest.mark.parametrize(
+    ("reason_code", "expected_banner"),
+    [
+        ("FEE_CAMPAIGN_BUDGET_EXCEEDED", "new cumulative maximum"),
+        ("FEE_PREP_FUNDING_INSUFFICIENT", "funding is insufficient"),
+    ],
+)
+def test_generic_cancel_budget_failure_opens_campaign_fee_review(
+    page, reason_code, expected_banner
+):
     _open_gui(page)
     preview = _preview()
 
     result = page.evaluate(
-        """async preview => {
+        """async ({preview, reasonCode}) => {
             bot_state = {running: false, offers: {buy: [{}], sell: [{}]}};
             window.__feeCalls = [];
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true,
                         running: false,
                         complete: false,
                         phase: 'error',
-                        reason_code: 'FEE_CAMPAIGN_BUDGET_EXCEEDED',
-                        message: 'Cancel all failed: FEE_CAMPAIGN_BUDGET_EXCEEDED',
+                        reason_code: reasonCode,
+                        message: `Cancel all failed: ${reasonCode}`,
                     }), {status: 200, headers: {'Content-Type': 'application/json'}});
                 }
                 if (url.includes('/coin-prep/fee-preview')) {
@@ -717,7 +795,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
                 banner: document.getElementById('cpReasonBanner').textContent,
             };
         }""",
-        preview,
+        {"preview": preview, "reasonCode": reason_code},
     )
 
     cancel_calls = [
@@ -731,7 +809,7 @@ def test_generic_cancel_budget_failure_opens_campaign_fee_review(page):
     assert len(cancel_calls) == 1
     assert len(preview_calls) == 1
     assert result["overlay"] is True
-    assert "new cumulative maximum" in result["banner"]
+    assert expected_banner in result["banner"]
 
 
 @pytest.mark.parametrize(
@@ -754,6 +832,11 @@ def test_stale_cancel_approval_opens_fresh_fee_review(page, reason):
             window.apiFetch = async (path, options = {}) => {
                 const url = String(path);
                 window.__feeCalls.push({path: url, body: options.body || null});
+                if (url.includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({success: true,
+                        stage: 'no_exact_candidate', candidate: null, abort: null,
+                        safety: {state: 'resolved', allowed: true}}), {status: 200});
+                }
                 if (url.includes('/offers/cancel_all/status')) {
                     return new Response(JSON.stringify({
                         success: true, running: false, complete: false,

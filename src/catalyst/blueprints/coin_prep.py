@@ -380,7 +380,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         derive_bootstrap_coin_prep_wave_counts,
         derive_bootstrap_runtime,
     )
-    from tx_fees import get_effective_transaction_fee_mojos
+    from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
     from wallet import get_wallet_balance
 
     try:
@@ -416,6 +416,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
     balances = {
         "xch_available": Decimal(xch_balance_mojos) / Decimal(10**12),
         "cat_available": Decimal(cat_balance_mojos) / Decimal(10**cat_decimals),
+        "cat_decimals": cat_decimals,
         "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
         "subsidy_spent_xch": Decimal("0"),
         "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),
@@ -425,6 +426,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         "fee_coin_size_xch": Decimal(
             str(getattr(cfg, "FEE_COIN_SIZE_XCH", "0.001") or "0.001")
         ),
+        "fee_pool_enabled": fee_pool_enabled(),
         "expected_cancel_requotes": int(
             getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 1) or 1
         ),
@@ -2148,6 +2150,7 @@ def api_coin_prep_verify(_args=None):
             cat_balance_mojos = _safe_non_negative_int(projected)
 
         xch_coins = []
+        xch_coin_records = []
         if xch_result and xch_result.get("success"):
             for r in xch_result.get("records", []):
                 if not isinstance(r, dict):
@@ -2158,6 +2161,7 @@ def api_coin_prep_verify(_args=None):
                 amt = _safe_non_negative_int(coin.get("amount", 0))
                 if amt > 0:
                     xch_coins.append(amt)
+                    xch_coin_records.append((r, amt))
 
         cat_coins = []
         if cat_result and cat_result.get("success"):
@@ -2373,12 +2377,64 @@ def api_coin_prep_verify(_args=None):
                 if bootstrap_context is not None
                 else frozenset()
             )
-            xch_allocated = allocate_matching_counts(
-                xch_coins,
-                xch_requests,
-                tolerance,
-                minimum_target_tiers=strict_xch_tiers,
-            )
+            if bootstrap_context is not None and "fees" in tier_specs:
+                # A fee-sized wallet coin is not necessarily available to
+                # protected cancellation. The runtime fee pool accepts only
+                # selectable coins designated fee_reserve in the durable DB.
+                from coin_manager import _coin_id_from_record
+                from database import get_free_coins
+                from tx_fees import get_fee_coin_size_mojos
+
+                def _normal_coin_id(value):
+                    value = str(value or "").strip().lower()
+                    return "0x" + value.removeprefix("0x") if value else ""
+
+                try:
+                    reserve_ids = {
+                        _normal_coin_id(row.get("coin_id"))
+                        for row in get_free_coins("xch")
+                        if row.get("purpose") == "fee_reserve"
+                    }
+                    runtime_fee_size = int(get_fee_coin_size_mojos())
+                except Exception:
+                    reserve_ids = set()
+                    runtime_fee_size = 0
+                fee_records = []
+                non_fee_coins = []
+                seen_fee_ids = set()
+                for record, amount in xch_coin_records:
+                    coin_id = _normal_coin_id(_coin_id_from_record(record))
+                    if (
+                        coin_id in reserve_ids
+                        and runtime_fee_size > 0
+                        and runtime_fee_size * 4 // 5
+                        <= amount
+                        <= runtime_fee_size * 6 // 5
+                    ):
+                        if coin_id not in seen_fee_ids:
+                            fee_records.append(amount)
+                            seen_fee_ids.add(coin_id)
+                    else:
+                        non_fee_coins.append(amount)
+                xch_allocated = allocate_matching_counts(
+                    non_fee_coins,
+                    [request for request in xch_requests if request[0] != "fees"],
+                    tolerance,
+                    minimum_target_tiers=strict_xch_tiers,
+                )
+                fee_request = [
+                    request for request in xch_requests if request[0] == "fees"
+                ]
+                xch_allocated.update(
+                    allocate_matching_counts(fee_records, fee_request, tolerance)
+                )
+            else:
+                xch_allocated = allocate_matching_counts(
+                    xch_coins,
+                    xch_requests,
+                    tolerance,
+                    minimum_target_tiers=strict_xch_tiers,
+                )
             cat_allocated = allocate_matching_counts(
                 cat_coins,
                 cat_requests,

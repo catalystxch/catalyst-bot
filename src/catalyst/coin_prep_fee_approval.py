@@ -499,14 +499,30 @@ def estimate_coin_prep_fee_preview(
     protected = minimum_cumulative = None
     if available:
         protected = max(cancel, accounting["protected_cancellation_fee_mojos"])
-        # Cancellation commitments already consumed part of the lifetime total;
-        # do not double-count them as preparation or discard prior protection.
-        minimum_cumulative = _exact_int(
-            max(
-                accounting["noncancellation_committed_fee_mojos"] + prep + protected,
-                accounting["committed_fee_mojos"] + prep + cancel,
-            )
+        ongoing_bootstrap = (
+            contract["scope"]["campaign_id"] is not None
+            and fee_approval_authority(request_options)["cancellation_recovery_action"]
+            is None
         )
+        if ongoing_bootstrap:
+            # Replacement offers need the full reserve still available after
+            # all earlier fee commitments and this preparation, including fees
+            # already spent on previous protected cancellations.
+            minimum_cumulative = _exact_int(
+                accounting["committed_fee_mojos"] + prep + protected
+            )
+        else:
+            # Recovery-only and standalone consent need not replenish a reserve
+            # for new Bootstrap offers; keep prior protection without counting
+            # cancellation commitments twice.
+            minimum_cumulative = _exact_int(
+                max(
+                    accounting["noncancellation_committed_fee_mojos"]
+                    + prep
+                    + protected,
+                    accounting["committed_fee_mojos"] + prep + cancel,
+                )
+            )
     result = {
         "available": available,
         "reason": "network_fee_estimate" if available else "FEE_ESTIMATE_UNAVAILABLE",

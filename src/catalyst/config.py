@@ -983,6 +983,7 @@ class Config:
         self.SPLASH_RECEIVE_MAX_BACKLOG = _int("SPLASH_RECEIVE_MAX_BACKLOG", 250)
         self.SPLASH_BINARY_PATH = _str("SPLASH_BINARY_PATH", "")
         self.SPLASH_P2P_PORT = _int("SPLASH_P2P_PORT", 11511)
+        self.SPLASH_KNOWN_PEER = _str("SPLASH_KNOWN_PEER", "").strip()
         self.SPLASH_AUTO_START = _bool("SPLASH_AUTO_START", True)
         self.SPLASH_TESTNET = _bool("SPLASH_TESTNET", False)
 

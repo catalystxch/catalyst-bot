@@ -349,6 +349,37 @@ def _evidence(
     return evidence
 
 
+def test_refresh_abort_effect_scope_excludes_confirmed_historical_prep():
+    """Settled Coin Prep history must not block exact cleanup years later."""
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    for ddl in (
+        "CREATE TABLE wallet_effect_claims(claim_token TEXT, operation_id TEXT)",
+        "CREATE TABLE wallet_effect_claim_resolutions(claim_token TEXT, outcome TEXT, evidence_json TEXT)",
+        "CREATE TABLE wallet_effect_dispatches(claim_token TEXT, dispatch_token TEXT)",
+        "CREATE TABLE coin_prep_operations(effect_claim_token TEXT, operation_id TEXT, outcome TEXT, outcome_evidence_json TEXT)",
+        "CREATE TABLE approved_fee_reservations(operation_id TEXT)",
+        "CREATE TABLE approved_fee_outcomes(operation_id TEXT)",
+        "CREATE TABLE publication_outbox(state TEXT, dispatch_started_at TEXT)",
+        "CREATE TABLE runtime_worker_delegations(state TEXT)",
+    ):
+        conn.execute(ddl)
+    conn.execute("INSERT INTO wallet_effect_claims VALUES ('old','coin-prep:old')")
+    conn.execute(
+        "INSERT INTO wallet_effect_claim_resolutions VALUES ('old','SUBMITTED','{}')"
+    )
+    conn.execute(
+        "INSERT INTO coin_prep_operations VALUES ('old','coin-prep:old','CONFIRMED','{}')"
+    )
+    database._assert_refresh_abort_effect_scope(conn, set())
+
+    conn.execute("INSERT INTO wallet_effect_claims VALUES ('new','coin-prep:new')")
+    with pytest.raises(ValueError, match="unrelated wallet effect"):
+        database._assert_refresh_abort_effect_scope(conn, set())
+    conn.close()
+
+
 @pytest.mark.parametrize(
     "skewed_clock",
     [
@@ -520,6 +551,46 @@ def test_exact_zero_fee_cancel_return_flow_is_proven():
             "amount": 1000,
         }
     ]
+
+
+def test_external_return_cannot_prove_cancel_even_with_spoofed_owned_coin_record():
+    evidence = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "external",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+
+    assert (
+        _classify(evidence, cancel_context=_cancel_context())["classification"]
+        == UNKNOWN
+    )
 
 
 def test_exact_post_expiry_cancel_return_proof_overrides_expired_wallet_label():
@@ -2210,6 +2281,285 @@ def test_sage_exact_coin_heights_prove_fill_after_transaction_archive_cap(
     assert reads == [42]
     assert evidence["transaction_history"]["complete"] is True
     assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
+def test_sage_grouped_fill_keeps_external_output_without_losing_owned_receipt(
+    monkeypatch,
+):
+    """An unrelated external output cannot erase an exact owned fill receipt."""
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    external_coin = "e" * 64
+    external_spent_coin = "0" * 64
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": COIN,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            },
+            {
+                "coin_id": external_spent_coin,
+                "asset_id": "xch",
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ],
+        created=[
+            {
+                "coin_id": RECEIVE,
+                "asset_id": ASSET,
+                "amount": 2000,
+                "address_kind": "own",
+            },
+            {
+                "coin_id": external_coin,
+                "asset_id": None,
+                "amount": 123,
+                "address_kind": "external",
+            },
+        ],
+    )
+    coin_rows = {
+        COIN: _coin(
+            COIN,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=TRADE,
+        ),
+        RECEIVE: _coin(
+            RECEIVE,
+            asset_id=ASSET,
+            amount=2000,
+            created_height=42,
+            transaction_id=TX,
+        ),
+    }
+    requested_coin_ids = []
+
+    def read_coins(ids):
+        requested_coin_ids.extend(ids)
+        return {coin_id: coin_rows[coin_id] for coin_id in ids if coin_id in coin_rows}
+
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": transaction,
+        },
+        get_coins_by_ids=read_coins,
+    )
+
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert external_coin not in requested_coin_ids
+    assert external_spent_coin not in requested_coin_ids
+    assert evidence["coin_records"]["complete"] is True
+    assert _classify(evidence)["classification"] == FILLED_PROVEN
+
+
+def test_grouped_three_buy_transaction_proves_only_two_owned_receipts():
+    """A grouped spend cannot assign one external output to a missing CAT receipt."""
+    trades = (TRADE, OTHER_TRADE, "d" * 64)
+    inputs = (COIN, OTHER_COIN, FEE_COIN)
+    requested = (2000, 2100, 2200)
+    received = (RECEIVE, OTHER_RETURN)
+    transaction = _transaction(
+        spent=[
+            {
+                "coin_id": coin_id,
+                "asset_id": "xch",
+                "amount": 1000,
+                "address_kind": "offer",
+            }
+            for coin_id in inputs
+        ],
+        created=[
+            {
+                "coin_id": coin_id,
+                "asset_id": ASSET,
+                "amount": amount,
+                "address_kind": "own",
+            }
+            for coin_id, amount in zip(received, requested[:2])
+        ]
+        + [
+            {
+                "coin_id": "e" * 64,
+                "asset_id": "xch",
+                "amount": requested[2],
+                "address_kind": "external",
+            }
+        ],
+    )
+    coins = {
+        coin_id: _coin(
+            coin_id,
+            asset_id="xch",
+            amount=1000,
+            spent_height=42,
+            transaction_id=TX,
+            offer_id=trade_id,
+        )
+        for coin_id, trade_id in zip(inputs, trades)
+    }
+    coins.update(
+        {
+            coin_id: _coin(
+                coin_id,
+                asset_id=ASSET,
+                amount=amount,
+                created_height=42,
+                transaction_id=TX,
+            )
+            for coin_id, amount in zip(received, requested[:2])
+        }
+    )
+    offers = [
+        _offer(
+            trade_id=trade_id,
+            selected_coin_ids=[coin_id],
+            requested=amount,
+        )
+        for trade_id, coin_id, amount in zip(trades, inputs, requested)
+    ]
+    results = [
+        _classify(
+            _evidence(offers=offers, transactions=[transaction], coins=coins),
+            intent=_intent(
+                trade_id=trade_id,
+                intent_id=f"grouped-{index}",
+                coin_ids=(coin_id,),
+                requested=str(amount),
+            ),
+        )
+        for index, (trade_id, coin_id, amount) in enumerate(
+            zip(trades, inputs, requested)
+        )
+    ]
+    assert [result["classification"] for result in results] == [
+        FILLED_PROVEN,
+        FILLED_PROVEN,
+        UNKNOWN,
+    ], results
+
+
+@pytest.mark.parametrize(
+    "malformed_receipt",
+    [
+        None,
+        {
+            "coin_id": RECEIVE,
+            "asset_id": None,
+            "amount": 2000,
+            "address_kind": "external",
+        },
+    ],
+)
+def test_sage_malformed_receipt_does_not_invent_coin_source_limit(
+    monkeypatch, malformed_receipt
+):
+    """An unrecognized receipt cannot prove a fill or erase exact input reads."""
+    monkeypatch.setattr(database, "get_offer_operation_events", lambda _id: [])
+    facade = SimpleNamespace(
+        get_wallet_backend_authority=lambda: "sage",
+        get_wallet_identity=lambda: {
+            "success": True,
+            "wallet_fingerprint_hash": WALLET,
+            "network_id": NETWORK,
+            "observed_at_utc": AT,
+        },
+        get_authoritative_offers_by_ids=lambda ids: {
+            "complete": True,
+            "requested_ids": list(ids),
+            "offers": [_offer()],
+        },
+        get_transaction_by_height=lambda _height: {
+            "success": True,
+            "transaction": _transaction(created=[malformed_receipt]),
+        },
+        get_coins_by_ids=lambda ids: {
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            )
+        },
+    )
+    evidence = load_authoritative_evidence(
+        _intent(), wallet_facade=facade, clock=_clock_at(), page_size=10
+    )
+    assert evidence["coin_records"]["read_error"] is None
+    assert evidence["coin_records"]["complete"] is True
+    created = evidence["transaction_history"]["records"][0]["created"]
+    if malformed_receipt is None:
+        assert created == [None]
+    else:
+        assert created == [
+            {
+                "coin_id": RECEIVE,
+                "asset_id": "xch",
+                "amount": 2000,
+                "address_kind": "external",
+            }
+        ]
+    assert _classify(evidence)["classification"] == UNKNOWN
+
+
+@pytest.mark.parametrize("address_kind", ["external", "offer"])
+def test_undelivered_output_matching_requested_asset_is_never_a_fill_receipt(
+    address_kind,
+):
+    external_coin = "e" * 64
+    evidence = _evidence(
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": external_coin,
+                        "asset_id": ASSET,
+                        "amount": 2000,
+                        "address_kind": address_kind,
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            external_coin: _coin(
+                external_coin,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+    assert _classify(evidence)["classification"] == UNKNOWN
 
 
 def test_sage_exact_coin_height_read_failure_is_not_complete(monkeypatch):
@@ -4431,6 +4781,9 @@ def test_terminal_journal_accepts_bounded_full_proof_digest_and_rejects_tail_cha
 
 def _persist_created_offer(
     *,
+    intent_id: str = "intent-task9",
+    trade_id: str = TRADE,
+    offer_hash: str = OFFER_HASH,
     coin_id: str = COIN,
     offered: str = "1000",
     requested: str = "2000",
@@ -4449,9 +4802,9 @@ def _persist_created_offer(
         purpose="lifecycle",
     )
     database.prepare_offer_intent(
-        intent_id="intent-task9",
-        operation_id="create:intent-task9",
-        event_id="create:intent-task9:prepared",
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:prepared",
         run_id="run-task9",
         wallet_fingerprint_hash=WALLET,
         network=NETWORK,
@@ -4459,7 +4812,7 @@ def _persist_created_offer(
         side=side,
         tier=tier,
         purpose="normal_lifecycle",
-        slot_key="slot:intent-task9",
+        slot_key=f"slot:{intent_id}",
         generation=0,
         offered_amount_atomic=offered,
         requested_amount_atomic=requested,
@@ -4470,22 +4823,22 @@ def _persist_created_offer(
         reserve_selected_coins=True,
     )
     database.finalize_offer_intent(
-        intent_id="intent-task9",
-        operation_id="create:intent-task9",
-        event_id="create:intent-task9:finalized",
+        intent_id=intent_id,
+        operation_id=f"create:{intent_id}",
+        event_id=f"create:{intent_id}:finalized",
         lifecycle_state="created",
         outcome="CONFIRMED",
-        sage_trade_id=TRADE,
-        offer_text_sha256=OFFER_HASH,
+        sage_trade_id=trade_id,
+        offer_text_sha256=offer_hash,
         wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
         evidence_json={"offer": "confirmed"},
         finalized_at=AT,
         finalize_selected_coin_reservations=True,
     )
-    economics = database.get_offer_intent_economic_authority("intent-task9")
+    economics = database.get_offer_intent_economic_authority(intent_id)
     assert economics is not None
     assert database.add_offer(
-        TRADE,
+        trade_id,
         side,
         price_xch=database.Decimal(economics["price_xch"]),
         size_xch=database.Decimal(economics["size_xch"]),
@@ -4495,7 +4848,102 @@ def _persist_created_offer(
         coin_id=database.norm_coin_id(coin_id),
         fee_mojos_xch=economics["fee_mojos_xch"],
     )
-    return database.get_offer_intent("intent-task9")
+    return database.get_offer_intent(intent_id)
+
+
+def test_second_fill_receipt_sqlite_failure_preserves_first_and_allows_retry(
+    isolated_database,
+):
+    """A real late SQLite failure must not half-commit the second fill."""
+
+    _persist_created_offer()
+    first = reconcile_offer("intent-task9", evidence=_evidence(), now=AFTER)
+    assert first["classification"] == FILLED_PROVEN
+    assert first["applied"] is True
+
+    other_intent = "intent-task9-other"
+    other_transaction = "e" * 64
+    _persist_created_offer(
+        intent_id=other_intent,
+        trade_id=OTHER_TRADE,
+        offer_hash="0" * 64,
+        coin_id=OTHER_COIN,
+    )
+    other_evidence = _evidence(
+        offers=[
+            _offer(
+                trade_id=OTHER_TRADE,
+                selected_coin_ids=[OTHER_COIN],
+                transaction_id=other_transaction,
+            )
+        ],
+        transactions=[
+            _transaction(
+                transaction_id=other_transaction,
+                spent=[
+                    {
+                        "coin_id": OTHER_COIN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "offer",
+                    }
+                ],
+                created=[
+                    {
+                        "coin_id": OTHER_RETURN,
+                        "asset_id": ASSET,
+                        "amount": 2000,
+                        "address_kind": "own",
+                    }
+                ],
+            )
+        ],
+        coins={
+            OTHER_COIN: _coin(
+                OTHER_COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=other_transaction,
+                offer_id=OTHER_TRADE,
+            ),
+            OTHER_RETURN: _coin(
+                OTHER_RETURN,
+                asset_id=ASSET,
+                amount=2000,
+                created_height=42,
+                transaction_id=other_transaction,
+            ),
+        },
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "CREATE TRIGGER fail_second_fill_receipt "
+        "BEFORE INSERT ON fills "
+        f"WHEN NEW.trade_id='{OTHER_TRADE}' "
+        "BEGIN SELECT RAISE(ABORT, 'injected receipt write failure'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected receipt write failure"):
+        reconcile_offer(other_intent, evidence=other_evidence, now=AFTER)
+
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
+    assert database.get_fill_by_trade_id(TRADE) is not None
+    assert database.get_offer_intent(other_intent)["lifecycle_state"] == "created"
+    assert database.get_offer(OTHER_TRADE)["status"] == "open"
+    assert database.get_fill_by_trade_id(OTHER_TRADE) is None
+    assert database.get_coin_state(OTHER_COIN)["status"] == "locked"
+    assert database.get_offer_operation_events(f"reconcile:{other_intent}") == []
+
+    conn.execute("DROP TRIGGER fail_second_fill_receipt")
+    conn.commit()
+    retried = reconcile_offer(other_intent, evidence=other_evidence, now=AFTER)
+    assert retried["classification"] == FILLED_PROVEN
+    assert retried["applied"] is True
+    assert database.get_fill_by_trade_id(OTHER_TRADE) is not None
+    assert database.get_coin_state(OTHER_COIN)["status"] == "spent"
+    assert database.get_fill_by_trade_id(TRADE) is not None
 
 
 def _live_mz_rounding_evidence(*, side: str = "buy") -> dict:
@@ -5423,7 +5871,11 @@ def _commit_fill_without_draining_hooks(monkeypatch, *, tier: str = "inner") -> 
 
 
 def _insert_authoritative_test_fill(
-    trade_id: str, *, block_height: int = 42, side: str = "buy"
+    trade_id: str,
+    *,
+    block_height: int = 42,
+    side: str = "buy",
+    purpose: str = "authoritative_test_fill",
 ) -> dict:
     assert side in {"buy", "sell"}
     identity = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()
@@ -5457,7 +5909,7 @@ def _insert_authoritative_test_fill(
         asset_id=ASSET,
         side=side,
         tier="inner",
-        purpose="authoritative_test_fill",
+        purpose=purpose,
         slot_key=f"slot:{intent_id}",
         generation=0,
         offered_amount_atomic=str(offered_amount),
@@ -5567,6 +6019,80 @@ def _insert_authoritative_test_fill(
     fill = database.get_authoritative_fill_by_id(committed["fill_id"])
     assert fill is not None
     return fill
+
+
+def test_campaign_deferred_hook_selector_excludes_other_fill_cohorts(
+    isolated_database,
+):
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == [
+        scoped["fill_id"]
+    ]
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+
+
+def test_campaign_deferred_hook_drain_delivers_real_callbacks_once(
+    isolated_database, monkeypatch
+):
+    from contextlib import contextmanager
+
+    import api_server
+    import mixed_terminal_recovery
+    import mutation_gate
+
+    campaign_id = "a" * 64
+    purpose = f"bootstrap:{campaign_id}:revision:0"
+    scoped = _insert_authoritative_test_fill("7" * 64, purpose=purpose)
+    unrelated = _insert_authoritative_test_fill("8" * 64, purpose="unrelated_campaign")
+    proof = {
+        "campaign_id": campaign_id,
+        "revision": 0,
+        "offers": [
+            {"intent_id": scoped["intent_id"], "classification": "FILLED_PROVEN"}
+        ],
+    }
+    runtime = SimpleNamespace(
+        status=lambda: SimpleNamespace(
+            to_dict=lambda: {"allowed": True, "lease": {"owned_by_this_run": True}}
+        )
+    )
+
+    @contextmanager
+    def verified(*_args):
+        yield (
+            proof,
+            {},
+            [{"intent_id": scoped["intent_id"], "lifecycle_state": "terminal"}],
+            None,
+        )
+
+    monkeypatch.setattr(mixed_terminal_recovery, "_verified_terminal_proof", verified)
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: runtime)
+    monkeypatch.setattr(api_server, "_registry_terminal_recovery_active", False)
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {"state": "resolved", "blocking_operation_ids_json": "[]"},
+    )
+
+    first = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert first["fill_ids"] == [scoped["fill_id"]]
+    assert first["hooks"][scoped["fill_id"]] == {
+        name: "completed" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    assert database.get_offer_fill_hook_receipts(scoped["fill_id"]) == list(
+        database._AUTHORITATIVE_FILL_HOOKS
+    )
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 0) == []
+    assert database.get_campaign_deferred_fill_hook_ids(campaign_id, 1) == []
+    assert database.get_authoritative_fill_by_id(unrelated["fill_id"]) is not None
+    assert unrelated["fill_id"] in database.get_offer_fill_hook_outbox_work()
+    second = mixed_terminal_recovery.drain_deferred_terminal_hooks(proof, runtime)
+    assert second["fill_ids"] == []
 
 
 def _boost_materialization(
@@ -5907,6 +6433,40 @@ def test_callback_construction_failure_is_contained_after_proof_commit(
         (row["hook_name"], row["state"], row["last_error_code"]) for row in rows
     ] == [
         (name, "pending", "CALLBACK_CONSTRUCTION_FAILED")
+        for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
+    ]
+
+
+def test_recovery_fill_defers_all_post_fill_hooks_without_claiming(
+    isolated_database, monkeypatch
+):
+    _persist_created_offer()
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda _fill: (_ for _ in ()).throw(AssertionError("hook constructed")),
+    )
+    result = reconcile_offer(
+        "intent-task9", evidence=_evidence(), now=AFTER, defer_post_fill_hooks=True
+    )
+    assert result["classification"] == FILLED_PROVEN
+    assert result["post_fill_hooks"] == {
+        name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS
+    }
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name, state, attempt, claim_token FROM offer_fill_hook_outbox "
+            "WHERE fill_id=? ORDER BY hook_name",
+            (result["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert [
+        (row["hook_name"], row["state"], row["attempt"], row["claim_token"])
+        for row in rows
+    ] == [
+        (name, "pending", 0, None)
         for name in sorted(database._AUTHORITATIVE_FILL_HOOKS)
     ]
 
@@ -8246,6 +8806,39 @@ def test_schema_migration_marks_backfilled_preexisting_receipts_completed(
     }
 
 
+def test_deferred_hook_authority_loss_prevents_callback_construction(
+    isolated_database, monkeypatch
+):
+    original_runner = reconciliation._run_post_fill_hooks
+    fill = _commit_fill_without_draining_hooks(monkeypatch)
+    monkeypatch.setattr(reconciliation, "_run_post_fill_hooks", original_runner)
+    monkeypatch.setattr(
+        reconciliation,
+        "_post_fill_hook_callbacks",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("callback constructed")),
+    )
+
+    with pytest.raises(ValueError, match="normal authority lost"):
+        reconciliation._run_post_fill_hooks(
+            fill,
+            completed_at=AFTER,
+            authority_check=lambda: (_ for _ in ()).throw(
+                ValueError("normal authority lost")
+            ),
+        )
+
+    rows = (
+        database.get_connection()
+        .execute(
+            "SELECT hook_name,state,attempt FROM offer_fill_hook_outbox WHERE fill_id=?",
+            (fill["fill_id"],),
+        )
+        .fetchall()
+    )
+    assert len(rows) == len(database._AUTHORITATIVE_FILL_HOOKS)
+    assert all(row["state"] == "pending" and row["attempt"] == 0 for row in rows)
+
+
 def test_durable_pending_outbox_has_explicit_wallet_free_drain_contract(
     isolated_database, monkeypatch
 ):
@@ -8871,6 +9464,1518 @@ def test_cancel_commit_spends_old_coin_and_inserts_exact_owned_return(
     assert database.get_coin_state(COIN)["status"] == "spent"
     assert database.get_coin_state(RETURN)["status"] == "free"
     assert database.get_coin_state(RETURN)["amount_mojos"] == 1000
+
+
+@pytest.mark.parametrize(
+    "prepared_cleanup",
+    [
+        False,
+        True,
+        "integrated",
+        "crash_after_claim",
+        "completion_extra_blocker",
+        "multi_target",
+        "restart_after_child",
+        "restart_after_expiry",
+        "entry_unrelated_journal",
+        "cleanup_unrelated_journal",
+        "cleanup_active_worker",
+        "completion_unrelated_journal",
+        "published_child",
+        "published_child_restart",
+        "dispatched_unconfirmed_child",
+    ],
+)
+def test_fenced_abort_records_confirmed_parent_without_publishing_child(
+    isolated_database,
+    monkeypatch,
+    prepared_cleanup,
+):
+    """The parent settles while exact child cancellation keeps recovery fenced."""
+
+    import mutation_gate
+
+    child_id = "a" * 64
+
+    monkeypatch.setattr(database, "_stability_wall_clock", lambda: AT)
+    monkeypatch.setattr(mutation_gate, "wallet_fingerprint_hash", lambda _value: WALLET)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-task9",
+        owner_pid=1,
+        owner_host="test-host",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        lease_expires_at="2026-08-20T12:10:00.000000Z",
+        now=AT,
+    )
+    assert lease["acquired"]
+    campaign_id = database.create_bootstrap_campaign(
+        {
+            "network": NETWORK,
+            "wallet_type": "sage",
+            "wallet_fingerprint": 736588221,
+            "wallet_id": 2,
+            "asset_id": ASSET,
+            "anchor_price": "0.01",
+            "minimum_price": "0.005",
+            "maximum_price": "0.02",
+            "xch_budget": "1",
+            "cat_budget": "200",
+            "fee_budget_xch": "0.05",
+            "subsidy_budget_xch": "0",
+            "created_at": AT,
+            "expires_at": "2026-08-21T12:00:00.000000Z",
+        }
+    )
+    assert database.stop_bootstrap_campaign(campaign_id, "manual", AFTER)
+    _persist_created_offer()
+    database.record_offer_intent_visibility(
+        "intent-task9",
+        publication_identity="registry:parent",
+        visible_at=AT,
+    )
+    # Model the historical in-flight cancel before the new pre-effect guard.
+    _persist_cancel_prepared()
+    assert database.upsert_coin(
+        OTHER_COIN,
+        "xch",
+        1000,
+        tier="inner",
+        designation="tier_active",
+        assigned_tier="inner",
+        purpose="lifecycle",
+    )
+    database.prepare_offer_intent(
+        intent_id=child_id,
+        operation_id=f"create:{child_id}",
+        event_id=f"create:{child_id}:prepared",
+        run_id="run-task9",
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        asset_id=ASSET,
+        side="buy",
+        tier="inner",
+        purpose="normal_lifecycle",
+        slot_key="slot:intent-task9",
+        generation=1,
+        parent_intent_id="intent-task9",
+        offered_amount_atomic="1000",
+        requested_amount_atomic="2000",
+        selected_coin_ids_json=[OTHER_COIN],
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
+        evidence_json={"intent": "replacement"},
+        prepared_at=AT,
+        reserve_selected_coins=True,
+    )
+    database.finalize_offer_intent(
+        intent_id=child_id,
+        operation_id=f"create:{child_id}",
+        event_id=f"create:{child_id}:finalized",
+        lifecycle_state="created",
+        outcome="CONFIRMED",
+        sage_trade_id=OTHER_TRADE,
+        offer_text_sha256="e" * 64,
+        wallet_identity_json={"wallet_fingerprint_hash": WALLET, "network": NETWORK},
+        evidence_json={"offer": "confirmed"},
+        finalized_at=AT,
+        finalize_selected_coin_reservations=True,
+    )
+    database.bind_refresh_lineage("intent-task9", child_id)
+    if prepared_cleanup in {
+        "published_child",
+        "published_child_restart",
+        "dispatched_unconfirmed_child",
+    }:
+        from publication_outbox import canonical_publication_identity
+
+        identity = canonical_publication_identity(NETWORK, "e" * 64, "epoch-child")
+        database.enqueue_publication_outbox(
+            publication_id="published-child-splash",
+            idempotency_key=identity.idempotency_key,
+            network=NETWORK,
+            offer_fingerprint="e" * 64,
+            publication_epoch="epoch-child",
+            publisher="splash",
+            payload_json={"offer_ref": OTHER_TRADE},
+            intent_id=child_id,
+            queued_at=AT,
+        )
+        conn = database.get_connection()
+        if prepared_cleanup == "dispatched_unconfirmed_child":
+            conn.execute(
+                "UPDATE publication_outbox SET state='claimed',"
+                "dispatch_started_at=? "
+                "WHERE publication_id='published-child-splash'",
+                (AT,),
+            )
+        else:
+            ack = '{"code":"SPLASH_HTTP_ACCEPTED"}'
+            conn.execute(
+                "UPDATE publication_outbox SET state='succeeded',"
+                "dispatch_started_at=?,succeeded_at=?,terminal_at=?,"
+                "acknowledgement_json=?,acknowledgement_sha256=? "
+                "WHERE publication_id='published-child-splash'",
+                (AT, AFTER, AFTER, ack, hashlib.sha256(ack.encode()).hexdigest()),
+            )
+        conn.commit()
+    extra_trade = "f" * 64
+    extra_intent = "9" * 64
+    observed_book = [OTHER_TRADE]
+    if prepared_cleanup in {
+        "multi_target",
+        "restart_after_child",
+        "restart_after_expiry",
+        "published_child_restart",
+    }:
+        extra_coin = "e" * 64
+        assert database.upsert_coin(
+            extra_coin,
+            "xch",
+            1000,
+            tier="inner",
+            designation="tier_active",
+            assigned_tier="inner",
+            purpose="lifecycle",
+        )
+        database.prepare_offer_intent(
+            intent_id=extra_intent,
+            operation_id=f"create:{extra_intent}",
+            event_id=f"create:{extra_intent}:prepared",
+            run_id="run-task9",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            side="buy",
+            tier="inner",
+            purpose="normal_lifecycle",
+            slot_key=f"slot:{extra_intent}",
+            generation=0,
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            selected_coin_ids_json=[extra_coin],
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"intent": "second exact target"},
+            prepared_at=AT,
+            reserve_selected_coins=True,
+        )
+        database.finalize_offer_intent(
+            intent_id=extra_intent,
+            operation_id=f"create:{extra_intent}",
+            event_id=f"create:{extra_intent}:finalized",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=extra_trade,
+            offer_text_sha256="0" * 64,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"offer": "second target"},
+            finalized_at=AT,
+            finalize_selected_coin_reservations=True,
+        )
+        if prepared_cleanup == "restart_after_expiry":
+            database.record_offer_intent_visibility(
+                extra_intent,
+                publication_identity="registry:extra",
+                visible_at=AT,
+            )
+        observed_book.append(extra_trade)
+    _persist_cancel_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        transaction_id=TX,
+        spend_identity=SPEND,
+    )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[f"cancel:{TRADE}"],
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        tripped_at=AFTER,
+    )
+    latch = database.get_runtime_safety_latch()
+    candidates = database.list_fenced_refresh_abort_candidates(
+        asset_id=ASSET,
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["parent_intent_id"] == "intent-task9"
+    assert candidates[0]["child_intent_id"] == child_id
+    assert candidates[0]["parent_trade_id"] == TRADE
+    assert candidates[0]["child_trade_id"] == OTHER_TRADE
+    assert candidates[0]["cancel_operation_id"] == f"cancel:{TRADE}"
+    published_case = prepared_cleanup in {"published_child", "published_child_restart"}
+    if published_case:
+        with pytest.raises(ValueError, match="cleanup mode differs"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        assert (
+            database.list_incomplete_refresh_aborts(
+                asset_id=ASSET,
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            == []
+        )
+
+    def append_unrelated_blocker():
+        database.append_offer_operation_event(
+            event_id="create:unrelated-review:attempt:1:prepared",
+            operation_id="create:unrelated-review",
+            operation_type="CREATE",
+            attempt=1,
+            phase="PREPARED",
+            outcome="PREPARED",
+            request_timestamp=AFTER,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={"diagnostic": "unrelated pending effect"},
+            blocks_mutation=True,
+            created_at=AFTER,
+        )
+
+    if prepared_cleanup == "entry_unrelated_journal":
+        append_unrelated_blocker()
+        with pytest.raises(ValueError, match="unrelated durable operation"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        return
+    if prepared_cleanup == "dispatched_unconfirmed_child":
+        with pytest.raises(ValueError, match="unresolved publication effect"):
+            database.begin_refresh_abort(
+                parent_intent_id="intent-task9",
+                child_intent_id=child_id,
+                campaign_id=campaign_id,
+                expected_latch_generation=latch["generation"],
+                owner_run_id="run-task9",
+                expected_lease_version=lease["lease"]["lease_version"],
+                observed_trade_ids=observed_book,
+                observed_at=AFTER,
+            )
+        assert (
+            database.list_incomplete_refresh_aborts(
+                asset_id=ASSET,
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            == []
+        )
+        return
+    abort = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id=child_id,
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=lease["lease"]["lease_version"],
+        observed_trade_ids=observed_book,
+        observed_at=AFTER,
+        published_cleanup=published_case,
+    )
+    if published_case:
+        marker = (
+            database.get_connection()
+            .execute(
+                "SELECT * FROM offer_refresh_published_cleanups WHERE abort_id=?",
+                (abort["abort_id"],),
+            )
+            .fetchone()
+        )
+        assert marker is not None
+        assert marker["offer_fingerprint"] == "e" * 64
+        assert len(json.loads(marker["receipts_json"])) == 1
+    assert [
+        row["abort_id"]
+        for row in database.list_incomplete_refresh_aborts(
+            asset_id=ASSET,
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+        )
+    ] == [abort["abort_id"]]
+    renewed = database.heartbeat_runtime_mutation_lease(
+        owner_run_id="run-task9",
+        expected_lease_version=lease["lease"]["lease_version"],
+        heartbeat_at=AFTER,
+        lease_expires_at="2026-08-20T12:20:00.000000Z",
+    )
+    assert renewed["heartbeat"] is True
+    replayed_abort = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id=child_id,
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=renewed["lease"]["lease_version"],
+        observed_trade_ids=observed_book,
+        observed_at=AFTER,
+        published_cleanup=published_case,
+    )
+    assert replayed_abort["idempotent"] is True
+    assert replayed_abort["abort_id"] == abort["abort_id"]
+    with pytest.raises(ValueError, match="abort safety, lease"):
+        database.begin_refresh_abort(
+            parent_intent_id="intent-task9",
+            child_intent_id=child_id,
+            campaign_id=campaign_id,
+            expected_latch_generation=latch["generation"],
+            owner_run_id="run-task9",
+            expected_lease_version=lease["lease"]["lease_version"],
+            observed_trade_ids=observed_book,
+            observed_at=AFTER,
+            published_cleanup=published_case,
+        )
+    with pytest.raises(ValueError, match="exact proven parent cancellation"):
+        reconcile_offer(
+            "intent-task9",
+            evidence=_evidence(offer_complete=False),
+            cancel_context=_cancel_context(),
+            refresh_abort_id=abort["abort_id"],
+            now=AFTER,
+        )
+    assert _journal_for("intent-task9") == []
+    proof = _evidence(
+        offers=[_offer(status=3)],
+        transactions=[
+            _transaction(
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    }
+                ]
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id="xch",
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id="xch",
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+    applied = reconcile_offer(
+        "intent-task9",
+        evidence=proof,
+        cancel_context=_cancel_context(),
+        refresh_abort_id=abort["abort_id"],
+        now=AFTER,
+    )
+    assert applied["classification"] == CANCELLED_PROVEN
+    assert applied["applied"] is True
+    assert database.get_offer_intent("intent-task9")["lifecycle_state"] == "terminal"
+    child = database.get_offer_intent(child_id)
+    assert child["lifecycle_state"] == "created"
+    assert child["first_visible_at"] is None
+    assert database.refresh_lineage_completion("intent-task9")["complete"] is False
+    assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    terminal_replay = database.begin_refresh_abort(
+        parent_intent_id="intent-task9",
+        child_intent_id=child_id,
+        campaign_id=campaign_id,
+        expected_latch_generation=latch["generation"],
+        owner_run_id="run-task9",
+        expected_lease_version=renewed["lease"]["lease_version"],
+        observed_trade_ids=observed_book,
+        observed_at=AFTER,
+        published_cleanup=published_case,
+    )
+    assert terminal_replay["idempotent"] is True
+    assert terminal_replay["state"] == "parent_terminal"
+    final_latch = database.get_runtime_safety_latch()
+    assert final_latch["state"] == "tripped"
+    assert json.loads(final_latch["blocking_operation_ids_json"]) == [
+        abort["blocking_operation_id"]
+    ]
+    cleanup = database.authorize_refresh_abort_cleanup_target(
+        abort_id=abort["abort_id"],
+        trade_id=OTHER_TRADE,
+        expected_latch_generation=abort["latch_generation"],
+        owner_run_id="run-task9",
+        observed_trade_ids=observed_book,
+        observed_pending_transaction_ids=[],
+        observed_at=AFTER,
+    )
+    assert cleanup["trade_id"] == OTHER_TRADE
+    assert cleanup["intent_id"] == child_id
+    assert cleanup["blocking_operation_id"] == abort["blocking_operation_id"]
+    if prepared_cleanup == "cleanup_unrelated_journal":
+        append_unrelated_blocker()
+        with pytest.raises(ValueError, match="unrelated durable operation"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+        return
+    if prepared_cleanup == "cleanup_active_worker":
+        database.issue_worker_delegation(
+            delegation_id="review-worker",
+            delegation_token_hash="e" * 64,
+            parent_run_id="run-task9",
+            operation_id="review-prep",
+            worker_id="review-worker",
+            purpose="coin-prep",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            issued_at=AFTER,
+            expires_at="2026-08-21T12:00:00.000000Z",
+        )
+        with pytest.raises(ValueError, match="active worker delegation"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+        return
+    with pytest.raises(ValueError, match="fresh Sage"):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at="2026-08-20T11:58:00.000000Z",
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book + ["0" * 64],
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=["f" * 64],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"] + 1,
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    with pytest.raises(ValueError):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="another-run",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
+    assert database.get_coin_state(COIN)["status"] == "spent"
+    assert database.get_coin_state(RETURN)["status"] == "free"
+    replay = reconcile_offer(
+        "intent-task9",
+        evidence=proof,
+        cancel_context=_cancel_context(),
+        refresh_abort_id=abort["abort_id"],
+        now=AFTER,
+    )
+    assert replay["idempotent"] is True
+    assert database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+    if prepared_cleanup == "restart_after_expiry":
+        # Sage has expired every target between runs, but the durable intents
+        # remain open. Scoped ownership may enter only the fenced recovery UI;
+        # cancellation and completion still require exact terminal proof.
+        fresh_clock = lambda: (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        monkeypatch.setattr(database, "_stability_wall_clock", fresh_clock)
+        prior = database.get_runtime_mutation_lease()
+        released = database.release_runtime_mutation_lease(
+            owner_run_id="run-task9",
+            expected_lease_version=prior["lease_version"],
+            released_at=fresh_clock(),
+        )
+        assert released["released"] is True
+        adopted = database.adopt_refresh_abort_successor(
+            abort_id=abort["abort_id"],
+            successor_owner_run_id="run-after-expiry",
+            successor_owner_pid=2,
+            successor_owner_host="test-host",
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            asset_id=ASSET,
+            expected_lease_version=released["lease"]["lease_version"],
+            lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            prior_owner_liveness_proven_dead=False,
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert adopted["adopted"] is True
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "created"
+        child_expiry = _evidence(
+            offers=[
+                _offer(
+                    status=5,
+                    trade_id=OTHER_TRADE,
+                    selected_coin_ids=[OTHER_COIN],
+                    transaction_id="",
+                )
+            ],
+            transactions=[],
+            coins={
+                OTHER_COIN: _coin(
+                    OTHER_COIN,
+                    asset_id="xch",
+                    amount=1000,
+                    offer_id=OTHER_TRADE,
+                )
+            },
+            observed_at=fresh_clock(),
+        )
+        authorized = database.authorize_refresh_abort_expiry_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert authorized["intent_id"] == child_id
+        for changed in (
+            {"observed_trade_ids": [OTHER_TRADE]},
+            {"observed_pending_transaction_ids": ["2" * 64]},
+            {"owner_run_id": "wrong-owner"},
+            {"expected_latch_generation": abort["latch_generation"] + 1},
+        ):
+            request = {
+                "abort_id": abort["abort_id"],
+                "trade_id": OTHER_TRADE,
+                "expected_latch_generation": abort["latch_generation"],
+                "owner_run_id": "run-after-expiry",
+                "observed_trade_ids": [],
+                "observed_pending_transaction_ids": [],
+                "observed_at": fresh_clock(),
+            }
+            with pytest.raises(ValueError):
+                database.authorize_refresh_abort_expiry_target(**(request | changed))
+        with pytest.raises(ValueError):
+            database.authorize_refresh_abort_expiry_target(
+                abort_id=abort["abort_id"],
+                trade_id="1" * 64,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-after-expiry",
+                observed_trade_ids=[],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+        expired = reconcile_offer(child_id, evidence=child_expiry, now=fresh_clock())
+        assert expired["classification"] == EXPIRED_PROVEN
+        assert expired["applied"] is True
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "terminal"
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        extra_expiry = _evidence(
+            offers=[
+                _offer(
+                    status=5,
+                    trade_id=extra_trade,
+                    selected_coin_ids=[extra_coin],
+                    transaction_id="",
+                )
+            ],
+            transactions=[],
+            coins={
+                extra_coin: _coin(
+                    extra_coin,
+                    asset_id="xch",
+                    amount=1000,
+                    offer_id=extra_trade,
+                )
+            },
+            observed_at=fresh_clock(),
+        )
+        next_target = database.authorize_refresh_abort_expiry_target(
+            abort_id=abort["abort_id"],
+            trade_id=extra_trade,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert next_target["intent_id"] == extra_intent
+        next_expired = reconcile_offer(
+            extra_intent, evidence=extra_expiry, now=fresh_clock()
+        )
+        assert next_expired["classification"] == EXPIRED_PROVEN
+        assert next_expired["applied"] is True
+        completed = database.complete_refresh_abort(
+            abort_id=abort["abort_id"],
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-after-expiry",
+            observed_trade_ids=[],
+            observed_pending_transaction_ids=[],
+            observed_at=fresh_clock(),
+        )
+        assert completed["state"] == "aborted"
+        assert database.get_runtime_safety_latch()["state"] == "resolved"
+        return
+    if prepared_cleanup is True:
+        child_operation = f"cancel:{OTHER_TRADE}"
+        database.prepare_offer_cancel(
+            operation_id=child_operation,
+            event_id=f"{child_operation}:attempt:1:prepared",
+            trade_id=OTHER_TRADE,
+            intent_id=child_id,
+            attempt=1,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": WALLET,
+                "network": NETWORK,
+            },
+            evidence_json={
+                "trade_id": OTHER_TRADE,
+                "effect_claim_protocol": "durable_cohort_claim_v1",
+            },
+            prepared_at=AFTER,
+        )
+        database.trip_runtime_safety_latch(
+            reason_code="UNRESOLVED_OPERATIONS",
+            blocking_operation_ids=[child_operation],
+            wallet_fingerprint_hash=WALLET,
+            network=NETWORK,
+            tripped_at=AFTER,
+        )
+        prepared_latch = database.get_runtime_safety_latch()
+        assert prepared_latch["generation"] == abort["latch_generation"]
+        assert set(json.loads(prepared_latch["blocking_operation_ids_json"])) == {
+            abort["blocking_operation_id"],
+            child_operation,
+        }
+        with pytest.raises(ValueError, match="fee journal differs"):
+            database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+                prepared_operation_id=child_operation,
+            )
+        with pytest.raises(ValueError, match="fee journal differs"):
+            database.claim_refresh_abort_cleanup_cancel_effect(
+                abort_id=abort["abort_id"],
+                trade_id=OTHER_TRADE,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=observed_book,
+                observed_pending_transaction_ids=[],
+                observed_at=AFTER,
+            )
+        for changed in (
+            {"observed_trade_ids": observed_book + ["0" * 64]},
+            {"observed_pending_transaction_ids": ["f" * 64]},
+            {"owner_run_id": "another-run"},
+            {"expected_latch_generation": abort["latch_generation"] + 1},
+        ):
+            with pytest.raises(ValueError):
+                database.claim_refresh_abort_cleanup_cancel_effect(
+                    **{
+                        "abort_id": abort["abort_id"],
+                        "trade_id": OTHER_TRADE,
+                        "expected_latch_generation": abort["latch_generation"],
+                        "owner_run_id": "run-task9",
+                        "observed_trade_ids": observed_book,
+                        "observed_pending_transaction_ids": [],
+                        "observed_at": AFTER,
+                        **changed,
+                    }
+                )
+        return
+    if prepared_cleanup in {
+        "integrated",
+        "crash_after_claim",
+        "completion_extra_blocker",
+        "multi_target",
+        "restart_after_child",
+        "completion_unrelated_journal",
+        "published_child",
+        "published_child_restart",
+    }:
+        # Exercise the complete manager -> durable Task 8 -> exact effect claim
+        # boundary on the same disposable incident.  The adapter and fee signer
+        # are local fakes; the journal, latch, lease and abort checks stay real.
+        import offer_manager
+        import wallet
+        from coin_manager import FeeCoinPool
+
+        fresh_clock = lambda: (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        current_lease = database.get_runtime_mutation_lease()
+        assert database.heartbeat_runtime_mutation_lease(
+            owner_run_id="run-task9",
+            expected_lease_version=current_lease["lease_version"],
+            heartbeat_at=AFTER,
+            lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        )["heartbeat"]
+        monkeypatch.setattr(database, "_stability_wall_clock", fresh_clock)
+        monkeypatch.setattr(
+            mutation_gate,
+            "current_runtime",
+            lambda: SimpleNamespace(run_id="run-task9"),
+        )
+        monkeypatch.setattr(
+            wallet,
+            "_read_refresh_abort_cleanup_snapshot",
+            lambda: {
+                "trade_ids": observed_book,
+                "pending_transaction_ids": [],
+                "observed_at": fresh_clock(),
+            },
+        )
+        monkeypatch.setattr(
+            offer_manager.OfferManager,
+            "_acquire_cancel_authority",
+            staticmethod(
+                lambda _intent, **_scope: (
+                    object(),
+                    {"snapshot_sha256": "e" * 64},
+                    WALLET,
+                    NETWORK,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            wallet, "refresh_offer_cancel_continuation", lambda *_args, **_kwargs: True
+        )
+        monkeypatch.setattr(
+            wallet, "close_offer_cancel_continuation", lambda *_args: True
+        )
+        effects = []
+
+        def cancelled_one(selected, **_request):
+            effects.append(selected)
+            trade_id = selected[0]
+            return {
+                trade_id: cancellation_result(
+                    CANCEL_SUBMITTED_UNCONFIRMED,
+                    method="sage_native_cancel_offers",
+                    raw_response={"success": True},
+                    transaction_id=("a" if trade_id == OTHER_TRADE else "c") * 64,
+                    spend_identity="sha256:"
+                    + ("b" if trade_id == OTHER_TRADE else "d") * 64,
+                ),
+                "_catalyst_effect_attempted": True,
+            }
+
+        monkeypatch.setattr(wallet, "cancel_offers_batch", cancelled_one)
+        pricing = __import__("coin_prep_fee_cancellation")
+        monkeypatch.setattr(
+            pricing,
+            "price_approved_cancellation",
+            lambda **request: {
+                "available": True,
+                "trade_ids": request["trade_ids"],
+                "source_coin_ids": request["source_coin_ids"],
+                "fee_coin_id": request["fee_coin_id"],
+                "fee_mojos": 42,
+            },
+        )
+        monkeypatch.setattr(
+            pricing,
+            "reserve_approved_cancellation",
+            lambda **_request: {
+                "validated_unsigned": {"sealed": True},
+            },
+        )
+        # This branch mocks the signer and its fee reservation. The real
+        # reservation lineage is exercised in test_coin_prep_fee_cancellation.
+        monkeypatch.setattr(
+            database,
+            "_refresh_abort_prepared_fee_hold",
+            lambda _conn, **_scope: "mock-exact-cancellation-fee-hold",
+        )
+        monkeypatch.setattr(
+            pricing, "recheck_reserved_approved_cancellation", lambda **_request: {}
+        )
+        monkeypatch.setattr(
+            database, "record_coin_prep_cancellation_fee_outcome", lambda _manifest: {}
+        )
+        pool = FeeCoinPool()
+        pool.refresh(
+            [
+                {"coin_id": FEE_COIN, "coin": {"amount": 1_000_000_000}},
+                *(
+                    [{"coin_id": "7" * 64, "coin": {"amount": 500_000_000}}]
+                    if prepared_cleanup
+                    in {
+                        "multi_target",
+                        "restart_after_child",
+                        "published_child_restart",
+                    }
+                    else []
+                ),
+            ]
+        )
+        manager = offer_manager.OfferManager()
+        manager._fee_pool = pool
+        if prepared_cleanup == "crash_after_claim":
+            monkeypatch.setattr(
+                manager,
+                "_offer_cancel_crash_boundary",
+                lambda stage, _intent: (
+                    (_ for _ in ()).throw(RuntimeError("injected after claim"))
+                    if stage == "before_wallet"
+                    else None
+                ),
+            )
+        original_finalize = database.finalize_offer_cancel_cohort
+
+        def observed_finalize(**request):
+            assert request["refresh_abort_id"] == abort["abort_id"]
+            with pytest.raises(ValueError, match="fenced by runtime recovery"):
+                original_finalize(**{**request, "refresh_abort_id": None})
+            with pytest.raises(ValueError, match="fenced by runtime recovery"):
+                original_finalize(**{**request, "refresh_abort_id": "0" * 64})
+            return original_finalize(**request)
+
+        monkeypatch.setattr(database, "finalize_offer_cancel_cohort", observed_finalize)
+        assert database.get_runtime_mutation_lease()["owner_run_id"] == "run-task9"
+        assert json.loads(
+            database.get_runtime_safety_latch()["blocking_operation_ids_json"]
+        ) == [abort["blocking_operation_id"]]
+        request = {
+            "abort_id": abort["abort_id"],
+            "expected_latch_generation": abort["latch_generation"],
+            "fee_approval_id": "d" * 64,
+        }
+        if prepared_cleanup == "crash_after_claim":
+            with pytest.raises(RuntimeError, match="injected after claim"):
+                manager.cancel_refresh_abort_targets(**request)
+            assert effects == []
+            assert [
+                event["phase"]
+                for event in database.get_offer_operation_events(
+                    f"cancel:{OTHER_TRADE}"
+                )
+            ] == ["PREPARED"]
+            assert (
+                database.get_offer_cancel_effect_claim(
+                    operation_id=f"cancel:{OTHER_TRADE}", attempt=1
+                )
+                is not None
+            )
+            with pytest.raises(ValueError, match="cleanup authority changed"):
+                manager.cancel_refresh_abort_targets(**request)
+            assert effects == []
+            return
+        submitted = manager.cancel_refresh_abort_targets(**request)
+        assert submitted["trade_id"] == OTHER_TRADE
+        assert submitted["result"]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+        assert effects == [[OTHER_TRADE]]
+        assert [
+            event["phase"]
+            for event in database.get_offer_operation_events(f"cancel:{OTHER_TRADE}")
+        ] == ["PREPARED", "FINALIZED"]
+        assert (
+            database.get_offer_cancel_effect_claim(
+                operation_id=f"cancel:{OTHER_TRADE}", attempt=1
+            )
+            is not None
+        )
+        assert (
+            database.get_refresh_abort(abort["abort_id"])["state"] == "parent_terminal"
+        )
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        completion_request = {
+            "abort_id": abort["abort_id"],
+            "expected_latch_generation": abort["latch_generation"],
+            "owner_run_id": "run-task9",
+            "observed_trade_ids": [],
+            "observed_pending_transaction_ids": [],
+            "observed_at": fresh_clock(),
+        }
+        with pytest.raises(ValueError, match="completion authority changed"):
+            database.complete_refresh_abort(**completion_request)
+        child_tx = "a" * 64
+        child_spend = "sha256:" + "b" * 64
+        prepared = database.get_offer_operation_events(f"cancel:{OTHER_TRADE}")[0]
+        child_observed = (
+            (
+                datetime.fromisoformat(
+                    prepared["request_timestamp"].replace("Z", "+00:00")
+                )
+                + timedelta(seconds=2)
+            )
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        child_transaction = _transaction(
+            transaction_id=child_tx,
+            timestamp=child_observed,
+            spent=[
+                {
+                    "coin_id": OTHER_COIN,
+                    "asset_id": "xch",
+                    "amount": 1000,
+                    "address_kind": "offer",
+                },
+                {
+                    "coin_id": FEE_COIN,
+                    "asset_id": "xch",
+                    "amount": 1_000_000_000,
+                    "address_kind": "own",
+                },
+            ],
+            created=[
+                {
+                    "coin_id": OTHER_RETURN,
+                    "asset_id": "xch",
+                    "amount": 1000,
+                    "address_kind": "own",
+                },
+                {
+                    "coin_id": FEE_RETURN,
+                    "asset_id": "xch",
+                    "amount": 999_999_958,
+                    "address_kind": "own",
+                },
+            ],
+        )
+        child_transaction["spend_identity"] = child_spend
+        child_proof = _evidence(
+            observed_at=child_observed,
+            offers=[
+                _offer(
+                    status=3,
+                    trade_id=OTHER_TRADE,
+                    selected_coin_ids=[OTHER_COIN],
+                    transaction_id=child_tx,
+                )
+            ],
+            transactions=[child_transaction],
+            coins={
+                OTHER_COIN: _coin(
+                    OTHER_COIN,
+                    asset_id="xch",
+                    amount=1000,
+                    spent_height=42,
+                    transaction_id=child_tx,
+                    offer_id=OTHER_TRADE,
+                ),
+                OTHER_RETURN: _coin(
+                    OTHER_RETURN,
+                    asset_id="xch",
+                    amount=1000,
+                    created_height=42,
+                    transaction_id=child_tx,
+                ),
+                FEE_COIN: _coin(
+                    FEE_COIN,
+                    asset_id="xch",
+                    amount=1_000_000_000,
+                    spent_height=42,
+                    transaction_id=child_tx,
+                ),
+                FEE_RETURN: _coin(
+                    FEE_RETURN,
+                    asset_id="xch",
+                    amount=999_999_958,
+                    created_height=42,
+                    transaction_id=child_tx,
+                ),
+            },
+        )
+        prepared_evidence = json.loads(prepared["evidence_json"])
+        manifest = database.get_offer_cancel_cohort_manifest(
+            prepared_evidence["cohort_id"]
+        )
+        member = manifest["members"][0]
+        child_context = {
+            "cohort_id": manifest["cohort_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "members": [
+                {
+                    "intent_id": child_id,
+                    "trade_id": OTHER_TRADE,
+                    "member_id": member["member_id"],
+                    "prepared_event_id": member["prepared_event_id"],
+                    "selected_coin_ids": [OTHER_COIN],
+                    "request_timestamp": prepared["request_timestamp"],
+                    "transaction_timestamp": child_observed,
+                    "asset_id": ASSET,
+                    "side": "buy",
+                    "offered_amount_atomic": "1000",
+                    "requested_amount_atomic": "2000",
+                    "offer_text_sha256": "e" * 64,
+                    "transaction_id": child_tx,
+                    "spend_identity": child_spend,
+                }
+            ],
+            "auxiliary_coin_ids": [FEE_COIN],
+        }
+        assert reconciliation._validated_cancel_context(child_context) is not None
+        exact_child = reconciliation._exact_intent(database.get_offer_intent(child_id))
+        exact_tx = reconciliation._exact_confirmed_transaction(child_transaction)
+        assert exact_child is not None
+        assert exact_tx is not None
+        assert reconciliation._offer_summary_matches(
+            exact_child, child_proof["offer_history"]["records"][0]
+        )
+        assert reconciliation._coin_matches_flow(
+            child_proof["coin_records"]["records"][OTHER_COIN],
+            reconciliation._flow(child_transaction["spent"][0]),
+            exact_tx,
+            spent=True,
+        )
+        assert reconciliation._coin_matches_flow(
+            child_proof["coin_records"]["records"][FEE_COIN],
+            reconciliation._flow(child_transaction["spent"][1]),
+            exact_tx,
+            spent=True,
+        )
+        for created in child_transaction["created"]:
+            assert reconciliation._coin_matches_flow(
+                child_proof["coin_records"]["records"][created["coin_id"]],
+                reconciliation._flow(created),
+                exact_tx,
+                spent=False,
+            )
+        direct_cancel = reconciliation._cancel_proof(
+            exact_child,
+            child_proof["offer_history"]["records"],
+            exact_tx,
+            child_proof["coin_records"]["records"],
+            child_context,
+        )
+        assert direct_cancel is not None
+        child_applied = reconcile_offer(
+            child_id,
+            evidence=child_proof,
+            cancel_context=child_context,
+            now=child_observed,
+        )
+        assert child_applied["classification"] == CANCELLED_PROVEN
+        assert child_applied["applied"] is True
+        assert database.get_offer_intent(child_id)["lifecycle_state"] == "terminal"
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        proof_connection = database._stability_connection()
+        try:
+            assert database._refresh_abort_child_is_fenced_or_cancelled(
+                proof_connection,
+                database.get_refresh_abort(abort["abort_id"]),
+                database.get_offer_intent(child_id),
+            )
+        finally:
+            proof_connection.close()
+        if prepared_cleanup in {
+            "multi_target",
+            "restart_after_child",
+            "published_child_restart",
+        }:
+            # A restart may adopt the unfinished abort after the child has
+            # already obtained exact terminal cancellation proof.
+            authority_connection = database._stability_connection()
+            try:
+                checked = database._validate_refresh_abort_commit_authority(
+                    authority_connection,
+                    abort_id=abort["abort_id"],
+                    parent=database.get_offer_intent("intent-task9"),
+                    child=database.get_offer_intent(child_id),
+                    wallet_hash=WALLET,
+                    network=NETWORK,
+                    at=fresh_clock(),
+                )
+                assert checked["abort_id"] == abort["abort_id"]
+            finally:
+                authority_connection.close()
+        assert json.loads(
+            database.get_runtime_safety_latch()["blocking_operation_ids_json"]
+        ) == [abort["blocking_operation_id"]]
+        if prepared_cleanup in {"restart_after_child", "published_child_restart"}:
+            observed_book[:] = [extra_trade]
+            prior_lease = database.get_runtime_mutation_lease()
+            released = database.release_runtime_mutation_lease(
+                owner_run_id="run-task9",
+                expected_lease_version=prior_lease["lease_version"],
+                released_at=fresh_clock(),
+            )
+            assert released["released"] is True
+            adopted = database.adopt_refresh_abort_successor(
+                abort_id=abort["abort_id"],
+                successor_owner_run_id="run-after-child",
+                successor_owner_pid=2,
+                successor_owner_host="test-host",
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+                asset_id=ASSET,
+                expected_lease_version=released["lease"]["lease_version"],
+                lease_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10))
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+                prior_owner_liveness_proven_dead=False,
+                observed_trade_ids=[extra_trade],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+            assert adopted["adopted"] is True
+            assert adopted["abort"]["state"] == "parent_terminal"
+            assert adopted["abort"]["owner_run_id"] == "run-after-child"
+            assert database.get_runtime_safety_latch()["state"] == "tripped"
+            return
+        if prepared_cleanup == "multi_target":
+            observed_book[:] = [extra_trade]
+            remaining = database.authorize_refresh_abort_cleanup_target(
+                abort_id=abort["abort_id"],
+                trade_id=extra_trade,
+                expected_latch_generation=abort["latch_generation"],
+                owner_run_id="run-task9",
+                observed_trade_ids=[extra_trade],
+                observed_pending_transaction_ids=[],
+                observed_at=fresh_clock(),
+            )
+            assert remaining["intent_id"] == extra_intent
+            assert remaining["trade_id"] == extra_trade
+            with pytest.raises(ValueError, match="durable wallet book is not empty"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            with pytest.raises(ValueError, match="complete Sage book"):
+                database.authorize_refresh_abort_cleanup_target(
+                    abort_id=abort["abort_id"],
+                    trade_id=extra_trade,
+                    expected_latch_generation=abort["latch_generation"],
+                    owner_run_id="run-task9",
+                    observed_trade_ids=[extra_trade, "0" * 64],
+                    observed_pending_transaction_ids=[],
+                    observed_at=fresh_clock(),
+                )
+            second = manager.cancel_refresh_abort_targets(**request)
+            assert second["trade_id"] == extra_trade
+            assert second["result"]["outcome"] == CANCEL_SUBMITTED_UNCONFIRMED
+            assert effects == [[OTHER_TRADE], [extra_trade]]
+            second_prepared = database.get_offer_operation_events(
+                f"cancel:{extra_trade}"
+            )[0]
+            second_observed = (
+                (
+                    datetime.fromisoformat(
+                        second_prepared["request_timestamp"].replace("Z", "+00:00")
+                    )
+                    + timedelta(seconds=2)
+                )
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
+            extra_fee_coin = "7" * 64
+            extra_return = "d" * 64
+            extra_fee_return = "0" * 64
+            extra_tx = "c" * 64
+            extra_spend = "sha256:" + "d" * 64
+            second_transaction = _transaction(
+                transaction_id=extra_tx,
+                height=43,
+                timestamp=second_observed,
+                spent=[
+                    {
+                        "coin_id": extra_coin,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "offer",
+                    },
+                    {
+                        "coin_id": extra_fee_coin,
+                        "asset_id": "xch",
+                        "amount": 500_000_000,
+                        "address_kind": "own",
+                    },
+                ],
+                created=[
+                    {
+                        "coin_id": extra_return,
+                        "asset_id": "xch",
+                        "amount": 1000,
+                        "address_kind": "own",
+                    },
+                    {
+                        "coin_id": extra_fee_return,
+                        "asset_id": "xch",
+                        "amount": 499_999_958,
+                        "address_kind": "own",
+                    },
+                ],
+            )
+            second_transaction["spend_identity"] = extra_spend
+            second_proof = _evidence(
+                observed_at=second_observed,
+                offers=[
+                    _offer(
+                        status=3,
+                        trade_id=extra_trade,
+                        selected_coin_ids=[extra_coin],
+                        transaction_id=extra_tx,
+                    )
+                ],
+                transactions=[second_transaction],
+                coins={
+                    extra_coin: _coin(
+                        extra_coin,
+                        asset_id="xch",
+                        amount=1000,
+                        spent_height=43,
+                        transaction_id=extra_tx,
+                        offer_id=extra_trade,
+                    ),
+                    extra_return: _coin(
+                        extra_return,
+                        asset_id="xch",
+                        amount=1000,
+                        created_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                    extra_fee_coin: _coin(
+                        extra_fee_coin,
+                        asset_id="xch",
+                        amount=500_000_000,
+                        spent_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                    extra_fee_return: _coin(
+                        extra_fee_return,
+                        asset_id="xch",
+                        amount=499_999_958,
+                        created_height=43,
+                        transaction_id=extra_tx,
+                    ),
+                },
+            )
+            second_prepared_evidence = json.loads(second_prepared["evidence_json"])
+            second_manifest = database.get_offer_cancel_cohort_manifest(
+                second_prepared_evidence["cohort_id"]
+            )
+            second_member = second_manifest["members"][0]
+            second_context = {
+                "cohort_id": second_manifest["cohort_id"],
+                "manifest_sha256": second_manifest["manifest_sha256"],
+                "members": [
+                    {
+                        "intent_id": extra_intent,
+                        "trade_id": extra_trade,
+                        "member_id": second_member["member_id"],
+                        "prepared_event_id": second_member["prepared_event_id"],
+                        "selected_coin_ids": [extra_coin],
+                        "request_timestamp": second_prepared["request_timestamp"],
+                        "transaction_timestamp": second_observed,
+                        "asset_id": ASSET,
+                        "side": "buy",
+                        "offered_amount_atomic": "1000",
+                        "requested_amount_atomic": "2000",
+                        "offer_text_sha256": "0" * 64,
+                        "transaction_id": extra_tx,
+                        "spend_identity": extra_spend,
+                    }
+                ],
+                "auxiliary_coin_ids": [extra_fee_coin],
+            }
+            second_applied = reconcile_offer(
+                extra_intent,
+                evidence=second_proof,
+                cancel_context=second_context,
+                now=second_observed,
+            )
+            assert second_applied["classification"] == CANCELLED_PROVEN
+            assert second_applied["applied"] is True
+            assert (
+                database.get_offer_intent(extra_intent)["lifecycle_state"] == "terminal"
+            )
+            observed_book.clear()
+            completed = database.complete_refresh_abort(
+                **{**completion_request, "observed_at": fresh_clock()}
+            )
+            assert completed["state"] == "aborted"
+            assert database.get_runtime_safety_latch()["state"] == "resolved"
+            assert (
+                database.refresh_lineage_completion("intent-task9")["complete"] is False
+            )
+            return
+        if prepared_cleanup == "completion_extra_blocker":
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                blocking_operation_ids=["unexpected:operation"],
+                wallet_fingerprint_hash=WALLET,
+                network=NETWORK,
+            )
+            with pytest.raises(ValueError, match="completion authority changed"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            assert database.get_refresh_abort(abort["abort_id"])["state"] == (
+                "parent_terminal"
+            )
+            return
+        if prepared_cleanup == "completion_unrelated_journal":
+            append_unrelated_blocker()
+            with pytest.raises(ValueError, match="unrelated durable operation"):
+                database.complete_refresh_abort(
+                    **{**completion_request, "observed_at": fresh_clock()}
+                )
+            assert database.get_refresh_abort(abort["abort_id"])["state"] == (
+                "parent_terminal"
+            )
+            assert database.get_runtime_safety_latch()["state"] == "tripped"
+            return
+        with pytest.raises(ValueError, match="zero live offers"):
+            database.complete_refresh_abort(
+                **{**completion_request, "observed_trade_ids": ["f" * 64]}
+            )
+        with pytest.raises(ValueError, match="zero live offers"):
+            database.complete_refresh_abort(
+                **{**completion_request, "observed_pending_transaction_ids": ["f" * 64]}
+            )
+        with pytest.raises(ValueError, match="generation changed"):
+            database.complete_refresh_abort(
+                **{
+                    **completion_request,
+                    "expected_latch_generation": abort["latch_generation"] + 1,
+                }
+            )
+        with pytest.raises(ValueError, match="completion authority changed"):
+            database.complete_refresh_abort(
+                **{**completion_request, "owner_run_id": "other-owner"}
+            )
+        queued_publications = database.list_publication_outbox(intent_id=child_id)
+        assert queued_publications
+        assert {row["state"] for row in queued_publications} == (
+            {"suppressed", "succeeded"}
+            if prepared_cleanup in {"published_child", "published_child_restart"}
+            else {"suppressed"}
+        )
+        completed = database.complete_refresh_abort(
+            **{**completion_request, "observed_at": fresh_clock()}
+        )
+        assert completed["state"] == "aborted"
+        assert completed["idempotent"] is False
+        assert database.get_runtime_safety_latch()["state"] == "resolved"
+        assert database.refresh_lineage_completion("intent-task9")["complete"] is False
+        assert {
+            row["state"] for row in database.list_publication_outbox(intent_id=child_id)
+        } == (
+            {"suppressed", "succeeded"}
+            if prepared_cleanup in {"published_child", "published_child_restart"}
+            else {"suppressed"}
+        )
+        replay = database.complete_refresh_abort(
+            **{**completion_request, "observed_at": fresh_clock()}
+        )
+        assert replay["idempotent"] is True
+        return
+    changed_proof = json.loads(json.dumps(proof))
+    changed_proof["diagnostic_note"] = "different-replay"
+    with pytest.raises(
+        ValueError, match="Task 8 nonblocking cancellation result contradicts proof"
+    ):
+        reconcile_offer(
+            "intent-task9",
+            evidence=changed_proof,
+            cancel_context=_cancel_context(),
+            refresh_abort_id=abort["abort_id"],
+            now=AFTER,
+        )
+    with pytest.raises(ValueError, match="fenced refresh abort is missing"):
+        reconcile_offer(
+            "intent-task9",
+            evidence=proof,
+            cancel_context=_cancel_context(),
+            refresh_abort_id="0" * 64,
+            now=AFTER,
+        )
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["unexpected:operation"],
+        wallet_fingerprint_hash=WALLET,
+        network=NETWORK,
+        tripped_at=AFTER,
+    )
+    with pytest.raises(ValueError, match="cleanup authority changed"):
+        database.authorize_refresh_abort_cleanup_target(
+            abort_id=abort["abort_id"],
+            trade_id=OTHER_TRADE,
+            expected_latch_generation=abort["latch_generation"],
+            owner_run_id="run-task9",
+            observed_trade_ids=observed_book,
+            observed_pending_transaction_ids=[],
+            observed_at=AFTER,
+        )
 
 
 @pytest.mark.parametrize("include_auxiliary_fee_coin", [False, True])
@@ -10251,6 +12356,7 @@ def test_exact_expiry_proof_persists_terminal_and_releases_selected_coin(
 
 def test_released_expiry_coin_reappears_from_authoritative_wallet_snapshot(
     isolated_database,
+    monkeypatch,
 ):
     """Released terminal proof must not strand a selectable coin as gone.
 
@@ -10290,6 +12396,23 @@ def test_released_expiry_coin_reappears_from_authoritative_wallet_snapshot(
     coin = database.get_coin_state(COIN)
     assert coin["status"] == "free"
     assert coin["trade_id"] is None
+
+    # A legacy mutation fence still preserves immutable terminal history,
+    # but a freshly selectable, proven-released input may fund preparation.
+    canonical = database.norm_coin_id(COIN)
+    assert canonical in database.get_coin_reconciliation_protected_ids([COIN])
+    assert database.get_coin_preparation_protected_ids([COIN]) == []
+    for fence in ("_active_wallet_effect_coin_ids", "_nonterminal_registry_coin_ids"):
+        with monkeypatch.context() as patch:
+            patch.setattr(database, fence, lambda _conn: {canonical})
+            assert database.get_coin_preparation_protected_ids([COIN]) == [canonical]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            database,
+            "_authoritative_coin_outcome",
+            lambda _conn, _id: {"disposition": "spent"},
+        )
+        assert database.get_coin_preparation_protected_ids([COIN]) == [canonical]
 
 
 def test_exact_expiry_with_later_spent_input_retires_stale_lock_as_spent(

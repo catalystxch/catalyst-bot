@@ -59,10 +59,12 @@ def build_manifest(args: argparse.Namespace) -> dict:
     tag = _version_tag(args.version)
     channel = getattr(args, "channel", "stable")
     source_commit = getattr(args, "source_commit", None)
-    if channel == "beta" and not re.fullmatch(
-        r"[a-f0-9]{40}", str(source_commit or "")
+    if channel == "beta" and source_commit is None:
+        raise ValueError("beta source commit is required")
+    if source_commit is not None and not re.fullmatch(
+        r"[a-f0-9]{40}", str(source_commit)
     ):
-        raise ValueError("beta source commit must be a full lowercase Git SHA")
+        raise ValueError("source commit must be a full lowercase Git SHA")
     version = tag.lstrip("vV")
     installer_name = installer.name
     expected_name = f"Catalyst-Setup-{tag}.exe"
@@ -109,7 +111,7 @@ def build_manifest(args: argparse.Namespace) -> dict:
             }
         },
     }
-    if channel == "beta":
+    if source_commit is not None:
         manifest["source_commit"] = source_commit
     return manifest
 
@@ -134,7 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         "--version", required=True, help="Release tag or version, e.g. v1.2.7"
     )
     parser.add_argument("--channel", choices=("stable", "beta"), default="stable")
-    parser.add_argument("--source-commit", help="Exact source commit for beta builds")
+    parser.add_argument(
+        "--source-commit", help="Exact source commit for release builds"
+    )
     parser.add_argument(
         "--installer", required=True, help="Path to Catalyst-Setup-vX.Y.Z.exe"
     )

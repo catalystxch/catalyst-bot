@@ -262,6 +262,49 @@ def test_stopped_campaign_cancel_review_ignores_locked_principal_and_mode_drift(
     assert recovered["recipe"]["economic_plan"]["campaign_revision"] == 0
     assert approval["dispatch_authorized"] is False
 
+    # The restricted abort route must also accept this real frozen prior plan.
+    # Its preparation targets remain historical; consent funds cancellations only.
+    offers = import_module("blueprints.offers")
+    monkeypatch.setattr(
+        offers,
+        "_exact_refresh_abort_fee_context",
+        lambda _body: (
+            {"abort_id": "e" * 64},
+            database.get_bootstrap_campaign(state["campaign_id"]),
+        ),
+    )
+    exact_options = {**options, "cancellation_recovery_action": "cancel_all"}
+    exact_economics = runtime.read_fee_economic_snapshot(exact_options)
+    assert exact_economics["recovery_only"] is True
+    assert exact_economics["recipe"]["targets"]
+    exact_preview = import_module("coin_prep_fee_approval").preview_coin_prep_fees(
+        exact_options
+    )
+    assert exact_preview["available"] is True
+    assert exact_preview["preparation_transaction_count_min"] == 0
+    exact_consent = {
+        "abort_id": "e" * 64,
+        "expected_latch_generation": 1,
+        "expected_trade_ids": [trade_id],
+        "confirmation": True,
+        "preview_id": exact_preview["preview_id"],
+        "maximum_fee_mojos": str(exact_preview["suggested_maximum_fee_mojos"]),
+        "cancellation_reserve_mojos": str(
+            exact_preview["minimum_cancellation_reserve_mojos"]
+        ),
+    }
+    with app.test_request_context(
+        "/api/offers/refresh_abort/fee_approval", method="POST", json=exact_consent
+    ):
+        exact_response = offers.api_refresh_abort_fee_approval()
+    assert exact_response.status_code == 200, exact_response.get_json()
+    exact_approval = exact_response.get_json()
+    assert exact_approval["dispatch_authorized"] is False
+    exact_recovered = runtime.read_approved_prep_fee_snapshot(
+        exact_approval["approval_id"], expected_recovery_action="cancel_all"
+    )
+    assert exact_recovered["recovery_only"] is True
+
 
 def test_active_campaign_requires_explicit_cancellation_recovery_intent(
     request, monkeypatch
@@ -338,6 +381,7 @@ def test_active_campaign_requires_explicit_cancellation_recovery_intent(
             "updated_at",
         )
     }
+    next_state["current_anchor_price"] = "0.0101"
     assert (
         database.update_bootstrap_campaign_state(
             state["campaign_id"], expected_revision=0, record=next_state

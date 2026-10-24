@@ -779,6 +779,54 @@ def test_offers_ui_surfaces_publication_discovery_and_confirmed_fill_authority()
     assert "Exact external fill proof" in html
 
 
+def test_offer_cards_use_validated_atomic_cat_terms_instead_of_nominal_rounding(
+    monkeypatch,
+):
+    from blueprints import offers
+
+    rows = [
+        {
+            "trade_id": "buy-trade",
+            "side": "buy",
+            "size_cat": "101380.116959",
+            "size_xch": "7.2",
+        },
+        {
+            "trade_id": "sell-trade",
+            "side": "sell",
+            "size_cat": "95486.666888",
+            "size_xch": "7.3",
+        },
+    ]
+    economics = {
+        "buy-trade": {
+            "side": "buy",
+            "cat_decimals": 3,
+            "requested_amount_atomic": "101380116",
+            "offered_amount_atomic": "7200000000000",
+        },
+        "sell-trade": {
+            "side": "sell",
+            "cat_decimals": 3,
+            "offered_amount_atomic": "95486666",
+            "requested_amount_atomic": "7300000000000",
+        },
+    }
+    monkeypatch.setattr(
+        offers.database,
+        "get_offer_ui_authority_by_trade_ids",
+        lambda _ids: {
+            trade_id: {"intent": {"intent_id": trade_id}, "economics": terms}
+            for trade_id, terms in economics.items()
+        },
+    )
+
+    rendered = offers._offers_with_durable_authority(rows)
+
+    assert [row["size_cat"] for row in rendered] == ["101,380.116", "95,486.666"]
+    assert [row["size_cat"] for row in rows] == ["101380.116959", "95486.666888"]
+
+
 def test_fills_endpoint_labels_only_authoritative_rows_as_confirmed(monkeypatch):
     from blueprints import offers
 

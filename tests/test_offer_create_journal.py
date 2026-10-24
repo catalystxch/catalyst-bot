@@ -16,6 +16,7 @@ import database
 import mutation_gate
 import offer_manager
 import wallet
+import bootstrap_fee_authority
 
 
 COIN_A = "a" * 64
@@ -910,6 +911,83 @@ def test_offer_creation_continuation_is_unserializable_and_explicit_close_is_onc
     assert exits == [permit]
     assert checks == []
     assert identities == []
+
+
+@pytest.mark.parametrize("revocation", ["fee", "campaign"])
+def test_bootstrap_authority_revoked_after_start_blocks_wallet_effect(
+    isolated_database, monkeypatch, revocation
+):
+    """A later cycle must recheck consent and campaign at the wallet boundary."""
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+    begun, closed = _stub_offer_manager_wallet(
+        monkeypatch, effect=lambda *_args, **_kwargs: effects.append(True)
+    )
+    manager = offer_manager.OfferManager()
+    campaign_id = "a" * 64
+    bootstrap_context = {
+        **CREATION_CONTEXT,
+        "purpose": f"bootstrap:{campaign_id}:revision:0",
+    }
+    campaign = {
+        "campaign_id": campaign_id,
+        "revision": 0,
+        "fee_budget_xch": "0.05",
+    }
+    authority_calls = []
+    fee_checked = []
+
+    def check_campaign(**_kwargs):
+        authority_calls.append(True)
+        if revocation == "campaign" and fee_checked:
+            raise ValueError("Bootstrap campaign revision is no longer active")
+        return {"campaign_id": campaign_id, "campaign_revision": 0}
+
+    def check_fee(_campaign):
+        fee_checked.append(True)
+        return (
+            {"ready": True, "approval_id": "b" * 64}
+            if revocation == "campaign"
+            else {
+                "ready": False,
+                "reason": "bootstrap_cancellation_fee_approval_stale",
+            }
+        )
+
+    monkeypatch.setattr(
+        offer_manager, "require_active_bootstrap_intent_authority", check_campaign
+    )
+    original_get_campaign = database.get_bootstrap_campaign
+    monkeypatch.setattr(
+        database,
+        "get_bootstrap_campaign",
+        lambda exact_id: (
+            campaign if exact_id == campaign_id else original_get_campaign(exact_id)
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap_fee_authority,
+        "cancellation_fee_readiness",
+        check_fee,
+    )
+
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        max_retries=2,
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=bootstrap_context,
+    )
+
+    assert result["success"] is False
+    assert fee_checked == [True]
+    assert len(authority_calls) >= 2
+    assert effects == []
+    assert len(begun) == 1
+    assert len(closed) == 1
+    intent = database.get_offer_intent(begun[0]["intent_id"])
+    assert intent["lifecycle_state"] == "creation_failed"
 
 
 def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(

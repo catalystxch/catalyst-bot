@@ -4757,6 +4757,25 @@
             white-space: pre-line;
             margin-bottom: 25px;
         }
+        #styledConfirmOverlay.proof-review .v4-modal-inner {
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+            max-height: min(88vh, 920px);
+            overflow: hidden;
+        }
+        #styledConfirmOverlay.proof-review #confirmMessage {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-wrap: anywhere;
+            text-align: left;
+            padding-right: 8px;
+            margin-bottom: 16px;
+        }
+        #styledConfirmOverlay.proof-review .confirm-modal-buttons {
+            flex: 0 0 auto;
+        }
         .confirm-modal-buttons {
             display: flex;
             gap: 8px;
@@ -9131,7 +9150,7 @@
                                         <div class="dashboard-startup-cta-title" id="startupReadyCtaTitle">Start the bot now</div>
                                         <div class="dashboard-startup-cta-detail" id="startupReadyCtaDetail">Coin prep is ready for this pair. Start market making now and the startup guide will step aside for the live dashboard.</div>
                                     </div>
-                                    <button class="btn btn-start btn-primary dashboard-startup-cta-btn" id="startupReadyCtaBtn" onclick="startBot()" disabled>▶ Start Bot Now</button>
+                                    <button class="btn btn-start btn-primary dashboard-startup-cta-btn" id="startupReadyCtaBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" disabled>▶ Start Bot Now</button>
                                 </div>
                                 <div class="dashboard-startup-resume" id="startupResumeOverview">
                                     <div class="dashboard-startup-resume-header">
@@ -9163,7 +9182,7 @@
                                         </div>
                                     </div>
                                     <div class="dashboard-startup-resume-actions" style="display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap;">
-                                        <button class="btn btn-start btn-primary" id="startupResumeContinueBtn" onclick="startBot()" style="min-width: 200px;">▶ Resume Bot Now</button>
+                                        <button class="btn btn-start btn-primary" id="startupResumeContinueBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" style="min-width: 200px;">▶ Resume Bot Now</button>
                                         <button class="btn btn-config btn-secondary" id="startupResumeSettingsBtn" onclick="handleResumeSettingsChangeRequest()" style="min-width: 190px;">↺ Start Fresh for Changes</button>
                                     </div>
                                 </div>
@@ -9175,7 +9194,7 @@
                          is visible directly under the token pill) ===== -->
                     <div class="v4-toolbar v4-toolbar--primary">
                         <div class="v4-toolbar-left">
-                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot()" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
+                        <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
                         <button class="btn btn-cancel btn-danger" id="cancelAllBtn" onclick="cancelAllOffers()">Cancel All (<span id="cancelAllCount">0</span>) <span class="cc-help">?<span class="cc-tooltip">Cancels every active buy and sell offer — use for a clean restart or wallet switch. Stop the bot first.</span></span></button>
@@ -9285,7 +9304,7 @@
                             <div class="v4-hero-sub data-pending" id="heroOffersSplit">— buy / — sell</div>
                         </div>
                         <div class="v4-hero-card">
-                            <div class="v4-hero-label">Session PnL <span class="cc-help">?<span class="cc-tooltip">Realised profit/loss from completed round-trip trades this session (buy then sell, or vice versa).</span></span></div>
+                            <div class="v4-hero-label"><span id="heroPnlScopeLabel">History PnL</span> <span class="cc-help">?<span class="cc-tooltip">Realised profit/loss from completed round-trip trades in the displayed history period (buy then sell, or vice versa).</span></span></div>
                             <div class="v4-hero-value neutral" id="heroPnl">0.000</div>
                             <div class="v4-hero-sub" id="heroFills">0 fills</div>
                         </div>
@@ -9407,7 +9426,7 @@
                         <span class="cc-val" id="ccLoopSecs">—</span>
                     </div>
                     <div class="cc-row">
-                        <span class="cc-label">Max Offers <span class="cc-help">?<span class="cc-tooltip">Maximum active buy and sell offers at any time.</span></span></span>
+                        <span class="cc-label"><span id="ccMaxOffersLabel">Max Offers</span> <span class="cc-help">?<span class="cc-tooltip">Follow-mode buy and sell offer limits. An active Bootstrap campaign uses its separately approved ladder; see Active Offers for the live book.</span></span></span>
                         <span class="cc-val" id="ccMaxOffers">—</span>
                     </div>
                 </div>
@@ -9585,7 +9604,7 @@
                 <div class="cc-panel-title" style="display: flex; justify-content: space-between; align-items: center;">
                     <span style="display: flex; align-items: center; gap: 6px;">
                         WALLET &amp; PERFORMANCE
-                        <span class="cc-help">?<span class="cc-tooltip">Live balances from your Sage wallet and bot performance stats this session.</span></span>
+                        <span class="cc-help">?<span class="cc-tooltip">Live balances from your Sage wallet and bot performance stats for the displayed history period.</span></span>
                     </span>
                     <button class="btn btn-config btn-secondary" style="padding: 2px 8px; font-size: 11px;" onclick="refreshBalances()" title="Refresh balances from wallet">Refresh</button>
                 </div>
@@ -9641,10 +9660,10 @@
 
                 <!-- Coin breakdown -->
                 <div class="cc-group" id="coinTrackingSection" style="display: none;">
-                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">Spendable = all coins not locked in an active offer, including dedicated fee coins. Locked = committed to active offers. Total = spendable + locked.</span></span></div>
+                    <div class="cc-group-label">Coins <span class="cc-help">?<span class="cc-tooltip">CATalyst-tracked usable coins only. Safety-protected, historically spent, and unresolved-claim coins are excluded. Spendable includes tracked free fee coins; Locked is committed to active offers; Total is their sum.</span></span></div>
                     <div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 3px 10px; font-size: 0.82em;">
                         <div style="opacity: 0.5;"></div>
-                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="All coins not locked in an active offer, including dedicated fee coins.">Spendable</span></div>
+                        <div style="opacity: 0.5; text-align: right; font-size: 0.85em;"><span title="Tracked free coins available to CATalyst, including dedicated fee coins; safety-protected and historical claims are excluded.">Spendable</span></div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Locked</div>
                         <div style="opacity: 0.5; text-align: right; font-size: 0.85em;">Total</div>
                         <div>XCH</div>
@@ -9695,7 +9714,7 @@
                         <span class="cc-val" id="loopTime">0.00s</span>
                     </div>
                     <div class="cc-row">
-                        <span class="cc-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Number of your offers that have been taken by other traders this session.</span></span></span>
+                        <span class="cc-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified offer fills in the displayed history period.</span></span></span>
                         <span class="cc-val" id="totalFills">0</span>
                     </div>
                     <div class="cc-row">
@@ -9968,7 +9987,7 @@
             <div id="historyTab" class="tab-content">
                 <div class="card-title">Recent Activity</div>
                 <div class="offers-list" id="historyOffers" style="max-height: 500px; overflow-y: auto;">
-                    <div class="empty-state">No fills in this session yet. As Dexie matches your offers, each fill will appear here with its side, price, and size.</div>
+                    <div class="empty-state">No fills in the displayed history period yet. As Dexie matches your offers, each fill will appear here with its side, price, and size.</div>
                 </div>
             </div>
 
@@ -9983,7 +10002,8 @@
                         <div class="v4-view-header-copy">
                             <div class="v4-view-kicker">Performance</div>
                             <h1 class="v4-view-title">PnL & Inventory</h1>
-                            <p class="v4-view-subtitle">Track verified fills, realized round-trip profit, and the inventory position the bot is carrying this session.</p>
+                            <p class="v4-view-subtitle">Track verified fills and realized round-trip profit alongside your current inventory position.</p>
+                            <div id="pnlHistoryScope" class="panel-context-note">Fill and realized PnL period loading...</div>
                             <div class="v4-tab-token-pill"><img class="cc-token-icon cc-token-icon-sm" src="" alt="" onerror="if(this.dataset.fallbackSrc&&this.src!==this.dataset.fallbackSrc){this.src=this.dataset.fallbackSrc;}else{this.style.display='none';}" style="display:none;"><span class="v4-tab-token-name"></span><span class="v4-tab-token-xch">&nbsp;/ XCH</span></div>
                         </div>
                     </div>
@@ -10029,7 +10049,7 @@
                 <!-- Time-Period Hero Cards -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlRoundTripsCard">
-                        <div class="v4-hero-label">Realized PnL <span class="cc-help">?<span class="cc-tooltip">Profit/loss from completed round trips this session.</span></span></div>
+                        <div class="v4-hero-label">Realized PnL <span class="cc-help">?<span class="cc-tooltip">Profit/loss from completed round trips in the displayed history period.</span></span></div>
                         <div class="v4-hero-value" id="pnlRealised" style="font-size: var(--text-xl);">0.000</div>
                         <div class="v4-hero-sub" id="pnlRealisedSub" style="color: var(--status-success);">XCH realized</div>
                     </div>
@@ -10040,7 +10060,7 @@
                         <div class="v4-hero-sub" id="pnlRoundTripTime" style="color: var(--text-tertiary); margin-top: 2px;">— avg time</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified fills recorded for this session. If Sage cannot safely confirm a take yet, it appears as pending verification instead of being counted into realized PnL.</span></span></div>
+                        <div class="v4-hero-label">Total Fills <span class="cc-help">?<span class="cc-tooltip">Verified fills recorded for the displayed history period. If Sage cannot safely confirm a take yet, it appears as pending verification instead of being counted into realized PnL.</span></span></div>
                         <div class="v4-hero-value" id="pnlTotalFills">0</div>
                         <div class="v4-hero-sub" id="pnlFillRate">0.0/hr</div>
                         <div class="v4-hero-sub" id="pnlBuySellSplit" style="color: var(--text-tertiary); margin-top: 2px;">—B / —S</div>
@@ -10061,7 +10081,7 @@
                 <!-- Secondary Stats Row -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Volume Traded <span class="cc-help">?<span class="cc-tooltip">Total XCH value of all verified fills this session. Shows trading activity even when PnL is zero from unmatched legs.</span></span></div>
+                        <div class="v4-hero-label">Volume Traded <span class="cc-help">?<span class="cc-tooltip">Total XCH value of verified fills in the displayed history period. Shows trading activity even when PnL is zero from unmatched legs.</span></span></div>
                         <div class="v4-hero-value" id="pnlVolumeXch" style="font-size: var(--text-xl);">0.00</div>
                         <div class="v4-hero-sub" id="pnlVolumeCat">0 CAT</div>
                     </div>
@@ -10080,17 +10100,17 @@
                 <!-- Gross Volume Breakdown Row — bought vs sold vs net flow -->
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); margin-bottom: var(--space-5);">
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Bought <span class="cc-help">?<span class="cc-tooltip">Gross XCH we paid out across all buy fills this session, and the CAT received in return. These are raw amounts (not round-trip pairs).</span></span></div>
+                        <div class="v4-hero-label">Bought <span class="cc-help">?<span class="cc-tooltip">Gross XCH paid across buy fills in the displayed history period, and CAT received in return. These are raw amounts (not round-trip pairs).</span></span></div>
                         <div class="v4-hero-value" id="pnlBuyVolumeXch" style="font-size: var(--text-xl); color: var(--status-danger);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlBuyVolumeCat">0 CAT received</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Sold <span class="cc-help">?<span class="cc-tooltip">Gross XCH we received across all sell fills this session, and the CAT delivered in return. These are raw amounts (not round-trip pairs).</span></span></div>
+                        <div class="v4-hero-label">Sold <span class="cc-help">?<span class="cc-tooltip">Gross XCH received across sell fills in the displayed history period, and CAT delivered in return. These are raw amounts (not round-trip pairs).</span></span></div>
                         <div class="v4-hero-value" id="pnlSellVolumeXch" style="font-size: var(--text-xl); color: var(--status-success);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlSellVolumeCat">0 CAT delivered</div>
                     </div>
                     <div class="v4-hero-card">
-                        <div class="v4-hero-label">Net Flow <span class="cc-help">?<span class="cc-tooltip">Raw XCH gain/loss: sold XCH minus bought XCH. Positive = wallet ended the session with more XCH than it started. Different from Realized PnL, which matches buys and sells into round trips.</span></span></div>
+                        <div class="v4-hero-label">Net Flow <span class="cc-help">?<span class="cc-tooltip">Raw XCH gain/loss: sold XCH minus bought XCH in the displayed history period. Different from Realized PnL, which matches buys and sells into round trips.</span></span></div>
                         <div class="v4-hero-value" id="pnlNetXchFlow" style="font-size: var(--text-xl);">0.0000</div>
                         <div class="v4-hero-sub" id="pnlNetCatFlow">0 CAT net</div>
                     </div>
@@ -10122,13 +10142,13 @@
                 <!-- Cumulative PnL Chart Area -->
                 <div class="mode-hide-on-buy-only mode-hide-on-sell-only" id="pnlCumulativeChartPanel" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-5);">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3);">
-                        <span style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px;">Cumulative PnL <span class="cc-help">?<span class="cc-tooltip">Running total of all realized PnL this session, shown as a bar chart. Updates after each round-trip match.</span></span></span>
+                        <span style="font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px;">Cumulative PnL <span class="cc-help">?<span class="cc-tooltip">Running total of realized PnL in the displayed history period, shown as a bar chart. Updates after each round-trip match.</span></span></span>
                         <span id="v4PnlChartStatus" style="font-size: var(--text-xs); color: var(--text-tertiary);">Collecting data...</span>
                     </div>
                     <div id="v4PnlChart" style="height: 140px; position: relative;">
                         <div style="text-align: center; width: 100%; color: var(--text-tertiary); font-size: var(--text-xs); align-self: center;">PnL chart updates as fills are recorded</div>
                     </div>
-                    <div id="pnlEmptyState" style="display:none; text-align:center; padding: 12px 0 4px; color: var(--text-tertiary); font-size: var(--text-xs);">No fills recorded this session yet. Fills will appear here as trades complete.</div>
+                    <div id="pnlEmptyState" style="display:none; text-align:center; padding: 12px 0 4px; color: var(--text-tertiary); font-size: var(--text-xs);">No fills recorded in the displayed history period yet. Fills will appear here as trades complete.</div>
                 </div>
 
                 <!-- Inventory Position Gauge -->
@@ -10777,13 +10797,18 @@
                             <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:12px;">
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapPreviewBtn" onclick="bootstrapPreviewCampaign()">Preview</button>
                                 <button type="button" class="btn btn-start btn-primary" id="bootstrapStartBtn" onclick="bootstrapStartCampaign()" disabled>Start Campaign</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapPrepReviewBtn" onclick="reviewBootstrapCampaignCoinPrep()" style="display:none" disabled>Review Campaign Coin Prep</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapStopBtn" onclick="bootstrapStopCampaign()" disabled>Stop &amp; Cancel Campaign Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileExpiredBtn" style="display:none;" disabled>Verify Expired Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileTerminalBtn" style="display:none;" disabled>Verify Terminal Offers</button>
+                                <button type="button" class="btn btn-config btn-secondary" id="bootstrapReconcileCompletedBtn" style="display:none;" disabled>Verify Completed Offers</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapRetryStoppedBtn" onclick="bootstrapStopCampaign('pending')" style="display:none;" disabled>Retry Stopped Campaign Cancellation</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapManifestExportBtn" onclick="bootstrapExportManifest()" disabled>Export / Sign Manifest</button>
                                 <button type="button" class="btn btn-config btn-secondary" id="bootstrapParticipationExportBtn" onclick="exportBootstrapParticipationProof()" disabled>Export / Sign Participation Proof</button>
                                 <button type="button" class="btn btn-config btn-secondary" onclick="document.getElementById('bootstrapManifestImportInput').click()">Import Signed Manifest</button>
                                 <input id="bootstrapManifestImportInput" type="file" accept="application/json,.json" style="display:none;" onchange="bootstrapImportManifest(event)">
                             </div>
+                            <div id="bootstrapCompletedProofAlert" role="alert" style="display:none; margin-top:12px; padding:12px; border:1px solid var(--status-warning); border-radius:8px; color:var(--status-warning); white-space:pre-line;"></div>
                         </div>
                     </div>
 
@@ -11038,6 +11063,12 @@
                                     <span class="safety-diagnostics-label">Safe next action</span>
                                     <span class="safety-diagnostics-value" id="safetyDiagnosticsAction">Review safety diagnostics</span>
                                 </div>
+                            </div>
+                            <div id="cancelLatchReviewPanel" style="margin-top: 12px;">
+                                <button type="button" class="btn btn-secondary" data-safety-action="review-cancellations">Review resolved cancellations</button>
+                                <p id="cancelLatchReviewStatus" class="safety-diagnostics-error"></p>
+                                <pre id="cancelLatchReviewProof" style="white-space: pre-wrap; overflow-wrap: anywhere;"></pre>
+                                <button type="button" class="btn btn-secondary" id="cancelLatchConfirm" data-safety-action="confirm-cancellations" disabled>Confirm database-only latch release</button>
                             </div>
                         </section>
                         <!-- Buy/sell side controls remain user-facing.
@@ -11545,27 +11576,24 @@
                             </label>
                         </div>
                         <div id="transactionFeeManualWrap" style="display: none;">
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                                <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
-                                    <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
-                                </div>
+                            <div class="form-group" style="margin-bottom: 10px;">
+                                <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
+                                <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Coin Size (XCH) <span class="cc-help">?<span class="cc-tooltip">The size of coin that the bot will prepare for fee coins.</span></span></label>
                                     <input type="number" id="configFeeCoinSizeXch" value="0.0001" step="0.00000001" min="0" oninput="updateFeeSettingsUi(); updateCoinPrepPreview();">
                                 </div>
-                            </div>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
                                 <div class="form-group" style="margin-bottom: 0;">
                                     <label style="font-size: 0.85em;">Fee Coin Count</label>
                                     <input type="number" id="configFeePrepCount" value="20" step="1" min="0" oninput="updateFeeSettingsUi(); updateCoinPrepPreview();">
                                 </div>
-                                <div class="form-group" style="margin-bottom: 0;">
-                                    <label style="font-size: 0.85em;">Fee Pool Use</label>
-                                    <div class="v4-settings-hint" style="margin: 0; color: var(--slate-400);">Bigger fee coins are fine. Change returns to the fee pool.</div>
-                                </div>
-                            </div>
                         </div>
+                        <div class="v4-settings-hint" style="margin-bottom: 10px; color: var(--slate-400);">Fee coins fund protected cancellations; unused change stays in the wallet.</div>
+                        <button type="button" class="btn btn-secondary" id="saveFeePoolOnlyBtn" onclick="saveFeePoolOnly()">Save Fee Pool Only</button>
+                        <div class="v4-settings-hint" style="margin: 6px 0 10px; color: var(--slate-400);">Saves only the fee coin count and size. It does not save the other Setup fields, prepare coins, or start trading.</div>
                         <div class="v4-settings-hint" id="feeStatusHint" style="margin-bottom: 10px; color: var(--slate-400);">
                             Fee status loading...
                         </div>
@@ -11752,6 +11780,24 @@
                 <div class="confirm-modal-buttons">
                     <button class="confirm-btn-cancel" id="promptCancelBtn" onclick="resolveStyledPrompt(null)">Cancel</button>
                     <button class="confirm-btn-warning" id="promptOkBtn" onclick="resolveStyledPrompt(document.getElementById('promptInput').value)">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="confirm-overlay" id="bootstrapFeeConsentOverlay" role="dialog" aria-modal="true" aria-labelledby="bootstrapFeeConsentTitle">
+        <div class="confirm-modal v4-modal-shell v4-modal-shell--warning">
+            <div class="v4-modal-inner">
+                <div class="confirm-modal-title" id="bootstrapFeeConsentTitle">Approve campaign cancellation fees</div>
+                <p class="confirm-modal-message">Your existing coins are ready. Before CATalyst creates offers, review a fee cap that protects cancellation if trading must stop. Approval alone sends no transaction and does not start the bot.</p>
+                <div id="bootstrapFeeConsentSummary" style="white-space:pre-line; text-align:left; line-height:1.6; margin:12px 0; font-variant-numeric:tabular-nums;"></div>
+                <label for="bootstrapFeeConsentMaximum">Maximum cumulative network fee (XCH)</label>
+                <input id="bootstrapFeeConsentMaximum" inputmode="decimal" autocomplete="off" style="width:100%; margin:8px 0 4px; box-sizing:border-box;">
+                <div id="bootstrapFeeConsentError" role="alert" style="min-height:1.5em; color:var(--sell-color);"></div>
+                <div class="confirm-modal-buttons">
+                    <button class="confirm-btn-cancel" type="button" onclick="closeBootstrapFeeConsentReview()">Back</button>
+                    <button class="confirm-btn-secondary" type="button" id="bootstrapFeeConsentRefresh" onclick="refreshBootstrapFeeConsentReview()">Refresh estimate</button>
+                    <button class="confirm-btn-warning" type="button" id="bootstrapFeeConsentApprove" onclick="approveBootstrapFeeConsent()" disabled>Approve fee cap</button>
                 </div>
             </div>
         </div>
@@ -12092,6 +12138,14 @@
                 <div class="v4-modal-note" id="cancelConfirmNote">
                     <span class="v4-modal-note-icon">ⓘ</span>
                     <span>Stop the bot first, then use this for a clean restart or wallet switch. It is not needed for routine monitoring.</span>
+                </div>
+                <div id="refreshAbortPanel" class="v4-modal-panel v4-modal-panel--warning" hidden>
+                    <strong>Fenced offer recovery</strong>
+                    <p id="refreshAbortSummary" style="overflow-wrap: anywhere;"></p>
+                    <label id="refreshAbortCampaignRow" hidden>Stopped campaign
+                        <select id="refreshAbortCampaign"></select>
+                    </label>
+                    <button type="button" id="refreshAbortActionBtn" class="btn btn-cancel btn-danger">Review recovery</button>
                 </div>
                 <div class="v4-modal-actions v4-modal-actions--center">
                     <button class="btn btn-config btn-secondary" onclick="closeCancelConfirm()" style="flex: 1; max-width: 170px;">Keep Offers</button>
@@ -14953,13 +15007,17 @@
             const cancelAllCountEl = document.getElementById('cancelAllCount');
             if (cancelAllCountEl) cancelAllCountEl.textContent = totalOffers;
 
-            // Session PnL — prefer cached dashboard payload (authoritative
+            // History PnL — prefer cached dashboard payload (authoritative
             // source with full precision), fall back to scraping the ccPnl
             // element which is populated later. Without this fallback chain,
             // the hero tile shows stale +0.0000 for the first few seconds
             // after page load until /api/dashboard resolves.
             let pnl = 0;
             const _perf = (typeof _dashboardData !== 'undefined' && _dashboardData && _dashboardData.performance) || null;
+            const historyScope = (data.stats && data.stats.history_scope) || (_perf && _perf.history_scope) || '';
+            const heroScopeLabel = document.getElementById('heroPnlScopeLabel');
+            if (heroScopeLabel) heroScopeLabel.textContent = historyScope === 'fresh_run'
+                ? 'Since Fresh Start PnL' : historyScope === 'lifetime' ? 'Lifetime PnL' : 'History PnL';
             if (_perf && _perf.realised_pnl_xch !== undefined && _perf.realised_pnl_xch !== null) {
                 pnl = parseFloat(_perf.realised_pnl_xch) || 0;
             } else {
@@ -15313,6 +15371,9 @@
             if (m === 'POST' && clean === 'bootstrap/preview') return 'preview_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/start') return 'start_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/stop') return 'stop_bootstrap_campaign';
+            if (m === 'POST' && clean === 'bootstrap/reconcile_expired') return 'reconcile_expired_bootstrap_offers';
+            if (m === 'POST' && clean === 'bootstrap/preview_completed') return 'preview_completed_bootstrap_offers';
+            if (m === 'POST' && clean === 'bootstrap/reconcile_completed') return 'reconcile_completed_bootstrap_offers';
             if (m === 'POST' && clean === 'bootstrap/renew') return 'renew_bootstrap_campaign';
             if (m === 'POST' && clean === 'bootstrap/manifest/export') return 'export_bootstrap_manifest';
             if (m === 'POST' && clean === 'bootstrap/manifest/import') return 'import_bootstrap_manifest';
@@ -15325,11 +15386,18 @@
             if (m === 'GET'  && clean === 'risk/spreads')       return 'get_risk_spreads';
             if (m === 'GET'  && clean === 'stats')              return 'get_stats';
             if (m === 'GET'  && clean === 'safety/status')      return 'get_safety_status';
+            if (m === 'GET'  && clean === 'safety/cancel-latch-review') return 'get_cancel_latch_review';
+            if (m === 'POST' && clean === 'safety/confirm-cancel-latch-review') return 'confirm_cancel_latch_review';
 
             // --- Offers ---
             if (m === 'GET'  && clean === 'offers')             return 'get_offers';
             if (m === 'POST' && clean === 'offers/cancel_all')  return 'cancel_all_offers';
             if (m === 'GET'  && clean === 'offers/cancel_all/status') return 'get_cancel_all_status';
+            if (m === 'GET'  && clean === 'offers/refresh_abort/preview') return 'get_refresh_abort_preview';
+            if (m === 'POST' && clean === 'offers/refresh_abort/begin') return 'begin_refresh_abort';
+            if (m === 'POST' && clean === 'offers/refresh_abort/cancel_next') return 'cancel_next_refresh_abort_offer';
+            if (m === 'POST' && clean === 'offers/refresh_abort/reconcile_target') return 'reconcile_refresh_abort_target';
+            if (m === 'POST' && clean === 'offers/refresh_abort/complete') return 'complete_refresh_abort';
             if (m === 'POST' && clean === 'offers/cancel')      return 'cancel_offer';
             if (m === 'POST' && clean === 'offers/cleanup_orphans') return 'cleanup_orphans';
             if (m === 'GET'  && clean === 'offers/diagnostic')  return 'get_offers_diagnostic';
@@ -15534,6 +15602,7 @@
             LATCH_BINDING_MISMATCH: 'Safety latch binding changed',
             STARTUP_AUTHORITY_CHANGED: 'Startup authority changed',
             UNRESOLVED_OPERATIONS: 'Unresolved operations require review',
+            REFRESH_ABORT_CLEANUP: 'Confirmed refresh cancellation requires exact offer cleanup',
             RECONCILIATION_REQUIRED: 'Authoritative reconciliation is required',
             CANCEL_UNKNOWN: 'Cancellation outcome requires reconciliation',
             CREATE_UNKNOWN: 'Creation outcome requires reconciliation',
@@ -15584,6 +15653,57 @@
         let _safetyDiagnosticsActionHandler = null;
         let _safetyDiagnosticsGeneration = 0;
         let _safetyDiagnosticsRequestInFlight = false;
+        let _cancelLatchReview = null;
+
+        async function reviewResolvedCancellations() {
+            _cancelLatchReview = null;
+            const confirmButton = document.getElementById('cancelLatchConfirm');
+            if (confirmButton) confirmButton.disabled = true;
+            safetyDiagnosticsText('cancelLatchReviewStatus', 'Checking the exact wallet, pending transactions, journal, and Sage offers…');
+            safetyDiagnosticsText('cancelLatchReviewProof', '');
+            try {
+                const response = await apiFetch(`${API_URL}/safety/cancel-latch-review`);
+                const payload = await response.json();
+                const review = payload && payload.review;
+                if (!response.ok || payload.success !== true || !review || review.ready !== true) {
+                    safetyDiagnosticsText('cancelLatchReviewStatus', `Release unavailable: ${review && review.reason_code || 'REVIEW_UNAVAILABLE'}`);
+                    return;
+                }
+                _cancelLatchReview = review;
+                const lines = review.proofs.map(proof =>
+                    `${proof.trade_id} · ${proof.outcome} · Sage ${proof.sage_status} · evidence ${proof.evidence_sha256}`
+                );
+                safetyDiagnosticsText('cancelLatchReviewStatus',
+                    `Wallet ${review.wallet_fingerprint} · ${review.network} · latch generation ${review.generation} · ${lines.length} exact cancellations proven · zero pending transactions. Trading remains stopped.`);
+                safetyDiagnosticsText('cancelLatchReviewProof', lines.join('\n'));
+                if (confirmButton) confirmButton.disabled = false;
+            } catch (_error) {
+                safetyDiagnosticsText('cancelLatchReviewStatus', 'Release unavailable: review failed.');
+            }
+        }
+
+        async function confirmResolvedCancellations() {
+            const review = _cancelLatchReview;
+            if (!review || review.ready !== true) return;
+            if (!window.confirm(`Release only latch generation ${review.generation} for ${review.operation_ids.length} proven cancelled offers? This does not start trading or send a wallet transaction.`)) return;
+            _cancelLatchReview = null;
+            const confirmButton = document.getElementById('cancelLatchConfirm');
+            if (confirmButton) confirmButton.disabled = true;
+            try {
+                const response = await apiFetch(`${API_URL}/safety/confirm-cancel-latch-review`, {
+                    method: 'POST',
+                    body: JSON.stringify({expected_generation: review.generation, review_digest: review.review_digest})
+                });
+                const result = await response.json();
+                safetyDiagnosticsText('cancelLatchReviewStatus', result.success === true && result.released === true
+                    ? 'The exact resolved latch was released. Trading remains stopped.'
+                    : `Release refused: ${result.reason_code || 'REVIEW_STALE_OR_INCOMPLETE'}. Review again.`);
+                safetyDiagnosticsText('cancelLatchReviewProof', '');
+                await refreshSafetyDiagnosticsStatus();
+            } catch (_error) {
+                safetyDiagnosticsText('cancelLatchReviewStatus', 'Release refused: fresh proof could not be checked.');
+            }
+        }
 
         function safetyDiagnosticsCount(value) {
             return Number.isInteger(value) && value >= 0 && value <= 2147483647
@@ -15828,6 +15948,10 @@
                 if (!button || !panel.contains(button)) return;
                 if (button.getAttribute('data-safety-action') === 'refresh') {
                     refreshSafetyDiagnosticsStatus();
+                } else if (button.getAttribute('data-safety-action') === 'review-cancellations') {
+                    reviewResolvedCancellations();
+                } else if (button.getAttribute('data-safety-action') === 'confirm-cancellations') {
+                    confirmResolvedCancellations();
                 }
             };
             panel.addEventListener('click', _safetyDiagnosticsActionHandler);
@@ -18175,6 +18299,7 @@
         }
 
         function isSettingsReviewedForCurrentPair() {
+            if (hasReviewedBootstrapSetup()) return true;
             if (!settingsReviewed) return false;
             const storedAssetId = getStoredSettingsReviewedAssetId();
             const currentAssetId = currentCAT?.asset_id || '';
@@ -18186,6 +18311,28 @@
         // setSettingsReviewedState(false), so a truly fresh pair still starts
         // blank while a saved Smart Settings run survives page reloads.
         let settingsReviewed = readStoredSettingsReviewed();
+        let _bootstrapSetupReviewScope = '';
+        let _bootstrapPrepReviewBusy = false;
+
+        function bootstrapSetupScope(campaign) {
+            if (!campaign || campaign.status !== 'active' || campaign.expired === true
+                || !/^[a-f0-9]{64}$/.test(String(campaign.campaign_id || ''))
+                || !Number.isSafeInteger(campaign.revision) || campaign.revision < 0
+                || campaign.asset_id !== currentCAT?.asset_id
+                || !/^[a-f0-9]{64}$/.test(String(campaign.asset_id || ''))
+                || campaign.network !== 'mainnet' || !campaign.wallet_fingerprint
+                || !Number.isFinite(Date.parse(campaign.expires_at))
+                || Date.parse(campaign.expires_at) <= Date.now()) return '';
+            return JSON.stringify([campaign.campaign_id, campaign.revision, campaign.asset_id,
+                campaign.wallet_fingerprint, campaign.network, campaign.xch_budget,
+                campaign.cat_budget, campaign.fee_budget_xch, campaign.anchor_price,
+                campaign.minimum_price, campaign.maximum_price, campaign.expires_at]);
+        }
+
+        function hasReviewedBootstrapSetup() {
+            return !!_bootstrapSetupReviewScope
+                && _bootstrapSetupReviewScope === bootstrapSetupScope(_bootstrapActiveCampaign);
+        }
         let userHasSavedSettings = settingsReviewed; // Only populate trade fields from .env after first save
         let coinPrepStatus = 'none'; // 'none' | 'done' | 'skipped'
         
@@ -18431,12 +18578,18 @@
                     ? (getSettingsSelectedCAT()?.asset_id ? getSettingsSelectedCAT() : (currentCAT?.asset_id ? currentCAT : {}))
                     : {});
             const hasPair = !!(effectiveCat && effectiveCat.asset_id);
+            const explicitPair = getDashboardSelectedPair({ requireExplicit: true });
+            const pairConfirmed = hasPair && explicitPair.selected
+                && explicitPair.asset_id === effectiveCat.asset_id;
             const pairReady = hasPair ? isPairDataReadyFor(effectiveCat.asset_id) : false;
             const pairName = effectiveCat?.name || effectiveCat?.ticker_id || 'Selected Pair';
             const locked = !!(bot_state && bot_state.running);
 
             if (selector) {
-                selector.value = hasPair ? effectiveCat.asset_id : '';
+                // Keep a deliberate picker interaction unselected even when a
+                // queued settings/balance refresh restores the saved CAT value.
+                selector.value = selector.classList.contains('v4-settings-hidden-select')
+                    && hasPair ? effectiveCat.asset_id : '';
             }
             if (card) {
                 card.classList.remove('is-empty', 'is-loading', 'is-ready');
@@ -18448,6 +18601,8 @@
             if (metaEl) {
                 if (!hasPair) {
                     metaEl.textContent = 'Choose the CAT token on the dashboard first. Settings, balances, pricing, and coin prep will then prepare for that token.';
+                } else if (!pairConfirmed) {
+                    metaEl.textContent = `Confirm ${pairName} for this run before previewing or saving settings.`;
                 } else if (!pairReady) {
                     metaEl.textContent = `${pairName} has been selected for this run. Waiting for fresh balances and market data before settings can be saved.`;
                 } else {
@@ -18457,13 +18612,14 @@
             if (statusEl) {
                 statusEl.textContent = !hasPair
                     ? 'Waiting for pair selection'
-                    : (pairReady ? 'App-wide trading pair confirmed' : 'Refreshing pair data');
+                    : (!pairConfirmed ? 'Confirm trading pair for this run'
+                        : (pairReady ? 'App-wide trading pair confirmed' : 'Refreshing pair data'));
             }
             if (btn) {
                 btn.disabled = locked;
                 btn.textContent = locked
                     ? 'Stop Bot to Change Pair'
-                    : (hasPair ? 'Change Trading Pair' : 'Choose Trading Pair');
+                    : (hasPair ? (pairConfirmed ? 'Change Trading Pair' : 'Confirm Trading Pair') : 'Choose Trading Pair');
                 btn.title = locked
                     ? 'Stop the bot before changing the trading pair for this run.'
                     : 'Trading pair is chosen once for the whole app.';
@@ -18520,8 +18676,17 @@
                 select.setAttribute('aria-hidden', 'true');
                 select.setAttribute('tabindex', '-1');
                 if (trigger) trigger.style.display = '';
+                // Re-render only after closing the interaction. While open,
+                // label refreshes deliberately keep the choice empty; after
+                // server acceptance Settings must retain the committed CAT.
+                updateSettingsPairControl(currentCAT);
+                validateSettingsForm();
             };
             select.addEventListener('change', onPick);
+            // A restored/stopped pair may already be selected without explicit
+            // authority for this run. Choosing the same option must fire change
+            // and pass through selectCAT(), not silently inherit that authority.
+            select.value = '';
             select.focus();
         }
 
@@ -18658,7 +18823,15 @@
         }
 
         function shouldUseFreshStartBlankTierTemplates() {
-            return _freshStartBlankTierTemplates && !isSettingsReviewedForCurrentPair() && !hasResumedLiveBook();
+            // A saved Bootstrap campaign is an explicit, pair-bound price and
+            // budget authority. Show this pair's persisted settings for review
+            // before Coin Prep, even when Follow market Smart Settings cannot
+            // calculate a plan from thin liquidity. A different pair still
+            // starts with blank templates.
+            const campaignForPair = _bootstrapActiveCampaign?.status === 'active'
+                && _bootstrapActiveCampaign.asset_id === currentCAT?.asset_id;
+            return _freshStartBlankTierTemplates && !isSettingsReviewedForCurrentPair()
+                && !hasResumedLiveBook() && !campaignForPair;
         }
 
         function resetCoreOrderBookInputsForFreshStart() {
@@ -19128,7 +19301,9 @@
                 : 'campaign-owned offers';
             return {
                 reason: campaign.cancel_reason || 'bootstrap_expired',
-                message: `Bootstrap campaign expired — ${offerPhrase} require cancellation before restart or renewal.`,
+                message: openCount > 0
+                    ? `Bootstrap campaign expired — ${offerPhrase} require cancellation or authoritative expiry proof before restart or renewal.`
+                    : 'Bootstrap campaign expired — stop campaign before restart or renewal.',
             };
         }
 
@@ -19378,6 +19553,7 @@
         }
 
         function updateStartupChecklist(data = bot_state) {
+            const setupReviewed = isSettingsReviewedForCurrentPair();
             const pair = getDashboardSelectedPair({ requireExplicit: true });
             const health = data && data.chia_health ? data.chia_health : {};
             const walletReachable = !!(
@@ -19415,17 +19591,19 @@
 
             setStartupStepState(
                 'startupStepSettings',
-                settingsReviewed ? 'ready' : 'action',
-                settingsReviewed
+                setupReviewed ? 'ready' : 'action',
+                setupReviewed
                     ? (_resumeSessionSummary
                         ? 'Previous session settings were restored. Core settings are locked while resuming live offers. Use Live Controls for safe live tweaks, or Start Fresh to reconfigure.'
-                        : 'Settings have been saved and confirmed for this run.')
+                        : hasReviewedBootstrapSetup()
+                            ? 'Saved campaign and existing settings reviewed; general settings were not overwritten.'
+                            : 'Settings have been saved and confirmed for this run.')
                     : 'Use Review Settings and save your setup for this run.'
             );
 
             const reviewBtn = document.getElementById('startupReviewSettingsBtn');
             if (reviewBtn) {
-                const shouldPulse = _pairSelectedByUser && !settingsReviewed && !(data && data.running);
+                const shouldPulse = _pairSelectedByUser && !setupReviewed && !(data && data.running);
                 reviewBtn.classList.toggle('btn-pulse-glow', shouldPulse);
             }
 
@@ -19468,7 +19646,7 @@
                 || (
                     startSafety.allowed && walletReachable
                     && pair.selected
-                    && settingsReviewed
+                    && setupReviewed
                     && coinPrepStatus !== 'checking'
                     && (coinPrepStatus === 'done' || coinPrepStatus === 'skipped-safe' || restoredBookIsPrepared)
                 );
@@ -19489,7 +19667,7 @@
             } else if (!pair.selected) {
                 startState = 'action';
                 startDetail = 'Choose a trading pair first.';
-            } else if (!settingsReviewed) {
+            } else if (!setupReviewed) {
                 startState = 'action';
                 startDetail = 'Save your settings to unlock the start path.';
             } else if (coinPrepStatus === 'checking') {
@@ -19680,6 +19858,12 @@
                     if (err.error === 'mutation_gate_blocked') {
                         return startSafetyMessage(err.reason || err.reason_code);
                     }
+                    // Bulk config writes can reject one field after applying others.
+                    // Show the rejected field so the operator can correct it.
+                    const firstFieldError = Array.isArray(err.errors) ? err.errors[0] : null;
+                    if (typeof firstFieldError === 'string' && firstFieldError.trim()) {
+                        return firstFieldError.trim().slice(0, 200);
+                    }
                     const code = err.code || err.error_code;
                     if (code && _ERROR_CODE_MAP[code]) return _ERROR_CODE_MAP[code];
                     // If `error` is a known code → map it
@@ -19840,13 +20024,14 @@
         // =================================================================
         let _confirmResolve = null;
         
-        function showStyledConfirm({ icon = '⚠️', title = 'Confirm', message = 'Are you sure?', confirmText = 'Confirm', cancelText = 'Cancel', extraText = '', style = 'danger', allowHtml = false } = {}) {
+        function showStyledConfirm({ icon = '⚠️', title = 'Confirm', message = 'Are you sure?', confirmText = 'Confirm', cancelText = 'Cancel', extraText = '', style = 'danger', allowHtml = false, proofReview = false } = {}) {
             return new Promise((resolve) => {
                 _confirmResolve = resolve;
                 document.getElementById('confirmIcon').innerHTML = icon;
                 document.getElementById('confirmTitle').textContent = title;
                 const msgEl = document.getElementById('confirmMessage');
                 msgEl.textContent = String(message);
+                document.getElementById('styledConfirmOverlay').classList.toggle('proof-review', proofReview === true);
                 document.getElementById('confirmCancelBtn').textContent = cancelText;
                 const okBtn = document.getElementById('confirmOkBtn');
                 okBtn.textContent = confirmText;
@@ -19866,6 +20051,7 @@
         
         function resolveConfirm(result) {
             document.getElementById('styledConfirmOverlay').classList.remove('active');
+            document.getElementById('styledConfirmOverlay').classList.remove('proof-review');
             if (_confirmResolve) {
                 _confirmResolve(result);
                 _confirmResolve = null;
@@ -21287,7 +21473,7 @@
                 transactionFeeEnabled: enabled,
                 transactionFeeMode: 'manual',
                 transactionFeeXch: manualFeeXch,
-                feePoolEnabled: enabled && feeCount > 0 && feeCoinSizeXch > 0 && effectiveFeeXch > 0,
+                feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
                 feeCount,
                 effectiveFeeXch
@@ -21303,7 +21489,7 @@
                 transactionFeeEnabled: enabled,
                 transactionFeeMode: 'manual',
                 transactionFeeXch: manualFeeXch,
-                feePoolEnabled: enabled && feeCount > 0 && feeCoinSizeXch > 0,
+                feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
                 feeCount,
                 effectiveFeeXch: enabled ? manualFeeXch : 0
@@ -21337,6 +21523,44 @@
             if (feeMode) feeMode.value = 'manual';
             if (manualWrap) manualWrap.style.display = enabled ? 'block' : 'none';
             renderFeeStatusHint();
+        }
+
+        async function saveFeePoolOnly() {
+            const button = document.getElementById('saveFeePoolOnlyBtn');
+            if (bot_state?.running) {
+                showToast('Stop the bot before changing its fee coin pool.', 'error');
+                return;
+            }
+            const countText = document.getElementById('configFeePrepCount')?.value?.trim() ?? '';
+            const sizeText = document.getElementById('configFeeCoinSizeXch')?.value?.trim() ?? '';
+            const count = Number(countText);
+            const size = Number(sizeText);
+            if (!/^\d+$/.test(countText) || !Number.isSafeInteger(count) || count > 10000
+                || !/^(?:\d+)(?:\.\d{1,12})?$/.test(sizeText)
+                || !Number.isFinite(size) || size > 9223372
+                || (count > 0 && size <= 0)) {
+                showToast('Enter a valid fee coin count and size before saving.', 'error');
+                return;
+            }
+            button.disabled = true;
+            try {
+                const response = await apiFetch(`${API_URL}/config`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({fee_prep_count: count, fee_coin_size_xch: sizeText})
+                });
+                const result = await response.json();
+                if (!response.ok || result.success !== true) {
+                    showToast('Fee coin pool was not saved: ' + formatError(result), 'error');
+                    return;
+                }
+                showToast('Fee coin pool saved. Review the saved campaign Coin Prep before trading.', 'success');
+                refreshFeeStatusPreview();
+            } catch (error) {
+                showToast('Fee coin pool was not saved: ' + formatError(error), 'error');
+            } finally {
+                button.disabled = false;
+            }
         }
 
         async function refreshFeeStatusPreview() {
@@ -26606,6 +26830,10 @@
         // ============ PnL & INVENTORY UPDATE (V2 NEW) ============
         function applyPnlSummary(data = {}) {
             const el = id => document.getElementById(id);
+            const scopeLabel = el('pnlHistoryScope');
+            if (scopeLabel) scopeLabel.textContent = data.history_scope === 'fresh_run'
+                ? 'Fills and realized PnL: since fresh start' : data.history_scope === 'lifetime'
+                    ? 'Fills and realized PnL: lifetime' : 'Fill and realized PnL period unknown';
             const verifiedFills = Number(data.total_fills || 0);
             const pendingCount = Number(data.pending_verification_count || 0);
             const fillRate = Number(data.fill_rate_per_hour || 0);
@@ -27172,6 +27400,8 @@
                     el('ccBuySell').innerHTML = buyBadge + ' / ' + sellBadge;
                     if (t.loop_seconds && el('ccLoopSecs')) el('ccLoopSecs').textContent = t.loop_seconds + 's';
                     if (t.max_active_buy !== undefined && el('ccMaxOffers')) {
+                        el('ccMaxOffersLabel').textContent = _bootstrapActiveCampaign?.status === 'active'
+                            ? 'Follow Limits' : 'Max Offers';
                         el('ccMaxOffers').textContent = formatSideSplitForLiquidityMode(
                             t.max_active_buy, t.max_active_sell, modeState.mode);
                     }
@@ -31684,7 +31914,7 @@
             const container = document.getElementById('historyOffers');
             
             if (!history || history.length === 0) {
-                container.innerHTML = '<div class="empty-state">No fills in this session yet. Each time Dexie matches one of your offers, it will show up here with the side, price, and size.</div>';
+                container.innerHTML = '<div class="empty-state">No fills in the displayed history period yet. Each time Dexie matches one of your offers, it will show up here with the side, price, and size.</div>';
                 return;
             }
 
@@ -32221,12 +32451,12 @@
                         <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:10px; margin-bottom:20px;">
                             <div style="background:rgba(16,185,129,0.10); border:1px solid rgba(16,185,129,0.22); border-radius:11px; padding:13px 10px; text-align:center;">
                                 <div style="font-size:10px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:var(--status-success); opacity:0.7; margin-bottom:6px;">Buy</div>
-                                <div style="font-size:22px; font-weight:700; color:var(--status-success); line-height:1;">${_rs.buy_count || 0}</div>
+                                <div id="resumeReadyBuyCount" style="font-size:22px; font-weight:700; color:var(--status-success); line-height:1;">${_rs.buy_count || 0}</div>
                                 <div style="font-size:10px; color:var(--slate-600); margin-top:4px;">offers</div>
                             </div>
                             <div style="background:rgba(248,113,113,0.10); border:1px solid rgba(248,113,113,0.22); border-radius:11px; padding:13px 10px; text-align:center;">
                                 <div style="font-size:10px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; color:var(--sell-color); opacity:0.7; margin-bottom:6px;">Sell</div>
-                                <div style="font-size:22px; font-weight:700; color:var(--sell-color); line-height:1;">${_rs.sell_count || 0}</div>
+                                <div id="resumeReadySellCount" style="font-size:22px; font-weight:700; color:var(--sell-color); line-height:1;">${_rs.sell_count || 0}</div>
                                 <div style="font-size:10px; color:var(--slate-600); margin-top:4px;">offers</div>
                             </div>
                             <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.09); border-radius:11px; padding:13px 10px; text-align:center;">
@@ -32242,10 +32472,11 @@
                         </div>
 
                         ${bootstrapBlock ? `<div class="v4-modal-note" style="margin-bottom:16px;">${escapeHtml(bootstrapBlock.message)} The offers remain live until Sage confirms cancellation.</div>` : ''}
+                        <div id="resumeReadyBookWarning" role="status" class="v4-modal-note" style="margin-bottom:16px; display:none;"></div>
                         <div style="display:flex; gap:10px;">
                             ${bootstrapBlock
                                 ? '<button class="btn btn-config btn-primary" onclick="closeResumeAfterLoad()" style="flex:1; padding:12px 16px;">Review Offers and Cancel All</button>'
-                                : '<button class="btn btn-config btn-secondary" onclick="dismissResumeAfterLoad()" style="flex:1; padding:12px 16px;">↺ Start Fresh</button><button class="btn btn-start btn-primary" onclick="resumeStartNow()" style="flex:2; padding:12px 16px; font-size:1.02em; font-weight:700; letter-spacing:0.01em;">▶ Start Bot Now</button>'}
+                                : '<button class="btn btn-config btn-secondary" onclick="closeResumeAfterLoad()" style="flex:1; padding:12px 16px;">Review Offers</button><button class="btn btn-config btn-secondary" onclick="dismissResumeAfterLoad()" style="flex:1; padding:12px 16px;">↺ Start Fresh</button><button class="btn btn-start btn-primary" onclick="resumeStartNow()" style="flex:2; padding:12px 16px; font-size:1.02em; font-weight:700; letter-spacing:0.01em;">▶ Start Bot Now</button>'}
                         </div>
                     </div></div>
                 `;
@@ -32353,8 +32584,46 @@
 
         // Called from the "Start Bot Now" button in the post-load modal
         async function resumeStartNow() {
-            document.getElementById('resumeSessionModal').classList.remove('active');
+            const modal = document.getElementById('resumeSessionModal');
+            const warning = document.getElementById('resumeReadyBookWarning');
+            const previous = _resumeSessionSummary;
+            try {
+                if (!previous) throw new Error('Session summary unavailable');
+                const response = await apiFetch(`${API_URL}/check-resume`);
+                if (!response.ok) throw new Error('Wallet offer query failed');
+                const latest = await response.json();
+                if (latest.reason === 'wallet_offer_query_not_fresh') {
+                    throw new Error('Wallet offer query is not fresh');
+                }
+                const buyCount = Number(latest.buy_count);
+                const sellCount = Number(latest.sell_count);
+                if (!Number.isSafeInteger(buyCount) || buyCount < 0
+                    || !Number.isSafeInteger(sellCount) || sellCount < 0) {
+                    throw new Error('Wallet offer counts are invalid');
+                }
+                if (!latest.can_resume || buyCount !== previous.buy_count
+                    || sellCount !== previous.sell_count) {
+                    setResumeSessionSummary(latest);
+                    const buyEl = document.getElementById('resumeReadyBuyCount');
+                    const sellEl = document.getElementById('resumeReadySellCount');
+                    if (buyEl) buyEl.textContent = String(buyCount);
+                    if (sellEl) sellEl.textContent = String(sellCount);
+                    if (warning) {
+                        warning.style.display = 'block';
+                        warning.textContent = 'The live offer book changed while this session was stopped. Review these updated counts before starting.';
+                    }
+                    return false;
+                }
+            } catch (error) {
+                if (warning) {
+                    warning.style.display = 'block';
+                    warning.textContent = 'Live offers could not be verified. Check Sage and retry before starting.';
+                }
+                return false;
+            }
+            modal.classList.remove('active');
             await startBot({ resumeExistingOffers: true });
+            return true;
         }
 
         async function startBot(options = {}) {
@@ -32453,6 +32722,15 @@
                     updateDashboardStartupLayout(bot_state);
                     // _botStarting stays true — updateUI() will clear it
                     // when it sees isRunning = true from the next status poll
+                } else if (['bootstrap_cancellation_fee_approval_required',
+                        'bootstrap_cancellation_fee_approval_stale',
+                        'bootstrap_cancellation_fee_budget_insufficient'].includes(result.reason)) {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    await openBootstrapFeeConsentReview();
                 } else if (result.needs_coin_prep) {
                     // Server detected wrong coin sizes — show coin prep modal
                     showToast(`Coins need re-splitting for ${result.target_xch} XCH offers`, 'warning');
@@ -32720,6 +32998,233 @@
         }
 
         let _cancelAllContext = null;
+        let _refreshAbortPreview = null;
+
+        async function loadRefreshAbortReview() {
+            const panel = document.getElementById('refreshAbortPanel');
+            const summary = document.getElementById('refreshAbortSummary');
+            const action = document.getElementById('refreshAbortActionBtn');
+            const broad = document.getElementById('cancelAllConfirmBtn');
+            const campaignRow = document.getElementById('refreshAbortCampaignRow');
+            const campaignSelect = document.getElementById('refreshAbortCampaign');
+            panel.hidden = true;
+            campaignRow.hidden = true;
+            broad.disabled = true;
+            action.disabled = true;
+            _refreshAbortPreview = null;
+            let preview;
+            try {
+                const response = await apiFetch(`${API_URL}/offers/refresh_abort/preview`, { cache: 'no-store' });
+                preview = await response.json();
+                if (!response.ok || preview.success !== true) throw new Error(preview.error || 'preview unavailable');
+            } catch (error) {
+                panel.hidden = false;
+                summary.textContent = 'The complete Sage book and safety state could not be verified. No cancellation will be sent.';
+                action.textContent = 'Recovery unavailable';
+                return;
+            }
+            _refreshAbortPreview = preview;
+            const hasRecovery = Boolean(preview.candidate || preview.abort);
+            if (!hasRecovery && preview.safety?.allowed === true) {
+                broad.disabled = false;
+                return;
+            }
+            document.getElementById('cancelConfirmTitle').textContent = hasRecovery
+                ? 'Recover fenced offers' : 'Offer control is blocked';
+            document.getElementById('cancelConfirmCopy').textContent = hasRecovery
+                ? 'The earlier cancellation needs exact Sage proof. Broad Cancel All is disabled; review one recorded offer at a time.'
+                : 'The safety gate is blocking wallet actions until its cause is resolved.';
+            panel.hidden = false;
+            const trades = preview.wallet?.active_trade_ids || [];
+            const fingerprint = preview.wallet?.fingerprint || 'unavailable';
+            const scope = `Sage wallet ${fingerprint}: ${trades.length} live offer${trades.length === 1 ? '' : 's'}, ${preview.wallet?.pending_transaction_count ?? '?'} pending transaction(s).`;
+            document.getElementById('cancelOfferCount').textContent = scope;
+            const proofIds = preview.safety?.blocking_operation_ids;
+            const exactCancelProof = !hasRecovery
+                && preview.safety?.reason_code === 'UNRESOLVED_OPERATIONS'
+                && Number.isInteger(preview.safety?.generation)
+                && Array.isArray(proofIds) && proofIds.length > 0
+                && proofIds.every(id => /^cancel:[0-9a-f]{64}$/.test(id));
+            if (exactCancelProof && preview.safety.lease_owned
+                    && preview.wallet?.pending_transaction_count === 0) {
+                summary.textContent = `${scope} Check Sage proof for ${proofIds.length} previously submitted cancellation${proofIds.length === 1 ? '' : 's'}. No new cancellation will be sent.`;
+                action.textContent = 'Check submitted cancellations';
+                action.disabled = false;
+                return;
+            }
+            if (!hasRecovery || !preview.safety?.lease_owned || preview.wallet?.pending_transaction_count !== 0) {
+                summary.textContent = `${scope} Exact recovery is unavailable; the wallet remains fenced.`;
+                action.textContent = 'Recovery blocked';
+                return;
+            }
+            if (preview.stage === 'submitted_parent_proof' || preview.stage === 'fenced') {
+                const campaigns = preview.stopped_campaigns || [];
+                campaignSelect.replaceChildren();
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = 'Choose the exact stopped campaign';
+                campaignSelect.appendChild(placeholder);
+                for (const campaign of campaigns) {
+                    const option = document.createElement('option');
+                    option.value = campaign.campaign_id;
+                    option.textContent = `${campaign.campaign_id.slice(0, 12)}… · ${campaign.fee_budget_xch} XCH fee cap`;
+                    campaignSelect.appendChild(option);
+                }
+                campaignRow.hidden = preview.stage !== 'submitted_parent_proof';
+                const publicationScope = preview.candidate?.published_cleanup === true
+                    ? 'The replacement is potentially public; every active wallet offer needs exact cancellation proof.'
+                    : 'The replacement child must remain unpublished while parent terminal proof is checked.';
+                summary.textContent = `${scope} Parent ${preview.candidate?.parent_trade_id?.slice(0, 14) || 'recorded'} has a submitted cancellation. ${publicationScope} No new cancellation is sent at this stage.`;
+                action.textContent = 'Check parent cancellation proof';
+                action.disabled = preview.stage === 'submitted_parent_proof';
+            } else if (preview.stage === 'parent_terminal') {
+                const next = trades[0];
+                const journal = preview.next_target_journal;
+                const expired = preview.next_expired_target_trade_id;
+                summary.textContent = journal
+                    ? `${scope} Cancellation ${journal.trade_id} needs terminal Sage proof before another offer can be touched.`
+                    : expired
+                    ? `${scope} Offer ${expired} is missing from Sage's active book. Check its natural expiry proof before closing this fence; no cancellation will be sent.`
+                    : next
+                    ? `${scope} Parent cancellation is proven. Next exact target: ${next}. One cancellation is submitted at a time, followed by Sage terminal proof.`
+                    : `${scope} All target offers must have terminal proof before this fence can close.`;
+                action.textContent = journal ? 'Check target cancellation proof'
+                    : expired ? 'Check target expiry proof'
+                    : !next ? 'Check empty-book completion' : 'Cancel this one offer';
+                action.disabled = journal?.phase === 'PREPARED';
+                if (action.disabled) summary.textContent += ' A prepared wallet effect is unresolved; no retry is allowed.';
+            } else {
+                summary.textContent = `${scope} Recovery stage ${preview.stage} requires review. No broad cancellation is allowed.`;
+                action.textContent = 'Recovery blocked';
+            }
+        }
+
+        async function runRefreshAbortAction() {
+            const preview = _refreshAbortPreview;
+            if (!preview || bot_state?.running) return;
+            const action = document.getElementById('refreshAbortActionBtn');
+            action.disabled = true;
+            const proofIds = preview.safety?.blocking_operation_ids;
+            if (!preview.candidate && !preview.abort
+                    && preview.safety?.reason_code === 'UNRESOLVED_OPERATIONS'
+                    && preview.safety?.lease_owned
+                    && preview.wallet?.pending_transaction_count === 0
+                    && Number.isInteger(preview.safety?.generation)
+                    && Array.isArray(proofIds) && proofIds.length > 0
+                    && proofIds.every(id => /^cancel:[0-9a-f]{64}$/.test(id))) {
+                const confirmed = await showStyledConfirm({ icon: '⚠',
+                    title: 'Check submitted cancellation proof?',
+                    message: `Check Sage for terminal proof of ${proofIds.length} exact submitted cancellation${proofIds.length === 1 ? '' : 's'}? No new cancellation or wallet transaction will be sent.`,
+                    confirmText: 'Check Proof', cancelText: 'Keep Wallet Fenced', style: 'danger' });
+                if (!confirmed) { await loadRefreshAbortReview(); return; }
+                try {
+                    const response = await apiFetch(`${API_URL}/offers/cancel_all`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reconciliation_only: true,
+                            expected_latch_generation: preview.safety.generation,
+                            expected_operation_ids: proofIds }),
+                    });
+                    const result = await response.json();
+                    if (response.ok && result.reconciliation_only && result.async) {
+                        showToast('Checking existing cancellation proof. No new cancellation was sent.', 'info');
+                        for (let attempt = 0; attempt < 90; attempt++) {
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            const statusResponse = await apiFetch(`${API_URL}/offers/cancel_all/status`,
+                                { cache: 'no-store' });
+                            if (!statusResponse.ok) continue;
+                            const status = await statusResponse.json();
+                            if (status.running) continue;
+                            showToast(status.message || (status.phase === 'reconciled'
+                                ? 'Submitted cancellations have terminal Sage proof.'
+                                : 'Cancellation proof is still incomplete; the wallet remains fenced.'),
+                                status.phase === 'reconciled' ? 'success' : 'warning');
+                            await loadRefreshAbortReview();
+                            return;
+                        }
+                        showToast('Proof check is still running. Reopen this review to check again.', 'warning');
+                    } else {
+                        showToast(`Proof check held: ${result.error || 'scope changed'}`, 'warning');
+                    }
+                } catch (_) {
+                    showToast('Proof check failed; no new cancellation was sent.', 'warning');
+                }
+                await loadRefreshAbortReview();
+                return;
+            }
+            const trades = preview.wallet?.active_trade_ids || [];
+            let path, body, title, message;
+            if (preview.stage === 'submitted_parent_proof' || preview.stage === 'fenced') {
+                const campaignId = preview.stage === 'fenced'
+                    ? preview.abort?.campaign_id : document.getElementById('refreshAbortCampaign').value;
+                if (!preview.candidate || !campaignId) return;
+                path = 'begin';
+                body = { confirmation: true, parent_intent_id: preview.candidate.parent_intent_id,
+                    child_intent_id: preview.candidate.child_intent_id, campaign_id: campaignId,
+                    expected_latch_generation: preview.safety.generation, expected_trade_ids: trades,
+                    published_cleanup: preview.candidate.published_cleanup === true };
+                title = 'Check exact parent cancellation?';
+                message = 'Keep the wallet fenced while CATalyst checks authoritative cancellation proof. This does not send another wallet transaction.';
+            } else if (preview.stage === 'parent_terminal' && preview.next_target_journal) {
+                if (preview.next_target_journal.phase === 'PREPARED') return;
+                path = 'reconcile_target';
+                body = { abort_id: preview.abort.abort_id,
+                    trade_id: preview.next_target_journal.trade_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check exact offer proof?';
+                message = 'Ask Sage for terminal proof for the submitted cancellation. This does not send another cancellation.';
+            } else if (preview.stage === 'parent_terminal' && preview.next_expired_target_trade_id) {
+                path = 'reconcile_target';
+                body = { abort_id: preview.abort.abort_id,
+                    trade_id: preview.next_expired_target_trade_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check natural expiry proof?';
+                message = 'Use complete Sage history and owned coin evidence to prove this exact offer expired. No cancellation or wallet transaction will be sent.';
+            } else if (preview.stage === 'parent_terminal' && trades.length === 0) {
+                path = 'complete';
+                body = { confirmation: true, abort_id: preview.abort.abort_id,
+                    expected_latch_generation: preview.abort.latch_generation };
+                title = 'Check empty wallet book?';
+                message = 'Close the recovery fence only after two complete empty Sage reads and durable terminal proof for every target.';
+            } else if (preview.stage === 'parent_terminal' && trades.length > 0) {
+                const approval = (preview.stopped_campaigns || []).find(
+                    campaign => campaign.campaign_id === preview.abort.campaign_id)?.fee_approval_id;
+                if (!approval) {
+                    showToast('The exact campaign fee approval is unavailable; no cancellation was sent.', 'warning');
+                    return;
+                }
+                path = 'cancel_next';
+                body = { confirmation: true, abort_id: preview.abort.abort_id,
+                    expected_latch_generation: preview.abort.latch_generation,
+                    expected_trade_ids: trades, expected_next_trade_id: trades[0],
+                    fee_approval_id: approval };
+                title = 'Cancel one exact live offer?';
+                message = `Sage shows ${trades.length} live offer(s). Send a cancellation for ${trades[0]} only, using the stopped campaign's fee approval? The other offers remain untouched until this one is proven terminal.`;
+            } else return;
+            const confirmed = await showStyledConfirm({ icon: '⚠', title, message,
+                confirmText: path === 'cancel_next' ? 'Cancel This Offer' : 'Check Proof',
+                cancelText: 'Keep Wallet Fenced', style: 'danger' });
+            if (!confirmed) { await loadRefreshAbortReview(); return; }
+            try {
+                const response = await apiFetch(`${API_URL}/offers/refresh_abort/${path}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const result = await response.json();
+                showToast(result.success ? `Recovery: ${result.stage}` :
+                    `Recovery held: ${result.error || result.stage || 'proof incomplete'}`,
+                    result.success ? 'info' : 'warning');
+            } catch (_) {
+                showToast('Recovery request failed; the wallet remains fenced.', 'warning');
+            }
+            await loadRefreshAbortReview();
+        }
+        document.getElementById('refreshAbortActionBtn').addEventListener('click', runRefreshAbortAction);
+        document.getElementById('refreshAbortCampaign').addEventListener('change', () => {
+            if (_refreshAbortPreview?.stage === 'submitted_parent_proof') {
+                document.getElementById('refreshAbortActionBtn').disabled =
+                    !document.getElementById('refreshAbortCampaign').value;
+            }
+        });
 
         async function cancelAllOffers(context = null) {
             if (bot_state?.running) {
@@ -32780,6 +33285,7 @@
             }
             
             document.getElementById('cancelConfirmModal').classList.add('active');
+            await loadRefreshAbortReview();
         }
         
         function closeCancelConfirm({ clearContext = true } = {}) {
@@ -32815,6 +33321,11 @@
         }
 
         async function confirmCancelAll() {
+            const review = _refreshAbortPreview;
+            if (!review || review.candidate || review.abort || review.safety?.allowed !== true) {
+                showToast('Broad cancellation is held pending exact wallet recovery review.', 'warning');
+                return;
+            }
             if (bot_state?.running) {
                 addLogEntry('warning', 'Cancel All blocked - stop the bot first');
                 showToast('Stop the bot before cancelling all offers', 'warning');
@@ -32874,8 +33385,11 @@
                 });
                 const result = await response.json();
 
-                if (!result.success) {
-                    addLogEntry('error', '   ❌ Cancel failed: ' + (result.error || 'Unknown error'));
+                const proofOnly = result.async === true && result.reconciliation_only === true;
+                if (!result.success && !proofOnly) {
+                    const failure = result.error || result.message || 'Unknown error';
+                    addLogEntry('error', '   ❌ Cancel failed: ' + failure);
+                    showToast(failure, 'error');
                     _cancelAllInProgress = false;
                     return;
                 }
@@ -32883,8 +33397,10 @@
                 // Backend runs asynchronously — open progress modal and poll
                 if (result.async) {
                     releaseImmediately = false;
-                    const total = result.total || totalActive;
-                    addLogEntry('info', `   Wallet cancel started for ${total} offers — tracking progress...`);
+                    const total = proofOnly ? 1 : (result.total || totalActive);
+                    addLogEntry('info', proofOnly
+                        ? `   ${result.message || 'Checking earlier cancellation proof; no new cancellation was submitted.'}`
+                        : `   Wallet cancel started for ${total} offers — tracking progress...`);
                     openCancelProgressModal(total);
                     startCancelAllProgressPolling(total, operationGeneration);
 
@@ -32894,12 +33410,20 @@
                     _cancelAllCompletionPoll = setInterval(async () => {
                         try {
                             const st = _get_cancel_all_state_local();
-                            if (st && (st.phase === 'complete' || st.phase === 'error')) {
+                            if (st && (st.phase === 'complete' || st.phase === 'error'
+                                || (proofOnly && ['reconciled', 'awaiting_authoritative_proof'].includes(st.phase)))) {
                                 clearCancelAllCompletionTimers();
                                 stopCancelAllProgressPolling();
                                 await fetchStatus();
                                 try { updateResumeOverview(); } catch (_re) { /* non-fatal */ }
-                                if (st.phase === 'complete') {
+                                if (proofOnly) {
+                                    const message = st.message || (st.phase === 'reconciled'
+                                        ? 'The earlier cancellation is resolved. Review the remaining offers before cancelling again.'
+                                        : 'The earlier cancellation still awaits Sage proof. No new cancellation was submitted.');
+                                    const severity = st.phase === 'reconciled' ? 'success' : 'warning';
+                                    addLogEntry(severity, `   ${message}`);
+                                    showToast(message, severity);
+                                } else if (st.phase === 'complete') {
                                     const view = cancelAllProgressView(st, total);
                                     addLogEntry(view.severity, `   ${view.message}`);
                                     showToast(view.message, view.severity);
@@ -32915,7 +33439,7 @@
                                 } else {
                                     addLogEntry('error', `   ❌ ${st.message || 'Cancel all failed'}`);
                                     showToast(st.message || 'Cancel all failed', 'error');
-                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED'].includes(String(st.reason_code || ''))) {
+                                    if (['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH', 'FEE_BUDGET_APPROVAL_REQUIRED', 'FEE_BUDGET_EXCEEDED', 'FEE_CAMPAIGN_BUDGET_EXCEEDED', 'FEE_PREP_FUNDING_INSUFFICIENT'].includes(String(st.reason_code || ''))) {
                                         await reviewCancelAllFeeBudgetFailure(st);
                                     }
                                 }
@@ -32932,7 +33456,9 @@
                         if (operationGeneration !== _cancelAllOperationGeneration) return;
                         clearCancelAllCompletionTimers();
                         stopCancelAllProgressPolling();
-                        const timeoutMessage = 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
+                        const timeoutMessage = proofOnly
+                            ? 'Cancellation proof check timed out. No new cancellation was submitted; check Sage and safety status.'
+                            : 'Cancellation status timed out. No offer was treated as terminal; check Sage, then retry Cancel All.';
                         _cancelAllLastState = {
                             success: false,
                             phase: 'error',
@@ -33009,6 +33535,8 @@
                 const reason = String(status?.reason_code || status?.code || '');
                 banner.textContent = ['FEE_APPROVAL_STALE', 'FEE_APPROVAL_LEGACY_UNSCOPED', 'FEE_APPROVAL_RECOVERY_ONLY', 'FEE_APPROVAL_RECOVERY_ACTION_MISMATCH'].includes(reason)
                     ? 'The previous cancellation fee approval or network quote has expired. Review the fresh estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
+                    : reason === 'FEE_BUDGET_APPROVAL_REQUIRED'
+                        ? 'This campaign has live offers but no campaign-bound cancellation fee approval. Review the cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                     : reason === 'FEE_PREP_FUNDING_INSUFFICIENT'
                         ? 'The current cancellation fee funding is insufficient. Review the fresh cancellation-only estimate below and explicitly approve its cumulative maximum before cancellation can continue.'
                         : 'The previous campaign fee ceiling has been reached. Review the authoritative spend below and explicitly approve a new cumulative maximum before cancellation can continue.';
@@ -33059,14 +33587,20 @@
             const failed = Number(status.failed) || 0;
             const processed = Math.min(total || cancelled, cancelled);
             const phase = String(status.phase || 'starting').toLowerCase();
-            const isDone = phase === 'complete' || phase === 'error';
+            const isDone = ['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(phase);
             const remaining = Math.max(0, total - processed);
             const terminalComplete = phase === 'complete'
                 && cancelled === total && pending === 0 && failed === 0;
             let title = 'Cancelling offers';
             let message = status.message || 'Preparing durable cancellation requests...';
             let severity = 'info';
-            if (terminalComplete) {
+            if (phase === 'reconciled') {
+                title = 'Earlier cancellation resolved';
+                severity = 'success';
+            } else if (phase === 'awaiting_authoritative_proof') {
+                title = 'Cancellation still blocked';
+                severity = 'warning';
+            } else if (terminalComplete) {
                 title = 'Cancel all complete';
                 message = `${cancelled} offer${cancelled !== 1 ? 's are' : ' is'} authoritatively terminal.`;
                 severity = 'success';
@@ -33118,9 +33652,11 @@
             if (iconEl) iconEl.textContent = view.severity === 'success' ? '✅' : view.severity === 'error' ? '❌' : '⏳';
             if (messageEl) messageEl.textContent = view.message;
             if (summaryEl) {
-                summaryEl.textContent = total > 0
-                    ? `${processed} of ${total} offers processed`
-                    : (status.message || 'Preparing cancel request...');
+                summaryEl.textContent = ['reconciled', 'awaiting_authoritative_proof'].includes(phase)
+                    ? view.message
+                    : total > 0
+                        ? `${processed} of ${total} offers processed`
+                        : (status.message || 'Preparing cancel request...');
             }
             if (statusEl) statusEl.textContent = status.message || 'Waiting for wallet progress...';
             if (processedEl) processedEl.textContent = `${processed} / ${total || 0}`;
@@ -33136,7 +33672,7 @@
                 percent = Math.max(8, Math.min(98, Math.round((processed / total) * 100)));
             }
             if (barEl) barEl.style.width = `${percent}%`;
-            if (closeBtn) closeBtn.textContent = (phase === 'complete' || phase === 'error') ? 'Close' : 'Hide';
+            if (closeBtn) closeBtn.textContent = isDone ? 'Close' : 'Hide';
             if (isDone) _stopCancelDots();
         }
 
@@ -33147,7 +33683,7 @@
                 if (!status || status.success === false) return;
                 if (operationGeneration !== _cancelAllOperationGeneration) return;
                 const statusPhase = String(status.phase || '').toLowerCase();
-                if (!_cancelAllInProgress && statusPhase !== 'complete' && statusPhase !== 'error') {
+                if (!_cancelAllInProgress && !['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(statusPhase)) {
                     return;
                 }
                 const terminalEmptyBook = statusPhase === 'complete'
@@ -33169,7 +33705,9 @@
                 if (status.message && progressKey !== _cancelAllLastProgressKey) {
                     const severity = status.phase === 'error'
                         ? 'error'
-                        : status.phase === 'complete'
+                        : status.phase === 'awaiting_authoritative_proof'
+                            ? 'warning'
+                        : status.phase === 'complete' || status.phase === 'reconciled'
                             ? 'success'
                             : 'info';
                     addLogEntry(severity, `   ${status.message}`);
@@ -33179,7 +33717,7 @@
                 const offerRefreshKey = `${status.cancelled || 0}|${status.pending || 0}|${status.failed || 0}|${status.current_batch || 0}|${status.phase || ''}`;
                 const shouldRefreshOffers = (
                     offerRefreshKey !== _cancelAllLastOfferRefreshKey
-                    && (status.pending || status.failed || status.phase === 'complete' || status.phase === 'error')
+                    && (status.pending || status.failed || ['complete', 'error', 'reconciled', 'awaiting_authoritative_proof'].includes(status.phase))
                 );
                 if (shouldRefreshOffers) {
                     _cancelAllLastOfferRefreshKey = offerRefreshKey;
@@ -33925,10 +34463,15 @@
                 if (!stopResp.ok || stopResult.error) {
                     throw new Error(stopResult.error || 'Could not request bot stop.');
                 }
-                setShutdownStep('Stop', 'active', 'Stop requested. Waiting for the bot to report completion.');
-                await waitForShutdownBotStop();
-                setShutdownStep('Stop', 'done', 'Bot reports stop complete. Server shutdown will separately verify remaining cleanup.');
-                addLogEntry('success', '   Bot reports stop complete; server shutdown will verify remaining cleanup');
+                if (stopResult.status === 'stopped' && stopResult.bot_initialized === false && stopResult.running === false) {
+                    setShutdownStep('Stop', 'done', 'No bot was initialised. Server shutdown will verify remaining cleanup.');
+                    addLogEntry('success', '   No bot was initialised; server shutdown will verify remaining cleanup');
+                } else {
+                    setShutdownStep('Stop', 'active', 'Stop requested. Waiting for the bot to report completion.');
+                    await waitForShutdownBotStop();
+                    setShutdownStep('Stop', 'done', 'Bot reports stop complete. Server shutdown will separately verify remaining cleanup.');
+                    addLogEntry('success', '   Bot reports stop complete; server shutdown will verify remaining cleanup');
+                }
 
                 // Step 2: Cancel offers (if requested)
                 if (cancelOffers) {
@@ -34932,10 +35475,41 @@
             return adjustments;
         }
 
+        function omitInactiveBlankSettings(config) {
+            const blankNumber = key => typeof config[key] === 'number' && !Number.isFinite(config[key]);
+            const omit = keys => keys.forEach(key => { if (blankNumber(key)) delete config[key]; });
+            const dbxInput = document.getElementById('configDbxMaxSpreadBps');
+            if (dbxInput?.closest('.form-group')?.style.display === 'none'
+                    && dbxInput.value === '') {
+                omit(['dbx_max_spread_bps']);
+            }
+            if (!config.tier_enabled) {
+                omit(['inner_size_xch', 'mid_size_xch', 'outer_size_xch', 'extreme_size_xch']);
+            }
+            if (!config.auto_requote) {
+                omit(['requote_bps', 'requote_cooldown', 'requote_batch_size']);
+            }
+            if (!config.dynamic_spread_enabled) {
+                omit(['base_spread_bps', 'min_spread_bps', 'max_spread_bps', 'volatility_window_hours']);
+            }
+            if (!config.inventory_enabled) {
+                omit(['skew_intensity', 'max_position_xch']);
+            }
+            return config;
+        }
+
         async function saveConfig() {
             setSaveConfigButtonState(true, 'Saving Settings...');
+            const spreadInput = document.getElementById('configSpreadBps');
+            const spreadValue = Number(spreadInput?.value);
+            if (!Number.isFinite(spreadValue) || spreadValue <= 0) {
+                showToast('Spread must be a positive percentage before saving settings.', 'error');
+                if (spreadInput) spreadInput.style.borderColor = 'var(--status-danger)';
+                setSaveConfigButtonState(false);
+                return;
+            }
             // Client-side spread warning (value is now in %)
-            const spreadPct = parseFloat(document.getElementById('configSpreadBps')?.value) || 0;
+            const spreadPct = spreadValue;
             if (spreadPct > 0 && spreadPct < 2) {
                 const proceed = await showStyledConfirm({
                     icon: '📉',
@@ -35283,6 +35857,16 @@
                 sage_set_change_address: document.getElementById('configSageChangeAddress').checked,
             };
             config = normalizeConfigForLiquidityMode(config);
+            omitInactiveBlankSettings(config);
+
+            const invalidConfigField = Object.entries(config).find(([, value]) =>
+                value == null || (typeof value === 'number' && !Number.isFinite(value))
+            );
+            if (invalidConfigField) {
+                showToast(`Cannot save: ${invalidConfigField[0].replaceAll('_', ' ')} is blank or invalid.`, 'error');
+                setSaveConfigButtonState(false);
+                return;
+            }
 
             const activeOffers = (bot_state && bot_state.offers)
                 ? (bot_state.offers.buy_count || 0) + (bot_state.offers.sell_count || 0)
@@ -35675,7 +36259,7 @@ function closeCtgErrorModal() {
         // the requested config. If everything matches we close the modal and
         // mark coin prep as done; otherwise we open the confirm view so the
         // user can decide whether to run prep.
-        async function checkIfCoinPrepNeeded(config) {
+        async function checkIfCoinPrepNeeded(config, { strictCampaignReview = false } = {}) {
             try {
                 config = normalizeConfigForLiquidityMode(config || {});
                 const bootstrapCampaign = _bootstrapActiveCampaign?.campaign_id
@@ -35872,6 +36456,14 @@ function closeCtgErrorModal() {
                     if (verifyTimeoutId !== null) clearTimeout(verifyTimeoutId);
                 }
                 const result = await resp.json();
+                if (strictCampaignReview && (!resp.ok || result?.success !== true
+                    || result.bootstrap_campaign_id !== bootstrapCampaign?.campaign_id
+                    || !Number.isSafeInteger(result.bootstrap_campaign_revision)
+                    || result.bootstrap_campaign_revision !== bootstrapCampaign?.revision
+                    || typeof result.all_sufficient !== 'boolean'
+                    || typeof result.balance_sufficient !== 'boolean')) {
+                    throw new Error('Exact saved campaign coin verification is unavailable or changed.');
+                }
                 debugLog('[COIN-PREP] verify result:', result);
 
                 // The verify endpoint returns sufficient/all_sufficient/insufficient
@@ -35886,7 +36478,7 @@ function closeCtgErrorModal() {
                     dismissCoinPrepConfirmLoading();
                     setCoinPrepStatus('done');
                     showToast('Coin prep skipped — wallet already has the right coins.', 'success');
-                    return;
+                    return true;
                 }
 
                 // Need prep — switch the modal from "loading" state into the
@@ -35897,7 +36489,13 @@ function closeCtgErrorModal() {
                     || result?.message
                     || 'Your wallet needs to be split into the right coin sizes for the new settings.';
                 showCoinPrepConfirm(config, reason, reasonMessage, result);
+                return true;
             } catch (err) {
+                if (strictCampaignReview) {
+                    dismissCoinPrepConfirmLoading();
+                    setCoinPrepStatus('none');
+                    throw err;
+                }
                 debugWarn('[COIN-PREP] checkIfCoinPrepNeeded failed:', err);
                 // On error, fall back to showing the confirm view so the user
                 // can choose to run prep manually rather than getting stuck.
@@ -36137,6 +36735,149 @@ function closeCtgErrorModal() {
                 options.cancellation_recovery_action = recoveryAction;
             }
             return options;
+        }
+
+        let _bootstrapFeeConsentPreview = null;
+        let _bootstrapFeeConsentCampaign = null;
+        let _bootstrapFeeConsentBusy = false;
+        let _bootstrapFeeConsentRequest = 0;
+
+        function closeBootstrapFeeConsentReview() {
+            ++_bootstrapFeeConsentRequest;
+            _bootstrapFeeConsentPreview = null;
+            _bootstrapFeeConsentCampaign = null;
+            document.getElementById('bootstrapFeeConsentOverlay')?.classList.remove('active');
+        }
+
+        async function openBootstrapFeeConsentReview() {
+            const campaign = _bootstrapActiveCampaign;
+            if (!campaign?.campaign_id || campaign.status !== 'active') {
+                showToast('The active campaign must be verified before fee approval.', 'warning');
+                return;
+            }
+            _bootstrapFeeConsentCampaign = {
+                campaign_id: String(campaign.campaign_id),
+                revision: Number(campaign.revision),
+                fee_budget_xch: String(campaign.fee_budget_xch),
+                asset_id: String(campaign.asset_id || ''),
+            };
+            _bootstrapFeeConsentPreview = null;
+            document.getElementById('bootstrapFeeConsentOverlay')?.classList.add('active');
+            await refreshBootstrapFeeConsentReview();
+        }
+
+        async function refreshBootstrapFeeConsentReview() {
+            const campaign = _bootstrapFeeConsentCampaign;
+            const summary = document.getElementById('bootstrapFeeConsentSummary');
+            const error = document.getElementById('bootstrapFeeConsentError');
+            const approve = document.getElementById('bootstrapFeeConsentApprove');
+            const refresh = document.getElementById('bootstrapFeeConsentRefresh');
+            if (!campaign || _bootstrapFeeConsentBusy) return;
+            const requestId = ++_bootstrapFeeConsentRequest;
+            _bootstrapFeeConsentPreview = null;
+            if (approve) approve.disabled = true;
+            if (refresh) refresh.disabled = true;
+            if (summary) summary.textContent = 'Checking wallet and network fees…';
+            if (error) error.textContent = '';
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/fee-preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        coin_multiplier: '1', target_seconds: 300,
+                        bootstrap_campaign_id: campaign.campaign_id,
+                        bootstrap_campaign_revision: campaign.revision,
+                    }),
+                });
+                const preview = await response.json();
+                if (requestId !== _bootstrapFeeConsentRequest) return;
+                if (!response.ok || preview.success !== true || preview.available !== true
+                        || preview.funded !== true || !preview.preview_id) {
+                    throw new Error(preview.reason || 'A current funded estimate is unavailable');
+                }
+                if (String(preview.wallet?.campaign_id) !== campaign.campaign_id
+                        || !campaign.asset_id
+                        || String(preview.wallet?.asset_id) !== campaign.asset_id
+                        || String(currentCAT?.asset_id || '') !== campaign.asset_id
+                        || Number(preview.preparation_transaction_count_min) !== 0
+                        || Number(preview.preparation_transaction_count_max) !== 0) {
+                    throw new Error('The campaign or coin preparation plan changed. Return to Coin Prep before starting.');
+                }
+                const reserve = canonicalCoinPrepMojos(preview.minimum_cancellation_reserve_mojos);
+                const minimum = canonicalCoinPrepMojos(preview.minimum_cumulative_fee_mojos);
+                const campaignCap = BigInt(coinPrepXchToMojos(campaign.fee_budget_xch));
+                if (reserve <= 0n || minimum > campaignCap || Date.now() / 1000 >= Number(preview.expires_at)) {
+                    throw new Error('Cancellation protection is not covered by this campaign cap or the estimate expired.');
+                }
+                _bootstrapFeeConsentPreview = preview;
+                if (summary) summary.textContent = [
+                    `Sage ${preview.wallet.wallet_fingerprint} · wallet ${preview.wallet.wallet_id} · ${preview.wallet.network}`,
+                    `Asset: ${campaign.asset_id}`,
+                    '0 preparation transactions · existing coins reused',
+                    `Current remaining plan estimate: ${coinPrepMojosToXch(preview.estimated_total_fee_mojos)} XCH`,
+                    `Protected cancellation: ${coinPrepMojosToXch(reserve.toString())} XCH`,
+                    `Previously spent: ${coinPrepMojosToXch(preview.fee_accounting?.spent_fee_mojos ?? '0')} XCH · held: ${coinPrepMojosToXch(preview.fee_accounting?.held_fee_mojos ?? '0')} XCH`,
+                    `Campaign fee cap: ${campaign.fee_budget_xch} XCH`,
+                ].join('\n');
+                const input = document.getElementById('bootstrapFeeConsentMaximum');
+                if (input) input.value = campaign.fee_budget_xch;
+                if (approve) approve.disabled = false;
+            } catch (problem) {
+                if (requestId === _bootstrapFeeConsentRequest) {
+                    if (summary) summary.textContent = 'No fee approval was recorded. The bot remains stopped.';
+                    if (error) error.textContent = formatError(problem);
+                }
+            } finally {
+                if (requestId === _bootstrapFeeConsentRequest && refresh) refresh.disabled = false;
+            }
+        }
+
+        async function approveBootstrapFeeConsent() {
+            if (_bootstrapFeeConsentBusy) return;
+            const campaign = _bootstrapFeeConsentCampaign;
+            const preview = _bootstrapFeeConsentPreview;
+            const error = document.getElementById('bootstrapFeeConsentError');
+            const approve = document.getElementById('bootstrapFeeConsentApprove');
+            if (!campaign || !preview) return;
+            _bootstrapFeeConsentBusy = true;
+            if (approve) approve.disabled = true;
+            if (error) error.textContent = '';
+            try {
+                if (_bootstrapActiveCampaign?.campaign_id !== campaign.campaign_id
+                        || Number(_bootstrapActiveCampaign?.revision) !== campaign.revision
+                        || Date.now() / 1000 >= Number(preview.expires_at)) {
+                    throw new Error('Campaign or fee estimate changed. Refresh and review it again.');
+                }
+                const maximum = BigInt(coinPrepXchToMojos(
+                    document.getElementById('bootstrapFeeConsentMaximum')?.value
+                ));
+                const minimum = canonicalCoinPrepMojos(preview.minimum_cumulative_fee_mojos);
+                const reserve = canonicalCoinPrepMojos(preview.minimum_cancellation_reserve_mojos);
+                const campaignCap = BigInt(coinPrepXchToMojos(campaign.fee_budget_xch));
+                if (maximum < minimum || maximum < reserve || maximum > campaignCap) {
+                    throw new Error('Choose a cap covering the current estimate and cancellation reserve, within the campaign fee cap.');
+                }
+                const response = await apiFetch(`${API_URL}/coin-prep/fee-approval`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        preview_id: preview.preview_id,
+                        maximum_fee_mojos: maximum.toString(),
+                        cancellation_reserve_mojos: reserve.toString(),
+                    }),
+                });
+                const result = await response.json();
+                if (!response.ok || result.success !== true || !result.approval_id) {
+                    throw new Error(result.reason || 'Fee approval was not recorded');
+                }
+                closeBootstrapFeeConsentReview();
+                showToast('Campaign cancellation fee cap approved. No transaction was sent. Review Start Bot again.', 'success');
+            } catch (problem) {
+                if (error) error.textContent = formatError(problem);
+            } finally {
+                _bootstrapFeeConsentBusy = false;
+                if (approve) approve.disabled = !_bootstrapFeeConsentPreview;
+            }
         }
 
         function setCoinPrepFeeText(id, value) {
@@ -36745,24 +37486,20 @@ function closeCtgErrorModal() {
                 btn.textContent = 'Checking history…';
             }
 
-            // Pre-prep: show the tri-checkbox history modal. Returns
-            // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
-            // When there's no data worth preserving it short-circuits to
-            // 'proceed' with all resets false so first-run UX is frictionless.
-            const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
-                .includes(String(recoveryIntent?.action || ''));
-            const historyChoice = cancellationOnlyRecovery
-                ? {action: 'proceed', resets: {}}
-                : await askPrepHistoryChoice();
-            if (!historyChoice || historyChoice.action === 'cancel') {
-                _coinPrepFeeConfirmBusy = false;
-                validateCoinPrepFeeMaximum();
-                return;
-            }
-            const resets = historyChoice.resets || {};
-            if (btn) btn.textContent = 'Starting...';
-
             try {
+                // Pre-prep: show the tri-checkbox history modal. Returns
+                // { action: 'proceed'|'cancel', resets: {pnl, offers, counters} }.
+                // When there's no data worth preserving it short-circuits to
+                // 'proceed' with all resets false so first-run UX is frictionless.
+                const cancellationOnlyRecovery = ['cancel_all', 'bootstrap_stop']
+                    .includes(String(recoveryIntent?.action || ''));
+                const historyChoice = cancellationOnlyRecovery
+                    ? {action: 'proceed', resets: {}}
+                    : await askPrepHistoryChoice();
+                if (!historyChoice || historyChoice.action === 'cancel') return;
+                const resets = historyChoice.resets || {};
+                if (btn) btn.textContent = 'Starting...';
+
                 if (confirmedPreview !== _coinPrepFeePreview) {
                     throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
                 }
@@ -36899,7 +37636,11 @@ function closeCtgErrorModal() {
             } finally {
                 _coinPrepFeeConfirmBusy = false;
                 const confirmView = document.getElementById('coinPrepConfirmView');
-                if (confirmView && confirmView.style.display !== 'none' && _coinPrepFeePreview) {
+                if (confirmView && confirmView.style.display !== 'none') {
+                    // A failed pre-start is a review state, not an active worker.
+                    // Restore the label even when expiry/provider failure keeps
+                    // the action disabled until a new quote is reviewed.
+                    if (btn) btn.textContent = _coinPrepConfirmReadyText;
                     validateCoinPrepFeeMaximum();
                 }
             }
@@ -38813,6 +39554,13 @@ function startupPollUntilReady() {
                 return;
             }
 
+            if (status.phase === 'error') {
+                startupSetPhase('error', 'Sage startup failed', 'Check Sage and retry', '');
+                document.getElementById('startupStartingFeedback').style.display = 'none';
+                startupShowError('Sage startup failed. Check Sage and retry.');
+                return;
+            }
+
             if (status.phase === 'ready') {
                 debugLog('[STARTUP POLL] Ready! Dismissing modal.');
                 startupSetPhase('done', 'Connected!', _startupWalletLabel + ' wallet is healthy and ready', '');
@@ -40059,13 +40807,27 @@ function syncBootstrapCampaignPairIntoSelectors(payload) {
 }
 
 function _bootstrapRenderStatus(payload) {
+    const prepReview = document.getElementById('bootstrapPrepReviewBtn');
     const globalStatus = document.getElementById('bootstrapGlobalStatus');
     const dashboardStatus = document.getElementById('bootstrapDashboardStatus');
     const stop = document.getElementById('bootstrapStopBtn');
+    const reconcileExpired = document.getElementById('bootstrapReconcileExpiredBtn');
+    const reconcileTerminal = document.getElementById('bootstrapReconcileTerminalBtn');
+    const reconcileCompleted = document.getElementById('bootstrapReconcileCompletedBtn');
     const stoppedRetry = document.getElementById('bootstrapRetryStoppedBtn');
     const exporter = document.getElementById('bootstrapManifestExportBtn');
     const hadActiveCampaign = !!_bootstrapActiveCampaign;
     _bootstrapActiveCampaign = payload?.active && payload?.campaign ? payload.campaign : null;
+    const completedProofAlert = document.getElementById('bootstrapCompletedProofAlert');
+    if (completedProofAlert?.dataset.campaignId
+        && completedProofAlert.dataset.campaignId !== (_bootstrapActiveCampaign?.campaign_id || '')) {
+        completedProofAlert.style.display = 'none';
+        completedProofAlert.textContent = '';
+        delete completedProofAlert.dataset.campaignId;
+    }
+    const maxOffersLabel = document.getElementById('ccMaxOffersLabel');
+    if (maxOffersLabel) maxOffersLabel.textContent = _bootstrapActiveCampaign?.status === 'active'
+        ? 'Follow Limits' : 'Max Offers';
     const unresolvedCreationCount = Number(_bootstrapActiveCampaign?.unresolved_creation_count || 0);
     const hasUnresolvedCreation = Number.isSafeInteger(unresolvedCreationCount)
         && unresolvedCreationCount > 0;
@@ -40144,7 +40906,7 @@ function _bootstrapRenderStatus(payload) {
                 summary = `Bootstrap expired — cancellation required for ${offerPhrase} · ${String(campaign.asset_id || '').slice(0, 12)}… · revision ${campaign.revision}`;
             }
         } else {
-            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% deployed · ${remainingTime} · revision ${campaign.revision}`;
+            summary = `Bootstrap active · ${String(campaign.asset_id || '').slice(0, 12)}… · stage ${campaign.stage || 'bootstrap'} · ${(Number(campaign.deployment_fraction || 0) * 100).toFixed(0)}% stage target · ${remainingTime} · revision ${campaign.revision}`;
         }
         campaign._uiCooldownCount = cooldowns;
     }
@@ -40180,12 +40942,41 @@ function _bootstrapRenderStatus(payload) {
             : hasUnresolvedCreation ? 'Stop & Review Campaign'
                 : noActiveCampaignOffers ? 'Stop Campaign' : 'Stop & Cancel Campaign Offers';
     }
+    if (reconcileExpired) {
+        const exactTrades = _bootstrapActiveCampaign?.reconciliation_trade_ids;
+        const canProve = _bootstrapActiveCampaign?.status === 'active'
+            && Array.isArray(exactTrades) && exactTrades.length > 0
+            && exactTrades.length === Number(_bootstrapActiveCampaign.open_offer_count)
+            && !hasUnresolvedCreation;
+        reconcileExpired.style.display = canProve ? '' : 'none';
+        reconcileExpired.disabled = !canProve || !!bot_state?.running;
+    }
+    if (reconcileTerminal) {
+        const count = Number(_bootstrapActiveCampaign?.open_offer_count || 0);
+        const canReview = _bootstrapActiveCampaign?.status === 'active'
+            && _bootstrapActiveCampaign?.expired === true
+            && Number.isSafeInteger(count) && count > 0;
+        reconcileTerminal.style.display = canReview ? '' : 'none';
+        reconcileTerminal.disabled = !canReview || !!bot_state?.running;
+    }
+    if (reconcileCompleted) {
+        const canProve = _bootstrapActiveCampaign?.status === 'active'
+            && Number(_bootstrapActiveCampaign.open_offer_count) > 0
+            && !hasUnresolvedCreation;
+        reconcileCompleted.style.display = canProve ? '' : 'none';
+        reconcileCompleted.disabled = !canProve || !!bot_state?.running;
+    }
     if (stoppedRetry) {
         const separateRetry = !!_bootstrapActiveCampaign && !!_bootstrapPendingStopRetry;
         stoppedRetry.style.display = separateRetry ? '' : 'none';
         stoppedRetry.disabled = !separateRetry;
     }
     if (exporter) exporter.disabled = !_bootstrapActiveCampaign;
+    if (prepReview) {
+        const canReview = !!bootstrapSetupScope(_bootstrapActiveCampaign);
+        prepReview.style.display = canReview ? '' : 'none';
+        prepReview.disabled = !canReview || !!bot_state?.running || _bootstrapPrepReviewBusy;
+    }
     const proofExporter = document.getElementById('bootstrapParticipationExportBtn');
     if (proofExporter) proofExporter.disabled = !_bootstrapActiveCampaign;
 }
@@ -40261,6 +41052,72 @@ async function bootstrapPreviewCampaign() {
     }
 }
 
+async function reviewBootstrapCampaignCoinPrep() {
+    if (_bootstrapPrepReviewBusy || bot_state?.running) return;
+    const expected = bootstrapSetupScope(_bootstrapActiveCampaign);
+    if (!expected) return;
+    _bootstrapPrepReviewBusy = true;
+    _bootstrapSetupReviewScope = '';
+    const button = document.getElementById('bootstrapPrepReviewBtn');
+    if (button) button.disabled = true;
+    try {
+        const response = await apiFetch('/api/bootstrap/status', {cache: 'no-store'});
+        const status = await response.json();
+        if (!response.ok || status?.success !== true || status.active !== true
+            || expected !== bootstrapSetupScope(status.campaign)
+            || expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            throw new Error('Saved campaign changed or is unavailable. Review its exact scope again.');
+        }
+        const configResponse = await apiFetch(`${API_URL}/config`, {cache: 'no-store'});
+        const raw = await configResponse.json();
+        const get = key => raw?.[key] ?? raw?.[key.toLowerCase()];
+        const count = Number(get('FEE_PREP_COUNT'));
+        const size = Number(get('FEE_COIN_SIZE_XCH'));
+        const reserves = ['XCH_RESERVE', 'CAT_RESERVE'].map(get);
+        if (!configResponse.ok || !Number.isSafeInteger(count) || count < 1
+            || !Number.isFinite(size) || size <= 0
+            || reserves.some(value => value == null || value === ''
+                || !Number.isFinite(Number(value)) || Number(value) < 0)) {
+            throw new Error('Existing configured fee pool is unavailable. Review fee funding before preparation.');
+        }
+        if (expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            throw new Error('Campaign changed during review. Review again.');
+        }
+        const config = {
+            liquidity_mode: 'two_sided',
+            xch_reserve: get('XCH_RESERVE') ?? 0,
+            cat_reserve: get('CAT_RESERVE') ?? 0,
+            coin_prep_multiplier: get('COIN_PREP_MULTIPLIER') ?? 1,
+            fee_prep_count: count,
+            fee_coin_size_xch: get('FEE_COIN_SIZE_XCH'),
+        };
+        // This is a new campaign review, never a continuation of the old
+        // cancellation-only UI intent. Durable approvals are not modified here.
+        _coinPrepFeeRecoveryIntent = null;
+        _coinPrepFeePreview = null;
+        _coinPrepFeePreviewOptions = null;
+        setCoinPrepStatus('checking');
+        showCoinPrepConfirmLoading(config);
+        await checkIfCoinPrepNeeded(config, {strictCampaignReview: true});
+        if (expected !== bootstrapSetupScope(_bootstrapActiveCampaign) || bot_state?.running) {
+            dismissCoinPrepConfirmLoading();
+            document.getElementById('coinPrepConfirmOverlay')?.classList.remove('active');
+            _coinPrepFeePreview = null;
+            setCoinPrepStatus('none');
+            throw new Error('Campaign changed during coin verification. Review again.');
+        }
+        _bootstrapSetupReviewScope = expected;
+        checkSettingsReviewed();
+    } catch (error) {
+        _bootstrapSetupReviewScope = '';
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Campaign preparation review failed.');
+        showToast(error?.message || 'Campaign preparation review failed.', 'warning');
+    } finally {
+        _bootstrapPrepReviewBusy = false;
+        if (button) button.disabled = !!bot_state?.running || !bootstrapSetupScope(_bootstrapActiveCampaign);
+    }
+}
+
 async function bootstrapStartCampaign() {
     try {
         if (!_bootstrapPreviewDigest || !_bootstrapPreviewBody) throw new Error('Preview the campaign again before starting.');
@@ -40295,6 +41152,201 @@ function bootstrapStopResultText(payload) {
         ? 'Campaign stopped. No campaign-owned offers needed cancellation.'
         : `Campaign stopped. ${count} campaign-owned offer cancellation(s) submitted.`;
 }
+
+async function bootstrapReconcileTerminalOffers() {
+    const campaign = _bootstrapActiveCampaign;
+    if (campaign?.status !== 'active' || campaign?.expired !== true || bot_state?.running) return;
+    const button = document.getElementById('bootstrapReconcileTerminalBtn');
+    if (button) button.disabled = true;
+    try {
+        const params = new URLSearchParams({
+            campaign_id: campaign.campaign_id,
+            revision: String(campaign.revision),
+        });
+        const previewResponse = await apiFetch('/api/bootstrap/preview_terminal?' + params);
+        const preview = await previewResponse.json();
+        const offers = preview?.offers;
+        const openCount = Number(campaign.open_offer_count);
+        if (!preview?.success || !Array.isArray(offers)
+            || !Number.isSafeInteger(openCount) || openCount < 1
+            || offers.length < openCount || offers.length > 256
+            || preview.campaign_id !== campaign.campaign_id
+            || preview.revision !== campaign.revision
+            || preview.asset_id !== campaign.asset_id
+            || preview.sage_live_offers !== 0
+            || preview.sage_pending_transactions !== 0
+            || !/^[a-f0-9]{64}$/.test(String(preview.proof_digest || ''))
+            || offers.some(offer => !/^[a-f0-9]{64}$/.test(String(offer.trade_id || ''))
+                || !['buy', 'sell'].includes(offer.side)
+                || !['FILLED_PROVEN', 'EXPIRED_PROVEN'].includes(offer.classification))) {
+            throw new Error('The complete exact terminal proof could not be reviewed');
+        }
+        const reviewed = {...preview};
+        delete reviewed.success;
+        const lines = offers.map(offer =>
+            `${offer.side.toUpperCase()} ${offer.tier} ${offer.trade_id}: ${offer.classification}${offer.already_terminal ? ' (already terminal)' : ''}`
+        );
+        const approved = await showStyledConfirm({
+            icon: '🔎',
+            title: 'Verify Terminal Offers in Sage?',
+            message: `Campaign ${campaign.campaign_id}, revision ${campaign.revision}\n`
+                + `Wallet ${preview.wallet_fingerprint_hash}, ${preview.network}\n`
+                + `Asset ${preview.asset_id}\nLatch generation ${preview.latch_generation}\n\n`
+                + `${lines.join('\n')}\n\n`
+                + 'CATalyst will recheck the full Sage book and each exact outcome before updating local records. Trading stays stopped. No wallet transaction will be sent.',
+            confirmText: 'Confirm database-only reconciliation',
+            cancelText: 'Keep current state',
+            style: 'warning',
+            proofReview: true,
+        });
+        if (!approved) return;
+        const response = await apiFetch('/api/bootstrap/commit_terminal', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({reviewed}),
+        });
+        const result = await response.json();
+        if (!result?.success) {
+            throw new Error('Terminal commit was refused or interrupted; a partial commit may have occurred. Obtain a fresh preview before retrying.');
+        }
+        const summary = `${Number(result.filled)} filled, ${Number(result.expired)} expired, `
+            + `${Number(result.already_terminal)} already terminal; ${Number(result.pending_hooks)} pending hooks; `
+            + `${Number(result.remaining_blockers)} remaining blockers. Trading stays stopped.`;
+        if (result.partial_commit) {
+            throw new Error(`Partial commit: ${summary} Obtain a fresh preview before retrying.`);
+        }
+        _bootstrapText('bootstrapStatusPanel', summary);
+        showToast('Terminal offers verified without a wallet transaction', 'success');
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Terminal proof is incomplete');
+        showToast(error?.message || 'Terminal proof is incomplete; review Sage and safety.', 'warning');
+    } finally {
+        await bootstrapRefreshStatus();
+    }
+}
+
+async function bootstrapReconcileExpiredOffers() {
+    const campaign = _bootstrapActiveCampaign;
+    const tradeIds = campaign?.reconciliation_trade_ids;
+    if (campaign?.status !== 'active' || !Array.isArray(tradeIds) || !tradeIds.length
+        || tradeIds.length !== Number(campaign.open_offer_count) || bot_state?.running) return;
+    const approved = await showStyledConfirm({
+        icon: '🔎',
+        title: 'Verify expired offers in Sage?',
+        message: `CATalyst will check these exact campaign offers against the complete Sage book and pending transactions:\n${tradeIds.join('\n')}\n\nOnly offers proven naturally expired will be marked terminal. The campaign can remain active. No wallet transaction will be sent.`,
+        confirmText: 'Verify expired offers',
+        cancelText: 'Keep current state',
+        style: 'warning'
+    });
+    if (!approved) return;
+    const button = document.getElementById('bootstrapReconcileExpiredBtn');
+    if (button) button.disabled = true;
+    try {
+        const response = await apiFetch('/api/bootstrap/reconcile_expired', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                campaign_id: campaign.campaign_id,
+                revision: campaign.revision,
+                expected_trade_ids: tradeIds,
+            }),
+        });
+        const payload = await response.json();
+        if (!payload?.success) throw new Error(payload?.code || 'Expired offer proof is incomplete');
+        _bootstrapText('bootstrapStatusPanel', `${Number(payload.proven_expired)} expired offer(s) verified in Sage. Review the campaign before stopping it.`);
+        showToast('Expired offers verified without a wallet transaction', 'success');
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Expired offer proof is incomplete');
+        showToast('Expired offer proof is incomplete; review the remaining campaign offers.', 'warning');
+    } finally {
+        await bootstrapRefreshStatus();
+    }
+}
+
+async function bootstrapReconcileCompletedOffers() {
+    const campaign = _bootstrapActiveCampaign;
+    if (campaign?.status !== 'active' || bot_state?.running) return;
+    const button = document.getElementById('bootstrapReconcileCompletedBtn');
+    const proofAlert = document.getElementById('bootstrapCompletedProofAlert');
+    let partialWarning = '';
+    if (button) button.disabled = true;
+    try {
+        const scope = {campaign_id: campaign.campaign_id, revision: campaign.revision};
+        const previewResponse = await apiFetch('/api/bootstrap/preview_completed', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(scope),
+        });
+        const preview = await previewResponse.json();
+        if (!preview?.success || !Array.isArray(preview.expected_trade_ids)
+            || preview.expected_trade_ids.length === 0) {
+            throw new Error(preview?.code || 'No completed campaign offers could be proven');
+        }
+        const reviewedOffers = preview.expected_offers;
+        const exactIds = preview.expected_trade_ids;
+        const exactAsset = String(preview.asset_id || '');
+        if (!/^[a-f0-9]{64}$/.test(exactAsset)
+            || exactAsset !== campaign.asset_id
+            || !Array.isArray(reviewedOffers)
+            || reviewedOffers.length !== exactIds.length
+            || reviewedOffers.some((offer, i) => offer?.trade_id !== exactIds[i]
+                || !/^[a-f0-9]{64}$/.test(String(offer.trade_id))
+                || !['buy', 'sell'].includes(offer.side)
+                || offer.asset_id !== exactAsset)) {
+            throw new Error('Completed offer preview changed or lacks exact offer details');
+        }
+        const offerLines = reviewedOffers.map(offer => `${offer.side.toUpperCase()} ${offer.trade_id}`);
+        const approved = await showStyledConfirm({
+            icon: '🔎',
+            title: 'Verify completed offers in Sage?',
+            message: `Campaign ${campaign.campaign_id}, revision ${campaign.revision}\nAsset ${exactAsset}\n\nCompleted offers to verify:\n${offerLines.join('\n')}\n\nCATalyst will recheck the complete Sage offer book and transaction proofs before marking these exact local records filled. No wallet transaction will be sent.`,
+            confirmText: 'Verify completed offers',
+            cancelText: 'Keep current state',
+            style: 'warning',
+            proofReview: true,
+        });
+        if (!approved) return;
+        const response = await apiFetch('/api/bootstrap/reconcile_completed', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({...scope, expected_trade_ids: preview.expected_trade_ids}),
+        });
+        const payload = await response.json();
+        if (!payload?.success) {
+            if (payload?.commit_may_be_partial === true) {
+                partialWarning = 'Completed-offer records may be partly reconciled. Refresh and preview the remaining exact offers before retrying; investigate any safety block. No wallet transaction was sent.';
+                throw new Error(partialWarning);
+            }
+            throw new Error(payload?.code || 'Completed offer proof is incomplete');
+        }
+        if (proofAlert) {
+            proofAlert.style.display = 'none';
+            proofAlert.textContent = '';
+            delete proofAlert.dataset.campaignId;
+        }
+        _bootstrapText('bootstrapStatusPanel', `${Number(payload.proven_completed)} completed offer(s) verified in Sage. Review the remaining live offers before starting the bot.`);
+        showToast('Completed offers verified without a wallet transaction', 'success');
+    } catch (error) {
+        _bootstrapText('bootstrapStatusPanel', error?.message || 'Completed offer proof is incomplete');
+        if (partialWarning && proofAlert) {
+            proofAlert.textContent = partialWarning;
+            proofAlert.dataset.campaignId = campaign.campaign_id;
+            proofAlert.style.display = '';
+        }
+        showToast(partialWarning || 'Completed offer proof is incomplete; review Sage and the campaign.', 'warning');
+    } finally {
+        await bootstrapRefreshStatus();
+    }
+}
+
+document.addEventListener('click', (event) => {
+    if (event.target.closest('#bootstrapReconcileTerminalBtn')) {
+        bootstrapReconcileTerminalOffers();
+    }
+    if (event.target.closest('#bootstrapReconcileExpiredBtn')) {
+        bootstrapReconcileExpiredOffers();
+    }
+    if (event.target.closest('#bootstrapReconcileCompletedBtn')) {
+        bootstrapReconcileCompletedOffers();
+    }
+});
 
 async function bootstrapStopCampaign(target = 'active') {
     const retrying = target === 'pending'

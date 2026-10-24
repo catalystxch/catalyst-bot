@@ -35,6 +35,12 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(effective, 500_000)
         self.assertTrue(self.tx_fees.fee_pool_enabled())
 
+    def test_configured_fee_reserves_remain_enabled_with_zero_manual_fee(self):
+        self.cfg.TRANSACTION_FEE_XCH = Decimal("0")
+        self.assertEqual(self.tx_fees.get_effective_transaction_fee_mojos(), 0)
+        self.assertTrue(self.tx_fees.fee_pool_enabled())
+        self.assertTrue(self.tx_fees.get_fee_pool_plan()["enabled"])
+
     def test_auto_fee_mode_prefers_suggested_fee(self):
         self.cfg.TRANSACTION_FEE_MODE = "auto"
         with patch.object(
