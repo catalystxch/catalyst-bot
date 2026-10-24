@@ -10405,7 +10405,7 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
             )
         except Exception:
             pass
-        return 0
+        raise
     if failures > 0:
         try:
             log_event(

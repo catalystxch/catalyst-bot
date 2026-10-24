@@ -718,6 +718,24 @@ class TestUpsertCoin(_TempDB):
         self.assertFalse(_db.get_connection().in_transaction)
         self.assertEqual(_db.get_free_coins("xch"), [])
 
+    def test_batch_upsert_commit_failure_is_not_reported_as_protected_coins(self):
+        real_conn = _db.get_connection()
+
+        class FailingCommit:
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("database is locked")
+
+        with patch.object(_db, "get_connection", return_value=FailingCommit()):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                _db.batch_upsert_coins(
+                    [{"coin_id": "0xcommit-failure", "amount_mojos": 1000}], "xch"
+                )
+        self.assertFalse(real_conn.in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestGetCoinSummary(_TempDB):
