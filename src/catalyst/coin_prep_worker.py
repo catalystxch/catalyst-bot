@@ -3068,6 +3068,7 @@ class CoinPrepWorker:
                 {
                     "coin_id": self._ensure_0x(coin.get("coin_id", "")),
                     "amount_mojos": coin.get("amount", 0),
+                    "tier": None,
                 }
                 for coin in coins
                 if coin.get("coin_id")

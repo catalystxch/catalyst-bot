@@ -115,6 +115,7 @@ def test_sell_only_final_sweep_preserves_owned_buy_coin_purpose(tmp_path, monkey
         buy_coin_id,
         "xch",
         buy_coin["amount"],
+        tier="inner",
         designation="tier_spare",
         assigned_tier="inner",
         purpose="replacement",
@@ -149,6 +150,7 @@ def test_sell_only_final_sweep_preserves_owned_buy_coin_purpose(tmp_path, monkey
         worker._designate_final_sweep()
         still_owned = database.get_coin_state(buy_coin_id)
         assert still_owned["status"] == "free"
+        assert still_owned["tier"] == "inner"
         assert still_owned["purpose"] == "replacement"
         assert still_owned["designation"] == "unknown"
         assert still_owned["assigned_tier"] == "none"
