@@ -191,6 +191,62 @@ def test_renewal_preserves_protection_and_prices_a_cumulative_ceiling(
     assert renewed["remaining_fee_mojos"] == want_funding
 
 
+def test_bootstrap_renewal_replenishes_full_reserve_after_prior_cancellation(context):
+    scope, plan, stages = context
+    scope["campaign_id"] = "a" * 64
+    scope["session_id"] = None
+    plan["campaign_revision"] = 0
+    contract = service.canonical_fee_contract(scope, plan)
+    prior = database.create_fee_approval(
+        scope_sha256=contract["scope_sha256"],
+        plan_sha256=contract["plan_sha256"],
+        total_fee_mojos=200,
+        cancellation_reserve_mojos=40,
+    )
+    for operation_id, fee, cancellation in (
+        ("1" * 64, 30, False),
+        ("2" * 64, 20, True),
+    ):
+        database.reserve_approved_fee(
+            approval_id=prior["approval_id"],
+            scope_sha256=contract["scope_sha256"],
+            plan_sha256=contract["plan_sha256"],
+            operation_id=operation_id,
+            fee_mojos=fee,
+            cancellation=cancellation,
+        )
+
+    preview = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=1_000,
+        request_options={"bootstrap_campaign_id": scope["campaign_id"]},
+    )
+    assert preview["estimated_preparation_fee_mojos"] == 70
+    assert preview["minimum_cancellation_reserve_mojos"] == 40
+    assert preview["fee_accounting"]["committed_fee_mojos"] == 50
+    assert preview["minimum_cumulative_fee_mojos"] == 160
+    with pytest.raises(ValueError, match="FEE_BUDGET_INSUFFICIENT"):
+        database.approve_coin_prep_fee_preview(
+            preview_id=preview["preview_id"],
+            scope_sha256=preview["scope_sha256"],
+            plan_sha256=preview["plan_sha256"],
+            maximum_fee_mojos=140,
+            cancellation_reserve_mojos=40,
+            now=100,
+        )
+    renewed = database.approve_coin_prep_fee_preview(
+        preview_id=preview["preview_id"],
+        scope_sha256=preview["scope_sha256"],
+        plan_sha256=preview["plan_sha256"],
+        maximum_fee_mojos=160,
+        cancellation_reserve_mojos=40,
+        now=100,
+    )
+    assert renewed["remaining_fee_mojos"] - 70 == 40
+
+
 def test_other_wallet_scope_does_not_inflate_renewal_disclosure(context):
     database.create_fee_approval(
         scope_sha256="f" * 64,

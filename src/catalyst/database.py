@@ -22128,6 +22128,12 @@ def approve_coin_prep_fee_preview(
             cancellation = _fee_amount(quote.get("estimated_cancellation_fee_mojos"))
             funding = _fee_amount(quote.get("fee_funding_mojos"))
             totals = _fee_scope_totals(conn, scope)
+            campaign_scoped = (
+                json.loads(preview["scope_json"]).get("campaign_id") is not None
+            )
+            recovery_action = json.loads(preview["request_options_json"]).get(
+                "cancellation_recovery_action"
+            )
             if (
                 reserve < cancellation
                 or (
@@ -22135,6 +22141,11 @@ def approve_coin_prep_fee_preview(
                     < prep
                 )
                 or (maximum - totals["committed_fee_mojos"] < prep + cancellation)
+                or (
+                    campaign_scoped
+                    and recovery_action is None
+                    and maximum - totals["committed_fee_mojos"] < prep + reserve
+                )
             ):
                 raise ValueError("FEE_BUDGET_INSUFFICIENT")
             if maximum - totals["committed_fee_mojos"] > min(
