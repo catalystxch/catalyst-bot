@@ -13024,6 +13024,7 @@ class BotLoop:
         revision = database.update_bootstrap_campaign_state(
             campaign["campaign_id"],
             expected_revision=campaign["revision"],
+            expected_state_revision=campaign["state_revision"],
             record=state_update,
         )
         occurred_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -13034,6 +13035,8 @@ class BotLoop:
                 "occurred_at": occurred_at,
                 "data": {
                     "revision": revision,
+                    "state_revision": campaign["state_revision"] + 1,
+                    "offer_authority_changed": revision != campaign["revision"],
                     "stage": state_update["stage"],
                     "deployment_fraction": state_update["deployment_fraction"],
                     "confirmed_fills": state_update["confirmed_fills"],
@@ -13044,12 +13047,17 @@ class BotLoop:
             }
         )
         refreshed = database.get_bootstrap_campaign(campaign["campaign_id"])
-        if type(refreshed) is not dict or refreshed.get("revision") != revision:
+        if (
+            type(refreshed) is not dict
+            or refreshed.get("revision") != revision
+            or refreshed.get("state_revision") != campaign["state_revision"] + 1
+        ):
             raise RuntimeError("Bootstrap evidence update could not be reloaded")
         log_event(
             "info",
             "bootstrap_authoritative_evidence_materialized",
-            f"Market Bootstrap advanced to {refreshed['stage']} at revision {revision}",
+            f"Market Bootstrap materialized {refreshed['stage']} evidence at "
+            f"offer revision {revision}, state revision {refreshed['state_revision']}",
             data={
                 "campaign_id": campaign["campaign_id"],
                 "confirmed_fills": refreshed["confirmed_fills"],

@@ -4335,7 +4335,8 @@ CREATE TABLE IF NOT EXISTS bootstrap_campaigns (
     revision                       INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
     stop_reason                    TEXT,
     stopped_at                     TEXT,
-    updated_at                     TEXT NOT NULL
+    updated_at                     TEXT NOT NULL,
+    state_revision                 INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_campaigns_one_active
     ON bootstrap_campaigns(network, wallet_fingerprint, asset_id)
@@ -5078,6 +5079,7 @@ _STABILITY_REQUIRED_COLUMNS = {
         "stop_reason",
         "stopped_at",
         "updated_at",
+        "state_revision",
     },
     "bootstrap_campaign_events": {
         "event_id",
@@ -7388,6 +7390,15 @@ def _migrate_stability_schema() -> None:
             "offer_reconciliation_coin_outcomes" in missing_stability_tables
         )
         conn.executescript(f"BEGIN EXCLUSIVE;\n{STABILITY_SCHEMA_SQL}")
+        bootstrap_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(bootstrap_campaigns)").fetchall()
+        }
+        if "state_revision" not in bootstrap_columns:
+            conn.execute(
+                "ALTER TABLE bootstrap_campaigns ADD COLUMN state_revision "
+                "INTEGER NOT NULL DEFAULT 0 CHECK(state_revision >= 0)"
+            )
         _upgrade_fee_session_generation_guard(conn)
         _upgrade_fee_outcome_journal_guard(conn)
         epoch_columns = {
@@ -39472,19 +39483,27 @@ def update_bootstrap_campaign_state(
     campaign_id: str,
     *,
     expected_revision: int,
+    expected_state_revision: Optional[int] = None,
     record: Dict[str, Any],
 ) -> int:
-    """Replace materialized policy state only at the expected revision."""
+    """CAS evidence independently of the offer-authority revision."""
 
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
     revision = _exact_integer(expected_revision, "expected_revision", minimum=0)
+    state_revision = _exact_integer(
+        revision if expected_state_revision is None else expected_state_revision,
+        "expected_state_revision",
+        minimum=0,
+    )
     state = _bootstrap_state_material(record)
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
         campaign = conn.execute(
             """
-            SELECT minimum_price, maximum_price FROM bootstrap_campaigns
+            SELECT minimum_price, maximum_price, stage, deployment_fraction,
+                   current_anchor_price, adverse_fill_times_json
+            FROM bootstrap_campaigns
             WHERE campaign_id=? AND status='active'
             """,
             (safe_id,),
@@ -39498,6 +39517,12 @@ def update_bootstrap_campaign_state(
             <= Decimal(campaign["maximum_price"])
         ):
             raise ValueError("current anchor is outside the campaign corridor")
+        plan_changed = (
+            campaign["stage"] != state["stage"]
+            or campaign["deployment_fraction"] != state["deployment_fraction"]
+            or campaign["current_anchor_price"] != state["current_anchor_price"]
+            or campaign["adverse_fill_times_json"] != state["adverse_fill_times_json"]
+        )
         cursor = conn.execute(
             """
             UPDATE bootstrap_campaigns SET
@@ -39505,8 +39530,10 @@ def update_bootstrap_campaign_state(
                 stable_since=?, confirmed_fills=?, settlement_clusters=?,
                 independent_depth_sides_json=?, suspected_linked_activity=?,
                 adverse_fill_times_json=?, fee_spent_xch=?, realized_loss_xch=?,
-                marked_inventory_loss_xch=?, revision=revision+1, updated_at=?
+                marked_inventory_loss_xch=?, revision=revision+?,
+                state_revision=state_revision+1, updated_at=?
             WHERE campaign_id=? AND status='active' AND revision=?
+                AND state_revision=?
             """,
             (
                 state["stage"],
@@ -39521,15 +39548,17 @@ def update_bootstrap_campaign_state(
                 state["fee_spent_xch"],
                 state["realized_loss_xch"],
                 state["marked_inventory_loss_xch"],
+                int(plan_changed),
                 state["updated_at"],
                 safe_id,
                 revision,
+                state_revision,
             ),
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Bootstrap state compare-and-set failed")
         conn.commit()
-        return revision + 1
+        return revision + int(plan_changed)
     except Exception:
         conn.rollback()
         raise
@@ -39562,7 +39591,8 @@ def stop_bootstrap_campaign(
             """
             UPDATE bootstrap_campaigns
             SET status='stopped', stage='stopped', deployment_fraction='0',
-                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1
+                stop_reason=?, stopped_at=?, updated_at=?, revision=revision+1,
+                state_revision=state_revision+1
             WHERE campaign_id=? AND status='active'
             """,
             (safe_reason, stopped, stopped, safe_id),
