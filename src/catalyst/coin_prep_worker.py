@@ -322,7 +322,6 @@ def _env_decimal(name: str, default: str, *fallback_names: str) -> Decimal:
 try:
     from database import (
         init_database,
-        batch_upsert_coins,
         upsert_coin,
         set_coin_designation,
         designate_reserve,
@@ -2979,6 +2978,8 @@ class CoinPrepWorker:
         if not self._db_ready:
             self.log("   DB: final sweep SKIPPED - DB not ready")
             return
+
+        from database import batch_upsert_coins
 
         self.log("\n   DB: Final designation sweep...")
 

@@ -203,7 +203,7 @@ def test_final_sweep_bounds_registry_scans_during_large_wallet_upsert(
         assert registry_scan.call_count <= 10
         assert len(database.get_free_coins("xch")) == 48
         monkeypatch.setattr(
-            coin_prep_worker,
+            database,
             "batch_upsert_coins",
             lambda *_args: (_ for _ in ()).throw(RuntimeError("guard unavailable")),
         )
