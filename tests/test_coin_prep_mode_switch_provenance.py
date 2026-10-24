@@ -5,6 +5,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 import coin_prep_worker
 import database
 import wallet_sage
@@ -200,5 +202,12 @@ def test_final_sweep_bounds_registry_scans_during_large_wallet_upsert(
             worker._designate_final_sweep()
         assert registry_scan.call_count <= 10
         assert len(database.get_free_coins("xch")) == 48
+        monkeypatch.setattr(
+            coin_prep_worker,
+            "batch_upsert_coins",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("guard unavailable")),
+        )
+        with pytest.raises(RuntimeError, match="guard unavailable"):
+            worker._designate_final_sweep()
     finally:
         database.close_connection()

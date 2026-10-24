@@ -3083,8 +3083,8 @@ class CoinPrepWorker:
                 try:
                     count = batch_upsert_coins(batch, wallet_type)
                 except Exception as e:
-                    count = 0
                     self.log(f"   DB: bounded upsert EXCEPTION: {e}")
+                    raise
                 upsert_ok += count
                 upsert_fail += len(batch) - count
                 if start + 8 < len(upsert_inputs):

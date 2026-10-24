@@ -706,6 +706,18 @@ class TestUpsertCoin(_TempDB):
         self.assertEqual(protected_ids.call_count, 1)
         self.assertEqual(len(_db.get_free_coins("xch")), 4)
 
+    def test_batch_upsert_releases_writer_when_protection_snapshot_fails(self):
+        coins = [{"coin_id": "0xguard-failure", "amount_mojos": 1000}]
+        with patch.object(
+            _db,
+            "_batch_coin_terminal_mutation_protection",
+            side_effect=RuntimeError("guard unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "guard unavailable"):
+                _db.batch_upsert_coins(coins, "xch")
+        self.assertFalse(_db.get_connection().in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestGetCoinSummary(_TempDB):

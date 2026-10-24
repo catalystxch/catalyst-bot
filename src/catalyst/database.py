@@ -10363,12 +10363,16 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
     failures = 0
     first_error: Optional[str] = None
     conn = get_connection()
-    if not conn.in_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
-    protection_snapshot = frozenset(
-        _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
-    )
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        normalized_coin_ids = [norm_coin_id(c["coin_id"]) for c in coins]
+        protection_snapshot = frozenset(
+            _batch_coin_terminal_mutation_protection(conn, normalized_coin_ids)
+        )
+    except Exception:
+        conn.rollback()
+        raise
     for c in coins:
         try:
             inserted = upsert_coin(
@@ -10391,6 +10395,7 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
     except Exception as e:
         # Commit failure is worse than any individual upsert failure —
         # the whole batch is lost. Log it so it's visible.
+        conn.rollback()
         try:
             log_event(
                 "error",
