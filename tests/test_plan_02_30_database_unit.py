@@ -704,6 +704,7 @@ class TestUpsertCoin(_TempDB):
 
         self.assertEqual(count, 4)
         self.assertEqual(protected_ids.call_count, 1)
+        self.assertEqual(len(_db.get_free_coins("xch")), 4)
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

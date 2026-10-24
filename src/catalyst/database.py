@@ -10292,8 +10292,12 @@ def upsert_coin(
                 amount_mojos,
             ),
         )
-        if not kwargs.get("_skip_commit"):
-            conn.commit()
+        if kwargs.get("_skip_commit"):
+            # The batch owner commits after every row. Logging here can roll
+            # back that still-open transaction (for example when an optional
+            # debug event is rejected), silently losing earlier batch rows.
+            return True
+        conn.commit()
         # Log the coin lifecycle event with structured data
         if existing is None:
             # Brand new coin

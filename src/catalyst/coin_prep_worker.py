@@ -322,6 +322,7 @@ def _env_decimal(name: str, default: str, *fallback_names: str) -> Decimal:
 try:
     from database import (
         init_database,
+        batch_upsert_coins,
         upsert_coin,
         set_coin_designation,
         designate_reserve,
@@ -3063,21 +3064,30 @@ class CoinPrepWorker:
             desig_ok = 0
             desig_fail = 0
 
-            for coin in coins:
-                coin_id = self._ensure_0x(coin.get("coin_id", ""))
-                amount = coin.get("amount", 0)
-                if not coin_id:
-                    continue
+            upsert_inputs = [
+                {
+                    "coin_id": self._ensure_0x(coin.get("coin_id", "")),
+                    "amount_mojos": coin.get("amount", 0),
+                }
+                for coin in coins
+                if coin.get("coin_id")
+            ]
+            # Keep each protection snapshot and write transaction small. A
+            # wallet-wide stream of single-row IMMEDIATE writes can starve the
+            # main process's mutation-lease heartbeat even though no one row
+            # holds the lock for long. Recheck durable protection inside each
+            # bounded batch, then give the heartbeat a chance to acquire it.
+            for start in range(0, len(upsert_inputs), 8):
+                batch = upsert_inputs[start : start + 8]
                 try:
-                    result = upsert_coin(coin_id, wallet_type, amount)
-                    if result:
-                        upsert_ok += 1
-                    else:
-                        upsert_fail += 1
-                        self.log(f"   DB: upsert returned False for {coin_id[:20]}...")
+                    count = batch_upsert_coins(batch, wallet_type)
                 except Exception as e:
-                    upsert_fail += 1
-                    self.log(f"   DB: upsert EXCEPTION: {e}")
+                    count = 0
+                    self.log(f"   DB: bounded upsert EXCEPTION: {e}")
+                upsert_ok += count
+                upsert_fail += len(batch) - count
+                if start + 8 < len(upsert_inputs):
+                    time.sleep(0.02)
 
             assigned_by_tier, unmatched = self._partition_coins_for_designation(
                 coins, wallet_type
