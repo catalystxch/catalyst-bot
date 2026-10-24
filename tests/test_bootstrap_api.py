@@ -1008,6 +1008,7 @@ def test_completed_offer_review_accepts_one_prior_policy_revision_and_preserves_
     ).get_json()["campaign_id"]
     campaign = database.get_bootstrap_campaign(campaign_id)
     state = {key: campaign[key] for key in database._BOOTSTRAP_STATE_FIELDS}
+    state["current_anchor_price"] = "0.00101"
     state["updated_at"] = "2026-09-12T12:00:01Z"
     assert (
         database.update_bootstrap_campaign_state(
@@ -1019,6 +1020,7 @@ def test_completed_offer_review_accepts_one_prior_policy_revision_and_preserves_
         key: database.get_bootstrap_campaign(campaign_id)[key]
         for key in database._BOOTSTRAP_STATE_FIELDS
     }
+    state["current_anchor_price"] = "0.00102"
     state["updated_at"] = "2026-09-12T12:00:02Z"
     assert (
         database.update_bootstrap_campaign_state(

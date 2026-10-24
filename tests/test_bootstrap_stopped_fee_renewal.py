@@ -381,6 +381,7 @@ def test_active_campaign_requires_explicit_cancellation_recovery_intent(
             "updated_at",
         )
     }
+    next_state["current_anchor_price"] = "0.0101"
     assert (
         database.update_bootstrap_campaign_state(
             state["campaign_id"], expected_revision=0, record=next_state
