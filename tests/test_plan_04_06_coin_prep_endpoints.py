@@ -940,7 +940,106 @@ class TestCoinPrepVerify(_FlaskBase):
         self.assertFalse(body["all_sufficient"])
         self.assertTrue(body["needs_coin_prep"])
         self.assertEqual(body["tiers"]["inner"]["xch_have"], 0)
-        self.assertEqual(body["tiers"]["fees"]["xch_have"], 1)
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 0)
+
+    def test_bootstrap_verify_does_not_count_unregistered_fee_sized_coins(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 1,
+                "cat_target": 0,
+                "buy_tier_sizes": "fees=0.001",
+                "cat_tier_sizes": "",
+                "tier_counts_xch": "fees=2",
+                "tier_counts_cat": "",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 2_000_000_000,
+            "cat_balance_mojos": 0,
+            "cat_decimals": 3,
+        }
+        xch_records = {
+            "success": True,
+            "records": [
+                {"coin_id": "a" * 64, "coin": {"amount": 1_000_000_000}},
+                {"coin_id": "b" * 64, "coin": {"amount": 1_000_000_000}},
+            ],
+        }
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch(
+                "wallet.get_spendable_coins_rpc",
+                side_effect=[xch_records, {"success": True, "records": []}],
+            ),
+            patch("wallet.WALLET_ID_XCH", 1),
+            patch("database.get_free_coins", return_value=[]),
+        ):
+            resp = self._get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertFalse(body["all_sufficient"])
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 0)
+
+    def test_bootstrap_verify_counts_only_selectable_durable_fee_reserves(self):
+        context = {
+            "campaign": {"campaign_id": "campaign-1", "revision": 4},
+            "worker_args": {
+                "xch_target": 1,
+                "cat_target": 0,
+                "buy_tier_sizes": "fees=0.001",
+                "cat_tier_sizes": "",
+                "tier_counts_xch": "fees=2",
+                "tier_counts_cat": "",
+                "prep_headroom_pct": "0",
+            },
+            "xch_balance_mojos": 2_000_000_000,
+            "cat_balance_mojos": 0,
+            "cat_decimals": 3,
+        }
+        xch_records = {
+            "success": True,
+            "records": [
+                {"coin_id": "a" * 64, "coin": {"amount": 1_000_000_000}},
+                {"coin_id": "b" * 64, "coin": {"amount": 1_000_000_000}},
+                {"coin_id": "c" * 64, "coin": {"amount": 1_000_000_000}},
+            ],
+        }
+        rows = [
+            {"coin_id": "a" * 64, "purpose": "fee_reserve"},
+            {"coin_id": "b" * 64, "purpose": "fee_reserve"},
+            {"coin_id": "c" * 64, "purpose": "replacement"},
+        ]
+        with (
+            patch.object(
+                coin_prep_blueprint,
+                "_active_bootstrap_coin_prep_context",
+                return_value=context,
+            ),
+            patch(
+                "wallet.get_spendable_coins_rpc",
+                side_effect=[xch_records, {"success": True, "records": []}],
+            ),
+            patch("wallet.WALLET_ID_XCH", 1),
+            patch("database.get_free_coins", return_value=rows),
+            patch("tx_fees.get_fee_coin_size_mojos", return_value=1_000_000_000),
+        ):
+            resp = self._get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&bootstrap_campaign_id=campaign-1&bootstrap_campaign_revision=4",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertTrue(body["all_sufficient"])
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 2)
 
     def test_returns_200_flat_mode(self):
         with (
