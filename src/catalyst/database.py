@@ -10344,6 +10344,8 @@ def upsert_coin(
                 conn.rollback()
             except Exception:
                 pass
+        if kwargs.get("_raise_on_error"):
+            raise
         log_event("error", "db_error", f"Failed to upsert coin {coin_id[:16]}...: {e}")
         return False
 
@@ -10360,8 +10362,6 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
     if type(coins) is not list or not coins:
         return 0
     count = 0
-    failures = 0
-    first_error: Optional[str] = None
     conn = get_connection()
     try:
         if not conn.in_transaction:
@@ -10383,13 +10383,13 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
                 purpose=c.get("purpose"),
                 _skip_commit=True,
                 _protection_snapshot=protection_snapshot,
+                _raise_on_error=True,
             )
             if inserted:
                 count += 1
-        except Exception as e:
-            failures += 1
-            if first_error is None:
-                first_error = f"{type(e).__name__}: {e}"
+        except Exception:
+            conn.rollback()
+            raise
     try:
         conn.commit()
     except Exception as e:
@@ -10406,16 +10406,6 @@ def batch_upsert_coins(coins: list, wallet_type: str = "xch") -> int:
         except Exception:
             pass
         raise
-    if failures > 0:
-        try:
-            log_event(
-                "warning",
-                "batch_upsert_partial_failure",
-                f"batch_upsert_coins ({wallet_type}): {failures}/{len(coins)} "
-                f"failed, first error: {first_error}",
-            )
-        except Exception:
-            pass
     return count
 
 

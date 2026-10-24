@@ -736,6 +736,16 @@ class TestUpsertCoin(_TempDB):
         self.assertFalse(real_conn.in_transaction)
         self.assertEqual(_db.get_free_coins("xch"), [])
 
+    def test_batch_upsert_rolls_back_every_row_on_unexpected_sql_error(self):
+        coins = [
+            {"coin_id": "0xvalid-before-error", "amount_mojos": 1000},
+            {"coin_id": "0xinvalid-amount", "amount_mojos": object()},
+        ]
+        with self.assertRaises(sqlite3.ProgrammingError):
+            _db.batch_upsert_coins(coins, "xch")
+        self.assertFalse(_db.get_connection().in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
+
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")
 class TestGetCoinSummary(_TempDB):
