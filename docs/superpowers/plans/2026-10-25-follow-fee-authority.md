@@ -58,8 +58,13 @@ revocation when the final check was absent. The task remains open until every
 ordinary Follow producer attaches this purpose; legacy unscoped producers must
 be fenced rather than silently inheriting a new run.
 The ladder builder now accepts an exact run ID and labels both ordinary and
-book-improving offers without losing their classification. BotLoop has not yet
-supplied that ID, and unscoped legacy creation remains a release blocker.
+book-improving offers without losing their classification. BotLoop's main
+replenishment producer reads the current durable run before creating and passes
+that ID. A missing or revoked authority pauses that producer. Requote cold
+start and staged refresh still call the ladder builder without a run ID, as do
+three BoostManager handoff/cascade producers. These must be bound to the exact
+parent/new-run scope or fenced before enabling a Follow run. Direct legacy
+`create_offer_with_retry` paths also need the same boundary audit.
 
 ### Task 3: Exact priced cancellation hold for every Follow path
 
