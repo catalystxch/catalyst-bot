@@ -295,6 +295,14 @@ class AppBridge:
             if type(body) is dict and body.get("resume_existing_offers") is True
             else {}
         )
+        if type(body) is dict:
+            for key in (
+                "review_confidence_override",
+                "duration_hours",
+                "confidence_override",
+            ):
+                if key in body:
+                    payload[key] = body[key]
         with api_server.app.test_request_context(
             "/api/bot/start", method="POST", json=payload
         ):

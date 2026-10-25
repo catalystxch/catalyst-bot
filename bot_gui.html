@@ -8294,6 +8294,21 @@
     <script defer src="/assets/walletconnect-signing.js"></script>
 </head>
 <body>
+    <div id="confidenceOverrideModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="confidenceOverrideTitle" style="display:none">
+        <div class="modal-content" style="max-width:620px;padding:24px;overflow:auto">
+            <h2 id="confidenceOverrideTitle">Continue despite low market confidence</h2>
+            <p>Thin market depth can cause poor execution or losses. This permits continuous Follow at the reviewed limits and suppresses confidence-only withdrawals while current, valid prices remain available. RED warnings stay visible.</p>
+            <p>Wallet identity, coin ownership, protected fee funding, fee limits, price freshness and runtime safety still apply. Stop or a restart removes consent. Expiry or changed settings restore ordinary confidence policy.</p>
+            <pre id="confidenceOverrideReviewText" style="white-space:pre-wrap"></pre>
+            <label><input type="checkbox" id="confidenceOverrideAccept"> I understand and approve this specific run.</label>
+            <div style="margin-top:16px">
+                <button type="button" onclick="closeConfidenceOverrideReview()">Back</button>
+                <button type="button" id="confidenceOverrideConfirm" disabled onclick="confirmConfidenceOverrideStart()">Start Follow with override</button>
+            </div>
+        </div>
+    </div>
+
+
 
     <div class="pair-switch-overlay" id="pairSwitchOverlay">
         <div class="pair-switch-card">
@@ -9246,6 +9261,8 @@
                             <span id="marketConfidenceReasons" class="v4-data-strip-badge v4-data-strip-badge--warn">market evidence warming</span>
                             <span id="marketProviderHealth" class="v4-data-strip-last">providers —</span>
                             <span id="marketMigrationReport" class="v4-data-strip-last">migration —</span>
+                            <span id="confidenceOverrideStatus" class="v4-data-strip-badge v4-data-strip-badge--warn" hidden></span>
+                            <button type="button" onclick="reviewConfidenceOverride()">Review low-confidence override</button>
                         </div>
                     </div>
 
@@ -24514,6 +24531,14 @@
                 ? confidence.reason_codes.map(code => String(code).replaceAll('_', ' ')).join(' · ')
                 : 'market evidence warming';
             setText('marketConfidenceReasons', reasons || 'healthy');
+            const override = data.confidence_override || {};
+            const overrideNode = document.getElementById('confidenceOverrideStatus');
+            if (overrideNode) {
+                overrideNode.hidden = !override.approved;
+                overrideNode.textContent = override.active
+                    ? `User override active until ${override.expires_at}; confidence remains ${state}`
+                    : 'User override inactive; ordinary confidence policy applies';
+            }
             const stage = String(
                 (data.degraded && data.degraded.withdrawal_stage)
                 || confidence.withdrawal_stage
@@ -32506,6 +32531,7 @@
         }
         
         function dismissResume() {
+            _confidenceOverrideResumeReviewRequired = false;
             _resumeHandled = true;
             clearResumeSessionSummary();
             setFreshStartTemplateState(true);
@@ -32520,6 +32546,7 @@
         }
 
         async function dismissResumeFresh() {
+            _confidenceOverrideResumeReviewRequired = false;
             try {
                 const response = await apiFetch(`${API_URL}/session/fresh-start`, {
                     method: 'POST',
@@ -32555,6 +32582,7 @@
         }
 
         function resumeSkip() {
+            _confidenceOverrideResumeReviewRequired = false;
             // A skipped live-book check cannot authorize a resumed start.
             ++_resumeSessionAttemptId;
             _resumeSessionNeedsVerification = true;
@@ -32573,6 +32601,7 @@
 
         // Leave the expired-campaign recovery prompt without changing the live book.
         function closeResumeAfterLoad() {
+            _confidenceOverrideResumeReviewRequired = false;
             document.getElementById('resumeSessionModal').classList.remove('active');
             document.getElementById('cancelAllBtn')?.focus();
         }
@@ -32622,8 +32651,74 @@
                 return false;
             }
             modal.classList.remove('active');
+            if (_confidenceOverrideResumeReviewRequired) {
+                _confidenceOverrideResumeReviewRequired = false;
+                await reviewConfidenceOverride();
+                return false;
+            }
             await startBot({ resumeExistingOffers: true });
             return true;
+        }
+
+        let _confidenceOverrideReview = null;
+        let _confidenceOverrideResumeReviewRequired = false;
+
+        function closeConfidenceOverrideReview() {
+            _confidenceOverrideReview = null;
+            document.getElementById('confidenceOverrideModal').style.display = 'none';
+            document.getElementById('confidenceOverrideAccept').checked = false;
+            document.getElementById('confidenceOverrideConfirm').disabled = true;
+        }
+
+        async function reviewConfidenceOverride() {
+            if (bot_state.running) {
+                showToast('Stop the bot before reviewing a new run override.', 'warning');
+                return;
+            }
+            closeConfidenceOverrideReview();
+            try {
+                const response = await apiFetch(`${API_URL}/bot/start`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ review_confidence_override: true, duration_hours: 48 })
+                });
+                const result = await response.json();
+                const review = result.confidence_override_review;
+                if (!review) { showToast(result.error || 'Review the saved Follow settings and fee approval first.', 'warning'); return; }
+                _confidenceOverrideReview = review;
+                const scope = review.scope;
+                const identity = scope.identity;
+                document.getElementById('confidenceOverrideReviewText').textContent =
+                    `Wallet ${identity.wallet_fingerprint} · ${identity.network} · ${identity.ticker}
+` +
+                    `Asset ${identity.asset_id}
+` +
+                    `Up to ${scope.buy_limit} BUY and ${scope.sell_limit} SELL offers
+` +
+                    `Approved Follow run fee ceiling: ${scope.fee_cap_mojos} mojos
+` +
+                    `Protected cancellation reserve: ${scope.protected_cancel_mojos} mojos
+` +
+                    `Retained reserves: ${scope.xch_reserve} XCH / ${scope.cat_reserve} CAT
+` +
+                    `Override lasts up to ${review.duration_hours} hours from confirmation.
+` +
+                    `This review expires at ${review.review_expires_at}.`;
+                document.getElementById('confidenceOverrideAccept').onchange = function () {
+                    document.getElementById('confidenceOverrideConfirm').disabled =
+                        !this.checked || !_confidenceOverrideReview || Date.now() >= Date.parse(_confidenceOverrideReview.review_expires_at);
+                };
+                document.getElementById('confidenceOverrideModal').style.display = 'flex';
+            } catch (error) { showToast('Could not review the confidence override.', 'error'); }
+        }
+
+        async function confirmConfidenceOverrideStart() {
+            const review = _confidenceOverrideReview;
+            if (!review || !document.getElementById('confidenceOverrideAccept').checked || Date.now() >= Date.parse(review.review_expires_at)) {
+                showToast('Review expired or confirmation missing. Review again before starting.', 'warning');
+                return;
+            }
+            closeConfidenceOverrideReview();
+            await startBot({ confidenceOverride: { review_id: review.review_id, accepted: true } });
         }
 
         async function startBot(options = {}) {
@@ -32686,6 +32781,10 @@
                     return;
                 }
                 if (needsResume) {
+                    if (options.confidenceOverride) {
+                        _confidenceOverrideResumeReviewRequired = true;
+                        showToast('Review the retained offers, then confirm a fresh confidence override.', 'warning');
+                    }
                     debugLog('[START] Resume modal shown, waiting for user choice...');
                     _botStarting = false;
                     startBtn.innerHTML = originalText;
@@ -32713,6 +32812,13 @@
                 if (options.resumeExistingOffers === true) {
                     startRequest.headers = { 'Content-Type': 'application/json' };
                     startRequest.body = JSON.stringify({ resume_existing_offers: true });
+                }
+                if (options.confidenceOverride) {
+                    startRequest.headers = { 'Content-Type': 'application/json' };
+                    startRequest.body = JSON.stringify({
+                        resume_existing_offers: options.resumeExistingOffers === true,
+                        confidence_override: options.confidenceOverride
+                    });
                 }
                 const response = await apiFetch(`${API_URL}/bot/start`, startRequest);
                 const result = await response.json();
@@ -32805,6 +32911,7 @@
         }
 
         async function stopBot() {
+            _confidenceOverrideResumeReviewRequired = false;
             // Immediately show "Stopping..." state on the button
             const stopBtn = document.getElementById('stopBtn');
             if (stopBtn) {
@@ -41695,5 +41802,7 @@ async function copyBootstrapSigningUri() {
     }
 }
 </script>
+
+
 </body>
 </html>

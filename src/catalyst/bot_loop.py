@@ -515,6 +515,8 @@ class BotLoop:
         self._market_runtime_risk_preset = ""
         self._market_runtime_refresh_cadence = 0
         self._market_runtime_minimum_provider_count = 0
+        self._confidence_override_consent = None
+        self._confidence_override_review = None
         self._market_confidence_result = None
         self._market_degraded_decision = None
         self._market_confidence_valid_until = None
@@ -1055,6 +1057,58 @@ class BotLoop:
             dispatch_authorizer=self._authorize_publication_claim,
         )
 
+    def _override_intent_matches(
+        self, intent: dict, *, publication: bool = False
+    ) -> bool:
+        consent = getattr(self, "_confidence_override_consent", None)
+        run_id = getattr(consent, "follow_run_id", None)
+        if type(run_id) is not str or len(run_id) != 64:
+            return False
+        states = {"created", "confirmed", "visible"}
+        if not publication:
+            states.add("cancel_requested")
+        trade_id = intent.get("sage_trade_id") if type(intent) is dict else None
+        return bool(
+            type(intent) is dict
+            and intent.get("purpose")
+            in {
+                f"follow:{run_id}:normal_lifecycle",
+                f"follow:{run_id}:book_opportunity",
+            }
+            and intent.get("asset_id") == getattr(cfg, "CAT_ASSET_ID", None)
+            and "terminal_at" in intent
+            and intent["terminal_at"] is None
+            and intent.get("lifecycle_state") in states
+            and type(trade_id) is str
+            and len(trade_id) == 64
+            and all(c in "0123456789abcdef" for c in trade_id)
+        )
+
+    def _override_authorizes_publication(self, claim: dict) -> bool:
+        if type(claim) is not dict or not self._confidence_override_active():
+            return False
+        try:
+            intent = database.get_offer_intent(str(claim.get("intent_id") or ""))
+        except Exception:
+            return False
+        return (
+            self._override_intent_matches(intent, publication=True)
+            and self._confidence_override_active()
+        )
+
+    def _override_protected_trade_ids(self) -> set[str]:
+        if not self._confidence_override_active():
+            return set()
+        try:
+            protected = {
+                row["sage_trade_id"]
+                for row in database.get_offer_intents_for_registry()
+                if self._override_intent_matches(row)
+            }
+        except Exception:
+            return set()
+        return protected if self._confidence_override_active() else set()
+
     def _authorize_publication_claim(self, claim: dict) -> bool:
         """Authorize one exact durable publication at its effect boundary.
 
@@ -1066,7 +1120,15 @@ class BotLoop:
         """
 
         if self._enter_runtime_effect_phase("publication"):
-            return True
+            consent = getattr(self, "_confidence_override_consent", None)
+            decision = getattr(self, "_market_degraded_decision", None)
+            if (
+                consent is None
+                or not getattr(self, "_market_runtime_required", False)
+                or bool(getattr(decision, "can_create", False))
+            ):
+                return True
+            return self._override_authorizes_publication(claim)
         if type(claim) is not dict or not self._runtime_recovery_cycle_boundary():
             return False
         context = self._bootstrap_campaign_context()
@@ -1186,6 +1248,72 @@ class BotLoop:
         )
         return False
 
+    def _market_confidence_snapshot(self):
+        lock = getattr(self, "_market_refresh_lock", None)
+        if lock is None:
+            return (
+                getattr(self, "_market_confidence_result", None),
+                getattr(self, "_market_confidence_valid_until", None),
+            )
+        with lock:
+            return (self._market_confidence_result, self._market_confidence_valid_until)
+
+    def _confidence_override_active(self) -> bool:
+        from confidence_override import current_scope
+
+        consent = getattr(self, "_confidence_override_consent", None)
+        if consent is None or consent.revoked or not getattr(self, "_running", False):
+            return False
+        try:
+            scope = current_scope()
+            raw, deadline = self._market_confidence_snapshot()
+            now = datetime.now(timezone.utc)
+            if not consent.active(scope=scope, now=now):
+                return False
+            return (
+                consent.price_range(
+                    raw,
+                    now=now,
+                    valid_until=deadline,
+                )
+                is not None
+            )
+        except ValueError as exc:
+            if str(exc) != "CONFIDENCE_OVERRIDE_OPERATION_PENDING":
+                consent.revoke()
+            return False
+        except Exception:
+            consent.revoke()
+            return False
+
+    def _effective_market_confidence(self, confidence=None, valid_until=None):
+        from confidence_override import ConsentedConfidence
+
+        raw, deadline = self._market_confidence_snapshot()
+        if confidence is not None:
+            raw, deadline = confidence, valid_until
+        if raw is None or not self._confidence_override_active():
+            return raw
+        consent = self._confidence_override_consent
+        prices = consent.price_range(
+            raw,
+            now=datetime.now(timezone.utc),
+            valid_until=deadline,
+        )
+        if prices is None:
+            return raw
+        return ConsentedConfidence(
+            raw,
+            lambda: (
+                self._confidence_override_active()
+                and consent.price_range(
+                    raw, now=datetime.now(timezone.utc), valid_until=deadline
+                )
+                is not None
+            ),
+            prices,
+        )
+
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
         """Re-sample continuity at every outer-cycle mutation phase boundary."""
 
@@ -1256,6 +1384,8 @@ class BotLoop:
                 ),
             )
             return False
+        if getattr(self, "_confidence_override_active", lambda: False)():
+            return True
         if phase_name == "requote":
             return bool(getattr(decision, "can_requote", False))
         if phase_name in {"create", "publication"}:
@@ -1277,7 +1407,10 @@ class BotLoop:
         if not bool(getattr(self, "_market_runtime_required", False)):
             return True
         decision = getattr(self, "_market_degraded_decision", None)
-        if decision is None or not bool(getattr(decision, "can_create", False)):
+        if decision is None or not (
+            bool(getattr(decision, "can_create", False))
+            or getattr(self, "_confidence_override_active", lambda: False)()
+        ):
             return False
         confidence = getattr(self, "_market_confidence_result", None)
         derived_at = getattr(confidence, "derived_at", None)
@@ -1430,6 +1563,7 @@ class BotLoop:
             protected_bootstrap_trade_ids = set()
 
         rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        protected_follow_trade_ids = self._override_protected_trade_ids()
         trade_ids = [
             str(row.get("trade_id") or "").strip()
             for row in rows
@@ -1438,6 +1572,7 @@ class BotLoop:
             and str(row.get("trade_id") or "").strip() not in attempted_trade_ids
             and str(row.get("trade_id") or "").strip()
             not in protected_bootstrap_trade_ids
+            and str(row.get("trade_id") or "").strip() not in protected_follow_trade_ids
         ]
         capacity_fn = getattr(self.offer_manager, "get_sage_bulk_cancel_capacity", None)
         if (
@@ -2767,6 +2902,22 @@ class BotLoop:
     def _apply_market_follow_capacity(self, targets: Dict[str, int]) -> Dict[str, int]:
         """Apply the current Follow confidence cap to a pair of targets."""
         confidence = getattr(self, "_market_confidence_result", None)
+        if self._confidence_override_active():
+            return {
+                side: min(
+                    int((targets or {}).get(side, 0) or 0),
+                    int(
+                        getattr(
+                            cfg,
+                            "MAX_ACTIVE_BUY_OFFERS"
+                            if side == "buy"
+                            else "MAX_ACTIVE_SELL_OFFERS",
+                            0,
+                        )
+                    ),
+                )
+                for side in ("buy", "sell")
+            }
         return {
             side: market_follow_offer_target(
                 int((targets or {}).get(side, 0) or 0), confidence
@@ -5763,6 +5914,13 @@ class BotLoop:
             )
             return False
 
+        previous_consent = getattr(self, "_confidence_override_consent", None)
+        if previous_consent is not None:
+            previous_consent.revoke()
+        self._confidence_override_consent = getattr(
+            self, "_confidence_override_pending", None
+        )
+        self._confidence_override_pending = None
         try:
             mutation_gate.require_allowed("startup:bot_loop_recovery")
         except mutation_gate.MutationBlocked as exc:
@@ -6058,6 +6216,10 @@ class BotLoop:
 
         Returns True if stopped, False if not running.
         """
+        consent = getattr(self, "_confidence_override_consent", None)
+        if consent is not None:
+            consent.revoke()
+        self._confidence_override_review = None
         if not self._running:
             finalizer = self._stop_finalize_thread
             if finalizer and finalizer.is_alive():
@@ -7630,7 +7792,10 @@ class BotLoop:
         try:
             market_result = self._refresh_offer_book_market()
             fresh_mid = (
-                market_result.confidence.trusted_midpoint
+                self._effective_market_confidence(
+                    market_result.confidence,
+                    getattr(market_result, "valid_until", None),
+                ).trusted_midpoint
                 if market_result is not None
                 else None
             )
@@ -8181,7 +8346,10 @@ class BotLoop:
         try:
             startup_market = self._refresh_offer_book_market()
             startup_mid = (
-                startup_market.confidence.trusted_midpoint
+                self._effective_market_confidence(
+                    startup_market.confidence,
+                    getattr(startup_market, "valid_until", None),
+                ).trusted_midpoint
                 if startup_market is not None
                 else None
             )
@@ -9707,7 +9875,11 @@ class BotLoop:
                 now=datetime.now(timezone.utc), error=market_error
             )
         trusted_midpoint = (
-            market_result.confidence.trusted_midpoint if market_result else None
+            self._effective_market_confidence(
+                market_result.confidence, getattr(market_result, "valid_until", None)
+            ).trusted_midpoint
+            if market_result
+            else None
         )
         price_data = (
             {
@@ -11328,7 +11500,7 @@ class BotLoop:
                         price_floor=price_floor,
                         live_offer_ids=_live_ids,
                         force_cancel_storm=True,
-                        market_confidence=self._market_confidence_result,
+                        market_confidence=self._effective_market_confidence(),
                     )
                     # Note: do NOT add to _requoted_this_cycle until we
                     # know progress was made. Previously we stamped this
@@ -12639,7 +12811,7 @@ class BotLoop:
                         RequoteSeverity.FULL,
                         RequoteSeverity.EMERGENCY,
                     ),
-                    market_confidence=self._market_confidence_result,
+                    market_confidence=self._effective_market_confidence(),
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force
@@ -13883,7 +14055,7 @@ class BotLoop:
                 price_floor=price_floor,
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
-                market_confidence=self._market_confidence_result,
+                market_confidence=self._effective_market_confidence(),
             )
             _parallel_results[side] = offers or []
 
@@ -17409,7 +17581,10 @@ class BotLoop:
             if mid_price <= 0:
                 market_result = self._refresh_offer_book_market()
                 if market_result is not None:
-                    trusted_midpoint = market_result.confidence.trusted_midpoint
+                    trusted_midpoint = self._effective_market_confidence(
+                        market_result.confidence,
+                        getattr(market_result, "valid_until", None),
+                    ).trusted_midpoint
                     if trusted_midpoint is not None:
                         mid_price = trusted_midpoint
 
