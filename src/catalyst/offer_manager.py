@@ -215,6 +215,58 @@ def require_active_bootstrap_intent_authority(
     }
 
 
+def require_active_follow_intent_authority(
+    *,
+    purpose: str,
+    asset_id: str,
+    side: str,
+    offer_max_time: Optional[int],
+    now: Optional[datetime] = None,
+) -> Optional[dict[str, str]]:
+    """Re-read the durable run encoded in a Follow offer purpose.
+
+    This verifies creation eligibility only. Cancellation and its fee hold use
+    separate cleanup authority, which survives a stopped or expired run.
+    """
+
+    if type(purpose) is not str:
+        raise ValueError("FOLLOW_PURPOSE_INVALID")
+    if not purpose.startswith("follow:"):
+        return None
+    parts = purpose.split(":")
+    if (
+        len(parts) != 3
+        or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+        or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+    ):
+        raise ValueError("FOLLOW_PURPOSE_INVALID")
+    if side not in {"buy", "sell"}:
+        raise ValueError("FOLLOW_SIDE_INVALID")
+    observed_at = now or datetime.now(timezone.utc)
+    if type(observed_at) is not datetime or observed_at.tzinfo is None:
+        raise ValueError("FOLLOW_TIME_INVALID")
+
+    from confidence_override import current_scope
+
+    scope = current_scope()
+    if (
+        type(scope) is not dict
+        or scope.get("follow_run_id") != parts[1]
+        or type(scope.get("identity")) is not dict
+        or scope["identity"].get("asset_id") != asset_id
+    ):
+        raise ValueError("FOLLOW_AUTHORITY_MISMATCH")
+    expires_at = scope.get("run_expires_at_epoch")
+    now_epoch = int(observed_at.timestamp())
+    if (
+        type(expires_at) is not int
+        or type(offer_max_time) is not int
+        or not now_epoch < offer_max_time <= expires_at
+    ):
+        raise ValueError("FOLLOW_EXPIRY_INVALID")
+    return {"run_id": parts[1], "classification": parts[2]}
+
+
 def _bounded_offer_max_time(offer_max_time: int, cap: int, *, now_second: int) -> int:
     """Keep a campaign offer's wallet expiry inside its approved window."""
 
@@ -2350,6 +2402,12 @@ class OfferManager:
             offer_max_time=offer_max_time,
             side=side,
         )
+        require_active_follow_intent_authority(
+            purpose=purpose,
+            asset_id=asset_id,
+            offer_max_time=offer_max_time,
+            side=side,
+        )
         if parent_intent_id is not None and (
             type(parent_intent_id) is not str
             or not parent_intent_id
@@ -2985,6 +3043,12 @@ class OfferManager:
                 offer_max_time=intent.offer_max_time,
                 side=intent.side,
             )
+            require_active_follow_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+                offer_max_time=intent.offer_max_time,
+                side=intent.side,
+            )
             continuation = wallet.begin_offer_creation_continuation(
                 operation_id=intent.operation_id,
                 intent_id=intent.intent_id,
@@ -3136,6 +3200,12 @@ class OfferManager:
                     offer_max_time=intent.offer_max_time,
                     side=intent.side,
                 )
+            require_active_follow_intent_authority(
+                purpose=intent.purpose,
+                asset_id=intent.asset_id,
+                offer_max_time=intent.offer_max_time,
+                side=intent.side,
+            )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),

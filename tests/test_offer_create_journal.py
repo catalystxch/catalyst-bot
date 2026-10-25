@@ -990,6 +990,42 @@ def test_bootstrap_authority_revoked_after_start_blocks_wallet_effect(
     assert intent["lifecycle_state"] == "creation_failed"
 
 
+def test_follow_run_revoked_after_prepare_blocks_wallet_effect(
+    isolated_database, monkeypatch
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+    begun, closed = _stub_offer_manager_wallet(
+        monkeypatch, effect=lambda *_args, **_kwargs: effects.append(True)
+    )
+    checks = []
+
+    def check_follow(**_kwargs):
+        checks.append(True)
+        if len(checks) == 3:
+            raise ValueError("FOLLOW_RUN_STOPPED")
+        return {"run_id": "a" * 64, "classification": "normal_lifecycle"}
+
+    monkeypatch.setattr(
+        offer_manager, "require_active_follow_intent_authority", check_follow
+    )
+    result = offer_manager.OfferManager().create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        max_retries=2,
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context={
+            **CREATION_CONTEXT,
+            "purpose": f"follow:{'a' * 64}:normal_lifecycle",
+        },
+    )
+    assert result["success"] is False
+    assert len(checks) >= 3
+    assert effects == []
+    assert len(begun) == len(closed) == 1
+
+
 def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(
     isolated_database,
     monkeypatch,

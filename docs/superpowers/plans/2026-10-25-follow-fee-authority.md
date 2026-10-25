@@ -51,6 +51,13 @@
 - [ ] Enforce authority before persisted create and before final wallet submission.
 - [ ] Verify both normal and book-opportunity intent purpose and restart recovery.
 
+Progress: exact `follow:<run_id>:normal_lifecycle|book_opportunity` purpose now
+rechecks the verified durable run at canonicalization, before intent preparation,
+and immediately before wallet submission. A regression reproduced wallet-boundary
+revocation when the final check was absent. The task remains open until every
+ordinary Follow producer attaches this purpose; legacy unscoped producers must
+be fenced rather than silently inheriting a new run.
+
 ### Task 3: Exact priced cancellation hold for every Follow path
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/database.py`, fee pricing/dispatch helpers, focused tests.
