@@ -8249,6 +8249,8 @@ class OfferManager:
         canonical_intents = [self._canonical_cancel_intent(tid) for tid in trade_ids]
         bootstrap_campaign_ids = set()
         bootstrap_member_count = 0
+        follow_run_ids = set()
+        follow_member_count = 0
         for canonical_intent in canonical_intents:
             creation_intent = database.get_offer_intent(canonical_intent.intent_id)
             purpose = (
@@ -8256,6 +8258,17 @@ class OfferManager:
                 if type(creation_intent) is dict
                 else ""
             )
+            if purpose.startswith("follow:"):
+                parts = purpose.split(":")
+                if (
+                    len(parts) != 3
+                    or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+                    or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+                ):
+                    raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+                follow_run_ids.add(parts[1])
+                follow_member_count += 1
+                continue
             if not purpose.startswith("bootstrap:"):
                 continue
             parts = purpose.split(":")
@@ -8268,6 +8281,15 @@ class OfferManager:
                 raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
             bootstrap_campaign_ids.add(parts[1])
             bootstrap_member_count += 1
+        if follow_run_ids:
+            if len(follow_run_ids) != 1 or follow_member_count != len(
+                canonical_intents
+            ):
+                raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+            # Follow cancellations require the exact reviewed run's cumulative
+            # fee hold.  Until that priced path is available, never route them
+            # through the generic batch or serial wallet cancellation.
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
         if bootstrap_campaign_ids:
             if len(bootstrap_campaign_ids) != 1 or bootstrap_member_count != len(
                 canonical_intents

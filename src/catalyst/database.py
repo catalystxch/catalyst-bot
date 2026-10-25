@@ -2029,6 +2029,57 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'fee consent lacks matching current preview');
 END;
+
+-- A reviewed Follow run owns one immutable financial scope across restarts.
+-- This row is authority metadata, never by itself a wallet dispatch permit.
+CREATE TABLE IF NOT EXISTS follow_run_authorities (
+    run_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'),
+    consent_id TEXT UNIQUE NOT NULL
+        CHECK(length(consent_id)=64 AND consent_id NOT GLOB '*[^0-9a-f]*'),
+    approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
+    started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL
+        CHECK(typeof(protected_shutdown_fee_mojos)='integer'
+              AND protected_shutdown_fee_mojos>=0
+              AND protected_shutdown_fee_mojos<=maximum_fee_mojos)
+);
+CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_identity
+    ON follow_run_authorities(identity_sha256, started_at_epoch DESC);
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_no_update
+BEFORE UPDATE ON follow_run_authorities BEGIN
+    SELECT RAISE(ABORT, 'Follow run authority is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_no_delete
+BEFORE DELETE ON follow_run_authorities BEGIN
+    SELECT RAISE(ABORT, 'Follow run authority is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_authorities_identity_guard
+BEFORE INSERT ON follow_run_authorities
+WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
+BEGIN SELECT RAISE(ABORT, 'Follow run identity mismatch'); END;
+CREATE TABLE IF NOT EXISTS follow_run_stops (
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES follow_run_authorities(run_id),
+    stopped_at_epoch INTEGER NOT NULL
+        CHECK(typeof(stopped_at_epoch)='integer' AND stopped_at_epoch>=0)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_stops_no_update
+BEFORE UPDATE ON follow_run_stops BEGIN
+    SELECT RAISE(ABORT, 'Follow run stop is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_stops_no_delete
+BEFORE DELETE ON follow_run_stops BEGIN
+    SELECT RAISE(ABORT, 'Follow run stop is immutable');
+END;
 """
 
 
@@ -4391,6 +4442,21 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "follow_run_stops": {"run_id", "stopped_at_epoch"},
+    "follow_run_authorities": {
+        "run_id",
+        "consent_id",
+        "approval_id",
+        "identity_sha256",
+        "identity_json",
+        "configuration_sha256",
+        "buy_limit",
+        "sell_limit",
+        "started_at_epoch",
+        "expires_at_epoch",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+    },
     "coin_prep_fee_sessions": {
         "session_id",
         "identity_sha256",
@@ -22188,6 +22254,284 @@ def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:
         if row is None:
             raise ValueError("FEE_APPROVAL_REQUIRED")
         return dict(row)
+    finally:
+        conn.close()
+
+
+_FOLLOW_IDENTITY_FIELDS = frozenset(
+    {
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "xch_wallet_id",
+        "asset_id",
+        "ticker",
+    }
+)
+
+
+def _follow_identity_json(identity: dict) -> str:
+    """Use the same closed wallet identity as the native fee consent."""
+    if type(identity) is not dict or set(identity) != _FOLLOW_IDENTITY_FIELDS:
+        raise ValueError("FOLLOW_IDENTITY_INVALID")
+    if (
+        identity["wallet_type"] not in ("sage", "chia")
+        or type(identity["network"]) is not str
+        or re.fullmatch(r"mainnet|testnet[0-9]+", identity["network"]) is None
+        or type(identity["ticker"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", identity["ticker"]) is None
+    ):
+        raise ValueError("FOLLOW_IDENTITY_INVALID")
+    _fee_digest(identity["asset_id"])
+    for key in ("wallet_fingerprint", "wallet_id", "xch_wallet_id"):
+        value = identity[key]
+        if type(value) is not int or not 1 <= value <= (2**32 - 1):
+            raise ValueError("FOLLOW_IDENTITY_INVALID")
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def create_follow_run_authority(
+    *,
+    consent_id: str,
+    approval_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    buy_limit: int,
+    sell_limit: int,
+    started_at_epoch: int,
+    expires_at_epoch: int,
+    maximum_fee_mojos: int,
+    protected_shutdown_fee_mojos: int,
+) -> Dict[str, Any]:
+    """Bind an explicit native run review to one already-approved fee scope.
+
+    The caller must supply the reviewed immutable run options. This database
+    transition does not start the bot or authorize a wallet effect.
+    """
+    consent = _fee_digest(consent_id)
+    approval = _fee_digest(approval_id)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if (
+        any(
+            type(value) is not int or not 1 <= value <= 50
+            for value in (buy_limit, sell_limit)
+        )
+        or type(started_at_epoch) is not int
+        or type(expires_at_epoch) is not int
+        or started_at_epoch < 0
+        or expires_at_epoch <= started_at_epoch
+        or expires_at_epoch - started_at_epoch > 48 * 3600
+    ):
+        raise ValueError("FOLLOW_REVIEW_INVALID")
+    maximum = _fee_amount(maximum_fee_mojos)
+    protected = _fee_amount(protected_shutdown_fee_mojos)
+    if maximum == 0 or protected > maximum:
+        raise ValueError("FOLLOW_FEE_CAP_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        approved = conn.execute(
+            "SELECT approval.*, preview.scope_json FROM fee_approvals AS approval "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE approval.approval_id=?",
+            (approval,),
+        ).fetchone()
+        if approved is None:
+            raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+        scope = json.loads(approved["scope_json"])
+        if (
+            any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS)
+            or scope.get("campaign_id") is not None
+            or scope.get("session_id") is None
+            or approved["total_fee_mojos"] != maximum
+            or approved["cancellation_reserve_mojos"] < protected
+        ):
+            raise ValueError("FOLLOW_FEE_APPROVAL_MISMATCH")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (approved["scope_sha256"],),
+        ).fetchone()[0]
+        if approved["version"] != latest:
+            raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+        prior = conn.execute(
+            "SELECT 1 FROM follow_run_authorities WHERE identity_sha256=? "
+            "AND expires_at_epoch>? LIMIT 1",
+            (identity_hash, started_at_epoch),
+        ).fetchone()
+        if prior is not None:
+            raise ValueError("FOLLOW_RUN_OVERLAP")
+        totals = _fee_scope_totals(conn, approved["scope_sha256"])
+        if totals["committed_fee_mojos"] + protected > maximum:
+            raise ValueError("FOLLOW_SHUTDOWN_RESERVE_UNFUNDED")
+        run_id = secrets.token_hex(32)
+        conn.execute(
+            "INSERT INTO follow_run_authorities VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                consent,
+                approval,
+                identity_hash,
+                encoded_identity,
+                config_hash,
+                buy_limit,
+                sell_limit,
+                started_at_epoch,
+                expires_at_epoch,
+                maximum,
+                protected,
+            ),
+        )
+        conn.commit()
+        return {"run_id": run_id, "consent_id": consent, "dispatch_authorized": False}
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_follow_creation_authority(
+    *,
+    identity: dict,
+    configuration_sha256: str,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Read one matching, funded run; this is never wallet dispatch authority."""
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    config_hash = _fee_digest(configuration_sha256)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    result = {
+        "ready": False,
+        "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
+        "run_id": None,
+        "identity": None,
+        "configuration_sha256": None,
+        "buy_limit": None,
+        "sell_limit": None,
+        "expires_at_epoch": None,
+        "maximum_fee_mojos": None,
+        "protected_shutdown_fee_mojos": None,
+        "consent_id": None,
+    }
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+            "approval.version, approval.total_fee_mojos, "
+            "approval.cancellation_reserve_mojos "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.identity_sha256=? "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
+            (identity_hash,),
+        ).fetchone()
+        if row is None:
+            return result
+        result.update(
+            {
+                "run_id": row["run_id"],
+                "identity": identity,
+                "configuration_sha256": row["configuration_sha256"],
+                "buy_limit": row["buy_limit"],
+                "sell_limit": row["sell_limit"],
+                "expires_at_epoch": row["expires_at_epoch"],
+                "maximum_fee_mojos": row["maximum_fee_mojos"],
+                "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+                "consent_id": row["consent_id"],
+            }
+        )
+        if row["configuration_sha256"] != config_hash:
+            result["reason_code"] = "FOLLOW_CONFIGURATION_CHANGED"
+        elif (
+            now_epoch < row["started_at_epoch"] or now_epoch >= row["expires_at_epoch"]
+        ):
+            result["reason_code"] = "FOLLOW_RUN_EXPIRED"
+        elif (
+            conn.execute(
+                "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+                (row["run_id"],),
+            ).fetchone()
+            is not None
+        ):
+            result["reason_code"] = "FOLLOW_RUN_STOPPED"
+        elif row["total_fee_mojos"] != row["maximum_fee_mojos"] or (
+            row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+        else:
+            latest = conn.execute(
+                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+                (row["scope_sha256"],),
+            ).fetchone()[0]
+            unresolved = conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "LIMIT 1",
+                (row["scope_sha256"],),
+            ).fetchone()
+            totals = _fee_scope_totals(conn, row["scope_sha256"])
+            if latest != row["version"]:
+                result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
+            elif unresolved is not None:
+                result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
+            elif (
+                totals["committed_fee_mojos"] + row["protected_shutdown_fee_mojos"]
+                > row["maximum_fee_mojos"]
+            ):
+                result["reason_code"] = "FOLLOW_SHUTDOWN_RESERVE_UNFUNDED"
+            else:
+                result["ready"] = True
+                result["reason_code"] = None
+        return result
+    finally:
+        conn.close()
+
+
+def stop_follow_run_authority(*, run_id: str, stopped_at_epoch: int) -> Dict[str, Any]:
+    """Stop new creation without destroying the approved cleanup scope."""
+    run = _fee_digest(run_id)
+    if type(stopped_at_epoch) is not int or stopped_at_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        authority = conn.execute(
+            "SELECT started_at_epoch FROM follow_run_authorities WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if authority is None:
+            raise ValueError("FOLLOW_AUTHORITY_REQUIRED")
+        if stopped_at_epoch < authority["started_at_epoch"]:
+            raise ValueError("FOLLOW_TIME_INVALID")
+        prior = conn.execute(
+            "SELECT stopped_at_epoch FROM follow_run_stops WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if prior is None:
+            conn.execute(
+                "INSERT INTO follow_run_stops VALUES (?,?)", (run, stopped_at_epoch)
+            )
+        conn.commit()
+        return {
+            "run_id": run,
+            "stopped_at_epoch": (
+                prior["stopped_at_epoch"] if prior else stopped_at_epoch
+            ),
+            "idempotent": prior is not None,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
