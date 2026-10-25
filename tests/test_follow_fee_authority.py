@@ -1,9 +1,124 @@
 """A Follow run cannot silently reset its financial authority on restart."""
 
 import json
+from unittest.mock import patch
 
 import database
+import pytest
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
+
+
+def reviewed_run(**terms):
+    review = database.create_follow_run_review(**terms)
+    with patch.object(
+        database.time, "time", return_value=terms["started_at_epoch"] + 1
+    ):
+        return database.create_follow_run_authority(
+            consent_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            **terms,
+        )
+
+
+def test_follow_review_is_exact_single_use_and_expires(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    terms = dict(
+        approval_id=approval_id,
+        identity={
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        },
+        configuration_sha256="a" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=1001 + 48 * 3600,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    review = database.create_follow_run_review(**terms)
+    with patch.object(database.time, "time", return_value=1002):
+        with pytest.raises(ValueError, match="FOLLOW_REVIEW_CHANGED"):
+            database.create_follow_run_authority(
+                consent_id=review["review_id"],
+                review_sha256="f" * 64,
+                **terms,
+            )
+        with pytest.raises(ValueError, match="FOLLOW_REVIEW_CHANGED"):
+            database.create_follow_run_authority(
+                consent_id=review["review_id"],
+                review_sha256=review["review_sha256"],
+                **(terms | {"buy_limit": 25}),
+            )
+        run = database.create_follow_run_authority(
+            consent_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            **terms,
+        )
+        assert run["consent_id"] == review["review_id"]
+        with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
+            database.create_follow_run_authority(
+                consent_id=review["review_id"],
+                review_sha256=review["review_sha256"],
+                **terms,
+            )
+    expired = database.create_follow_run_review(
+        **(terms | {"started_at_epoch": 2000, "expires_at_epoch": 2000 + 48 * 3600})
+    )
+    with patch.object(database.time, "time", return_value=2301):
+        with pytest.raises(ValueError, match="FOLLOW_REVIEW_EXPIRED"):
+            database.create_follow_run_authority(
+                consent_id=expired["review_id"],
+                review_sha256=expired["review_sha256"],
+                **(
+                    terms
+                    | {"started_at_epoch": 2000, "expires_at_epoch": 2000 + 48 * 3600}
+                ),
+            )
+
+
+def test_arbitrary_follow_consent_cannot_create_financial_run(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    with pytest.raises(ValueError, match="FOLLOW_REVIEW_REQUIRED"):
+        database.create_follow_run_authority(
+            consent_id="c" * 64,
+            review_sha256="f" * 64,
+            approval_id=approval_id,
+            identity=identity,
+            configuration_sha256="a" * 64,
+            buy_limit=24,
+            sell_limit=24,
+            started_at_epoch=1001,
+            expires_at_epoch=1001 + 48 * 3600,
+            maximum_fee_mojos=80,
+            protected_shutdown_fee_mojos=40,
+        )
 
 
 def test_follow_creation_authority_is_bound_to_original_review(approved):
@@ -23,8 +138,7 @@ def test_follow_creation_authority_is_bound_to_original_review(approved):
         )
     }
     config_digest = "a" * 64
-    run = database.create_follow_run_authority(
-        consent_id="c" * 64,
+    run = reviewed_run(
         approval_id=approval_id,
         identity=identity,
         configuration_sha256=config_digest,
@@ -81,8 +195,7 @@ def test_unresolved_fee_effect_temporarily_blocks_creation_without_reset(approve
             "ticker",
         )
     }
-    run = database.create_follow_run_authority(
-        consent_id="d" * 64,
+    run = reviewed_run(
         approval_id=approval_id,
         identity=identity,
         configuration_sha256="a" * 64,
@@ -142,8 +255,7 @@ def test_unapproved_fee_ledger_cannot_create_follow_authority(approved):
     import pytest
 
     with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_REQUIRED"):
-        database.create_follow_run_authority(
-            consent_id="e" * 64,
+        reviewed_run(
             approval_id=generic["approval_id"],
             identity=identity,
             configuration_sha256="a" * 64,
@@ -173,8 +285,7 @@ def test_stopping_run_revokes_creation_but_keeps_cleanup_scope(approved):
             "ticker",
         )
     }
-    run = database.create_follow_run_authority(
-        consent_id="d" * 64,
+    run = reviewed_run(
         approval_id=approval_id,
         identity=identity,
         configuration_sha256="a" * 64,
@@ -192,7 +303,7 @@ def test_stopping_run_revokes_creation_but_keeps_cleanup_scope(approved):
     assert result["ready"] is False
     assert result["reason_code"] == "FOLLOW_RUN_STOPPED"
     assert result["run_id"] == run["run_id"]
-    assert result["consent_id"] == "d" * 64
+    assert result["consent_id"] == run["consent_id"]
 
 
 def test_stopped_and_expired_run_retains_only_bound_cleanup_scope(approved):
@@ -212,8 +323,7 @@ def test_stopped_and_expired_run_retains_only_bound_cleanup_scope(approved):
             "ticker",
         )
     }
-    run = database.create_follow_run_authority(
-        consent_id="d" * 64,
+    run = reviewed_run(
         approval_id=approval_id,
         identity=identity,
         configuration_sha256="a" * 64,

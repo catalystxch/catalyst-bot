@@ -107,8 +107,7 @@ def test_scope_accepts_only_actual_durable_follow_run(approved, monkeypatch):
         "ticker": configuration["CAT_TICKER_ID"],
     }
     now = int(datetime.now(timezone.utc).timestamp())
-    run = database.create_follow_run_authority(
-        consent_id="d" * 64,
+    terms = dict(
         approval_id=approved["approval"]["approval_id"],
         identity=identity,
         configuration_sha256=policy.current_configuration_digest(),
@@ -119,9 +118,16 @@ def test_scope_accepts_only_actual_durable_follow_run(approved, monkeypatch):
         maximum_fee_mojos=80,
         protected_shutdown_fee_mojos=40,
     )
+    review = database.create_follow_run_review(**terms)
+    monkeypatch.setattr(database.time, "time", lambda: now + 1)
+    run = database.create_follow_run_authority(
+        consent_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        **terms,
+    )
     scope = policy.current_scope()
     assert scope["follow_run_id"] == run["run_id"]
-    assert scope["financial_consent_id"] == "d" * 64
+    assert scope["financial_consent_id"] == review["review_id"]
     database.stop_follow_run_authority(run_id=run["run_id"], stopped_at_epoch=now)
     with pytest.raises(ValueError, match="FOLLOW_FEE_AUTHORITY_REQUIRED"):
         policy.current_scope()

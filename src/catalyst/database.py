@@ -2032,10 +2032,46 @@ END;
 
 -- A reviewed Follow run owns one immutable financial scope across restarts.
 -- This row is authority metadata, never by itself a wallet dispatch permit.
+CREATE TABLE IF NOT EXISTS follow_run_reviews (
+    review_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(review_id)=64 AND review_id NOT GLOB '*[^0-9a-f]*'),
+    review_sha256 TEXT NOT NULL
+        CHECK(length(review_sha256)=64 AND review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
+    started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL
+        CHECK(typeof(protected_shutdown_fee_mojos)='integer'
+              AND protected_shutdown_fee_mojos>=0
+              AND protected_shutdown_fee_mojos<=maximum_fee_mojos),
+    review_expires_at_epoch INTEGER NOT NULL
+        CHECK(typeof(review_expires_at_epoch)='integer'
+              AND review_expires_at_epoch>started_at_epoch)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_no_update
+BEFORE UPDATE ON follow_run_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow run review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_no_delete
+BEFORE DELETE ON follow_run_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow run review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reviews_identity_guard
+BEFORE INSERT ON follow_run_reviews
+WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
+BEGIN SELECT RAISE(ABORT, 'Follow review identity mismatch'); END;
 CREATE TABLE IF NOT EXISTS follow_run_authorities (
     run_id TEXT PRIMARY KEY NOT NULL
         CHECK(length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'),
-    consent_id TEXT UNIQUE NOT NULL
+    consent_id TEXT UNIQUE NOT NULL REFERENCES follow_run_reviews(review_id)
         CHECK(length(consent_id)=64 AND consent_id NOT GLOB '*[^0-9a-f]*'),
     approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
     identity_sha256 TEXT NOT NULL
@@ -4442,6 +4478,21 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "follow_run_reviews": {
+        "review_id",
+        "review_sha256",
+        "approval_id",
+        "identity_sha256",
+        "identity_json",
+        "configuration_sha256",
+        "buy_limit",
+        "sell_limit",
+        "started_at_epoch",
+        "expires_at_epoch",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "review_expires_at_epoch",
+    },
     "follow_run_stops": {"run_id", "stopped_at_epoch"},
     "follow_run_authorities": {
         "run_id",
@@ -22291,9 +22342,101 @@ def _follow_identity_json(identity: dict) -> str:
     return json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def create_follow_run_review(
+    *,
+    approval_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    buy_limit: int,
+    sell_limit: int,
+    started_at_epoch: int,
+    expires_at_epoch: int,
+    maximum_fee_mojos: int,
+    protected_shutdown_fee_mojos: int,
+) -> Dict[str, Any]:
+    """Freeze server-verified run terms for one short-lived native review.
+
+    This is only durable review data. A separate native confirmation must
+    consume its opaque ID; it never starts trading or grants wallet dispatch.
+    """
+    approval = _fee_digest(approval_id)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if (
+        any(type(v) is not int or not 1 <= v <= 50 for v in (buy_limit, sell_limit))
+        or type(started_at_epoch) is not int
+        or type(expires_at_epoch) is not int
+        or started_at_epoch < 0
+        or not started_at_epoch < expires_at_epoch <= started_at_epoch + 48 * 3600
+    ):
+        raise ValueError("FOLLOW_REVIEW_INVALID")
+    maximum = _fee_amount(maximum_fee_mojos)
+    protected = _fee_amount(protected_shutdown_fee_mojos)
+    if maximum == 0 or protected > maximum:
+        raise ValueError("FOLLOW_FEE_CAP_INVALID")
+    review_id = secrets.token_hex(32)
+    review_terms = {
+        "approval_id": approval,
+        "identity": identity,
+        "configuration_sha256": config_hash,
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "started_at_epoch": started_at_epoch,
+        "expires_at_epoch": expires_at_epoch,
+        "maximum_fee_mojos": maximum,
+        "protected_shutdown_fee_mojos": protected,
+    }
+    review_sha256 = hashlib.sha256(
+        json.dumps(
+            review_terms, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    ).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_fee_consents WHERE approval_id=?", (approval,)
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+        conn.execute(
+            "INSERT INTO follow_run_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                review_id,
+                review_sha256,
+                approval,
+                identity_hash,
+                encoded_identity,
+                config_hash,
+                buy_limit,
+                sell_limit,
+                started_at_epoch,
+                expires_at_epoch,
+                maximum,
+                protected,
+                started_at_epoch + 300,
+            ),
+        )
+        conn.commit()
+        return {
+            "review_id": review_id,
+            "review_sha256": review_sha256,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def create_follow_run_authority(
     *,
     consent_id: str,
+    review_sha256: str,
     approval_id: str,
     identity: dict,
     configuration_sha256: str,
@@ -22310,6 +22453,7 @@ def create_follow_run_authority(
     transition does not start the bot or authorize a wallet effect.
     """
     consent = _fee_digest(consent_id)
+    review_digest = _fee_digest(review_sha256)
     approval = _fee_digest(approval_id)
     config_hash = _fee_digest(configuration_sha256)
     encoded_identity = _follow_identity_json(identity)
@@ -22333,6 +22477,38 @@ def create_follow_run_authority(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        review = conn.execute(
+            "SELECT * FROM follow_run_reviews WHERE review_id=?", (consent,)
+        ).fetchone()
+        if review is None:
+            raise ValueError("FOLLOW_REVIEW_REQUIRED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM follow_run_authorities WHERE consent_id=?", (consent,)
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FOLLOW_REVIEW_USED")
+        if (
+            not review["started_at_epoch"]
+            <= int(time.time())
+            < review["review_expires_at_epoch"]
+        ):
+            raise ValueError("FOLLOW_REVIEW_EXPIRED")
+        if (
+            review["review_sha256"] != review_digest
+            or review["approval_id"] != approval
+            or review["identity_sha256"] != identity_hash
+            or review["identity_json"] != encoded_identity
+            or review["configuration_sha256"] != config_hash
+            or review["buy_limit"] != buy_limit
+            or review["sell_limit"] != sell_limit
+            or review["started_at_epoch"] != started_at_epoch
+            or review["expires_at_epoch"] != expires_at_epoch
+            or review["maximum_fee_mojos"] != maximum
+            or review["protected_shutdown_fee_mojos"] != protected
+        ):
+            raise ValueError("FOLLOW_REVIEW_CHANGED")
         approved = conn.execute(
             "SELECT approval.*, preview.scope_json FROM fee_approvals AS approval "
             "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
