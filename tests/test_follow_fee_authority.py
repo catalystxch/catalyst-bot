@@ -107,6 +107,13 @@ def test_unresolved_fee_effect_temporarily_blocks_creation_without_reset(approve
     assert blocked["ready"] is False
     assert blocked["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
     assert blocked["run_id"] == run["run_id"]
+    cleanup = database.get_follow_cleanup_authority(
+        run_id=run["run_id"], identity=identity, now_epoch=1002
+    )
+    assert cleanup["ready"] is False
+    assert cleanup["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
+    assert cleanup["held_fee_mojos"] == 1
+    assert cleanup["remaining_fee_mojos"] == 79
 
 
 def test_unapproved_fee_ledger_cannot_create_follow_authority(approved):
@@ -186,3 +193,49 @@ def test_stopping_run_revokes_creation_but_keeps_cleanup_scope(approved):
     assert result["reason_code"] == "FOLLOW_RUN_STOPPED"
     assert result["run_id"] == run["run_id"]
     assert result["consent_id"] == "d" * 64
+
+
+def test_stopped_and_expired_run_retains_only_bound_cleanup_scope(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    run = database.create_follow_run_authority(
+        consent_id="d" * 64,
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=1001 + 48 * 3600,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    database.stop_follow_run_authority(run_id=run["run_id"], stopped_at_epoch=1010)
+    cleanup = database.get_follow_cleanup_authority(
+        run_id=run["run_id"], identity=identity, now_epoch=1001 + 48 * 3600 + 1
+    )
+    assert cleanup["ready"] is True
+    assert cleanup["approval_id"] == approval_id
+    assert cleanup["maximum_fee_mojos"] == 80
+    assert cleanup["protected_shutdown_fee_mojos"] == 40
+    assert cleanup["dispatch_authorized"] is False
+    wrong = {**identity, "wallet_fingerprint": identity["wallet_fingerprint"] + 1}
+    refused = database.get_follow_cleanup_authority(
+        run_id=run["run_id"], identity=wrong, now_epoch=1001 + 48 * 3600 + 1
+    )
+    assert refused["ready"] is False
+    assert refused["reason_code"] == "FOLLOW_IDENTITY_MISMATCH"

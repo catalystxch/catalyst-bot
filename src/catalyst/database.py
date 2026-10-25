@@ -22496,6 +22496,110 @@ def get_follow_creation_authority(
         conn.close()
 
 
+def get_follow_cleanup_authority(
+    *, run_id: str, identity: dict, now_epoch: int
+) -> Dict[str, Any]:
+    """Read the original fee scope for stopped or expired Follow cleanup.
+
+    Stopping and expiry remove creation rights, but neither may substitute a
+    new approval or silently discard the old run's cumulative fee accounting.
+    This read grants no wallet dispatch authority.
+    """
+    run = _fee_digest(run_id)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    result: Dict[str, Any] = {
+        "ready": False,
+        "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
+        "run_id": run,
+        "approval_id": None,
+        "scope_sha256": None,
+        "plan_sha256": None,
+        "maximum_fee_mojos": None,
+        "protected_shutdown_fee_mojos": None,
+        "spent_fee_mojos": None,
+        "held_fee_mojos": None,
+        "remaining_fee_mojos": None,
+        "dispatch_authorized": False,
+    }
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
+            "approval.version, approval.total_fee_mojos, "
+            "approval.cancellation_reserve_mojos, preview.scope_json "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE run.run_id=?",
+            (run,),
+        ).fetchone()
+        if row is None:
+            return result
+        result.update(
+            {
+                "approval_id": row["approval_id"],
+                "scope_sha256": row["scope_sha256"],
+                "plan_sha256": row["plan_sha256"],
+                "maximum_fee_mojos": row["maximum_fee_mojos"],
+                "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+            }
+        )
+        scope = json.loads(row["scope_json"])
+        if (
+            row["identity_sha256"] != identity_hash
+            or row["identity_json"] != encoded_identity
+        ):
+            result["reason_code"] = "FOLLOW_IDENTITY_MISMATCH"
+        elif any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS):
+            result["reason_code"] = "FOLLOW_IDENTITY_MISMATCH"
+        elif now_epoch < row["started_at_epoch"]:
+            result["reason_code"] = "FOLLOW_RUN_NOT_STARTED"
+        elif (
+            row["total_fee_mojos"] != row["maximum_fee_mojos"]
+            or row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+        else:
+            latest = conn.execute(
+                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+                (row["scope_sha256"],),
+            ).fetchone()[0]
+            totals = _fee_scope_totals(conn, row["scope_sha256"])
+            committed = totals["committed_fee_mojos"]
+            result.update(
+                {
+                    "spent_fee_mojos": totals["spent_fee_mojos"],
+                    "held_fee_mojos": totals["held_fee_mojos"],
+                    "remaining_fee_mojos": max(0, row["maximum_fee_mojos"] - committed),
+                }
+            )
+            unresolved = conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "LIMIT 1",
+                (row["scope_sha256"],),
+            ).fetchone()
+            if latest != row["version"]:
+                result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
+            elif unresolved is not None:
+                result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
+            elif committed > row["maximum_fee_mojos"]:
+                result["reason_code"] = "FOLLOW_FEE_CAP_EXCEEDED"
+            else:
+                result["ready"] = True
+                result["reason_code"] = None
+        return result
+    finally:
+        conn.close()
+
+
 def stop_follow_run_authority(*, run_id: str, stopped_at_epoch: int) -> Dict[str, Any]:
     """Stop new creation without destroying the approved cleanup scope."""
     run = _fee_digest(run_id)
