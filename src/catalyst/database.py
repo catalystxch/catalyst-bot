@@ -22433,6 +22433,29 @@ def create_follow_run_review(
         conn.close()
 
 
+def get_follow_run_review(review_id: str) -> Dict[str, Any]:
+    """Read the immutable native review terms without granting effect authority."""
+    review_id = _fee_digest(review_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT review.*, EXISTS(SELECT 1 FROM follow_run_authorities AS run "
+            "WHERE run.consent_id=review.review_id) AS consumed "
+            "FROM follow_run_reviews AS review WHERE review.review_id=?",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_REVIEW_REQUIRED")
+        return {
+            **dict(row),
+            "identity": json.loads(row["identity_json"]),
+            "consumed": bool(row["consumed"]),
+            "dispatch_authorized": False,
+        }
+    finally:
+        conn.close()
+
+
 def create_follow_run_authority(
     *,
     consent_id: str,

@@ -48,6 +48,14 @@ def test_follow_review_is_exact_single_use_and_expires(approved):
         protected_shutdown_fee_mojos=40,
     )
     review = database.create_follow_run_review(**terms)
+    stored = database.get_follow_run_review(review["review_id"])
+    assert stored["review_sha256"] == review["review_sha256"]
+    assert stored["identity"] == terms["identity"]
+    assert stored["buy_limit"] == stored["sell_limit"] == 24
+    assert stored["maximum_fee_mojos"] == 80
+    assert stored["protected_shutdown_fee_mojos"] == 40
+    assert stored["consumed"] is False
+    assert stored["dispatch_authorized"] is False
     with patch.object(database.time, "time", return_value=1002):
         with pytest.raises(ValueError, match="FOLLOW_REVIEW_CHANGED"):
             database.create_follow_run_authority(
@@ -67,12 +75,16 @@ def test_follow_review_is_exact_single_use_and_expires(approved):
             **terms,
         )
         assert run["consent_id"] == review["review_id"]
+        assert database.get_follow_run_review(review["review_id"])["consumed"] is True
         with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
             database.create_follow_run_authority(
                 consent_id=review["review_id"],
                 review_sha256=review["review_sha256"],
                 **terms,
             )
+
+    with pytest.raises(ValueError, match="FOLLOW_REVIEW_REQUIRED"):
+        database.get_follow_run_review("0" * 64)
     expired = database.create_follow_run_review(
         **(terms | {"started_at_epoch": 2000, "expires_at_epoch": 2000 + 48 * 3600})
     )
