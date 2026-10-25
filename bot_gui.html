@@ -33026,6 +33026,13 @@
             _refreshAbortPreview = preview;
             const hasRecovery = Boolean(preview.candidate || preview.abort);
             if (!hasRecovery && preview.safety?.allowed === true) {
+                document.getElementById('cancelConfirmTitle').textContent = 'Cancel all live offers?';
+                document.getElementById('cancelConfirmCopy').textContent = 'This sends cancellation requests for every live offer in the connected wallet, including offers not tracked by CATalyst. Use it for a clean restart or wallet switch after the bot has been stopped.';
+                const trades = preview.wallet?.active_trade_ids;
+                if (Array.isArray(trades)) {
+                    const fingerprint = preview.wallet?.fingerprint || 'unavailable';
+                    document.getElementById('cancelOfferCount').textContent = `Sage wallet ${fingerprint}: ${trades.length} live offer${trades.length === 1 ? '' : 's'}, ${preview.wallet?.pending_transaction_count ?? '?'} pending transaction(s).`;
+                }
                 broad.disabled = false;
                 return;
             }
@@ -33138,6 +33145,7 @@
                                 ? 'Submitted cancellations have terminal Sage proof.'
                                 : 'Cancellation proof is still incomplete; the wallet remains fenced.'),
                                 status.phase === 'reconciled' ? 'success' : 'warning');
+                            if (status.phase === 'reconciled') await fetchStatus();
                             await loadRefreshAbortReview();
                             return;
                         }

@@ -3673,6 +3673,45 @@ def test_native_cancel_review_exposes_exact_proof_only_action(page):
     }
 
 
+def test_cancel_review_refreshes_wallet_count_and_unblocks_title_after_proof(page):
+    """A terminal Sage cancel must not leave the old broad-cancel warning on screen."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            window.__cancelProofSettled = false;
+            bot_state = { running: false, offers: {
+                buy: [{ trade_id: 'already-cancelled' }],
+                sell: [{ trade_id: 'remaining' }],
+            } };
+            apiFetch = async (path) => {
+                if (String(path).includes('/offers/refresh_abort/preview')) {
+                    return new Response(JSON.stringify({
+                        success: true, stage: 'no_exact_candidate', candidate: null,
+                        abort: null,
+                        wallet: { fingerprint: 736588221, pending_transaction_count: 0,
+                            active_trade_ids: ['remaining'] },
+                        safety: window.__cancelProofSettled
+                            ? { allowed: true, reason_code: '', lease_owned: true,
+                                blocking_operation_ids: [] }
+                            : { allowed: false, reason_code: 'UNRESOLVED_OPERATIONS',
+                                generation: 685, lease_owned: true,
+                                blocking_operation_ids: ['cancel:' + 'a'.repeat(64)] },
+                    }), { status: 200 });
+                }
+                throw new Error(`Unexpected request: ${path}`);
+            };
+            await cancelAllOffers();
+            window.__cancelProofSettled = true;
+            await loadRefreshAbortReview();
+        }"""
+    )
+    expect(page.locator("#cancelConfirmTitle")).to_have_text("Cancel all live offers?")
+    expect(page.locator("#cancelOfferCount")).to_contain_text("1 live offer")
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_enabled()
+
+
 def test_cancel_all_shows_preflight_rejection_to_operator(page):
     """A stopped-process guard failure must be visible without another click."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
