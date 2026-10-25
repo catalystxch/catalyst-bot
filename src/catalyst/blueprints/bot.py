@@ -745,6 +745,37 @@ def api_bot_start():
         return jsonify({"success": True, "status": "already_running"})
 
     request_payload = request.get_json(silent=True)
+    if (
+        type(request_payload) is dict
+        and request_payload.get("review_confidence_override") is True
+    ):
+        from confidence_override import prepare_review
+
+        try:
+            review = prepare_review(
+                bot, duration_hours=request_payload.get("duration_hours", 48)
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CONFIDENCE_OVERRIDE_REVIEW_REQUIRED",
+                    "confidence_override_review": review,
+                }
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            message = (
+                "A matching approved Follow run and protected fee budget are required before reviewing this override."
+                if str(exc).startswith("FOLLOW_FEE_AUTHORITY")
+                else str(exc)
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CONFIDENCE_OVERRIDE_REVIEW_UNAVAILABLE",
+                    "error": message,
+                }
+            ), 409
+
     resume_existing_offers = bool(
         type(request_payload) is dict
         and request_payload.get("resume_existing_offers") is True
@@ -1220,8 +1251,37 @@ def api_bot_start():
                     "error": "Fresh-start choice could not be cleared from the user data directory",
                 }
             ), 500
+        previous = getattr(bot, "_confidence_override_consent", None)
+        if previous is not None:
+            previous.revoke()
+        bot._confidence_override_pending = None
+        if type(request_payload) is dict and "confidence_override" in request_payload:
+            from confidence_override import confirm_review, current_scope
+            import database
+
+            try:
+                consent = confirm_review(bot, request_payload["confidence_override"])
+                scope = current_scope()
+                if not consent.active(scope=scope, now=datetime.now(timezone.utc)):
+                    raise ValueError("CONFIDENCE_OVERRIDE_REVIEW_CHANGED")
+                database.record_confidence_override_consent(consent.record(), scope)
+                bot._confidence_override_pending = consent
+            except (ValueError, TypeError, KeyError) as exc:
+                return jsonify(
+                    {
+                        "success": False,
+                        "reason": "CONFIDENCE_OVERRIDE_CONFIRMATION_REQUIRED",
+                        "error": str(exc),
+                    }
+                ), 409
         server._reset_runtime_session_stats()
         started = bot.start()
+        if (
+            not started
+            and getattr(bot, "_confidence_override_pending", None) is not None
+        ):
+            bot._confidence_override_pending.revoke()
+            bot._confidence_override_pending = None
     if not started:
         state = {}
         try:

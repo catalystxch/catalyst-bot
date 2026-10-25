@@ -851,7 +851,12 @@ def _run_offer_operation_continuation(
     if state is None:
         return blocked_result()
     effect_attempted = False
+    market_authorizer = callback_kwargs.pop("_market_authorizer", None)
     try:
+        if market_authorizer is not None and not callable(market_authorizer):
+            return blocked_result(
+                "MARKET_CONFIDENCE_OVERRIDE_INACTIVE", effect_attempted=False
+            )
         try:
             operation = _exact_continuation_text(operation_id, "operation_id")
             intent = _exact_continuation_text(intent_id, "intent_id")
@@ -962,6 +967,10 @@ def _run_offer_operation_continuation(
                 raise mutation_gate.MutationBlocked(
                     "WALLET_IDENTITY_BINDING_INVALID",
                     f"{wallet_operation}:{safe_step}",
+                )
+            if market_authorizer is not None and market_authorizer() is not True:
+                raise mutation_gate.MutationBlocked(
+                    "MARKET_CONFIDENCE_OVERRIDE_INACTIVE", wallet_operation
                 )
             effect_attempted = True
 
@@ -1638,6 +1647,7 @@ def create_offer(
     _creation_continuation=None,
     _creation_operation_id: str = None,
     _creation_intent_id: str = None,
+    _market_authorizer=None,
 ):
     if validate_only is _ADAPTER_DEFAULT:
         validate_only = WALLET_TYPE == "chia"
@@ -1663,12 +1673,20 @@ def create_offer(
     if any(value is not None for value in continuation_arguments):
         if not all(value is not None for value in continuation_arguments):
             return _blocked_offer_creation_continuation()
+        if _market_authorizer is not None:
+            if not callable(_market_authorizer):
+                return _blocked_offer_creation_continuation()
+            kwargs["_market_authorizer"] = _market_authorizer
         return _run_offer_creation_continuation(
             _creation_continuation,
             _creation_operation_id,
             _creation_intent_id,
             offer_dict,
             **kwargs,
+        )
+    if _market_authorizer is not None:
+        return _blocked_offer_creation_continuation(
+            "OFFER_CREATION_JOURNAL_REQUIRED", effect_attempted=False
         )
     return _run_wallet_mutation("create_offer", offer_dict, **kwargs)
 

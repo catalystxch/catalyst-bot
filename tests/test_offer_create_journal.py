@@ -3230,3 +3230,72 @@ def test_offer_manager_adapter_local_rejection_finalizes_failed_and_releases(
         == "released"
     )
     assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+@pytest.mark.parametrize("approved", [False, "raises", True])
+def test_confidence_consent_rechecked_after_wallet_identity_read(monkeypatch, approved):
+    effects = []
+
+    def effect(*args, **kwargs):
+        kwargs["_identity_recheck"]("make_offer")
+        effects.append(True)
+        return {"success": True}
+
+    _stub_continuation_authority(monkeypatch, effect=effect, identity_count=3)
+    continuation = wallet.begin_offer_creation_continuation(
+        operation_id="create:override", intent_id="override"
+    )
+
+    def authorize():
+        if approved == "raises":
+            raise ValueError("review expired")
+        return approved
+
+    result = wallet.create_offer(
+        {"1": -1000, "2": 2000},
+        _creation_continuation=continuation,
+        _creation_operation_id="create:override",
+        _creation_intent_id="override",
+        _market_authorizer=authorize,
+    )
+    assert effects == ([True] if approved is True else [])
+    assert result["_catalyst_effect_attempted"] is (approved is True)
+
+
+def test_manager_carries_confidence_guard_through_prepared_wallet_dispatch(
+    isolated_database, monkeypatch
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    checked = []
+
+    def guard():
+        checked.append("at-dispatch")
+        return False
+
+    def effect(offer_dict, **kwargs):
+        assert kwargs["_market_authorizer"] is guard
+        assert kwargs["_market_authorizer"]() is False
+        return {
+            "success": False,
+            "reason": "MARKET_CONFIDENCE_OVERRIDE_INACTIVE",
+            "_catalyst_effect_attempted": False,
+        }
+
+    _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    manager = offer_manager.OfferManager()
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+        market_authorizer=guard,
+    )
+    assert result["success"] is False and result["_catalyst_effect_attempted"] is False
+    assert checked == ["at-dispatch"]
+    intent = database.get_offer_intent(result["_catalyst_intent_id"])
+    assert intent["lifecycle_state"] == "creation_failed"
+    assert (
+        database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
+        == "released"
+    )

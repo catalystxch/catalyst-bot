@@ -2947,11 +2947,13 @@ class OfferManager:
         *,
         intent: _CanonicalOfferCreationIntent,
         spend_wallet_id: int,
+        market_authorizer=None,
     ) -> dict:
         with self._sage_creation_authority_lock:
             return self._create_offer_from_journal_serialized(
                 intent=intent,
                 spend_wallet_id=spend_wallet_id,
+                market_authorizer=market_authorizer,
             )
 
     def wait_for_offer_creation_quiescence(self) -> None:
@@ -2965,6 +2967,7 @@ class OfferManager:
         *,
         intent: _CanonicalOfferCreationIntent,
         spend_wallet_id: int,
+        market_authorizer=None,
     ) -> dict:
         existing = database.get_offer_intent(intent.intent_id)
         if existing is not None:
@@ -3144,6 +3147,11 @@ class OfferManager:
                 _creation_continuation=continuation,
                 _creation_operation_id=intent.operation_id,
                 _creation_intent_id=intent.intent_id,
+                **(
+                    {"_market_authorizer": market_authorizer}
+                    if market_authorizer is not None
+                    else {}
+                ),
             )
             continuation = None
             self._offer_creation_crash_boundary("after_wallet_response", intent)
@@ -3627,6 +3635,7 @@ class OfferManager:
         strict_preferred_tier: bool = False,
         creation_context: dict = None,
         offer_max_time_cap: int = None,
+        market_authorizer=None,
     ) -> Optional[Dict]:
         """Create a Chia offer with automatic retry on transient errors.
 
@@ -3706,6 +3715,11 @@ class OfferManager:
                 strict_preferred_tier=strict_preferred_tier,
                 creation_context=creation_context,
                 offer_max_time_cap=offer_max_time_cap,
+                **(
+                    {"market_authorizer": market_authorizer}
+                    if market_authorizer is not None
+                    else {}
+                ),
             )
         finally:
             if _reservation_id:
@@ -3729,6 +3743,7 @@ class OfferManager:
         strict_preferred_tier: bool = False,
         creation_context: dict = None,
         offer_max_time_cap: int = None,
+        market_authorizer=None,
     ) -> Optional[Dict]:
         """Internal implementation — called by create_offer_with_retry after
         the reservation lease is acquired.  See create_offer_with_retry for
@@ -3866,6 +3881,15 @@ class OfferManager:
                 "_catalyst_effect_attempted": False,
             }
 
+        if market_authorizer is not None and not (
+            use_coin_ids_mode and selected_coin_id and authoritative_backend == "sage"
+        ):
+            return {
+                "success": False,
+                "reason": "OFFER_CREATION_JOURNAL_REQUIRED",
+                "_catalyst_effect_attempted": False,
+            }
+
         # Track which coin was claimed for inflight cleanup
         _inflight_claimed = selected_coin_id if use_coin_ids_mode else None
 
@@ -3899,6 +3923,11 @@ class OfferManager:
                 return self._create_offer_from_journal(
                     intent=intent,
                     spend_wallet_id=spend_wallet_id,
+                    **(
+                        {"market_authorizer": market_authorizer}
+                        if market_authorizer is not None
+                        else {}
+                    ),
                 )
             except _OfferCreationClaimLost:
                 return {
@@ -5087,8 +5116,15 @@ class OfferManager:
                 if refresh_parent_ids is not None
                 else None
             )
+            from confidence_override import ConsentedConfidence
+
             res = self.create_offer_with_retry(
                 spec["offer_dict"],
+                **(
+                    {"market_authorizer": market_confidence.dispatch_allowed}
+                    if isinstance(market_confidence, ConsentedConfidence)
+                    else {}
+                ),
                 expiry_offset=spec["stagger"],
                 used_coins=used_coin_ids,
                 coin_ids_enabled=coin_ids_enabled,

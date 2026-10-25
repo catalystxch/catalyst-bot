@@ -39773,3 +39773,17 @@ def list_bootstrap_participation(
         }
         for row in rows
     ]
+
+
+def record_confidence_override_consent(
+    record: Dict[str, Any], scope: Dict[str, Any]
+) -> None:
+    """Persist an audit receipt only. Never load it as a runtime permit."""
+    payload = json.dumps(
+        {**record, "scope": scope},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    if not set_setting("confidence_override_consent:" + record["consent_id"], payload):
+        raise ValueError("CONFIDENCE_OVERRIDE_AUDIT_FAILED")
