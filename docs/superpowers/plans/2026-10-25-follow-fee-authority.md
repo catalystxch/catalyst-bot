@@ -39,7 +39,7 @@
 - [x] Add immutable schema and reader; run focused tests.
 - [x] Add unresolved-hold test and fail-closed reader state.
 - [ ] Bind creation to an exact native review/consent event and verify copied original-profile DB migration.
-- [ ] Add Stop/expiry append-only lifecycle with cleanup rights retained.
+- [x] Add append-only Stop lifecycle and read-only exact-scope cleanup reader that survives Stop/expiry; unresolved fee effects still block new cleanup dispatch. Native cleanup authorization and wallet-effect pricing remain pending.
 
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
