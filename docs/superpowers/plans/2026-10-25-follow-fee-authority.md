@@ -52,6 +52,13 @@ run authority. `create_follow_run_authority` must reject arbitrary 64-hex
 reader and must be updated to exercise the real review transition. Approval
 must never start the bot or dispatch a wallet effect.
 
+Progress: the database now persists an immutable five-minute review and its
+digest, and the run-authority transition rejects arbitrary IDs, changed terms,
+expired reviews and replay. This is DB-only. The native server route must still
+derive the review terms from verified wallet/configuration and display them to
+the human; the final native click must submit the exact review ID/digest. The
+review is not yet a user consent by itself.
+
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/bot_loop.py`, `src/catalyst/database.py`, focused tests.
