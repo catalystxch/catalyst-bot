@@ -41,6 +41,17 @@
 - [ ] Bind creation to an exact native review/consent event and verify copied original-profile DB migration.
 - [x] Add append-only Stop lifecycle and read-only exact-scope cleanup reader that survives Stop/expiry; unresolved fee effects still block new cleanup dispatch. Native cleanup authorization and wallet-effect pricing remain pending.
 
+Native consent boundary to implement next: the server must persist an immutable,
+short-lived review for the exact wallet fingerprint/network/asset, settings
+digest, 24/24 limits, 48-hour expiry, maximum safe principal, fee approval ID,
+0.05 XCH ceiling and protected shutdown reserve. The final native click may
+submit only that review ID and digest. In one database transaction, compare the
+still-current review and approval, record a single-use consent, and create the
+run authority. `create_follow_run_authority` must reject arbitrary 64-hex
+`consent_id` values; current tests use such values only for the provisional
+reader and must be updated to exercise the real review transition. Approval
+must never start the bot or dispatch a wallet effect.
+
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/bot_loop.py`, `src/catalyst/database.py`, focused tests.
