@@ -13575,6 +13575,21 @@ class BotLoop:
             },
         )
 
+    @staticmethod
+    def _require_follow_creation_run_id() -> str:
+        """Read the durable, current Follow scope before producing an offer."""
+        from confidence_override import current_scope
+
+        scope = current_scope()
+        run_id = scope.get("follow_run_id") if type(scope) is dict else None
+        if (
+            type(run_id) is not str
+            or len(run_id) != 64
+            or any(char not in "0123456789abcdef" for char in run_id)
+        ):
+            raise ValueError("FOLLOW_FEE_AUTHORITY_REQUIRED")
+        return run_id
+
     def _create_offers_if_needed(
         self,
         mid_price: Decimal,
@@ -14042,6 +14057,16 @@ class BotLoop:
             )[:needed]
             if not self._enter_runtime_effect_phase("create"):
                 return
+            try:
+                follow_run_id = self._require_follow_creation_run_id()
+            except Exception as exc:
+                log_event(
+                    "warning",
+                    "follow_create_authority_missing",
+                    "Follow offer creation paused until the reviewed run is funded",
+                    data={"reason_code": str(exc)[:120]},
+                )
+                return
             offers = self.offer_manager.create_ladder(
                 ladder_mid_price,
                 side,
@@ -14056,6 +14081,7 @@ class BotLoop:
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
                 market_confidence=self._effective_market_confidence(),
+                follow_run_id=follow_run_id,
             )
             _parallel_results[side] = offers or []
 
