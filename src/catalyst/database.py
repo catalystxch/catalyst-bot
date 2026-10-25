@@ -2050,7 +2050,7 @@ CREATE TABLE IF NOT EXISTS follow_run_reviews (
     maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
     protected_shutdown_fee_mojos INTEGER NOT NULL
         CHECK(typeof(protected_shutdown_fee_mojos)='integer'
-              AND protected_shutdown_fee_mojos>=0
+              AND protected_shutdown_fee_mojos>0
               AND protected_shutdown_fee_mojos<=maximum_fee_mojos),
     review_expires_at_epoch INTEGER NOT NULL
         CHECK(typeof(review_expires_at_epoch)='integer'
@@ -2086,7 +2086,7 @@ CREATE TABLE IF NOT EXISTS follow_run_authorities (
     maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
     protected_shutdown_fee_mojos INTEGER NOT NULL
         CHECK(typeof(protected_shutdown_fee_mojos)='integer'
-              AND protected_shutdown_fee_mojos>=0
+              AND protected_shutdown_fee_mojos>0
               AND protected_shutdown_fee_mojos<=maximum_fee_mojos)
 );
 CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_identity
@@ -22373,7 +22373,7 @@ def create_follow_run_review(
         raise ValueError("FOLLOW_REVIEW_INVALID")
     maximum = _fee_amount(maximum_fee_mojos)
     protected = _fee_amount(protected_shutdown_fee_mojos)
-    if maximum == 0 or protected > maximum:
+    if maximum == 0 or protected == 0 or protected > maximum:
         raise ValueError("FOLLOW_FEE_CAP_INVALID")
     review_id = secrets.token_hex(32)
     review_terms = {
@@ -22495,7 +22495,7 @@ def create_follow_run_authority(
         raise ValueError("FOLLOW_REVIEW_INVALID")
     maximum = _fee_amount(maximum_fee_mojos)
     protected = _fee_amount(protected_shutdown_fee_mojos)
-    if maximum == 0 or protected > maximum:
+    if maximum == 0 or protected == 0 or protected > maximum:
         raise ValueError("FOLLOW_FEE_CAP_INVALID")
     conn = _stability_connection()
     try:
