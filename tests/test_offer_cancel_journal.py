@@ -2246,9 +2246,11 @@ def test_offer_manager_prepares_entire_cohort_before_first_wallet_effect(
     ]
 
 
+@pytest.mark.parametrize("manual_fee_mojos", [0, 13_079_100])
 def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     isolated_database,
     monkeypatch,
+    manual_fee_mojos,
 ):
     trade_ids = ["a" * 64, "b" * 64]
     source_coin_ids = ["c" * 64, "d" * 64]
@@ -2304,7 +2306,7 @@ def test_offer_manager_uses_one_journalled_sage_bulk_cancel_and_one_fee_coin(
     monkeypatch.setattr(
         offer_manager,
         "get_effective_transaction_fee_mojos",
-        lambda: 13_079_100,
+        lambda: manual_fee_mojos,
         raising=False,
     )
     reserved = []
