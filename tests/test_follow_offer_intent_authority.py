@@ -1,11 +1,13 @@
 """Follow-labelled offer intents retain their reviewed run at every boundary."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
 import offer_manager
 import confidence_override
+import database
 
 
 RUN_ID = "a" * 64
@@ -96,3 +98,60 @@ def test_follow_intent_cannot_be_canonicalized_after_authority_is_revoked(monkey
             min_coin_hint=None,
             max_coin_hint=None,
         )
+
+
+def test_follow_ladder_labels_created_offer_with_exact_run(monkeypatch):
+    seen = []
+
+    def capture(_self, _offer_dict, **kwargs):
+        seen.append(kwargs["creation_context"]["purpose"])
+        return {"success": False, "error": "test stop before wallet"}
+
+    monkeypatch.setattr(offer_manager.OfferManager, "create_offer_with_retry", capture)
+    manager = offer_manager.OfferManager()
+    manager.create_ladder(
+        mid_price=Decimal("0.001"),
+        side="buy",
+        num_offers=1,
+        cat_asset_id=ASSET_ID,
+        cat_wallet_id=2,
+        follow_run_id=RUN_ID,
+    )
+    assert seen == [f"follow:{RUN_ID}:normal_lifecycle"]
+
+
+def test_follow_book_opportunity_retains_its_classification(monkeypatch):
+    seen = []
+
+    def capture(_self, _offer_dict, **kwargs):
+        seen.append(kwargs["creation_context"]["purpose"])
+        return {"success": False, "error": "test stop before wallet"}
+
+    monkeypatch.setattr(offer_manager.OfferManager, "create_offer_with_retry", capture)
+    monkeypatch.setattr(
+        offer_manager,
+        "assess_offer_book_candidate",
+        lambda **_kwargs: {
+            "eligible": True,
+            "improves_book": True,
+            "evidence_digest": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        database, "claim_offer_book_improvement", lambda **_kwargs: True
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "book_opportunity_size_cap",
+        lambda **_kwargs: Decimal("0.25"),
+    )
+    offer_manager.OfferManager().create_ladder(
+        mid_price=Decimal("0.001"),
+        side="sell",
+        num_offers=1,
+        cat_asset_id=ASSET_ID,
+        cat_wallet_id=2,
+        market_confidence=object(),
+        follow_run_id=RUN_ID,
+    )
+    assert seen == [f"follow:{RUN_ID}:book_opportunity"]

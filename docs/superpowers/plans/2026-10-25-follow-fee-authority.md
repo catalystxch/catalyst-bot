@@ -57,6 +57,9 @@ and immediately before wallet submission. A regression reproduced wallet-boundar
 revocation when the final check was absent. The task remains open until every
 ordinary Follow producer attaches this purpose; legacy unscoped producers must
 be fenced rather than silently inheriting a new run.
+The ladder builder now accepts an exact run ID and labels both ordinary and
+book-improving offers without losing their classification. BotLoop has not yet
+supplied that ID, and unscoped legacy creation remains a release blocker.
 
 ### Task 3: Exact priced cancellation hold for every Follow path
 

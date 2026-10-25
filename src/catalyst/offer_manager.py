@@ -4356,6 +4356,7 @@ class OfferManager:
         interpolate_refill_prices: bool = True,
         refresh_parent_ids: Dict[int, str] = None,
         market_confidence: Any = None,
+        follow_run_id: Optional[str] = None,
     ) -> List[Dict]:
         """Create a ladder of offers on one side (buy or sell).
 
@@ -4386,9 +4387,16 @@ class OfferManager:
                 bound only after its confirmed Sage identity is durable.
             market_confidence: Exact current offer-book decision authorizing
                 price, profitability, and any public-book improvement.
+            follow_run_id: Exact reviewed financial run for newly created
+                Follow intents. It is embedded in the durable purpose.
 
         Returns list of created offer details (trade_id, price, size, etc.)
         """
+        if follow_run_id is not None and (
+            type(follow_run_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", follow_run_id) is None
+        ):
+            raise ValueError("FOLLOW_RUN_ID_INVALID")
         # Use config defaults
         if slot_sequence is not None:
             slot_sequence = list(slot_sequence)
@@ -4866,6 +4874,9 @@ class OfferManager:
                     if not market_guard.get("eligible"):
                         continue
                     purpose = "book_opportunity"
+
+            if follow_run_id is not None:
+                purpose = f"follow:{follow_run_id}:{purpose}"
 
             offer_specs.append(
                 {
