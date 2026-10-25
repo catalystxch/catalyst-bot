@@ -94,6 +94,39 @@ def test_scope_requires_real_follow_authority_and_records_audit_only(
     assert saved["restorable"] is False and saved["scope"] == scope
 
 
+def test_scope_accepts_only_actual_durable_follow_run(approved, monkeypatch):
+    complete(approved, monkeypatch)
+    from coin_prep_fee_runtime import _configuration, _verified_identity
+
+    configuration = _configuration()
+    identity = {
+        **_verified_identity(configuration),
+        "asset_id": configuration["CAT_ASSET_ID"],
+        "wallet_id": configuration["CAT_WALLET_ID"],
+        "xch_wallet_id": configuration["WALLET_ID_XCH"],
+        "ticker": configuration["CAT_TICKER_ID"],
+    }
+    now = int(datetime.now(timezone.utc).timestamp())
+    run = database.create_follow_run_authority(
+        consent_id="d" * 64,
+        approval_id=approved["approval"]["approval_id"],
+        identity=identity,
+        configuration_sha256=policy.current_configuration_digest(),
+        buy_limit=configuration["MAX_ACTIVE_BUY_OFFERS"],
+        sell_limit=configuration["MAX_ACTIVE_SELL_OFFERS"],
+        started_at_epoch=now,
+        expires_at_epoch=now + 48 * 3600,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    scope = policy.current_scope()
+    assert scope["follow_run_id"] == run["run_id"]
+    assert scope["financial_consent_id"] == "d" * 64
+    database.stop_follow_run_authority(run_id=run["run_id"], stopped_at_epoch=now)
+    with pytest.raises(ValueError, match="FOLLOW_FEE_AUTHORITY_REQUIRED"):
+        policy.current_scope()
+
+
 def test_completed_prep_consent_alone_cannot_grant_override(approved, monkeypatch):
     complete(approved, monkeypatch)
     monkeypatch.delattr(database, "get_follow_creation_authority", raising=False)
