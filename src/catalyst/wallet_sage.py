@@ -4872,6 +4872,20 @@ def cancel_offer(
         )
     )
 
+    # A secure cancellation must have a relay fee. If an explicitly planned
+    # bulk fee cannot be funded, never silently submit a zero-fee single
+    # cancellation and leave its offer pending behind a safety latch.
+    if secure and resolved_fee <= 0:
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={
+                "success": False,
+                "error_code": "FEE_CANCELLATION_FUNDING_REQUIRED",
+            },
+            error="FEE_CANCELLATION_FUNDING_REQUIRED",
+        )
+
     payload = {
         "offer_id": trade_id,  # Sage uses offer_id, not trade_id
         "fee": str(int(resolved_fee)),  # REQUIRED — Sage 422s without fee field

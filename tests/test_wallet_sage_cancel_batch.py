@@ -346,6 +346,20 @@ class WalletSageCancelBatchTests(unittest.TestCase):
         self.assertFalse(result["success"])
         validate_cancel_result(result)
 
+    def test_secure_cancel_refuses_zero_manual_fee_before_wallet_effect(self):
+        with (
+            patch.object(wallet_sage, "_require_signing_capability", return_value=True),
+            patch.object(
+                wallet_sage, "get_effective_transaction_fee_mojos", return_value=0
+            ),
+            patch.object(wallet_sage, "_sage_post") as sage_post,
+        ):
+            result = wallet_sage.cancel_offer("0xabc123", secure=True)
+
+        self.assertEqual(result["outcome"], CANCEL_FAILED)
+        self.assertEqual(result["error"], "FEE_CANCELLATION_FUNDING_REQUIRED")
+        sage_post.assert_not_called()
+
     def test_bulk_cancel_replicates_stable_no_spendable_code_to_every_member(self):
         trade_ids = ["0xabc123", "0xdef456"]
         with (

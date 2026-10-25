@@ -6402,7 +6402,7 @@ class OfferManager:
         if (
             type(configured_fee_mojos) is not int
             or isinstance(configured_fee_mojos, bool)
-            or configured_fee_mojos <= 0
+            or configured_fee_mojos < 0
         ):
             raise ValueError("configured cancellation fee is invalid")
         input_count = member_count + 1

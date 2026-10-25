@@ -2705,6 +2705,20 @@ def test_sage_bulk_cancel_capacity_is_bounded_by_largest_fee_coin(monkeypatch):
     assert manager._sage_bulk_cancel_fee_mojos(5) == 1_236_000_000
 
 
+def test_sage_bulk_cancel_prices_network_fee_with_manual_fee_disabled(monkeypatch):
+    """A zero manual trading fee cannot downgrade a protected bulk cancel."""
+    monkeypatch.setattr(
+        offer_manager,
+        "get_effective_transaction_fee_mojos",
+        lambda: 0,
+    )
+    manager = OfferManager()
+    manager._fee_pool = SimpleNamespace(largest_available_amount=1_000_000_000)
+
+    assert manager._sage_bulk_cancel_fee_mojos(2) == 678_000_000
+    assert manager.get_sage_bulk_cancel_capacity(2) == 2
+
+
 def _confirmed_sage_bulk_cancel_evidence(
     *,
     trade_ids: list[str],
