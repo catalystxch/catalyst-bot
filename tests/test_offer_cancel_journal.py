@@ -3359,6 +3359,19 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
             follow_settlements.append(kwargs) or {"state": "CONFIRMED_SPENT"}
         ),
     )
+
+    def release_after_accounting(*_args, **_kwargs):
+        assert follow_settlements == [{"run_id": "f" * 64, "manifest_json": manifest}]
+        return {"released": True}
+
+    monkeypatch.setattr(
+        mutation_gate,
+        "current_runtime",
+        lambda: SimpleNamespace(
+            release_resolved=release_after_accounting,
+            status=lambda: {"allowed": True},
+        ),
+    )
     assert OfferManager().retry_failed_cancels() == 0
     assert len(fee_settlements) == 2
     assert follow_settlements == [{"run_id": "f" * 64, "manifest_json": manifest}]
