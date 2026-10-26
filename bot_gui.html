@@ -8338,9 +8338,9 @@
             <pre id="followFeeCeilingReviewText" style="white-space:pre-wrap"></pre>
             <label><input type="checkbox" id="followFeeCeilingReviewAccept" disabled> I approve the exact revised cumulative fee ceiling shown above for this run.</label>
             <div style="margin-top:16px">
-                <button type="button" onclick="closeFollowFeeCeilingReview()">Back</button>
-                <button type="button" id="followFeeCeilingReviewPrepare" onclick="prepareFollowFeeCeilingReview()">Refresh exact review</button>
-                <button type="button" id="followFeeCeilingReviewConfirm" disabled onclick="confirmFollowFeeCeilingReview()">Record revised ceiling</button>
+                <button type="button" class="btn btn-secondary" onclick="closeFollowFeeCeilingReview()">Back</button>
+                <button type="button" class="btn btn-secondary" id="followFeeCeilingReviewPrepare" onclick="prepareFollowFeeCeilingReview()">Refresh exact review</button>
+                <button type="button" class="btn btn-primary" id="followFeeCeilingReviewConfirm" disabled onclick="confirmFollowFeeCeilingReview()">Record revised ceiling</button>
             </div>
         </div>
     </div>
@@ -32991,6 +32991,14 @@
             document.getElementById('followFeeCeilingReviewModal').style.display = 'flex';
         }
 
+        function formatFollowFeeMojos(mojos) {
+            const amount = BigInt(mojos);
+            const whole = amount / 1000000000000n;
+            const fraction = (amount % 1000000000000n).toString()
+                .padStart(12, '0').replace(/0+$/, '') || '0';
+            return `${whole}.${fraction} XCH (${mojos} mojos)`;
+        }
+
         async function prepareFollowFeeCeilingReview() {
             if (_followFeeCeilingBusy || !IS_DESKTOP
                 || !window.pywebview?.api?.prepare_follow_fee_ceiling_review) return;
@@ -33038,12 +33046,12 @@
                     `Wallet ${id.wallet_fingerprint} · ${id.network} · ${id.ticker || ''}\n` +
                     `Asset ${id.asset_id}\n` +
                     `Run ${review.run_id} · current revision ${review.prior_revision}\n` +
-                    `Current cumulative ceiling: ${review.prior_maximum_fee_mojos} mojos\n` +
-                    `New cumulative ceiling: ${review.proposed_maximum_fee_mojos} mojos\n` +
-                    `Already spent: ${review.reviewed_spent_fee_mojos} mojos\n` +
-                    `Pending fee holds: ${review.reviewed_held_fee_mojos} mojos\n` +
-                    `Protected shutdown reserve: ${review.protected_shutdown_fee_mojos} mojos\n` +
-                    `Selectable protected fee principal: ${review.observed_fee_principal_mojos} mojos\n` +
+                    `Current cumulative ceiling: ${formatFollowFeeMojos(review.prior_maximum_fee_mojos)}\n` +
+                    `New cumulative ceiling: ${formatFollowFeeMojos(review.proposed_maximum_fee_mojos)}\n` +
+                    `Already spent: ${formatFollowFeeMojos(review.reviewed_spent_fee_mojos)}\n` +
+                    `Pending fee holds: ${formatFollowFeeMojos(review.reviewed_held_fee_mojos)}\n` +
+                    `Protected shutdown reserve: ${formatFollowFeeMojos(review.protected_shutdown_fee_mojos)}\n` +
+                    `Selectable protected fee principal: ${formatFollowFeeMojos(review.observed_fee_principal_mojos)}\n` +
                     `Exact review expires: ${new Date(review.expires_at_epoch * 1000).toISOString()}`;
                 const accept = document.getElementById('followFeeCeilingReviewAccept');
                 const confirm = document.getElementById('followFeeCeilingReviewConfirm');
