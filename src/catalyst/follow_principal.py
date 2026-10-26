@@ -395,8 +395,9 @@ def prepare_follow_run_review(
     *,
     buy_limit: int,
     sell_limit: int,
-    duration_seconds: int,
+    duration_seconds: int | None,
     requested_fee_cap_mojos: int,
+    continuous: bool = False,
 ) -> dict:
     """Persist a short-lived review from server-verified principal and slots.
 
@@ -405,6 +406,7 @@ def prepare_follow_run_review(
     """
 
     import database
+    from follow_run_terms import CONTINUOUS_RUN_EXPIRY
 
     if (
         type(approval_id) is not str
@@ -413,8 +415,15 @@ def prepare_follow_run_review(
         or type(sell_limit) is not int
         or not 1 <= buy_limit <= 50
         or not 1 <= sell_limit <= 50
-        or type(duration_seconds) is not int
-        or not 0 < duration_seconds <= 48 * 3600
+        or type(continuous) is not bool
+        or (
+            (duration_seconds is not None)
+            if continuous
+            else (
+                type(duration_seconds) is not int
+                or not 0 < duration_seconds <= 48 * 3600
+            )
+        )
         or type(requested_fee_cap_mojos) is not int
         or requested_fee_cap_mojos <= 0
     ):
@@ -464,10 +473,14 @@ def prepare_follow_run_review(
         "buy_limit": buy_limit,
         "sell_limit": sell_limit,
         "started_at_epoch": started_at_epoch,
-        "expires_at_epoch": started_at_epoch + duration_seconds,
+        "expires_at_epoch": (
+            CONTINUOUS_RUN_EXPIRY if continuous else started_at_epoch + duration_seconds
+        ),
         "maximum_fee_mojos": requested_fee_cap_mojos,
         "protected_shutdown_fee_mojos": proposal["cancellation_reserve_mojos"],
     }
+    if continuous:
+        terms["continuous"] = True
     review = database.create_follow_run_review(**terms)
     if _current_proposal() != proposal:
         raise ValueError("FOLLOW_REVIEW_PROPOSAL_CHANGED")

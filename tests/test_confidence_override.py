@@ -538,6 +538,16 @@ def test_risk_consent_cannot_extend_financial_run_expiry():
     assert permit.expires_at == NOW + timedelta(minutes=5)
 
 
+def test_continuous_financial_run_keeps_risk_override_bounded():
+    from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
+    scope = SCOPE | {"run_expires_at_epoch": CONTINUOUS_RUN_EXPIRY}
+    permit = RunConsent.confirm(
+        scope=scope, reviewed_digest=scope_digest(scope), duration_hours=48, now=NOW
+    )
+    assert permit.expires_at == NOW + timedelta(hours=48)
+
+
 def test_pending_financial_effect_temporarily_blocks_matching_risk_consent(monkeypatch):
     loop = runtime_loop(monkeypatch)
 

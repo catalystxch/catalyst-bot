@@ -53,6 +53,29 @@ def test_follow_review_accepts_only_explicit_public_run_terms(monkeypatch):
     assert body["dispatch_authorized"] is False
 
 
+def test_follow_review_accepts_explicit_continuous_term(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        follow_principal,
+        "prepare_follow_run_review",
+        lambda approval_id, **terms: (
+            calls.append(terms) or {"dispatch_authorized": False}
+        ),
+    )
+    _, status = _call(
+        {
+            "approval_id": "a" * 64,
+            "buy_limit": 24,
+            "sell_limit": 24,
+            "continuous": True,
+            "maximum_fee_mojos": 50_000_000_000,
+        }
+    )
+    assert status == 200
+    assert calls[0]["continuous"] is True
+    assert calls[0]["duration_seconds"] is None
+
+
 def test_follow_review_rejects_missing_or_coerced_terms_before_service(monkeypatch):
     monkeypatch.setattr(
         follow_principal,

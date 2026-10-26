@@ -11,6 +11,8 @@ import threading
 import time
 import uuid
 
+from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
 
 _ALLOWED_REASONS = frozenset(
     {
@@ -61,7 +63,8 @@ class RunConsent:
             epoch = scope["run_expires_at_epoch"]
             if type(epoch) is not int or epoch <= int(now.timestamp()):
                 raise ValueError("FOLLOW_FEE_AUTHORITY_EXPIRED")
-            expires = min(expires, datetime.fromtimestamp(epoch, timezone.utc))
+            if epoch != CONTINUOUS_RUN_EXPIRY:
+                expires = min(expires, datetime.fromtimestamp(epoch, timezone.utc))
         return cls(
             digest=digest,
             approved_at=now,
@@ -347,9 +350,13 @@ def current_scope():
         "follow_run_id": authority["run_id"],
         "financial_consent_id": authority["consent_id"],
         "run_expires_at_epoch": authority["expires_at_epoch"],
-        "run_expires_at": datetime.fromtimestamp(
-            authority["expires_at_epoch"], timezone.utc
-        ).isoformat(),
+        "run_expires_at": (
+            None
+            if authority["expires_at_epoch"] == CONTINUOUS_RUN_EXPIRY
+            else datetime.fromtimestamp(
+                authority["expires_at_epoch"], timezone.utc
+            ).isoformat()
+        ),
         "buy_limit": authority["buy_limit"],
         "sell_limit": authority["sell_limit"],
         "xch_reserve": str(configuration["XCH_RESERVE"]),

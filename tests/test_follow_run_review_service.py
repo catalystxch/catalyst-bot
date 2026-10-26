@@ -78,6 +78,37 @@ def test_review_freezes_server_derived_24_by_24_proposal(monkeypatch):
     assert result["dispatch_authorized"] is False
 
 
+def test_continuous_review_uses_explicit_nonexpiring_term(monkeypatch):
+    import database
+    import follow_principal
+    from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
+    monkeypatch.setattr(follow_principal.time, "time", lambda: 1_000_000)
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda *_a, **_kw: _proposal(),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        database,
+        "create_follow_run_review",
+        lambda **terms: captured.update(terms) or {"review_id": "e" * 64},
+    )
+    result = follow_principal.prepare_follow_run_review(
+        "1" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        duration_seconds=None,
+        continuous=True,
+        requested_fee_cap_mojos=50_000_000_000,
+    )
+    assert captured["expires_at_epoch"] == CONTINUOUS_RUN_EXPIRY
+    assert captured["continuous"] is True
+    assert result["continuous"] is True
+    assert result["review_expires_at_epoch"] == 1_000_300
+
+
 @pytest.mark.parametrize(
     "change",
     [

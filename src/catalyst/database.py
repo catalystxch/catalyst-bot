@@ -33,6 +33,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
 
 # ---------------------------------------------------------------------------
 # Coin ID normalization — Sage returns without 0x, DB stores with 0x
@@ -22460,6 +22462,7 @@ def create_follow_run_review(
     expires_at_epoch: int,
     maximum_fee_mojos: int,
     protected_shutdown_fee_mojos: int,
+    continuous: bool = False,
 ) -> Dict[str, Any]:
     """Freeze server-verified run terms for one short-lived native review.
 
@@ -22476,7 +22479,13 @@ def create_follow_run_review(
         or type(started_at_epoch) is not int
         or type(expires_at_epoch) is not int
         or started_at_epoch < 0
-        or not started_at_epoch < expires_at_epoch <= started_at_epoch + 48 * 3600
+        or expires_at_epoch <= started_at_epoch
+        or type(continuous) is not bool
+        or not (
+            expires_at_epoch == CONTINUOUS_RUN_EXPIRY
+            if continuous
+            else started_at_epoch < expires_at_epoch <= started_at_epoch + 48 * 3600
+        )
     ):
         raise ValueError("FOLLOW_REVIEW_INVALID")
     maximum = _fee_amount(maximum_fee_mojos)
@@ -22496,6 +22505,8 @@ def create_follow_run_review(
         "maximum_fee_mojos": maximum,
         "protected_shutdown_fee_mojos": protected,
     }
+    if continuous:
+        review_terms["continuous"] = True
     review_sha256 = hashlib.sha256(
         json.dumps(
             review_terms, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -22619,7 +22630,10 @@ def create_follow_run_authority(
         or type(expires_at_epoch) is not int
         or started_at_epoch < 0
         or expires_at_epoch <= started_at_epoch
-        or expires_at_epoch - started_at_epoch > 48 * 3600
+        or (
+            expires_at_epoch != CONTINUOUS_RUN_EXPIRY
+            and expires_at_epoch - started_at_epoch > 48 * 3600
+        )
     ):
         raise ValueError("FOLLOW_REVIEW_INVALID")
     maximum = _fee_amount(maximum_fee_mojos)

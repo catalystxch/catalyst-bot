@@ -6,6 +6,51 @@ from unittest.mock import patch
 import database
 import pytest
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
+from follow_run_terms import CONTINUOUS_RUN_EXPIRY
+
+
+def test_explicit_continuous_review_survives_finite_window(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    terms = dict(
+        approval_id=approval_id,
+        identity={
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        },
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    with pytest.raises(ValueError, match="FOLLOW_REVIEW_INVALID"):
+        database.create_follow_run_review(**terms)
+    review = database.create_follow_run_review(**terms, continuous=True)
+    with patch.object(database.time, "time", return_value=1002):
+        run = database.create_follow_run_authority(
+            consent_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            **terms,
+        )
+    assert run["run_id"]
+    assert (
+        database.get_follow_run_review(review["review_id"])["expires_at_epoch"]
+        == CONTINUOUS_RUN_EXPIRY
+    )
 
 
 def reviewed_run(**terms):

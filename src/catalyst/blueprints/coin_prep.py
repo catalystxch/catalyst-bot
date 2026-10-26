@@ -222,13 +222,22 @@ def api_follow_run_review():
     if (
         type(body) is not dict
         or set(body)
-        != {
-            "approval_id",
-            "buy_limit",
-            "sell_limit",
-            "duration_seconds",
-            "maximum_fee_mojos",
-        }
+        not in (
+            {
+                "approval_id",
+                "buy_limit",
+                "sell_limit",
+                "duration_seconds",
+                "maximum_fee_mojos",
+            },
+            {
+                "approval_id",
+                "buy_limit",
+                "sell_limit",
+                "continuous",
+                "maximum_fee_mojos",
+            },
+        )
         or type(body["approval_id"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
         or any(
@@ -236,13 +245,19 @@ def api_follow_run_review():
             for key in (
                 "buy_limit",
                 "sell_limit",
-                "duration_seconds",
                 "maximum_fee_mojos",
+            )
+        )
+        or (
+            body.get("continuous") is not True
+            if "continuous" in body
+            else (
+                type(body.get("duration_seconds")) is not int
+                or not 1 <= body["duration_seconds"] <= 48 * 3600
             )
         )
         or not 1 <= body["buy_limit"] <= 50
         or not 1 <= body["sell_limit"] <= 50
-        or not 1 <= body["duration_seconds"] <= 48 * 3600
         or not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1
     ):
         return jsonify(
@@ -257,8 +272,9 @@ def api_follow_run_review():
             body["approval_id"],
             buy_limit=body["buy_limit"],
             sell_limit=body["sell_limit"],
-            duration_seconds=body["duration_seconds"],
+            duration_seconds=body.get("duration_seconds"),
             requested_fee_cap_mojos=body["maximum_fee_mojos"],
+            **({"continuous": True} if body.get("continuous") is True else {}),
         )
         return jsonify(_fee_json_amounts({**result, "success": True}))
     except ValueError as exc:

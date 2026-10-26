@@ -8314,9 +8314,10 @@
             <p>Review the current wallet, prepared trading principal, offer slots and protected fee allowance. Recording this approval does not start trading.</p>
             <label>BUY offers <input id="followRunBuyLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
             <label>SELL offers <input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
-            <label>Run authority (hours) <input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
+            <label><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"> Continue until I stop the run or its fee/safety limit is reached</label>
+            <label>Timed authority (hours, when continuous is unchecked) <input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
             <label>Cumulative fee ceiling (XCH) <input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.05" oninput="invalidateFollowRunReview()"></label>
-            <p>The authority expires after the displayed period. A longer observation needs renewed approval before expiry.</p>
+            <p>The 48-hour observation is separate from the run lifetime. A continuous run still stops when you stop it or a financial or safety gate requires it.</p>
             <pre id="followRunReviewText" style="white-space:pre-wrap"></pre>
             <label><input type="checkbox" id="followRunReviewAccept" disabled> I approve the exact wallet, trading limits and fee allowance shown above.</label>
             <div style="margin-top:16px">
@@ -32805,11 +32806,13 @@
             const buyLimit = Number(document.getElementById('followRunBuyLimit').value);
             const sellLimit = Number(document.getElementById('followRunSellLimit').value);
             const hours = Number(document.getElementById('followRunHours').value);
+            const continuous = document.getElementById('followRunContinuous').checked;
             const requestedFeeCap = followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value);
-            if (![buyLimit, sellLimit, hours].every(Number.isSafeInteger)
+            if (![buyLimit, sellLimit].every(Number.isSafeInteger)
                 || buyLimit < 1 || buyLimit > 50 || sellLimit < 1 || sellLimit > 50
-                || hours < 1 || hours > 48 || requestedFeeCap === null) {
-                output.textContent = 'Enter 1–50 offers per side, 1–48 hours and a positive fee ceiling of up to 12 decimal places.';
+                || (!continuous && (!Number.isSafeInteger(hours) || hours < 1 || hours > 48))
+                || requestedFeeCap === null) {
+                output.textContent = 'Enter 1–50 offers per side, a valid timed duration if selected, and a positive fee ceiling of up to 12 decimal places.';
                 return;
             }
             _followRunReviewBusy = true;
@@ -32834,14 +32837,15 @@
                         approval_id: approvalId,
                         buy_limit: buyLimit,
                         sell_limit: sellLimit,
-                        duration_seconds: hours * 3600,
+                        ...(continuous ? {continuous: true} : {duration_seconds: hours * 3600}),
                         maximum_fee_mojos: feeCap,
                     }),
                 });
                 const review = await response.json();
                 if (Number(document.getElementById('followRunBuyLimit').value) !== buyLimit
                     || Number(document.getElementById('followRunSellLimit').value) !== sellLimit
-                    || Number(document.getElementById('followRunHours').value) !== hours
+                    || document.getElementById('followRunContinuous').checked !== continuous
+                    || (!continuous && Number(document.getElementById('followRunHours').value) !== hours)
                     || followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value) !== requestedFeeCap) {
                     throw new Error('The terms changed while the wallet review was prepared. Refresh the exact review.');
                 }
@@ -32849,6 +32853,7 @@
                     || !/^[0-9a-f]{64}$/.test(review.review_id || '')
                     || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')
                     || review.buy_limit !== buyLimit || review.sell_limit !== sellLimit
+                    || (review.continuous === true) !== continuous
                     || Number(review.maximum_fee_mojos) !== feeCap
                     || review.replacement_count_gate_passed !== true
                     || review.current_prep_targets_proven !== true
@@ -32867,7 +32872,7 @@
                     `Protected fee principal: ${review.protected_fee_principal_mojos} mojos\n` +
                     `Cumulative fee ceiling: ${review.maximum_fee_mojos} mojos\n` +
                     `Protected cancellation reserve: ${review.cancellation_reserve_mojos} mojos\n` +
-                    `Authority expires: ${new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
+                    `Authority: ${continuous ? 'continuous until stopped or fee/safety limit' : 'expires ' + new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
                     `This exact review expires: ${new Date(review.review_expires_at_epoch * 1000).toISOString()}`;
                 accept.disabled = false;
                 accept.onchange = () => {
