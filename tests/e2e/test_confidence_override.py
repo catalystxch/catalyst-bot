@@ -71,6 +71,14 @@ def test_changing_override_duration_requires_new_exact_review(page):
     assert page.evaluate("window.__reviewRequests.at(-1).duration_hours") == 96
 
 
+def test_invalid_duration_keeps_review_open_for_correction(page):
+    open_review(page)
+    page.locator("#confidenceOverrideHours").fill("169")
+    page.get_by_role("button", name="Refresh exact review").click()
+    expect(page.locator("#confidenceOverrideModal")).to_be_visible()
+    assert len(page.evaluate("window.__reviewRequests")) == 1
+
+
 def test_expired_review_never_starts_and_red_stays_red(page):
     open_review(page)
     page.evaluate("""() => {

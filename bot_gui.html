@@ -32709,12 +32709,12 @@
                 showToast('Stop the bot before reviewing a new run override.', 'warning');
                 return;
             }
-            closeConfidenceOverrideReview();
             const durationHours = Number(document.getElementById('confidenceOverrideHours').value);
             if (!Number.isSafeInteger(durationHours) || durationHours < 1 || durationHours > 168) {
                 showToast('Enter an override duration of 1–168 hours.', 'warning');
                 return;
             }
+            closeConfidenceOverrideReview();
             try {
                 const response = await apiFetch(`${API_URL}/bot/start`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
