@@ -28,9 +28,9 @@ def _prepared_follow_cancel(
     sources = []
     trades = []
     for index in range(offset, offset + count):
-        trade = chr(ord("a") + index) * 64
-        source = chr(ord("c") + index) * 64
-        intent_id = str(index + 1) * 64
+        trade = chr(ord("a") + index) * 64 if index < 2 else f"{index + 1:064x}"
+        source = chr(ord("c") + index) * 64 if index < 2 else f"{index + 1000:064x}"
+        intent_id = str(index + 1) * 64 if index < 2 else f"{index + 2000:064x}"
         operation_id = f"create:{intent_id}"
         database.upsert_coin(
             source, "xch", 1000, designation="tier_spare", purpose="lifecycle"
@@ -60,7 +60,9 @@ def _prepared_follow_cancel(
             lifecycle_state="created",
             outcome="CONFIRMED",
             sage_trade_id=trade,
-            offer_text_sha256=str(index + 2) * 64,
+            offer_text_sha256=(
+                str(index + 2) * 64 if index < 2 else f"{index + 3000:064x}"
+            ),
             wallet_identity_json={"binding_digest": "b" * 64},
             evidence_json={"effect_attempted": True},
             finalize_selected_coin_reservations=True,
@@ -77,10 +79,13 @@ def _prepared_follow_cancel(
         trades.append(trade)
         sources.append(source)
     manifest = database.canonical_offer_cancel_cohort_manifest(members)
+    source_by_trade = dict(zip(trades, sources))
     contract = {
         "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
-        "trade_ids": trades,
-        "source_coin_ids": sources,
+        "trade_ids": [member["trade_id"] for member in manifest["members"]],
+        "source_coin_ids": [
+            source_by_trade[member["trade_id"]] for member in manifest["members"]
+        ],
         "fee_coin_id": FEE_COIN,
         "fee_mojos": fee,
     }
@@ -292,6 +297,49 @@ def test_follow_cancel_holds_exact_run_fee_and_refuses_replay(approved):
             batch_contract=contract,
             final_quote=_quote(approved),
         )
+
+
+def test_full_24_by_24_book_uses_one_bounded_cancel_hold(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(run_id, identity, count=48, fee=20)
+    assert len(manifest["members"]) == 48
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved),
+    )
+    assert hold["fee_mojos"] == 20
+    assert hold["dispatch_authorized"] is False
+    assert (
+        database.get_effective_follow_fee_policy(
+            run_id=run_id,
+            identity=identity,
+            now_epoch=1002,
+            _own_unresolved_operation_id=hold["operation_id"],
+        )["remaining_fee_mojos"]
+        == 60
+    )
+
+
+def test_full_24_by_24_book_cannot_consume_protected_shutdown_reserve(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(run_id, identity, count=48, fee=50)
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_RESERVE_PROTECTED"):
+        database.reserve_follow_cancellation_fee(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=_quote(approved, fee=50),
+        )
+    status = database.get_coin_prep_fee_approval_status(
+        approved["approval"]["approval_id"]
+    )
+    assert status["held_fee_mojos"] == 0
 
 
 def test_durable_stop_releases_reserve_only_for_exact_run_cleanup(approved):
