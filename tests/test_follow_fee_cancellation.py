@@ -5,10 +5,19 @@ from importlib import import_module
 from unittest.mock import patch
 
 import database
+import pytest
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def current_database_module():
+    global database
+    database = import_module("database")
+
+
 def _run(approved):
+    global database
+    database = import_module("database")
     scope = json.loads(
         database.get_coin_prep_fee_approval_context(
             approved["approval"]["approval_id"]
