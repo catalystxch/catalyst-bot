@@ -23045,7 +23045,25 @@ def get_follow_creation_authority(
             ).fetchone()
             totals = _fee_scope_totals(conn, row["scope_sha256"])
             if latest != row["version"]:
-                result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
+                effective = get_effective_follow_fee_policy(
+                    run_id=row["run_id"], identity=identity, now_epoch=now_epoch
+                )
+                if effective["revision"] < 1:
+                    result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
+                elif not effective["ready"]:
+                    result["reason_code"] = effective["reason_code"]
+                else:
+                    result.update(
+                        {
+                            "ready": True,
+                            "reason_code": None,
+                            "approval_id": effective["approval_id"],
+                            "maximum_fee_mojos": effective["maximum_fee_mojos"],
+                            "protected_shutdown_fee_mojos": effective[
+                                "protected_shutdown_fee_mojos"
+                            ],
+                        }
+                    )
             elif unresolved is not None:
                 result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
             elif (
@@ -23225,6 +23243,7 @@ def get_effective_follow_fee_policy(
         if run is None or policy["reason_code"] not in (
             None,
             "FOLLOW_FEE_CAP_EXCEEDED",
+            "FOLLOW_UNRESOLVED_EFFECT",
         ):
             return {
                 **policy,
@@ -23285,8 +23304,12 @@ def get_effective_follow_fee_policy(
             return {**policy, "ready": False, "reason_code": "FOLLOW_FEE_CAP_EXCEEDED"}
         return {
             **policy,
-            "ready": True,
-            "reason_code": None,
+            "ready": policy["reason_code"] != "FOLLOW_UNRESOLVED_EFFECT",
+            "reason_code": (
+                "FOLLOW_UNRESOLVED_EFFECT"
+                if policy["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
+                else None
+            ),
             "revision": last["revision"],
             "approval_id": last["approval_id"],
             "maximum_fee_mojos": prior_maximum,

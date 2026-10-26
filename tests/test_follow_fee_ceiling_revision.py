@@ -26,6 +26,82 @@ def test_initial_effective_fee_policy_uses_original_run_scope(approved):
     assert policy["dispatch_authorized"] is False
 
 
+def test_confirmed_revision_updates_creation_authority_without_new_run(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    revision = database.confirm_follow_fee_ceiling_review(
+        review_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        identity=identity,
+        configuration_sha256="a" * 64,
+        observed_fee_principal_mojos=120,
+        now_epoch=1003,
+    )
+    authority = database.get_follow_creation_authority(
+        identity=identity,
+        configuration_sha256="a" * 64,
+        now_epoch=1004,
+    )
+    assert authority["ready"] is True
+    assert authority["run_id"] == run_id
+    assert authority["approval_id"] == revision["approval_id"]
+    assert authority["maximum_fee_mojos"] == 120
+    assert authority["protected_shutdown_fee_mojos"] == 40
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1005)
+    stopped = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1006
+    )
+    assert stopped["ready"] is False
+    assert stopped["reason_code"] == "FOLLOW_RUN_STOPPED"
+
+
+def test_lowered_ceiling_and_pending_fee_are_reflected_in_creation(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=60,
+        observed_fee_principal_mojos=60,
+        now_epoch=1002,
+    )
+    revision = database.confirm_follow_fee_ceiling_review(
+        review_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        identity=identity,
+        configuration_sha256="a" * 64,
+        observed_fee_principal_mojos=60,
+        now_epoch=1003,
+    )
+    authority = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1004
+    )
+    assert authority["ready"] is True
+    assert authority["approval_id"] == revision["approval_id"]
+    assert authority["maximum_fee_mojos"] == 60
+
+    database.reserve_approved_fee(
+        approval_id=revision["approval_id"],
+        scope_sha256=approved["approval"]["scope_sha256"],
+        plan_sha256=approved["approval"]["plan_sha256"],
+        operation_id="1" * 64,
+        fee_mojos=1,
+        cancellation=False,
+    )
+    pending = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1004
+    )
+    assert pending["ready"] is False
+    assert pending["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
+
+
 def test_ceiling_review_freezes_active_run_without_creating_authority(approved):
     run_id, identity = _run(approved)
     review = database.create_follow_fee_ceiling_review(

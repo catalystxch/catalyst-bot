@@ -8654,7 +8654,7 @@ class OfferManager:
             follow_run_id = next(iter(follow_run_ids))
             try:
                 follow_identity = database.get_follow_run_identity(follow_run_id)
-                cleanup = database.get_follow_cleanup_authority(
+                cleanup = database.get_effective_follow_fee_policy(
                     run_id=follow_run_id,
                     identity=follow_identity,
                     now_epoch=int(time.time()),
