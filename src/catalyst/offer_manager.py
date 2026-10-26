@@ -231,7 +231,18 @@ def require_active_follow_intent_authority(
 
     if type(purpose) is not str:
         raise ValueError("FOLLOW_PURPOSE_INVALID")
+    observed_at = now or datetime.now(timezone.utc)
+    if type(observed_at) is not datetime or observed_at.tzinfo is None:
+        raise ValueError("FOLLOW_TIME_INVALID")
     if not purpose.startswith("follow:"):
+        # An existing reviewed run owns this asset's offer effects even after
+        # a Stop or settings drift. Never let a legacy producer silently
+        # create an unscoped replacement during its acceptance window.
+        marker = database.get_unexpired_follow_run_marker(
+            asset_id=asset_id, now_epoch=int(observed_at.timestamp())
+        )
+        if marker is not None:
+            raise ValueError("FOLLOW_PURPOSE_REQUIRED")
         return None
     parts = purpose.split(":")
     if (
@@ -242,10 +253,6 @@ def require_active_follow_intent_authority(
         raise ValueError("FOLLOW_PURPOSE_INVALID")
     if side not in {"buy", "sell"}:
         raise ValueError("FOLLOW_SIDE_INVALID")
-    observed_at = now or datetime.now(timezone.utc)
-    if type(observed_at) is not datetime or observed_at.tzinfo is None:
-        raise ValueError("FOLLOW_TIME_INVALID")
-
     from confidence_override import current_scope
 
     scope = current_scope()

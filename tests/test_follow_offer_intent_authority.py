@@ -35,6 +35,25 @@ def test_follow_purpose_requires_the_exact_active_run(monkeypatch):
     assert result == {"run_id": RUN_ID, "classification": "normal_lifecycle"}
 
 
+def test_unscoped_follow_creation_is_fenced_while_run_exists(monkeypatch):
+    seen = []
+
+    def marker(*, asset_id, now_epoch):
+        seen.append((asset_id, now_epoch))
+        return {"run_id": RUN_ID, "stopped": True}
+
+    monkeypatch.setattr(database, "get_unexpired_follow_run_marker", marker)
+    with pytest.raises(ValueError, match="FOLLOW_PURPOSE_REQUIRED"):
+        offer_manager.require_active_follow_intent_authority(
+            purpose="normal_lifecycle",
+            asset_id=ASSET_ID,
+            side="buy",
+            offer_max_time=int(NOW.timestamp()) + 3600,
+            now=NOW,
+        )
+    assert seen == [(ASSET_ID, int(NOW.timestamp()))]
+
+
 @pytest.mark.parametrize(
     "purpose,asset_id,side,expiry",
     [
