@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from test_follow_run_review_service import _proposal
+from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
 def _review():
@@ -122,6 +123,62 @@ def test_native_bridge_requires_explicit_acceptance_and_forwards_only_review_ids
     )
     assert rejected["success"] is False
     assert calls == [("e" * 64, "f" * 64)]
+
+
+def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatch):
+    import api_server
+    import database
+    import follow_principal
+    import json
+
+    approved["now"] = 1_001
+    monkeypatch.setattr(follow_principal, "time", SimpleNamespace(time=lambda: 1_001))
+    monkeypatch.setattr(api_server, "bot", SimpleNamespace(is_running=lambda: False))
+    monkeypatch.setattr(api_server, "_bot_cancel_lifecycle_lock", RLock())
+    monkeypatch.setattr(api_server, "_cancel_all_state_lock", RLock())
+    monkeypatch.setattr(api_server, "_cancel_all_state", {"running": False})
+    monkeypatch.setattr(api_server, "_cancel_all_thread", None)
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    proposal = _proposal() | {
+        "identity": {
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        },
+        "maximum_fee_mojos": 80,
+        "cancellation_reserve_mojos": 40,
+    }
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda *_a, **_kw: dict(proposal),
+    )
+    review = follow_principal.prepare_follow_run_review(
+        approval_id,
+        buy_limit=24,
+        sell_limit=24,
+        duration_seconds=48 * 3600,
+        requested_fee_cap_mojos=80,
+    )
+    run = follow_principal.confirm_follow_run_review(
+        review["review_id"], review["review_sha256"]
+    )
+    assert len(run["run_id"]) == 64
+    assert database.get_follow_run_review(review["review_id"])["consumed"] is True
+    with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
+        follow_principal.confirm_follow_run_review(
+            review["review_id"], review["review_sha256"]
+        )
 
 
 @pytest.mark.parametrize(
