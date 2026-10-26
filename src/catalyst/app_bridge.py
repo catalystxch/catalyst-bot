@@ -1171,6 +1171,100 @@ class AppBridge:
         return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
+    @_mutation_guard("app_bridge:prepare_follow_fee_ceiling_review")
+    def prepare_follow_fee_ceiling_review(self, body=None):
+        """Freeze the current run's proposed fee ceiling for native review."""
+        import time
+
+        from coin_prep_fee_runtime import _configuration
+        from follow_principal import prepare_follow_fee_ceiling_review
+        import database
+
+        if (
+            type(body) is not dict
+            or set(body) != {"proposed_maximum_fee_mojos"}
+            or type(body["proposed_maximum_fee_mojos"]) is not int
+            or not 0 < body["proposed_maximum_fee_mojos"] <= 2**63 - 1
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_REVISION_INVALID",
+                "dispatch_authorized": False,
+            }
+        try:
+            asset_id = _configuration()["CAT_ASSET_ID"]
+            marker = database.get_unexpired_follow_run_marker(
+                asset_id=asset_id, now_epoch=int(time.time())
+            )
+            if marker is None or marker["stopped"]:
+                raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+            result = prepare_follow_fee_ceiling_review(
+                marker["run_id"],
+                proposed_maximum_fee_mojos=body["proposed_maximum_fee_mojos"],
+            )
+            identity = database.get_follow_run_identity(result["run_id"])
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_FEE_REVISION_INVALID",
+                "FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED",
+                "FOLLOW_FEE_REVISION_UNFUNDED",
+                "FOLLOW_FEE_REVISION_CHANGED",
+                "FOLLOW_FEE_REVISION_WALLET_CHANGED",
+                "FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE",
+            }:
+                reason = "FOLLOW_FEE_REVISION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {
+            **result,
+            "identity": identity,
+            "success": True,
+            "dispatch_authorized": False,
+        }
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_follow_fee_ceiling_review")
+    def confirm_follow_fee_ceiling_review(self, body=None):
+        """Record only the exact accepted native in-run fee review."""
+        import re
+
+        from follow_principal import confirm_follow_fee_ceiling_review
+
+        if (
+            type(body) is not dict
+            or set(body) != {"review_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_REVISION_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            result = confirm_follow_fee_ceiling_review(
+                body["review_id"], body["review_sha256"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_FEE_REVISION_REVIEW_REQUIRED",
+                "FOLLOW_FEE_REVISION_REVIEW_USED",
+                "FOLLOW_FEE_REVISION_REVIEW_CHANGED",
+                "FOLLOW_FEE_REVISION_REVIEW_EXPIRED",
+                "FOLLOW_FEE_REVISION_WALLET_CHANGED",
+                "FOLLOW_FEE_REVISION_CHANGED",
+                "FOLLOW_FEE_REVISION_UNFUNDED",
+            }:
+                reason = "FOLLOW_FEE_REVISION_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**result, "success": True, "dispatch_authorized": False}
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -2209,6 +2303,8 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "preview_follow_principal",
     "prepare_follow_run_review",
     "confirm_follow_run_review",
+    "prepare_follow_fee_ceiling_review",
+    "confirm_follow_fee_ceiling_review",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

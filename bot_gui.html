@@ -8330,6 +8330,21 @@
         </div>
     </div>
 
+    <div id="followFeeCeilingReviewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="followFeeCeilingReviewTitle" style="display:none">
+        <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
+            <h2 id="followFeeCeilingReviewTitle">Adjust active Follow fee ceiling</h2>
+            <p>A new ceiling applies to the current run only after you review and approve its exact wallet, fees already used, protected reserve and available fee principal. Trading remains subject to its other safety gates.</p>
+            <label>New cumulative fee ceiling (XCH) <input id="followFeeCeilingProposedXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowFeeCeilingReview()"></label>
+            <pre id="followFeeCeilingReviewText" style="white-space:pre-wrap"></pre>
+            <label><input type="checkbox" id="followFeeCeilingReviewAccept" disabled> I approve the exact revised cumulative fee ceiling shown above for this run.</label>
+            <div style="margin-top:16px">
+                <button type="button" onclick="closeFollowFeeCeilingReview()">Back</button>
+                <button type="button" id="followFeeCeilingReviewPrepare" onclick="prepareFollowFeeCeilingReview()">Refresh exact review</button>
+                <button type="button" id="followFeeCeilingReviewConfirm" disabled onclick="confirmFollowFeeCeilingReview()">Record revised ceiling</button>
+            </div>
+        </div>
+    </div>
+
 
 
     <div class="pair-switch-overlay" id="pairSwitchOverlay">
@@ -9233,6 +9248,7 @@
                         <div class="v4-toolbar-left">
                         <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
                         <button type="button" class="btn" onclick="openFollowRunReview()">Review Follow run</button>
+                        <button type="button" class="btn" onclick="openFollowFeeCeilingReview()">Adjust Follow fee</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
                         <button class="btn btn-cancel btn-danger" id="cancelAllBtn" onclick="cancelAllOffers()">Cancel All (<span id="cancelAllCount">0</span>) <span class="cc-help">?<span class="cc-tooltip">Cancels every active buy and sell offer — use for a clean restart or wallet switch. Stop the bot first.</span></span></button>
@@ -32938,6 +32954,145 @@
                     `${error?.message || 'Follow approval failed.'} Refresh the exact review before trying again.`;
             } finally {
                 _followRunReviewBusy = false;
+            }
+        }
+
+        let _followFeeCeilingReview = null;
+        let _followFeeCeilingBusy = false;
+
+        function invalidateFollowFeeCeilingReview() {
+            _followFeeCeilingReview = null;
+            const accept = document.getElementById('followFeeCeilingReviewAccept');
+            accept.checked = false;
+            accept.disabled = true;
+            document.getElementById('followFeeCeilingReviewConfirm').disabled = true;
+            document.getElementById('followFeeCeilingReviewText').textContent =
+                'Amount changed. Refresh the exact wallet review before approving.';
+        }
+
+        function closeFollowFeeCeilingReview() {
+            _followFeeCeilingReview = null;
+            document.getElementById('followFeeCeilingReviewModal').style.display = 'none';
+            const accept = document.getElementById('followFeeCeilingReviewAccept');
+            accept.checked = false;
+            accept.disabled = true;
+            document.getElementById('followFeeCeilingReviewConfirm').disabled = true;
+        }
+
+        function openFollowFeeCeilingReview() {
+            if (!IS_DESKTOP || !window.pywebview?.api?.prepare_follow_fee_ceiling_review
+                || !window.pywebview?.api?.confirm_follow_fee_ceiling_review) {
+                showToast('Fee ceiling changes require the native desktop app.', 'warning');
+                return;
+            }
+            closeFollowFeeCeilingReview();
+            document.getElementById('followFeeCeilingReviewText').textContent =
+                'Enter the new cumulative ceiling and refresh the exact current-run review.';
+            document.getElementById('followFeeCeilingReviewModal').style.display = 'flex';
+        }
+
+        async function prepareFollowFeeCeilingReview() {
+            if (_followFeeCeilingBusy || !IS_DESKTOP
+                || !window.pywebview?.api?.prepare_follow_fee_ceiling_review) return;
+            invalidateFollowFeeCeilingReview();
+            const prepare = document.getElementById('followFeeCeilingReviewPrepare');
+            const output = document.getElementById('followFeeCeilingReviewText');
+            const proposed = followRunFeeCapMojos(
+                document.getElementById('followFeeCeilingProposedXch').value);
+            if (proposed === null) {
+                output.textContent = 'Enter a positive XCH amount with no more than 12 decimal places.';
+                return;
+            }
+            _followFeeCeilingBusy = true;
+            prepare.disabled = true;
+            output.textContent = 'Checking the current wallet, fee ledger and protected principal…';
+            try {
+                const review = await window.pywebview.api.prepare_follow_fee_ceiling_review({
+                    proposed_maximum_fee_mojos: proposed,
+                });
+                if (followRunFeeCapMojos(document.getElementById('followFeeCeilingProposedXch').value) !== proposed) {
+                    throw new Error('The ceiling changed during review. Refresh the exact review.');
+                }
+                const id = review?.identity || {};
+                const amountKeys = [
+                    'prior_maximum_fee_mojos', 'proposed_maximum_fee_mojos',
+                    'protected_shutdown_fee_mojos', 'observed_fee_principal_mojos',
+                    'reviewed_spent_fee_mojos', 'reviewed_held_fee_mojos',
+                ];
+                if (review?.success !== true || review.dispatch_authorized !== false
+                    || review.consumed !== false
+                    || !/^[0-9a-f]{64}$/.test(review.review_id || '')
+                    || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')
+                    || !/^[0-9a-f]{64}$/.test(review.run_id || '')
+                    || !Number.isSafeInteger(review.prior_revision)
+                    || !Number.isSafeInteger(review.expires_at_epoch)
+                    || Date.now() >= review.expires_at_epoch * 1000
+                    || !amountKeys.every(key => Number.isSafeInteger(review[key]) && review[key] >= 0)
+                    || review.proposed_maximum_fee_mojos !== proposed
+                    || !Number.isSafeInteger(id.wallet_fingerprint)
+                    || typeof id.network !== 'string' || typeof id.asset_id !== 'string') {
+                    throw new Error(`Fee ceiling review unavailable (${review?.reason || 'wallet or fee ledger could not be proved'}).`);
+                }
+                _followFeeCeilingReview = review;
+                output.textContent =
+                    `Wallet ${id.wallet_fingerprint} · ${id.network} · ${id.ticker || ''}\n` +
+                    `Asset ${id.asset_id}\n` +
+                    `Run ${review.run_id} · current revision ${review.prior_revision}\n` +
+                    `Current cumulative ceiling: ${review.prior_maximum_fee_mojos} mojos\n` +
+                    `New cumulative ceiling: ${review.proposed_maximum_fee_mojos} mojos\n` +
+                    `Already spent: ${review.reviewed_spent_fee_mojos} mojos\n` +
+                    `Pending fee holds: ${review.reviewed_held_fee_mojos} mojos\n` +
+                    `Protected shutdown reserve: ${review.protected_shutdown_fee_mojos} mojos\n` +
+                    `Selectable protected fee principal: ${review.observed_fee_principal_mojos} mojos\n` +
+                    `Exact review expires: ${new Date(review.expires_at_epoch * 1000).toISOString()}`;
+                const accept = document.getElementById('followFeeCeilingReviewAccept');
+                const confirm = document.getElementById('followFeeCeilingReviewConfirm');
+                accept.disabled = false;
+                accept.onchange = () => {
+                    confirm.disabled = !accept.checked || !_followFeeCeilingReview
+                        || Date.now() >= _followFeeCeilingReview.expires_at_epoch * 1000;
+                };
+            } catch (error) {
+                output.textContent = error?.message || 'Could not verify the fee ceiling review.';
+            } finally {
+                _followFeeCeilingBusy = false;
+                prepare.disabled = false;
+            }
+        }
+
+        async function confirmFollowFeeCeilingReview() {
+            const review = _followFeeCeilingReview;
+            const accept = document.getElementById('followFeeCeilingReviewAccept');
+            const confirm = document.getElementById('followFeeCeilingReviewConfirm');
+            if (_followFeeCeilingBusy || !review || !accept.checked
+                || Date.now() >= review.expires_at_epoch * 1000
+                || followRunFeeCapMojos(document.getElementById('followFeeCeilingProposedXch').value)
+                    !== review.proposed_maximum_fee_mojos
+                || !IS_DESKTOP || !window.pywebview?.api?.confirm_follow_fee_ceiling_review) {
+                showToast('Review expired or changed. Refresh the exact review.', 'warning');
+                return;
+            }
+            _followFeeCeilingBusy = true;
+            confirm.disabled = true;
+            try {
+                const result = await window.pywebview.api.confirm_follow_fee_ceiling_review({
+                    review_id: review.review_id,
+                    review_sha256: review.review_sha256,
+                    accepted: true,
+                });
+                if (result?.success !== true || result.dispatch_authorized !== false
+                    || result.run_id !== review.run_id
+                    || result.maximum_fee_mojos !== review.proposed_maximum_fee_mojos) {
+                    throw new Error(result?.reason || 'Revised ceiling was not recorded.');
+                }
+                closeFollowFeeCeilingReview();
+                showToast('Revised cumulative fee ceiling recorded for this Follow run.', 'success');
+            } catch (error) {
+                invalidateFollowFeeCeilingReview();
+                document.getElementById('followFeeCeilingReviewText').textContent =
+                    `${error?.message || 'Fee ceiling approval failed.'} Refresh the exact review before trying again.`;
+            } finally {
+                _followFeeCeilingBusy = false;
             }
         }
 
