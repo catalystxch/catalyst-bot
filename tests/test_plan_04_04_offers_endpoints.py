@@ -1984,6 +1984,46 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["phase"], "error")
         self.assertEqual(status["reason_code"], "FEE_APPROVAL_STALE")
 
+    def test_stopped_cancel_all_reports_pre_effect_fee_failure_immediately(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_id = "a" * 64
+        stopped.offer_manager.cancel_offers.return_value = {
+            trade_id: {
+                "outcome": "CANCEL_FAILED",
+                "success": False,
+                "submitted": False,
+                "reconciliation_required": False,
+                "error": "FEE_CANCELLATION_FUNDING_REQUIRED",
+            }
+        }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[{"trade_id": trade_id, "status": "ACTIVE"}],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        stopped.offer_manager.retry_failed_cancels.assert_not_called()
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
+        self.assertEqual(
+            status["reason_code"], "FEE_CANCELLATION_FUNDING_REQUIRED"
+        )
+        self.assertFalse(status["running"])
+        self.assertFalse(status["complete"])
+
     def test_stopped_bot_routes_active_offer_through_durable_manager(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False

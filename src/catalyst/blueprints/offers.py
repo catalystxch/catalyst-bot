@@ -1982,7 +1982,24 @@ def _api_cancel_all_locked():
                             _cancel_kwargs["_retry_failed_attempts"] = (
                                 _batch_retry_attempts
                             )
-                        durable_manager.cancel_offers(_batch_targets, **_cancel_kwargs)
+                        _cancel_results = durable_manager.cancel_offers(
+                            _batch_targets, **_cancel_kwargs
+                        )
+                        # A fee funding rejection occurs before any wallet
+                        # effect.  Waiting for terminal Sage proof cannot fix
+                        # it, and obscures the action the user must review.
+                        if isinstance(_cancel_results, dict) and all(
+                            isinstance(_cancel_results.get(trade_id), dict)
+                            and _cancel_results[trade_id].get("outcome")
+                            == "CANCEL_FAILED"
+                            and _cancel_results[trade_id].get("submitted") is False
+                            and _cancel_results[trade_id].get("reconciliation_required")
+                            is False
+                            and _cancel_results[trade_id].get("error")
+                            == "FEE_CANCELLATION_FUNDING_REQUIRED"
+                            for trade_id in _batch_targets
+                        ):
+                            raise ValueError("FEE_CANCELLATION_FUNDING_REQUIRED")
                         _batch_terminal_ids = _authoritatively_terminal_offer_ids(
                             _batch_targets
                         )
@@ -2113,6 +2130,7 @@ def _api_cancel_all_locked():
                         "FEE_BUDGET_EXCEEDED",
                         "FEE_CAMPAIGN_BUDGET_EXCEEDED",
                         "FEE_PREP_FUNDING_INSUFFICIENT",
+                        "FEE_CANCELLATION_FUNDING_REQUIRED",
                     }
                     _reason_code = next(
                         (code for code in _fee_reason_codes if code in str(_e).upper()),
