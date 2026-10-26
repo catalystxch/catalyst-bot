@@ -5874,11 +5874,12 @@ class BotLoop:
 
     def _fresh_wallet_offer_book_for_start(self) -> bool:
         """Reject a cached or failed Sage offer read before spawning workers."""
+        self._fresh_start_active_offer_count = None
         try:
             offers, meta = self.offer_manager.sync_from_wallet_with_meta()
         except Exception:
             return False
-        return (
+        valid = (
             type(offers) is tuple
             and len(offers) == 3
             and all(type(rows) is list for rows in offers)
@@ -5886,6 +5887,9 @@ class BotLoop:
             and meta.get("fresh") is True
             and meta.get("using_cache") is False
         )
+        if valid:
+            self._fresh_start_active_offer_count = len(offers[0]) + len(offers[1])
+        return valid
 
     def _detect_fills_for_wallet_cycle(self, current_buy_ids, current_sell_ids):
         """Only a fresh offer book can advance fill detection state."""
@@ -6089,6 +6093,45 @@ class BotLoop:
                 "error",
                 "bot_start_wallet_offers_not_fresh",
                 "Bot start blocked because the live wallet offer book is not fresh",
+            )
+            return False
+
+        # The HTTP Start route makes this check too, but a direct in-process
+        # caller must not bypass the reviewed financial run before workers
+        # start. A fresh Sage active book requires a separate exact resume
+        # review; it cannot silently inherit a new run's free-coin approval.
+        try:
+            bootstrap_context = self._bootstrap_campaign_context()
+            if type(bootstrap_context) is not dict:
+                raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+            if bootstrap_context.get("active") is True:
+                if bootstrap_context.get("blocked") is not False:
+                    raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+            elif bootstrap_context.get("active") is False:
+                from follow_principal import reviewed_follow_start_readiness
+
+                active_count = getattr(self, "_fresh_start_active_offer_count", None)
+                if type(active_count) is not int or active_count < 0:
+                    raise ValueError("FOLLOW_WALLET_BOOK_UNAVAILABLE")
+                readiness = reviewed_follow_start_readiness(
+                    cfg, resume_existing_offers=active_count > 0
+                )
+                if readiness.get("ready") is not True:
+                    raise ValueError(
+                        readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
+                    )
+            else:
+                raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+        except Exception as exc:
+            reason = (
+                str(exc) if isinstance(exc, ValueError) else "FOLLOW_REVIEW_UNAVAILABLE"
+            )
+            self._set_state(running=False, status="blocked", error=reason)
+            log_event(
+                "error",
+                "bot_start_review_unavailable",
+                "Bot start blocked because reviewed financial authority is unavailable",
+                data={"reason_code": reason},
             )
             return False
 

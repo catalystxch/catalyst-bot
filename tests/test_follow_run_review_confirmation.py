@@ -177,7 +177,7 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
     from blueprints import bot as bot_routes
     import confidence_override
 
-    monkeypatch.setattr(bot_routes.time, "time", lambda: 1_002)
+    monkeypatch.setattr(follow_principal.time, "time", lambda: 1_002)
     monkeypatch.setattr(
         confidence_override,
         "current_scope",

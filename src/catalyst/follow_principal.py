@@ -577,3 +577,65 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
         }
         authority = database.create_follow_run_authority(**terms)
         return {**authority, "dispatch_authorized": False}
+
+
+def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) -> dict:
+    """Reprove a two-sided Follow run immediately before the trading thread starts.
+
+    The review and its native confirmation are separate from Start. This
+    reader cannot create run authority or submit a wallet effect.
+    """
+    if (
+        str(getattr(cfg_obj, "LIQUIDITY_MODE", "two_sided") or "").lower()
+        != "two_sided"
+    ):
+        return {"ready": True}
+    if resume_existing_offers:
+        # A retained offer book needs its own exact run-bound membership proof.
+        return {"ready": False, "reason": "FOLLOW_RESUME_REVIEW_REQUIRED"}
+    try:
+        import database
+        from confidence_override import current_scope
+
+        scope = current_scope()
+        identity = scope["identity"]
+        authority = database.get_follow_creation_authority(
+            identity=identity,
+            configuration_sha256=scope["configuration_sha256"],
+            now_epoch=int(time.time()),
+        )
+        if (
+            authority.get("ready") is not True
+            or authority.get("run_id") != scope.get("follow_run_id")
+            or authority.get("consent_id") != scope.get("financial_consent_id")
+            or authority.get("identity") != identity
+            or authority.get("buy_limit")
+            != getattr(cfg_obj, "MAX_ACTIVE_BUY_OFFERS", None)
+            or authority.get("sell_limit")
+            != getattr(cfg_obj, "MAX_ACTIVE_SELL_OFFERS", None)
+        ):
+            return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+        proposal = preview_approved_follow_principal(
+            authority["approval_id"],
+            buy_limit=authority["buy_limit"],
+            sell_limit=authority["sell_limit"],
+        )
+        if (
+            proposal.get("dispatch_authorized") is not False
+            or proposal.get("identity") != identity
+            or proposal.get("configuration_sha256") != authority["configuration_sha256"]
+            or proposal.get("proposal_sha256") != authority["principal_review_sha256"]
+            or proposal.get("maximum_fee_mojos") != authority["maximum_fee_mojos"]
+            or proposal.get("cancellation_reserve_mojos")
+            != authority["protected_shutdown_fee_mojos"]
+            or proposal.get("replacement_count_gate_passed") is not True
+            or proposal.get("current_prep_targets_proven") is not True
+            or proposal.get("buy_slots_arithmetic_fit") != authority["buy_limit"]
+            or proposal.get("sell_slots_arithmetic_fit") != authority["sell_limit"]
+        ):
+            return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+        return {"ready": True, "run_id": authority["run_id"]}
+    except (ValueError, KeyError, TypeError):
+        return {"ready": False, "reason": "FOLLOW_REVIEW_REQUIRED"}
+    except Exception:
+        return {"ready": False, "reason": "FOLLOW_REVIEW_UNAVAILABLE"}

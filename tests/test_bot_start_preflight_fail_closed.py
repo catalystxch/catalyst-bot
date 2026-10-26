@@ -103,6 +103,64 @@ def test_direct_bot_start_requires_fresh_wallet_offer_metadata():
     assert bot_loop.BotLoop._fresh_wallet_offer_book_for_start(loop) is False
     manager.get_wallet_sync_meta = lambda: {"fresh": True, "using_cache": False}
     assert bot_loop.BotLoop._fresh_wallet_offer_book_for_start(loop) is True
+    assert loop._fresh_start_active_offer_count == 1
+
+
+@pytest.mark.parametrize(
+    "active_count,expected_reason",
+    [(0, "FOLLOW_REVIEW_REQUIRED"), (1, "FOLLOW_RESUME_REVIEW_REQUIRED")],
+)
+def test_direct_bot_start_requires_reviewed_follow_run_before_worker(
+    monkeypatch, active_count, expected_reason
+):
+    """In-process starts cannot skip the native financial Start proof."""
+    import doctor
+    import follow_principal
+    import wallet
+
+    states = []
+    loop = SimpleNamespace(
+        _running=False,
+        _stop_finalize_thread=None,
+        _set_state=lambda **state: states.append(state),
+        _reset_runtime_state=lambda: None,
+        _establish_runtime_recovery_baseline=lambda: True,
+        _restore_authoritative_sweep_downstream_effects=lambda: None,
+        runtime_monitor=SimpleNamespace(reset_session=lambda: None),
+        _recovery_state={},
+        _clear_alert=lambda _name: None,
+        _fresh_wallet_offer_book_for_start=lambda: True,
+        _fresh_start_active_offer_count=active_count,
+        _bootstrap_campaign_context=lambda: {"active": False},
+        _watcher_stop_event=SimpleNamespace(
+            clear=lambda: (_ for _ in ()).throw(AssertionError("worker launched"))
+        ),
+    )
+    monkeypatch.setattr(bot_loop.mutation_gate, "require_allowed", lambda *_: None)
+    monkeypatch.setattr(bot_loop.cfg, "reload", lambda: None)
+    monkeypatch.setattr(bot_loop, "log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        doctor,
+        "run_preflight",
+        lambda **_: SimpleNamespace(summary="Ready", duration_ms=1, can_start=True),
+    )
+    monkeypatch.setattr(wallet, "get_wallet_type", lambda: "chia")
+    monkeypatch.setattr(
+        follow_principal,
+        "reviewed_follow_start_readiness",
+        lambda *_args, **kwargs: {
+            "ready": False,
+            "reason": (
+                "FOLLOW_RESUME_REVIEW_REQUIRED"
+                if kwargs["resume_existing_offers"]
+                else "FOLLOW_REVIEW_REQUIRED"
+            ),
+        },
+    )
+
+    assert bot_loop.BotLoop.start(loop) is False
+    assert states[-1]["status"] == "blocked"
+    assert states[-1]["error"] == expected_reason
 
 
 def test_stale_wallet_cycle_does_not_run_fill_detection():
