@@ -209,6 +209,7 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
     """
 
     import database
+    from coin_prep_fee_approval import _prove_approved_coin_prep_targets
     from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
     from confidence_override import current_configuration_digest
 
@@ -288,6 +289,7 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
     observed = read_approved_prep_fee_snapshot(approval_id)
     if type(observed) is not dict or observed.get("scope") != scope:
         raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+    _prove_approved_coin_prep_targets(observed)
     principal = _principal_from_observed_snapshot(
         observed, fee_cap_mojos=before["total_fee_mojos"]
     )
@@ -323,5 +325,6 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         "planned_replacement_cat_coin_count": replacement_counts["cat"],
         "planned_replacement_xch_mojos": replacement_atoms["xch"],
         "planned_replacement_cat_atoms": replacement_atoms["cat"],
+        "current_prep_targets_proven": True,
         "dispatch_authorized": False,
     }

@@ -88,6 +88,10 @@ calculating principal. That reader revalidates the stored economics against
 current wallet identity, settings, session ownership and approval version;
 the principal calculation uses the same verified snapshot. A changed approved
 plan therefore cannot produce a seemingly current Follow proposal.
+The preview also invokes Coin Prep's exact zero-effect target matcher on that
+snapshot. Its `current_prep_targets_proven` flag means every approved prep
+denomination is still selectable at preview time; it does not establish the
+live price or match 24 current ladder slots.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is

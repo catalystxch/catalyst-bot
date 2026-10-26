@@ -12,6 +12,7 @@ from follow_principal import (
     preview_approved_follow_principal,
     read_follow_principal_snapshot,
 )
+from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
 def _coin(asset, marker, amount, *, purpose="", protected=False):
@@ -170,6 +171,7 @@ def test_fee_coin_cannot_also_be_a_wallet_reserve():
 
 def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypatch):
     import confidence_override
+    import coin_prep_fee_approval
     import coin_prep_fee_runtime
     import database
     import follow_principal
@@ -249,6 +251,18 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
         "read_approved_prep_fee_snapshot",
         lambda _id: {"scope": scope, "identity": identity},
     )
+    monkeypatch.setattr(
+        coin_prep_fee_approval,
+        "_prove_approved_coin_prep_targets",
+        lambda _context: (_ for _ in ()).throw(ValueError("FEE_SESSION_INCOMPLETE")),
+    )
+    with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):
+        preview_approved_follow_principal(approval_id)
+    monkeypatch.setattr(
+        coin_prep_fee_approval,
+        "_prove_approved_coin_prep_targets",
+        lambda _context: object(),
+    )
     result = preview_approved_follow_principal(approval_id)
     assert result["identity"] == identity
     assert result["maximum_trade_xch_mojos"] == 100_000_000_000
@@ -258,6 +272,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert result["planned_replacement_cat_coin_count"] == 1
     assert result["planned_replacement_xch_mojos"] == 10
     assert result["planned_replacement_cat_atoms"] == 20
+    assert result["current_prep_targets_proven"] is True
     assert len(result["proposal_sha256"]) == 64
     assert result["dispatch_authorized"] is False
     status["stale"] = True
@@ -283,6 +298,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
 
 def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkeypatch):
     import confidence_override
+    import coin_prep_fee_approval
     import coin_prep_fee_runtime
     import database
     import follow_principal
@@ -345,7 +361,47 @@ def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkey
         lambda _id: {"scope": scope},
     )
     monkeypatch.setattr(
+        coin_prep_fee_approval,
+        "_prove_approved_coin_prep_targets",
+        lambda _context: object(),
+    )
+    monkeypatch.setattr(
         confidence_override, "current_configuration_digest", lambda: "f" * 64
     )
     with pytest.raises(ValueError, match="FOLLOW_PRINCIPAL_REVIEW_CHANGED"):
         preview_approved_follow_principal(approval_id)
+
+
+def test_approved_principal_preview_proves_current_frozen_prep_targets(
+    approved, monkeypatch
+):
+    from importlib import import_module
+
+    import config
+    from fee_approval_test_utils import _coin
+
+    runtime = import_module("coin_prep_fee_runtime")
+    service = import_module("coin_prep_fee_approval")
+    targets = runtime.read_approved_prep_fee_snapshot(
+        approved["approval"]["approval_id"]
+    )["recipe"]["targets"]
+    approved["xch"] = [
+        _coin(20000 + i, str(target.amount_mojos))
+        for i, target in enumerate(targets)
+        if target.asset == "xch"
+    ]
+    approved["cat"] = [
+        _coin(30000 + i, str(target.amount_mojos))
+        for i, target in enumerate(targets)
+        if target.asset == "cat"
+    ]
+    service.complete_coin_prep_fee_session(approved["approval"]["approval_id"])
+    monkeypatch.setattr(config, "cfg", approved["config"])
+    result = preview_approved_follow_principal(approved["approval"]["approval_id"])
+    assert result["current_prep_targets_proven"] is True
+    assert result["planned_replacement_xch_coin_count"] == 1
+    assert result["planned_replacement_cat_coin_count"] == 1
+    assert result["dispatch_authorized"] is False
+    approved["cat"] = []
+    with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):
+        preview_approved_follow_principal(approved["approval"]["approval_id"])

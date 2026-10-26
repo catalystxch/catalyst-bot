@@ -152,6 +152,7 @@ def api_follow_principal_preview():
         if reason not in {
             "FOLLOW_FEE_APPROVAL_STALE",
             "FEE_APPROVAL_STALE",
+            "FEE_SESSION_INCOMPLETE",
             "FOLLOW_FEE_SCOPE_INVALID",
             "FOLLOW_PRINCIPAL_REVIEW_CHANGED",
             "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
