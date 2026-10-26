@@ -84,6 +84,14 @@ three BoostManager handoff/cascade producers. These must be bound to the exact
 parent/new-run scope or fenced before enabling a Follow run. Direct legacy
 `create_offer_with_retry` paths also need the same boundary audit.
 
+Central producer fence: canonical creation must reject unscoped Follow offers
+while an unexpired run exists for the verified wallet and asset. The fence must
+hold after settings drift or Stop; `current_scope()` alone cannot detect those
+cases because it deliberately raises when creation authority is unavailable.
+Recheck at the final wallet boundary, then bind or disable each Boost, Sniper,
+requote and refresh producer. An ended run must require an explicit new mode
+decision instead of falling back to unscoped creation during acceptance.
+
 ### Task 3: Exact priced cancellation hold for every Follow path
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/database.py`, fee pricing/dispatch helpers, focused tests.
