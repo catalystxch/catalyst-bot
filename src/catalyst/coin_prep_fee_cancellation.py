@@ -123,6 +123,8 @@ def price_approved_cancellation(
         if not is_current_fee_quote(quote, cost, target_seconds):
             return _unavailable(context, "FEE_ESTIMATE_UNAVAILABLE")
         if quote["fee_mojos"] == fee:
+            if fee == 0:
+                return _unavailable(context, "FEE_CANCELLATION_FUNDING_REQUIRED")
             after = read_approved_prep_fee_snapshot(
                 approval_id,
                 expected_recovery_action=expected_recovery_action,

@@ -305,6 +305,50 @@ def test_refresh_abort_continuation_dispatches_one_sealed_target(monkeypatch):
     assert exits == [permit]
 
 
+def test_batch_continuation_rechecks_fee_authority_at_final_submit(monkeypatch):
+    effects = []
+    fee_checks = []
+    authority_current = [True]
+
+    def fee_authorizer():
+        fee_checks.append(authority_current[0])
+        return authority_current[0]
+
+    def batch_effect(selected, *args, _identity_recheck=None, **kwargs):
+        _identity_recheck("cancel_offers:sign")
+        authority_current[0] = False
+        _identity_recheck("cancel_offers:submit")
+        effects.append(selected)
+        return {TRADE_ID: {"outcome": CANCEL_SUBMITTED_UNCONFIRMED}}
+
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *args, **kwargs: {},
+        batch_effect=batch_effect,
+        identity_count=4,
+    )
+    continuation = wallet.begin_offer_cancel_continuation(
+        operation_id=OPERATION_ID,
+        intent_id=INTENT_ID,
+        trade_id=TRADE_ID,
+    )
+    result = wallet.cancel_offers_batch(
+        [TRADE_ID],
+        fee_mojos=42,
+        source_coin_ids=["c" * 64],
+        fee_coin_id="d" * 64,
+        _validated_unsigned={"sealed": True},
+        _fee_authorizer=fee_authorizer,
+        _cancel_continuation=continuation,
+        _cancel_operation_id=OPERATION_ID,
+        _cancel_intent_id=INTENT_ID,
+        _cancel_trade_id=TRADE_ID,
+    )
+    assert fee_checks == [True, False]
+    assert effects == []
+    assert result[TRADE_ID]["error"] == "FEE_FOLLOW_AUTHORITY_REQUIRED"
+
+
 def test_refresh_abort_continuation_renews_under_scoped_gate(monkeypatch):
     permit, _identities, _exits, _checks = _stub_cancel_continuation_authority(
         monkeypatch, effect=lambda *args, **kwargs: {}

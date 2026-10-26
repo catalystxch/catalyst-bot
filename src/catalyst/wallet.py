@@ -402,6 +402,7 @@ def _blocked_offer_cancel_continuation(
         CANCEL_UNKNOWN,
         method="continuation",
         raw_response={"reason_code": reason},
+        error=reason if reason == "FEE_FOLLOW_AUTHORITY_REQUIRED" else "",
     )
     result["_catalyst_effect_attempted"] = effect_attempted
     return result
@@ -852,10 +853,15 @@ def _run_offer_operation_continuation(
         return blocked_result()
     effect_attempted = False
     market_authorizer = callback_kwargs.pop("_market_authorizer", None)
+    fee_authorizer = callback_kwargs.pop("_fee_authorizer", None)
     try:
         if market_authorizer is not None and not callable(market_authorizer):
             return blocked_result(
                 "MARKET_CONFIDENCE_OVERRIDE_INACTIVE", effect_attempted=False
+            )
+        if fee_authorizer is not None and not callable(fee_authorizer):
+            return blocked_result(
+                "FEE_FOLLOW_AUTHORITY_REQUIRED", effect_attempted=False
             )
         try:
             operation = _exact_continuation_text(operation_id, "operation_id")
@@ -971,6 +977,10 @@ def _run_offer_operation_continuation(
             if market_authorizer is not None and market_authorizer() is not True:
                 raise mutation_gate.MutationBlocked(
                     "MARKET_CONFIDENCE_OVERRIDE_INACTIVE", wallet_operation
+                )
+            if fee_authorizer is not None and fee_authorizer() is not True:
+                raise mutation_gate.MutationBlocked(
+                    "FEE_FOLLOW_AUTHORITY_REQUIRED", wallet_operation
                 )
             effect_attempted = True
 
@@ -1735,6 +1745,7 @@ def cancel_offers_batch(
     source_coin_ids: list = None,
     fee_coin_id: str = None,
     _validated_unsigned: dict = None,
+    _fee_authorizer=None,
     _cancel_continuation=None,
     _cancel_operation_id: str = None,
     _cancel_intent_id: str = None,
@@ -1761,6 +1772,14 @@ def cancel_offers_batch(
             "OFFER_CANCEL_JOURNAL_REQUIRED",
             effect_attempted=False,
         )
+    if _fee_authorizer is not None and (
+        not callable(_fee_authorizer)
+        or secure is not True
+        or type(fee_mojos) is not int
+        or fee_mojos <= 0
+        or type(_validated_unsigned) is not dict
+    ):
+        return blocked_batch("FEE_FOLLOW_AUTHORITY_REQUIRED")
     continuation_arguments = (
         _cancel_continuation,
         _cancel_operation_id,
@@ -1776,6 +1795,8 @@ def cancel_offers_batch(
         }
         if _validated_unsigned is not None:
             callback_kwargs["_validated_unsigned"] = _validated_unsigned
+        if _fee_authorizer is not None:
+            callback_kwargs["_fee_authorizer"] = _fee_authorizer
         return _run_offer_operation_continuation(
             _cancel_continuation,
             _cancel_operation_id,

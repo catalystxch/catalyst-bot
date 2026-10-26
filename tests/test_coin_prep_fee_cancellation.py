@@ -84,7 +84,7 @@ def test_cancellation_price_converges_on_actual_unsigned_cost_without_dispatch(
     )
 
 
-def test_cancellation_price_preserves_available_zero_fee_without_extra_build(
+def test_cancellation_price_refuses_zero_fee_before_wallet_effect(
     approved, monkeypatch
 ):
     calls = _builder(monkeypatch, approved)
@@ -92,9 +92,9 @@ def test_cancellation_price_preserves_available_zero_fee_without_extra_build(
 
     result = _price(approved)
 
-    assert result["available"] is True
-    assert result["fee_mojos"] == 0
-    assert result["quote"]["source"] == "coinset"
+    assert result["available"] is False
+    assert result["reason"] == "FEE_CANCELLATION_FUNDING_REQUIRED"
+    assert result["dispatch_authorized"] is False
     assert calls == [0]
 
 
