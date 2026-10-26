@@ -7454,11 +7454,10 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
     # SQLite attempts to reparse it during ALTER TABLE and rejects the known
     # partially-upgraded shape.  Drop only the exact canonical trigger inside
     # the migration transaction; FEE_SCHEMA_SQL recreates it deterministically.
-    dependent_trigger_name = "coin_prep_fee_session_completions_authority_guard"
-    dependent = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
-        (dependent_trigger_name,),
-    ).fetchone()
+    dependent_trigger_names = (
+        "coin_prep_fee_session_completions_authority_guard",
+        "follow_fee_ceiling_revisions_binding_guard",
+    )
     drop_dependent_sql = ""
     restore_wallet_guard_sql = ""
     canonical_db = _sqlite_connect(":memory:")
@@ -7470,18 +7469,27 @@ def _upgrade_legacy_fee_ledger_schema(conn: sqlite3.Connection) -> None:
                 "AND name IN ('fee_approvals','approved_fee_reservations')"
             ).fetchall()
         )
-        expected_dependent = canonical_db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
-            (dependent_trigger_name,),
-        ).fetchone()
+        expected_dependents = {
+            name: canonical_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (name,),
+            ).fetchone()
+            for name in dependent_trigger_names
+        }
     finally:
         canonical_db.close()
-    if dependent is not None:
-        if expected_dependent is None or _normalized_schema_sql(
-            str(dependent[0])
-        ) != _normalized_schema_sql(str(expected_dependent[0])):
-            raise RuntimeError("legacy fee ledger has unknown dependent trigger")
-        drop_dependent_sql = f"DROP TRIGGER {dependent_trigger_name}; "
+    for name in dependent_trigger_names:
+        dependent = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (name,),
+        ).fetchone()
+        if dependent is not None:
+            expected = expected_dependents[name]
+            if expected is None or _normalized_schema_sql(
+                str(dependent[0])
+            ) != _normalized_schema_sql(str(expected[0])):
+                raise RuntimeError("legacy fee ledger has unknown dependent trigger")
+            drop_dependent_sql += f"DROP TRIGGER {name}; "
     # The current wallet-effect resolution guard also reads the fee tables.
     # The exact PR #218 fixture keeps that guard while replacing its fee
     # tables, so preserve only our known definition across the DDL swap.
@@ -23136,17 +23144,107 @@ def get_follow_cleanup_authority(
 def get_effective_follow_fee_policy(
     *, run_id: str, identity: dict, now_epoch: int
 ) -> Dict[str, Any]:
-    """Read the initial approved ceiling and its lifetime scope totals.
-
-    This reader grants no fee reservation or wallet dispatch authority. A
-    later revision must preserve the run ID and scope while replacing the
-    effective approval and ceiling in this response.
-    """
+    """Read the revision chain and lifetime ledger without dispatch authority."""
 
     policy = get_follow_cleanup_authority(
         run_id=run_id, identity=identity, now_epoch=now_epoch
     )
-    return {**policy, "revision": 0, "dispatch_authorized": False}
+    policy = {**policy, "revision": 0, "dispatch_authorized": False}
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        run = conn.execute(
+            "SELECT run.identity_sha256,run.configuration_sha256,"
+            "run.started_at_epoch,run.expires_at_epoch,initial.version "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS initial USING(approval_id) WHERE run.run_id=?",
+            (run_id,),
+        ).fetchone()
+        revisions = conn.execute(
+            "SELECT revision.*, review.*, approval.scope_sha256 AS approval_scope,"
+            "approval.plan_sha256 AS approval_plan,approval.total_fee_mojos,"
+            "approval.cancellation_reserve_mojos,approval.version "
+            "FROM follow_fee_ceiling_revisions AS revision "
+            "JOIN follow_fee_ceiling_reviews AS review USING(review_id) "
+            "JOIN fee_approvals AS approval ON approval.approval_id=revision.approval_id "
+            "WHERE revision.run_id=? ORDER BY revision.revision",
+            (run_id,),
+        ).fetchall()
+        if not revisions:
+            return policy
+        if run is None or policy["reason_code"] not in (
+            None,
+            "FOLLOW_FEE_CAP_EXCEEDED",
+        ):
+            return {
+                **policy,
+                "ready": False,
+                "reason_code": "FOLLOW_FEE_REVISION_INVALID",
+            }
+        expected_identity = hashlib.sha256(
+            _follow_identity_json(identity).encode("utf-8")
+        ).hexdigest()
+        prior_maximum = policy["maximum_fee_mojos"]
+        prior_version = run["version"]
+        for number, row in enumerate(revisions, start=1):
+            if (
+                row["revision"] != number
+                or row["prior_revision"] != number - 1
+                or row["prior_maximum_fee_mojos"] != prior_maximum
+                or row["run_id"] != run_id
+                or row["identity_sha256"] != expected_identity
+                or row["identity_sha256"] != run["identity_sha256"]
+                or row["configuration_sha256"] != run["configuration_sha256"]
+                or row["scope_sha256"] != policy["scope_sha256"]
+                or row["plan_sha256"] != policy["plan_sha256"]
+                or row["approval_scope"] != policy["scope_sha256"]
+                or row["approval_plan"] != policy["plan_sha256"]
+                or row["total_fee_mojos"] != row["maximum_fee_mojos"]
+                or row["cancellation_reserve_mojos"]
+                < row["protected_shutdown_fee_mojos"]
+                or row["proposed_maximum_fee_mojos"] != row["maximum_fee_mojos"]
+                or row["version"] <= prior_version
+                or not run["started_at_epoch"]
+                <= row["confirmed_at_epoch"]
+                < run["expires_at_epoch"]
+                or not row["reviewed_at_epoch"]
+                <= row["confirmed_at_epoch"]
+                < row["expires_at_epoch"]
+                or _follow_fee_ceiling_review_digest(row) != row["review_sha256"]
+            ):
+                return {
+                    **policy,
+                    "ready": False,
+                    "reason_code": "FOLLOW_FEE_REVISION_INVALID",
+                }
+            prior_maximum = row["maximum_fee_mojos"]
+            prior_version = row["version"]
+        latest_version = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (policy["scope_sha256"],),
+        ).fetchone()[0]
+        if prior_version != latest_version:
+            return {
+                **policy,
+                "ready": False,
+                "reason_code": "FOLLOW_FEE_REVISION_STALE",
+            }
+        last = revisions[-1]
+        committed = policy["spent_fee_mojos"] + policy["held_fee_mojos"]
+        if committed > prior_maximum:
+            return {**policy, "ready": False, "reason_code": "FOLLOW_FEE_CAP_EXCEEDED"}
+        return {
+            **policy,
+            "ready": True,
+            "reason_code": None,
+            "revision": last["revision"],
+            "approval_id": last["approval_id"],
+            "maximum_fee_mojos": prior_maximum,
+            "protected_shutdown_fee_mojos": last["protected_shutdown_fee_mojos"],
+            "remaining_fee_mojos": prior_maximum - committed,
+        }
+    finally:
+        conn.close()
 
 
 _FOLLOW_FEE_CEILING_REVIEW_TERMS = (
@@ -23198,8 +23296,9 @@ def create_follow_fee_ceiling_review(
     policy = get_effective_follow_fee_policy(
         run_id=run, identity=identity, now_epoch=now_epoch
     )
-    if policy.get("ready") is not True or policy.get("revision") != 0:
+    if policy.get("ready") is not True:
         raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+    prior_revision = policy["revision"]
     prior_maximum = policy["maximum_fee_mojos"]
     protected = policy["protected_shutdown_fee_mojos"]
     committed = policy["spent_fee_mojos"] + policy["held_fee_mojos"]
@@ -23216,7 +23315,7 @@ def create_follow_fee_ceiling_review(
         "scope_sha256": policy["scope_sha256"],
         "plan_sha256": policy["plan_sha256"],
         "configuration_sha256": config_hash,
-        "prior_revision": 0,
+        "prior_revision": prior_revision,
         "prior_maximum_fee_mojos": prior_maximum,
         "proposed_maximum_fee_mojos": proposed,
         "protected_shutdown_fee_mojos": protected,
@@ -23238,14 +23337,21 @@ def create_follow_fee_ceiling_review(
         stopped = conn.execute(
             "SELECT 1 FROM follow_run_stops WHERE run_id=?", (run,)
         ).fetchone()
-        revised = conn.execute(
-            "SELECT 1 FROM follow_fee_ceiling_revisions WHERE run_id=? LIMIT 1", (run,)
+        latest = conn.execute(
+            "SELECT revision,maximum_fee_mojos,approval_id "
+            "FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (run,),
         ).fetchone()
         totals = _fee_scope_totals(conn, policy["scope_sha256"])
         if (
             current is None
             or stopped is not None
-            or revised is not None
+            or (latest["revision"] if latest else 0) != prior_revision
+            or (latest["maximum_fee_mojos"] if latest else current["maximum_fee_mojos"])
+            != prior_maximum
+            or (latest["approval_id"] if latest else current["approval_id"])
+            != policy["approval_id"]
             or not current["started_at_epoch"]
             <= now_epoch
             < current["expires_at_epoch"]
@@ -23253,7 +23359,7 @@ def create_follow_fee_ceiling_review(
             or current["configuration_sha256"] != config_hash
             or current["scope_sha256"] != policy["scope_sha256"]
             or current["plan_sha256"] != policy["plan_sha256"]
-            or current["maximum_fee_mojos"] != prior_maximum
+            or (prior_revision == 0 and current["maximum_fee_mojos"] != prior_maximum)
             or totals["committed_fee_mojos"] != committed
             or totals["committed_fee_mojos"] + protected > proposed
         ):
@@ -23268,7 +23374,7 @@ def create_follow_fee_ceiling_review(
                 policy["scope_sha256"],
                 policy["plan_sha256"],
                 config_hash,
-                0,
+                prior_revision,
                 prior_maximum,
                 proposed,
                 protected,

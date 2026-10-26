@@ -333,6 +333,16 @@ def test_exact_pr218_schema_upgrades_without_losing_pending_fee(ledger):
     )
     assert wallet_guard is not None
     assert "approved_fee_reservations" in wallet_guard[0]
+    ceiling_guard = (
+        ledger.get_connection()
+        .execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='follow_fee_ceiling_revisions_binding_guard'"
+        )
+        .fetchone()
+    )
+    assert ceiling_guard is not None
+    assert "fee_approvals" in ceiling_guard[0]
     with pytest.raises(sqlite3.IntegrityError):
         ledger.get_connection().execute("DELETE FROM approved_fee_reservations")
     ledger.get_connection().rollback()

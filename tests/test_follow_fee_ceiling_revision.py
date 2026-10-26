@@ -121,6 +121,78 @@ def test_ceiling_review_getter_rejects_wrong_digest(approved):
         database.get_follow_fee_ceiling_review(review["review_id"])
 
 
+def test_effective_policy_reads_confirmed_revision_without_resetting_scope(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    revised = database.create_fee_approval(
+        scope_sha256=approved["approval"]["scope_sha256"],
+        plan_sha256=approved["approval"]["plan_sha256"],
+        total_fee_mojos=120,
+        cancellation_reserve_mojos=40,
+    )
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
+        (run_id, 1, review["review_id"], revised["approval_id"], 120, 40, 1003),
+    )
+    conn.commit()
+    policy = database.get_effective_follow_fee_policy(
+        run_id=run_id, identity=identity, now_epoch=1004
+    )
+    assert policy["ready"] is True
+    assert policy["revision"] == 1
+    assert policy["approval_id"] == revised["approval_id"]
+    assert policy["maximum_fee_mojos"] == 120
+    assert policy["remaining_fee_mojos"] == 120
+    assert policy["scope_sha256"] == approved["approval"]["scope_sha256"]
+    assert policy["dispatch_authorized"] is False
+
+    second = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=100,
+        observed_fee_principal_mojos=100,
+        now_epoch=1005,
+    )
+    assert (
+        database.get_follow_fee_ceiling_review(second["review_id"])["prior_revision"]
+        == 1
+    )
+    assert (
+        database.get_follow_fee_ceiling_review(second["review_id"])[
+            "prior_maximum_fee_mojos"
+        ]
+        == 120
+    )
+    third_approval = database.create_fee_approval(
+        scope_sha256=approved["approval"]["scope_sha256"],
+        plan_sha256=approved["approval"]["plan_sha256"],
+        total_fee_mojos=100,
+        cancellation_reserve_mojos=40,
+    )
+    conn.execute(
+        "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
+        (run_id, 2, second["review_id"], third_approval["approval_id"], 100, 40, 1006),
+    )
+    conn.commit()
+    conn.close()
+    policy = database.get_effective_follow_fee_policy(
+        run_id=run_id, identity=identity, now_epoch=1007
+    )
+    assert policy["ready"] is True
+    assert policy["revision"] == 2
+    assert policy["maximum_fee_mojos"] == 100
+    assert policy["approval_id"] == third_approval["approval_id"]
+
+
 def test_fee_ceiling_review_is_append_only(approved):
     run_id, identity = _run(approved)
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
