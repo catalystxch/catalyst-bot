@@ -6773,6 +6773,116 @@ class OfferManager:
             fee_pool.release_ticket(reserved_coin_id, ticket)
             raise
 
+    def _plan_follow_cancel(
+        self,
+        members: list[tuple],
+        run_id: str,
+        identity: dict,
+        expected_recovery_action: Optional[str] = None,
+    ) -> tuple[dict, dict, tuple[Any, str, int]]:
+        """Price exact Follow roots and reserve only an unspent fee coin input.
+
+        This is a pre-journal plan, not an approved fee hold or dispatch right.
+        The durable reservation is made only after cohort PREPARED events exist.
+        """
+
+        if len(members) < 1 or get_wallet_type() != "sage" or self._fee_pool is None:
+            raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
+        trade_ids = []
+        source_coin_ids = []
+        for intent, _attempt, _member_id in members:
+            creation = database.get_offer_intent_by_trade_id(intent.trade_id)
+            if type(creation) is not dict:
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            try:
+                selected = json.loads(creation["selected_coin_ids_json"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID") from exc
+            if (
+                creation.get("intent_id") != intent.intent_id
+                or creation.get("sage_trade_id") != intent.trade_id
+                or creation.get("purpose")
+                not in {
+                    f"follow:{run_id}:normal_lifecycle",
+                    f"follow:{run_id}:book_opportunity",
+                }
+                or creation.get("lifecycle_state")
+                not in {"created", "visible", "cancel_requested"}
+                or type(selected) is not list
+                or len(selected) != 1
+                or type(selected[0]) is not str
+            ):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            source_id = selected[0].strip().lower().removeprefix("0x")
+            offer = database.get_offer(intent.trade_id)
+            projected = offer.get("coin_id") if type(offer) is dict else None
+            projected_id = (
+                str(projected).strip().lower().removeprefix("0x")
+                if projected is not None
+                else source_id
+            )
+            if (
+                len(source_id) != 64
+                or any(ch not in "0123456789abcdef" for ch in source_id)
+                or projected_id != source_id
+            ):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            trade_ids.append(intent.trade_id)
+            source_coin_ids.append(source_id)
+        if len(set(source_coin_ids)) != len(source_coin_ids):
+            raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+
+        reserved = self._reserve_protected_cancel_fee_source(expected_recovery_action)
+        if reserved is None:
+            raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+        fee_pool, reserved_coin_id, ticket, fee_coin_amount = reserved
+        fee_coin_id = str(reserved_coin_id).strip().lower().removeprefix("0x")
+        try:
+            from follow_fee_cancellation import price_follow_cancellation
+
+            priced = price_follow_cancellation(
+                run_id=run_id,
+                identity=identity,
+                trade_ids=trade_ids,
+                source_coin_ids=source_coin_ids,
+                fee_coin_id=fee_coin_id,
+                now_epoch=int(time.time()),
+            )
+            if priced.get("available") is not True:
+                raise ValueError(
+                    str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE")
+                )
+            fee = priced.get("fee_mojos")
+            if type(fee) is not int or fee <= 0 or fee > fee_coin_amount:
+                raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+            if (
+                priced.get("trade_ids") != trade_ids
+                or priced.get("source_coin_ids") != source_coin_ids
+                or priced.get("fee_coin_id") != fee_coin_id
+            ):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            contract = {
+                "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
+                "trade_ids": trade_ids,
+                "source_coin_ids": source_coin_ids,
+                "fee_coin_id": fee_coin_id,
+                "fee_mojos": fee,
+            }
+            wallet_effect = {
+                "secure": True,
+                "timeout": 60,
+                "fee_mojos": fee,
+                "batch": {
+                    key: value for key, value in contract.items() if key != "fee_mojos"
+                },
+            }
+            if not self._is_exact_cancel_wallet_effect(wallet_effect):
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+            return contract, priced, (fee_pool, reserved_coin_id, ticket)
+        except Exception:
+            fee_pool.release_ticket(reserved_coin_id, ticket)
+            raise
+
     @staticmethod
     def _prepare_cancel_member(
         intent: _CanonicalOfferCancelIntent,
