@@ -75,6 +75,22 @@ def test_initial_follow_slot_fit_requires_each_tier_coin_and_trade_principal():
         prove_initial_follow_slot_fit(**terms)
 
 
+def test_full_assigned_coin_principal_must_fit_after_protected_reserves():
+    from follow_slot_fit import prove_initial_follow_slot_fit
+
+    terms = _terms()
+    terms["outputs"][0]["amount_mojos"] = 1_100_000_000_000
+    terms["outputs"][1]["amount_mojos"] = 2_200_000_000_000
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT"):
+        prove_initial_follow_slot_fit(**terms)
+
+    terms = _terms()
+    terms["outputs"][2]["amount_mojos"] = 1_100
+    terms["outputs"][3]["amount_mojos"] = 2_000
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT"):
+        prove_initial_follow_slot_fit(**terms)
+
+
 def test_reversed_buy_slots_use_reversed_prepared_size_tiers():
     from follow_slot_fit import prove_initial_follow_slot_fit
 

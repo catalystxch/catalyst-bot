@@ -1110,6 +1110,21 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:prepare_follow_run_review")
+    def prepare_follow_run_review(self, body=None):
+        """Freeze review terms for a later native final confirmation."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/follow/run-review",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_follow_run_review()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -2146,6 +2161,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "live_config",
     "preview_coin_prep_fees",
     "preview_follow_principal",
+    "prepare_follow_run_review",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

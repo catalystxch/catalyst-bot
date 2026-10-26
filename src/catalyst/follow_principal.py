@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from dataclasses import replace
 from decimal import Decimal, ROUND_CEILING
 
@@ -385,5 +386,95 @@ def preview_approved_follow_principal(
         **count_gate,
         **slot_fit,
         "current_prep_targets_proven": True,
+        "dispatch_authorized": False,
+    }
+
+
+def prepare_follow_run_review(
+    approval_id: str,
+    *,
+    buy_limit: int,
+    sell_limit: int,
+    duration_seconds: int,
+    requested_fee_cap_mojos: int,
+) -> dict:
+    """Persist a short-lived review from server-verified principal and slots.
+
+    The returned review is display data only. A later native final click must
+    reprove the proposal and consume this exact review before Start is allowed.
+    """
+
+    import database
+
+    if (
+        type(approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
+        or type(buy_limit) is not int
+        or type(sell_limit) is not int
+        or not 1 <= buy_limit <= 50
+        or not 1 <= sell_limit <= 50
+        or type(duration_seconds) is not int
+        or not 0 < duration_seconds <= 48 * 3600
+        or type(requested_fee_cap_mojos) is not int
+        or requested_fee_cap_mojos <= 0
+    ):
+        raise ValueError("FOLLOW_REVIEW_REQUEST_INVALID")
+
+    def _current_proposal() -> dict:
+        proposal = preview_approved_follow_principal(
+            approval_id, buy_limit=buy_limit, sell_limit=sell_limit
+        )
+        reserve = proposal.get("cancellation_reserve_mojos")
+        if (
+            proposal.get("dispatch_authorized") is not False
+            or proposal.get("buy_limit") != buy_limit
+            or proposal.get("sell_limit") != sell_limit
+            or proposal.get("replacement_count_gate_passed") is not True
+            or proposal.get("buy_slots_arithmetic_fit") != buy_limit
+            or proposal.get("sell_slots_arithmetic_fit") != sell_limit
+            or proposal.get("current_prep_targets_proven") is not True
+            or proposal.get("maximum_fee_mojos") != requested_fee_cap_mojos
+            or type(reserve) is not int
+            or not 0 < reserve <= requested_fee_cap_mojos
+            or type(proposal.get("maximum_trade_xch_mojos")) is not int
+            or proposal["maximum_trade_xch_mojos"] <= 0
+            or type(proposal.get("maximum_trade_cat_atoms")) is not int
+            or proposal["maximum_trade_cat_atoms"] <= 0
+            or any(
+                type(proposal.get(key)) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", proposal[key]) is None
+                for key in (
+                    "configuration_sha256",
+                    "proposal_sha256",
+                    "slot_assignment_sha256",
+                )
+            )
+            or type(proposal.get("identity")) is not dict
+        ):
+            raise ValueError("FOLLOW_REVIEW_PROPOSAL_INVALID")
+        return proposal
+
+    proposal = _current_proposal()
+    started_at_epoch = int(time.time())
+    terms = {
+        "approval_id": approval_id,
+        "identity": proposal["identity"],
+        "configuration_sha256": proposal["configuration_sha256"],
+        "principal_review_sha256": proposal["proposal_sha256"],
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "started_at_epoch": started_at_epoch,
+        "expires_at_epoch": started_at_epoch + duration_seconds,
+        "maximum_fee_mojos": requested_fee_cap_mojos,
+        "protected_shutdown_fee_mojos": proposal["cancellation_reserve_mojos"],
+    }
+    review = database.create_follow_run_review(**terms)
+    if _current_proposal() != proposal:
+        raise ValueError("FOLLOW_REVIEW_PROPOSAL_CHANGED")
+    return {
+        **proposal,
+        **terms,
+        **review,
+        "review_expires_at_epoch": started_at_epoch + 300,
         "dispatch_authorized": False,
     }

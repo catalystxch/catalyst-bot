@@ -124,6 +124,7 @@ def prove_initial_follow_slot_fit(
         options.sort()
 
     required = {"xch": 0, "cat": 0}
+    assigned_sources = {"xch": 0, "cat": 0}
     assignments = []
     for side, limit, counts, sizes, asset in (
         ("buy", buy_limit, buy_tier_counts, buy_tier_sizes_xch, "xch"),
@@ -167,6 +168,7 @@ def prove_initial_follow_slot_fit(
                 raise ValueError("FOLLOW_SLOT_DENOMINATION_SHORT")
             coin_amount, ordinal = options.pop(selected)
             required[asset] += atoms
+            assigned_sources[asset] += coin_amount
             assignments.append(
                 (side, slot, tier, format(price, "f"), atoms, ordinal, coin_amount)
             )
@@ -175,6 +177,11 @@ def prove_initial_follow_slot_fit(
         or required["cat"] > maximum_trade_cat_atoms
     ):
         raise ValueError("FOLLOW_SLOT_PRINCIPAL_SHORT")
+    if (
+        assigned_sources["xch"] > maximum_trade_xch_mojos
+        or assigned_sources["cat"] > maximum_trade_cat_atoms
+    ):
+        raise ValueError("FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT")
     digest_terms = {
         "buy_limit": buy_limit,
         "sell_limit": sell_limit,
@@ -194,6 +201,8 @@ def prove_initial_follow_slot_fit(
         "sell_slots_arithmetic_fit": sell_limit,
         "required_xch_mojos": required["xch"],
         "required_cat_atoms": required["cat"],
+        "assigned_xch_coin_mojos": assigned_sources["xch"],
+        "assigned_cat_coin_atoms": assigned_sources["cat"],
         "slot_assignment_sha256": digest,
         "dispatch_authorized": False,
     }

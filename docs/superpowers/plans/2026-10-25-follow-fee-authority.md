@@ -108,6 +108,19 @@ denomination even when raw coin counts are sufficient. This is a necessary
 inventory and arithmetic check, not a dispatch gate: the native consent route,
 contemporaneous market confidence, DB tier labels, profitability, live coin
 selection, and final wallet-boundary recheck are still missing.
+Independent review found that requested spend could fit the trading principal
+while the full selected prepared coins would cross a protected reserve. The
+preview now sums and bounds the full assigned source coin amounts on both
+assets, regardless of Coin Prep headroom. A failing regression first
+reproduced the false positive. The full source amounts are returned and bound
+through the proposal digest. Actual wallet coin selection remains unproven.
+
+The public-path review preparation service now accepts explicit offer limits,
+duration and fee cap, derives the exact current principal proposal from the
+server, and persists only a five-minute immutable review. It compares the
+proposal again after persistence; a drifted proposal is reported as unusable.
+The HTTP and native bridge entry points cannot create run authority or start
+the bot. The native final-click consent, exact recheck and GUI are still open.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is
@@ -148,6 +161,11 @@ cases because it deliberately raises when creation authority is unavailable.
 Recheck at the final wallet boundary, then bind or disable each Boost, Sniper,
 requote and refresh producer. An ended run must require an explicit new mode
 decision instead of falling back to unscoped creation during acceptance.
+The canonical offer path now queries an unexpired durable run marker before
+accepting an unscoped purpose, so legacy Boost, Sniper, requote and refresh
+producers fail closed while the reviewed run owns the asset. Their intended
+Follow replacement behavior and the post-expiry mode decision still need
+explicit work and tests.
 
 ### Task 3: Exact priced cancellation hold for every Follow path
 

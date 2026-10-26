@@ -183,6 +183,7 @@ def api_follow_principal_preview():
             "FOLLOW_SLOT_AMOUNT_INVALID",
             "FOLLOW_SLOT_DENOMINATION_SHORT",
             "FOLLOW_SLOT_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT",
             "FOLLOW_SLOT_CONFIGURATION_MISMATCH",
             "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
             "FOLLOW_TRADING_PRINCIPAL_UNAVAILABLE",
@@ -202,6 +203,91 @@ def api_follow_principal_preview():
             {
                 "success": False,
                 "reason": "FOLLOW_PRINCIPAL_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        ), 503
+
+
+@bp.route("/api/follow/run-review", methods=["POST"])
+def api_follow_run_review():
+    """Freeze exact server-derived Follow terms for later native consent.
+
+    This route creates only immutable display data. It does not consume that
+    review, start trading, or authorize a wallet effect.
+    """
+    from follow_principal import prepare_follow_run_review
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if (
+        type(body) is not dict
+        or set(body)
+        != {
+            "approval_id",
+            "buy_limit",
+            "sell_limit",
+            "duration_seconds",
+            "maximum_fee_mojos",
+        }
+        or type(body["approval_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+        or any(
+            type(body[key]) is not int
+            for key in (
+                "buy_limit",
+                "sell_limit",
+                "duration_seconds",
+                "maximum_fee_mojos",
+            )
+        )
+        or not 1 <= body["buy_limit"] <= 50
+        or not 1 <= body["sell_limit"] <= 50
+        or not 1 <= body["duration_seconds"] <= 48 * 3600
+        or not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_REQUEST_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
+    try:
+        result = prepare_follow_run_review(
+            body["approval_id"],
+            buy_limit=body["buy_limit"],
+            sell_limit=body["sell_limit"],
+            duration_seconds=body["duration_seconds"],
+            requested_fee_cap_mojos=body["maximum_fee_mojos"],
+        )
+        return jsonify(_fee_json_amounts({**result, "success": True}))
+    except ValueError as exc:
+        reason = str(exc)
+        if reason not in {
+            "FOLLOW_REVIEW_PROPOSAL_INVALID",
+            "FOLLOW_REVIEW_PROPOSAL_CHANGED",
+            "FOLLOW_FEE_APPROVAL_STALE",
+            "FOLLOW_FEE_APPROVAL_REQUIRED",
+            "FOLLOW_FEE_APPROVAL_MISMATCH",
+            "FOLLOW_SLOT_INVENTORY_SHORT",
+            "FOLLOW_SLOT_DENOMINATION_SHORT",
+            "FOLLOW_SLOT_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_CONFIGURATION_MISMATCH",
+            "FOLLOW_SLOT_PRICE_UNAVAILABLE",
+            "FOLLOW_SLOT_PRICE_CHANGED",
+            "FEE_SESSION_INCOMPLETE",
+        }:
+            reason = "FOLLOW_REVIEW_UNAVAILABLE"
+        return jsonify(
+            {"success": False, "reason": reason, "dispatch_authorized": False}
+        ), 409
+    except Exception:
+        slog("FOLLOW", "Run review could not verify current terms", level="error")
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_UNAVAILABLE",
                 "dispatch_authorized": False,
             }
         ), 503
