@@ -8308,6 +8308,25 @@
         </div>
     </div>
 
+    <div id="followRunReviewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="followRunReviewTitle" style="display:none">
+        <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
+            <h2 id="followRunReviewTitle">Review continuous Follow run</h2>
+            <p>Review the current wallet, prepared trading principal, offer slots and protected fee allowance. Recording this approval does not start trading.</p>
+            <label>BUY offers <input id="followRunBuyLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+            <label>SELL offers <input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+            <label>Run authority (hours) <input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
+            <label>Cumulative fee ceiling (XCH) <input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.05" oninput="invalidateFollowRunReview()"></label>
+            <p>The authority expires after the displayed period. A longer observation needs renewed approval before expiry.</p>
+            <pre id="followRunReviewText" style="white-space:pre-wrap"></pre>
+            <label><input type="checkbox" id="followRunReviewAccept" disabled> I approve the exact wallet, trading limits and fee allowance shown above.</label>
+            <div style="margin-top:16px">
+                <button type="button" onclick="closeFollowRunReview()">Back</button>
+                <button type="button" id="followRunReviewPrepare" onclick="prepareFollowRunReview()">Refresh exact review</button>
+                <button type="button" id="followRunReviewConfirm" disabled onclick="confirmFollowRunReview()">Record approval</button>
+            </div>
+        </div>
+    </div>
+
 
 
     <div class="pair-switch-overlay" id="pairSwitchOverlay">
@@ -9210,6 +9229,7 @@
                     <div class="v4-toolbar v4-toolbar--primary">
                         <div class="v4-toolbar-left">
                         <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
+                        <button type="button" class="btn" onclick="openFollowRunReview()">Review Follow run</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
                         <button class="btn btn-cancel btn-danger" id="cancelAllBtn" onclick="cancelAllOffers()">Cancel All (<span id="cancelAllCount">0</span>) <span class="cc-help">?<span class="cc-tooltip">Cancels every active buy and sell offer — use for a clean restart or wallet switch. Stop the bot first.</span></span></button>
@@ -12004,10 +12024,11 @@
                 </div>
                 
                 <div class="coin-prep-message" style="margin-bottom: 25px;">
-                    Press Start Bot on the main screen to begin trading.
+                    For continuous Follow mode, review the prepared run before starting the bot.
                 </div>
                 
                 <div style="display: flex; justify-content: center;">
+                    <button type="button" class="btn" onclick="closeCoinPrepConfirm(); openFollowRunReview()">Review Follow run</button>
                     <button class="btn btn-start btn-primary" onclick="closeCoinPrepConfirm()" style="padding: 12px 40px; font-size: 1.1em;">Done</button>
                 </div>
             </div>
@@ -15439,6 +15460,7 @@
             if (m === 'GET'  && clean === 'coin-prep/status')   return 'get_coin_prep_status';
             if (m === 'POST' && clean === 'coin-prep/fee-preview') return 'preview_coin_prep_fees';
             if (m === 'POST' && clean === 'follow/principal-preview') return 'preview_follow_principal';
+            if (m === 'POST' && clean === 'follow/run-review') return 'prepare_follow_run_review';
             if (m === 'POST' && clean === 'coin-prep/fee-approval') return 'approve_coin_prep_fees';
             if (m === 'POST' && clean === 'coin-prep/trigger')  return 'trigger_coin_prep';
             if (m === 'POST' && clean === 'coin-prep/reset')    return 'reset_coin_prep';
@@ -32720,6 +32742,178 @@
             }
             closeConfidenceOverrideReview();
             await startBot({ confidenceOverride: { review_id: review.review_id, accepted: true } });
+        }
+
+        let _followRunReview = null;
+        let _followRunReviewBusy = false;
+
+        function invalidateFollowRunReview() {
+            _followRunReview = null;
+            const accept = document.getElementById('followRunReviewAccept');
+            if (accept) { accept.checked = false; accept.disabled = true; }
+            const confirm = document.getElementById('followRunReviewConfirm');
+            if (confirm) confirm.disabled = true;
+            const output = document.getElementById('followRunReviewText');
+            if (output) output.textContent = 'Terms changed. Refresh the exact review before approving.';
+        }
+
+        function closeFollowRunReview() {
+            _followRunReview = null;
+            const modal = document.getElementById('followRunReviewModal');
+            if (modal) modal.style.display = 'none';
+            const accept = document.getElementById('followRunReviewAccept');
+            if (accept) { accept.checked = false; accept.disabled = true; }
+            const confirm = document.getElementById('followRunReviewConfirm');
+            if (confirm) confirm.disabled = true;
+        }
+
+        function openFollowRunReview() {
+            if (!IS_DESKTOP || !window.pywebview?.api?.confirm_follow_run_review) {
+                showToast('Financial Follow run approval is available in the native desktop app.', 'warning');
+                return;
+            }
+            if (bot_state.running) {
+                showToast('Stop the bot before reviewing a new Follow run.', 'warning');
+                return;
+            }
+            closeFollowRunReview();
+            document.getElementById('followRunReviewText').textContent =
+                'Refresh the exact review after Coin Prep completes. This review does not start trading.';
+            document.getElementById('followRunReviewModal').style.display = 'flex';
+        }
+
+        function followRunFeeCapMojos(value) {
+            const raw = String(value || '').trim();
+            if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,12})?$/.test(raw)) return null;
+            const parts = raw.split('.');
+            const mojos = BigInt(parts[0]) * 1000000000000n
+                + BigInt((parts[1] || '').padEnd(12, '0'));
+            return mojos > 0n && mojos <= BigInt(Number.MAX_SAFE_INTEGER)
+                ? Number(mojos) : null;
+        }
+
+        async function prepareFollowRunReview() {
+            if (_followRunReviewBusy || !IS_DESKTOP || !window.pywebview?.api?.confirm_follow_run_review) return;
+            _followRunReview = null;
+            const accept = document.getElementById('followRunReviewAccept');
+            const confirm = document.getElementById('followRunReviewConfirm');
+            const prepare = document.getElementById('followRunReviewPrepare');
+            const output = document.getElementById('followRunReviewText');
+            accept.checked = false;
+            accept.disabled = true;
+            confirm.disabled = true;
+            const buyLimit = Number(document.getElementById('followRunBuyLimit').value);
+            const sellLimit = Number(document.getElementById('followRunSellLimit').value);
+            const hours = Number(document.getElementById('followRunHours').value);
+            const requestedFeeCap = followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value);
+            if (![buyLimit, sellLimit, hours].every(Number.isSafeInteger)
+                || buyLimit < 1 || buyLimit > 50 || sellLimit < 1 || sellLimit > 50
+                || hours < 1 || hours > 48 || requestedFeeCap === null) {
+                output.textContent = 'Enter 1–50 offers per side, 1–48 hours and a positive fee ceiling of up to 12 decimal places.';
+                return;
+            }
+            _followRunReviewBusy = true;
+            prepare.disabled = true;
+            output.textContent = 'Checking the completed Coin Prep fee approval and current wallet inventory…';
+            try {
+                const statusResponse = await apiFetch(`${API_URL}/coin-prep/status`);
+                const status = await statusResponse.json();
+                const approvalId = status?.fee_approval_id;
+                const feeCap = Number(status?.fee_approval?.total_fee_mojos);
+                if (!statusResponse.ok || status?.success !== true
+                    || !/^[0-9a-f]{64}$/.test(approvalId || '')
+                    || !Number.isSafeInteger(feeCap) || feeCap <= 0) {
+                    throw new Error('A completed, current Coin Prep fee approval is required. Review Coin Prep first.');
+                }
+                if (feeCap !== requestedFeeCap) {
+                    throw new Error('The Coin Prep fee approval has a different cumulative ceiling. Review the exact approved amount before continuing.');
+                }
+                const response = await apiFetch(`${API_URL}/follow/run-review`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        approval_id: approvalId,
+                        buy_limit: buyLimit,
+                        sell_limit: sellLimit,
+                        duration_seconds: hours * 3600,
+                        maximum_fee_mojos: feeCap,
+                    }),
+                });
+                const review = await response.json();
+                if (Number(document.getElementById('followRunBuyLimit').value) !== buyLimit
+                    || Number(document.getElementById('followRunSellLimit').value) !== sellLimit
+                    || Number(document.getElementById('followRunHours').value) !== hours
+                    || followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value) !== requestedFeeCap) {
+                    throw new Error('The terms changed while the wallet review was prepared. Refresh the exact review.');
+                }
+                if (!response.ok || review?.success !== true
+                    || !/^[0-9a-f]{64}$/.test(review.review_id || '')
+                    || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')
+                    || review.buy_limit !== buyLimit || review.sell_limit !== sellLimit
+                    || Number(review.maximum_fee_mojos) !== feeCap
+                    || review.replacement_count_gate_passed !== true
+                    || review.current_prep_targets_proven !== true
+                    || review.buy_slots_arithmetic_fit !== buyLimit
+                    || review.sell_slots_arithmetic_fit !== sellLimit) {
+                    throw new Error(`Follow review unavailable (${review?.reason || 'current wallet or slots could not be proved'}).`);
+                }
+                _followRunReview = review;
+                const id = review.identity || {};
+                output.textContent =
+                    `Wallet ${id.wallet_fingerprint} · ${id.network} · ${id.ticker}\n` +
+                    `Asset ${id.asset_id}\n` +
+                    `Prepared slots: ${buyLimit} BUY / ${sellLimit} SELL\n` +
+                    `Maximum selectable trade XCH: ${review.maximum_trade_xch_mojos} mojos\n` +
+                    `Maximum selectable trade token: ${review.maximum_trade_cat_atoms} atoms\n` +
+                    `Protected fee principal: ${review.protected_fee_principal_mojos} mojos\n` +
+                    `Cumulative fee ceiling: ${review.maximum_fee_mojos} mojos\n` +
+                    `Protected cancellation reserve: ${review.cancellation_reserve_mojos} mojos\n` +
+                    `Authority expires: ${new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
+                    `This exact review expires: ${new Date(review.review_expires_at_epoch * 1000).toISOString()}`;
+                accept.disabled = false;
+                accept.onchange = () => {
+                    confirm.disabled = !accept.checked || !_followRunReview
+                        || Date.now() >= _followRunReview.review_expires_at_epoch * 1000;
+                };
+            } catch (error) {
+                output.textContent = error?.message || 'Could not verify this Follow run.';
+            } finally {
+                _followRunReviewBusy = false;
+                prepare.disabled = false;
+            }
+        }
+
+        async function confirmFollowRunReview() {
+            const review = _followRunReview;
+            const accept = document.getElementById('followRunReviewAccept');
+            const confirm = document.getElementById('followRunReviewConfirm');
+            if (_followRunReviewBusy || !review || !accept.checked
+                || Date.now() >= review.review_expires_at_epoch * 1000
+                || !IS_DESKTOP || !window.pywebview?.api?.confirm_follow_run_review) {
+                showToast('Review expired or native confirmation unavailable. Refresh the exact review.', 'warning');
+                return;
+            }
+            _followRunReviewBusy = true;
+            confirm.disabled = true;
+            try {
+                const result = await window.pywebview.api.confirm_follow_run_review({
+                    review_id: review.review_id,
+                    review_sha256: review.review_sha256,
+                    accepted: true,
+                });
+                if (result?.success !== true || result?.dispatch_authorized !== false) {
+                    throw new Error(result?.reason || 'Follow approval was not recorded.');
+                }
+                closeFollowRunReview();
+                showToast('Follow run authority recorded. Review the Start action separately.', 'success');
+            } catch (error) {
+                _followRunReview = null;
+                accept.checked = false;
+                accept.disabled = true;
+                document.getElementById('followRunReviewText').textContent =
+                    `${error?.message || 'Follow approval failed.'} Refresh the exact review before trying again.`;
+            } finally {
+                _followRunReviewBusy = false;
+            }
         }
 
         async function startBot(options = {}) {
