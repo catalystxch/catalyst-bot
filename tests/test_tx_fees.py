@@ -197,6 +197,14 @@ class TxFeesTests(unittest.TestCase):
         self.assertFalse(snapshot["environment"]["supports_auto_estimate"])
         self.assertEqual(snapshot["suggested"]["source"], "manual_fallback_only")
 
+    def test_sage_without_full_node_describes_coinset_when_enabled(self):
+        self.cfg.COINSET_ENABLED = True
+        environment = self.tx_fees.get_wallet_fee_environment()
+        self.assertFalse(environment["supports_auto_estimate"])
+        self.assertTrue(environment["supports_cloud_estimate"])
+        self.assertIn("Coinset", environment["message"])
+        self.assertNotIn("falls back to the manual fee", environment["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

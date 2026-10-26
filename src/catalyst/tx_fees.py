@@ -71,12 +71,18 @@ def get_wallet_fee_environment() -> Dict:
     wallet_type = str(getattr(cfg, "WALLET_TYPE", "sage") or "sage").strip().lower()
     has_full_node_rpc = _get_full_node_cert_paths() is not None
     if wallet_type == "sage" and not has_full_node_rpc:
+        cloud_enabled = bool(getattr(cfg, "COINSET_ENABLED", True))
         return {
             "wallet_type": wallet_type,
             "has_full_node_rpc": False,
             "supports_auto_estimate": False,
+            "supports_cloud_estimate": cloud_enabled,
             "reason": "sage_no_full_node_rpc",
-            "message": "Sage has no local full-node fee estimator in this setup, so auto falls back to the manual fee.",
+            "message": (
+                "Sage has no local full-node fee estimator; Coinset may provide a network fee estimate."
+                if cloud_enabled
+                else "Sage has no local full-node fee estimator in this setup, so auto falls back to the manual fee."
+            ),
         }
     if has_full_node_rpc:
         return {
