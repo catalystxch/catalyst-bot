@@ -22,18 +22,28 @@ def current_database_module():
 
 
 def _prepared_follow_cancel(
-    run_id, identity, *, purpose=None, fee=20, count=1, offset=0, reason="cancel_all"
+    run_id,
+    identity,
+    *,
+    purpose=None,
+    fee=20,
+    count=1,
+    offset=0,
+    reason="cancel_all",
+    mixed_sides=False,
 ):
     members = []
     sources = []
     trades = []
     for index in range(offset, offset + count):
+        side = "sell" if mixed_sides and index % 2 else "buy"
+        asset_type = "cat" if side == "sell" else "xch"
         trade = chr(ord("a") + index) * 64 if index < 2 else f"{index + 1:064x}"
         source = chr(ord("c") + index) * 64 if index < 2 else f"{index + 1000:064x}"
         intent_id = str(index + 1) * 64 if index < 2 else f"{index + 2000:064x}"
         operation_id = f"create:{intent_id}"
         database.upsert_coin(
-            source, "xch", 1000, designation="tier_spare", purpose="lifecycle"
+            source, asset_type, 1000, designation="tier_spare", purpose="lifecycle"
         )
         database.prepare_offer_intent(
             intent_id=intent_id,
@@ -43,7 +53,7 @@ def _prepared_follow_cancel(
             wallet_fingerprint_hash="f" * 64,
             network=identity["network"],
             asset_id=identity["asset_id"],
-            side="buy",
+            side=side,
             tier="inner",
             purpose=purpose or f"follow:{run_id}:normal_lifecycle",
             selected_coin_ids_json=[source],
@@ -302,8 +312,24 @@ def test_follow_cancel_holds_exact_run_fee_and_refuses_replay(approved):
 def test_full_24_by_24_book_uses_one_bounded_cancel_hold(approved):
     run_id, identity = _run(approved)
     approved["now"] = 1002
-    manifest, contract = _prepared_follow_cancel(run_id, identity, count=48, fee=20)
+    manifest, contract = _prepared_follow_cancel(
+        run_id, identity, count=48, fee=20, mixed_sides=True
+    )
     assert len(manifest["members"]) == 48
+    assert {
+        side: sum(
+            database.get_offer_intent(member["intent_id"])["side"] == side
+            for member in manifest["members"]
+        )
+        for side in ("buy", "sell")
+    } == {"buy": 24, "sell": 24}
+    assert {
+        asset: sum(
+            database.get_coin_state(coin_id)["wallet_type"] == asset
+            for coin_id in contract["source_coin_ids"]
+        )
+        for asset in ("xch", "cat")
+    } == {"xch": 24, "cat": 24}
     hold = database.reserve_follow_cancellation_fee(
         run_id=run_id,
         identity=identity,
@@ -327,7 +353,9 @@ def test_full_24_by_24_book_uses_one_bounded_cancel_hold(approved):
 def test_full_24_by_24_book_cannot_consume_protected_shutdown_reserve(approved):
     run_id, identity = _run(approved)
     approved["now"] = 1002
-    manifest, contract = _prepared_follow_cancel(run_id, identity, count=48, fee=50)
+    manifest, contract = _prepared_follow_cancel(
+        run_id, identity, count=48, fee=50, mixed_sides=True
+    )
     with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_RESERVE_PROTECTED"):
         database.reserve_follow_cancellation_fee(
             run_id=run_id,
