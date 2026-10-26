@@ -134,10 +134,18 @@ def read_follow_principal_snapshot(*, fee_cap_mojos: int) -> dict:
     """
 
     from coin_prep_fee_runtime import read_fee_wallet_snapshot
+
+    return _principal_from_observed_snapshot(
+        read_fee_wallet_snapshot(), fee_cap_mojos=fee_cap_mojos
+    )
+
+
+def _principal_from_observed_snapshot(observed: dict, *, fee_cap_mojos: int) -> dict:
+    """Calculate principal from one trusted, identity-verified wallet read."""
+
     from tx_fees import get_fee_pool_plan
     import database
 
-    observed = read_fee_wallet_snapshot()
     config = observed["configuration"]
     snapshot = observed["snapshot"]
     plan = get_fee_pool_plan()
@@ -201,6 +209,7 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
     """
 
     import database
+    from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
     from confidence_override import current_configuration_digest
 
     if (
@@ -276,7 +285,12 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
             replacement_atoms[output["asset"]] += output["amount_mojos"]
     identity = {key: scope.get(key) for key in identity_keys}
     configuration_sha256 = current_configuration_digest()
-    principal = read_follow_principal_snapshot(fee_cap_mojos=before["total_fee_mojos"])
+    observed = read_approved_prep_fee_snapshot(approval_id)
+    if type(observed) is not dict or observed.get("scope") != scope:
+        raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+    principal = _principal_from_observed_snapshot(
+        observed, fee_cap_mojos=before["total_fee_mojos"]
+    )
     after = database.get_coin_prep_fee_approval_status(approval_id)
     if (
         principal.get("identity") != identity

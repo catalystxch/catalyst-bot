@@ -170,6 +170,7 @@ def test_fee_coin_cannot_also_be_a_wallet_reserve():
 
 def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypatch):
     import confidence_override
+    import coin_prep_fee_runtime
     import database
     import follow_principal
 
@@ -229,10 +230,24 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
         database, "get_coin_prep_fee_approval_status", lambda _id: dict(status)
     )
     monkeypatch.setattr(
-        follow_principal, "read_follow_principal_snapshot", lambda **_kw: principal
+        follow_principal,
+        "_principal_from_observed_snapshot",
+        lambda *_a, **_kw: principal,
     )
     monkeypatch.setattr(
         confidence_override, "current_configuration_digest", lambda: "f" * 64
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        lambda _id: (_ for _ in ()).throw(ValueError("FEE_APPROVAL_STALE")),
+    )
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        preview_approved_follow_principal(approval_id)
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        lambda _id: {"scope": scope, "identity": identity},
     )
     result = preview_approved_follow_principal(approval_id)
     assert result["identity"] == identity
@@ -252,7 +267,9 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     drifted = dict(principal)
     drifted["identity"] = {**identity, "wallet_fingerprint": 456}
     monkeypatch.setattr(
-        follow_principal, "read_follow_principal_snapshot", lambda **_kw: drifted
+        follow_principal,
+        "_principal_from_observed_snapshot",
+        lambda *_a, **_kw: drifted,
     )
     with pytest.raises(ValueError, match="FOLLOW_PRINCIPAL_REVIEW_CHANGED"):
         preview_approved_follow_principal(approval_id)
@@ -266,6 +283,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
 
 def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkeypatch):
     import confidence_override
+    import coin_prep_fee_runtime
     import database
     import follow_principal
 
@@ -311,8 +329,8 @@ def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkey
     )
     monkeypatch.setattr(
         follow_principal,
-        "read_follow_principal_snapshot",
-        lambda **_kw: {
+        "_principal_from_observed_snapshot",
+        lambda *_a, **_kw: {
             "identity": {
                 key: scope[key]
                 for key in scope
@@ -320,6 +338,11 @@ def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkey
             },
             "principal_review_sha256": "e" * 64,
         },
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        lambda _id: {"scope": scope},
     )
     monkeypatch.setattr(
         confidence_override, "current_configuration_digest", lambda: "f" * 64

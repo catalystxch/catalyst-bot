@@ -83,6 +83,11 @@ The preview also reports the approved Coin Prep plan's replacement-coin counts
 and atomic totals by asset. These figures must be compared with 24 slots per
 side and current principal; they do not prove contemporaneous price fit or
 the exact live ladder's slot allocation.
+The preview now uses Coin Prep's authoritative approved-snapshot reader before
+calculating principal. That reader revalidates the stored economics against
+current wallet identity, settings, session ownership and approval version;
+the principal calculation uses the same verified snapshot. A changed approved
+plan therefore cannot produce a seemingly current Follow proposal.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is

@@ -151,6 +151,7 @@ def api_follow_principal_preview():
         reason = str(exc)
         if reason not in {
             "FOLLOW_FEE_APPROVAL_STALE",
+            "FEE_APPROVAL_STALE",
             "FOLLOW_FEE_SCOPE_INVALID",
             "FOLLOW_PRINCIPAL_REVIEW_CHANGED",
             "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
