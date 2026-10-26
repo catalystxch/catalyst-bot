@@ -201,7 +201,39 @@ def _principal_from_observed_snapshot(observed: dict, *, fee_cap_mojos: int) -> 
     return {**result, "identity": identity, "principal_review_sha256": proposal_sha256}
 
 
-def preview_approved_follow_principal(approval_id: str) -> dict:
+def prove_follow_replacement_count_capacity(
+    *, buy_limit: int, sell_limit: int, replacement_counts: dict
+) -> dict:
+    """Require one approved replacement coin per requested initial offer.
+
+    This is a necessary count gate, not a price, denomination, market or
+    dispatch proof. Those checks must still pass before a Follow run starts.
+    """
+
+    if (
+        type(buy_limit) is not int
+        or type(sell_limit) is not int
+        or not 1 <= buy_limit <= 50
+        or not 1 <= sell_limit <= 50
+        or type(replacement_counts) is not dict
+        or set(replacement_counts) != {"xch", "cat"}
+        or any(
+            type(value) is not int or value < 0 for value in replacement_counts.values()
+        )
+    ):
+        raise ValueError("FOLLOW_SLOT_LIMIT_INVALID")
+    if replacement_counts["xch"] < buy_limit or replacement_counts["cat"] < sell_limit:
+        raise ValueError("FOLLOW_SLOT_INVENTORY_SHORT")
+    return {
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "replacement_count_gate_passed": True,
+    }
+
+
+def preview_approved_follow_principal(
+    approval_id: str, *, buy_limit: int | None = None, sell_limit: int | None = None
+) -> dict:
     """Bind a fresh principal proposal to one completed, current fee scope.
 
     This is a read-only candidate for the native Follow review. The final
@@ -284,6 +316,13 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         if output["purpose"] == "replacement":
             replacement_counts[output["asset"]] += 1
             replacement_atoms[output["asset"]] += output["amount_mojos"]
+    count_gate = {"replacement_count_gate_passed": False}
+    if buy_limit is not None or sell_limit is not None:
+        count_gate = prove_follow_replacement_count_capacity(
+            buy_limit=buy_limit,
+            sell_limit=sell_limit,
+            replacement_counts=replacement_counts,
+        )
     identity = {key: scope.get(key) for key in identity_keys}
     configuration_sha256 = current_configuration_digest()
     observed = read_approved_prep_fee_snapshot(approval_id)
@@ -308,6 +347,7 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         "plan_sha256": context["plan_sha256"],
         "configuration_sha256": configuration_sha256,
         "principal_review_sha256": principal["principal_review_sha256"],
+        **count_gate,
         "maximum_fee_mojos": before["total_fee_mojos"],
         "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
     }
@@ -325,6 +365,7 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         "planned_replacement_cat_coin_count": replacement_counts["cat"],
         "planned_replacement_xch_mojos": replacement_atoms["xch"],
         "planned_replacement_cat_atoms": replacement_atoms["cat"],
+        **count_gate,
         "current_prep_targets_proven": True,
         "dispatch_authorized": False,
     }

@@ -133,9 +133,22 @@ def api_follow_principal_preview():
     body = request.get_json(silent=True)
     if (
         type(body) is not dict
-        or set(body) != {"approval_id"}
+        or set(body)
+        not in (
+            {"approval_id"},
+            {"approval_id", "buy_limit", "sell_limit"},
+        )
         or type(body["approval_id"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+        or (
+            "buy_limit" in body
+            and (
+                type(body["buy_limit"]) is not int
+                or type(body["sell_limit"]) is not int
+                or not 1 <= body["buy_limit"] <= 50
+                or not 1 <= body["sell_limit"] <= 50
+            )
+        )
     ):
         return jsonify(
             {
@@ -145,7 +158,12 @@ def api_follow_principal_preview():
             }
         ), 400
     try:
-        result = preview_approved_follow_principal(body["approval_id"])
+        limits = (
+            {"buy_limit": body["buy_limit"], "sell_limit": body["sell_limit"]}
+            if "buy_limit" in body
+            else {}
+        )
+        result = preview_approved_follow_principal(body["approval_id"], **limits)
         return jsonify(_fee_json_amounts({**result, "success": True}))
     except ValueError as exc:
         reason = str(exc)
@@ -155,6 +173,7 @@ def api_follow_principal_preview():
             "FEE_SESSION_INCOMPLETE",
             "FOLLOW_FEE_SCOPE_INVALID",
             "FOLLOW_PRINCIPAL_REVIEW_CHANGED",
+            "FOLLOW_SLOT_INVENTORY_SHORT",
             "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
             "FOLLOW_TRADING_PRINCIPAL_UNAVAILABLE",
             "FOLLOW_PRINCIPAL_INVENTORY_INVALID",

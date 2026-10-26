@@ -273,8 +273,14 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert result["planned_replacement_xch_mojos"] == 10
     assert result["planned_replacement_cat_atoms"] == 20
     assert result["current_prep_targets_proven"] is True
+    assert result["replacement_count_gate_passed"] is False
     assert len(result["proposal_sha256"]) == 64
     assert result["dispatch_authorized"] is False
+    counted = preview_approved_follow_principal(approval_id, buy_limit=1, sell_limit=1)
+    assert counted["replacement_count_gate_passed"] is True
+    assert counted["proposal_sha256"] != result["proposal_sha256"]
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
+        preview_approved_follow_principal(approval_id, buy_limit=2, sell_limit=1)
     status["stale"] = True
     with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_STALE"):
         preview_approved_follow_principal(approval_id)
@@ -405,3 +411,25 @@ def test_approved_principal_preview_proves_current_frozen_prep_targets(
     approved["cat"] = []
     with pytest.raises(ValueError, match="FEE_SESSION_INCOMPLETE"):
         preview_approved_follow_principal(approved["approval"]["approval_id"])
+
+
+def test_follow_replacement_count_gate_refuses_a_short_24_by_24_plan():
+    from follow_principal import prove_follow_replacement_count_capacity
+
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
+        prove_follow_replacement_count_capacity(
+            buy_limit=24,
+            sell_limit=24,
+            replacement_counts={"xch": 23, "cat": 24},
+        )
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
+        prove_follow_replacement_count_capacity(
+            buy_limit=24,
+            sell_limit=24,
+            replacement_counts={"xch": 24, "cat": 23},
+        )
+    assert prove_follow_replacement_count_capacity(
+        buy_limit=24,
+        sell_limit=24,
+        replacement_counts={"xch": 24, "cat": 24},
+    ) == {"buy_limit": 24, "sell_limit": 24, "replacement_count_gate_passed": True}

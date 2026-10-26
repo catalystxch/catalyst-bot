@@ -44,3 +44,18 @@ def test_follow_principal_preview_returns_atomic_strings_without_authority(monke
     assert body["maximum_trade_xch_mojos"] == "123456789123456"
     assert body["maximum_trade_cat_atoms"] == "987654321987654"
     assert body["dispatch_authorized"] is False
+
+
+def test_follow_principal_preview_binds_requested_24_by_24_counts(monkeypatch):
+    seen = []
+
+    def preview(approval_id, *, buy_limit=None, sell_limit=None):
+        seen.append((approval_id, buy_limit, sell_limit))
+        raise ValueError("FOLLOW_SLOT_INVENTORY_SHORT")
+
+    monkeypatch.setattr(follow_principal, "preview_approved_follow_principal", preview)
+    body, status = _call({"approval_id": "a" * 64, "buy_limit": 24, "sell_limit": 24})
+    assert seen == [("a" * 64, 24, 24)]
+    assert status == 409
+    assert body["reason"] == "FOLLOW_SLOT_INVENTORY_SHORT"
+    assert body["dispatch_authorized"] is False
