@@ -99,6 +99,28 @@ def test_ceiling_review_rejects_stopped_run(approved):
         )
 
 
+def test_ceiling_review_getter_rejects_wrong_digest(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    conn = database.get_connection()
+    conn.execute("DROP TRIGGER follow_fee_ceiling_reviews_no_update")
+    conn.execute(
+        "UPDATE follow_fee_ceiling_reviews SET review_sha256=? WHERE review_id=?",
+        ("0" * 64, review["review_id"]),
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_REVIEW_MISMATCH"):
+        database.get_follow_fee_ceiling_review(review["review_id"])
+
+
 def test_fee_ceiling_review_is_append_only(approved):
     run_id, identity = _run(approved)
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))

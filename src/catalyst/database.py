@@ -23149,6 +23149,29 @@ def get_effective_follow_fee_policy(
     return {**policy, "revision": 0, "dispatch_authorized": False}
 
 
+_FOLLOW_FEE_CEILING_REVIEW_TERMS = (
+    "run_id",
+    "identity_sha256",
+    "scope_sha256",
+    "plan_sha256",
+    "configuration_sha256",
+    "prior_revision",
+    "prior_maximum_fee_mojos",
+    "proposed_maximum_fee_mojos",
+    "protected_shutdown_fee_mojos",
+    "observed_fee_principal_mojos",
+    "reviewed_at_epoch",
+    "expires_at_epoch",
+)
+
+
+def _follow_fee_ceiling_review_digest(terms: dict) -> str:
+    bound = {key: terms[key] for key in _FOLLOW_FEE_CEILING_REVIEW_TERMS}
+    return hashlib.sha256(
+        json.dumps(bound, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def create_follow_fee_ceiling_review(
     *,
     run_id: str,
@@ -23201,9 +23224,7 @@ def create_follow_fee_ceiling_review(
         "reviewed_at_epoch": now_epoch,
         "expires_at_epoch": now_epoch + 300,
     }
-    review_sha256 = hashlib.sha256(
-        json.dumps(terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    review_sha256 = _follow_fee_ceiling_review_digest(terms)
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -23283,6 +23304,8 @@ def get_follow_fee_ceiling_review(review_id: str) -> Dict[str, Any]:
         ).fetchone()
         if row is None:
             raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+        if _follow_fee_ceiling_review_digest(row) != row["review_sha256"]:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_MISMATCH")
         return {
             **dict(row),
             "consumed": bool(row["consumed"]),
