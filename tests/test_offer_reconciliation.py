@@ -1668,6 +1668,266 @@ def _simple_cancel_flow_evidence(*, status) -> dict:
     )
 
 
+def _external_sage_sell_cancel_evidence() -> dict:
+    evidence = _evidence(
+        offers=[_offer(status=3, side="sell")],
+        transactions=[
+            _transaction(
+                spent=[
+                    {
+                        "coin_id": COIN,
+                        "asset_id": ASSET,
+                        "amount": 1000,
+                        "address_kind": "offer",
+                    },
+                    {
+                        "coin_id": FEE_COIN,
+                        "asset_id": "xch",
+                        "amount": 100,
+                        "address_kind": "own",
+                    },
+                ],
+                created=[
+                    {
+                        "coin_id": RETURN,
+                        "asset_id": ASSET,
+                        "amount": 1000,
+                        "address_kind": "own",
+                    },
+                    {
+                        "coin_id": FEE_RETURN,
+                        "asset_id": "xch",
+                        "amount": 90,
+                        "address_kind": "own",
+                    },
+                ],
+            )
+        ],
+        coins={
+            COIN: _coin(
+                COIN,
+                asset_id=ASSET,
+                amount=1000,
+                spent_height=42,
+                transaction_id=TX,
+                offer_id=TRADE,
+            ),
+            FEE_COIN: _coin(
+                FEE_COIN,
+                asset_id="xch",
+                amount=100,
+                spent_height=42,
+                transaction_id=TX,
+            ),
+            RETURN: _coin(
+                RETURN,
+                asset_id=ASSET,
+                amount=1000,
+                created_height=42,
+                transaction_id=TX,
+            ),
+            FEE_RETURN: _coin(
+                FEE_RETURN,
+                asset_id="xch",
+                amount=90,
+                created_height=42,
+                transaction_id=TX,
+            ),
+        },
+    )
+    return evidence
+
+
+def test_external_sage_sell_cancel_requires_exact_return_and_fee_flow():
+    """A human Sage cancellation can be proved without a CATalyst effect claim."""
+
+    sell = _intent(side="sell")
+    evidence = _external_sage_sell_cancel_evidence()
+
+    result = reconciliation.classify_external_cancel_evidence(sell, evidence, now=AFTER)
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["reason_code"] == "EXACT_EXTERNAL_CANCEL_RETURN_PROOF"
+    assert result["origin"] == "external"
+    assert result["fee_mojos"] == 10
+    assert result["coin_rebindings"] == [
+        {
+            "input_coin_id": COIN,
+            "return_coin_id": RETURN,
+            "asset_id": ASSET,
+            "amount": 1000,
+        }
+    ]
+
+
+def test_external_sage_idless_transaction_uses_spend_identity():
+    evidence = _external_sage_sell_cancel_evidence()
+    evidence["offer_history"]["records"][0].pop("transaction_id")
+    evidence["transaction_history"]["records"][0]["transaction_id"] = ""
+    for record in evidence["coin_records"]["records"].values():
+        record["transaction_id"] = None
+
+    result = reconciliation.classify_external_cancel_evidence(
+        _intent(side="sell"), evidence, now=AFTER
+    )
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["transaction_id"] is None
+    assert result["spend_identity"] == SPEND
+    assert result["fee_mojos"] == 10
+
+
+def test_external_sage_cancel_status_without_transaction_stays_unproven():
+    evidence = _evidence(offers=[_offer(status=3)], transactions=[])
+
+    result = reconciliation.classify_external_cancel_evidence(
+        _intent(), evidence, now=AFTER
+    )
+
+    assert result["classification"] == UNKNOWN
+    assert result["reason_code"] == "EXTERNAL_CANCEL_PROOF_INCOMPLETE"
+
+
+def test_external_cancel_terminal_commit_is_atomic_and_does_not_claim_task8(
+    isolated_database,
+):
+    intent = _persist_created_offer(side="sell")
+    evidence = _external_sage_sell_cancel_evidence()
+
+    result = reconciliation.reconcile_external_cancellation(
+        intent["intent_id"], evidence=evidence, now=AFTER
+    )
+
+    assert result["classification"] == CANCELLED_PROVEN
+    assert result["applied"] is True
+    assert database.get_offer(TRADE)["status"] == "cancelled"
+    assert (
+        database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "terminal"
+    )
+    assert database.get_coin_state(COIN)["status"] == "spent"
+    assert database.get_coin_state(RETURN)["status"] == "free"
+    assert (
+        database.get_external_cancel_fee_audit(intent["intent_id"])["fee_mojos"] == 10
+    )
+    assert database.get_offer_operation_events(f"cancel:{TRADE}") == []
+
+
+def test_external_cancel_replay_does_not_double_book_fee(isolated_database):
+    intent = _persist_created_offer(side="sell")
+    evidence = _external_sage_sell_cancel_evidence()
+
+    first = reconciliation.reconcile_external_cancellation(
+        intent["intent_id"], evidence=evidence, now=AFTER
+    )
+    second = reconciliation.reconcile_external_cancellation(
+        intent["intent_id"], evidence=evidence, now=AFTER
+    )
+
+    assert first["applied"] is True
+    assert second["applied"] is True
+    assert second["idempotent"] is True
+    assert (
+        database.get_external_cancel_fee_audit(intent["intent_id"])["fee_mojos"] == 10
+    )
+
+
+def test_external_cancel_incomplete_proof_cannot_settle_or_book_fee(
+    isolated_database,
+):
+    intent = _persist_created_offer(side="sell")
+    evidence = _external_sage_sell_cancel_evidence()
+    evidence["transaction_history"]["records"] = []
+
+    result = reconciliation.reconcile_external_cancellation(
+        intent["intent_id"], evidence=evidence, now=AFTER
+    )
+
+    assert result["classification"] == UNKNOWN
+    assert result["applied"] is False
+    assert (
+        database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
+    )
+    assert database.get_coin_state(COIN)["status"] != "spent"
+    assert database.get_external_cancel_fee_audit(intent["intent_id"]) is None
+
+
+def test_external_cancel_fee_audit_failure_rolls_back_terminal_state(
+    isolated_database,
+):
+    intent = _persist_created_offer(side="sell")
+    conn = database.get_connection()
+    conn.execute(
+        "CREATE TRIGGER test_reject_external_cancel_fee "
+        "BEFORE INSERT ON offer_external_cancel_fee_audits "
+        "BEGIN SELECT RAISE(ABORT, 'injected external fee failure'); END"
+    )
+    conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected external fee failure"):
+        reconciliation.reconcile_external_cancellation(
+            intent["intent_id"],
+            evidence=_external_sage_sell_cancel_evidence(),
+            now=AFTER,
+        )
+
+    assert (
+        database.get_offer_intent(intent["intent_id"])["lifecycle_state"] == "created"
+    )
+    assert database.get_offer(TRADE)["status"] == "open"
+    assert database.get_coin_state(COIN)["status"] == "locked"
+    assert database.get_coin_state(RETURN) is None
+    assert database.get_external_cancel_fee_audit(intent["intent_id"]) is None
+    assert database.get_offer_operation_events(f"reconcile:{intent['intent_id']}") == []
+
+
+def test_external_cancel_fee_audit_cannot_disappear_after_migration(
+    isolated_database,
+):
+    database.close_connection()
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("DROP TABLE offer_external_cancel_fee_audits")
+    conn.commit()
+    conn.close()
+    database._db_initialized = False
+    database._db_initialized_path = None
+
+    with pytest.raises(
+        RuntimeError, match="external cancellation audit watermark contradicts schema"
+    ):
+        database.init_database()
+
+
+@pytest.mark.parametrize("effect_attempted", [False, True])
+def test_external_cancel_cannot_adopt_cat_cancel_effect(
+    isolated_database, effect_attempted
+):
+    intent = _persist_created_offer(side="sell")
+    _persist_cancel_prepared(claim_effect=effect_attempted)
+    _persist_cancel_result(CANCEL_FAILED, effect_attempted=effect_attempted)
+
+    if effect_attempted:
+        with pytest.raises(ValueError, match="conflicts with CATalyst cancellation"):
+            reconciliation.reconcile_external_cancellation(
+                intent["intent_id"],
+                evidence=_external_sage_sell_cancel_evidence(),
+                now=AFTER,
+            )
+        assert (
+            database.get_offer_intent(intent["intent_id"])["lifecycle_state"]
+            == "created"
+        )
+        assert database.get_external_cancel_fee_audit(intent["intent_id"]) is None
+    else:
+        result = reconciliation.reconcile_external_cancellation(
+            intent["intent_id"],
+            evidence=_external_sage_sell_cancel_evidence(),
+            now=AFTER,
+        )
+        assert result["applied"] is True
+        events = database.get_offer_operation_events(f"cancel:{TRADE}")
+        assert events[-1]["outcome"] == "CANCEL_FAILED"
+
+
 def test_filled_status_contradicting_exact_cancel_flow_is_conflict():
     result = _classify(
         _simple_cancel_flow_evidence(status=4),

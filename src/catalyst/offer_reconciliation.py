@@ -1164,8 +1164,13 @@ def _cancel_proof(
     tx: dict[str, Any],
     coins: dict[str, dict[str, Any]],
     context: Any,
+    *,
+    external: bool = False,
 ) -> dict[str, Any] | None:
-    exact_context = _validated_cancel_context(context)
+    if external:
+        exact_context = context if _basic_cancel_members(context) is not None else None
+    else:
+        exact_context = _validated_cancel_context(context)
     if exact_context is None:
         return None
     members = exact_context["members"]
@@ -1508,6 +1513,7 @@ def _classify_terminal_evidence(
     *,
     cancel_context: Any = None,
     now: Any = None,
+    external_cancel: bool = False,
 ) -> dict[str, Any]:
     """Classify immutable evidence without database, wallet, or clock side effects."""
 
@@ -1653,7 +1659,57 @@ def _classify_terminal_evidence(
         else candidate_fill
     )
     cancel_candidates: list[dict[str, Any]] = []
-    if cancel_context is not None:
+    if external_cancel and status in _CANCELLED_STATUSES:
+        for row in transactions:
+            candidate = _exact_confirmed_transaction(row)
+            if candidate is None:
+                continue
+            candidate_time = _parse_utc(candidate["timestamp"])
+            if (
+                candidate_time is None
+                or candidate_time < exact_intent["offer_created_at"]
+                or candidate_time > observed_now
+            ):
+                continue
+            spent = candidate.get("spent")
+            if type(spent) is not list:
+                continue
+            selected = set(exact_intent["selected_coin_ids"])
+            spent_ids = {
+                _hex_id(flow.get("coin_id")) for flow in spent if type(flow) is dict
+            }
+            if not selected.issubset(spent_ids):
+                continue
+            auxiliary = sorted(spent_ids - selected)
+            context = {
+                "members": [
+                    {
+                        "trade_id": exact_intent["sage_trade_id"],
+                        "selected_coin_ids": list(exact_intent["selected_coin_ids"]),
+                        "request_timestamp": _canonical_utc(
+                            exact_intent["offer_created_at"]
+                        ),
+                        "transaction_timestamp": candidate["timestamp"],
+                        "transaction_id": _hex_id(candidate.get("transaction_id"))
+                        or None,
+                        "spend_identity": candidate.get("spend_identity"),
+                        "asset_id": exact_intent["asset_id"],
+                        "side": exact_intent["side"],
+                        "offered_amount_atomic": exact_intent["offered_amount_atomic"],
+                        "requested_amount_atomic": exact_intent[
+                            "requested_amount_atomic"
+                        ],
+                        "offer_text_sha256": exact_intent["offer_text_sha256"],
+                    }
+                ],
+                "auxiliary_coin_ids": auxiliary,
+            }
+            proof = _cancel_proof(
+                exact_intent, offer_rows, candidate, coins, context, external=True
+            )
+            if proof is not None:
+                cancel_candidates.append(proof)
+    elif cancel_context is not None:
         candidate_transactions = (
             [tx]
             if tx is not None
@@ -1712,8 +1768,13 @@ def _classify_terminal_evidence(
     if status in _CANCELLED_STATUSES and cancel is not None:
         return {
             "classification": CANCELLED_PROVEN,
-            "reason_code": "EXACT_CANCEL_RETURN_PROOF",
+            "reason_code": (
+                "EXACT_EXTERNAL_CANCEL_RETURN_PROOF"
+                if external_cancel
+                else "EXACT_CANCEL_RETURN_PROOF"
+            ),
             **cancel,
+            **({"origin": "external"} if external_cancel else {}),
         }
     if status in _CANCELLED_STATUSES and fill is not None:
         return _conflict()
@@ -1787,6 +1848,26 @@ def classify_terminal_evidence(
         )
     except BaseException:
         return _unknown("EVIDENCE_SCHEMA_INVALID")
+
+
+def classify_external_cancel_evidence(
+    intent: Any, evidence: Any, *, now: Any = None
+) -> dict[str, Any]:
+    """Prove a Sage cancellation without claiming a CATalyst wallet effect.
+
+    This pure classifier does not authorize a terminal database write. The
+    external authority and fee audit have a separate transactional boundary.
+    """
+
+    try:
+        result = _classify_terminal_evidence(
+            intent, evidence, now=now, external_cancel=True
+        )
+    except BaseException:
+        return _unknown("EVIDENCE_SCHEMA_INVALID")
+    if result.get("reason_code") == "CANCEL_PROOF_INCOMPLETE":
+        return _unknown("EXTERNAL_CANCEL_PROOF_INCOMPLETE")
+    return result
 
 
 def _offer_list(
@@ -4160,6 +4241,96 @@ def _derive_sage_bulk_cancel_context(
         if proof.get("classification") == CANCELLED_PROVEN:
             contexts.append(context)
     return contexts[0] if len(contexts) == 1 else None
+
+
+def reconcile_external_cancellation(
+    intent_id: str,
+    *,
+    evidence: Any = None,
+    wallet_facade: Any = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Settle a human Sage cancellation from exact proof, without wallet effect.
+
+    Callers must establish native user review before invoking this mutation.
+    Untrusted API bodies must never supply ``evidence``; that parameter exists
+    for deterministic isolated tests only.
+    """
+
+    import database
+
+    intent = database.get_offer_intent(intent_id)
+    if intent is None:
+        raise ValueError("intent_id does not exist")
+    if evidence is None:
+        try:
+            collected = load_authoritative_evidence(intent, wallet_facade=wallet_facade)
+        except BaseException:
+            return {
+                **_unknown("EXTERNAL_CANCEL_EVIDENCE_UNAVAILABLE"),
+                "applied": False,
+            }
+        observed_at = _clock_utc()
+    else:
+        observed_at = _canonical_utc(datetime.now(timezone.utc) if now is None else now)
+        collected = evidence
+    result = classify_external_cancel_evidence(intent, collected, now=observed_at)
+    if result.get("classification") != CANCELLED_PROVEN:
+        return {**result, "applied": False}
+    destination, registry_evidence = _registry_evidence(intent, result, observed_at)
+    records = tuple(
+        offer_record_from_row(row) for row in database.get_offer_intents_for_registry()
+    )
+    decision = authorize_transition(
+        RegistrySnapshot(records),
+        OfferReference(
+            intent_id=intent["intent_id"],
+            sage_trade_id=intent["sage_trade_id"],
+            offer_text_sha256=intent["offer_text_sha256"],
+        ),
+        destination,
+        intent["wallet_fingerprint_hash"],
+        intent["network"],
+        evidence=registry_evidence,
+    )
+    if not decision.allowed:
+        return {
+            **result,
+            "applied": False,
+            "authorization_code": decision.code.value,
+        }
+    durable_proof = {"classification": result, "evidence": collected}
+    durable_json, _full_digest = canonical_evidence_and_digest(durable_proof)
+    if json.loads(durable_json).get("bounded") is True:
+        return {**_unknown("EXTERNAL_CANCEL_EVIDENCE_TOO_LARGE"), "applied": False}
+    evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
+    committed = database.commit_offer_reconciliation(
+        intent_id=intent["intent_id"],
+        operation_id=f"reconcile:{intent['intent_id']}",
+        classification=CANCELLED_PROVEN,
+        reason_code=result["reason_code"],
+        wallet_identity_json={
+            "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
+            "network": intent["network"],
+        },
+        evidence_json=durable_json,
+        evidence_sha256=evidence_sha256,
+        transaction_id=result.get("transaction_id"),
+        spend_identity=result.get("spend_identity"),
+        block_height=result["block_height"],
+        fee_mojos=result["fee_mojos"],
+        coin_rebindings=result["coin_rebindings"],
+        reconciled_at=observed_at,
+        external_cancel=True,
+    )
+    return {
+        **result,
+        "applied": True,
+        "authorization_code": decision.code.value,
+        "evidence_sha256": evidence_sha256,
+        "event": committed["event"],
+        "idempotent": committed["idempotent"],
+    }
 
 
 def reconcile_offer(

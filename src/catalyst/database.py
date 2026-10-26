@@ -2464,6 +2464,56 @@ BEFORE DELETE ON offer_reconciliation_coin_outcomes
 BEGIN
     SELECT RAISE(ABORT, 'offer_reconciliation_coin_outcomes is append-only');
 END;
+
+-- A cancellation performed directly in Sage is terminal wallet history, not a
+-- CATalyst Task 8 wallet effect or a new Follow run fee. Keep its proven fee in
+-- a separate immutable audit row in the same transaction as Task 9 settlement.
+CREATE TABLE IF NOT EXISTS offer_external_cancel_fee_audits (
+    intent_id            TEXT PRIMARY KEY REFERENCES offer_intents(intent_id),
+    terminal_event_id    TEXT NOT NULL UNIQUE,
+    trade_id             TEXT NOT NULL,
+    wallet_fingerprint_hash TEXT NOT NULL,
+    network              TEXT NOT NULL,
+    transaction_id       TEXT,
+    spend_identity       TEXT,
+    confirmed_height     INTEGER NOT NULL CHECK(confirmed_height > 0),
+    fee_mojos            INTEGER NOT NULL CHECK(fee_mojos >= 0),
+    evidence_sha256      TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+    recorded_at          TEXT NOT NULL,
+    CHECK(transaction_id IS NOT NULL OR spend_identity IS NOT NULL)
+);
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_no_update
+BEFORE UPDATE ON offer_external_cancel_fee_audits BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_no_delete
+BEFORE DELETE ON offer_external_cancel_fee_audits BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee audit is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS offer_external_cancel_fee_audits_proof_guard
+BEFORE INSERT ON offer_external_cancel_fee_audits
+WHEN NOT EXISTS (
+    SELECT 1 FROM offer_operation_journal AS event
+    JOIN offer_intents AS intent ON intent.intent_id=NEW.intent_id
+    WHERE event.event_id=NEW.terminal_event_id
+      AND event.operation_id='reconcile:' || NEW.intent_id
+      AND event.intent_id=NEW.intent_id
+      AND event.operation_type='RECONCILE'
+      AND event.phase='FINALIZED'
+      AND event.outcome='CANCELLED_PROVEN'
+      AND event.reason_code='EXACT_EXTERNAL_CANCEL_RETURN_PROOF'
+      AND event.transaction_id IS NEW.transaction_id
+      AND event.spend_identity IS NEW.spend_identity
+      AND event.evidence_sha256=NEW.evidence_sha256
+      AND event.created_at=NEW.recorded_at
+      AND intent.sage_trade_id=NEW.trade_id
+      AND intent.wallet_fingerprint_hash=NEW.wallet_fingerprint_hash
+      AND intent.network=NEW.network
+      AND intent.lifecycle_state='terminal'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'external cancellation fee lacks terminal proof');
+END;
 CREATE TRIGGER IF NOT EXISTS offer_reconciliation_coin_outcomes_proof_guard_v2
 BEFORE INSERT ON offer_reconciliation_coin_outcomes
 WHEN NOT EXISTS (
@@ -4799,6 +4849,19 @@ _STABILITY_REQUIRED_COLUMNS = {
         "evidence_sha256",
         "recorded_at",
     },
+    "offer_external_cancel_fee_audits": {
+        "intent_id",
+        "terminal_event_id",
+        "trade_id",
+        "wallet_fingerprint_hash",
+        "network",
+        "transaction_id",
+        "spend_identity",
+        "confirmed_height",
+        "fee_mojos",
+        "evidence_sha256",
+        "recorded_at",
+    },
     "offer_reconciliation_coin_outcome_quarantine": {
         "outcome_sequence",
         "reason_code",
@@ -6767,6 +6830,28 @@ _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256 = hashlib.sha256(
 _FOLLOW_FEE_CEILING_SCHEMA_TABLES = frozenset(
     {"follow_fee_ceiling_reviews", "follow_fee_ceiling_revisions"}
 )
+_EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY = "external-cancel-fee-audit-schema"
+_EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION = 1
+_EXTERNAL_CANCEL_AUDIT_POLICY_SHA256 = hashlib.sha256(
+    b"external-cancel-fee-audit:v1:task9-terminal-proof-separated-from-follow-budget"
+).hexdigest()
+_EXTERNAL_CANCEL_AUDIT_TABLES = frozenset({"offer_external_cancel_fee_audits"})
+
+
+def _external_cancel_audit_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?",
+        (_EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION
+        or row["policy_sha256"] != _EXTERNAL_CANCEL_AUDIT_POLICY_SHA256
+    ):
+        raise RuntimeError("external cancellation audit watermark contradicts policy")
+    return True
 
 
 def _follow_fee_ceiling_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -7964,6 +8049,7 @@ def _migrate_stability_schema() -> None:
         fee_session_completion_completed = _fee_session_completion_schema_completed(
             conn
         )
+        external_audit_completed = _external_cancel_audit_schema_completed(conn)
         if (
             fee_schema_completed
             and missing_stability_tables & _FEE_APPROVAL_SCHEMA_TABLES
@@ -7988,10 +8074,20 @@ def _migrate_stability_schema() -> None:
             raise RuntimeError(
                 "fee ceiling revision schema watermark contradicts schema"
             )
+        if external_audit_completed and (
+            missing_stability_tables & _EXTERNAL_CANCEL_AUDIT_TABLES
+        ):
+            raise RuntimeError(
+                "external cancellation audit watermark contradicts schema"
+            )
         legacy_missing_tables = missing_stability_tables - (
             {
                 "offer_reconciliation_coin_outcomes",
                 "offer_reconciliation_coin_outcome_quarantine",
+                # Added after the original stability backfill watermark. An
+                # existing profile first receives this proof-only audit table
+                # during its next schema migration.
+                "offer_external_cancel_fee_audits",
                 "authoritative_fill_receipts",
                 "authoritative_round_trip_receipts",
                 "offer_authority_migration_audit",
@@ -8025,6 +8121,7 @@ def _migrate_stability_schema() -> None:
             | _FEE_SESSION_COMPLETION_TABLES
             | _FOLLOW_SCHEMA_TABLES
             | _FOLLOW_FEE_CEILING_SCHEMA_TABLES
+            | _EXTERNAL_CANCEL_AUDIT_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -8102,6 +8199,18 @@ def _migrate_stability_schema() -> None:
                     _FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY,
                     _FOLLOW_FEE_CEILING_SCHEMA_VERSION,
                     _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not external_audit_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _EXTERNAL_CANCEL_AUDIT_MIGRATION_KEY,
+                    _EXTERNAL_CANCEL_AUDIT_SCHEMA_VERSION,
+                    _EXTERNAL_CANCEL_AUDIT_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
@@ -30946,6 +31055,72 @@ def commit_legacy_expired_offer_intent(
         conn.close()
 
 
+def _validate_external_cancel_commit_evidence(
+    conn: sqlite3.Connection,
+    *,
+    intent: Dict[str, Any],
+    canonical_evidence: str,
+    reconciled_at: str,
+    transaction_id: Optional[str],
+    spend_identity: Optional[str],
+    block_height: Optional[int],
+    fee_mojos: int,
+    rebindings: List[Dict[str, Any]],
+) -> None:
+    """Recompute a Sage-only cancel proof without borrowing Task 8 authority."""
+
+    from offer_reconciliation import classify_external_cancel_evidence
+
+    envelope = json.loads(canonical_evidence)
+    if type(envelope) is not dict or set(envelope) != {"classification", "evidence"}:
+        raise ValueError("external cancellation evidence envelope is invalid")
+    derived = classify_external_cancel_evidence(
+        intent, envelope["evidence"], now=reconciled_at
+    )
+    if (
+        derived.get("classification") != "CANCELLED_PROVEN"
+        or derived.get("reason_code") != "EXACT_EXTERNAL_CANCEL_RETURN_PROOF"
+        or derived.get("origin") != "external"
+        or envelope["classification"] != derived
+        or derived.get("transaction_id") != transaction_id
+        or derived.get("spend_identity") != spend_identity
+        or derived.get("block_height") != block_height
+        or derived.get("fee_mojos") != fee_mojos
+    ):
+        raise ValueError("external cancellation proof differs from Sage evidence")
+    expected_rebindings = [
+        {
+            "input_coin_id": row["input_bare"],
+            "return_coin_id": row["return_bare"],
+            "asset_id": row["asset_id"],
+            "amount": row["amount"],
+        }
+        for row in rebindings
+    ]
+    if derived.get("coin_rebindings") != expected_rebindings:
+        raise ValueError("external cancellation returned coin proof differs")
+    latest = conn.execute(
+        "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+        "ORDER BY sequence DESC LIMIT 1",
+        (f"cancel:{intent['sage_trade_id']}",),
+    ).fetchone()
+    if latest is None:
+        return
+    event = validate_offer_operation_event(dict(latest))
+    try:
+        effect_evidence = json.loads(event["evidence_json"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prior cancellation journal is invalid") from exc
+    if (
+        event["phase"] != "FINALIZED"
+        or event["outcome"] != "CANCEL_FAILED"
+        or event["blocks_mutation"] != 0
+        or type(effect_evidence) is not dict
+        or effect_evidence.get("effect_attempted") is not False
+    ):
+        raise ValueError("external recovery conflicts with CATalyst cancellation")
+
+
 def commit_offer_reconciliation(
     *,
     intent_id: str,
@@ -30967,6 +31142,7 @@ def commit_offer_reconciliation(
     refresh_abort_id: Optional[str] = None,
     reconciled_at: Any = None,
     recovery_fence: Optional[Dict[str, Any]] = None,
+    external_cancel: bool = False,
 ) -> Dict[str, Any]:
     """Commit one policy-authorized reconciliation in one short transaction.
 
@@ -30989,6 +31165,10 @@ def commit_offer_reconciliation(
         | _RECONCILE_OBSERVATION_OUTCOMES
     ):
         raise ValueError("reconciliation classification is not committable")
+    if type(external_cancel) is not bool:
+        raise ValueError("external_cancel must be an exact bool")
+    if external_cancel and safe_classification != "CANCELLED_PROVEN":
+        raise ValueError("external recovery requires proven cancellation")
     safe_refresh_abort_id = (
         _required_stability_text(refresh_abort_id, "refresh_abort_id")
         if refresh_abort_id is not None
@@ -31003,6 +31183,8 @@ def commit_offer_reconciliation(
         "ACTIVE_PROVEN": "OBSERVED",
     }.get(safe_classification, "FINALIZED")
     safe_reason = _required_stability_text(reason_code, "reason_code").upper()
+    if external_cancel and safe_reason != "EXACT_EXTERNAL_CANCEL_RETURN_PROOF":
+        raise ValueError("external recovery requires exact external proof")
     when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
     wallet_json = _canonical_json_text(
         wallet_identity_json,
@@ -31115,8 +31297,14 @@ def commit_offer_reconciliation(
             max_bytes=262144,
         )
         safe_cancel_context = json.loads(cancel_context_text)
-    if safe_classification == "CANCELLED_PROVEN" and safe_cancel_context is None:
+    if (
+        safe_classification == "CANCELLED_PROVEN"
+        and safe_cancel_context is None
+        and not external_cancel
+    ):
         raise ValueError("proven cancellation requires exact Task 8 context")
+    if external_cancel and safe_cancel_context is not None:
+        raise ValueError("external recovery cannot borrow Task 8 context")
     if safe_classification != "CANCELLED_PROVEN" and safe_cancel_context is not None:
         raise ValueError("only proven cancellation may carry Task 8 context")
 
@@ -31207,71 +31395,84 @@ def commit_offer_reconciliation(
         if safe_classification == "CANCELLED_PROVEN":
             if not trade_hint:
                 raise ValueError("Task 8 cancellation target trade is missing")
-            task8 = _validate_reconciliation_cancel_context(
-                conn,
-                safe_cancel_context,
-                intent_id=safe_intent_id,
-                trade_id=trade_hint,
-                fee_mojos=safe_fee,
-            )
-            for task8_operation_id, observed_sequence in task8[
-                "latest_sequences"
-            ].items():
-                current_latest = conn.execute(
-                    """
-                    SELECT sequence FROM offer_operation_journal
-                    WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
-                    """,
-                    (task8_operation_id,),
-                ).fetchone()
-                if current_latest is None or int(current_latest["sequence"]) != int(
-                    observed_sequence
+            if external_cancel:
+                _validate_external_cancel_commit_evidence(
+                    conn,
+                    intent=intent,
+                    canonical_evidence=canonical_evidence,
+                    reconciled_at=when,
+                    transaction_id=safe_transaction_id,
+                    spend_identity=safe_spend_identity,
+                    block_height=safe_height,
+                    fee_mojos=safe_fee,
+                    rebindings=safe_rebindings,
+                )
+            else:
+                task8 = _validate_reconciliation_cancel_context(
+                    conn,
+                    safe_cancel_context,
+                    intent_id=safe_intent_id,
+                    trade_id=trade_hint,
+                    fee_mojos=safe_fee,
+                )
+                for task8_operation_id, observed_sequence in task8[
+                    "latest_sequences"
+                ].items():
+                    current_latest = conn.execute(
+                        """
+                        SELECT sequence FROM offer_operation_journal
+                        WHERE operation_id=? ORDER BY sequence DESC LIMIT 1
+                        """,
+                        (task8_operation_id,),
+                    ).fetchone()
+                    if current_latest is None or int(current_latest["sequence"]) != int(
+                        observed_sequence
+                    ):
+                        raise ValueError(
+                            "Task 8 cancellation cohort changed during reconciliation"
+                        )
+                latest_event = task8["latest"]
+                cancel_operation_id = f"cancel:{trade_hint}"
+                if latest_event["blocks_mutation"] == 1 or (
+                    task8["external_recovery"] is True
+                    and latest_event["phase"] == "FINALIZED"
+                    and latest_event["outcome"] == "CANCEL_FAILED"
+                    and latest_event["blocks_mutation"] == 0
+                ):
+                    cancel_resolution = {
+                        "observed_sequence": latest_event["sequence"],
+                        "operation_id": cancel_operation_id,
+                        "journal": _journal_values(
+                            event_id=(
+                                f"{cancel_operation_id}:attempt:"
+                                f"{latest_event['attempt']}:reconciled"
+                            ),
+                            operation_id=cancel_operation_id,
+                            intent_id=safe_intent_id,
+                            operation_type="CANCEL",
+                            attempt=latest_event["attempt"],
+                            phase="RECONCILED",
+                            outcome="CANCEL_CONFIRMED",
+                            request_timestamp=when,
+                            wallet_identity_json=wallet_json,
+                            transaction_id=safe_transaction_id,
+                            spend_identity=safe_spend_identity,
+                            evidence_json=canonical_evidence,
+                            evidence_sha256=expected_digest,
+                            reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+                            blocks_mutation=False,
+                            created_at=when,
+                        ),
+                    }
+                elif (
+                    latest_event["outcome"] != "CANCEL_CONFIRMED"
+                    or latest_event["transaction_id"] != safe_transaction_id
+                    or latest_event["spend_identity"] != safe_spend_identity
+                    or latest_event["evidence_sha256"] != expected_digest
                 ):
                     raise ValueError(
-                        "Task 8 cancellation cohort changed during reconciliation"
+                        "Task 8 nonblocking cancellation result contradicts proof"
                     )
-            latest_event = task8["latest"]
-            cancel_operation_id = f"cancel:{trade_hint}"
-            if latest_event["blocks_mutation"] == 1 or (
-                task8["external_recovery"] is True
-                and latest_event["phase"] == "FINALIZED"
-                and latest_event["outcome"] == "CANCEL_FAILED"
-                and latest_event["blocks_mutation"] == 0
-            ):
-                cancel_resolution = {
-                    "observed_sequence": latest_event["sequence"],
-                    "operation_id": cancel_operation_id,
-                    "journal": _journal_values(
-                        event_id=(
-                            f"{cancel_operation_id}:attempt:"
-                            f"{latest_event['attempt']}:reconciled"
-                        ),
-                        operation_id=cancel_operation_id,
-                        intent_id=safe_intent_id,
-                        operation_type="CANCEL",
-                        attempt=latest_event["attempt"],
-                        phase="RECONCILED",
-                        outcome="CANCEL_CONFIRMED",
-                        request_timestamp=when,
-                        wallet_identity_json=wallet_json,
-                        transaction_id=safe_transaction_id,
-                        spend_identity=safe_spend_identity,
-                        evidence_json=canonical_evidence,
-                        evidence_sha256=expected_digest,
-                        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
-                        blocks_mutation=False,
-                        created_at=when,
-                    ),
-                }
-            elif (
-                latest_event["outcome"] != "CANCEL_CONFIRMED"
-                or latest_event["transaction_id"] != safe_transaction_id
-                or latest_event["spend_identity"] != safe_spend_identity
-                or latest_event["evidence_sha256"] != expected_digest
-            ):
-                raise ValueError(
-                    "Task 8 nonblocking cancellation result contradicts proof"
-                )
         if safe_filled_at is not None:
             offer_created_at = _parse_iso_timestamp(
                 intent.get("confirmed_at") or intent.get("prepared_at"),
@@ -31313,6 +31514,17 @@ def commit_offer_reconciliation(
                 raise ValueError(
                     "terminal offer was reconciled with different authoritative proof"
                 )
+            if external_cancel:
+                audit_row = conn.execute(
+                    "SELECT * FROM offer_external_cancel_fee_audits WHERE intent_id=?",
+                    (safe_intent_id,),
+                ).fetchone()
+                if audit_row is None or (
+                    audit_row["terminal_event_id"] != existing["event_id"]
+                    or audit_row["fee_mojos"] != safe_fee
+                    or audit_row["evidence_sha256"] != expected_digest
+                ):
+                    raise ValueError("external cancellation fee audit replay differs")
             fill_id = None
             if safe_classification == "FILLED_PROVEN":
                 fill_row = conn.execute(
@@ -31715,6 +31927,30 @@ def commit_offer_reconciliation(
                 """,
                 (when, *selected_registry, trade_id),
             )
+            if external_cancel:
+                conn.execute(
+                    """
+                    INSERT INTO offer_external_cancel_fee_audits (
+                        intent_id, terminal_event_id, trade_id,
+                        wallet_fingerprint_hash, network, transaction_id,
+                        spend_identity, confirmed_height, fee_mojos,
+                        evidence_sha256, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        safe_intent_id,
+                        event["event_id"],
+                        trade_id,
+                        wallet_hash,
+                        network,
+                        safe_transaction_id,
+                        safe_spend_identity,
+                        safe_height,
+                        safe_fee,
+                        expected_digest,
+                        when,
+                    ),
+                )
         elif safe_classification == "EXPIRED_PROVEN" and safe_height is not None:
             conn.execute(
                 f"""
@@ -31779,6 +32015,21 @@ def commit_offer_reconciliation(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def get_external_cancel_fee_audit(intent_id: str) -> Optional[Dict[str, Any]]:
+    """Read the immutable fee of a proven cancellation performed in Sage."""
+
+    safe_intent_id = _required_stability_text(intent_id, "intent_id")
+    conn = _stability_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM offer_external_cancel_fee_audits WHERE intent_id=?",
+            (safe_intent_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
     finally:
         conn.close()
 
