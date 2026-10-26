@@ -24005,6 +24005,18 @@ def reserve_follow_cancellation_fee(
         ).fetchone()
         if fee_coin is not None and fee_coin["designation"] == "reserve":
             raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        # A cancellation cohort is not yet proof that every offer in this
+        # Follow run is closing. Preserve the shutdown allowance until a
+        # distinct full-run shutdown authority and book proof are available.
+        totals = _fee_scope_totals(conn, row["scope_sha256"])
+        committed_after = totals["committed_fee_mojos"] + fee
+        if committed_after > row["maximum_fee_mojos"]:
+            raise ValueError("FEE_BUDGET_EXCEEDED")
+        if (
+            committed_after + row["protected_shutdown_fee_mojos"]
+            > row["maximum_fee_mojos"]
+        ):
+            raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
         result = _reserve_approved_fee_locked(
             conn,
             row["approval_id"],
@@ -24141,7 +24153,10 @@ def recheck_follow_cancellation_fee_hold(
             ):
                 return False
             totals = _fee_scope_totals(conn, row["scope_sha256"])
-            if totals["committed_fee_mojos"] > row["maximum_fee_mojos"]:
+            if (
+                totals["committed_fee_mojos"] + row["protected_shutdown_fee_mojos"]
+                > row["maximum_fee_mojos"]
+            ):
                 return False
             other = conn.execute(
                 "SELECT 1 FROM approved_fee_reservations AS reservation "

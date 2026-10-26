@@ -92,6 +92,13 @@ The preview also invokes Coin Prep's exact zero-effect target matcher on that
 snapshot. Its `current_prep_targets_proven` flag means every approved prep
 denomination is still selectable at preview time; it does not establish the
 live price or match 24 current ladder slots.
+An explicit `buy_limit`/`sell_limit` principal preview now rejects a completed
+prep plan with fewer replacement coins than the requested slots on either
+side. The result and proposal digest bind the count gate; a preview without
+limits explicitly reports that the gate has not passed. Coin counts remain
+only a necessary condition. The final native review must request the exact
+24/24 limits and independently prove each slot's current price, spend amount,
+denomination, market gate and unique coin assignment before Start.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is
@@ -145,6 +152,16 @@ decision instead of falling back to unscoped creation during acceptance.
 - [ ] Enforce full-book shutdown reserve at creation and cancellation planning.
 - [ ] Recheck the same approval, run, wallet, intent roots, fee coin and quote under the final dispatch lock.
 - [ ] Verify crash/restart and ambiguous submitted outcomes remain held without duplicate effect.
+
+Independent review found that Cancel All grouped Follow offers with unrelated
+legacy offers, and its actual `cancel_all` reason missed the protected fee-pool
+recovery branch. Both paths now have focused regression coverage, including a
+public Cancel All grouping test. The fee reservation and final adapter recheck
+now reject a Follow cancellation if it would eat the protected shutdown
+allowance, including after a prior confirmed spend. This is a provisional
+fail-closed fence: it does not yet permit spending the allowance for a proven
+full-run shutdown. That distinct native review, complete wallet-book proof,
+and exact priced shutdown hold remain required before a release build.
 
 ### Task 4: Native configuration, integration and release gates
 

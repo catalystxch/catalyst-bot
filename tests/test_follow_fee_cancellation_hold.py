@@ -277,7 +277,7 @@ def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
     approved["now"] = 1002
     first, first_contract = _prepared_follow_cancel(run_id, identity)
     second, second_contract = _prepared_follow_cancel(
-        run_id, identity, fee=61, offset=1
+        run_id, identity, fee=50, offset=1
     )
     database.reserve_follow_cancellation_fee(
         run_id=run_id,
@@ -292,7 +292,7 @@ def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
             identity=identity,
             manifest_json=second,
             batch_contract=second_contract,
-            final_quote=_quote(approved, fee=61),
+            final_quote=_quote(approved, fee=50),
         )
     transaction_id = _finalize_follow_submitted(first)
     member = first["members"][0]
@@ -325,13 +325,13 @@ def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
         )["state"]
         == "CONFIRMED_SPENT"
     )
-    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_RESERVE_PROTECTED"):
         database.reserve_follow_cancellation_fee(
             run_id=run_id,
             identity=identity,
             manifest_json=second,
             batch_contract=second_contract,
-            final_quote=_quote(approved, fee=61),
+            final_quote=_quote(approved, fee=50),
         )
 
 
@@ -375,7 +375,9 @@ def test_follow_cancel_hold_refuses_expired_quote_and_run_cap(approved):
         )
 
 
-def test_follow_cancel_hold_survives_run_stop_but_rechecks_exact_claim(approved):
+def test_follow_cancel_hold_survives_run_stop_but_rechecks_exact_claim(
+    approved, monkeypatch
+):
     run_id, identity = _run(approved)
     approved["now"] = 1002
     manifest, contract = _prepared_follow_cancel(run_id, identity)
@@ -404,6 +406,25 @@ def test_follow_cancel_hold_survives_run_stop_but_rechecks_exact_claim(approved)
             final_quote=quote,
         )
         is True
+    )
+    original_totals = database._fee_scope_totals
+    monkeypatch.setattr(
+        database,
+        "_fee_scope_totals",
+        lambda *args: {
+            **original_totals(*args),
+            "committed_fee_mojos": 50,
+        },
+    )
+    assert (
+        database.recheck_follow_cancellation_fee_hold(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=quote,
+        )
+        is False
     )
     approved["now"] = quote["expires_at"]
     assert (

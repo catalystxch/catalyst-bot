@@ -74,6 +74,32 @@ def test_follow_and_legacy_offers_cannot_share_cancel_batch(
     assert effects == []
 
 
+def test_cancel_all_partitions_legacy_and_each_follow_run(monkeypatch):
+    trade_ids = ["a" * 64, "b" * 64, "c" * 64, "d" * 64]
+    purposes = {
+        trade_ids[0]: "normal_lifecycle",
+        trade_ids[1]: f"follow:{'e' * 64}:normal_lifecycle",
+        trade_ids[2]: f"follow:{'f' * 64}:book_opportunity",
+        trade_ids[3]: f"follow:{'e' * 64}:book_opportunity",
+    }
+    monkeypatch.setattr(
+        offer_manager.database,
+        "get_offer_intent_by_trade_id",
+        lambda trade_id: {"purpose": purposes[trade_id]},
+    )
+    groups = offer_manager.OfferManager._cancel_fee_scope_groups(trade_ids)
+    assert [group["trade_ids"] for group in groups] == [
+        [trade_ids[0]],
+        [trade_ids[1], trade_ids[3]],
+        [trade_ids[2]],
+    ]
+    assert [group.get("follow_run_id") for group in groups] == [
+        None,
+        "e" * 64,
+        "f" * 64,
+    ]
+
+
 def test_reviewed_follow_singleton_reaches_exact_plan_without_wallet_effect(
     isolated_database, monkeypatch
 ):
@@ -102,14 +128,14 @@ def test_reviewed_follow_singleton_reaches_exact_plan_without_wallet_effect(
     )
     seen = []
 
-    def plan(_self, _members, exact_run, identity, *_args):
-        seen.append((len(_members), exact_run, identity))
+    def plan(_self, _members, exact_run, identity, recovery_action):
+        seen.append((len(_members), exact_run, identity, recovery_action))
         raise ValueError("FOLLOW_PLAN_SENTINEL")
 
     monkeypatch.setattr(offer_manager.OfferManager, "_plan_follow_cancel", plan)
     with pytest.raises(ValueError, match="FOLLOW_PLAN_SENTINEL"):
         offer_manager.OfferManager().cancel_offers(
-            ["a" * 64], force_storm=True, reason="manual_cancel_all"
+            ["a" * 64], force_storm=True, reason="cancel_all"
         )
-    assert seen == [(1, run_id, {"network": "mainnet"})]
+    assert seen == [(1, run_id, {"network": "mainnet"}, "cancel_all")]
     assert effects == []

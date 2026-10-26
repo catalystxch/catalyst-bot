@@ -8663,7 +8663,7 @@ class OfferManager:
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED") from exc
             if cleanup.get("ready") is not True:
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
-            if reason == "manual_cancel_all":
+            if reason in {"manual_cancel_all", "cancel_all"}:
                 follow_recovery_action = "cancel_all"
         if bootstrap_campaign_ids:
             if len(bootstrap_campaign_ids) != 1 or bootstrap_member_count != len(
@@ -9226,6 +9226,7 @@ class OfferManager:
         authoritative terminal proof.
         """
         ordinary = []
+        follow_runs = {}
         campaigns = {}
         seen = set()
         for trade_id in trade_ids:
@@ -9238,6 +9239,16 @@ class OfferManager:
                 if type(creation_intent) is dict
                 else ""
             )
+            if purpose.startswith("follow:"):
+                parts = purpose.split(":")
+                if (
+                    len(parts) != 3
+                    or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+                    or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+                ):
+                    raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+                follow_runs.setdefault(parts[1], []).append(trade_id)
+                continue
             if not purpose.startswith("bootstrap:"):
                 ordinary.append(trade_id)
                 continue
@@ -9253,6 +9264,14 @@ class OfferManager:
         groups = []
         if ordinary:
             groups.append({"trade_ids": ordinary, "campaign_id": None})
+        groups.extend(
+            {
+                "trade_ids": follow_runs[run_id],
+                "campaign_id": None,
+                "follow_run_id": run_id,
+            }
+            for run_id in sorted(follow_runs)
+        )
         groups.extend(
             {"trade_ids": campaigns[campaign_id], "campaign_id": campaign_id}
             for campaign_id in sorted(campaigns)
