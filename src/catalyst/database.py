@@ -22428,6 +22428,7 @@ _FOLLOW_IDENTITY_FIELDS = frozenset(
         "ticker",
     }
 )
+_FOLLOW_SHUTDOWN_REASONS = frozenset({"cancel_all", "manual_cancel_all"})
 
 
 def _follow_identity_json(identity: dict) -> str:
@@ -23972,6 +23973,7 @@ def reserve_follow_cancellation_fee(
             "fee_mojos": fee,
             "batch": {k: v for k, v in batch_contract.items() if k != "fee_mojos"},
         }
+        shutdown_cleanup = True
         for member, source_id in zip(manifest["members"], source_ids):
             prepared = conn.execute(
                 "SELECT * FROM offer_operation_journal WHERE event_id=?",
@@ -23987,6 +23989,9 @@ def reserve_follow_cancellation_fee(
                 dict(prepared), manifest
             )
             evidence = json.loads(event["evidence_json"])
+            shutdown_cleanup = (
+                shutdown_cleanup and evidence.get("reason") in _FOLLOW_SHUTDOWN_REASONS
+            )
             journal = json.loads(event["wallet_identity_json"])
             binding = journal.get("snapshot", {}).get("binding", {})
             if (
@@ -24021,17 +24026,24 @@ def reserve_follow_cancellation_fee(
         ).fetchone()
         if fee_coin is not None and fee_coin["designation"] == "reserve":
             raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
-        # A cancellation cohort is not yet proof that every offer in this
-        # Follow run is closing. Preserve the shutdown allowance until a
-        # distinct full-run shutdown authority and book proof are available.
+        # While Follow is active, routine requotes must leave the shutdown
+        # allowance untouched. A durable Stop prevents new creation; after
+        # Stop, each exact journaled cohort may spend the remaining allowance
+        # for this same run, still under the original cumulative cap.
         totals = _fee_scope_totals(conn, row["scope_sha256"])
         committed_after = totals["committed_fee_mojos"] + fee
         if committed_after > row["maximum_fee_mojos"]:
             raise ValueError("FEE_BUDGET_EXCEEDED")
-        if (
-            committed_after + row["protected_shutdown_fee_mojos"]
-            > row["maximum_fee_mojos"]
-        ):
+        stopped = (
+            conn.execute(
+                "SELECT 1 FROM follow_run_stops WHERE run_id=? AND stopped_at_epoch<=?",
+                (run, now),
+            ).fetchone()
+            is not None
+        )
+        if (not stopped or not shutdown_cleanup) and committed_after + row[
+            "protected_shutdown_fee_mojos"
+        ] > row["maximum_fee_mojos"]:
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
         result = _reserve_approved_fee_locked(
             conn,
@@ -24169,11 +24181,16 @@ def recheck_follow_cancellation_fee_hold(
             ):
                 return False
             totals = _fee_scope_totals(conn, row["scope_sha256"])
-            if (
-                totals["committed_fee_mojos"] + row["protected_shutdown_fee_mojos"]
-                > row["maximum_fee_mojos"]
-            ):
+            if totals["committed_fee_mojos"] > row["maximum_fee_mojos"]:
                 return False
+            stopped = (
+                conn.execute(
+                    "SELECT 1 FROM follow_run_stops WHERE run_id=? "
+                    "AND stopped_at_epoch<=?",
+                    (run, now),
+                ).fetchone()
+                is not None
+            )
             other = conn.execute(
                 "SELECT 1 FROM approved_fee_reservations AS reservation "
                 "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
@@ -24199,6 +24216,7 @@ def recheck_follow_cancellation_fee_hold(
                 "fee_mojos": fee,
                 "batch": {k: v for k, v in batch_contract.items() if k != "fee_mojos"},
             }
+            shutdown_cleanup = True
             for member, source_id in zip(manifest["members"], source_ids):
                 prepared = conn.execute(
                     "SELECT * FROM offer_operation_journal WHERE event_id=?",
@@ -24219,6 +24237,10 @@ def recheck_follow_cancellation_fee_hold(
                     dict(prepared), manifest
                 )
                 evidence = json.loads(event["evidence_json"])
+                shutdown_cleanup = (
+                    shutdown_cleanup
+                    and evidence.get("reason") in _FOLLOW_SHUTDOWN_REASONS
+                )
                 journal = json.loads(event["wallet_identity_json"])
                 binding = journal.get("snapshot", {}).get("binding", {})
                 if (
@@ -24241,6 +24263,10 @@ def recheck_follow_cancellation_fee_hold(
                     or binding.get("network_id") != identity["network"]
                 ):
                     return False
+            if (not stopped or not shutdown_cleanup) and totals[
+                "committed_fee_mojos"
+            ] + row["protected_shutdown_fee_mojos"] > row["maximum_fee_mojos"]:
+                return False
             fee_coin = conn.execute(
                 "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
             ).fetchone()
