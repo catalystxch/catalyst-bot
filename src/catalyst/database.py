@@ -22395,13 +22395,30 @@ def create_follow_run_review(
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        if (
-            conn.execute(
-                "SELECT 1 FROM coin_prep_fee_consents WHERE approval_id=?", (approval,)
-            ).fetchone()
-            is None
-        ):
+        approved = conn.execute(
+            "SELECT approval.*, preview.scope_json FROM fee_approvals AS approval "
+            "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
+            "JOIN coin_prep_fee_previews AS preview USING(preview_id) "
+            "WHERE approval.approval_id=?",
+            (approval,),
+        ).fetchone()
+        if approved is None:
             raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+        scope = json.loads(approved["scope_json"])
+        if (
+            any(scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS)
+            or scope.get("campaign_id") is not None
+            or scope.get("session_id") is None
+            or approved["total_fee_mojos"] != maximum
+            or approved["cancellation_reserve_mojos"] < protected
+        ):
+            raise ValueError("FOLLOW_FEE_APPROVAL_MISMATCH")
+        latest = conn.execute(
+            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+            (approved["scope_sha256"],),
+        ).fetchone()[0]
+        if approved["version"] != latest:
+            raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
         conn.execute(
             "INSERT INTO follow_run_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (

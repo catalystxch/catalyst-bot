@@ -164,6 +164,50 @@ def test_follow_review_requires_positive_protected_shutdown_reserve(approved):
         )
 
 
+def test_follow_review_rejects_approval_scope_and_ceiling_mismatch(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    terms = dict(
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=1001 + 48 * 3600,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_MISMATCH"):
+        database.create_follow_run_review(**(terms | {"maximum_fee_mojos": 81}))
+    with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_MISMATCH"):
+        database.create_follow_run_review(
+            **(
+                terms
+                | {
+                    "identity": {
+                        **identity,
+                        "wallet_fingerprint": identity["wallet_fingerprint"] + 1,
+                    }
+                }
+            )
+        )
+
+
 def test_follow_creation_authority_is_bound_to_original_review(approved):
     approval_id = approved["approval"]["approval_id"]
     context = database.get_coin_prep_fee_approval_context(approval_id)
