@@ -137,6 +137,40 @@ def test_follow_cancel_price_requires_positive_fresh_fee_and_does_not_dispatch(
     assert refused["dispatch_authorized"] is False
 
 
+def test_follow_cancel_price_refuses_unsigned_cost_above_one_block(
+    approved, monkeypatch
+):
+    run_id, identity = _run(approved)
+    pricing = import_module("follow_fee_cancellation")
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 11_000_000_001,
+        },
+    )
+    monkeypatch.setattr(
+        pricing,
+        "quote_fee",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized batch must not be quoted")
+        ),
+    )
+    result = pricing.price_follow_cancellation(
+        run_id=run_id,
+        identity=identity,
+        trade_ids=["b" * 64],
+        source_coin_ids=["c" * 64],
+        fee_coin_id="d" * 64,
+        now_epoch=1002,
+    )
+    assert result["available"] is False
+    assert result["reason"] == "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT"
+    assert result["dispatch_authorized"] is False
+
+
 def test_follow_cancel_price_refuses_unresolved_run_before_unsigned_build(
     approved, monkeypatch
 ):

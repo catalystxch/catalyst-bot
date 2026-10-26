@@ -11,6 +11,7 @@ import database
 from coin_prep_fee_cancellation import _canonical_ids
 from coin_prep_fee_pricing import is_current_fee_quote
 from fee_estimation import quote_fee
+from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
 import wallet
 
 
@@ -67,6 +68,12 @@ def price_follow_cancellation(
         )
         if type(cost) is not int or cost <= 0:
             return _refused("FEE_UNSIGNED_COST_UNAVAILABLE", authority)
+        if cost > ONE_BLOCK_COST_LIMIT:
+            return _refused(
+                "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT",
+                authority,
+                required_cost=cost,
+            )
         try:
             quote = quote_fee(cost, target_seconds=target_seconds)
         except Exception:
