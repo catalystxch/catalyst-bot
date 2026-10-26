@@ -319,6 +319,10 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
 
     with (
         api_mutations_permitted(api_server),
+        # Isolate warning redaction after the independently tested review gate.
+        patch.object(
+            bot_routes, "_reviewed_follow_start_readiness", return_value={"ready": True}
+        ),
         patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch.object(
             bot_routes,
