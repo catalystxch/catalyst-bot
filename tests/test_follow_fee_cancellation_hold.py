@@ -425,6 +425,31 @@ def test_stopped_run_routine_requote_cannot_spend_shutdown_reserve(approved):
         )
 
 
+def test_reserve_floor_shutdown_requires_durable_stop_before_spending_reserve(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(
+        run_id, identity, fee=50, reason="reserve_floor_breached"
+    )
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_RESERVE_PROTECTED"):
+        database.reserve_follow_cancellation_fee(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=_quote(approved, fee=50),
+        )
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved, fee=50),
+    )
+    assert hold["fee_mojos"] == 50
+
+
 def test_expired_follow_run_can_use_reserve_for_journaled_cancel_all(approved):
     run_id, identity = _run(approved)
     approved["now"] = 1001 + 48 * 3600 + 1

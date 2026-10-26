@@ -8663,7 +8663,7 @@ class OfferManager:
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED") from exc
             if cleanup.get("ready") is not True:
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
-            if reason in {"manual_cancel_all", "cancel_all"}:
+            if reason in {"manual_cancel_all", "cancel_all", "reserve_floor_breached"}:
                 follow_recovery_action = "cancel_all"
         if bootstrap_campaign_ids:
             if len(bootstrap_campaign_ids) != 1 or bootstrap_member_count != len(

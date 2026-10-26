@@ -6282,6 +6282,75 @@ class BotLoop:
             )
             return False
 
+    def _cancel_reserve_floor_offers(self, trade_ids: set[str]) -> bool:
+        """Halt a reviewed Follow run before using its shutdown allowance.
+
+        Return False after a Follow stop so the current cycle exits. Never
+        discard local offer IDs: only wallet proof may retire those slots.
+        """
+        follow_run_id = getattr(self, "_reviewed_follow_run_id", None)
+        if not trade_ids and follow_run_id is None:
+            return True
+        cancel_phase_allowed = self._enter_runtime_effect_phase("cancel")
+        if follow_run_id is None and not cancel_phase_allowed:
+            return False
+        if follow_run_id is not None:
+            # stop(wait=False) cannot join this trading thread. It revokes
+            # creation immediately and lets the finalizer wait for us.
+            if not self.stop(wait=False) or not self._record_reviewed_follow_stop():
+                return False
+            if not cancel_phase_allowed:
+                return False
+            try:
+                self.offer_manager.wait_for_offer_creation_quiescence()
+                rows = database.get_offer_intents_for_registry()
+                current = set()
+                for row in rows:
+                    if (
+                        row.get("purpose")
+                        not in {
+                            f"follow:{follow_run_id}:normal_lifecycle",
+                            f"follow:{follow_run_id}:book_opportunity",
+                        }
+                        or row.get("terminal_at") is not None
+                    ):
+                        continue
+                    trade_id = row.get("sage_trade_id")
+                    if (
+                        row.get("lifecycle_state")
+                        not in {"created", "confirmed", "visible", "cancel_requested"}
+                        or type(trade_id) is not str
+                        or len(trade_id) != 64
+                        or any(ch not in "0123456789abcdef" for ch in trade_id)
+                    ):
+                        raise ValueError("FOLLOW_RESERVE_FLOOR_BOOK_UNVERIFIED")
+                    current.add(trade_id)
+                if not set(trade_ids).issubset(current):
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_BOOK_UNVERIFIED")
+                trade_ids = current
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "reserve_floor_shutdown_unverified",
+                    "Follow run stopped; exact offer book could not be proved for reserve-floor cancellation",
+                    data={"error_type": type(exc).__name__},
+                )
+                return False
+        if trade_ids:
+            try:
+                self.offer_manager.cancel_offers(
+                    sorted(trade_ids), reason="reserve_floor_breached", force_storm=True
+                )
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "reserve_floor_cancel_failed",
+                    "Reserve-floor cancellation failed; offers remain tracked for proof and retry",
+                    data={"error_type": type(exc).__name__},
+                )
+                return False
+        return follow_run_id is None
+
     def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
 
@@ -12001,14 +12070,8 @@ class BotLoop:
                         action_label="Stop Bot",
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
-                    if _all_open:
-                        if not self._enter_runtime_effect_phase("cancel"):
-                            return False
-                        self.offer_manager.cancel_offers(
-                            _all_open, reason="reserve_floor_breached", force_storm=True
-                        )
-                        current_buy_ids.clear()
-                        current_sell_ids.clear()
+                    if not self._cancel_reserve_floor_offers(set(_all_open)):
+                        return False
                     _reserve_skip_create = True
                 elif _xch_total <= _xch_near_floor:
                     log_event(
@@ -12068,14 +12131,8 @@ class BotLoop:
                         action_label="Stop Bot",
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
-                    if _all_open:
-                        if not self._enter_runtime_effect_phase("cancel"):
-                            return False
-                        self.offer_manager.cancel_offers(
-                            _all_open, reason="reserve_floor_breached", force_storm=True
-                        )
-                        current_buy_ids.clear()
-                        current_sell_ids.clear()
+                    if not self._cancel_reserve_floor_offers(set(_all_open)):
+                        return False
                     _reserve_skip_create = True
                 elif _cat_total <= _cat_near_floor:
                     log_event(

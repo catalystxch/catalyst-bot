@@ -22610,7 +22610,9 @@ _FOLLOW_IDENTITY_FIELDS = frozenset(
         "ticker",
     }
 )
-_FOLLOW_SHUTDOWN_REASONS = frozenset({"cancel_all", "manual_cancel_all"})
+_FOLLOW_SHUTDOWN_REASONS = frozenset(
+    {"cancel_all", "manual_cancel_all", "reserve_floor_breached"}
+)
 
 
 def _follow_identity_json(identity: dict) -> str:
