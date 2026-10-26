@@ -3330,6 +3330,7 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         is None
     )
     fee_settlements = []
+    follow_settlements = []
 
     def settle_protected_cancellation(manifest):
         fee_settlements.append(manifest)
@@ -3342,8 +3343,25 @@ def test_retry_failed_cancels_settles_one_confirmed_sage_bulk_cohort(
         "record_coin_prep_cancellation_fee_outcome",
         settle_protected_cancellation,
     )
+    monkeypatch.setattr(
+        database,
+        "get_unsettled_follow_cancellation_manifests",
+        lambda: (
+            []
+            if database.get_unresolved_offer_operation_blockers()
+            else [{"run_id": "f" * 64, "manifest": manifest}]
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "record_follow_cancellation_fee_outcome",
+        lambda **kwargs: (
+            follow_settlements.append(kwargs) or {"state": "CONFIRMED_SPENT"}
+        ),
+    )
     assert OfferManager().retry_failed_cancels() == 0
     assert len(fee_settlements) == 2
+    assert follow_settlements == [{"run_id": "f" * 64, "manifest_json": manifest}]
     assert {row["cohort_id"] for row in fee_settlements} == {manifest["cohort_id"]}
     assert database.get_runtime_safety_latch()["state"] == "resolved"
     assert database.get_unresolved_offer_operation_blockers() == []

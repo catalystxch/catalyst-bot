@@ -10361,6 +10361,16 @@ class OfferManager:
                         raise ValueError(
                             "native bulk cancellation blockers remain unresolved"
                         )
+                    # Task 9 may have proved every member while the protected
+                    # Follow fee hold remains unsettled. Finish the exact
+                    # cohort's accounting before another cohort can read its
+                    # remaining fee authority and attempt a wallet effect.
+                    for held in database.get_unsettled_follow_cancellation_manifests():
+                        if held["manifest"] == exact_manifest:
+                            database.record_follow_cancellation_fee_outcome(
+                                run_id=held["run_id"],
+                                manifest_json=exact_manifest,
+                            )
                     runtime = mutation_gate.current_runtime()
                     if runtime is None:
                         return False

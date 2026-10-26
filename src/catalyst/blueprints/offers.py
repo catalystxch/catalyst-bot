@@ -1916,8 +1916,12 @@ def _api_cancel_all_locked():
                     _cancel_batches = [
                         (batch, group["campaign_id"], group.get("follow_run_id"))
                         for group in fee_scope_groups
-                        for batch in _balanced_cancel_batches(
-                            group["trade_ids"], _batch_capacity
+                        for batch in (
+                            [group["trade_ids"]]
+                            if group.get("follow_run_id") is not None
+                            else _balanced_cancel_batches(
+                                group["trade_ids"], _batch_capacity
+                            )
                         )
                     ]
                     _deadline_seconds = _cancel_all_deadline_seconds(

@@ -2858,13 +2858,26 @@ class TestCancelAllPost(_FlaskBase):
     def test_stopped_cancel_all_splits_exact_unsigned_over_block_book(self):
         stopped = _make_bot()
         stopped.is_running.return_value = False
-        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 48
-        stopped.offer_manager.preview_follow_cancel_book.side_effect = (
-            lambda cohorts, **_kwargs: {
-                "cohorts": cohorts,
+        # The legacy capacity is conservative. The exact Follow preview must
+        # see the whole remaining scope before it chooses priced cohorts.
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 4
+        preview_calls = []
+
+        def preview(cohorts, **_kwargs):
+            if not preview_calls:
+                self.assertEqual(len(cohorts), 1)
+                self.assertEqual(len(cohorts[0]), 48)
+            preview_calls.append(cohorts)
+            remaining = [trade_id for cohort in cohorts for trade_id in cohort]
+            return {
+                "cohorts": [
+                    remaining[index : index + 12]
+                    for index in range(0, len(remaining), 12)
+                ],
                 "dispatch_authorized": False,
             }
-        )
+
+        stopped.offer_manager.preview_follow_cancel_book.side_effect = preview
         trade_ids = [f"{index:064x}" for index in range(1, 49)]
         terminal_ids = set()
         submitted = []
