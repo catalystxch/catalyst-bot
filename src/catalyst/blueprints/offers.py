@@ -1941,6 +1941,82 @@ def _api_cancel_all_locked():
                         _cancel_batch, _campaign_id, _follow_run_id = _cancel_batches[
                             _batch_position
                         ]
+                        if _follow_run_id is not None:
+                            _scope_end = _batch_position
+                            while (
+                                _scope_end < len(_cancel_batches)
+                                and _cancel_batches[_scope_end][2] == _follow_run_id
+                            ):
+                                _scope_end += 1
+                            _scope_targets = [
+                                trade_id
+                                for batch, _campaign, _run in _cancel_batches[
+                                    _batch_position:_scope_end
+                                ]
+                                for trade_id in batch
+                                if trade_id not in _terminal_ids
+                            ]
+                            if _scope_targets:
+                                if callable(refresh_fee_pool):
+                                    refresh_fee_pool()
+                                _identity = database.get_follow_run_identity(
+                                    _follow_run_id
+                                )
+                                _preview = durable_manager.preview_follow_cancel_book(
+                                    [
+                                        [
+                                            trade_id
+                                            for trade_id in batch
+                                            if trade_id not in _terminal_ids
+                                        ]
+                                        for batch, _campaign, _run in _cancel_batches[
+                                            _batch_position:_scope_end
+                                        ]
+                                        if any(
+                                            trade_id not in _terminal_ids
+                                            for trade_id in batch
+                                        )
+                                    ],
+                                    run_id=_follow_run_id,
+                                    identity=_identity,
+                                    recovery_action="cancel_all",
+                                )
+                                if (
+                                    type(_preview) is not dict
+                                    or _preview.get("dispatch_authorized") is not False
+                                    or type(_preview.get("cohorts")) is not list
+                                    or [
+                                        trade_id
+                                        for batch in _preview["cohorts"]
+                                        for trade_id in batch
+                                    ]
+                                    != _scope_targets
+                                ):
+                                    raise ValueError("FOLLOW_CANCEL_PREVIEW_INVALID")
+                                _cancel_batches[_batch_position:_scope_end] = [
+                                    (list(batch), None, _follow_run_id)
+                                    for batch in _preview["cohorts"]
+                                ]
+                                _batch_capacity = max(
+                                    len(batch)
+                                    for batch, _campaign, _run in _cancel_batches
+                                )
+                                _deadline = max(
+                                    _deadline,
+                                    time.monotonic()
+                                    + _cancel_all_deadline_seconds(
+                                        len(_cancel_open_ids),
+                                        cfg.CANCEL_MAX_WAIT_SECS,
+                                        batch_count=len(_cancel_batches),
+                                    ),
+                                )
+                                _set_cancel_all_state(
+                                    batch_size=_batch_capacity,
+                                    total_batches=len(_cancel_batches),
+                                )
+                                _cancel_batch, _campaign_id, _follow_run_id = (
+                                    _cancel_batches[_batch_position]
+                                )
                         _batch_index = _batch_position + 1
                         _batch_targets = [
                             trade_id

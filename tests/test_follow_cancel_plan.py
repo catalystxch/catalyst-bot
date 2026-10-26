@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from importlib import import_module
+import time
 
 import database
 import follow_fee_cancellation
@@ -102,6 +103,137 @@ def test_follow_cancel_plan_keeps_exact_singleton_fee_input(monkeypatch):
     assert pool.reserved_count == 1
     assert reservation[0].release_ticket(reservation[1], reservation[2]) is True
     assert pool.reserved_count == 0
+
+
+@pytest.mark.parametrize(
+    ("remaining_fee", "fee_coin_count", "expected_reason"),
+    [
+        (100, 4, None),
+        (70, 4, "FEE_BUDGET_EXCEEDED"),
+        (100, 2, "FEE_PREP_FUNDING_INSUFFICIENT"),
+    ],
+)
+def test_follow_full_book_preflight_prices_all_cohorts_before_effect(
+    monkeypatch, remaining_fee, fee_coin_count, expected_reason
+):
+    pool = FeeCoinPool()
+    pool.refresh(
+        [
+            {"coin_id": f"{index + 100:064x}", "coin": {"amount": 1_000_000}}
+            for index in range(fee_coin_count)
+        ]
+    )
+    manager = OfferManager()
+    manager._fee_pool = pool
+    trade_ids = [f"{index:064x}" for index in range(1, 49)]
+    identity = {"network": "mainnet"}
+    monkeypatch.setattr(
+        manager,
+        "_canonical_cancel_intent",
+        lambda trade_id: SimpleNamespace(trade_id=trade_id, intent_id=trade_id),
+    )
+    monkeypatch.setattr(
+        database,
+        "get_effective_follow_fee_policy",
+        lambda **_kwargs: {
+            "ready": True,
+            "remaining_fee_mojos": remaining_fee,
+            "revision": 0,
+            "approval_id": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(database, "get_unresolved_offer_operation_blockers", lambda: [])
+    monkeypatch.setattr(
+        manager,
+        "cancel_offers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight must not dispatch")
+        ),
+    )
+    planned_fee_coins = []
+
+    def price(members, _run_id, _identity, _action):
+        if len(members) > 12:
+            raise ValueError("FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT")
+        reserved = pool.reserve_largest_with_ticket()
+        if reserved is None:
+            raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")
+        fee_coin_id, _amount, ticket = reserved
+        planned_fee_coins.append(fee_coin_id)
+        cohort = [member[0].trade_id for member in members]
+        return (
+            {
+                "trade_ids": cohort,
+                "source_coin_ids": cohort,
+                "fee_coin_id": fee_coin_id,
+            },
+            {"fee_mojos": 20, "quote": {"expires_at": int(time.time()) + 60}},
+            (pool, fee_coin_id, ticket),
+        )
+
+    monkeypatch.setattr(manager, "_plan_follow_cancel", price)
+    if expected_reason is not None:
+        with pytest.raises(ValueError, match=expected_reason):
+            manager.preview_follow_cancel_book(
+                [trade_ids], run_id=RUN, identity=identity, recovery_action="cancel_all"
+            )
+    else:
+        preview = manager.preview_follow_cancel_book(
+            [trade_ids], run_id=RUN, identity=identity, recovery_action="cancel_all"
+        )
+        assert preview["cohorts"] == [
+            trade_ids[index : index + 12] for index in range(0, 48, 12)
+        ]
+        assert preview["total_fee_mojos"] == 80
+        assert preview["dispatch_authorized"] is False
+        assert len(set(planned_fee_coins)) == 4
+    assert pool.reserved_count == 0
+
+
+def test_follow_full_book_preflight_rejects_fee_coin_used_by_later_offer(
+    monkeypatch,
+):
+    manager = OfferManager()
+    trade_ids = ["1" * 64, "2" * 64]
+    releases = []
+    pool = SimpleNamespace(
+        release_ticket=lambda coin_id, ticket: (
+            releases.append((coin_id, ticket)) or True
+        )
+    )
+    monkeypatch.setattr(
+        manager,
+        "_canonical_cancel_intent",
+        lambda trade_id: SimpleNamespace(trade_id=trade_id, intent_id=trade_id),
+    )
+    monkeypatch.setattr(
+        database,
+        "get_effective_follow_fee_policy",
+        lambda **_kwargs: {"ready": True, "remaining_fee_mojos": 100},
+    )
+
+    def price(members, _run_id, _identity, _action):
+        trade_id = members[0][0].trade_id
+        fee_coin_id = trade_ids[1] if trade_id == trade_ids[0] else "3" * 64
+        return (
+            {
+                "trade_ids": [trade_id],
+                "source_coin_ids": [trade_id],
+                "fee_coin_id": fee_coin_id,
+            },
+            {"fee_mojos": 20, "quote": {"expires_at": int(time.time()) + 60}},
+            (pool, fee_coin_id, len(releases) + 1),
+        )
+
+    monkeypatch.setattr(manager, "_plan_follow_cancel", price)
+    with pytest.raises(ValueError, match="FEE_CANCELLATION_PLAN_INVALID"):
+        manager.preview_follow_cancel_book(
+            [[trade_ids[0]], [trade_ids[1]]],
+            run_id=RUN,
+            identity={"network": "mainnet"},
+            recovery_action="cancel_all",
+        )
+    assert len(releases) == 2
 
 
 def test_follow_cancel_plan_refuses_coin_substitution(monkeypatch):

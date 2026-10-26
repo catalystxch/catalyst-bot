@@ -2859,6 +2859,12 @@ class TestCancelAllPost(_FlaskBase):
         stopped = _make_bot()
         stopped.is_running.return_value = False
         stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 48
+        stopped.offer_manager.preview_follow_cancel_book.side_effect = (
+            lambda cohorts, **_kwargs: {
+                "cohorts": cohorts,
+                "dispatch_authorized": False,
+            }
+        )
         trade_ids = [f"{index:064x}" for index in range(1, 49)]
         terminal_ids = set()
         submitted = []
@@ -2915,6 +2921,9 @@ class TestCancelAllPost(_FlaskBase):
                 side_effect=terminal_records,
             ),
             patch("database.get_unresolved_offer_operation_blockers", return_value=[]),
+            patch(
+                "database.get_follow_run_identity", return_value={"network": "mainnet"}
+            ),
             patch.object(api_server, "start_mutation_thread", side_effect=run_now),
         ):
             response = self._post("/api/offers/cancel_all")
@@ -2966,6 +2975,51 @@ class TestCancelAllPost(_FlaskBase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(attempts, [tuple(trade_ids)])
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
+
+    def test_stopped_follow_cancel_all_requires_aggregate_fee_preview(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        trade_ids = ["1" * 64, "2" * 64]
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 2
+        stopped.offer_manager.preview_follow_cancel_book.side_effect = ValueError(
+            "FEE_BUDGET_EXCEEDED"
+        )
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "offer_manager.OfferManager._cancel_fee_scope_groups",
+                return_value=[
+                    {
+                        "trade_ids": trade_ids,
+                        "campaign_id": None,
+                        "follow_run_id": "a" * 64,
+                    }
+                ],
+            ),
+            patch(
+                "database.get_follow_run_identity", return_value={"network": "mainnet"}
+            ),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                ],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        stopped.offer_manager.cancel_offers.assert_not_called()
         status = self._get(
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()

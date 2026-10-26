@@ -6338,7 +6338,7 @@ class BotLoop:
                 return False
         if trade_ids:
             try:
-                if follow_run_id is not None and len(trade_ids) > 12:
+                if follow_run_id is not None:
                     BotLoop._cancel_follow_reserve_floor_cohorts(
                         self, sorted(trade_ids)
                     )
@@ -6367,17 +6367,33 @@ class BotLoop:
         for Task 9 terminal proof of every member of the previous one.
         """
 
+        run_id = self._reviewed_follow_run_id
+        identity = database.get_follow_run_identity(run_id)
         pending = [trade_ids]
         while pending:
-            cohort = pending.pop(0)
-            if not cohort:
-                continue
             coin_manager = getattr(self, "coin_manager", None)
             refresh_fee_pool = getattr(
                 coin_manager, "refresh_fee_pool_from_wallet", None
             )
             if callable(refresh_fee_pool):
                 refresh_fee_pool()
+            expected_ids = [trade_id for batch in pending for trade_id in batch]
+            preview = self.offer_manager.preview_follow_cancel_book(
+                pending,
+                run_id=run_id,
+                identity=identity,
+                recovery_action="cancel_all",
+            )
+            if (
+                type(preview) is not dict
+                or preview.get("dispatch_authorized") is not False
+                or type(preview.get("cohorts")) is not list
+                or [trade_id for batch in preview["cohorts"] for trade_id in batch]
+                != expected_ids
+            ):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_PREVIEW_INVALID")
+            pending = [list(batch) for batch in preview["cohorts"]]
+            cohort = pending.pop(0)
             try:
                 results = self.offer_manager.cancel_offers(
                     cohort,

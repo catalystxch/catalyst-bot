@@ -6917,6 +6917,129 @@ class OfferManager:
             fee_pool.release_ticket(reserved_coin_id, ticket)
             raise
 
+    def preview_follow_cancel_book(
+        self,
+        cohorts: list[list[str]],
+        *,
+        run_id: str,
+        identity: dict,
+        recovery_action: str,
+    ) -> dict:
+        """Price every exact stopped-run cohort before the first wallet effect.
+
+        Keep fee inputs reserved only during this read-only preview so that
+        distinct cohorts cannot appear funded by the same spendable coin.
+        Dispatch later requotes and rechecks the durable cap independently.
+        """
+
+        if (
+            type(cohorts) is not list
+            or not cohorts
+            or any(type(cohort) is not list or not cohort for cohort in cohorts)
+            or recovery_action != "cancel_all"
+        ):
+            raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+        flattened = [trade_id for cohort in cohorts for trade_id in cohort]
+        if len(flattened) != len(set(flattened)):
+            raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+        now = int(time.time())
+        before = database.get_effective_follow_fee_policy(
+            run_id=run_id, identity=identity, now_epoch=now
+        )
+        if before.get("ready") is not True:
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+
+        pending = [list(cohort) for cohort in cohorts]
+        selected = []
+        reservations = []
+        all_source_ids = set()
+        all_fee_coin_ids = set()
+        try:
+            while pending:
+                cohort = pending.pop(0)
+                members = [
+                    (self._canonical_cancel_intent(trade_id), 1, "preview")
+                    for trade_id in cohort
+                ]
+                try:
+                    contract, priced, reservation = self._plan_follow_cancel(
+                        members, run_id, identity, recovery_action
+                    )
+                except ValueError as exc:
+                    if (
+                        str(exc)
+                        not in {
+                            "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT",
+                            "FEE_UNSIGNED_COST_UNAVAILABLE",
+                        }
+                        or len(cohort) == 1
+                        or database.get_unresolved_offer_operation_blockers()
+                    ):
+                        raise
+                    midpoint = len(cohort) // 2
+                    pending[0:0] = [cohort[:midpoint], cohort[midpoint:]]
+                    continue
+                if type(reservation) is not tuple or len(reservation) != 3:
+                    raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+                reservations.append(reservation)
+                if (
+                    type(contract) is not dict
+                    or contract.get("trade_ids") != cohort
+                    or type(contract.get("source_coin_ids")) is not list
+                    or len(contract["source_coin_ids"]) != len(cohort)
+                    or type(priced) is not dict
+                    or type(priced.get("fee_mojos")) is not int
+                    or priced["fee_mojos"] <= 0
+                    or type(priced.get("quote")) is not dict
+                    or type(priced["quote"].get("expires_at")) is not int
+                ):
+                    raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+                sources = set(contract["source_coin_ids"])
+                fee_coin_id = contract.get("fee_coin_id")
+                if (
+                    len(sources) != len(cohort)
+                    or sources & all_source_ids
+                    or type(fee_coin_id) is not str
+                    or fee_coin_id in all_fee_coin_ids
+                ):
+                    raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+                all_source_ids.update(sources)
+                all_fee_coin_ids.add(fee_coin_id)
+                selected.append((cohort, contract, priced))
+
+            if all_fee_coin_ids & all_source_ids:
+                raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
+
+            after = database.get_effective_follow_fee_policy(
+                run_id=run_id, identity=identity, now_epoch=int(time.time())
+            )
+            if after.get("ready") is not True or after != before:
+                raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+            if any(
+                priced["quote"]["expires_at"] <= int(time.time())
+                for _, _, priced in selected
+            ):
+                raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
+            total_fee = sum(priced["fee_mojos"] for _, _, priced in selected)
+            if total_fee > after["remaining_fee_mojos"]:
+                raise ValueError("FEE_BUDGET_EXCEEDED")
+            preview = {
+                "cohorts": [cohort for cohort, _contract, _priced in selected],
+                "total_fee_mojos": total_fee,
+                "remaining_fee_mojos": after["remaining_fee_mojos"],
+                "dispatch_authorized": False,
+            }
+        finally:
+            release_ok = True
+            for pool, coin_id, ticket in reservations:
+                try:
+                    release_ok = pool.release_ticket(coin_id, ticket) and release_ok
+                except Exception:
+                    release_ok = False
+            if not release_ok:
+                raise ValueError("FEE_CANCELLATION_FEE_POOL_CHANGED")
+        return preview
+
     @staticmethod
     def _prepare_cancel_member(
         intent: _CanonicalOfferCancelIntent,
