@@ -68,6 +68,12 @@ def test_fee_ceiling_review_is_append_only(approved):
         total_fee_mojos=120,
         cancellation_reserve_mojos=40,
     )
+    with pytest.raises(sqlite3.IntegrityError, match="binding mismatch"):
+        conn.execute(
+            "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
+            (run_id, 1, "1" * 64, revision_approval["approval_id"], 121, 40, 1003),
+        )
+    conn.rollback()
     conn.execute(
         "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
         (run_id, 1, "1" * 64, revision_approval["approval_id"], 120, 40, 1003),

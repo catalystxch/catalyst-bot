@@ -2180,6 +2180,29 @@ CREATE TABLE IF NOT EXISTS follow_fee_ceiling_revisions (
     confirmed_at_epoch INTEGER NOT NULL CHECK(typeof(confirmed_at_epoch)='integer' AND confirmed_at_epoch>=0),
     PRIMARY KEY(run_id, revision)
 );
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_binding_guard
+BEFORE INSERT ON follow_fee_ceiling_revisions
+WHEN NOT EXISTS (
+    SELECT 1 FROM follow_fee_ceiling_reviews AS review
+    JOIN follow_run_authorities AS run ON run.run_id=review.run_id
+    JOIN fee_approvals AS initial ON initial.approval_id=run.approval_id
+    JOIN fee_approvals AS revised ON revised.approval_id=NEW.approval_id
+    WHERE review.review_id=NEW.review_id AND review.run_id=NEW.run_id
+      AND review.prior_revision+1=NEW.revision
+      AND review.proposed_maximum_fee_mojos=NEW.maximum_fee_mojos
+      AND review.protected_shutdown_fee_mojos=NEW.protected_shutdown_fee_mojos
+      AND review.scope_sha256=initial.scope_sha256
+      AND review.plan_sha256=initial.plan_sha256
+      AND review.identity_sha256=run.identity_sha256
+      AND review.configuration_sha256=run.configuration_sha256
+      AND revised.scope_sha256=initial.scope_sha256
+      AND revised.plan_sha256=initial.plan_sha256
+      AND revised.total_fee_mojos=NEW.maximum_fee_mojos
+      AND revised.cancellation_reserve_mojos>=NEW.protected_shutdown_fee_mojos
+      AND NEW.confirmed_at_epoch>=review.reviewed_at_epoch
+      AND NEW.confirmed_at_epoch<review.expires_at_epoch
+)
+BEGIN SELECT RAISE(ABORT, 'Follow fee ceiling revision binding mismatch'); END;
 CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_update
 BEFORE UPDATE ON follow_fee_ceiling_revisions BEGIN
     SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
