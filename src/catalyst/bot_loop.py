@@ -6100,6 +6100,7 @@ class BotLoop:
         # caller must not bypass the reviewed financial run before workers
         # start. A fresh Sage active book requires a separate exact resume
         # review; it cannot silently inherit a new run's free-coin approval.
+        reviewed_follow_run_id = None
         try:
             bootstrap_context = self._bootstrap_campaign_context()
             if type(bootstrap_context) is not dict:
@@ -6120,6 +6121,7 @@ class BotLoop:
                     raise ValueError(
                         readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
                     )
+                reviewed_follow_run_id = readiness.get("run_id")
             else:
                 raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
         except Exception as exc:
@@ -6134,6 +6136,8 @@ class BotLoop:
                 data={"reason_code": reason},
             )
             return False
+
+        self._reviewed_follow_run_id = reviewed_follow_run_id
 
         self._watcher_stop_event.clear()
         self._running = True
@@ -6254,6 +6258,30 @@ class BotLoop:
         )
         return True
 
+    def _record_reviewed_follow_stop(self) -> bool:
+        """Revoke new Follow creation while retaining its cleanup fee scope."""
+        run_id = getattr(self, "_reviewed_follow_run_id", None)
+        if run_id is None:
+            return True
+        try:
+            import database
+
+            result = database.stop_follow_run_authority(
+                run_id=run_id, stopped_at_epoch=int(time.time())
+            )
+            if result.get("run_id") != run_id:
+                raise ValueError("FOLLOW_RUN_STOP_NOT_RECORDED")
+            return True
+        except Exception as exc:
+            log_event(
+                "error",
+                "follow_run_stop_not_recorded",
+                "Reviewed Follow run could not record its durable Stop; "
+                "the bot remains in stopping state",
+                data={"run_id": run_id, "error_type": type(exc).__name__},
+            )
+            return False
+
     def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
 
@@ -6294,6 +6322,7 @@ class BotLoop:
         # minutes after stop() returns, because the 10s join timeout
         # expires but the thread is still alive creating offers.
         self.offer_manager._stop_requested = True
+        self._record_reviewed_follow_stop()
 
         # Wake sleeping threads promptly. For GUI/API stop we return after
         # this signal and let the finalizer perform joins/cleanup.
@@ -6413,6 +6442,13 @@ class BotLoop:
             self._set_state(running=False, status="stopping")
             return False
 
+        if not self._record_reviewed_follow_stop():
+            self._set_state(
+                running=False,
+                status="stopping",
+                error="FOLLOW_RUN_STOP_NOT_RECORDED",
+            )
+            return False
         self._set_state(status="stopped")
 
         # Clear all operational alerts so they don't linger on the GUI after stop
@@ -6530,6 +6566,13 @@ class BotLoop:
                 self._set_state(running=False, status="stopping")
                 return
 
+            if not self._record_reviewed_follow_stop():
+                self._set_state(
+                    running=False,
+                    status="stopping",
+                    error="FOLLOW_RUN_STOP_NOT_RECORDED",
+                )
+                return
             self._set_state(running=False, status="stopped")
 
             for alert_id in (
