@@ -901,11 +901,33 @@ class TestBotStart(_FlaskBase):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
         ):
             resp = self._post("/api/bot/start")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertEqual(body.get("status"), "started")
+
+    def test_two_sided_follow_start_requires_current_review(self):
+        bot = _make_bot(running=False, start_returns=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": False, "reason": "FOLLOW_REVIEW_REQUIRED"},
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "FOLLOW_REVIEW_REQUIRED")
+        bot.start.assert_not_called()
 
     def test_wallet_identity_preflight_denial_blocks_start_with_stable_error(self):
         fake_cfg = _fake_cfg()
@@ -958,6 +980,10 @@ class TestBotStart(_FlaskBase):
             patch(
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
             ),
         ):
             resp = self._post("/api/bot/start")

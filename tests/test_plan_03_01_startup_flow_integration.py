@@ -483,6 +483,10 @@ class TestStartupPhase6BotStartValidation(_TempDB):
             ),
             patch.object(api_server.cfg, "CAT_ASSET_ID", asset_id),
             patch.object(api_server.cfg, "SPREAD_BPS", spread_bps),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
             patch("api_server.events"),
         ):
             return self.client.post(

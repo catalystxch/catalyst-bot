@@ -204,8 +204,8 @@ and exact priced shutdown hold remain required before a release build.
 
 **Files:** Native GUI, Flask routes/AppBridge, integration and browser tests, build workflow.
 
-- [ ] Present exact wallet, pair, 24/24 limits, duration, principal, 0.05 cap and shutdown reserve for native approval.
-- [ ] Require financial creation authority and scoped risk consent before Start; do not auto-start on either approval.
+- [x] Present exact wallet, pair, requested 24/24 limits, duration, principal, fee cap and shutdown reserve for native approval. The native confirmation records durable authority without starting the bot; rendered styling and original-profile review remain pending.
+- [ ] Require financial creation authority and scoped risk consent before every Start; do not auto-start on either approval. The HTTP Start path now rechecks two-sided Follow authority, current principal/slots and fee scope under the lifecycle lock. Exact retained-offer resume proof, one-sided Follow authority, direct BotLoop.start defense and a RED override when needed remain pending.
 - [ ] Show spent/held/remaining fees and clear review-needed reasons in GUI.
 - [ ] Run relevant full tests, Ruff, copied original-profile migration/replay, clean default Windows build, Defender and independent review.
 - [ ] Use the same exact built artifact on both original profiles after action-time executable confirmation and human wallet authentication.

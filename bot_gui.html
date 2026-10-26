@@ -33032,6 +33032,22 @@
                     updateStartupChecklist(bot_state);
                     updateDashboardStartupLayout(bot_state);
                     await openBootstrapFeeConsentReview();
+                } else if (['FOLLOW_REVIEW_REQUIRED', 'FOLLOW_REVIEW_CHANGED',
+                        'FOLLOW_REVIEW_UNAVAILABLE'].includes(result.reason)) {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    showToast('Review the exact Follow wallet, prepared slots and fee ceiling before starting.', 'warning');
+                    openFollowRunReview();
+                } else if (result.reason === 'FOLLOW_RESUME_REVIEW_REQUIRED') {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    showToast('The retained Follow offers need an exact run-bound resume review before Start.', 'warning');
                 } else if (result.needs_coin_prep) {
                     // Server detected wrong coin sizes — show coin prep modal
                     showToast(`Coins need re-splitting for ${result.target_xch} XCH offers`, 'warning');

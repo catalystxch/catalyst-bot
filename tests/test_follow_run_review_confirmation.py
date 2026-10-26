@@ -174,6 +174,28 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
         review["review_id"], review["review_sha256"]
     )
     assert len(run["run_id"]) == 64
+    from blueprints import bot as bot_routes
+    import confidence_override
+
+    monkeypatch.setattr(bot_routes.time, "time", lambda: 1_002)
+    monkeypatch.setattr(
+        confidence_override,
+        "current_scope",
+        lambda: {
+            "identity": proposal["identity"],
+            "configuration_sha256": proposal["configuration_sha256"],
+            "follow_run_id": run["run_id"],
+            "financial_consent_id": review["review_id"],
+        },
+    )
+    assert bot_routes._reviewed_follow_start_readiness(
+        SimpleNamespace(
+            LIQUIDITY_MODE="two_sided",
+            MAX_ACTIVE_BUY_OFFERS=24,
+            MAX_ACTIVE_SELL_OFFERS=24,
+        ),
+        resume_existing_offers=False,
+    ) == {"ready": True, "run_id": run["run_id"]}
     assert database.get_follow_run_review(review["review_id"])["consumed"] is True
     with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
         follow_principal.confirm_follow_run_review(
