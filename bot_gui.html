@@ -15438,6 +15438,7 @@
             if (m === 'POST' && clean === 'coins/topup')        return 'trigger_topup';
             if (m === 'GET'  && clean === 'coin-prep/status')   return 'get_coin_prep_status';
             if (m === 'POST' && clean === 'coin-prep/fee-preview') return 'preview_coin_prep_fees';
+            if (m === 'POST' && clean === 'follow/principal-preview') return 'preview_follow_principal';
             if (m === 'POST' && clean === 'coin-prep/fee-approval') return 'approve_coin_prep_fees';
             if (m === 'POST' && clean === 'coin-prep/trigger')  return 'trigger_coin_prep';
             if (m === 'POST' && clean === 'coin-prep/reset')    return 'reset_coin_prep';

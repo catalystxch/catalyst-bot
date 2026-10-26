@@ -1095,6 +1095,21 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:preview_follow_principal")
+    def preview_follow_principal(self, body=None):
+        """Read-only Follow principal proposal via the shared HTTP handler."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/follow/principal-preview",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_follow_principal_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -2130,6 +2145,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "fresh_start",
     "live_config",
     "preview_coin_prep_fees",
+    "preview_follow_principal",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

@@ -69,6 +69,15 @@ consent or wallet effects. The native review still must bind this digest and
 recheck the same live inventory at final consent; offer-sized Coin Prep and
 24/24 affordability remain to be proved before Start.
 
+The read-only Follow principal preview now requires a current, completed
+standalone Coin Prep fee approval. It verifies the stored approval scope and
+plan hashes, matches the wallet identity to a fresh selectable-coin snapshot,
+and rechecks approval accounting and configuration after that read. The
+response carries exact atomic amounts as JSON strings plus a proposal digest;
+the browser API and native bridge share the same handler. It records no
+consent or run authority. Persisting a single-use principal-bound review and
+rechecking it at the final native click remain pending.
+
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/bot_loop.py`, `src/catalyst/database.py`, focused tests.

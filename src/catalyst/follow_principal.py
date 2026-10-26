@@ -191,3 +191,97 @@ def read_follow_principal_snapshot(*, fee_cap_mojos: int) -> dict:
         ).encode("utf-8")
     ).hexdigest()
     return {**result, "identity": identity, "principal_review_sha256": proposal_sha256}
+
+
+def preview_approved_follow_principal(approval_id: str) -> dict:
+    """Bind a fresh principal proposal to one completed, current fee scope.
+
+    This is a read-only candidate for the native Follow review. The final
+    consent route must re-read it and consume a persisted single-use review.
+    """
+
+    import database
+    from confidence_override import current_configuration_digest
+
+    if (
+        type(approval_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
+    ):
+        raise ValueError("FOLLOW_FEE_APPROVAL_REQUIRED")
+    before = database.get_coin_prep_fee_approval_status(approval_id)
+    context = database.get_coin_prep_fee_approval_context(approval_id)
+    if (
+        type(before) is not dict
+        or before.get("approval_id") != approval_id
+        or before.get("stale") is not False
+        or before.get("session_completed") is not True
+        or before.get("unresolved_operation_count") != 0
+        or type(before.get("total_fee_mojos")) is not int
+        or before["total_fee_mojos"] <= 0
+        or type(before.get("cancellation_reserve_mojos")) is not int
+        or not 0 < before["cancellation_reserve_mojos"] <= before["total_fee_mojos"]
+        or type(context) is not dict
+        or context.get("version") != context.get("latest_version")
+    ):
+        raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+    scope_json = context.get("scope_json")
+    plan_json = context.get("plan_json")
+    if (
+        type(scope_json) is not str
+        or type(plan_json) is not str
+        or hashlib.sha256(scope_json.encode("utf-8")).hexdigest()
+        != context.get("scope_sha256")
+        or hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
+        != context.get("plan_sha256")
+    ):
+        raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
+    scope = json.loads(scope_json)
+    identity_keys = {
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "xch_wallet_id",
+        "asset_id",
+        "ticker",
+    }
+    if (
+        type(scope) is not dict
+        or scope.get("campaign_id") is not None
+        or type(scope.get("session_id")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", scope["session_id"]) is None
+    ):
+        raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
+    identity = {key: scope.get(key) for key in identity_keys}
+    configuration_sha256 = current_configuration_digest()
+    principal = read_follow_principal_snapshot(fee_cap_mojos=before["total_fee_mojos"])
+    after = database.get_coin_prep_fee_approval_status(approval_id)
+    if (
+        principal.get("identity") != identity
+        or type(principal.get("principal_review_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", principal["principal_review_sha256"]) is None
+        or after != before
+        or current_configuration_digest() != configuration_sha256
+    ):
+        raise ValueError("FOLLOW_PRINCIPAL_REVIEW_CHANGED")
+    review_terms = {
+        "approval_id": approval_id,
+        "scope_sha256": context["scope_sha256"],
+        "plan_sha256": context["plan_sha256"],
+        "configuration_sha256": configuration_sha256,
+        "principal_review_sha256": principal["principal_review_sha256"],
+        "maximum_fee_mojos": before["total_fee_mojos"],
+        "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
+    }
+    review_sha256 = hashlib.sha256(
+        json.dumps(review_terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        **principal,
+        **review_terms,
+        "review_sha256": review_sha256,
+        "spent_fee_mojos": before["spent_fee_mojos"],
+        "held_fee_mojos": before["held_fee_mojos"],
+        "remaining_fee_mojos": before["remaining_fee_mojos"],
+        "dispatch_authorized": False,
+    }

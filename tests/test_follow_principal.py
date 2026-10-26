@@ -1,11 +1,17 @@
 """A Follow review must bound trading principal after protected wallet funds."""
 
 from decimal import Decimal
+import hashlib
+import json
 
 import pytest
 
 from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
-from follow_principal import calculate_follow_principal, read_follow_principal_snapshot
+from follow_principal import (
+    calculate_follow_principal,
+    preview_approved_follow_principal,
+    read_follow_principal_snapshot,
+)
 
 
 def _coin(asset, marker, amount, *, purpose="", protected=False):
@@ -160,3 +166,142 @@ def test_fee_coin_cannot_also_be_a_wallet_reserve():
             fee_pool_principal_mojos=0,
             fee_reserve_coin_ids={"b" * 64},
         )
+
+
+def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypatch):
+    import confidence_override
+    import database
+    import follow_principal
+
+    approval_id = "a" * 64
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 123,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": "f" * 64,
+        "ticker": "MZ",
+    }
+    scope = {**identity, "campaign_id": None, "session_id": "b" * 64}
+    scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    plan_json = "{}"
+    context = {
+        "scope_json": scope_json,
+        "scope_sha256": hashlib.sha256(scope_json.encode()).hexdigest(),
+        "plan_json": plan_json,
+        "plan_sha256": hashlib.sha256(plan_json.encode()).hexdigest(),
+        "version": 1,
+        "latest_version": 1,
+    }
+    status = {
+        "approval_id": approval_id,
+        "stale": False,
+        "session_completed": True,
+        "unresolved_operation_count": 0,
+        "total_fee_mojos": 50_000_000_000,
+        "cancellation_reserve_mojos": 10_000_000_000,
+        "spent_fee_mojos": 0,
+        "held_fee_mojos": 0,
+        "remaining_fee_mojos": 50_000_000_000,
+    }
+    principal = {
+        "identity": identity,
+        "principal_review_sha256": "e" * 64,
+        "maximum_trade_xch_mojos": 100_000_000_000,
+        "maximum_trade_cat_atoms": 1_000_000,
+        "dispatch_authorized": False,
+    }
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_context", lambda _id: context
+    )
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_status", lambda _id: dict(status)
+    )
+    monkeypatch.setattr(
+        follow_principal, "read_follow_principal_snapshot", lambda **_kw: principal
+    )
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "f" * 64
+    )
+    result = preview_approved_follow_principal(approval_id)
+    assert result["identity"] == identity
+    assert result["maximum_trade_xch_mojos"] == 100_000_000_000
+    assert result["maximum_fee_mojos"] == 50_000_000_000
+    assert result["configuration_sha256"] == "f" * 64
+    assert len(result["review_sha256"]) == 64
+    assert result["dispatch_authorized"] is False
+    status["stale"] = True
+    with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_STALE"):
+        preview_approved_follow_principal(approval_id)
+    status["stale"] = False
+    drifted = dict(principal)
+    drifted["identity"] = {**identity, "wallet_fingerprint": 456}
+    monkeypatch.setattr(
+        follow_principal, "read_follow_principal_snapshot", lambda **_kw: drifted
+    )
+    with pytest.raises(ValueError, match="FOLLOW_PRINCIPAL_REVIEW_CHANGED"):
+        preview_approved_follow_principal(approval_id)
+
+
+def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkeypatch):
+    import confidence_override
+    import database
+    import follow_principal
+
+    approval_id = "a" * 64
+    scope = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 123,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": "f" * 64,
+        "ticker": "MZ",
+        "campaign_id": None,
+        "session_id": "b" * 64,
+    }
+    scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    context = {
+        "scope_json": scope_json,
+        "scope_sha256": hashlib.sha256(scope_json.encode()).hexdigest(),
+        "plan_json": "{}",
+        "plan_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "version": 1,
+        "latest_version": 1,
+    }
+    status = {
+        "approval_id": approval_id,
+        "stale": False,
+        "session_completed": True,
+        "unresolved_operation_count": 0,
+        "total_fee_mojos": 50_000_000_000,
+        "cancellation_reserve_mojos": 10_000_000_000,
+        "spent_fee_mojos": 0,
+        "held_fee_mojos": 0,
+        "remaining_fee_mojos": 50_000_000_000,
+    }
+    calls = iter((dict(status), {**status, "held_fee_mojos": 1}))
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_status", lambda _id: next(calls)
+    )
+    monkeypatch.setattr(
+        database, "get_coin_prep_fee_approval_context", lambda _id: context
+    )
+    monkeypatch.setattr(
+        follow_principal,
+        "read_follow_principal_snapshot",
+        lambda **_kw: {
+            "identity": {
+                key: scope[key]
+                for key in scope
+                if key not in {"campaign_id", "session_id"}
+            },
+            "principal_review_sha256": "e" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "f" * 64
+    )
+    with pytest.raises(ValueError, match="FOLLOW_PRINCIPAL_REVIEW_CHANGED"):
+        preview_approved_follow_principal(approval_id)

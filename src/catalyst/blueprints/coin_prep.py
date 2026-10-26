@@ -115,13 +115,65 @@ def _fee_json_amounts(value):
     if type(value) is dict:
         return {
             key: str(item)
-            if key.endswith("_mojos") and type(item) is int
+            if key.endswith(("_mojos", "_atoms")) and type(item) is int
             else _fee_json_amounts(item)
             for key, item in value.items()
         }
     if type(value) is list:
         return [_fee_json_amounts(item) for item in value]
     return value
+
+
+@bp.route("/api/follow/principal-preview", methods=["POST"])
+def api_follow_principal_preview():
+    """Read the current approved Follow principal without consent or effects."""
+    from follow_principal import preview_approved_follow_principal
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if (
+        type(body) is not dict
+        or set(body) != {"approval_id"}
+        or type(body["approval_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_PRINCIPAL_REQUEST_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
+    try:
+        result = preview_approved_follow_principal(body["approval_id"])
+        return jsonify(_fee_json_amounts({**result, "success": True}))
+    except ValueError as exc:
+        reason = str(exc)
+        if reason not in {
+            "FOLLOW_FEE_APPROVAL_STALE",
+            "FOLLOW_FEE_SCOPE_INVALID",
+            "FOLLOW_PRINCIPAL_REVIEW_CHANGED",
+            "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
+            "FOLLOW_TRADING_PRINCIPAL_UNAVAILABLE",
+            "FOLLOW_PRINCIPAL_INVENTORY_INVALID",
+            "FOLLOW_FEE_POOL_UNAVAILABLE",
+            "FEE_WALLET_INVENTORY_UNAVAILABLE",
+            "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            "FEE_WALLET_ASSET_UNAVAILABLE",
+        }:
+            reason = "FOLLOW_PRINCIPAL_UNAVAILABLE"
+        return jsonify(
+            {"success": False, "reason": reason, "dispatch_authorized": False}
+        ), 409
+    except Exception:
+        slog("FOLLOW", "Principal preview could not read current wallet", level="error")
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_PRINCIPAL_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        ), 503
 
 
 @bp.route("/api/coin-prep/fee-preview", methods=["POST"])
