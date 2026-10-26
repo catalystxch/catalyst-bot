@@ -32903,11 +32903,12 @@
                     `Wallet ${id.wallet_fingerprint} · ${id.network} · ${id.ticker}\n` +
                     `Asset ${id.asset_id}\n` +
                     `Prepared slots: ${buyLimit} BUY / ${sellLimit} SELL\n` +
-                    `Maximum selectable trade XCH: ${review.maximum_trade_xch_mojos} mojos\n` +
+                    `Maximum selectable trade XCH: ${formatFollowFeeMojos(review.maximum_trade_xch_mojos)}\n` +
                     `Maximum selectable trade token: ${review.maximum_trade_cat_atoms} atoms\n` +
-                    `Protected fee principal: ${review.protected_fee_principal_mojos} mojos\n` +
-                    `Cumulative fee ceiling: ${review.maximum_fee_mojos} mojos\n` +
-                    `Protected cancellation reserve: ${review.cancellation_reserve_mojos} mojos\n` +
+                    `Protected fee principal: ${formatFollowFeeMojos(review.protected_fee_principal_mojos)}\n` +
+                    `Cumulative fee ceiling: ${formatFollowFeeMojos(review.maximum_fee_mojos)}\n` +
+                    `Protected cancellation reserve: ${formatFollowFeeMojos(review.cancellation_reserve_mojos)}\n` +
+                    `The live book's cancellation fee will be quoted again as offers are created.\n` +
                     `Authority: ${continuous ? 'continuous until stopped or fee/safety limit' : 'expires ' + new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
                     `This exact review expires: ${new Date(review.review_expires_at_epoch * 1000).toISOString()}`;
                 accept.disabled = false;
@@ -32992,6 +32993,10 @@
         }
 
         function formatFollowFeeMojos(mojos) {
+            if ((typeof mojos === 'number' && !Number.isSafeInteger(mojos))
+                || !/^(?:0|[1-9][0-9]*)$/.test(String(mojos))) {
+                throw new Error('Exact Follow fee amount unavailable. Refresh the review.');
+            }
             const amount = BigInt(mojos);
             const whole = amount / 1000000000000n;
             const fraction = (amount % 1000000000000n).toString()
