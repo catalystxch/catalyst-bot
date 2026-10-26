@@ -18,10 +18,11 @@ def test_external_cancel_review_disables_broad_cancel_and_shows_exact_fee(page):
             bot_state = {running: false, offers: {buy: [], sell: [{trade_id: 'b'.repeat(64)}]}};
             window.__externalCommitCalls = [];
             const review = {
-                intent_id: 'a'.repeat(64), trade_id: 'b'.repeat(64),
+                intent_id: 'a'.repeat(64), trade_id: 'b'.repeat(64), side: 'sell',
                 wallet_fingerprint: 736588221, network: 'mainnet',
                 asset_id: 'd'.repeat(64), input_coin_id: 'e'.repeat(64),
-                return_coin_id: 'f'.repeat(64), returned_amount_atomic: '24166667',
+                return_coin_id: 'f'.repeat(64), returned_asset_id: 'd'.repeat(64),
+                returned_amount_atomic: '24166667',
                 fee_mojos: '10000000', confirmed_height: 9483977,
                 proof_digest: '1'.repeat(64), expires_at_epoch: 9999999999,
                 wallet_effect_started: false
@@ -43,6 +44,7 @@ def test_external_cancel_review_disables_broad_cancel_and_shows_exact_fee(page):
     )
     expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
     expect(page.locator("#externalCancelPanel")).to_be_visible()
+    expect(page.locator("#externalCancelSummary")).to_contain_text("CAT atoms")
     expect(page.locator("#externalCancelFee")).to_contain_text("0.000010000000 XCH")
     expect(page.locator("#externalCancelCommitBtn")).to_be_enabled()
     assert page.evaluate("window.__externalCommitCalls") == []
@@ -76,3 +78,29 @@ def test_external_cancel_identity_outage_keeps_broad_cancel_disabled(page):
     expect(page.locator("#externalCancelSummary")).to_contain_text(
         "Exact cancellation proof is unavailable"
     )
+
+
+def test_external_buy_cancellation_review_labels_xch_mojos(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """async () => {
+            IS_DESKTOP = true;
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            document.getElementById('cancelConfirmModal').classList.add('active');
+            const review = {
+                intent_id: 'a'.repeat(64), trade_id: 'b'.repeat(64), side: 'buy',
+                wallet_fingerprint: 123, network: 'mainnet',
+                asset_id: 'd'.repeat(64), input_coin_id: 'e'.repeat(64),
+                return_coin_id: 'f'.repeat(64), returned_asset_id: 'xch',
+                returned_amount_atomic: '24166667', fee_mojos: '10000000',
+                confirmed_height: 9483977, proof_digest: '1'.repeat(64),
+                expires_at_epoch: 9999999999, wallet_effect_started: false
+            };
+            window.pywebview = {api: {
+                preview_external_cancellation: async () => ({success: true, review})
+            }};
+            await loadExternalCancelReview();
+        }"""
+    )
+    expect(page.locator("#externalCancelSummary")).to_contain_text("BUY ")
+    expect(page.locator("#externalCancelSummary")).to_contain_text("XCH mojos")

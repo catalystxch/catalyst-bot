@@ -33560,6 +33560,10 @@
                 const review = response.review;
                 if (review.wallet_effect_started !== false
                         || typeof review.trade_id !== 'string'
+                        || !['buy', 'sell'].includes(review.side)
+                        || (review.returned_asset_id !== 'xch'
+                            && review.returned_asset_id !== review.asset_id)
+                        || (review.side === 'buy') !== (review.returned_asset_id === 'xch')
                         || typeof review.proof_digest !== 'string'
                         || typeof review.fee_mojos !== 'string'
                         || typeof review.returned_amount_atomic !== 'string') {
@@ -33567,10 +33571,12 @@
                 }
                 const fee = BigInt(review.fee_mojos);
                 const feeXch = `${fee / 1000000000000n}.${(fee % 1000000000000n).toString().padStart(12, '0')}`;
+                const returnedAsset = review.returned_asset_id === 'xch' ? 'XCH' : 'CAT';
+                const returnedUnit = review.returned_asset_id === 'xch' ? 'XCH mojos' : 'CAT atoms';
                 document.getElementById('externalCancelSummary').textContent =
-                    `Sage proves SELL ${review.trade_id} cancelled at block ${review.confirmed_height}. ` +
-                    `Selected CAT coin ${review.input_coin_id} returned as ${review.return_coin_id} ` +
-                    `(${review.returned_amount_atomic} atoms). No wallet transaction will be sent.`;
+                    `Sage proves ${review.side.toUpperCase()} ${review.trade_id} cancelled at block ${review.confirmed_height}. ` +
+                    `Selected ${returnedAsset} coin ${review.input_coin_id} returned as ${review.return_coin_id} ` +
+                    `(${review.returned_amount_atomic} ${returnedUnit}). No wallet transaction will be sent.`;
                 document.getElementById('externalCancelIdentity').textContent =
                     `Wallet ${review.wallet_fingerprint}, ${review.network}; CAT asset ${review.asset_id}.`;
                 document.getElementById('externalCancelFee').textContent =

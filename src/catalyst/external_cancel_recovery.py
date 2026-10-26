@@ -147,16 +147,21 @@ def _verified_external_proof():
         if json.loads(canonical).get("bounded") is True:
             raise ValueError("external cancellation proof exceeds review limit")
         returned = classified["coin_rebindings"][0]
+        expected_return_asset = "xch" if before["side"] == "buy" else asset_id
+        if returned.get("asset_id") != expected_return_asset:
+            raise ValueError("external cancellation returned asset differs")
         reviewed_at = int(time.time())
         review = {
             "intent_id": before["intent_id"],
             "trade_id": before["sage_trade_id"],
+            "side": before["side"],
             "wallet_fingerprint": binding.fingerprint,
             "wallet_fingerprint_hash": before["wallet_fingerprint_hash"],
             "network": before["network"],
             "asset_id": before["asset_id"],
             "input_coin_id": returned["input_coin_id"],
             "return_coin_id": returned["return_coin_id"],
+            "returned_asset_id": returned["asset_id"],
             "returned_amount_atomic": str(returned["amount"]),
             "fee_mojos": str(classified["fee_mojos"]),
             "confirmed_height": classified["block_height"],
