@@ -2159,6 +2159,8 @@ CREATE TABLE IF NOT EXISTS follow_fee_ceiling_reviews (
     proposed_maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(proposed_maximum_fee_mojos)='integer' AND proposed_maximum_fee_mojos>0),
     protected_shutdown_fee_mojos INTEGER NOT NULL CHECK(typeof(protected_shutdown_fee_mojos)='integer' AND protected_shutdown_fee_mojos>0),
     observed_fee_principal_mojos INTEGER NOT NULL CHECK(typeof(observed_fee_principal_mojos)='integer' AND observed_fee_principal_mojos>=0),
+    reviewed_spent_fee_mojos INTEGER NOT NULL CHECK(typeof(reviewed_spent_fee_mojos)='integer' AND reviewed_spent_fee_mojos>=0),
+    reviewed_held_fee_mojos INTEGER NOT NULL CHECK(typeof(reviewed_held_fee_mojos)='integer' AND reviewed_held_fee_mojos>=0),
     reviewed_at_epoch INTEGER NOT NULL CHECK(typeof(reviewed_at_epoch)='integer' AND reviewed_at_epoch>=0),
     expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>reviewed_at_epoch)
 );
@@ -4586,6 +4588,8 @@ _STABILITY_REQUIRED_COLUMNS = {
         "proposed_maximum_fee_mojos",
         "protected_shutdown_fee_mojos",
         "observed_fee_principal_mojos",
+        "reviewed_spent_fee_mojos",
+        "reviewed_held_fee_mojos",
         "reviewed_at_epoch",
         "expires_at_epoch",
     },
@@ -6749,9 +6753,9 @@ _FOLLOW_SCHEMA_TABLES = frozenset(
     {"follow_run_reviews", "follow_run_authorities", "follow_run_stops"}
 )
 _FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY = "follow-fee-ceiling-revision-schema"
-_FOLLOW_FEE_CEILING_SCHEMA_VERSION = 1
+_FOLLOW_FEE_CEILING_SCHEMA_VERSION = 2
 _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256 = hashlib.sha256(
-    b"follow-fee-ceiling-revision:v1:immutable-review-and-revision"
+    b"follow-fee-ceiling-revision:v2:immutable-review-ledger-and-revision"
 ).hexdigest()
 _FOLLOW_FEE_CEILING_SCHEMA_TABLES = frozenset(
     {"follow_fee_ceiling_reviews", "follow_fee_ceiling_revisions"}
@@ -23258,6 +23262,8 @@ _FOLLOW_FEE_CEILING_REVIEW_TERMS = (
     "proposed_maximum_fee_mojos",
     "protected_shutdown_fee_mojos",
     "observed_fee_principal_mojos",
+    "reviewed_spent_fee_mojos",
+    "reviewed_held_fee_mojos",
     "reviewed_at_epoch",
     "expires_at_epoch",
 )
@@ -23320,6 +23326,8 @@ def create_follow_fee_ceiling_review(
         "proposed_maximum_fee_mojos": proposed,
         "protected_shutdown_fee_mojos": protected,
         "observed_fee_principal_mojos": observed_principal,
+        "reviewed_spent_fee_mojos": policy["spent_fee_mojos"],
+        "reviewed_held_fee_mojos": policy["held_fee_mojos"],
         "reviewed_at_epoch": now_epoch,
         "expires_at_epoch": now_epoch + 300,
     }
@@ -23365,7 +23373,7 @@ def create_follow_fee_ceiling_review(
         ):
             raise ValueError("FOLLOW_FEE_REVISION_CHANGED")
         conn.execute(
-            "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 review_id,
                 review_sha256,
@@ -23379,6 +23387,8 @@ def create_follow_fee_ceiling_review(
                 proposed,
                 protected,
                 observed_principal,
+                policy["spent_fee_mojos"],
+                policy["held_fee_mojos"],
                 now_epoch,
                 now_epoch + 300,
             ),
@@ -23417,6 +23427,133 @@ def get_follow_fee_ceiling_review(review_id: str) -> Dict[str, Any]:
             "consumed": bool(row["consumed"]),
             "dispatch_authorized": False,
         }
+    finally:
+        conn.close()
+
+
+def confirm_follow_fee_ceiling_review(
+    *,
+    review_id: str,
+    review_sha256: str,
+    identity: dict,
+    configuration_sha256: str,
+    observed_fee_principal_mojos: int,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Consume one exact native-reviewed ceiling in a serialized DB transaction.
+
+    The trusted native service must re-read the wallet fee principal and pass
+    its exact value. This function does not reserve, dispatch, or start trading.
+    """
+
+    review = _fee_digest(review_id)
+    digest = _fee_digest(review_sha256)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    principal = _fee_amount(observed_fee_principal_mojos)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_reviews WHERE review_id=?", (review,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+        if conn.execute(
+            "SELECT 1 FROM follow_fee_ceiling_revisions WHERE review_id=?", (review,)
+        ).fetchone():
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_USED")
+        if (
+            row["review_sha256"] != digest
+            or _follow_fee_ceiling_review_digest(row) != digest
+            or row["identity_sha256"] != identity_hash
+            or row["configuration_sha256"] != config_hash
+            or row["observed_fee_principal_mojos"] != principal
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        if not row["reviewed_at_epoch"] <= now_epoch < row["expires_at_epoch"]:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_EXPIRED")
+        run = conn.execute(
+            "SELECT run.*, approval.scope_sha256,approval.plan_sha256 "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.run_id=?",
+            (row["run_id"],),
+        ).fetchone()
+        latest = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (row["run_id"],),
+        ).fetchone()
+        if (
+            run is None
+            or conn.execute(
+                "SELECT 1 FROM follow_run_stops WHERE run_id=?", (row["run_id"],)
+            ).fetchone()
+            or not run["started_at_epoch"] <= now_epoch < run["expires_at_epoch"]
+            or run["identity_sha256"] != identity_hash
+            or run["configuration_sha256"] != config_hash
+            or run["scope_sha256"] != row["scope_sha256"]
+            or run["plan_sha256"] != row["plan_sha256"]
+            or (latest["revision"] if latest else 0) != row["prior_revision"]
+            or (latest["maximum_fee_mojos"] if latest else run["maximum_fee_mojos"])
+            != row["prior_maximum_fee_mojos"]
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        previous_approval = latest["approval_id"] if latest else run["approval_id"]
+        latest_approval = conn.execute(
+            "SELECT approval_id FROM fee_approvals WHERE scope_sha256=? "
+            "ORDER BY version DESC LIMIT 1",
+            (row["scope_sha256"],),
+        ).fetchone()
+        totals = _fee_scope_totals(conn, row["scope_sha256"])
+        committed = totals["committed_fee_mojos"]
+        proposed = row["proposed_maximum_fee_mojos"]
+        if (
+            latest_approval is None
+            or latest_approval["approval_id"] != previous_approval
+            or totals["spent_fee_mojos"] != row["reviewed_spent_fee_mojos"]
+            or totals["held_fee_mojos"] != row["reviewed_held_fee_mojos"]
+            or proposed == row["prior_maximum_fee_mojos"]
+            or proposed < committed + row["protected_shutdown_fee_mojos"]
+            or principal < proposed - committed
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        approval_id = _insert_fee_approval(
+            conn,
+            row["scope_sha256"],
+            row["plan_sha256"],
+            proposed,
+            row["protected_shutdown_fee_mojos"],
+        )
+        revision = row["prior_revision"] + 1
+        conn.execute(
+            "INSERT INTO follow_fee_ceiling_revisions VALUES (?,?,?,?,?,?,?)",
+            (
+                row["run_id"],
+                revision,
+                review,
+                approval_id,
+                proposed,
+                row["protected_shutdown_fee_mojos"],
+                now_epoch,
+            ),
+        )
+        conn.commit()
+        return {
+            "run_id": row["run_id"],
+            "revision": revision,
+            "approval_id": approval_id,
+            "maximum_fee_mojos": proposed,
+            "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

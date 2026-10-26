@@ -55,6 +55,47 @@ def test_ceiling_review_freezes_active_run_without_creating_authority(approved):
     )
 
 
+def test_service_funds_review_from_exact_selectable_fee_coin(approved, monkeypatch):
+    from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
+    import coin_prep_fee_runtime
+    import confidence_override
+    import follow_principal
+
+    run_id, identity = _run(approved)
+    coin_id = "f" * 64
+    observed = {
+        "identity": identity,
+        "snapshot": CoinSnapshot(
+            (SelectableCoin("xch", coin_id, 120, "", True, False),)
+        ),
+    }
+    monkeypatch.setattr(
+        coin_prep_fee_runtime, "read_fee_wallet_snapshot", lambda: observed
+    )
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "a" * 64
+    )
+    monkeypatch.setattr(
+        database,
+        "get_free_coins",
+        lambda asset: [{"coin_id": coin_id, "purpose": "fee_reserve"}],
+    )
+    monkeypatch.setattr(follow_principal.time, "time", lambda: 1002)
+    review = follow_principal.prepare_follow_fee_ceiling_review(
+        run_id, proposed_maximum_fee_mojos=120
+    )
+    assert review["observed_fee_principal_mojos"] == 120
+    assert review["proposed_maximum_fee_mojos"] == 120
+    assert review["reviewed_spent_fee_mojos"] == 0
+    assert review["reviewed_held_fee_mojos"] == 0
+    assert review["dispatch_authorized"] is False
+    confirmed = follow_principal.confirm_follow_fee_ceiling_review(
+        review["review_id"], review["review_sha256"]
+    )
+    assert confirmed["revision"] == 1
+    assert confirmed["dispatch_authorized"] is False
+
+
 @pytest.mark.parametrize(
     ("proposed", "principal", "configuration"),
     [
@@ -97,6 +138,119 @@ def test_ceiling_review_rejects_stopped_run(approved):
             observed_fee_principal_mojos=120,
             now_epoch=1004,
         )
+
+
+def test_confirmed_ceiling_revision_is_atomic_and_single_use(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    result = database.confirm_follow_fee_ceiling_review(
+        review_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        identity=identity,
+        configuration_sha256="a" * 64,
+        observed_fee_principal_mojos=120,
+        now_epoch=1003,
+    )
+    assert result["revision"] == 1
+    assert result["maximum_fee_mojos"] == 120
+    assert result["dispatch_authorized"] is False
+    policy = database.get_effective_follow_fee_policy(
+        run_id=run_id, identity=identity, now_epoch=1004
+    )
+    assert policy["approval_id"] == result["approval_id"]
+    assert policy["maximum_fee_mojos"] == 120
+    assert (
+        database.get_follow_fee_ceiling_review(review["review_id"])["consumed"] is True
+    )
+    with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_REVIEW_USED"):
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            identity=identity,
+            configuration_sha256="a" * 64,
+            observed_fee_principal_mojos=120,
+            now_epoch=1004,
+        )
+
+
+@pytest.mark.parametrize(
+    ("digest", "config", "principal", "epoch", "reason"),
+    [
+        ("0" * 64, "a" * 64, 120, 1003, "REVIEW_CHANGED"),
+        (None, "b" * 64, 120, 1003, "REVIEW_CHANGED"),
+        (None, "a" * 64, 119, 1003, "REVIEW_CHANGED"),
+        (None, "a" * 64, 120, 1302, "REVIEW_EXPIRED"),
+    ],
+)
+def test_ceiling_confirmation_rejects_changed_or_expired_review_without_approval(
+    approved, digest, config, principal, epoch, reason
+):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    with pytest.raises(ValueError, match=f"FOLLOW_FEE_REVISION_{reason}"):
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=digest or review["review_sha256"],
+            identity=identity,
+            configuration_sha256=config,
+            observed_fee_principal_mojos=principal,
+            now_epoch=epoch,
+        )
+    conn = database.get_connection()
+    assert (
+        conn.execute("SELECT count(*) FROM follow_fee_ceiling_revisions").fetchone()[0]
+        == 0
+    )
+    assert conn.execute("SELECT count(*) FROM fee_approvals").fetchone()[0] == 1
+    assert (
+        database.get_follow_fee_ceiling_review(review["review_id"])["consumed"] is False
+    )
+
+
+def test_ceiling_confirmation_rejects_new_fee_hold_after_review(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    database.reserve_approved_fee(
+        approval_id=approved["approval"]["approval_id"],
+        scope_sha256=approved["approval"]["scope_sha256"],
+        plan_sha256=approved["approval"]["plan_sha256"],
+        operation_id="1" * 64,
+        fee_mojos=1,
+        cancellation=False,
+    )
+    with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_REVIEW_CHANGED"):
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            identity=identity,
+            configuration_sha256="a" * 64,
+            observed_fee_principal_mojos=120,
+            now_epoch=1003,
+        )
+    assert (
+        database.get_follow_fee_ceiling_review(review["review_id"])["consumed"] is False
+    )
 
 
 def test_ceiling_review_getter_rejects_wrong_digest(approved):
@@ -198,7 +352,7 @@ def test_fee_ceiling_review_is_append_only(approved):
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     conn = database.get_connection()
     conn.execute(
-        "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "1" * 64,
             "2" * 64,
@@ -212,6 +366,8 @@ def test_fee_ceiling_review_is_append_only(approved):
             120,
             40,
             120,
+            0,
+            0,
             1002,
             1302,
         ),

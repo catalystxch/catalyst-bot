@@ -592,6 +592,124 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
         return {**authority, "dispatch_authorized": False}
 
 
+def _current_follow_fee_funding(run_id: str) -> dict:
+    """Read selectable designated fee coins for the exact running wallet."""
+
+    import database
+    from coin_prep_fee_runtime import read_fee_wallet_snapshot
+    from confidence_override import current_configuration_digest
+
+    expected_identity = database.get_follow_run_identity(run_id)
+    observed = read_fee_wallet_snapshot()
+    if type(observed) is not dict or observed.get("identity") != expected_identity:
+        raise ValueError("FOLLOW_FEE_REVISION_WALLET_CHANGED")
+    snapshot = observed.get("snapshot")
+    if type(snapshot) is not CoinSnapshot:
+        raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+    rows = database.get_free_coins("xch")
+    if type(rows) is not list:
+        raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+    fee_ids = {
+        row["coin_id"]
+        for row in rows
+        if type(row) is dict and row.get("purpose") == "fee_reserve"
+    }
+    if not fee_ids or any(
+        type(coin_id) is not str or re.fullmatch(r"[0-9a-f]{64}", coin_id) is None
+        for coin_id in fee_ids
+    ):
+        raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+    seen = set()
+    total = 0
+    for coin in snapshot.coins:
+        if coin.coin_id in fee_ids:
+            if (
+                coin.coin_id in seen
+                or coin.asset != "xch"
+                or coin.selectable is not True
+                or type(coin.amount_mojos) is not int
+                or coin.amount_mojos <= 0
+                or coin.purpose == "reserve"
+            ):
+                raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+            seen.add(coin.coin_id)
+            total += coin.amount_mojos
+    if seen != fee_ids:
+        raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+    return {
+        "identity": expected_identity,
+        "configuration_sha256": current_configuration_digest(),
+        "observed_fee_principal_mojos": total,
+        "dispatch_authorized": False,
+    }
+
+
+def prepare_follow_fee_ceiling_review(
+    run_id: str, *, proposed_maximum_fee_mojos: int
+) -> dict:
+    """Freeze a fee-ceiling proposal from a fresh trusted wallet read."""
+
+    import database
+
+    if (
+        type(run_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", run_id) is None
+        or type(proposed_maximum_fee_mojos) is not int
+        or proposed_maximum_fee_mojos <= 0
+    ):
+        raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    observed = _current_follow_fee_funding(run_id)
+    now_epoch = int(time.time())
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=observed["identity"],
+        configuration_sha256=observed["configuration_sha256"],
+        proposed_maximum_fee_mojos=proposed_maximum_fee_mojos,
+        observed_fee_principal_mojos=observed["observed_fee_principal_mojos"],
+        now_epoch=now_epoch,
+    )
+    if _current_follow_fee_funding(run_id) != observed:
+        raise ValueError("FOLLOW_FEE_REVISION_WALLET_CHANGED")
+    return {
+        **database.get_follow_fee_ceiling_review(review["review_id"]),
+        "dispatch_authorized": False,
+    }
+
+
+def confirm_follow_fee_ceiling_review(review_id: str, review_sha256: str) -> dict:
+    """Consume the exact native review against a fresh wallet funding read."""
+
+    import api_server
+    import database
+
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (review_id, review_sha256)
+    ):
+        raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+    with api_server._bot_cancel_lifecycle_lock:
+        review = database.get_follow_fee_ceiling_review(review_id)
+        if review["consumed"]:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_USED")
+        if review["review_sha256"] != review_sha256:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_CHANGED")
+        observed = _current_follow_fee_funding(review["run_id"])
+        if (
+            observed["configuration_sha256"] != review["configuration_sha256"]
+            or observed["observed_fee_principal_mojos"]
+            != review["observed_fee_principal_mojos"]
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_WALLET_CHANGED")
+        return database.confirm_follow_fee_ceiling_review(
+            review_id=review_id,
+            review_sha256=review_sha256,
+            identity=observed["identity"],
+            configuration_sha256=observed["configuration_sha256"],
+            observed_fee_principal_mojos=observed["observed_fee_principal_mojos"],
+            now_epoch=int(time.time()),
+        )
+
+
 def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) -> dict:
     """Reprove a two-sided Follow run immediately before the trading thread starts.
 

@@ -35,7 +35,7 @@ def test_existing_profile_can_install_revision_schema_once(isolated_db):
             "SELECT schema_version FROM stability_migration_watermarks WHERE migration_key=?",
             (KEY,),
         ).fetchone()[0]
-        == 1
+        == 2
     )
     assert all(
         conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
