@@ -96,6 +96,194 @@ def test_follow_reserve_floor_includes_offer_created_before_quiescence(monkeypat
     )
 
 
+def test_follow_reserve_floor_splits_oversized_48_book_and_proves_each_cohort(
+    monkeypatch,
+):
+    loop, calls = _fake_loop()
+    monkeypatch.setattr(
+        bot_loop.database, "get_unresolved_offer_operation_blockers", lambda: []
+    )
+    trade_ids = [f"{index:064x}" for index in range(1, 49)]
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "purpose": f"follow:{RUN_ID}:normal_lifecycle",
+                "sage_trade_id": trade_id,
+                "lifecycle_state": "visible",
+                "terminal_at": None,
+            }
+            for trade_id in trade_ids
+        ],
+    )
+    proven = set()
+    in_flight = set()
+    effects = []
+
+    def cancel(ids, **_kwargs):
+        if len(ids) > 12:
+            raise ValueError("FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT")
+        assert not in_flight, "next wallet effect preceded terminal proof"
+        in_flight.update(ids)
+        effects.append(tuple(ids))
+        return {
+            trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"} for trade_id in ids
+        }
+
+    def reconcile():
+        proven.update(in_flight)
+        in_flight.clear()
+        return 0
+
+    monkeypatch.setattr(loop.offer_manager, "cancel_offers", cancel)
+    loop.offer_manager.reconcile_submitted_cancels_only = reconcile
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_authoritative_terminal_records",
+        lambda ids: {
+            trade_id: {
+                "sage_trade_id": trade_id,
+                "outcome": "CANCELLED_PROVEN",
+            }
+            for trade_id in ids
+            if trade_id in proven
+        },
+    )
+
+    assert bot_loop.BotLoop._cancel_reserve_floor_offers(loop, set(trade_ids)) is False
+    assert len(effects) == 4
+    assert all(len(cohort) == 12 for cohort in effects)
+    assert set().union(*(set(cohort) for cohort in effects)) == set(trade_ids)
+    assert proven == set(trade_ids)
+
+
+def test_follow_reserve_floor_never_submits_second_cohort_without_first_proof(
+    monkeypatch,
+):
+    loop, _calls = _fake_loop()
+    monkeypatch.setattr(
+        bot_loop.database, "get_unresolved_offer_operation_blockers", lambda: []
+    )
+    trade_ids = [f"{index:064x}" for index in range(1, 49)]
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "purpose": f"follow:{RUN_ID}:normal_lifecycle",
+                "sage_trade_id": trade_id,
+                "lifecycle_state": "visible",
+                "terminal_at": None,
+            }
+            for trade_id in trade_ids
+        ],
+    )
+    effects = []
+
+    def cancel(ids, **_kwargs):
+        if len(ids) > 12:
+            raise ValueError("FEE_UNSIGNED_COST_UNAVAILABLE")
+        effects.append(tuple(ids))
+        return {
+            trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"} for trade_id in ids
+        }
+
+    monkeypatch.setattr(loop.offer_manager, "cancel_offers", cancel)
+    loop.offer_manager.reconcile_submitted_cancels_only = lambda: -1
+    monkeypatch.setattr(
+        bot_loop.database, "get_authoritative_terminal_records", lambda _ids: {}
+    )
+    ticks = iter([0.0, 301.0])
+    monkeypatch.setattr(
+        bot_loop,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _seconds: None),
+    )
+
+    assert bot_loop.BotLoop._cancel_reserve_floor_offers(loop, set(trade_ids)) is False
+    assert len(effects) == 1
+    assert len(effects[0]) == 12
+
+
+def test_follow_reserve_floor_does_not_split_with_unresolved_cancel(monkeypatch):
+    loop, _calls = _fake_loop()
+    trade_ids = [f"{index:064x}" for index in range(1, 49)]
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "purpose": f"follow:{RUN_ID}:normal_lifecycle",
+                "sage_trade_id": trade_id,
+                "lifecycle_state": "visible",
+                "terminal_at": None,
+            }
+            for trade_id in trade_ids
+        ],
+    )
+    attempts = []
+
+    def cancel(ids, **_kwargs):
+        attempts.append(tuple(ids))
+        raise ValueError("FEE_UNSIGNED_COST_UNAVAILABLE")
+
+    monkeypatch.setattr(loop.offer_manager, "cancel_offers", cancel)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": "cancel:ambiguous"}],
+    )
+
+    assert bot_loop.BotLoop._cancel_reserve_floor_offers(loop, set(trade_ids)) is False
+    assert attempts == [tuple(sorted(trade_ids))]
+
+
+def test_follow_reserve_floor_reports_known_pre_effect_failure_without_waiting(
+    monkeypatch,
+):
+    loop, _calls = _fake_loop()
+    trade_ids = [f"{index:064x}" for index in range(1, 49)]
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "purpose": f"follow:{RUN_ID}:normal_lifecycle",
+                "sage_trade_id": trade_id,
+                "lifecycle_state": "visible",
+                "terminal_at": None,
+            }
+            for trade_id in trade_ids
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop.database, "get_unresolved_offer_operation_blockers", lambda: []
+    )
+    effects = []
+
+    def cancel(ids, **_kwargs):
+        if len(ids) > 12:
+            raise ValueError("FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT")
+        effects.append(tuple(ids))
+        return {
+            trade_id: {
+                "outcome": "CANCEL_FAILED",
+                "submitted": False,
+                "reconciliation_required": False,
+            }
+            for trade_id in ids
+        }
+
+    monkeypatch.setattr(loop.offer_manager, "cancel_offers", cancel)
+    loop.offer_manager.reconcile_submitted_cancels_only = lambda: (_ for _ in ()).throw(
+        AssertionError("known pre-effect failure must not wait for proof")
+    )
+
+    assert bot_loop.BotLoop._cancel_reserve_floor_offers(loop, set(trade_ids)) is False
+    assert len(effects) == 1
+
+
 def test_follow_reserve_floor_still_stops_when_cancel_phase_is_denied(monkeypatch):
     loop, calls = _fake_loop(cancel_phase_allowed=False)
     monkeypatch.setattr(

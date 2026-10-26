@@ -6338,9 +6338,16 @@ class BotLoop:
                 return False
         if trade_ids:
             try:
-                self.offer_manager.cancel_offers(
-                    sorted(trade_ids), reason="reserve_floor_breached", force_storm=True
-                )
+                if follow_run_id is not None and len(trade_ids) > 12:
+                    BotLoop._cancel_follow_reserve_floor_cohorts(
+                        self, sorted(trade_ids)
+                    )
+                else:
+                    self.offer_manager.cancel_offers(
+                        sorted(trade_ids),
+                        reason="reserve_floor_breached",
+                        force_storm=True,
+                    )
             except Exception as exc:
                 log_event(
                     "error",
@@ -6350,6 +6357,78 @@ class BotLoop:
                 )
                 return False
         return follow_run_id is None
+
+    def _cancel_follow_reserve_floor_cohorts(self, trade_ids: list[str]) -> None:
+        """Split an oversized stopped Follow book without crossing unproved effects.
+
+        The normal dispatcher prices each exact cohort before preparing its
+        durable journal. An unsigned-cost refusal may bisect a cohort only if
+        no unresolved cancellation is journaled. A later wallet effect waits
+        for Task 9 terminal proof of every member of the previous one.
+        """
+
+        pending = [trade_ids]
+        while pending:
+            cohort = pending.pop(0)
+            if not cohort:
+                continue
+            coin_manager = getattr(self, "coin_manager", None)
+            refresh_fee_pool = getattr(
+                coin_manager, "refresh_fee_pool_from_wallet", None
+            )
+            if callable(refresh_fee_pool):
+                refresh_fee_pool()
+            try:
+                results = self.offer_manager.cancel_offers(
+                    cohort,
+                    reason="reserve_floor_breached",
+                    force_storm=True,
+                )
+            except ValueError as exc:
+                if (
+                    str(exc)
+                    not in {
+                        "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT",
+                        "FEE_UNSIGNED_COST_UNAVAILABLE",
+                    }
+                    or len(cohort) == 1
+                ):
+                    raise
+                # A late error cannot be treated as a read-only size probe if
+                # any durable cancellation operation may already have begun.
+                if database.get_unresolved_offer_operation_blockers():
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_COHORT_UNRESOLVED") from exc
+                midpoint = len(cohort) // 2
+                pending[0:0] = [cohort[:midpoint], cohort[midpoint:]]
+                continue
+            if type(results) is not dict or set(results) != set(cohort):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_CANCEL_RESULT_INVALID")
+            if all(
+                type(results[trade_id]) is dict
+                and results[trade_id].get("outcome") == "CANCEL_FAILED"
+                and results[trade_id].get("submitted") is False
+                and results[trade_id].get("reconciliation_required") is False
+                for trade_id in cohort
+            ):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_CANCEL_PRE_EFFECT_FAILED")
+            deadline = time.monotonic() + 300
+            while True:
+                self.offer_manager.reconcile_submitted_cancels_only()
+                records = database.get_authoritative_terminal_records(cohort)
+                if type(records) is not dict:
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_PROOF_UNAVAILABLE")
+                if all(
+                    type(records.get(trade_id)) is dict
+                    and records[trade_id].get("sage_trade_id") == trade_id
+                    and records[trade_id].get("outcome")
+                    in {"CANCELLED_PROVEN", "FILLED_PROVEN", "EXPIRED_PROVEN"}
+                    for trade_id in cohort
+                ):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("FOLLOW_RESERVE_FLOOR_COHORT_UNCONFIRMED")
+                time.sleep(min(1.0, remaining))
 
     def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
