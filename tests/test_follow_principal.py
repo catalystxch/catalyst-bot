@@ -243,7 +243,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert result["planned_replacement_cat_coin_count"] == 1
     assert result["planned_replacement_xch_mojos"] == 10
     assert result["planned_replacement_cat_atoms"] == 20
-    assert len(result["review_sha256"]) == 64
+    assert len(result["proposal_sha256"]) == 64
     assert result["dispatch_authorized"] is False
     status["stale"] = True
     with pytest.raises(ValueError, match="FOLLOW_FEE_APPROVAL_STALE"):

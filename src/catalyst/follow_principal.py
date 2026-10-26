@@ -295,13 +295,13 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         "maximum_fee_mojos": before["total_fee_mojos"],
         "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
     }
-    review_sha256 = hashlib.sha256(
+    proposal_sha256 = hashlib.sha256(
         json.dumps(review_terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
         **principal,
         **review_terms,
-        "review_sha256": review_sha256,
+        "proposal_sha256": proposal_sha256,
         "spent_fee_mojos": before["spent_fee_mojos"],
         "held_fee_mojos": before["held_fee_mojos"],
         "remaining_fee_mojos": before["remaining_fee_mojos"],

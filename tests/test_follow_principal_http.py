@@ -34,7 +34,7 @@ def test_follow_principal_preview_returns_atomic_strings_without_authority(monke
             "maximum_trade_xch_mojos": 123_456_789_123_456,
             "maximum_trade_cat_atoms": 987_654_321_987_654,
             "protected_fee_principal_mojos": 50_000_000_000,
-            "review_sha256": "b" * 64,
+            "proposal_sha256": "b" * 64,
             "dispatch_authorized": False,
         },
     )
