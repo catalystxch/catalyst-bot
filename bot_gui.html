@@ -8318,7 +8318,7 @@
             <label>SELL offers <input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
             <label><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"> Continue until I stop the run or its fee/safety limit is reached</label>
             <label>Timed authority (hours, when continuous is unchecked) <input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
-            <label>Cumulative fee ceiling (XCH) <input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.05" oninput="invalidateFollowRunReview()"></label>
+            <label>Cumulative fee ceiling (XCH) <input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowRunReview()"></label>
             <p>The 48-hour observation is separate from the run lifetime. A continuous run still stops when you stop it or a financial or safety gate requires it.</p>
             <pre id="followRunReviewText" style="white-space:pre-wrap"></pre>
             <label><input type="checkbox" id="followRunReviewAccept" disabled> I approve the exact wallet, trading limits and fee allowance shown above.</label>
