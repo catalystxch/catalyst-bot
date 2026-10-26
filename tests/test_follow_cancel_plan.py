@@ -1,6 +1,7 @@
 """Follow cancellation plans stay exact before any wallet or ledger effect."""
 
 from types import SimpleNamespace
+from importlib import import_module
 
 import database
 import follow_fee_cancellation
@@ -13,6 +14,13 @@ TRADE = "a" * 64
 SOURCE = "c" * 64
 FEE_COIN = "e" * 64
 RUN = "f" * 64
+
+
+@pytest.fixture(autouse=True)
+def current_database_module():
+    global database, OfferManager
+    database = import_module("database")
+    OfferManager = import_module("offer_manager").OfferManager
 
 
 def test_follow_cancel_plan_prices_exact_source_and_releases_on_refusal(monkeypatch):
