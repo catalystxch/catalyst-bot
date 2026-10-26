@@ -193,6 +193,7 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
             LIQUIDITY_MODE="two_sided",
             MAX_ACTIVE_BUY_OFFERS=24,
             MAX_ACTIVE_SELL_OFFERS=24,
+            CAT_ASSET_ID=proposal["identity"]["asset_id"],
         ),
         resume_existing_offers=False,
     ) == {"ready": True, "run_id": run["run_id"]}

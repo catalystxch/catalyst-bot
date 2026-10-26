@@ -1,5 +1,6 @@
 """A native Follow review must still be current at the Start boundary."""
 
+import hashlib
 from types import SimpleNamespace
 
 import api_server  # noqa: F401  # Registers the blueprint before importing it directly.
@@ -39,7 +40,10 @@ PROPOSAL = {
     "sell_slots_arithmetic_fit": 24,
 }
 CFG = SimpleNamespace(
-    LIQUIDITY_MODE="two_sided", MAX_ACTIVE_BUY_OFFERS=24, MAX_ACTIVE_SELL_OFFERS=24
+    LIQUIDITY_MODE="two_sided",
+    MAX_ACTIVE_BUY_OFFERS=24,
+    MAX_ACTIVE_SELL_OFFERS=24,
+    CAT_ASSET_ID="f" * 64,
 )
 
 
@@ -59,6 +63,8 @@ def _ready_sources(monkeypatch):
         "preview_approved_follow_principal",
         lambda *_args, **_kwargs: PROPOSAL.copy(),
     )
+    monkeypatch.setattr(database, "get_open_offers", lambda **_kwargs: [])
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: [])
 
 
 def test_two_sided_follow_start_requires_native_review(monkeypatch):
@@ -90,6 +96,46 @@ def test_two_sided_follow_start_rejects_changed_inventory(monkeypatch):
     )
     result = routes._reviewed_follow_start_readiness(CFG, resume_existing_offers=False)
     assert result == {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+
+
+def test_two_sided_follow_start_rejects_stale_local_offer(monkeypatch):
+    import database
+
+    _ready_sources(monkeypatch)
+    monkeypatch.setattr(
+        database,
+        "get_open_offers",
+        lambda **_kwargs: [{"trade_id": "e" * 64, "status": "open"}],
+    )
+
+    assert routes._reviewed_follow_start_readiness(
+        CFG, resume_existing_offers=False
+    ) == {"ready": False, "reason": "FOLLOW_LOCAL_OFFERS_UNRESOLVED"}
+
+
+def test_two_sided_follow_start_rejects_unresolved_intent_without_offer_row(
+    monkeypatch,
+):
+    import database
+
+    _ready_sources(monkeypatch)
+    wallet_hash = hashlib.sha256(b"fingerprint:123").hexdigest()
+    monkeypatch.setattr(
+        database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": "mainnet",
+                "asset_id": CFG.CAT_ASSET_ID,
+                "lifecycle_state": "visible",
+            }
+        ],
+    )
+
+    assert routes._reviewed_follow_start_readiness(
+        CFG, resume_existing_offers=False
+    ) == {"ready": False, "reason": "FOLLOW_LOCAL_OFFERS_UNRESOLVED"}
 
 
 def test_two_sided_follow_resume_needs_exact_book_review():

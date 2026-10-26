@@ -791,6 +791,29 @@ def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) ->
             != getattr(cfg_obj, "MAX_ACTIVE_SELL_OFFERS", None)
         ):
             return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+        asset_id = getattr(cfg_obj, "CAT_ASSET_ID", None)
+        fingerprint = identity.get("wallet_fingerprint")
+        if (
+            type(asset_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", asset_id) is None
+            or type(fingerprint) is not int
+            or fingerprint <= 0
+        ):
+            return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+        wallet_hash = hashlib.sha256(
+            f"fingerprint:{fingerprint}".encode("utf-8")
+        ).hexdigest()
+        local_open = database.get_open_offers(cat_asset_id=asset_id)
+        unresolved = [
+            row
+            for row in database.get_offer_intents_for_registry()
+            if row.get("wallet_fingerprint_hash") == wallet_hash
+            and row.get("network") == identity.get("network")
+            and row.get("asset_id") == asset_id
+            and row.get("lifecycle_state") not in {"terminal", "creation_failed"}
+        ]
+        if local_open or unresolved:
+            return {"ready": False, "reason": "FOLLOW_LOCAL_OFFERS_UNRESOLVED"}
         proposal = preview_approved_follow_principal(
             authority["approval_id"],
             buy_limit=authority["buy_limit"],
