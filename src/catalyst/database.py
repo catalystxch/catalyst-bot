@@ -22964,10 +22964,6 @@ def get_follow_cleanup_authority(
         ):
             result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
         else:
-            latest = conn.execute(
-                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
-                (row["scope_sha256"],),
-            ).fetchone()[0]
             totals = _fee_scope_totals(conn, row["scope_sha256"])
             committed = totals["committed_fee_mojos"]
             result.update(
@@ -22984,9 +22980,7 @@ def get_follow_cleanup_authority(
                 "LIMIT 1",
                 (row["scope_sha256"],),
             ).fetchone()
-            if latest != row["version"]:
-                result["reason_code"] = "FOLLOW_FEE_APPROVAL_STALE"
-            elif unresolved is not None:
+            if unresolved is not None:
                 result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
             elif committed > row["maximum_fee_mojos"]:
                 result["reason_code"] = "FOLLOW_FEE_CAP_EXCEEDED"
@@ -23296,7 +23290,15 @@ def reserve_approved_fee(
 
 
 def _reserve_approved_fee_locked(
-    conn, approval_id, scope, plan, operation, fee, cancellation
+    conn,
+    approval_id,
+    scope,
+    plan,
+    operation,
+    fee,
+    cancellation,
+    *,
+    allow_superseded_follow_cancellation=False,
 ):
     """Shared ledger arithmetic; caller owns the IMMEDIATE write transaction."""
     approval = conn.execute(
@@ -23309,6 +23311,16 @@ def _reserve_approved_fee_locked(
     ).fetchone()[0]
     if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
         raise ValueError("FEE_APPROVAL_STALE")
+    if allow_superseded_follow_cancellation and (
+        not cancellation
+        or conn.execute(
+            "SELECT 1 FROM follow_run_authorities WHERE approval_id=? "
+            "AND maximum_fee_mojos=? LIMIT 1",
+            (approval_id, approval["total_fee_mojos"]),
+        ).fetchone()
+        is None
+    ):
+        raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
     existing = conn.execute(
         "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
     ).fetchone()
@@ -23321,7 +23333,12 @@ def _reserve_approved_fee_locked(
         ):
             raise ValueError("FEE_OPERATION_CONFLICT")
         return {**dict(existing), "idempotent": True}
-    if approval["version"] != latest:
+    # A Follow cancellation already passed the exact run, identity and
+    # journal checks in its caller. A later fee approval must not strand that
+    # run's outstanding offers; the original ceiling still bounds this hold.
+    if approval["version"] != latest and not (
+        allow_superseded_follow_cancellation and cancellation
+    ):
         raise ValueError("FEE_APPROVAL_STALE")
     totals = _fee_scope_totals(conn, scope)
     if totals["committed_fee_mojos"] + fee > approval["total_fee_mojos"] or (
@@ -23915,10 +23932,6 @@ def reserve_follow_cancellation_fee(
             raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
         scope = json.loads(row["scope_json"])
         plan = json.loads(row["plan_json"])
-        latest = conn.execute(
-            "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
-            (row["scope_sha256"],),
-        ).fetchone()[0]
         if (
             row["identity_sha256"] != identity_hash
             or row["identity_json"] != encoded_identity
@@ -23927,7 +23940,6 @@ def reserve_follow_cancellation_fee(
             or scope.get("session_id") is None
             or row["total_fee_mojos"] != row["maximum_fee_mojos"]
             or row["cancellation_reserve_mojos"] < row["protected_shutdown_fee_mojos"]
-            or row["version"] != latest
             or plan.get("target_seconds") != target_seconds
             or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
             != row["scope_sha256"]
@@ -24053,6 +24065,7 @@ def reserve_follow_cancellation_fee(
             operation_id,
             fee,
             True,
+            allow_superseded_follow_cancellation=True,
         )
         conn.commit()
         return {**result, "dispatch_authorized": False}
@@ -24142,10 +24155,6 @@ def recheck_follow_cancellation_fee_hold(
                 return False
             scope = json.loads(row["scope_json"])
             plan = json.loads(row["plan_json"])
-            latest = conn.execute(
-                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
-                (row["scope_sha256"],),
-            ).fetchone()[0]
             hold = conn.execute(
                 "SELECT reservation.*, outcome.state AS accounting_outcome "
                 "FROM approved_fee_reservations AS reservation "
@@ -24164,7 +24173,6 @@ def recheck_follow_cancellation_fee_hold(
                 or row["total_fee_mojos"] != row["maximum_fee_mojos"]
                 or row["cancellation_reserve_mojos"]
                 < row["protected_shutdown_fee_mojos"]
-                or row["version"] != latest
                 or plan.get("target_seconds") != final_quote["target_seconds"]
                 or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
                 != row["scope_sha256"]

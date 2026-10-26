@@ -365,6 +365,54 @@ def test_expired_follow_run_routine_requote_keeps_shutdown_reserve(approved):
         )
 
 
+def test_new_fee_approval_keeps_old_run_cleanup_under_original_cap(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+    original = approved["approval"]
+    database.create_fee_approval(
+        scope_sha256=original["scope_sha256"],
+        plan_sha256=original["plan_sha256"],
+        total_fee_mojos=120,
+        cancellation_reserve_mojos=40,
+    )
+    with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
+        database.reserve_approved_fee(
+            approval_id=original["approval_id"],
+            scope_sha256=original["scope_sha256"],
+            plan_sha256=original["plan_sha256"],
+            operation_id="9" * 64,
+            fee_mojos=1,
+            cancellation=True,
+        )
+    cleanup = database.get_follow_cleanup_authority(
+        run_id=run_id, identity=identity, now_epoch=1002
+    )
+    assert cleanup["ready"] is True
+    assert cleanup["maximum_fee_mojos"] == 80
+    manifest, contract = _prepared_follow_cancel(run_id, identity, fee=50)
+    quote = _quote(approved, fee=50)
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=quote,
+    )
+    assert hold["fee_mojos"] == 50
+    database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+    assert (
+        database.recheck_follow_cancellation_fee_hold(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=quote,
+        )
+        is True
+    )
+
+
 def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
     run_id, identity = _run(approved)
     approved["now"] = 1002
