@@ -150,3 +150,51 @@ def test_native_fee_change_consumes_review_in_original_run_ledger(
         )["revision"]
         == 1
     )
+
+
+def test_native_stopped_run_can_review_funded_cleanup_increase(approved, monkeypatch):
+    from importlib import import_module
+
+    import coin_prep_fee_runtime
+    import follow_principal
+
+    database = import_module("database")
+    run_id, identity = _run(approved)
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "_configuration",
+        lambda: {"CAT_ASSET_ID": identity["asset_id"]},
+    )
+    monkeypatch.setattr(follow_principal.time, "time", lambda: 1003)
+    monkeypatch.setattr(
+        follow_principal,
+        "_current_follow_fee_funding",
+        lambda _run_id: {
+            "identity": identity,
+            "configuration_sha256": "a" * 64,
+            "observed_fee_principal_mojos": 120,
+            "dispatch_authorized": False,
+        },
+    )
+    review = _method("prepare_follow_fee_ceiling_review")(
+        SimpleNamespace(), {"proposed_maximum_fee_mojos": 120}
+    )
+    assert review["success"] is True
+    assert review["run_stopped"] is True
+    confirmed = _method("confirm_follow_fee_ceiling_review")(
+        SimpleNamespace(),
+        {
+            "review_id": review["review_id"],
+            "review_sha256": review["review_sha256"],
+            "accepted": True,
+        },
+    )
+    assert confirmed["success"] is True
+    assert confirmed["maximum_fee_mojos"] == 120
+    assert (
+        database.get_follow_creation_authority(
+            identity=identity, configuration_sha256="a" * 64, now_epoch=1003
+        )["ready"]
+        is False
+    )

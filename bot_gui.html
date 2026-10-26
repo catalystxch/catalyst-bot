@@ -8332,7 +8332,7 @@
 
     <div id="followFeeCeilingReviewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="followFeeCeilingReviewTitle" style="display:none">
         <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
-            <h2 id="followFeeCeilingReviewTitle">Adjust active Follow fee ceiling</h2>
+            <h2 id="followFeeCeilingReviewTitle">Review Follow fee ceiling</h2>
             <p>A new ceiling applies to the current run only after you review and approve its exact wallet, fees already used, protected reserve and available fee principal. Trading remains subject to its other safety gates.</p>
             <label>New cumulative fee ceiling (XCH) <input id="followFeeCeilingProposedXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowFeeCeilingReview()"></label>
             <pre id="followFeeCeilingReviewText" style="white-space:pre-wrap"></pre>
@@ -33040,6 +33040,7 @@
                     || !Number.isSafeInteger(review.prior_revision)
                     || !Number.isSafeInteger(review.expires_at_epoch)
                     || Date.now() >= review.expires_at_epoch * 1000
+                    || typeof review.run_stopped !== 'boolean'
                     || !amountKeys.every(key => Number.isSafeInteger(review[key]) && review[key] >= 0)
                     || review.proposed_maximum_fee_mojos !== proposed
                     || !Number.isSafeInteger(id.wallet_fingerprint)
@@ -33051,6 +33052,9 @@
                     `Wallet ${id.wallet_fingerprint} · ${id.network} · ${id.ticker || ''}\n` +
                     `Asset ${id.asset_id}\n` +
                     `Run ${review.run_id} · current revision ${review.prior_revision}\n` +
+                    (review.run_stopped
+                        ? `State at review: stopped; this increase funds cleanup only and cannot restart trading.\n`
+                        : `State at review: active.\n`) +
                     `Current cumulative ceiling: ${formatFollowFeeMojos(review.prior_maximum_fee_mojos)}\n` +
                     `New cumulative ceiling: ${formatFollowFeeMojos(review.proposed_maximum_fee_mojos)}\n` +
                     `Already spent: ${formatFollowFeeMojos(review.reviewed_spent_fee_mojos)}\n` +
@@ -33099,7 +33103,9 @@
                     throw new Error(result?.reason || 'Revised ceiling was not recorded.');
                 }
                 closeFollowFeeCeilingReview();
-                showToast('Revised cumulative fee ceiling recorded for this Follow run.', 'success');
+                showToast(review.run_stopped
+                    ? 'Cleanup fee ceiling recorded. This Follow run remains stopped.'
+                    : 'Revised cumulative fee ceiling recorded for this Follow run.', 'success');
             } catch (error) {
                 invalidateFollowFeeCeilingReview();
                 document.getElementById('followFeeCeilingReviewText').textContent =

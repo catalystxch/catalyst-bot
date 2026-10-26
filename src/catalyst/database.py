@@ -23425,7 +23425,7 @@ def create_follow_fee_ceiling_review(
         totals = _fee_scope_totals(conn, policy["scope_sha256"])
         if (
             current is None
-            or stopped is not None
+            or (stopped is not None and proposed < prior_maximum)
             or (latest["revision"] if latest else 0) != prior_revision
             or (latest["maximum_fee_mojos"] if latest else current["maximum_fee_mojos"])
             != prior_maximum
@@ -23559,11 +23559,15 @@ def confirm_follow_fee_ceiling_review(
             "ORDER BY revision DESC LIMIT 1",
             (row["run_id"],),
         ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?", (row["run_id"],)
+        ).fetchone()
         if (
             run is None
-            or conn.execute(
-                "SELECT 1 FROM follow_run_stops WHERE run_id=?", (row["run_id"],)
-            ).fetchone()
+            or (
+                stopped is not None
+                and row["proposed_maximum_fee_mojos"] < row["prior_maximum_fee_mojos"]
+            )
             or not run["started_at_epoch"] <= now_epoch < run["expires_at_epoch"]
             or run["identity_sha256"] != identity_hash
             or run["configuration_sha256"] != config_hash

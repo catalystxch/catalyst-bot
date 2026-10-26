@@ -1196,7 +1196,7 @@ class AppBridge:
             marker = database.get_unexpired_follow_run_marker(
                 asset_id=asset_id, now_epoch=int(time.time())
             )
-            if marker is None or marker["stopped"]:
+            if marker is None:
                 raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
             result = prepare_follow_fee_ceiling_review(
                 marker["run_id"],
@@ -1218,6 +1218,7 @@ class AppBridge:
         return {
             **result,
             "identity": identity,
+            "run_stopped": marker["stopped"],
             "success": True,
             "dispatch_authorized": False,
         }

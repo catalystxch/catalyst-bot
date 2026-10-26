@@ -202,16 +202,55 @@ def test_ceiling_review_rejects_unchanged_unfunded_or_wrong_config(
     conn.close()
 
 
-def test_ceiling_review_rejects_stopped_run(approved):
+def test_stopped_run_can_raise_cleanup_ceiling_but_cannot_lower_it(approved):
     run_id, identity = _run(approved)
     database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1003)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1004,
+    )
+    confirmed = database.confirm_follow_fee_ceiling_review(
+        review_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        identity=identity,
+        configuration_sha256="a" * 64,
+        observed_fee_principal_mojos=120,
+        now_epoch=1005,
+    )
+    assert confirmed["maximum_fee_mojos"] == 120
     with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_CHANGED"):
         database.create_follow_fee_ceiling_review(
             run_id=run_id,
             identity=identity,
             configuration_sha256="a" * 64,
-            proposed_maximum_fee_mojos=120,
+            proposed_maximum_fee_mojos=60,
             observed_fee_principal_mojos=120,
+            now_epoch=1006,
+        )
+
+
+def test_active_run_lowering_review_cannot_be_confirmed_after_stop(approved):
+    run_id, identity = _run(approved)
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=60,
+        observed_fee_principal_mojos=80,
+        now_epoch=1002,
+    )
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1003)
+    with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_REVIEW_CHANGED"):
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            identity=identity,
+            configuration_sha256="a" * 64,
+            observed_fee_principal_mojos=80,
             now_epoch=1004,
         )
 
