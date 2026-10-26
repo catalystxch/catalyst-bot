@@ -22774,6 +22774,7 @@ def get_follow_creation_authority(
         "ready": False,
         "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
         "run_id": None,
+        "approval_id": None,
         "identity": None,
         "configuration_sha256": None,
         "principal_review_sha256": None,
@@ -22803,6 +22804,7 @@ def get_follow_creation_authority(
         result.update(
             {
                 "run_id": row["run_id"],
+                "approval_id": row["approval_id"],
                 "identity": identity,
                 "configuration_sha256": row["configuration_sha256"],
                 "principal_review_sha256": row["principal_review_sha256"],

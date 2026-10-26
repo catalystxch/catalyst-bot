@@ -1125,6 +1125,52 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:confirm_follow_run_review")
+    def confirm_follow_run_review(self, body=None):
+        """Consume a reviewed financial run from an explicit native click.
+
+        This records authority but never starts the bot or sends a wallet
+        effect. The browser-mode HTTP surface has no equivalent endpoint.
+        """
+        import re
+
+        from follow_principal import confirm_follow_run_review
+
+        if (
+            type(body) is not dict
+            or set(body) != {"review_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            result = confirm_follow_run_review(body["review_id"], body["review_sha256"])
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_REVIEW_REQUIRED",
+                "FOLLOW_REVIEW_USED",
+                "FOLLOW_REVIEW_EXPIRED",
+                "FOLLOW_REVIEW_CHANGED",
+                "FOLLOW_BOT_MUST_BE_STOPPED",
+                "FOLLOW_CANCELLATION_IN_PROGRESS",
+                "FOLLOW_FEE_APPROVAL_STALE",
+                "FOLLOW_RUN_OVERLAP",
+                "FOLLOW_SHUTDOWN_RESERVE_UNFUNDED",
+            }:
+                reason = "FOLLOW_REVIEW_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**result, "success": True, "dispatch_authorized": False}
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -2162,6 +2208,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "preview_coin_prep_fees",
     "preview_follow_principal",
     "prepare_follow_run_review",
+    "confirm_follow_run_review",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",

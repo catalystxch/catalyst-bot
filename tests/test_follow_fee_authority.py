@@ -256,6 +256,7 @@ def test_follow_creation_authority_is_bound_to_original_review(approved):
     )
     assert current["ready"] is True
     assert current["run_id"] == run["run_id"]
+    assert current["approval_id"] == approval_id
     assert current["principal_review_sha256"] == "d" * 64
     assert current["maximum_fee_mojos"] == 80
     assert current["protected_shutdown_fee_mojos"] == 40

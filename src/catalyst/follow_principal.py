@@ -478,3 +478,102 @@ def prepare_follow_run_review(
         "review_expires_at_epoch": started_at_epoch + 300,
         "dispatch_authorized": False,
     }
+
+
+def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
+    """Consume one native-confirmed review without starting or dispatching.
+
+    This service must only be reached from the native confirmation control.
+    The bot and wallet-wide cancellation remain stopped while the current
+    principal proposal is rechecked and the durable authority is recorded.
+    """
+
+    import api_server
+    import database
+
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (review_id, review_sha256)
+    ):
+        raise ValueError("FOLLOW_REVIEW_CONFIRMATION_INVALID")
+    with api_server._bot_cancel_lifecycle_lock:
+        bot = api_server.bot
+        try:
+            stopped = bot is not None and bot.is_running() is False
+        except Exception:
+            stopped = False
+        if not stopped:
+            raise ValueError("FOLLOW_BOT_MUST_BE_STOPPED")
+        with api_server._cancel_all_state_lock:
+            cancelling = api_server._cancel_all_state.get("running") is not False
+        worker = api_server._cancel_all_thread
+        if cancelling or (worker is not None and worker.is_alive()):
+            raise ValueError("FOLLOW_CANCELLATION_IN_PROGRESS")
+
+        review = database.get_follow_run_review(review_id)
+        if type(review) is not dict or review.get("review_id") != review_id:
+            raise ValueError("FOLLOW_REVIEW_REQUIRED")
+        if review.get("consumed") is not False:
+            raise ValueError("FOLLOW_REVIEW_USED")
+        if review.get("review_sha256") != review_sha256:
+            raise ValueError("FOLLOW_REVIEW_CHANGED")
+        now_epoch = int(time.time())
+        if (
+            type(review.get("started_at_epoch")) is not int
+            or type(review.get("review_expires_at_epoch")) is not int
+            or type(review.get("expires_at_epoch")) is not int
+            or not review["started_at_epoch"]
+            <= now_epoch
+            < review["review_expires_at_epoch"]
+            or now_epoch >= review["expires_at_epoch"]
+        ):
+            raise ValueError("FOLLOW_REVIEW_EXPIRED")
+        approval_id = review.get("approval_id")
+        buy_limit = review.get("buy_limit")
+        sell_limit = review.get("sell_limit")
+        if (
+            type(approval_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
+            or type(buy_limit) is not int
+            or type(sell_limit) is not int
+            or not 1 <= buy_limit <= 50
+            or not 1 <= sell_limit <= 50
+            or type(review.get("identity")) is not dict
+            or type(review.get("maximum_fee_mojos")) is not int
+            or type(review.get("protected_shutdown_fee_mojos")) is not int
+        ):
+            raise ValueError("FOLLOW_REVIEW_CHANGED")
+        proposal = preview_approved_follow_principal(
+            approval_id, buy_limit=buy_limit, sell_limit=sell_limit
+        )
+        if (
+            proposal.get("dispatch_authorized") is not False
+            or proposal.get("replacement_count_gate_passed") is not True
+            or proposal.get("current_prep_targets_proven") is not True
+            or proposal.get("buy_slots_arithmetic_fit") != buy_limit
+            or proposal.get("sell_slots_arithmetic_fit") != sell_limit
+            or proposal.get("identity") != review["identity"]
+            or proposal.get("configuration_sha256")
+            != review.get("configuration_sha256")
+            or proposal.get("proposal_sha256") != review.get("principal_review_sha256")
+            or proposal.get("maximum_fee_mojos") != review["maximum_fee_mojos"]
+            or proposal.get("cancellation_reserve_mojos")
+            != review["protected_shutdown_fee_mojos"]
+        ):
+            raise ValueError("FOLLOW_REVIEW_CHANGED")
+        terms = {
+            "consent_id": review_id,
+            "review_sha256": review_sha256,
+            "approval_id": approval_id,
+            "identity": review["identity"],
+            "configuration_sha256": review["configuration_sha256"],
+            "principal_review_sha256": review["principal_review_sha256"],
+            "buy_limit": buy_limit,
+            "sell_limit": sell_limit,
+            "started_at_epoch": review["started_at_epoch"],
+            "expires_at_epoch": review["expires_at_epoch"],
+            "maximum_fee_mojos": review["maximum_fee_mojos"],
+            "protected_shutdown_fee_mojos": review["protected_shutdown_fee_mojos"],
+        }
+        authority = database.create_follow_run_authority(**terms)
+        return {**authority, "dispatch_authorized": False}

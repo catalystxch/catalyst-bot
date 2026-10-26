@@ -119,8 +119,18 @@ The public-path review preparation service now accepts explicit offer limits,
 duration and fee cap, derives the exact current principal proposal from the
 server, and persists only a five-minute immutable review. It compares the
 proposal again after persistence; a drifted proposal is reported as unusable.
-The HTTP and native bridge entry points cannot create run authority or start
-the bot. The native final-click consent, exact recheck and GUI are still open.
+The HTTP review entry point and native review-preparation method cannot
+create run authority or start the bot. The native final-click GUI remains open.
+The native-only confirmation service now accepts one exact review ID and
+digest. Under the bot/Cancel All lifecycle lock it requires a stopped bot,
+no wallet-wide cancellation, an unused unexpired review, and a fresh matching
+approved wallet/principal/slot proposal before the database consumes consent.
+It returns a run ID without starting or dispatching. The native GUI still
+must display the full terms and wire its final button to this method; Start
+must independently recheck authority and wallet inventory. The current
+48-hour run expiry is measured from review creation, so it cannot yet prove
+a full 48-hour live observation starting after setup. Extend or renew the
+run term before claiming that observation requirement.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is
