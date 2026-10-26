@@ -2140,6 +2140,54 @@ CREATE TRIGGER IF NOT EXISTS follow_run_stops_no_delete
 BEFORE DELETE ON follow_run_stops BEGIN
     SELECT RAISE(ABORT, 'Follow run stop is immutable');
 END;
+CREATE TABLE IF NOT EXISTS follow_fee_ceiling_reviews (
+    review_id TEXT PRIMARY KEY NOT NULL
+        CHECK(length(review_id)=64 AND review_id NOT GLOB '*[^0-9a-f]*'),
+    review_sha256 TEXT NOT NULL
+        CHECK(length(review_sha256)=64 AND review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    identity_sha256 TEXT NOT NULL
+        CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    scope_sha256 TEXT NOT NULL
+        CHECK(length(scope_sha256)=64 AND scope_sha256 NOT GLOB '*[^0-9a-f]*'),
+    plan_sha256 TEXT NOT NULL
+        CHECK(length(plan_sha256)=64 AND plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+    configuration_sha256 TEXT NOT NULL
+        CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    prior_revision INTEGER NOT NULL CHECK(typeof(prior_revision)='integer' AND prior_revision>=0),
+    prior_maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(prior_maximum_fee_mojos)='integer' AND prior_maximum_fee_mojos>0),
+    proposed_maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(proposed_maximum_fee_mojos)='integer' AND proposed_maximum_fee_mojos>0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL CHECK(typeof(protected_shutdown_fee_mojos)='integer' AND protected_shutdown_fee_mojos>0),
+    observed_fee_principal_mojos INTEGER NOT NULL CHECK(typeof(observed_fee_principal_mojos)='integer' AND observed_fee_principal_mojos>=0),
+    reviewed_at_epoch INTEGER NOT NULL CHECK(typeof(reviewed_at_epoch)='integer' AND reviewed_at_epoch>=0),
+    expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>reviewed_at_epoch)
+);
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_reviews_no_update
+BEFORE UPDATE ON follow_fee_ceiling_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling review is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_reviews_no_delete
+BEFORE DELETE ON follow_fee_ceiling_reviews BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling review is immutable');
+END;
+CREATE TABLE IF NOT EXISTS follow_fee_ceiling_revisions (
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=1),
+    review_id TEXT UNIQUE NOT NULL REFERENCES follow_fee_ceiling_reviews(review_id),
+    approval_id TEXT UNIQUE NOT NULL REFERENCES fee_approvals(approval_id),
+    maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>0),
+    protected_shutdown_fee_mojos INTEGER NOT NULL CHECK(typeof(protected_shutdown_fee_mojos)='integer' AND protected_shutdown_fee_mojos>0),
+    confirmed_at_epoch INTEGER NOT NULL CHECK(typeof(confirmed_at_epoch)='integer' AND confirmed_at_epoch>=0),
+    PRIMARY KEY(run_id, revision)
+);
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_update
+BEFORE UPDATE ON follow_fee_ceiling_revisions BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_delete
+BEFORE DELETE ON follow_fee_ceiling_revisions BEGIN
+    SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
+END;
 """
 
 
@@ -4502,6 +4550,31 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "follow_fee_ceiling_reviews": {
+        "review_id",
+        "review_sha256",
+        "run_id",
+        "identity_sha256",
+        "scope_sha256",
+        "plan_sha256",
+        "configuration_sha256",
+        "prior_revision",
+        "prior_maximum_fee_mojos",
+        "proposed_maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "observed_fee_principal_mojos",
+        "reviewed_at_epoch",
+        "expires_at_epoch",
+    },
+    "follow_fee_ceiling_revisions": {
+        "run_id",
+        "revision",
+        "review_id",
+        "approval_id",
+        "maximum_fee_mojos",
+        "protected_shutdown_fee_mojos",
+        "confirmed_at_epoch",
+    },
     "follow_run_reviews": {
         "review_id",
         "review_sha256",
@@ -6652,6 +6725,30 @@ _FOLLOW_SCHEMA_POLICY_SHA256 = hashlib.sha256(
 _FOLLOW_SCHEMA_TABLES = frozenset(
     {"follow_run_reviews", "follow_run_authorities", "follow_run_stops"}
 )
+_FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY = "follow-fee-ceiling-revision-schema"
+_FOLLOW_FEE_CEILING_SCHEMA_VERSION = 1
+_FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"follow-fee-ceiling-revision:v1:immutable-review-and-revision"
+).hexdigest()
+_FOLLOW_FEE_CEILING_SCHEMA_TABLES = frozenset(
+    {"follow_fee_ceiling_reviews", "follow_fee_ceiling_revisions"}
+)
+
+
+def _follow_fee_ceiling_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks "
+        "WHERE migration_key=?",
+        (_FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _FOLLOW_FEE_CEILING_SCHEMA_VERSION
+        or row["policy_sha256"] != _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("fee ceiling revision schema watermark contradicts policy")
+    return True
 
 
 def _follow_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -7819,6 +7916,14 @@ def _migrate_stability_schema() -> None:
         follow_schema_completed = _follow_schema_completed(conn)
         if follow_schema_completed and missing_stability_tables & _FOLLOW_SCHEMA_TABLES:
             raise RuntimeError("Follow authority schema watermark contradicts schema")
+        ceiling_schema_completed = _follow_fee_ceiling_schema_completed(conn)
+        if (
+            ceiling_schema_completed
+            and missing_stability_tables & _FOLLOW_FEE_CEILING_SCHEMA_TABLES
+        ):
+            raise RuntimeError(
+                "fee ceiling revision schema watermark contradicts schema"
+            )
         legacy_missing_tables = missing_stability_tables - (
             {
                 "offer_reconciliation_coin_outcomes",
@@ -7855,6 +7960,7 @@ def _migrate_stability_schema() -> None:
             | _FEE_APPROVAL_SCHEMA_TABLES
             | _FEE_SESSION_COMPLETION_TABLES
             | _FOLLOW_SCHEMA_TABLES
+            | _FOLLOW_FEE_CEILING_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -7920,6 +8026,18 @@ def _migrate_stability_schema() -> None:
                     _FOLLOW_SCHEMA_MIGRATION_KEY,
                     _FOLLOW_SCHEMA_VERSION,
                     _FOLLOW_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not ceiling_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    _FOLLOW_FEE_CEILING_SCHEMA_MIGRATION_KEY,
+                    _FOLLOW_FEE_CEILING_SCHEMA_VERSION,
+                    _FOLLOW_FEE_CEILING_SCHEMA_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
@@ -22990,6 +23108,22 @@ def get_follow_cleanup_authority(
         return result
     finally:
         conn.close()
+
+
+def get_effective_follow_fee_policy(
+    *, run_id: str, identity: dict, now_epoch: int
+) -> Dict[str, Any]:
+    """Read the initial approved ceiling and its lifetime scope totals.
+
+    This reader grants no fee reservation or wallet dispatch authority. A
+    later revision must preserve the run ID and scope while replacing the
+    effective approval and ceiling in this response.
+    """
+
+    policy = get_follow_cleanup_authority(
+        run_id=run_id, identity=identity, now_epoch=now_epoch
+    )
+    return {**policy, "revision": 0, "dispatch_authorized": False}
 
 
 def get_follow_run_identity(run_id: str) -> Dict[str, Any]:

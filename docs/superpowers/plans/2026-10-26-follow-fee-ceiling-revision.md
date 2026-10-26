@@ -38,7 +38,7 @@
 
 - [ ] Write tests for immutable five-minute review, exact identity/run/scope binding, initial 0.005 XCH ceiling, and stale/replayed review rejection.
 - [ ] Run those tests and confirm the missing interfaces fail.
-- [ ] Add append-only review and revision tables plus schema validation and the read-only effective policy reader.
+- [ ] Add append-only review and revision tables under a distinct schema migration watermark (do not rewrite the existing Follow authority watermark), schema validation, and the read-only effective policy reader. Replay migration on a disposable copy of each original profile DB.
 - [ ] Run focused schema/restart tests, Ruff and `git diff --check`; commit.
 
 ### Task 2: Native final consent and funding proof
