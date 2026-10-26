@@ -27,6 +27,11 @@ def _proposal():
         "maximum_trade_cat_atoms": 987_000_000,
         "maximum_fee_mojos": 50_000_000_000,
         "cancellation_reserve_mojos": 10_000_000_000,
+        "shutdown_funding": {
+            "ready": True,
+            "full_book_proven": False,
+            "dispatch_authorized": False,
+        },
         "dispatch_authorized": False,
     }
 
@@ -118,6 +123,7 @@ def test_continuous_review_uses_explicit_nonexpiring_term(monkeypatch):
         {"dispatch_authorized": True},
         {"cancellation_reserve_mojos": 0},
         {"slot_assignment_sha256": None},
+        {"shutdown_funding": {"ready": False}},
     ],
 )
 def test_review_rejects_incomplete_or_inexact_proposal(monkeypatch, change):
@@ -168,5 +174,38 @@ def test_review_rejects_proposal_drift_after_persistence(monkeypatch):
             buy_limit=24,
             sell_limit=24,
             duration_seconds=48 * 3600,
+            requested_fee_cap_mojos=50_000_000_000,
+        )
+
+
+def test_review_names_insufficient_fee_coin_before_persisting(monkeypatch):
+    import database
+    import follow_principal
+
+    proposal = _proposal() | {
+        "shutdown_funding": {
+            "ready": False,
+            "reason": "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL",
+            "full_book_proven": False,
+            "dispatch_authorized": False,
+        }
+    }
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda *_a, **_kw: proposal,
+    )
+    monkeypatch.setattr(
+        database,
+        "create_follow_run_review",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("review persisted")),
+    )
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL"):
+        follow_principal.prepare_follow_run_review(
+            "1" * 64,
+            buy_limit=24,
+            sell_limit=24,
+            duration_seconds=None,
+            continuous=True,
             requested_fee_cap_mojos=50_000_000_000,
         )

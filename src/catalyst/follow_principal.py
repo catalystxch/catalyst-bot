@@ -60,6 +60,7 @@ def calculate_follow_principal(
     user_reserve = {"xch": 0, "cat": 0}
     unprotected_count = {"xch": 0, "cat": 0}
     fee_coins = 0
+    largest_fee_coin = 0
     seen = set()
     canonical = []
     for coin in snapshot.coins:
@@ -96,6 +97,7 @@ def calculate_follow_principal(
             user_reserve[asset] += amount
         if coin_id in fee_reserve_coin_ids:
             fee_coins += amount
+            largest_fee_coin = max(largest_fee_coin, amount)
         canonical.append((asset, coin_id, amount, purpose, is_protected))
     if not fee_reserve_coin_ids.issubset(seen):
         raise ValueError("FOLLOW_PRINCIPAL_INVENTORY_INVALID")
@@ -116,6 +118,7 @@ def calculate_follow_principal(
         "maximum_trade_xch_mojos": trade_xch,
         "maximum_trade_cat_atoms": trade_cat,
         "protected_fee_principal_mojos": fee_floor,
+        "largest_spendable_fee_coin_mojos": largest_fee_coin,
         "protected_xch_reserve_mojos": xch_floor,
         "protected_cat_reserve_atoms": cat_floor,
         "selectable_xch_mojos": totals["xch"],
@@ -304,6 +307,7 @@ def preview_approved_follow_principal(
         raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
     replacement_counts = {"xch": 0, "cat": 0}
     replacement_atoms = {"xch": 0, "cat": 0}
+    largest_planned_fee_coin_mojos = 0
     for output in outputs:
         if (
             type(output) is not dict
@@ -317,6 +321,10 @@ def preview_approved_follow_principal(
         if output["purpose"] == "replacement":
             replacement_counts[output["asset"]] += 1
             replacement_atoms[output["asset"]] += output["amount_mojos"]
+        else:
+            largest_planned_fee_coin_mojos = max(
+                largest_planned_fee_coin_mojos, output["amount_mojos"]
+            )
     count_gate = {"replacement_count_gate_passed": False}
     if buy_limit is not None or sell_limit is not None:
         count_gate = prove_follow_replacement_count_capacity(
@@ -334,8 +342,16 @@ def preview_approved_follow_principal(
         observed, fee_cap_mojos=before["total_fee_mojos"]
     )
     slot_fit = {}
+    shutdown_funding = {
+        "ready": False,
+        "reason": "FOLLOW_SLOT_REVIEW_REQUIRED",
+        "full_book_proven": False,
+        "dispatch_authorized": False,
+    }
     if count_gate["replacement_count_gate_passed"]:
         from follow_slot_fit import preview_current_follow_slot_fit
+        from follow_shutdown_funding import preview_one_block_shutdown_funding
+        from config import cfg
 
         slot_fit = preview_current_follow_slot_fit(
             configuration=observed.get("configuration"),
@@ -344,6 +360,14 @@ def preview_approved_follow_principal(
             sell_limit=sell_limit,
             maximum_trade_xch_mojos=principal["maximum_trade_xch_mojos"],
             maximum_trade_cat_atoms=principal["maximum_trade_cat_atoms"],
+        )
+        shutdown_funding = preview_one_block_shutdown_funding(
+            maximum_fee_mojos=before["total_fee_mojos"],
+            spent_fee_mojos=before["spent_fee_mojos"],
+            held_fee_mojos=before["held_fee_mojos"],
+            largest_fee_coin_mojos=principal["largest_spendable_fee_coin_mojos"],
+            protected_shutdown_fee_mojos=before["cancellation_reserve_mojos"],
+            target_seconds=int(getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300)),
         )
     after = database.get_coin_prep_fee_approval_status(approval_id)
     if (
@@ -368,6 +392,8 @@ def preview_approved_follow_principal(
         },
         "maximum_fee_mojos": before["total_fee_mojos"],
         "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
+        "largest_planned_fee_coin_mojos": largest_planned_fee_coin_mojos,
+        "shutdown_funding": shutdown_funding,
     }
     proposal_sha256 = hashlib.sha256(
         json.dumps(review_terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -433,6 +459,17 @@ def prepare_follow_run_review(
         proposal = preview_approved_follow_principal(
             approval_id, buy_limit=buy_limit, sell_limit=sell_limit
         )
+        funding = proposal.get("shutdown_funding")
+        if type(funding) is dict and funding.get("ready") is False:
+            reason = funding.get("reason")
+            if reason in {
+                "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE",
+                "FOLLOW_SHUTDOWN_FEE_FUNDING_REQUIRED",
+                "FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT",
+                "FOLLOW_SHUTDOWN_RESERVE_INSUFFICIENT",
+                "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL",
+            }:
+                raise ValueError(reason)
         reserve = proposal.get("cancellation_reserve_mojos")
         if (
             proposal.get("dispatch_authorized") is not False
@@ -442,6 +479,10 @@ def prepare_follow_run_review(
             or proposal.get("buy_slots_arithmetic_fit") != buy_limit
             or proposal.get("sell_slots_arithmetic_fit") != sell_limit
             or proposal.get("current_prep_targets_proven") is not True
+            or type(proposal.get("shutdown_funding")) is not dict
+            or proposal["shutdown_funding"].get("ready") is not True
+            or proposal["shutdown_funding"].get("full_book_proven") is not False
+            or proposal["shutdown_funding"].get("dispatch_authorized") is not False
             or proposal.get("maximum_fee_mojos") != requested_fee_cap_mojos
             or type(reserve) is not int
             or not 0 < reserve <= requested_fee_cap_mojos
@@ -563,6 +604,10 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
             proposal.get("dispatch_authorized") is not False
             or proposal.get("replacement_count_gate_passed") is not True
             or proposal.get("current_prep_targets_proven") is not True
+            or type(proposal.get("shutdown_funding")) is not dict
+            or proposal["shutdown_funding"].get("ready") is not True
+            or proposal["shutdown_funding"].get("full_book_proven") is not False
+            or proposal["shutdown_funding"].get("dispatch_authorized") is not False
             or proposal.get("buy_slots_arithmetic_fit") != buy_limit
             or proposal.get("sell_slots_arithmetic_fit") != sell_limit
             or proposal.get("identity") != review["identity"]

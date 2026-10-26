@@ -40,6 +40,7 @@ def test_max_safe_principal_preserves_fee_pool_and_configured_reserves():
     )
     assert result["maximum_trade_xch_mojos"] == 52_000_000_000
     assert result["maximum_trade_cat_atoms"] == 850_000
+    assert result["largest_spendable_fee_coin_mojos"] == 30_000_000_000
     assert result["protected_fee_principal_mojos"] == 50_000_000_000
     assert result["protected_xch_reserve_mojos"] == 20_000_000_000
     assert result["protected_cat_reserve_atoms"] == 150_000
@@ -223,6 +224,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
         "principal_review_sha256": "e" * 64,
         "maximum_trade_xch_mojos": 100_000_000_000,
         "maximum_trade_cat_atoms": 1_000_000,
+        "largest_spendable_fee_coin_mojos": 30,
         "dispatch_authorized": False,
     }
     monkeypatch.setattr(
@@ -277,6 +279,7 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert len(result["proposal_sha256"]) == 64
     assert result["dispatch_authorized"] is False
     import follow_slot_fit
+    import follow_shutdown_funding
 
     monkeypatch.setattr(
         follow_slot_fit,
@@ -291,9 +294,20 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
             "dispatch_authorized": False,
         },
     )
+    monkeypatch.setattr(
+        follow_shutdown_funding,
+        "preview_one_block_shutdown_funding",
+        lambda **kwargs: {
+            "ready": kwargs["largest_fee_coin_mojos"] == 30,
+            "full_book_proven": False,
+            "dispatch_authorized": False,
+        },
+    )
     counted = preview_approved_follow_principal(approval_id, buy_limit=1, sell_limit=1)
     assert counted["replacement_count_gate_passed"] is True
     assert counted["slot_assignment_sha256"] == "a" * 64
+    assert counted["largest_planned_fee_coin_mojos"] == 30
+    assert counted["shutdown_funding"]["ready"] is True
     assert counted["proposal_sha256"] != result["proposal_sha256"]
     with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
         preview_approved_follow_principal(approval_id, buy_limit=2, sell_limit=1)
