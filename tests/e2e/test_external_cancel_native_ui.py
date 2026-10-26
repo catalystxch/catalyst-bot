@@ -51,3 +51,28 @@ def test_external_cancel_review_disables_broad_cancel_and_shows_exact_fee(page):
     assert (
         page.evaluate("window.__externalCommitCalls[0].reviewed.trade_id") == "b" * 64
     )
+
+
+def test_external_cancel_identity_outage_keeps_broad_cancel_disabled(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """async () => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            IS_DESKTOP = true;
+            bot_state = {running: false, offers: {buy: [], sell: [{trade_id: 'b'.repeat(64)}]}};
+            window.pywebview = {api: {
+                preview_external_cancellation: async () => ({success: false})
+            }};
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: true, stage: 'normal', safety: {allowed: true},
+                wallet: {fingerprint: 736588221, active_trade_ids: [],
+                         pending_transaction_count: 0}
+            }), {status: 200});
+            await cancelAllOffers();
+        }"""
+    )
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
+    expect(page.locator("#externalCancelCommitBtn")).to_be_disabled()
+    expect(page.locator("#externalCancelSummary")).to_contain_text(
+        "Exact cancellation proof is unavailable"
+    )
