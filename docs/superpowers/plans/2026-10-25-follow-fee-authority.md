@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bind every wallet fee in a reviewed 48-hour Follow ladder to one durable cumulative 0.05 XCH ceiling, including safe shutdown after restart.
+**Goal:** Bind every wallet fee in a reviewed continuous Follow ladder to one durable cumulative ceiling, initially 0.005 XCH per PC, including safe shutdown after restart and explicitly reviewed ceiling revisions during the run.
 
 **Architecture:** A native review records one immutable wallet, configuration, offer-limit, expiry and fee consent. Every Follow offer intent carries that run ID. Fee-bearing operations obtain a fresh exact price and an atomic, append-only hold in the same run scope before wallet dispatch; unknown effects remain held until proved. Creation pauses when the shutdown reserve cannot be protected. The RED-market override consumes this run's read-only creation authority.
 
 **Tech Stack:** Python, Flask/PyWebView, SQLite WAL, Sage wallet adapter, pytest, Playwright.
 
-**Spec:** User instructions in this task: continuous Follow, 24 BUY + 24 SELL on each original-profile PC, maximum safely selectable XCH/MZ while retaining protected fee principal, 0.05 XCH cumulative fee cap per PC, 48-hour observation, one identical normal production-path build.
+**Spec:** User instructions in this task: continuous Follow, 24 BUY + 24 SELL on each original-profile PC, maximum safely selectable XCH/MZ while retaining protected fee principal, initial 0.005 XCH cumulative fee cap per PC adjustable during the active run after fresh review, 48-hour observation, one identical normal production-path build. See `docs/superpowers/plans/2026-10-26-follow-fee-ceiling-revision.md` for the revision path.
 
 ## Global Constraints
 
@@ -24,7 +24,7 @@
 - A single-offer cancellation must not fall back to unapproved serial dispatch.
 - A settings or wallet change must invalidate creation while retaining cleanup authority for prior offers.
 - A Stop or expiry must remove creation authority without stranding approved cleanup.
-- A new fee session or process restart must not reset the previous run's 0.05 XCH accounting.
+- A new fee session, reviewed ceiling revision, or process restart must not reset the previous run's cumulative accounting.
 
 ---
 
@@ -44,7 +44,7 @@
 Native consent boundary to implement next: the server must persist an immutable,
 short-lived review for the exact wallet fingerprint/network/asset, settings
 digest, 24/24 limits, 48-hour expiry, maximum safe principal, fee approval ID,
-0.05 XCH ceiling and protected shutdown reserve. The final native click may
+initial 0.005 XCH ceiling and protected shutdown reserve. The final native click may
 submit only that review ID and digest. In one database transaction, compare the
 still-current review and approval, record a single-use consent, and create the
 run authority. `create_follow_run_authority` must reject arbitrary 64-hex
