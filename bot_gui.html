@@ -12204,6 +12204,14 @@
                     </label>
                     <button type="button" id="refreshAbortActionBtn" class="btn btn-cancel btn-danger">Review recovery</button>
                 </div>
+                <div id="externalCancelPanel" class="v4-modal-panel v4-modal-panel--warning" hidden>
+                    <strong>Sage-only cancellation proof</strong>
+                    <p id="externalCancelSummary" style="overflow-wrap: anywhere;"></p>
+                    <p id="externalCancelIdentity" style="overflow-wrap: anywhere;"></p>
+                    <p id="externalCancelFee" style="overflow-wrap: anywhere;"></p>
+                    <p id="externalCancelDigest" style="overflow-wrap: anywhere;"></p>
+                    <button type="button" id="externalCancelCommitBtn" class="btn btn-cancel btn-danger" disabled>Confirm local records only</button>
+                </div>
                 <div class="v4-modal-actions v4-modal-actions--center">
                     <button class="btn btn-config btn-secondary" onclick="closeCancelConfirm()" style="flex: 1; max-width: 170px;">Keep Offers</button>
                     <button class="btn btn-cancel btn-danger" onclick="confirmCancelAll()" style="flex: 1; max-width: 170px;" id="cancelAllConfirmBtn">Cancel All</button>
@@ -33534,6 +33542,85 @@
 
         let _cancelAllContext = null;
         let _refreshAbortPreview = null;
+        let _externalCancelReview = null;
+
+        async function loadExternalCancelReview() {
+            const panel = document.getElementById('externalCancelPanel');
+            const confirm = document.getElementById('externalCancelCommitBtn');
+            const broad = document.getElementById('cancelAllConfirmBtn');
+            panel.hidden = true;
+            confirm.disabled = true;
+            _externalCancelReview = null;
+            if (_cancelAllContext || !IS_DESKTOP
+                    || typeof window.pywebview?.api?.preview_external_cancellation !== 'function') return;
+            try {
+                const response = await window.pywebview.api.preview_external_cancellation();
+                if (!document.getElementById('cancelConfirmModal').classList.contains('active')) return;
+                if (response?.success !== true || !response.review) throw new Error('proof unavailable');
+                const review = response.review;
+                if (review.wallet_effect_started !== false
+                        || typeof review.trade_id !== 'string'
+                        || typeof review.proof_digest !== 'string'
+                        || typeof review.fee_mojos !== 'string'
+                        || typeof review.returned_amount_atomic !== 'string') {
+                    throw new Error('review invalid');
+                }
+                const fee = BigInt(review.fee_mojos);
+                const feeXch = `${fee / 1000000000000n}.${(fee % 1000000000000n).toString().padStart(12, '0')}`;
+                document.getElementById('externalCancelSummary').textContent =
+                    `Sage proves SELL ${review.trade_id} cancelled at block ${review.confirmed_height}. ` +
+                    `Selected CAT coin ${review.input_coin_id} returned as ${review.return_coin_id} ` +
+                    `(${review.returned_amount_atomic} atoms). No wallet transaction will be sent.`;
+                document.getElementById('externalCancelIdentity').textContent =
+                    `Wallet ${review.wallet_fingerprint}, ${review.network}; CAT asset ${review.asset_id}.`;
+                document.getElementById('externalCancelFee').textContent =
+                    `Historical Sage cancellation fee: ${feeXch} XCH (${review.fee_mojos} mojos). ` +
+                    `This was paid before the new Follow run and is not charged to its ceiling.`;
+                document.getElementById('externalCancelDigest').textContent =
+                    `Exact proof ${review.proof_digest}; review expires at ` +
+                    `${new Date(review.expires_at_epoch * 1000).toLocaleString()}.`;
+                _externalCancelReview = review;
+                panel.hidden = false;
+                broad.disabled = true;
+                confirm.disabled = false;
+            } catch (_) {
+                const localCount = (bot_state?.offers?.buy?.length || 0)
+                    + (bot_state?.offers?.sell?.length || 0);
+                const liveIds = _refreshAbortPreview?.wallet?.active_trade_ids;
+                if (localCount > 0 && Array.isArray(liveIds) && liveIds.length === 0) {
+                    document.getElementById('externalCancelSummary').textContent =
+                        'Sage has no live offers, but CATalyst still has a local open offer. ' +
+                        'Exact cancellation proof is unavailable; trading and broad cancellation remain blocked.';
+                    document.getElementById('externalCancelIdentity').textContent = '';
+                    document.getElementById('externalCancelFee').textContent = '';
+                    document.getElementById('externalCancelDigest').textContent = '';
+                    panel.hidden = false;
+                    broad.disabled = true;
+                }
+            }
+        }
+
+        document.getElementById('externalCancelCommitBtn').addEventListener('click', async () => {
+            const reviewed = _externalCancelReview;
+            if (!reviewed || bot_state?.running) return;
+            const button = document.getElementById('externalCancelCommitBtn');
+            button.disabled = true;
+            _externalCancelReview = null;
+            try {
+                const response = await window.pywebview.api.commit_external_cancellation({ reviewed });
+                if (response?.success !== true || response.applied !== true
+                        || response.wallet_effect_started !== false) {
+                    throw new Error('exact proof changed');
+                }
+                showToast('Sage cancellation proven; local offer records reconciled.', 'success');
+                closeCancelConfirm();
+                await fetchStatus();
+            } catch (_) {
+                document.getElementById('externalCancelSummary').textContent =
+                    'Exact proof changed or the local recovery was blocked. Refresh the review before trying again.';
+                showToast('Sage cancellation recovery needs a fresh review.', 'warning');
+            }
+        });
 
         async function loadRefreshAbortReview() {
             const panel = document.getElementById('refreshAbortPanel');
@@ -33568,7 +33655,7 @@
                     const fingerprint = preview.wallet?.fingerprint || 'unavailable';
                     document.getElementById('cancelOfferCount').textContent = `Sage wallet ${fingerprint}: ${trades.length} live offer${trades.length === 1 ? '' : 's'}, ${preview.wallet?.pending_transaction_count ?? '?'} pending transaction(s).`;
                 }
-                broad.disabled = false;
+                broad.disabled = !Array.isArray(trades) || trades.length === 0;
                 return;
             }
             document.getElementById('cancelConfirmTitle').textContent = hasRecovery
@@ -33829,10 +33916,13 @@
             
             document.getElementById('cancelConfirmModal').classList.add('active');
             await loadRefreshAbortReview();
+            await loadExternalCancelReview();
         }
         
         function closeCancelConfirm({ clearContext = true } = {}) {
             document.getElementById('cancelConfirmModal').classList.remove('active');
+            _externalCancelReview = null;
+            document.getElementById('externalCancelCommitBtn').disabled = true;
             if (clearContext) _cancelAllContext = null;
         }
         

@@ -610,6 +610,31 @@ class AppBridge:
         return {"success": True, **proof}
 
     @_safe
+    def preview_external_cancellation(self):
+        """Read exact Sage-only cancellation proof for a native review."""
+
+        import external_cancel_recovery
+
+        return {
+            "success": True,
+            "review": external_cancel_recovery.preview_external_cancellation(),
+        }
+
+    @_safe
+    @_mutation_guard("app_bridge:commit_external_cancellation")
+    def commit_external_cancellation(self, body=None):
+        """Apply a single reviewed local settlement without a wallet effect."""
+
+        import external_cancel_recovery
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = external_cancel_recovery.commit_external_cancellation(body["reviewed"])
+        return {"success": True, **result}
+
+    @_safe
     def commit_terminal_offers(self, body=None):
         """Apply a freshly reverified, database-only terminal cohort."""
         import mixed_terminal_recovery
@@ -2306,6 +2331,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "confirm_follow_run_review",
     "prepare_follow_fee_ceiling_review",
     "confirm_follow_fee_ceiling_review",
+    "commit_external_cancellation",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",
@@ -2419,6 +2445,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "preview_bootstrap_campaign",
     "preview_completed_bootstrap_offers",
     "preview_terminal_offers",
+    "preview_external_cancellation",
     "refresh_balances",
     "run_doctor",
     "validate_config",
