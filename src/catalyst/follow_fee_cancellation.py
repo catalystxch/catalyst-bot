@@ -33,13 +33,13 @@ def price_follow_cancellation(
     fee_coin_id: str,
     now_epoch: int,
 ) -> dict:
-    """Converge a Sage unsigned cancellation against the original run cap."""
+    """Converge a Sage unsigned cancellation against the effective run cap."""
     trades = _canonical_ids(trade_ids)
     sources = _canonical_ids(source_coin_ids)
     fee_coins = _canonical_ids([fee_coin_id])
     if len(trades) != len(sources) or fee_coins[0] in set(sources):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
-    authority = database.get_follow_cleanup_authority(
+    authority = database.get_effective_follow_fee_policy(
         run_id=run_id, identity=identity, now_epoch=now_epoch
     )
     if authority.get("ready") is not True:
@@ -77,7 +77,7 @@ def price_follow_cancellation(
         if quoted_fee == fee:
             if fee == 0:
                 return _refused("FEE_CANCELLATION_FUNDING_REQUIRED", authority)
-            after = database.get_follow_cleanup_authority(
+            after = database.get_effective_follow_fee_policy(
                 run_id=run_id, identity=identity, now_epoch=now_epoch
             )
             if after.get("ready") is not True or after != authority:

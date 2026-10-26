@@ -207,7 +207,14 @@ def test_existing_fee_outcome_guard_upgrades_without_losing_proof_gate(approved)
                   WHERE run.run_id=json_extract(
                       NEW.evidence_json, '$.follow_run_id'
                   )
-                    AND run.approval_id=reservation.approval_id
+                    AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )
                     AND reservation.operation_id=catalyst_sha256(
                         'follow-cancel:' || run.run_id || ':' || manifest.cohort_id
                     )
@@ -225,17 +232,32 @@ def test_existing_fee_outcome_guard_upgrades_without_losing_proof_gate(approved)
       AND json_extract(NEW.evidence_json, '$.kind')=
           'coin_prep_cancellation_fee_outcome'"""
         assert current.count(new_fragment) == 1
-        prior = current.replace(new_fragment, prior_fragment)
-        conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
-        conn.execute(prior)
-        database._upgrade_fee_outcome_journal_guard(conn)
-        upgraded = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' "
-            "AND name='approved_fee_outcomes_journal_guard'"
-        ).fetchone()[0]
-        assert database._normalized_schema_sql(
-            upgraded
-        ) == database._normalized_schema_sql(current)
+        old_follow_fragment = new_fragment.replace(
+            """AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )""",
+            "AND run.approval_id=reservation.approval_id",
+        )
+        assert old_follow_fragment != new_fragment
+        for prior in (
+            current.replace(new_fragment, old_follow_fragment),
+            current.replace(new_fragment, prior_fragment),
+        ):
+            conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
+            conn.execute(prior)
+            database._upgrade_fee_outcome_journal_guard(conn)
+            upgraded = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='approved_fee_outcomes_journal_guard'"
+            ).fetchone()[0]
+            assert database._normalized_schema_sql(
+                upgraded
+            ) == database._normalized_schema_sql(current)
     finally:
         conn.close()
 
@@ -305,6 +327,9 @@ def test_durable_stop_releases_reserve_only_for_exact_run_cleanup(approved):
         )
         is True
     )
+    assert database.get_unsettled_follow_cancellation_manifests() == [
+        {"run_id": run_id, "manifest": manifest}
+    ]
 
 
 def test_stopped_run_routine_requote_cannot_spend_shutdown_reserve(approved):
@@ -363,6 +388,53 @@ def test_expired_follow_run_routine_requote_keeps_shutdown_reserve(approved):
             batch_contract=contract,
             final_quote=_quote(approved, fee=50),
         )
+
+
+def test_revised_follow_ceiling_funds_exact_routine_cancel_hold(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1004
+    review = database.create_follow_fee_ceiling_review(
+        run_id=run_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        proposed_maximum_fee_mojos=120,
+        observed_fee_principal_mojos=120,
+        now_epoch=1002,
+    )
+    revision = database.confirm_follow_fee_ceiling_review(
+        review_id=review["review_id"],
+        review_sha256=review["review_sha256"],
+        identity=identity,
+        configuration_sha256="a" * 64,
+        observed_fee_principal_mojos=120,
+        now_epoch=1003,
+    )
+    manifest, contract = _prepared_follow_cancel(
+        run_id, identity, fee=60, reason="requote"
+    )
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved, fee=60),
+    )
+    assert hold["fee_mojos"] == 60
+    assert hold["approval_id"] == revision["approval_id"]
+    database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+    assert (
+        database.recheck_follow_cancellation_fee_hold(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=_quote(approved, fee=60),
+        )
+        is True
+    )
+    assert database.get_unsettled_follow_cancellation_manifests() == [
+        {"run_id": run_id, "manifest": manifest}
+    ]
 
 
 def test_new_fee_approval_keeps_old_run_cleanup_under_original_cap(approved):
@@ -580,9 +652,29 @@ def test_follow_cancel_hold_survives_run_stop_but_rechecks_exact_claim(
     )
 
 
-def test_follow_cancel_no_effect_releases_hold_only_after_journal_proof(approved):
+@pytest.mark.parametrize("revised", [False, True])
+def test_follow_cancel_no_effect_releases_hold_only_after_journal_proof(
+    approved, revised
+):
     run_id, identity = _run(approved)
-    approved["now"] = 1002
+    approved["now"] = 1004 if revised else 1002
+    if revised:
+        review = database.create_follow_fee_ceiling_review(
+            run_id=run_id,
+            identity=identity,
+            configuration_sha256="a" * 64,
+            proposed_maximum_fee_mojos=120,
+            observed_fee_principal_mojos=120,
+            now_epoch=1002,
+        )
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            identity=identity,
+            configuration_sha256="a" * 64,
+            observed_fee_principal_mojos=120,
+            now_epoch=1003,
+        )
     manifest, contract = _prepared_follow_cancel(run_id, identity)
     hold = database.reserve_follow_cancellation_fee(
         run_id=run_id,
@@ -640,9 +732,27 @@ def test_follow_cancel_no_effect_releases_hold_only_after_journal_proof(approved
     )
 
 
-def test_follow_confirmed_spend_charges_original_cap_after_restart(approved):
+@pytest.mark.parametrize("revised", [False, True])
+def test_follow_confirmed_spend_charges_run_scope_after_restart(approved, revised):
     run_id, identity = _run(approved)
-    approved["now"] = 1002
+    approved["now"] = 1004 if revised else 1002
+    if revised:
+        review = database.create_follow_fee_ceiling_review(
+            run_id=run_id,
+            identity=identity,
+            configuration_sha256="a" * 64,
+            proposed_maximum_fee_mojos=120,
+            observed_fee_principal_mojos=120,
+            now_epoch=1002,
+        )
+        database.confirm_follow_fee_ceiling_review(
+            review_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            identity=identity,
+            configuration_sha256="a" * 64,
+            observed_fee_principal_mojos=120,
+            now_epoch=1003,
+        )
     manifest, contract = _prepared_follow_cancel(run_id, identity)
     hold = database.reserve_follow_cancellation_fee(
         run_id=run_id,

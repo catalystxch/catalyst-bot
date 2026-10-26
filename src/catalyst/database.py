@@ -1888,7 +1888,14 @@ AND NOT EXISTS (
                   WHERE run.run_id=json_extract(
                       NEW.evidence_json, '$.follow_run_id'
                   )
-                    AND run.approval_id=reservation.approval_id
+                    AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )
                     AND reservation.operation_id=catalyst_sha256(
                         'follow-cancel:' || run.run_id || ':' || manifest.cohort_id
                     )
@@ -7621,7 +7628,14 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
                   WHERE run.run_id=json_extract(
                       NEW.evidence_json, '$.follow_run_id'
                   )
-                    AND run.approval_id=reservation.approval_id
+                    AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )
                     AND reservation.operation_id=catalyst_sha256(
                         'follow-cancel:' || run.run_id || ':' || manifest.cohort_id
                     )
@@ -7640,6 +7654,20 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
           'coin_prep_cancellation_fee_outcome'"""
     if expected_sql.count(follow_guard_sql) != 1:
         raise RuntimeError("follow fee outcome guard definition is unavailable")
+    prior_follow_guard_sql = follow_guard_sql.replace(
+        """AND (
+                        run.approval_id=reservation.approval_id
+                        OR EXISTS (
+                            SELECT 1 FROM follow_fee_ceiling_revisions AS revision
+                            WHERE revision.run_id=run.run_id
+                              AND revision.approval_id=reservation.approval_id
+                        )
+                    )""",
+        "AND run.approval_id=reservation.approval_id",
+    )
+    if prior_follow_guard_sql == follow_guard_sql:
+        raise RuntimeError("prior Follow fee outcome guard definition is unavailable")
+    prior_follow_sql = expected_sql.replace(follow_guard_sql, prior_follow_guard_sql)
     prior_current_sql = expected_sql.replace(follow_guard_sql, prior_guard_sql)
     legacy_sql = """
     CREATE TRIGGER approved_fee_outcomes_journal_guard
@@ -7688,6 +7716,7 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
     """
     if _normalized_schema_sql(actual_sql) not in {
         _normalized_schema_sql(legacy_sql),
+        _normalized_schema_sql(prior_follow_sql),
         _normalized_schema_sql(prior_current_sql),
     }:
         raise RuntimeError("fee outcome journal guard has unknown schema")
@@ -23033,7 +23062,11 @@ def get_follow_creation_authority(
 
 
 def get_follow_cleanup_authority(
-    *, run_id: str, identity: dict, now_epoch: int
+    *,
+    run_id: str,
+    identity: dict,
+    now_epoch: int,
+    _own_unresolved_operation_id: str | None = None,
 ) -> Dict[str, Any]:
     """Read the original fee scope for stopped or expired Follow cleanup.
 
@@ -23046,6 +23079,11 @@ def get_follow_cleanup_authority(
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if type(now_epoch) is not int or now_epoch < 0:
         raise ValueError("FOLLOW_TIME_INVALID")
+    own_operation = (
+        _fee_operation_identity(_own_unresolved_operation_id)
+        if _own_unresolved_operation_id is not None
+        else None
+    )
     result: Dict[str, Any] = {
         "ready": False,
         "reason_code": "FOLLOW_AUTHORITY_REQUIRED",
@@ -23130,8 +23168,9 @@ def get_follow_cleanup_authority(
                 "SELECT 1 FROM approved_fee_reservations AS reservation "
                 "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
                 "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL "
+                "AND (? IS NULL OR reservation.operation_id<>?) "
                 "LIMIT 1",
-                (row["scope_sha256"],),
+                (row["scope_sha256"], own_operation, own_operation),
             ).fetchone()
             if unresolved is not None:
                 result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
@@ -23146,12 +23185,19 @@ def get_follow_cleanup_authority(
 
 
 def get_effective_follow_fee_policy(
-    *, run_id: str, identity: dict, now_epoch: int
+    *,
+    run_id: str,
+    identity: dict,
+    now_epoch: int,
+    _own_unresolved_operation_id: str | None = None,
 ) -> Dict[str, Any]:
     """Read the revision chain and lifetime ledger without dispatch authority."""
 
     policy = get_follow_cleanup_authority(
-        run_id=run_id, identity=identity, now_epoch=now_epoch
+        run_id=run_id,
+        identity=identity,
+        now_epoch=now_epoch,
+        _own_unresolved_operation_id=_own_unresolved_operation_id,
     )
     policy = {**policy, "revision": 0, "dispatch_authorized": False}
     conn = _stability_read_only_connection()
@@ -23877,16 +23923,21 @@ def _reserve_approved_fee_locked(
     ).fetchone()[0]
     if approval["scope_sha256"] != scope or approval["plan_sha256"] != plan:
         raise ValueError("FEE_APPROVAL_STALE")
-    if allow_superseded_follow_cancellation and (
-        not cancellation
-        or conn.execute(
+    if allow_superseded_follow_cancellation:
+        follow_approval = conn.execute(
             "SELECT 1 FROM follow_run_authorities WHERE approval_id=? "
-            "AND maximum_fee_mojos=? LIMIT 1",
-            (approval_id, approval["total_fee_mojos"]),
+            "AND maximum_fee_mojos=? "
+            "UNION ALL SELECT 1 FROM follow_fee_ceiling_revisions "
+            "WHERE approval_id=? AND maximum_fee_mojos=? LIMIT 1",
+            (
+                approval_id,
+                approval["total_fee_mojos"],
+                approval_id,
+                approval["total_fee_mojos"],
+            ),
         ).fetchone()
-        is None
-    ):
-        raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+        if not cancellation or follow_approval is None:
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
     existing = conn.execute(
         "SELECT * FROM approved_fee_reservations WHERE operation_id=?", (operation,)
     ).fetchone()
@@ -23900,8 +23951,8 @@ def _reserve_approved_fee_locked(
             raise ValueError("FEE_OPERATION_CONFLICT")
         return {**dict(existing), "idempotent": True}
     # A Follow cancellation already passed the exact run, identity and
-    # journal checks in its caller. A later fee approval must not strand that
-    # run's outstanding offers; the original ceiling still bounds this hold.
+    # journal checks in its caller. Later unrelated approvals must not strand
+    # exact cleanup; the caller's selected effective run cap bounds this hold.
     if approval["version"] != latest and not (
         allow_superseded_follow_cancellation and cancellation
     ):
@@ -24415,7 +24466,7 @@ def reserve_follow_cancellation_fee(
     batch_contract: Dict[str, Any],
     final_quote: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Atomically hold one exact Follow cohort against its original run cap.
+    """Atomically hold one exact Follow cohort against its effective run cap.
 
     The hold is accounting, not wallet authority. A later final adapter check
     must prove this same run, journal, quote and still-unsettled hold again.
@@ -24523,6 +24574,37 @@ def reserve_follow_cancellation_fee(
             is not None
         ):
             raise ValueError("FEE_OPERATION_REPLAY")
+        effective = get_effective_follow_fee_policy(
+            run_id=run, identity=identity, now_epoch=now
+        )
+        if effective.get("ready") is not True:
+            raise ValueError(
+                effective.get("reason_code") or "FEE_FOLLOW_AUTHORITY_REQUIRED"
+            )
+        latest_revision = conn.execute(
+            "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (run,),
+        ).fetchone()
+        if (
+            effective["scope_sha256"] != row["scope_sha256"]
+            or effective["plan_sha256"] != row["plan_sha256"]
+            or effective["revision"]
+            != (latest_revision["revision"] if latest_revision else 0)
+            or effective["approval_id"]
+            != (
+                latest_revision["approval_id"]
+                if latest_revision
+                else row["approval_id"]
+            )
+            or effective["maximum_fee_mojos"]
+            != (
+                latest_revision["maximum_fee_mojos"]
+                if latest_revision
+                else row["maximum_fee_mojos"]
+            )
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_CHANGED")
         if (
             conn.execute(
                 "SELECT 1 FROM approved_fee_reservations AS reservation "
@@ -24609,7 +24691,7 @@ def reserve_follow_cancellation_fee(
         # exact journaled cleanup may then spend the same run's allowance.
         totals = _fee_scope_totals(conn, row["scope_sha256"])
         committed_after = totals["committed_fee_mojos"] + fee
-        if committed_after > row["maximum_fee_mojos"]:
+        if committed_after > effective["maximum_fee_mojos"]:
             raise ValueError("FEE_BUDGET_EXCEEDED")
         stopped = (
             conn.execute(
@@ -24621,11 +24703,11 @@ def reserve_follow_cancellation_fee(
         cleanup_eligible = stopped or now >= row["expires_at_epoch"]
         if (not cleanup_eligible or not shutdown_cleanup) and committed_after + row[
             "protected_shutdown_fee_mojos"
-        ] > row["maximum_fee_mojos"]:
+        ] > effective["maximum_fee_mojos"]:
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
         result = _reserve_approved_fee_locked(
             conn,
-            row["approval_id"],
+            effective["approval_id"],
             row["scope_sha256"],
             row["plan_sha256"],
             operation_id,
@@ -24728,8 +24810,23 @@ def recheck_follow_cancellation_fee_hold(
                 "WHERE reservation.operation_id=?",
                 (operation_id,),
             ).fetchone()
+            effective = get_effective_follow_fee_policy(
+                run_id=run,
+                identity=identity,
+                now_epoch=now,
+                _own_unresolved_operation_id=operation_id,
+            )
+            revision = conn.execute(
+                "SELECT * FROM follow_fee_ceiling_revisions WHERE run_id=? "
+                "ORDER BY revision DESC LIMIT 1",
+                (run,),
+            ).fetchone()
             if (
-                row["identity_sha256"] != identity_hash
+                effective.get("ready") is not True
+                or effective["revision"] != (revision["revision"] if revision else 0)
+                or effective["approval_id"]
+                != (revision["approval_id"] if revision else row["approval_id"])
+                or row["identity_sha256"] != identity_hash
                 or row["identity_json"] != encoded_identity
                 or any(
                     scope.get(key) != identity[key] for key in _FOLLOW_IDENTITY_FIELDS
@@ -24746,7 +24843,7 @@ def recheck_follow_cancellation_fee_hold(
                 != row["plan_sha256"]
                 or now < row["started_at_epoch"]
                 or hold is None
-                or hold["approval_id"] != row["approval_id"]
+                or hold["approval_id"] != effective["approval_id"]
                 or hold["scope_sha256"] != row["scope_sha256"]
                 or hold["plan_sha256"] != row["plan_sha256"]
                 or hold["fee_mojos"] != fee
@@ -24755,7 +24852,7 @@ def recheck_follow_cancellation_fee_hold(
             ):
                 return False
             totals = _fee_scope_totals(conn, row["scope_sha256"])
-            if totals["committed_fee_mojos"] > row["maximum_fee_mojos"]:
+            if totals["committed_fee_mojos"] > effective["maximum_fee_mojos"]:
                 return False
             stopped = (
                 conn.execute(
@@ -24840,7 +24937,9 @@ def recheck_follow_cancellation_fee_hold(
             cleanup_eligible = stopped or now >= row["expires_at_epoch"]
             if (not cleanup_eligible or not shutdown_cleanup) and totals[
                 "committed_fee_mojos"
-            ] + row["protected_shutdown_fee_mojos"] > row["maximum_fee_mojos"]:
+            ] + effective["protected_shutdown_fee_mojos"] > effective[
+                "maximum_fee_mojos"
+            ]:
                 return False
             fee_coin = conn.execute(
                 "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
@@ -24923,7 +25022,7 @@ def get_unsettled_follow_cancellation_manifests() -> List[Dict[str, Any]]:
     """Read exact unsettled Follow holds for proof-only restart accounting.
 
     This grants no wallet signing or cancellation retry authority. Every
-    returned run/cohort is bound to the original approval and reservation.
+    returned run/cohort is bound to an approved run revision and reservation.
     """
 
     conn = _stability_read_only_connection()
@@ -24934,7 +25033,10 @@ def get_unsettled_follow_cancellation_manifests() -> List[Dict[str, Any]]:
             "manifest.manifest_json, manifest.created_at "
             "FROM approved_fee_reservations AS reservation "
             "JOIN follow_run_authorities AS run "
-            "ON run.approval_id=reservation.approval_id "
+            "ON (run.approval_id=reservation.approval_id OR EXISTS ("
+            "SELECT 1 FROM follow_fee_ceiling_revisions AS revision "
+            "WHERE revision.run_id=run.run_id "
+            "AND revision.approval_id=reservation.approval_id)) "
             "JOIN offer_cancel_cohort_manifests AS manifest "
             "ON reservation.operation_id=catalyst_sha256("
             "'follow-cancel:' || run.run_id || ':' || manifest.cohort_id) "
@@ -25016,7 +25118,14 @@ def _record_protected_cancellation_fee_outcome(
                 "SELECT approval_id FROM follow_run_authorities WHERE run_id=?",
                 (run_id,),
             ).fetchone()
-            if run is None or reservation["approval_id"] != run["approval_id"]:
+            revised = conn.execute(
+                "SELECT 1 FROM follow_fee_ceiling_revisions "
+                "WHERE run_id=? AND approval_id=?",
+                (run_id, reservation["approval_id"]),
+            ).fetchone()
+            if run is None or (
+                reservation["approval_id"] != run["approval_id"] and revised is None
+            ):
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
         durable = conn.execute(
             "SELECT manifest_sequence,cohort_id,manifest_sha256,member_count,"
