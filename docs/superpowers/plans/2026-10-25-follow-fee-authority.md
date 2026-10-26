@@ -59,6 +59,16 @@ derive the review terms from verified wallet/configuration and display them to
 the human; the final native click must submit the exact review ID/digest. The
 review is not yet a user consent by itself.
 
+Principal review groundwork: `follow_principal.py` now reads the existing
+identity-verified, complete selectable Sage coin snapshot, combines it with
+durable fee-reserve purpose, and calculates an exact atomic trading upper
+bound after the configured wallet reserves and the larger of approved fee
+ceiling or configured fee-pool principal. Its inventory and proposal digests
+change when coin evidence or material reserve terms change. It cannot grant
+consent or wallet effects. The native review still must bind this digest and
+recheck the same live inventory at final consent; offer-sized Coin Prep and
+24/24 affordability remain to be proved before Start.
+
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/bot_loop.py`, `src/catalyst/database.py`, focused tests.
