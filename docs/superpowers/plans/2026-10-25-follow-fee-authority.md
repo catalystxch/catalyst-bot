@@ -77,6 +77,10 @@ response carries exact atomic amounts as JSON strings plus a proposal digest;
 the browser API and native bridge share the same handler. It records no
 consent or run authority. Persisting a single-use principal-bound review and
 rechecking it at the final native click remain pending.
+The preview also reports the approved Coin Prep plan's replacement-coin counts
+and atomic totals by asset. These figures must be compared with 24 slots per
+side and current principal; they do not prove contemporaneous price fit or
+the exact live ladder's slot allocation.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is

@@ -185,7 +185,17 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     }
     scope = {**identity, "campaign_id": None, "session_id": "b" * 64}
     scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
-    plan_json = "{}"
+    plan_json = json.dumps(
+        {
+            "outputs": [
+                {"asset": "xch", "purpose": "replacement", "amount_mojos": 10},
+                {"asset": "cat", "purpose": "replacement", "amount_mojos": 20},
+                {"asset": "xch", "purpose": "fee_reserve", "amount_mojos": 30},
+            ]
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     context = {
         "scope_json": scope_json,
         "scope_sha256": hashlib.sha256(scope_json.encode()).hexdigest(),
@@ -229,6 +239,10 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert result["maximum_trade_xch_mojos"] == 100_000_000_000
     assert result["maximum_fee_mojos"] == 50_000_000_000
     assert result["configuration_sha256"] == "f" * 64
+    assert result["planned_replacement_xch_coin_count"] == 1
+    assert result["planned_replacement_cat_coin_count"] == 1
+    assert result["planned_replacement_xch_mojos"] == 10
+    assert result["planned_replacement_cat_atoms"] == 20
     assert len(result["review_sha256"]) == 64
     assert result["dispatch_authorized"] is False
     status["stale"] = True
@@ -241,6 +255,12 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
         follow_principal, "read_follow_principal_snapshot", lambda **_kw: drifted
     )
     with pytest.raises(ValueError, match="FOLLOW_PRINCIPAL_REVIEW_CHANGED"):
+        preview_approved_follow_principal(approval_id)
+    context["plan_json"] = (
+        '{"outputs":[{"asset":"xch","purpose":"replacement","amount_mojos":true}]}'
+    )
+    context["plan_sha256"] = hashlib.sha256(context["plan_json"].encode()).hexdigest()
+    with pytest.raises(ValueError, match="FOLLOW_FEE_SCOPE_INVALID"):
         preview_approved_follow_principal(approval_id)
 
 
@@ -262,11 +282,12 @@ def test_approved_principal_preview_rejects_fee_change_during_wallet_read(monkey
         "session_id": "b" * 64,
     }
     scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    plan_json = '{"outputs":[]}'
     context = {
         "scope_json": scope_json,
         "scope_sha256": hashlib.sha256(scope_json.encode()).hexdigest(),
-        "plan_json": "{}",
-        "plan_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "plan_json": plan_json,
+        "plan_sha256": hashlib.sha256(plan_json.encode()).hexdigest(),
         "version": 1,
         "latest_version": 1,
     }

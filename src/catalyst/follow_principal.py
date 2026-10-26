@@ -235,7 +235,11 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         != context.get("plan_sha256")
     ):
         raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
-    scope = json.loads(scope_json)
+    try:
+        scope = json.loads(scope_json)
+        plan = json.loads(plan_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FOLLOW_FEE_SCOPE_INVALID") from exc
     identity_keys = {
         "network",
         "wallet_type",
@@ -252,6 +256,24 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         or re.fullmatch(r"[0-9a-f]{64}", scope["session_id"]) is None
     ):
         raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
+    outputs = plan.get("outputs") if type(plan) is dict else None
+    if type(outputs) is not list:
+        raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
+    replacement_counts = {"xch": 0, "cat": 0}
+    replacement_atoms = {"xch": 0, "cat": 0}
+    for output in outputs:
+        if (
+            type(output) is not dict
+            or output.get("asset") not in replacement_counts
+            or output.get("purpose") not in {"replacement", "fee_reserve"}
+            or type(output.get("amount_mojos")) is not int
+            or output["amount_mojos"] <= 0
+            or (output["purpose"] == "fee_reserve" and output["asset"] != "xch")
+        ):
+            raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
+        if output["purpose"] == "replacement":
+            replacement_counts[output["asset"]] += 1
+            replacement_atoms[output["asset"]] += output["amount_mojos"]
     identity = {key: scope.get(key) for key in identity_keys}
     configuration_sha256 = current_configuration_digest()
     principal = read_follow_principal_snapshot(fee_cap_mojos=before["total_fee_mojos"])
@@ -283,5 +305,9 @@ def preview_approved_follow_principal(approval_id: str) -> dict:
         "spent_fee_mojos": before["spent_fee_mojos"],
         "held_fee_mojos": before["held_fee_mojos"],
         "remaining_fee_mojos": before["remaining_fee_mojos"],
+        "planned_replacement_xch_coin_count": replacement_counts["xch"],
+        "planned_replacement_cat_coin_count": replacement_counts["cat"],
+        "planned_replacement_xch_mojos": replacement_atoms["xch"],
+        "planned_replacement_cat_atoms": replacement_atoms["cat"],
         "dispatch_authorized": False,
     }
