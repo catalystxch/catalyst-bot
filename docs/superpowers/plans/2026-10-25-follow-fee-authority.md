@@ -78,6 +78,13 @@ the browser API and native bridge share the same handler. It records no
 consent or run authority. Persisting a single-use principal-bound review and
 rechecking it at the final native click remain pending.
 
+The immutable Follow review and resulting authority now store the exact
+principal proposal digest; changing that digest when consuming the review is
+rejected. The creation-authority reader exposes the frozen digest for a future
+Start recheck. The reviewed digest still needs to be supplied from a trusted
+server review route and compared with fresh inventory at final consent and
+before offer creation; the database field alone does not prove that check.
+
 ### Task 2: Attribute all Follow intents and fee effects to the run
 
 **Files:** `src/catalyst/offer_manager.py`, `src/catalyst/bot_loop.py`, `src/catalyst/database.py`, focused tests.

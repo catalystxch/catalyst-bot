@@ -9,6 +9,7 @@ from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
 def reviewed_run(**terms):
+    terms.setdefault("principal_review_sha256", "d" * 64)
     review = database.create_follow_run_review(**terms)
     with patch.object(
         database.time, "time", return_value=terms["started_at_epoch"] + 1
@@ -40,6 +41,7 @@ def test_follow_review_is_exact_single_use_and_expires(approved):
             )
         },
         configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
         buy_limit=24,
         sell_limit=24,
         started_at_epoch=1001,
@@ -50,6 +52,7 @@ def test_follow_review_is_exact_single_use_and_expires(approved):
     review = database.create_follow_run_review(**terms)
     stored = database.get_follow_run_review(review["review_id"])
     assert stored["review_sha256"] == review["review_sha256"]
+    assert stored["principal_review_sha256"] == terms["principal_review_sha256"]
     assert stored["identity"] == terms["identity"]
     assert stored["buy_limit"] == stored["sell_limit"] == 24
     assert stored["maximum_fee_mojos"] == 80
@@ -68,6 +71,12 @@ def test_follow_review_is_exact_single_use_and_expires(approved):
                 consent_id=review["review_id"],
                 review_sha256=review["review_sha256"],
                 **(terms | {"buy_limit": 25}),
+            )
+        with pytest.raises(ValueError, match="FOLLOW_REVIEW_CHANGED"):
+            database.create_follow_run_authority(
+                consent_id=review["review_id"],
+                review_sha256=review["review_sha256"],
+                **(terms | {"principal_review_sha256": "e" * 64}),
             )
         run = database.create_follow_run_authority(
             consent_id=review["review_id"],
@@ -124,6 +133,7 @@ def test_arbitrary_follow_consent_cannot_create_financial_run(approved):
             approval_id=approval_id,
             identity=identity,
             configuration_sha256="a" * 64,
+            principal_review_sha256="d" * 64,
             buy_limit=24,
             sell_limit=24,
             started_at_epoch=1001,
@@ -155,6 +165,7 @@ def test_follow_review_requires_positive_protected_shutdown_reserve(approved):
             approval_id=approval_id,
             identity=identity,
             configuration_sha256="a" * 64,
+            principal_review_sha256="d" * 64,
             buy_limit=24,
             sell_limit=24,
             started_at_epoch=1001,
@@ -185,6 +196,7 @@ def test_follow_review_rejects_approval_scope_and_ceiling_mismatch(approved):
         approval_id=approval_id,
         identity=identity,
         configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
         buy_limit=24,
         sell_limit=24,
         started_at_epoch=1001,
@@ -244,6 +256,7 @@ def test_follow_creation_authority_is_bound_to_original_review(approved):
     )
     assert current["ready"] is True
     assert current["run_id"] == run["run_id"]
+    assert current["principal_review_sha256"] == "d" * 64
     assert current["maximum_fee_mojos"] == 80
     assert current["protected_shutdown_fee_mojos"] == 40
     assert current["buy_limit"] == current["sell_limit"] == 24

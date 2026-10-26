@@ -111,6 +111,7 @@ def test_scope_accepts_only_actual_durable_follow_run(approved, monkeypatch):
         approval_id=approved["approval"]["approval_id"],
         identity=identity,
         configuration_sha256=policy.current_configuration_digest(),
+        principal_review_sha256="d" * 64,
         buy_limit=configuration["MAX_ACTIVE_BUY_OFFERS"],
         sell_limit=configuration["MAX_ACTIVE_SELL_OFFERS"],
         started_at_epoch=now,

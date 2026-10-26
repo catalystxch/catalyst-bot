@@ -39,6 +39,7 @@ def _run(approved):
         approval_id=approved["approval"]["approval_id"],
         identity=identity,
         configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
         buy_limit=24,
         sell_limit=24,
         started_at_epoch=1001,

@@ -2061,6 +2061,8 @@ CREATE TABLE IF NOT EXISTS follow_run_reviews (
     identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
     configuration_sha256 TEXT NOT NULL
         CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
     buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
     sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
     started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
@@ -2097,6 +2099,8 @@ CREATE TABLE IF NOT EXISTS follow_run_authorities (
     identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
     configuration_sha256 TEXT NOT NULL
         CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
     buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
     sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
     started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
@@ -4503,6 +4507,7 @@ _STABILITY_REQUIRED_COLUMNS = {
         "identity_sha256",
         "identity_json",
         "configuration_sha256",
+        "principal_review_sha256",
         "buy_limit",
         "sell_limit",
         "started_at_epoch",
@@ -4519,6 +4524,7 @@ _STABILITY_REQUIRED_COLUMNS = {
         "identity_sha256",
         "identity_json",
         "configuration_sha256",
+        "principal_review_sha256",
         "buy_limit",
         "sell_limit",
         "started_at_epoch",
@@ -22447,6 +22453,7 @@ def create_follow_run_review(
     approval_id: str,
     identity: dict,
     configuration_sha256: str,
+    principal_review_sha256: str,
     buy_limit: int,
     sell_limit: int,
     started_at_epoch: int,
@@ -22461,6 +22468,7 @@ def create_follow_run_review(
     """
     approval = _fee_digest(approval_id)
     config_hash = _fee_digest(configuration_sha256)
+    principal_hash = _fee_digest(principal_review_sha256)
     encoded_identity = _follow_identity_json(identity)
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
@@ -22480,6 +22488,7 @@ def create_follow_run_review(
         "approval_id": approval,
         "identity": identity,
         "configuration_sha256": config_hash,
+        "principal_review_sha256": principal_hash,
         "buy_limit": buy_limit,
         "sell_limit": sell_limit,
         "started_at_epoch": started_at_epoch,
@@ -22520,7 +22529,7 @@ def create_follow_run_review(
         if approved["version"] != latest:
             raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
         conn.execute(
-            "INSERT INTO follow_run_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO follow_run_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 review_id,
                 review_sha256,
@@ -22528,6 +22537,7 @@ def create_follow_run_review(
                 identity_hash,
                 encoded_identity,
                 config_hash,
+                principal_hash,
                 buy_limit,
                 sell_limit,
                 started_at_epoch,
@@ -22580,6 +22590,7 @@ def create_follow_run_authority(
     approval_id: str,
     identity: dict,
     configuration_sha256: str,
+    principal_review_sha256: str,
     buy_limit: int,
     sell_limit: int,
     started_at_epoch: int,
@@ -22596,6 +22607,7 @@ def create_follow_run_authority(
     review_digest = _fee_digest(review_sha256)
     approval = _fee_digest(approval_id)
     config_hash = _fee_digest(configuration_sha256)
+    principal_hash = _fee_digest(principal_review_sha256)
     encoded_identity = _follow_identity_json(identity)
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
@@ -22641,6 +22653,7 @@ def create_follow_run_authority(
             or review["identity_sha256"] != identity_hash
             or review["identity_json"] != encoded_identity
             or review["configuration_sha256"] != config_hash
+            or review["principal_review_sha256"] != principal_hash
             or review["buy_limit"] != buy_limit
             or review["sell_limit"] != sell_limit
             or review["started_at_epoch"] != started_at_epoch
@@ -22685,7 +22698,7 @@ def create_follow_run_authority(
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_UNFUNDED")
         run_id = secrets.token_hex(32)
         conn.execute(
-            "INSERT INTO follow_run_authorities VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO follow_run_authorities VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 run_id,
                 consent,
@@ -22693,6 +22706,7 @@ def create_follow_run_authority(
                 identity_hash,
                 encoded_identity,
                 config_hash,
+                principal_hash,
                 buy_limit,
                 sell_limit,
                 started_at_epoch,
@@ -22762,6 +22776,7 @@ def get_follow_creation_authority(
         "run_id": None,
         "identity": None,
         "configuration_sha256": None,
+        "principal_review_sha256": None,
         "buy_limit": None,
         "sell_limit": None,
         "expires_at_epoch": None,
@@ -22790,6 +22805,7 @@ def get_follow_creation_authority(
                 "run_id": row["run_id"],
                 "identity": identity,
                 "configuration_sha256": row["configuration_sha256"],
+                "principal_review_sha256": row["principal_review_sha256"],
                 "buy_limit": row["buy_limit"],
                 "sell_limit": row["sell_limit"],
                 "expires_at_epoch": row["expires_at_epoch"],
