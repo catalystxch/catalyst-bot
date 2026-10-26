@@ -22805,6 +22805,7 @@ def get_follow_cleanup_authority(
         "approval_id": None,
         "scope_sha256": None,
         "plan_sha256": None,
+        "target_seconds": None,
         "maximum_fee_mojos": None,
         "protected_shutdown_fee_mojos": None,
         "spent_fee_mojos": None,
@@ -22819,7 +22820,8 @@ def get_follow_cleanup_authority(
         row = conn.execute(
             "SELECT run.*, approval.scope_sha256, approval.plan_sha256, "
             "approval.version, approval.total_fee_mojos, "
-            "approval.cancellation_reserve_mojos, preview.scope_json "
+            "approval.cancellation_reserve_mojos, preview.scope_json, "
+            "preview.plan_json "
             "FROM follow_run_authorities AS run "
             "JOIN fee_approvals AS approval USING(approval_id) "
             "JOIN coin_prep_fee_consents AS consent USING(approval_id) "
@@ -22839,6 +22841,19 @@ def get_follow_cleanup_authority(
             }
         )
         scope = json.loads(row["scope_json"])
+        plan = json.loads(row["plan_json"])
+        target_seconds = plan.get("target_seconds")
+        if (
+            type(target_seconds) is not int
+            or target_seconds < 1
+            or hashlib.sha256(row["scope_json"].encode("utf-8")).hexdigest()
+            != row["scope_sha256"]
+            or hashlib.sha256(row["plan_json"].encode("utf-8")).hexdigest()
+            != row["plan_sha256"]
+        ):
+            result["reason_code"] = "FOLLOW_FEE_APPROVAL_MISMATCH"
+            return result
+        result["target_seconds"] = target_seconds
         if (
             row["identity_sha256"] != identity_hash
             or row["identity_json"] != encoded_identity
