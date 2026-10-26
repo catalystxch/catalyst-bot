@@ -22610,6 +22610,40 @@ def create_follow_run_authority(
         conn.close()
 
 
+def get_unexpired_follow_run_marker(
+    *, asset_id: str, now_epoch: int
+) -> Optional[Dict[str, Any]]:
+    """Identify a reviewed Follow run without granting creation authority.
+
+    This deliberately survives a Stop and ignores mutable configuration. It
+    lets the canonical offer boundary fence legacy, unscoped producers while
+    a reviewed run still covers this asset.
+    """
+    asset = _fee_digest(asset_id)
+    if type(now_epoch) is not int or now_epoch < 0:
+        raise ValueError("FOLLOW_TIME_INVALID")
+    conn = _stability_read_only_connection()
+    try:
+        _validate_stability_schema(conn)
+        row = conn.execute(
+            "SELECT run.run_id, run.expires_at_epoch, "
+            "stop.stopped_at_epoch IS NOT NULL AS stopped "
+            "FROM follow_run_authorities AS run "
+            "LEFT JOIN follow_run_stops AS stop USING(run_id) "
+            "WHERE json_extract(run.identity_json, '$.asset_id')=? "
+            "AND run.started_at_epoch<=? AND run.expires_at_epoch>? "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
+            (asset, now_epoch, now_epoch),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["stopped"] = bool(result["stopped"])
+        return result
+    finally:
+        conn.close()
+
+
 def get_follow_creation_authority(
     *,
     identity: dict,

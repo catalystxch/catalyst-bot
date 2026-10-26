@@ -393,6 +393,57 @@ def test_stopping_run_revokes_creation_but_keeps_cleanup_scope(approved):
     assert result["consent_id"] == run["consent_id"]
 
 
+def test_unexpired_follow_run_marker_survives_stop_and_settings_drift(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    run = reviewed_run(
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=1001 + 48 * 3600,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    marker = database.get_unexpired_follow_run_marker(
+        asset_id=identity["asset_id"], now_epoch=1002
+    )
+    assert marker["run_id"] == run["run_id"]
+    assert marker["stopped"] is False
+    database.stop_follow_run_authority(run_id=run["run_id"], stopped_at_epoch=1010)
+    marker = database.get_unexpired_follow_run_marker(
+        asset_id=identity["asset_id"], now_epoch=1011
+    )
+    assert marker["run_id"] == run["run_id"]
+    assert marker["stopped"] is True
+    assert (
+        database.get_unexpired_follow_run_marker(asset_id="b" * 64, now_epoch=1011)
+        is None
+    )
+    assert (
+        database.get_unexpired_follow_run_marker(
+            asset_id=identity["asset_id"], now_epoch=1001 + 48 * 3600
+        )
+        is None
+    )
+
+
 def test_stopped_and_expired_run_retains_only_bound_cleanup_scope(approved):
     approval_id = approved["approval"]["approval_id"]
     scope = json.loads(
