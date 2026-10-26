@@ -23149,6 +23149,149 @@ def get_effective_follow_fee_policy(
     return {**policy, "revision": 0, "dispatch_authorized": False}
 
 
+def create_follow_fee_ceiling_review(
+    *,
+    run_id: str,
+    identity: dict,
+    configuration_sha256: str,
+    proposed_maximum_fee_mojos: int,
+    observed_fee_principal_mojos: int,
+    now_epoch: int,
+) -> Dict[str, Any]:
+    """Freeze an exact fee change for later native confirmation, without effect.
+
+    A trusted service must supply the observed protected fee principal from a
+    current wallet and Coin Prep read. This function never approves a fee.
+    """
+
+    run = _fee_digest(run_id)
+    config_hash = _fee_digest(configuration_sha256)
+    encoded_identity = _follow_identity_json(identity)
+    identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
+    proposed = _fee_amount(proposed_maximum_fee_mojos)
+    observed_principal = _fee_amount(observed_fee_principal_mojos)
+    if type(now_epoch) is not int or now_epoch < 0 or proposed == 0:
+        raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    policy = get_effective_follow_fee_policy(
+        run_id=run, identity=identity, now_epoch=now_epoch
+    )
+    if policy.get("ready") is not True or policy.get("revision") != 0:
+        raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+    prior_maximum = policy["maximum_fee_mojos"]
+    protected = policy["protected_shutdown_fee_mojos"]
+    committed = policy["spent_fee_mojos"] + policy["held_fee_mojos"]
+    if (
+        proposed == prior_maximum
+        or committed + protected > proposed
+        or observed_principal < proposed - committed
+    ):
+        raise ValueError("FOLLOW_FEE_REVISION_UNFUNDED")
+    review_id = secrets.token_hex(32)
+    terms = {
+        "run_id": run,
+        "identity_sha256": identity_hash,
+        "scope_sha256": policy["scope_sha256"],
+        "plan_sha256": policy["plan_sha256"],
+        "configuration_sha256": config_hash,
+        "prior_revision": 0,
+        "prior_maximum_fee_mojos": prior_maximum,
+        "proposed_maximum_fee_mojos": proposed,
+        "protected_shutdown_fee_mojos": protected,
+        "observed_fee_principal_mojos": observed_principal,
+        "reviewed_at_epoch": now_epoch,
+        "expires_at_epoch": now_epoch + 300,
+    }
+    review_sha256 = hashlib.sha256(
+        json.dumps(terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT run.*, approval.scope_sha256, approval.plan_sha256 "
+            "FROM follow_run_authorities AS run "
+            "JOIN fee_approvals AS approval USING(approval_id) "
+            "WHERE run.run_id=?",
+            (run,),
+        ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?", (run,)
+        ).fetchone()
+        revised = conn.execute(
+            "SELECT 1 FROM follow_fee_ceiling_revisions WHERE run_id=? LIMIT 1", (run,)
+        ).fetchone()
+        totals = _fee_scope_totals(conn, policy["scope_sha256"])
+        if (
+            current is None
+            or stopped is not None
+            or revised is not None
+            or not current["started_at_epoch"]
+            <= now_epoch
+            < current["expires_at_epoch"]
+            or current["identity_sha256"] != identity_hash
+            or current["configuration_sha256"] != config_hash
+            or current["scope_sha256"] != policy["scope_sha256"]
+            or current["plan_sha256"] != policy["plan_sha256"]
+            or current["maximum_fee_mojos"] != prior_maximum
+            or totals["committed_fee_mojos"] != committed
+            or totals["committed_fee_mojos"] + protected > proposed
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_CHANGED")
+        conn.execute(
+            "INSERT INTO follow_fee_ceiling_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                review_id,
+                review_sha256,
+                run,
+                identity_hash,
+                policy["scope_sha256"],
+                policy["plan_sha256"],
+                config_hash,
+                0,
+                prior_maximum,
+                proposed,
+                protected,
+                observed_principal,
+                now_epoch,
+                now_epoch + 300,
+            ),
+        )
+        conn.commit()
+        return {
+            "review_id": review_id,
+            "review_sha256": review_sha256,
+            "dispatch_authorized": False,
+        }
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_follow_fee_ceiling_review(review_id: str) -> Dict[str, Any]:
+    """Read a proposed ceiling change without confirming or dispatching."""
+
+    review = _fee_digest(review_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT review.*, EXISTS(SELECT 1 FROM follow_fee_ceiling_revisions "
+            "AS revision WHERE revision.review_id=review.review_id) AS consumed "
+            "FROM follow_fee_ceiling_reviews AS review WHERE review.review_id=?",
+            (review,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_FEE_REVISION_REVIEW_REQUIRED")
+        return {
+            **dict(row),
+            "consumed": bool(row["consumed"]),
+            "dispatch_authorized": False,
+        }
+    finally:
+        conn.close()
+
+
 def get_follow_run_identity(run_id: str) -> Dict[str, Any]:
     """Read a run's immutable wallet identity for stopped-run fee cleanup.
 
