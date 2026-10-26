@@ -6618,6 +6618,29 @@ _FEE_SESSION_COMPLETION_POLICY_SHA256 = hashlib.sha256(
     b"coin-prep-fee-session-completion:v1:journal-and-current-target-proof"
 ).hexdigest()
 _FEE_SESSION_COMPLETION_TABLES = frozenset({"coin_prep_fee_session_completions"})
+_FOLLOW_SCHEMA_MIGRATION_KEY = "follow-run-authority-schema"
+_FOLLOW_SCHEMA_VERSION = 1
+_FOLLOW_SCHEMA_POLICY_SHA256 = hashlib.sha256(
+    b"follow-run-authority-schema:v1:review-authority-stop"
+).hexdigest()
+_FOLLOW_SCHEMA_TABLES = frozenset(
+    {"follow_run_reviews", "follow_run_authorities", "follow_run_stops"}
+)
+
+
+def _follow_schema_completed(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT schema_version, policy_sha256 FROM stability_migration_watermarks WHERE migration_key=?",
+        (_FOLLOW_SCHEMA_MIGRATION_KEY,),
+    ).fetchone()
+    if row is None:
+        return False
+    if (
+        row["schema_version"] != _FOLLOW_SCHEMA_VERSION
+        or row["policy_sha256"] != _FOLLOW_SCHEMA_POLICY_SHA256
+    ):
+        raise RuntimeError("Follow authority schema watermark contradicts policy")
+    return True
 
 
 def _fee_approval_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -7723,6 +7746,9 @@ def _migrate_stability_schema() -> None:
         missing_post_tibet_tables = missing_stability_tables & _POST_TIBET_SCHEMA_TABLES
         if post_tibet_schema_completed and missing_post_tibet_tables:
             raise RuntimeError("post-TibetSwap schema watermark contradicts schema")
+        follow_schema_completed = _follow_schema_completed(conn)
+        if follow_schema_completed and missing_stability_tables & _FOLLOW_SCHEMA_TABLES:
+            raise RuntimeError("Follow authority schema watermark contradicts schema")
         legacy_missing_tables = missing_stability_tables - (
             {
                 "offer_reconciliation_coin_outcomes",
@@ -7758,6 +7784,7 @@ def _migrate_stability_schema() -> None:
             | _BOOTSTRAP_SCHEMA_TABLES
             | _FEE_APPROVAL_SCHEMA_TABLES
             | _FEE_SESSION_COMPLETION_TABLES
+            | _FOLLOW_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")
@@ -7812,6 +7839,17 @@ def _migrate_stability_schema() -> None:
                     _FEE_APPROVAL_SCHEMA_MIGRATION_KEY,
                     _FEE_APPROVAL_SCHEMA_VERSION,
                     _FEE_APPROVAL_SCHEMA_POLICY_SHA256,
+                    _stability_wall_clock(),
+                ),
+            )
+        if not follow_schema_completed:
+            conn.execute(
+                "INSERT INTO stability_migration_watermarks "
+                "(migration_key, schema_version, policy_sha256, completed_at) VALUES (?, ?, ?, ?)",
+                (
+                    _FOLLOW_SCHEMA_MIGRATION_KEY,
+                    _FOLLOW_SCHEMA_VERSION,
+                    _FOLLOW_SCHEMA_POLICY_SHA256,
                     _stability_wall_clock(),
                 ),
             )
