@@ -1241,12 +1241,18 @@ def api_bot_start():
             )
             if follow_readiness.get("ready") is not True:
                 reason = follow_readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
+                error = (
+                    "CATalyst has an unresolved local offer for this wallet and CAT. "
+                    "Review exact Sage terminal proof before starting"
+                    if reason == "FOLLOW_LOCAL_OFFERS_UNRESOLVED"
+                    else "Review the current Follow wallet, prepared slots and fee ceiling before starting"
+                )
                 return jsonify(
                     {
                         "success": False,
                         "status": "error",
                         "reason": reason,
-                        "error": "Review the current Follow wallet, prepared slots and fee ceiling before starting",
+                        "error": error,
                     }
                 ), 409
         # A stale flag would hide live-book recovery on restart. Fail before

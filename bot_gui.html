@@ -33273,6 +33273,13 @@
                     updateStartupChecklist(bot_state);
                     updateDashboardStartupLayout(bot_state);
                     showToast('The retained Follow offers need an exact run-bound resume review before Start.', 'warning');
+                } else if (result.reason === 'FOLLOW_LOCAL_OFFERS_UNRESOLVED') {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    showToast('CATalyst has an unresolved local offer. Review exact Sage terminal proof before Start.', 'warning');
                 } else if (result.needs_coin_prep) {
                     // Server detected wrong coin sizes — show coin prep modal
                     showToast(`Coins need re-splitting for ${result.target_xch} XCH offers`, 'warning');

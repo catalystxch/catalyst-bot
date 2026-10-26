@@ -445,7 +445,7 @@ class TestStartupPhase5DashboardLoad(_TempDB):
 class TestStartupPhase6BotStartValidation(_TempDB):
     """Bot start must fail gracefully when setup is incomplete."""
 
-    def _try_start(self, asset_id="", spread_bps=50, bot=None):
+    def _try_start(self, asset_id="", spread_bps=50, bot=None, follow_readiness=None):
         if bot is None:
             bot = MagicMock()
             bot.offer_manager.sync_from_wallet.return_value = ([], [], [])
@@ -485,7 +485,7 @@ class TestStartupPhase6BotStartValidation(_TempDB):
             patch.object(api_server.cfg, "SPREAD_BPS", spread_bps),
             patch(
                 "blueprints.bot._reviewed_follow_start_readiness",
-                return_value={"ready": True, "run_id": "a" * 64},
+                return_value=follow_readiness or {"ready": True, "run_id": "a" * 64},
             ),
             patch("api_server.events"),
         ):
@@ -499,6 +499,19 @@ class TestStartupPhase6BotStartValidation(_TempDB):
         """No CAT_ASSET_ID → setup incomplete → 400 error."""
         resp = self._try_start(asset_id="")
         self.assertEqual(resp.status_code, 400)
+
+    def test_unresolved_local_offer_start_has_exact_recovery_message(self):
+        resp = self._try_start(
+            asset_id="b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105",
+            follow_readiness={
+                "ready": False,
+                "reason": "FOLLOW_LOCAL_OFFERS_UNRESOLVED",
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+        body = resp.get_json()
+        self.assertEqual(body["reason"], "FOLLOW_LOCAL_OFFERS_UNRESOLVED")
+        self.assertIn("unresolved local offer", body["error"])
 
     def test_start_without_cat_includes_error_message(self):
         """400 response gives a user-facing setup action."""
