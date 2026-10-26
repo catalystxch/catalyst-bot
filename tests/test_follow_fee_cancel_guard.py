@@ -72,3 +72,44 @@ def test_follow_and_legacy_offers_cannot_share_cancel_batch(
             ["a" * 64, "b" * 64], force_storm=True, reason="manual_cancel_all"
         )
     assert effects == []
+
+
+def test_reviewed_follow_singleton_reaches_exact_plan_without_wallet_effect(
+    isolated_database, monkeypatch
+):
+    run_id = "f" * 64
+    _seed_task7_created_offer(
+        trade_id="a" * 64,
+        coin_id="c" * 64,
+        intent_seed="reviewed-follow-singleton",
+        purpose=f"follow:{run_id}:normal_lifecycle",
+    )
+    effects = []
+    _stub_cancel_continuation_authority(
+        monkeypatch,
+        effect=lambda *_args, **_kwargs: effects.append(True),
+        batch_effect=lambda *_args, **_kwargs: effects.append(True),
+    )
+    monkeypatch.setattr(
+        offer_manager.database,
+        "get_follow_run_identity",
+        lambda exact_run: {"network": "mainnet"} if exact_run == run_id else None,
+    )
+    monkeypatch.setattr(
+        offer_manager.database,
+        "get_follow_cleanup_authority",
+        lambda **_kwargs: {"ready": True},
+    )
+    seen = []
+
+    def plan(_self, _members, exact_run, identity, *_args):
+        seen.append((len(_members), exact_run, identity))
+        raise ValueError("FOLLOW_PLAN_SENTINEL")
+
+    monkeypatch.setattr(offer_manager.OfferManager, "_plan_follow_cancel", plan)
+    with pytest.raises(ValueError, match="FOLLOW_PLAN_SENTINEL"):
+        offer_manager.OfferManager().cancel_offers(
+            ["a" * 64], force_storm=True, reason="manual_cancel_all"
+        )
+    assert seen == [(1, run_id, {"network": "mainnet"})]
+    assert effects == []

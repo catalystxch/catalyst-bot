@@ -22965,6 +22965,39 @@ def get_follow_cleanup_authority(
         conn.close()
 
 
+def get_follow_run_identity(run_id: str) -> Dict[str, Any]:
+    """Read a run's immutable wallet identity for stopped-run fee cleanup.
+
+    This is not creation, approval or wallet-effect authority. Callers must
+    still require the exact current approval, journal and wallet binding.
+    """
+
+    run = _fee_digest(run_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT identity_json,identity_sha256 FROM follow_run_authorities "
+            "WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("FOLLOW_AUTHORITY_REQUIRED")
+        encoded = row["identity_json"]
+        try:
+            identity = json.loads(encoded)
+            canonical = _follow_identity_json(identity)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("FOLLOW_IDENTITY_MISMATCH") from exc
+        if canonical != encoded or (
+            hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            != row["identity_sha256"]
+        ):
+            raise ValueError("FOLLOW_IDENTITY_MISMATCH")
+        return identity
+    finally:
+        conn.close()
+
+
 def stop_follow_run_authority(*, run_id: str, stopped_at_epoch: int) -> Dict[str, Any]:
     """Stop new creation without destroying the approved cleanup scope."""
     run = _fee_digest(run_id)

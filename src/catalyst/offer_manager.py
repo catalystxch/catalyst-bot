@@ -7167,6 +7167,14 @@ class OfferManager:
             except ValueError as exc:
                 if str(exc) != "FEE_EFFECT_UNRESOLVED":
                     raise
+        for held in database.get_unsettled_follow_cancellation_manifests():
+            try:
+                database.record_follow_cancellation_fee_outcome(
+                    run_id=held["run_id"], manifest_json=held["manifest"]
+                )
+            except ValueError as exc:
+                if str(exc) != "FEE_EFFECT_UNRESOLVED":
+                    raise
         return recovered
 
     def _abort_cancel_after_ambiguous_peer(
@@ -7945,6 +7953,8 @@ class OfferManager:
         priced_cancellation: Optional[dict] = None,
         fee_reservation: Optional[tuple] = None,
         expected_recovery_action: Optional[str] = None,
+        follow_run_id: Optional[str] = None,
+        follow_identity: Optional[dict] = None,
         refresh_abort_id: Optional[str] = None,
         refresh_latch_generation: Optional[int] = None,
     ) -> Dict[str, dict]:
@@ -7961,6 +7971,15 @@ class OfferManager:
         if len(bindings) != 1:
             raise ValueError("cancellation cohort wallet identities do not match")
         wallet_hash, network = next(iter(bindings))
+        if follow_run_id is not None and (
+            fee_approval_id is not None
+            or refresh_abort_id is not None
+            or type(follow_identity) is not dict
+            or type(priced_cancellation) is not dict
+            or type(priced_cancellation.get("quote")) is not dict
+            or type(priced_cancellation.get("validated_unsigned")) is not dict
+        ):
+            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
 
         def release_proven_unattempted_fee_input(results: dict) -> None:
             if fee_reservation is None or len(results) != len(members):
@@ -7977,7 +7996,50 @@ class OfferManager:
 
         self._offer_cancel_crash_boundary("after_prepare", representative)
         validated_unsigned = None
-        if fee_approval_id is not None:
+        fee_authorizer = None
+        if follow_run_id is not None:
+            quote = priced_cancellation["quote"]
+            validated_unsigned = priced_cancellation["validated_unsigned"]
+
+            def fee_authorizer() -> bool:
+                return database.recheck_follow_cancellation_fee_hold(
+                    run_id=follow_run_id,
+                    identity=follow_identity,
+                    manifest_json=manifest,
+                    batch_contract=batch_contract,
+                    final_quote=quote,
+                )
+
+            try:
+                database.reserve_follow_cancellation_fee(
+                    run_id=follow_run_id,
+                    identity=follow_identity,
+                    manifest_json=manifest,
+                    batch_contract=batch_contract,
+                    final_quote=quote,
+                )
+            except Exception:
+                results = {}
+                for intent, attempt, member_id in members:
+                    authority = member_authorities[intent.trade_id]
+                    context = {
+                        "journal": authority[1],
+                        "wallet_hash": authority[2],
+                        "network": authority[3],
+                    }
+                    results[intent.trade_id] = self._finalize_unattempted_cohort_cancel(
+                        intent,
+                        attempt=attempt,
+                        cohort_id=manifest["cohort_id"],
+                        cohort_size=manifest["member_count"],
+                        member_id=member_id,
+                        context=context,
+                        reason_code="FEE_FOLLOW_RESERVATION_BLOCKED",
+                    )
+                release_proven_unattempted_fee_input(results)
+                return results
+            self._offer_cancel_crash_boundary("after_fee_reservation", representative)
+        elif fee_approval_id is not None:
             from coin_prep_fee_cancellation import (
                 recheck_reserved_approved_cancellation,
                 reserve_approved_cancellation,
@@ -8094,6 +8156,26 @@ class OfferManager:
                 for intent, attempt, _member_id in members
             }
 
+        if fee_authorizer is not None and fee_authorizer() is not True:
+            database.trip_runtime_safety_latch(
+                reason_code="UNRESOLVED_OPERATIONS",
+                reason="Follow cancellation fee hold changed after effect claim",
+                blocking_operation_ids=[
+                    intent.operation_id for intent, _attempt, _member_id in members
+                ],
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+            )
+            return {
+                intent.trade_id: self._cancel_reconciliation_result(
+                    intent,
+                    idempotent_replay=False,
+                    effect_attempted=False,
+                    attempt=attempt,
+                )
+                for intent, attempt, _member_id in members
+            }
+
         self._offer_cancel_crash_boundary("before_wallet", representative)
         first_intent, _first_attempt, _first_member_id = members[0]
         continuation, _journal, _wallet_hash, _network = member_authorities[
@@ -8118,6 +8200,7 @@ class OfferManager:
                 source_coin_ids=list(batch_contract["source_coin_ids"]),
                 fee_coin_id=batch_contract["fee_coin_id"],
                 _validated_unsigned=validated_unsigned,
+                _fee_authorizer=fee_authorizer,
                 _cancel_continuation=continuation,
                 _cancel_operation_id=first_intent.operation_id,
                 _cancel_intent_id=first_intent.intent_id,
@@ -8219,6 +8302,14 @@ class OfferManager:
         if fee_approval_id is not None:
             try:
                 database.record_coin_prep_cancellation_fee_outcome(manifest)
+            except ValueError as exc:
+                if str(exc) != "FEE_EFFECT_UNRESOLVED":
+                    raise
+        elif follow_run_id is not None:
+            try:
+                database.record_follow_cancellation_fee_outcome(
+                    run_id=follow_run_id, manifest_json=manifest
+                )
             except ValueError as exc:
                 if str(exc) != "FEE_EFFECT_UNRESOLVED":
                     raise
@@ -8515,15 +8606,31 @@ class OfferManager:
                 raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
             bootstrap_campaign_ids.add(parts[1])
             bootstrap_member_count += 1
+        follow_run_id = None
+        follow_identity = None
+        follow_recovery_action = None
         if follow_run_ids:
-            if len(follow_run_ids) != 1 or follow_member_count != len(
-                canonical_intents
+            if (
+                len(follow_run_ids) != 1
+                or follow_member_count != len(canonical_intents)
+                or fee_approval_id is not None
+                or refresh_cleanup
             ):
                 raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
-            # Follow cancellations require the exact reviewed run's cumulative
-            # fee hold.  Until that priced path is available, never route them
-            # through the generic batch or serial wallet cancellation.
-            raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+            follow_run_id = next(iter(follow_run_ids))
+            try:
+                follow_identity = database.get_follow_run_identity(follow_run_id)
+                cleanup = database.get_follow_cleanup_authority(
+                    run_id=follow_run_id,
+                    identity=follow_identity,
+                    now_epoch=int(time.time()),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED") from exc
+            if cleanup.get("ready") is not True:
+                raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+            if reason == "manual_cancel_all":
+                follow_recovery_action = "cancel_all"
         if bootstrap_campaign_ids:
             if len(bootstrap_campaign_ids) != 1 or bootstrap_member_count != len(
                 canonical_intents
@@ -8588,7 +8695,9 @@ class OfferManager:
             )
             members.append((intent, attempt, member_id))
 
-        is_cohort = len(members) > 1 or fee_approval_id is not None
+        is_cohort = (
+            len(members) > 1 or fee_approval_id is not None or follow_run_id is not None
+        )
         recoverable_contexts = {}
         existing_results = {}
         for intent, attempt, member_id in members:
@@ -8645,7 +8754,8 @@ class OfferManager:
             ]
             manifest = None
             if len(participating) > 1 or (
-                fee_approval_id is not None and len(participating) == 1
+                (fee_approval_id is not None or follow_run_id is not None)
+                and len(participating) == 1
             ):
                 manifest = database.canonical_offer_cancel_cohort_manifest(
                     [
@@ -8702,7 +8812,8 @@ class OfferManager:
                     )
                     members.append((intent, attempt, member_id))
             is_cohort = len(members) > 1 or (
-                fee_approval_id is not None and bool(members)
+                (fee_approval_id is not None or follow_run_id is not None)
+                and bool(members)
             )
         else:
             manifest = None
@@ -8718,7 +8829,25 @@ class OfferManager:
             and {intent.trade_id for intent, _attempt, _member_id in members}
             == {intent.trade_id for intent, _attempt, _member_id in ordered_members}
         ):
-            if fee_approval_id is None:
+            if follow_run_id is not None:
+                (
+                    batch_contract,
+                    priced_cancellation,
+                    fee_reservation,
+                ) = self._plan_follow_cancel(
+                    members,
+                    follow_run_id,
+                    follow_identity,
+                    follow_recovery_action,
+                )
+                if (
+                    type(batch_contract) is not dict
+                    or type(priced_cancellation) is not dict
+                    or type(fee_reservation) is not tuple
+                    or len(fee_reservation) != 3
+                ):
+                    raise ValueError("FEE_FOLLOW_AUTHORITY_REQUIRED")
+            elif fee_approval_id is None:
                 batch_contract = self._plan_sage_bulk_cancel(members)
             else:
                 (
@@ -8730,7 +8859,7 @@ class OfferManager:
                     fee_approval_id,
                     expected_recovery_action,
                 )
-        elif fee_approval_id is not None:
+        elif fee_approval_id is not None or follow_run_id is not None:
             raise ValueError("FEE_CANCELLATION_BATCH_REQUIRED")
 
         authorities = {}
@@ -8861,6 +8990,8 @@ class OfferManager:
                     priced_cancellation=priced_cancellation,
                     fee_reservation=fee_reservation,
                     expected_recovery_action=expected_recovery_action,
+                    follow_run_id=follow_run_id,
+                    follow_identity=follow_identity,
                     refresh_abort_id=_refresh_abort_id,
                     refresh_latch_generation=_refresh_latch_generation,
                 )
@@ -9857,6 +9988,11 @@ class OfferManager:
                     "FEE_EFFECT_UNRESOLVED",
                 }:
                     raise
+            for held in database.get_unsettled_follow_cancellation_manifests():
+                if held["manifest"] == exact_manifest:
+                    database.record_follow_cancellation_fee_outcome(
+                        run_id=held["run_id"], manifest_json=exact_manifest
+                    )
             runtime = mutation_gate.current_runtime()
             if runtime is None:
                 return False

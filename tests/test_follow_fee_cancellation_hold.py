@@ -21,54 +21,66 @@ def current_database_module():
     database = import_module("database")
 
 
-def _prepared_follow_cancel(run_id, identity, *, purpose=None, fee=20):
-    intent_id = "1" * 64
-    operation_id = f"create:{intent_id}"
-    database.upsert_coin(
-        SOURCE, "xch", 1000, designation="tier_spare", purpose="lifecycle"
-    )
-    database.prepare_offer_intent(
-        intent_id=intent_id,
-        operation_id=operation_id,
-        event_id=f"{operation_id}:prepared",
-        run_id="runtime-test",
-        wallet_fingerprint_hash="f" * 64,
-        network=identity["network"],
-        asset_id=identity["asset_id"],
-        side="buy",
-        tier="inner",
-        purpose=purpose or f"follow:{run_id}:normal_lifecycle",
-        selected_coin_ids_json=[SOURCE],
-        offered_amount_atomic="1000",
-        requested_amount_atomic="2000",
-        wallet_identity_json={"binding_digest": "b" * 64},
-        evidence_json={"canonical_intent_sha256": intent_id},
-        reserve_selected_coins=True,
-    )
-    database.finalize_offer_intent(
-        intent_id=intent_id,
-        operation_id=operation_id,
-        event_id=f"{operation_id}:finalized:confirmed",
-        lifecycle_state="created",
-        outcome="CONFIRMED",
-        sage_trade_id=TRADE,
-        offer_text_sha256="2" * 64,
-        wallet_identity_json={"binding_digest": "b" * 64},
-        evidence_json={"effect_attempted": True},
-        finalize_selected_coin_reservations=True,
-    )
-    member = {
-        "trade_id": TRADE,
-        "operation_id": f"cancel:{TRADE}",
-        "intent_id": intent_id,
-        "attempt": 1,
-        "prepared_event_id": f"cancel:{TRADE}:attempt:1:prepared",
-    }
-    manifest = database.canonical_offer_cancel_cohort_manifest([member])
+def _prepared_follow_cancel(
+    run_id, identity, *, purpose=None, fee=20, count=1, offset=0
+):
+    members = []
+    sources = []
+    trades = []
+    for index in range(offset, offset + count):
+        trade = chr(ord("a") + index) * 64
+        source = chr(ord("c") + index) * 64
+        intent_id = str(index + 1) * 64
+        operation_id = f"create:{intent_id}"
+        database.upsert_coin(
+            source, "xch", 1000, designation="tier_spare", purpose="lifecycle"
+        )
+        database.prepare_offer_intent(
+            intent_id=intent_id,
+            operation_id=operation_id,
+            event_id=f"{operation_id}:prepared",
+            run_id="runtime-test",
+            wallet_fingerprint_hash="f" * 64,
+            network=identity["network"],
+            asset_id=identity["asset_id"],
+            side="buy",
+            tier="inner",
+            purpose=purpose or f"follow:{run_id}:normal_lifecycle",
+            selected_coin_ids_json=[source],
+            offered_amount_atomic="1000",
+            requested_amount_atomic="2000",
+            wallet_identity_json={"binding_digest": "b" * 64},
+            evidence_json={"canonical_intent_sha256": intent_id},
+            reserve_selected_coins=True,
+        )
+        database.finalize_offer_intent(
+            intent_id=intent_id,
+            operation_id=operation_id,
+            event_id=f"{operation_id}:finalized:confirmed",
+            lifecycle_state="created",
+            outcome="CONFIRMED",
+            sage_trade_id=trade,
+            offer_text_sha256=str(index + 2) * 64,
+            wallet_identity_json={"binding_digest": "b" * 64},
+            evidence_json={"effect_attempted": True},
+            finalize_selected_coin_reservations=True,
+        )
+        members.append(
+            {
+                "trade_id": trade,
+                "operation_id": f"cancel:{trade}",
+                "intent_id": intent_id,
+                "attempt": 1,
+                "prepared_event_id": f"cancel:{trade}:attempt:1:prepared",
+            }
+        )
+        trades.append(trade)
+        sources.append(source)
+    manifest = database.canonical_offer_cancel_cohort_manifest(members)
     contract = {
         "protocol": "sage_native_cancel_offers_zero_plus_fee_v1",
-        "trade_ids": [TRADE],
-        "source_coin_ids": [SOURCE],
+        "trade_ids": trades,
+        "source_coin_ids": sources,
         "fee_coin_id": FEE_COIN,
         "fee_mojos": fee,
     }
@@ -96,8 +108,8 @@ def _prepared_follow_cancel(run_id, identity, *, purpose=None, fee=20):
                     "intent_id": member["intent_id"],
                     "attempt": member["attempt"],
                     "cohort_id": manifest["cohort_id"],
-                    "cohort_size": 1,
-                    "member_id": manifest["members"][0]["member_id"],
+                    "cohort_size": count,
+                    "member_id": member["member_id"],
                     "reason": "cancel_all",
                     "continuation_journal_sha256": "f" * 64,
                     "wallet_effect": {
@@ -111,6 +123,7 @@ def _prepared_follow_cancel(run_id, identity, *, purpose=None, fee=20):
                     "effect_claim_protocol": "durable_cohort_claim_v1",
                 },
             }
+            for member in manifest["members"]
         ],
     )
     return manifest, contract
@@ -126,6 +139,44 @@ def _quote(state, fee=20):
         "observed_at": state["now"],
         "expires_at": state["now"] + 60,
     }
+
+
+def _finalize_follow_submitted(manifest, transaction_id="6" * 64):
+    from cancel_outcomes import CANCEL_SUBMITTED_UNCONFIRMED, cancellation_result
+
+    submitted = cancellation_result(
+        CANCEL_SUBMITTED_UNCONFIRMED,
+        method="sage_native_cancel_offers",
+        raw_response={"success": True, "transaction_id": transaction_id},
+        transaction_id=transaction_id,
+    )
+    database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+    requests = []
+    for member in manifest["members"]:
+        prepared = database.get_offer_operation_events(member["operation_id"])[0]
+        requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": f"{member['operation_id']}:attempt:1:finalized",
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": 1,
+                "cancel_result": submitted,
+                "wallet_identity_json": json.loads(prepared["wallet_identity_json"]),
+                "evidence_json": {
+                    "trade_id": member["trade_id"],
+                    "attempt": 1,
+                    "cohort_id": manifest["cohort_id"],
+                    "member_id": member["member_id"],
+                    "effect_attempted": True,
+                    "cancel_result": submitted,
+                },
+            }
+        )
+    database.finalize_offer_cancel_cohort(
+        manifest_json=manifest, member_requests_json=requests
+    )
+    return transaction_id
 
 
 def test_existing_fee_outcome_guard_upgrades_without_losing_proof_gate(approved):
@@ -218,6 +269,69 @@ def test_follow_cancel_holds_exact_run_fee_and_refuses_replay(approved):
             manifest_json=manifest,
             batch_contract=contract,
             final_quote=_quote(approved),
+        )
+
+
+def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    first, first_contract = _prepared_follow_cancel(run_id, identity)
+    second, second_contract = _prepared_follow_cancel(
+        run_id, identity, fee=61, offset=1
+    )
+    database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=first,
+        batch_contract=first_contract,
+        final_quote=_quote(approved),
+    )
+    with pytest.raises(ValueError, match="FOLLOW_UNRESOLVED_EFFECT"):
+        database.reserve_follow_cancellation_fee(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=second,
+            batch_contract=second_contract,
+            final_quote=_quote(approved, fee=61),
+        )
+    transaction_id = _finalize_follow_submitted(first)
+    member = first["members"][0]
+    prepared = database.get_offer_operation_events(member["operation_id"])[0]
+    database.append_offer_operation_event(
+        event_id=f"{member['operation_id']}:attempt:1:reconciled",
+        operation_id=member["operation_id"],
+        intent_id=member["intent_id"],
+        operation_type="CANCEL",
+        attempt=1,
+        phase="RECONCILED",
+        outcome="CANCEL_CONFIRMED",
+        request_timestamp="2026-10-26T08:00:00Z",
+        wallet_identity_json=json.loads(prepared["wallet_identity_json"]),
+        transaction_id=transaction_id,
+        evidence_json={
+            "trade_id": member["trade_id"],
+            "cohort_id": first["cohort_id"],
+            "member_id": member["member_id"],
+            "effect_attempted": True,
+            "authoritative_terminal_proof": True,
+        },
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        blocks_mutation=False,
+        created_at="2026-10-26T08:00:00Z",
+    )
+    assert (
+        database.record_follow_cancellation_fee_outcome(
+            run_id=run_id, manifest_json=first
+        )["state"]
+        == "CONFIRMED_SPENT"
+    )
+    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+        database.reserve_follow_cancellation_fee(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=second,
+            batch_contract=second_contract,
+            final_quote=_quote(approved, fee=61),
         )
 
 
@@ -362,3 +476,185 @@ def test_follow_cancel_no_effect_releases_hold_only_after_journal_proof(approved
         )["idempotent"]
         is True
     )
+
+
+def test_follow_confirmed_spend_charges_original_cap_after_restart(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(run_id, identity)
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved),
+    )
+    member = manifest["members"][0]
+    transaction_id = _finalize_follow_submitted(manifest)
+    prepared = database.get_offer_operation_events(member["operation_id"])[0]
+    with pytest.raises(ValueError, match="FEE_EFFECT_UNRESOLVED"):
+        database.record_follow_cancellation_fee_outcome(
+            run_id=run_id, manifest_json=manifest
+        )
+    assert database.get_unsettled_follow_cancellation_manifests() == [
+        {"run_id": run_id, "manifest": manifest}
+    ]
+    database.append_offer_operation_event(
+        event_id=f"{member['operation_id']}:attempt:1:reconciled",
+        operation_id=member["operation_id"],
+        intent_id=member["intent_id"],
+        operation_type="CANCEL",
+        attempt=1,
+        phase="RECONCILED",
+        outcome="CANCEL_CONFIRMED",
+        request_timestamp="2026-10-26T08:00:00Z",
+        wallet_identity_json=json.loads(prepared["wallet_identity_json"]),
+        transaction_id=transaction_id,
+        evidence_json={
+            "trade_id": member["trade_id"],
+            "cohort_id": manifest["cohort_id"],
+            "member_id": member["member_id"],
+            "effect_attempted": True,
+            "authoritative_terminal_proof": True,
+        },
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        blocks_mutation=False,
+        created_at="2026-10-26T08:00:00Z",
+    )
+    settled = database.record_follow_cancellation_fee_outcome(
+        run_id=run_id, manifest_json=manifest
+    )
+    assert settled["operation_id"] == hold["operation_id"]
+    assert settled["state"] == "CONFIRMED_SPENT"
+    assert database.get_unsettled_follow_cancellation_manifests() == []
+    status = database.get_coin_prep_fee_approval_status(
+        approved["approval"]["approval_id"]
+    )
+    assert status["held_fee_mojos"] == 0
+    assert status["spent_fee_mojos"] == 20
+    assert (
+        database.record_follow_cancellation_fee_outcome(
+            run_id=run_id, manifest_json=manifest
+        )["idempotent"]
+        is True
+    )
+
+
+def test_follow_partial_confirmation_keeps_entire_batch_fee_held(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(run_id, identity, count=2)
+    database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved),
+    )
+    transaction_id = _finalize_follow_submitted(manifest)
+    member = manifest["members"][0]
+    prepared = database.get_offer_operation_events(member["operation_id"])[0]
+    database.append_offer_operation_event(
+        event_id=f"{member['operation_id']}:attempt:1:reconciled",
+        operation_id=member["operation_id"],
+        intent_id=member["intent_id"],
+        operation_type="CANCEL",
+        attempt=1,
+        phase="RECONCILED",
+        outcome="CANCEL_CONFIRMED",
+        request_timestamp="2026-10-26T08:00:00Z",
+        wallet_identity_json=json.loads(prepared["wallet_identity_json"]),
+        transaction_id=transaction_id,
+        evidence_json={
+            "trade_id": member["trade_id"],
+            "cohort_id": manifest["cohort_id"],
+            "member_id": member["member_id"],
+            "effect_attempted": True,
+            "authoritative_terminal_proof": True,
+        },
+        reason_code="AUTHORITATIVE_TERMINAL_PROOF",
+        blocks_mutation=False,
+        created_at="2026-10-26T08:00:00Z",
+    )
+    with pytest.raises(ValueError, match="FEE_EFFECT_UNRESOLVED"):
+        database.record_follow_cancellation_fee_outcome(
+            run_id=run_id, manifest_json=manifest
+        )
+    status = database.get_coin_prep_fee_approval_status(
+        approved["approval"]["approval_id"]
+    )
+    assert status["held_fee_mojos"] == 20
+    assert status["spent_fee_mojos"] == 0
+    assert database.get_unsettled_follow_cancellation_manifests() == [
+        {"run_id": run_id, "manifest": manifest}
+    ]
+    other = manifest["members"][1]
+    other_prepared = database.get_offer_operation_events(other["operation_id"])[0]
+    database.append_offer_operation_event(
+        event_id=f"{other['operation_id']}:attempt:1:reconciled",
+        operation_id=other["operation_id"],
+        intent_id=other["intent_id"],
+        operation_type="CANCEL",
+        attempt=1,
+        phase="RECONCILED",
+        outcome="CANCEL_FAILED",
+        request_timestamp="2026-10-26T08:00:01Z",
+        wallet_identity_json=json.loads(other_prepared["wallet_identity_json"]),
+        transaction_id=transaction_id,
+        evidence_json={
+            "trade_id": other["trade_id"],
+            "cohort_id": manifest["cohort_id"],
+            "member_id": other["member_id"],
+            "effect_attempted": True,
+            "relay_rejection": {"reason_code": "SAGE_RELAY_REJECTED"},
+        },
+        reason_code="SAGE_RELAY_REJECTED",
+        blocks_mutation=False,
+        created_at="2026-10-26T08:00:01Z",
+    )
+    with pytest.raises(ValueError, match="FEE_EFFECT_UNRESOLVED"):
+        database.record_follow_cancellation_fee_outcome(
+            run_id=run_id, manifest_json=manifest
+        )
+    assert (
+        database.get_coin_prep_fee_approval_status(approved["approval"]["approval_id"])[
+            "held_fee_mojos"
+        ]
+        == 20
+    )
+
+
+def test_follow_all_peer_rejection_releases_without_spend(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1002
+    manifest, contract = _prepared_follow_cancel(run_id, identity, count=2)
+    database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved),
+    )
+    transaction_id = _finalize_follow_submitted(manifest)
+    database.reconcile_rejected_offer_cancel_cohort(
+        manifest_json=manifest,
+        transaction_id=transaction_id,
+        relay_evidence_json={
+            "status": "rejected",
+            "transaction_id": transaction_id,
+            "reason_code": "INVALID_FEE_TOO_CLOSE_TO_ZERO",
+            "evidence_sha256": "7" * 64,
+            "source": "sage_native_log",
+            "source_file": "app.log.2026-10-26",
+        },
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+    )
+    settled = database.record_follow_cancellation_fee_outcome(
+        run_id=run_id, manifest_json=manifest
+    )
+    assert settled["state"] == "RELEASED_NO_EFFECT"
+    status = database.get_coin_prep_fee_approval_status(
+        approved["approval"]["approval_id"]
+    )
+    assert status["held_fee_mojos"] == status["spent_fee_mojos"] == 0

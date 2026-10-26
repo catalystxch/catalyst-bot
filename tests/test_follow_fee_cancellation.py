@@ -56,6 +56,15 @@ def _run(approved):
     return run["run_id"], identity
 
 
+def test_follow_cleanup_identity_reader_survives_stop(approved):
+    run_id, identity = _run(approved)
+    assert database.get_follow_run_identity(run_id) == identity
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+    assert database.get_follow_run_identity(run_id) == identity
+    with pytest.raises(ValueError, match="FOLLOW_AUTHORITY_REQUIRED"):
+        database.get_follow_run_identity("0" * 64)
+
+
 def test_follow_cancel_price_requires_positive_fresh_fee_and_does_not_dispatch(
     approved, monkeypatch
 ):
