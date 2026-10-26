@@ -77,6 +77,7 @@ fake_database.mark_cancel_attempted = lambda *args, **kwargs: None
 fake_database.get_unresolved_offer_operation_blockers = lambda: []
 fake_database.get_retryable_failed_offer_cancels = lambda: []
 fake_database.get_pending_refresh_lineage_parent_ids = lambda **kwargs: []
+fake_database.get_unexpired_follow_run_marker = lambda **kwargs: None
 fake_database.get_runtime_mutation_lease = lambda: {
     "wallet_fingerprint_hash": "f" * 64,
     "network": "mainnet",

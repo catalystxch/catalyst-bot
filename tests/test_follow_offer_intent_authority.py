@@ -54,6 +54,51 @@ def test_unscoped_follow_creation_is_fenced_while_run_exists(monkeypatch):
     assert seen == [(ASSET_ID, int(NOW.timestamp()))]
 
 
+def test_direct_legacy_wallet_path_cannot_bypass_follow_run(monkeypatch):
+    monkeypatch.setattr(
+        offer_manager.wallet, "get_wallet_backend_authority", lambda: "chia"
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": RUN_ID},
+    )
+    monkeypatch.setattr(
+        offer_manager,
+        "create_offer",
+        lambda *_args, **_kwargs: pytest.fail("wallet effect reached"),
+    )
+    result = offer_manager.OfferManager()._create_offer_with_retry_inner(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=False,
+        creation_context=None,
+    )
+    assert result["reason"] == "FOLLOW_PURPOSE_REQUIRED"
+    assert result["_catalyst_effect_attempted"] is False
+
+
+def test_direct_sage_producer_without_context_cannot_inherit_follow_run(monkeypatch):
+    monkeypatch.setattr(offer_manager.cfg, "CAT_ASSET_ID", ASSET_ID)
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": RUN_ID},
+    )
+    with pytest.raises(ValueError, match="FOLLOW_PURPOSE_REQUIRED"):
+        offer_manager.OfferManager()._build_canonical_creation_intent(
+            offer_dict={"1": -1000, "2": 2000},
+            selected_coin_id="d" * 64,
+            preferred_tier="sniper",
+            creation_context=None,
+            expiry_seconds=3600,
+            expiry_offset=0,
+            stagger_seconds=0,
+            offer_max_time=int(NOW.timestamp()) + 3600,
+            min_coin_hint=None,
+            max_coin_hint=None,
+        )
+
+
 @pytest.mark.parametrize(
     "purpose,asset_id,side,expiry",
     [

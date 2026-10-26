@@ -3871,6 +3871,40 @@ class OfferManager:
                 "reason": "OFFER_CREATION_AUTHORITY_DENIED",
                 "_catalyst_effect_attempted": False,
             }
+        if authoritative_backend == "chia":
+            # Chia's legacy direct path has no durable Sage creation journal.
+            # Fence it before coin reads or wallet effects when a Follow run
+            # owns this asset; it cannot inherit that run implicitly.
+            context = creation_context if type(creation_context) is dict else {}
+            purpose = context.get("purpose", "normal_lifecycle")
+            asset_id = context.get("asset_id", getattr(cfg, "CAT_ASSET_ID", None))
+            side = context.get(
+                "side",
+                "buy"
+                if spend_wallet_id == getattr(cfg, "WALLET_ID_XCH", 1)
+                else "sell",
+            )
+            try:
+                require_active_follow_intent_authority(
+                    purpose=purpose,
+                    asset_id=asset_id,
+                    side=side,
+                    offer_max_time=offer_max_time,
+                )
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": str(exc),
+                    "reason": str(exc),
+                    "_catalyst_effect_attempted": False,
+                }
+            if purpose.startswith("follow:"):
+                return {
+                    "success": False,
+                    "error": "Follow creation requires a durable Sage journal",
+                    "reason": "OFFER_CREATION_JOURNAL_REQUIRED",
+                    "_catalyst_effect_attempted": False,
+                }
 
         # --- V3 Coin Selection Mode ---
         # When coin_ids_enabled=True, we pre-select a specific coin and pass it
