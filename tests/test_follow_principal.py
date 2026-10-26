@@ -276,8 +276,24 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert result["replacement_count_gate_passed"] is False
     assert len(result["proposal_sha256"]) == 64
     assert result["dispatch_authorized"] is False
+    import follow_slot_fit
+
+    monkeypatch.setattr(
+        follow_slot_fit,
+        "preview_current_follow_slot_fit",
+        lambda **_kwargs: {
+            "buy_slots_arithmetic_fit": 1,
+            "sell_slots_arithmetic_fit": 1,
+            "required_xch_mojos": 10,
+            "required_cat_atoms": 20,
+            "slot_assignment_sha256": "a" * 64,
+            "readonly_mid_price_xch": "0.00005",
+            "dispatch_authorized": False,
+        },
+    )
     counted = preview_approved_follow_principal(approval_id, buy_limit=1, sell_limit=1)
     assert counted["replacement_count_gate_passed"] is True
+    assert counted["slot_assignment_sha256"] == "a" * 64
     assert counted["proposal_sha256"] != result["proposal_sha256"]
     with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
         preview_approved_follow_principal(approval_id, buy_limit=2, sell_limit=1)

@@ -59,3 +59,17 @@ def test_follow_principal_preview_binds_requested_24_by_24_counts(monkeypatch):
     assert status == 409
     assert body["reason"] == "FOLLOW_SLOT_INVENTORY_SHORT"
     assert body["dispatch_authorized"] is False
+
+
+def test_follow_principal_preview_explains_unfitting_prepared_denomination(monkeypatch):
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda _id, **_kw: (_ for _ in ()).throw(
+            ValueError("FOLLOW_SLOT_DENOMINATION_SHORT")
+        ),
+    )
+    body, status = _call({"approval_id": "a" * 64, "buy_limit": 24, "sell_limit": 24})
+    assert status == 409
+    assert body["reason"] == "FOLLOW_SLOT_DENOMINATION_SHORT"
+    assert body["dispatch_authorized"] is False

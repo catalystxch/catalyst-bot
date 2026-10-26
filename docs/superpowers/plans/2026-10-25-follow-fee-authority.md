@@ -99,6 +99,15 @@ limits explicitly reports that the gate has not passed. Coin counts remain
 only a necessary condition. The final native review must request the exact
 24/24 limits and independently prove each slot's current price, spend amount,
 denomination, market gate and unique coin assignment before Start.
+The explicit-count preview now also performs a read-only arithmetic check for
+every initial slot against the current server quote, configured tier sizes and
+the approved plan's exact replacement denominations. Each fitting target is
+assigned once; the proposal digest binds the quote, spend amounts, coin-size
+policy and assignments. A 24/24 preview rejects a missing or undersized
+denomination even when raw coin counts are sufficient. This is a necessary
+inventory and arithmetic check, not a dispatch gate: the native consent route,
+contemporaneous market confidence, DB tier labels, profitability, live coin
+selection, and final wallet-boundary recheck are still missing.
 
 The immutable Follow review and resulting authority now store the exact
 principal proposal digest; changing that digest when consuming the review is

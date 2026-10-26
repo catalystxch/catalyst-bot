@@ -332,6 +332,18 @@ def preview_approved_follow_principal(
     principal = _principal_from_observed_snapshot(
         observed, fee_cap_mojos=before["total_fee_mojos"]
     )
+    slot_fit = {}
+    if count_gate["replacement_count_gate_passed"]:
+        from follow_slot_fit import preview_current_follow_slot_fit
+
+        slot_fit = preview_current_follow_slot_fit(
+            configuration=observed.get("configuration"),
+            outputs=outputs,
+            buy_limit=buy_limit,
+            sell_limit=sell_limit,
+            maximum_trade_xch_mojos=principal["maximum_trade_xch_mojos"],
+            maximum_trade_cat_atoms=principal["maximum_trade_cat_atoms"],
+        )
     after = database.get_coin_prep_fee_approval_status(approval_id)
     if (
         principal.get("identity") != identity
@@ -348,6 +360,11 @@ def preview_approved_follow_principal(
         "configuration_sha256": configuration_sha256,
         "principal_review_sha256": principal["principal_review_sha256"],
         **count_gate,
+        **{
+            key: value
+            for key, value in slot_fit.items()
+            if key != "dispatch_authorized"
+        },
         "maximum_fee_mojos": before["total_fee_mojos"],
         "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
     }
@@ -366,6 +383,7 @@ def preview_approved_follow_principal(
         "planned_replacement_xch_mojos": replacement_atoms["xch"],
         "planned_replacement_cat_atoms": replacement_atoms["cat"],
         **count_gate,
+        **slot_fit,
         "current_prep_targets_proven": True,
         "dispatch_authorized": False,
     }
