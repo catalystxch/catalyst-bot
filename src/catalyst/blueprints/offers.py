@@ -1914,7 +1914,7 @@ def _api_cancel_all_locked():
                         else len(_cancel_open_ids)
                     )
                     _cancel_batches = [
-                        (batch, group["campaign_id"])
+                        (batch, group["campaign_id"], group.get("follow_run_id"))
                         for group in fee_scope_groups
                         for batch in _balanced_cancel_batches(
                             group["trade_ids"], _batch_capacity
@@ -1936,15 +1936,19 @@ def _api_cancel_all_locked():
                         current_batch=1,
                         pending=len(_cancel_open_ids) - len(_terminal_ids),
                     )
-                    for _batch_index, (_cancel_batch, _campaign_id) in enumerate(
-                        _cancel_batches, start=1
-                    ):
+                    _batch_position = 0
+                    while _batch_position < len(_cancel_batches):
+                        _cancel_batch, _campaign_id, _follow_run_id = _cancel_batches[
+                            _batch_position
+                        ]
+                        _batch_index = _batch_position + 1
                         _batch_targets = [
                             trade_id
                             for trade_id in _cancel_batch
                             if trade_id not in _terminal_ids
                         ]
                         if not _batch_targets:
+                            _batch_position += 1
                             continue
                         _set_cancel_all_state(
                             running=True,
@@ -1982,9 +1986,53 @@ def _api_cancel_all_locked():
                             _cancel_kwargs["_retry_failed_attempts"] = (
                                 _batch_retry_attempts
                             )
-                        _cancel_results = durable_manager.cancel_offers(
-                            _batch_targets, **_cancel_kwargs
-                        )
+                        try:
+                            _cancel_results = durable_manager.cancel_offers(
+                                _batch_targets, **_cancel_kwargs
+                            )
+                        except ValueError as exc:
+                            if (
+                                _follow_run_id is None
+                                or str(exc)
+                                not in {
+                                    "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT",
+                                    "FEE_UNSIGNED_COST_UNAVAILABLE",
+                                }
+                                or len(_batch_targets) == 1
+                                or database.get_unresolved_offer_operation_blockers()
+                            ):
+                                raise
+                            midpoint = len(_batch_targets) // 2
+                            _cancel_batches[_batch_position : _batch_position + 1] = [
+                                (
+                                    _batch_targets[:midpoint],
+                                    _campaign_id,
+                                    _follow_run_id,
+                                ),
+                                (
+                                    _batch_targets[midpoint:],
+                                    _campaign_id,
+                                    _follow_run_id,
+                                ),
+                            ]
+                            _deadline = max(
+                                _deadline,
+                                time.monotonic()
+                                + _cancel_all_deadline_seconds(
+                                    len(_cancel_open_ids),
+                                    cfg.CANCEL_MAX_WAIT_SECS,
+                                    batch_count=len(_cancel_batches),
+                                ),
+                            )
+                            _batch_capacity = max(
+                                len(batch)
+                                for batch, _campaign, _follow in _cancel_batches
+                            )
+                            _set_cancel_all_state(
+                                batch_size=_batch_capacity,
+                                total_batches=len(_cancel_batches),
+                            )
+                            continue
                         # A fee funding rejection occurs before any wallet
                         # effect.  Waiting for terminal Sage proof cannot fix
                         # it, and obscures the action the user must review.
@@ -2051,6 +2099,7 @@ def _api_cancel_all_locked():
                         _terminal_ids = _authoritatively_terminal_offer_ids(
                             _cancel_open_ids
                         )
+                        _batch_position += 1
                     # Task 9 proves the planned targets, not wallet-wide
                     # emptiness. A new offer can appear while those cancels
                     # are pending, and a bounded/cached refresh cannot prove

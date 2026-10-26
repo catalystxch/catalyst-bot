@@ -2018,9 +2018,7 @@ class TestCancelAllPost(_FlaskBase):
             "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
         ).get_json()
         self.assertEqual(status["phase"], "error")
-        self.assertEqual(
-            status["reason_code"], "FEE_CANCELLATION_FUNDING_REQUIRED"
-        )
+        self.assertEqual(status["reason_code"], "FEE_CANCELLATION_FUNDING_REQUIRED")
         self.assertFalse(status["running"])
         self.assertFalse(status["complete"])
 
@@ -2856,6 +2854,122 @@ class TestCancelAllPost(_FlaskBase):
         self.assertEqual(status["total_batches"], 3)
         self.assertEqual(status["current_batch"], 3)
         self.assertEqual(status["cancelled"], 10)
+
+    def test_stopped_cancel_all_splits_exact_unsigned_over_block_book(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 48
+        trade_ids = [f"{index:064x}" for index in range(1, 49)]
+        terminal_ids = set()
+        submitted = []
+
+        def cancel_batch(batch, **_kwargs):
+            if len(batch) > 12:
+                raise ValueError("FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT")
+            submitted.append(tuple(batch))
+            terminal_ids.update(batch)
+            return {
+                trade_id: {"outcome": "CANCEL_SUBMITTED_UNCONFIRMED"}
+                for trade_id in batch
+            }
+
+        stopped.offer_manager.cancel_offers.side_effect = cancel_batch
+
+        def terminal_records(candidates):
+            return {
+                trade_id: {
+                    "intent_id": f"intent:{trade_id}",
+                    "sage_trade_id": trade_id,
+                    "outcome": "CANCELLED_PROVEN",
+                }
+                for trade_id in candidates
+                if trade_id in terminal_ids
+            }
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "offer_manager.OfferManager._cancel_fee_scope_groups",
+                return_value=[
+                    {
+                        "trade_ids": trade_ids,
+                        "campaign_id": None,
+                        "follow_run_id": "a" * 64,
+                    }
+                ],
+            ),
+            patch(
+                "wallet.get_all_offers",
+                side_effect=lambda **_bounds: [
+                    {"trade_id": trade_id, "status": "ACTIVE"}
+                    for trade_id in trade_ids
+                    if trade_id not in terminal_ids
+                ],
+            ),
+            patch(
+                "database.get_authoritative_terminal_records",
+                side_effect=terminal_records,
+            ),
+            patch("database.get_unresolved_offer_operation_blockers", return_value=[]),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([len(batch) for batch in submitted], [12, 12, 12, 12])
+        self.assertEqual(
+            set().union(*(set(batch) for batch in submitted)), set(trade_ids)
+        )
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["batch_size"], 12)
+        self.assertEqual(status["total_batches"], 4)
+        self.assertEqual(status["cancelled"], 48)
+
+    def test_stopped_cancel_all_does_not_split_non_follow_fee_scope(self):
+        stopped = _make_bot()
+        stopped.is_running.return_value = False
+        stopped.offer_manager.get_sage_bulk_cancel_capacity.return_value = 2
+        trade_ids = ["1" * 64, "2" * 64]
+        attempts = []
+
+        def cancel_batch(batch, **_kwargs):
+            attempts.append(tuple(batch))
+            raise ValueError("FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT")
+
+        stopped.offer_manager.cancel_offers.side_effect = cancel_batch
+
+        def run_now(*, operation, target, name):
+            target()
+            return object()
+
+        with (
+            patch.object(api_server, "bot", stopped),
+            patch(
+                "offer_manager.OfferManager._cancel_fee_scope_groups",
+                return_value=[{"trade_ids": trade_ids, "campaign_id": None}],
+            ),
+            patch(
+                "wallet.get_all_offers",
+                return_value=[
+                    {"trade_id": trade_id, "status": "ACTIVE"} for trade_id in trade_ids
+                ],
+            ),
+            patch.object(api_server, "start_mutation_thread", side_effect=run_now),
+        ):
+            response = self._post("/api/offers/cancel_all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attempts, [tuple(trade_ids)])
+        status = self._get(
+            "/api/offers/cancel_all/status", environ_base=self._LOOPBACK
+        ).get_json()
+        self.assertEqual(status["phase"], "error")
 
     def test_stopped_cancel_all_separates_bootstrap_and_orphan_fee_scopes(self):
         stopped = _make_bot()
