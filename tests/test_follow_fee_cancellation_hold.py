@@ -324,6 +324,47 @@ def test_stopped_run_routine_requote_cannot_spend_shutdown_reserve(approved):
         )
 
 
+def test_expired_follow_run_can_use_reserve_for_journaled_cancel_all(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1001 + 48 * 3600 + 1
+    manifest, contract = _prepared_follow_cancel(run_id, identity, fee=50)
+    hold = database.reserve_follow_cancellation_fee(
+        run_id=run_id,
+        identity=identity,
+        manifest_json=manifest,
+        batch_contract=contract,
+        final_quote=_quote(approved, fee=50),
+    )
+    assert hold["fee_mojos"] == 50
+    database.claim_offer_cancel_cohort_effects(manifest_json=manifest)
+    assert (
+        database.recheck_follow_cancellation_fee_hold(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=_quote(approved, fee=50),
+        )
+        is True
+    )
+
+
+def test_expired_follow_run_routine_requote_keeps_shutdown_reserve(approved):
+    run_id, identity = _run(approved)
+    approved["now"] = 1001 + 48 * 3600 + 1
+    manifest, contract = _prepared_follow_cancel(
+        run_id, identity, fee=50, reason="requote"
+    )
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_RESERVE_PROTECTED"):
+        database.reserve_follow_cancellation_fee(
+            run_id=run_id,
+            identity=identity,
+            manifest_json=manifest,
+            batch_contract=contract,
+            final_quote=_quote(approved, fee=50),
+        )
+
+
 def test_follow_cancel_refuses_competing_hold_and_counts_prior_spend(approved):
     run_id, identity = _run(approved)
     approved["now"] = 1002

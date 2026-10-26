@@ -24027,9 +24027,8 @@ def reserve_follow_cancellation_fee(
         if fee_coin is not None and fee_coin["designation"] == "reserve":
             raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
         # While Follow is active, routine requotes must leave the shutdown
-        # allowance untouched. A durable Stop prevents new creation; after
-        # Stop, each exact journaled cohort may spend the remaining allowance
-        # for this same run, still under the original cumulative cap.
+        # allowance untouched. Stop or finite expiry ends creation rights;
+        # exact journaled cleanup may then spend the same run's allowance.
         totals = _fee_scope_totals(conn, row["scope_sha256"])
         committed_after = totals["committed_fee_mojos"] + fee
         if committed_after > row["maximum_fee_mojos"]:
@@ -24041,7 +24040,8 @@ def reserve_follow_cancellation_fee(
             ).fetchone()
             is not None
         )
-        if (not stopped or not shutdown_cleanup) and committed_after + row[
+        cleanup_eligible = stopped or now >= row["expires_at_epoch"]
+        if (not cleanup_eligible or not shutdown_cleanup) and committed_after + row[
             "protected_shutdown_fee_mojos"
         ] > row["maximum_fee_mojos"]:
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
@@ -24263,7 +24263,8 @@ def recheck_follow_cancellation_fee_hold(
                     or binding.get("network_id") != identity["network"]
                 ):
                     return False
-            if (not stopped or not shutdown_cleanup) and totals[
+            cleanup_eligible = stopped or now >= row["expires_at_epoch"]
+            if (not cleanup_eligible or not shutdown_cleanup) and totals[
                 "committed_fee_mojos"
             ] + row["protected_shutdown_fee_mojos"] > row["maximum_fee_mojos"]:
                 return False
