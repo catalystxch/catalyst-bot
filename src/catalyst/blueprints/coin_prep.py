@@ -61,6 +61,64 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bp = Blueprint("coin_prep", __name__)
 
 
+def _historical_stopped_campaign_fee_approval(accounting: object) -> bool:
+    """Recognize a discharged campaign's fee history without granting authority.
+
+    The status file can retain a campaign approval after that campaign stops.
+    Its paid fees must stay visible, but it cannot resume preparation for a
+    different Follow plan. If any local offer, intent, abort, or fee effect is
+    unresolved, keep the existing overlap block. Coin Prep's final trigger
+    separately proves the complete Sage offer book before a wallet effect.
+    """
+
+    if type(accounting) is not dict or accounting.get("campaign_id") is None:
+        return False
+    if accounting.get("state") not in {"approved", "paused_budget"}:
+        return False
+    if accounting.get("unresolved_operation_count") != 0:
+        return False
+    try:
+        import database
+        from mutation_gate import wallet_fingerprint_hash
+
+        campaign_id = accounting["campaign_id"]
+        campaign = database.get_bootstrap_campaign(campaign_id)
+        if (
+            type(campaign) is not dict
+            or campaign.get("status") != "stopped"
+            or campaign.get("stage") != "stopped"
+            or campaign.get("asset_id")
+            != str(getattr(cfg, "CAT_ASSET_ID", "") or "").lower()
+            or database.get_open_offers(include_elapsed=True)
+        ):
+            return False
+        terminal_states = {
+            "terminal",
+            "creation_failed",
+            "rejected",
+            "cancelled",
+            "filled",
+            "expired",
+        }
+        for intent in database.get_offer_intents_for_registry():
+            if (
+                type(intent) is not dict
+                or intent.get("lifecycle_state") not in terminal_states
+            ):
+                return False
+        if database.list_incomplete_refresh_aborts(
+            asset_id=campaign["asset_id"],
+            wallet_fingerprint_hash=wallet_fingerprint_hash(
+                campaign["wallet_fingerprint"]
+            ),
+            network=campaign["network"],
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _public_fee_reason(exc: ValueError, fallback: str) -> str:
     """Translate internal exceptions to fixed public reason-code literals."""
     value = str(exc)
@@ -2143,9 +2201,15 @@ def api_coin_prep_status():
                     "paused_budget",
                 }
                 if durable_fee.get("state") in active_fee_states:
-                    result["overlapping_coin_prep_blocked"] = True
-                    if not result.get("running"):
-                        result["fee_resume_required"] = True
+                    if not result.get(
+                        "running"
+                    ) and _historical_stopped_campaign_fee_approval(durable_fee):
+                        result["historical_campaign_fee_approval"] = True
+                        result["fee_approval"]["state"] = "historical"
+                    else:
+                        result["overlapping_coin_prep_blocked"] = True
+                        if not result.get("running"):
+                            result["fee_resume_required"] = True
             except Exception:
                 result["fee_approval"] = {
                     "approval_id": worker_fee_approval_id,

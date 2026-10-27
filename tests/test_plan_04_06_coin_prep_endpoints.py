@@ -503,6 +503,130 @@ class TestCoinPrepStatus(_FlaskBase):
             [call(worker_approval_id), call(renewed_approval_id)],
         )
 
+    def test_stopped_bootstrap_with_terminal_offers_does_not_block_new_prep(self):
+        """Historical campaign fees remain visible without trapping new prep."""
+
+        campaign_id = "a" * 64
+        approval_id = "b" * 64
+        worker_status = {
+            "phase": "complete",
+            "run_id": "old-bootstrap-prep",
+            "fee_approval_id": approval_id,
+        }
+        accounting = {
+            "approval_id": approval_id,
+            "campaign_id": campaign_id,
+            "state": "approved",
+            "total_fee_mojos": 1_000_000_000,
+            "spent_fee_mojos": 206_165_626,
+            "held_fee_mojos": 0,
+            "unresolved_operation_count": 0,
+            "dispatch_authorized": False,
+        }
+        campaign = {
+            "campaign_id": campaign_id,
+            "status": "stopped",
+            "stage": "stopped",
+            "asset_id": "c" * 64,
+            "wallet_fingerprint": 736588221,
+            "network": "mainnet",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "coin_prep_status.json")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(worker_status, handle)
+            api_server._coin_prep_state.update(
+                {"running": False, "complete": False, "error": None, "run_id": None}
+            )
+            with (
+                patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "c" * 64),
+                patch.object(
+                    coin_prep_blueprint,
+                    "list_active_bootstrap_campaigns_for_asset",
+                    return_value=[],
+                ),
+                patch.object(
+                    coin_prep_blueprint,
+                    "_coin_prep_status_file",
+                    return_value=status_path,
+                ),
+                patch(
+                    "database.get_coin_prep_fee_approval_status",
+                    return_value=accounting,
+                ),
+                patch(
+                    "database.get_latest_coin_prep_fee_approval_for_campaign",
+                    return_value=approval_id,
+                ),
+                patch("database.get_bootstrap_campaign", return_value=campaign),
+                patch("database.get_open_offers", return_value=[]),
+                patch(
+                    "database.get_offer_intents_for_registry",
+                    return_value=[
+                        {
+                            "purpose": f"bootstrap:{campaign_id}:revision:1",
+                            "lifecycle_state": "terminal",
+                        }
+                    ],
+                ),
+                patch("database.list_incomplete_refresh_aborts", return_value=[]),
+                patch("database.get_coin_summary", return_value={}),
+            ):
+                body = self._get_status().get_json()
+
+        self.assertEqual(body["fee_approval_id"], approval_id)
+        self.assertEqual(body["fee_approval"]["spent_fee_mojos"], "206165626")
+        self.assertEqual(body["fee_approval"]["state"], "historical")
+        self.assertTrue(body["historical_campaign_fee_approval"])
+        self.assertFalse(body.get("overlapping_coin_prep_blocked", False))
+        self.assertFalse(body.get("fee_resume_required", False))
+
+    def test_stopped_campaign_fee_still_blocks_with_unresolved_offer_or_abort(self):
+        campaign_id = "a" * 64
+        accounting = {
+            "campaign_id": campaign_id,
+            "state": "approved",
+            "unresolved_operation_count": 0,
+        }
+        campaign = {
+            "campaign_id": campaign_id,
+            "status": "stopped",
+            "stage": "stopped",
+            "asset_id": "c" * 64,
+            "wallet_fingerprint": 736588221,
+            "network": "mainnet",
+        }
+        with (
+            patch.object(coin_prep_blueprint.cfg, "CAT_ASSET_ID", "c" * 64),
+            patch("database.get_bootstrap_campaign", return_value=campaign),
+            patch("database.get_open_offers", return_value=[]),
+        ):
+            for intent_state in ("created", "creation_unknown", "conflicted"):
+                with (
+                    self.subTest(intent_state=intent_state),
+                    patch(
+                        "database.get_offer_intents_for_registry",
+                        return_value=[{"lifecycle_state": intent_state}],
+                    ),
+                ):
+                    self.assertFalse(
+                        coin_prep_blueprint._historical_stopped_campaign_fee_approval(
+                            accounting
+                        )
+                    )
+            with (
+                patch("database.get_offer_intents_for_registry", return_value=[]),
+                patch(
+                    "database.list_incomplete_refresh_aborts",
+                    return_value=[{"state": "fenced"}],
+                ),
+            ):
+                self.assertFalse(
+                    coin_prep_blueprint._historical_stopped_campaign_fee_approval(
+                        accounting
+                    )
+                )
+
     def test_tier_size_drift_marks_status_as_needing_prep(self):
         summary = {
             "xch_free_count": 5,
