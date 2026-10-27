@@ -33750,6 +33750,7 @@
         }
 
         async function runRefreshAbortAction() {
+            if (_cancelAllRecoveryOnly) return;
             const preview = _refreshAbortPreview;
             if (!preview || bot_state?.running) return;
             const action = document.getElementById('refreshAbortActionBtn');
@@ -33907,7 +33908,12 @@
             const noteEl = document.getElementById('cancelConfirmNote');
             const confirmBtn = document.getElementById('cancelAllConfirmBtn');
             if (confirmBtn) confirmBtn.disabled = true;
-            if (_cancelAllContext) {
+            if (_cancelAllRecoveryOnly) {
+                if (titleEl) titleEl.textContent = 'Review Sage cancellation proof';
+                if (copyEl) copyEl.textContent = 'Review one exact Sage-only cancellation for local record recovery. This review cannot send a wallet transaction.';
+                if (noteEl) noteEl.textContent = 'Only a fresh exact proof can enable a separate local-record confirmation.';
+                if (confirmBtn) confirmBtn.textContent = 'Wallet cancellation unavailable';
+            } else if (_cancelAllContext) {
                 if (titleEl) titleEl.textContent = 'Cancel offers before coin prep?';
                 const willResume = _cancelAllContext.resumeAfterCancel !== false;
                 if (copyEl) copyEl.textContent = willResume
@@ -33938,7 +33944,13 @@
             }
             
             document.getElementById('cancelConfirmModal').classList.add('active');
-            await loadRefreshAbortReview();
+            if (_cancelAllRecoveryOnly) {
+                _refreshAbortPreview = null;
+                document.getElementById('refreshAbortPanel').hidden = true;
+                document.getElementById('refreshAbortActionBtn').disabled = true;
+            } else {
+                await loadRefreshAbortReview();
+            }
             await loadExternalCancelReview();
         }
         

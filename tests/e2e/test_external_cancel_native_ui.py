@@ -49,6 +49,33 @@ def test_sage_recovery_entry_works_without_selected_pair_or_visible_offers(page)
     assert wallet_writes == []
 
 
+def test_sage_recovery_entry_hides_other_wallet_recovery_actions(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            IS_DESKTOP = true;
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            window.pywebview = {api: {
+                preview_external_cancellation: async () => ({success: false})
+            }};
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: true, stage: 'parent_terminal',
+                candidate: {parent_trade_id: 'a'.repeat(64)},
+                safety: {allowed: false, lease_owned: true},
+                wallet: {fingerprint: 736588221,
+                         active_trade_ids: ['c'.repeat(64)],
+                         pending_transaction_count: 0}
+            }), {status: 200});
+        }"""
+    )
+    page.locator('button[data-view="offers"]').click()
+    page.locator("#externalCancelReviewEntry").click()
+    expect(page.locator("#externalCancelPanel")).to_be_visible()
+    expect(page.locator("#refreshAbortPanel")).to_be_hidden()
+    expect(page.locator("#refreshAbortActionBtn")).to_be_disabled()
+
+
 def test_external_cancel_review_disables_broad_cancel_and_shows_exact_fee(page):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
     page.evaluate(
