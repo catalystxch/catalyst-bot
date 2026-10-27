@@ -9,6 +9,46 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.e2e
 
 
+def test_sage_recovery_entry_works_without_selected_pair_or_visible_offers(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate(
+        """() => {
+            document.getElementById('startupOverlay').style.display = 'none';
+            IS_DESKTOP = true;
+            bot_state = {running: false, offers: {buy: [], sell: []}};
+            window.pywebview = {api: {
+                preview_external_cancellation: async () => ({success: false})
+            }};
+            window.apiFetch = async () => new Response(JSON.stringify({
+                success: true, stage: 'normal', safety: {allowed: true},
+                wallet: {fingerprint: 736588221,
+                         active_trade_ids: ['c'.repeat(64)],
+                         pending_transaction_count: 0}
+            }), {status: 200});
+        }"""
+    )
+    page.locator('button[data-view="offers"]').click()
+    page.locator("#externalCancelReviewEntry").click()
+    expect(page.locator("#cancelConfirmModal")).to_have_class("modal active")
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
+    expect(page.locator("#externalCancelCommitBtn")).to_be_disabled()
+    wallet_writes = page.evaluate(
+        """async () => {
+            const writes = [];
+            window.apiFetch = async (url, options) => {
+                if (options?.method === 'POST') {
+                    writes.push(url);
+                    throw new Error('blocked test wallet effect');
+                }
+                return new Response(JSON.stringify({success: true}), {status: 200});
+            };
+            await confirmCancelAll();
+            return writes;
+        }"""
+    )
+    assert wallet_writes == []
+
+
 def test_external_cancel_review_disables_broad_cancel_and_shows_exact_fee(page):
     page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
     page.evaluate(
