@@ -68,7 +68,11 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
     expect(page.locator("#prestartFollowFeeConfirm")).to_be_disabled()
     page.locator("#prestartFollowFeeAccept").check()
     expect(page.locator("#prestartFollowFeeConfirm")).to_be_enabled()
-    page.locator("#prestartFollowFeeXch").fill("0.006")
+    page.evaluate("""() => {
+        const input = document.getElementById('prestartFollowFeeXch');
+        input.value = '0.006';
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+    }""")
     expect(page.locator("#prestartFollowFeeConfirm")).to_be_disabled()
     assert len(page.evaluate("window.__prestartCalls")) == 1
 

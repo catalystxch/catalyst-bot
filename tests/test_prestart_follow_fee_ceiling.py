@@ -1,5 +1,6 @@
 """A completed Coin Prep scope needs a fresh, single-use initial Follow cap review."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 
@@ -94,7 +95,44 @@ def test_completed_session_accepts_only_one_initial_ceiling_revision(approved):
         review["preview_id"], review["review_sha256"]
     )
     with pytest.raises(ValueError, match="FEE_APPROVAL_STALE"):
-        preview_prestart_follow_fee_ceiling(confirmed["approval_id"], 6_000_000_000)
+        preview_prestart_follow_fee_ceiling(confirmed["approval_id"], 5_000_000_000)
+
+
+@pytest.mark.parametrize("amount", [4_500_000_000, 6_000_000_000])
+def test_prestart_review_requires_exact_initial_ceiling(approved, amount):
+    from prestart_follow_fee_ceiling import preview_prestart_follow_fee_ceiling
+
+    _completed_review(approved)
+    with pytest.raises(ValueError, match="FEE_PRESTART_INITIAL_CEILING_REQUIRED"):
+        preview_prestart_follow_fee_ceiling(approved["approval"]["approval_id"], amount)
+
+
+def test_ledger_rejects_a_nonstandard_prestart_ceiling_quote(approved):
+    review = _completed_review(approved)
+    stored = database.get_coin_prep_fee_preview(review["preview_id"])
+    quote = json.loads(stored["quote_json"])
+    quote["prestart_review"]["proposed_maximum_fee_mojos"] = 6_000_000_000
+    forged = database.store_coin_prep_fee_preview(
+        scope_sha256=stored["scope_sha256"],
+        plan_sha256=stored["plan_sha256"],
+        scope_json=stored["scope_json"],
+        plan_json=stored["plan_json"],
+        request_options_json=stored["request_options_json"],
+        quote_json=json.dumps(quote, sort_keys=True, separators=(",", ":")),
+        observed_at=stored["observed_at"],
+        expires_at=stored["expires_at"],
+    )
+    with pytest.raises(ValueError, match="FEE_PRESTART_INITIAL_CEILING_REQUIRED"):
+        database.confirm_prestart_follow_fee_ceiling_review(
+            preview_id=forged["preview_id"],
+            current_fee_funding_mojos=10_000_000_000,
+        )
+    assert (
+        database.get_latest_prestart_follow_fee_approval(
+            approved["approval"]["approval_id"]
+        )
+        is None
+    )
 
 
 def test_prestart_review_rejects_changed_accounting(approved):

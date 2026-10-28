@@ -8335,7 +8335,7 @@
         <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
             <h2 id="prestartFollowFeeTitle">Review initial Follow fee ceiling</h2>
             <p>Coin Prep is complete. Review the original wallet, fees already spent or held, protected cancellation reserve, and the exact new cumulative ceiling. Recording this approval does not start trading or send a wallet transaction.</p>
-            <label>New cumulative fee ceiling (XCH) <input id="prestartFollowFeeXch" type="text" inputmode="decimal" value="0.005" oninput="invalidatePrestartFollowFeeReview()"></label>
+            <label>Initial cumulative fee ceiling (XCH) <input id="prestartFollowFeeXch" type="text" value="0.005" readonly oninput="invalidatePrestartFollowFeeReview()"></label>
             <pre id="prestartFollowFeeText" style="white-space:pre-wrap"></pre>
             <label><input type="checkbox" id="prestartFollowFeeAccept" disabled> I approve the exact cumulative ceiling shown above for this completed Coin Prep session.</label>
             <div style="margin-top:16px">
@@ -33088,6 +33088,10 @@
             const proposed = followRunFeeCapMojos(document.getElementById('prestartFollowFeeXch').value);
             if (proposed === null) {
                 output.textContent = 'Enter a positive exact XCH amount with at most 12 decimal places.';
+                return;
+            }
+            if (proposed !== 5000000000) {
+                output.textContent = 'The initial cumulative fee ceiling must be exactly 0.005 XCH.';
                 return;
             }
             _prestartFollowFeeBusy = true;

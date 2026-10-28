@@ -57,7 +57,7 @@
 
 **Files:** No production edits unless a failing test identifies a defect; add only targeted regressions needed to prove a discovered gap.
 
-- [x] Run relevant fee, Coin Prep, Follow principal/slot/shutdown, database migration and UI suites; inspect every failure and preserve traces. Full four-worker suite: 8,263 passed, 356 skipped, 460 subtests passed. Focused backend handoff: 12 passed. Native review E2E: 2 passed.
+- [x] Run relevant fee, Coin Prep, Follow principal/slot/shutdown, database migration and UI suites; inspect every failure and preserve traces. Fresh reviewer found the initial ceiling could exceed 0.005; two RED tests demonstrated that gap. The service and ledger now require exactly 5,000,000,000 mojos; latest four-worker suite: 8,266 passed, 356 skipped, 460 subtests passed. Native review E2E: 2 passed.
 - [ ] Run lint/security gates and fresh normal Windows build from the exact PR head. Record source commit, test counts, CI revision, ZIP/manifest and EXE hashes.
 - [ ] Re-audit both original DBs/Sage/native process identities and balances before proposing any EXE replacement. A new live EXE launch needs action-time user confirmation.
 - [ ] Keep PR272 draft and site PR93 unpublished. Only after native 0.005 review, 24/24 principal/slot/market proof and separate final financial confirmation may a live Start be considered; 48-hour observation begins only after both ladders run.
