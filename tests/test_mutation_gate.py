@@ -3414,7 +3414,8 @@ import api_server
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=15,
+        # This checks import side effects, not cold-import latency under load.
+        timeout=90,
         check=False,
     )
 

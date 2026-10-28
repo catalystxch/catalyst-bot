@@ -60,6 +60,9 @@ def active_worker(approved, monkeypatch):
     cleanup()
     when = datetime(2026, 8, 21, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(gate, "_utc_now", lambda: when)
+    # MutationGate's default clock was bound when its constructor was defined.
+    # Keep its lease clock aligned with the controlled database/identity clock.
+    monkeypatch.setattr(gate.MutationGate, "_now", lambda _self: when)
     monkeypatch.setattr(
         database, "_stability_wall_clock", lambda: "2026-08-21T12:00:00.000000Z"
     )

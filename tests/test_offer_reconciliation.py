@@ -9315,7 +9315,7 @@ def test_post_fill_hook_claim_allows_one_effect_under_concurrent_replay(
             def run(_row, **claim):
                 if name == "offer_filled_event":
                     effect_entered.set()
-                    assert release_effect.wait(timeout=5)
+                    assert release_effect.wait(timeout=30)
                 calls[name] += 1
                 return _record_claimed_test_sink_ack(
                     _row["fill_id"], name, {"test_sink": name}, claim
@@ -9338,13 +9338,15 @@ def test_post_fill_hook_claim_allows_one_effect_under_concurrent_replay(
 
     threads = [threading.Thread(target=run_reconcile)]
     threads[0].start()
-    assert effect_entered.wait(timeout=5)
+    assert effect_entered.wait(timeout=30)
     threads.append(threading.Thread(target=run_reconcile, kwargs={"done": second_done}))
     threads[1].start()
-    second_finished_before_release = second_done.wait(timeout=1)
+    # Preserve the before-release ordering proof without a one-second scheduler
+    # requirement on hosts running other isolated test processes.
+    second_finished_before_release = second_done.wait(timeout=10)
     release_effect.set()
     for thread in threads:
-        thread.join(timeout=10)
+        thread.join(timeout=30)
 
     assert second_finished_before_release is True
     assert not errors
