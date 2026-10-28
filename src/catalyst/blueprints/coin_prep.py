@@ -2219,6 +2219,28 @@ def api_coin_prep_status():
                 }
                 result["overlapping_coin_prep_blocked"] = True
 
+            # A native pre-start review may append a higher Follow ceiling to
+            # the same completed scope. Keep the worker's original approval
+            # visible as completion evidence; expose the new version only for
+            # Follow review, never as a Coin Prep resume permit.
+            if campaign_id is None:
+                try:
+                    from database import (
+                        get_coin_prep_fee_approval_status,
+                        get_latest_prestart_follow_fee_approval,
+                    )
+
+                    follow_id = get_latest_prestart_follow_fee_approval(
+                        worker_fee_approval_id
+                    )
+                    if follow_id is not None:
+                        result["follow_fee_approval_id"] = follow_id
+                        result["follow_fee_approval"] = _fee_json_amounts(
+                            get_coin_prep_fee_approval_status(follow_id)
+                        )
+                except Exception:
+                    result["follow_fee_approval_lookup_unavailable"] = True
+
         # Optionally refresh live coin counts (when not actively prepping)
         refresh = request.args.get("refresh", "false").lower() == "true"
         if refresh and bot and not api_server._coin_prep_state["running"]:

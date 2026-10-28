@@ -8325,7 +8325,23 @@
             <div style="margin-top:16px">
                 <button type="button" onclick="closeFollowRunReview()">Back</button>
                 <button type="button" id="followRunReviewPrepare" onclick="prepareFollowRunReview()">Refresh exact review</button>
+                <button type="button" id="prestartFollowFeeOpen" onclick="openPrestartFollowFeeReview()">Review initial fee ceiling</button>
                 <button type="button" id="followRunReviewConfirm" disabled onclick="confirmFollowRunReview()">Record approval</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="prestartFollowFeeModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="prestartFollowFeeTitle" style="display:none">
+        <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
+            <h2 id="prestartFollowFeeTitle">Review initial Follow fee ceiling</h2>
+            <p>Coin Prep is complete. Review the original wallet, fees already spent or held, protected cancellation reserve, and the exact new cumulative ceiling. Recording this approval does not start trading or send a wallet transaction.</p>
+            <label>New cumulative fee ceiling (XCH) <input id="prestartFollowFeeXch" type="text" inputmode="decimal" value="0.005" oninput="invalidatePrestartFollowFeeReview()"></label>
+            <pre id="prestartFollowFeeText" style="white-space:pre-wrap"></pre>
+            <label><input type="checkbox" id="prestartFollowFeeAccept" disabled> I approve the exact cumulative ceiling shown above for this completed Coin Prep session.</label>
+            <div style="margin-top:16px">
+                <button type="button" onclick="closePrestartFollowFeeReview()">Back</button>
+                <button type="button" id="prestartFollowFeePrepare" onclick="preparePrestartFollowFeeReview()">Refresh exact review</button>
+                <button type="button" id="prestartFollowFeeConfirm" disabled onclick="confirmPrestartFollowFeeReview()">Record initial ceiling</button>
             </div>
         </div>
     </div>
@@ -32869,8 +32885,8 @@
             try {
                 const statusResponse = await apiFetch(`${API_URL}/coin-prep/status`);
                 const status = await statusResponse.json();
-                const approvalId = status?.fee_approval_id;
-                const feeCap = Number(status?.fee_approval?.total_fee_mojos);
+                const approvalId = status?.follow_fee_approval_id || status?.fee_approval_id;
+                const feeCap = Number((status?.follow_fee_approval || status?.fee_approval)?.total_fee_mojos);
                 if (!statusResponse.ok || status?.success !== true
                     || !/^[0-9a-f]{64}$/.test(approvalId || '')
                     || !Number.isSafeInteger(feeCap) || feeCap <= 0) {
@@ -33032,6 +33048,135 @@
             const fraction = (amount % 1000000000000n).toString()
                 .padStart(12, '0').replace(/0+$/, '') || '0';
             return `${whole}.${fraction} XCH (${mojos} mojos)`;
+        }
+
+        let _prestartFollowFeeReview = null;
+        let _prestartFollowFeeBusy = false;
+
+        function invalidatePrestartFollowFeeReview() {
+            _prestartFollowFeeReview = null;
+            const accept = document.getElementById('prestartFollowFeeAccept');
+            accept.checked = false;
+            accept.disabled = true;
+            document.getElementById('prestartFollowFeeConfirm').disabled = true;
+            document.getElementById('prestartFollowFeeText').textContent =
+                'Terms changed. Refresh the exact review before approving.';
+        }
+
+        function closePrestartFollowFeeReview() {
+            invalidatePrestartFollowFeeReview();
+            document.getElementById('prestartFollowFeeModal').style.display = 'none';
+        }
+
+        function openPrestartFollowFeeReview() {
+            if (!IS_DESKTOP || !window.pywebview?.api?.prepare_prestart_follow_fee_ceiling_review
+                || !window.pywebview?.api?.confirm_prestart_follow_fee_ceiling_review) {
+                showToast('Initial fee ceiling review requires the native desktop app.', 'warning');
+                return;
+            }
+            invalidatePrestartFollowFeeReview();
+            document.getElementById('prestartFollowFeeText').textContent =
+                'Refresh to inspect the completed Coin Prep scope and exact fee accounting.';
+            document.getElementById('prestartFollowFeeModal').style.display = 'flex';
+        }
+
+        async function preparePrestartFollowFeeReview() {
+            if (_prestartFollowFeeBusy || !IS_DESKTOP) return;
+            invalidatePrestartFollowFeeReview();
+            const output = document.getElementById('prestartFollowFeeText');
+            const button = document.getElementById('prestartFollowFeePrepare');
+            const proposed = followRunFeeCapMojos(document.getElementById('prestartFollowFeeXch').value);
+            if (proposed === null) {
+                output.textContent = 'Enter a positive exact XCH amount with at most 12 decimal places.';
+                return;
+            }
+            _prestartFollowFeeBusy = true;
+            button.disabled = true;
+            output.textContent = 'Checking the completed session, wallet and exact fee accounting…';
+            try {
+                const statusResponse = await apiFetch(`${API_URL}/coin-prep/status`);
+                const status = await statusResponse.json();
+                const approvalId = status?.fee_approval_id;
+                if (!statusResponse.ok || status?.success !== true
+                    || !/^[0-9a-f]{64}$/.test(approvalId || '')
+                    || status?.fee_approval?.session_completed !== true
+                    || status?.follow_fee_approval_id) {
+                    throw new Error('A completed Coin Prep session without an initial Follow ceiling review is required.');
+                }
+                const review = await window.pywebview.api.prepare_prestart_follow_fee_ceiling_review({
+                    approval_id: approvalId,
+                    proposed_maximum_fee_mojos: proposed,
+                });
+                if (followRunFeeCapMojos(document.getElementById('prestartFollowFeeXch').value) !== proposed) {
+                    throw new Error('The requested ceiling changed. Refresh the exact review.');
+                }
+                if (review?.success !== true || !/^[0-9a-f]{64}$/.test(review.preview_id || '')
+                    || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')
+                    || review.proposed_maximum_fee_mojos !== proposed
+                    || review.dispatch_authorized !== false
+                    || Date.now() >= review.expires_at * 1000) {
+                    throw new Error(review?.reason || 'The initial ceiling review is unavailable.');
+                }
+                _prestartFollowFeeReview = review;
+                output.textContent =
+                    `Wallet: ${review.wallet.wallet_type} ${review.wallet.network}, fingerprint ${review.wallet.wallet_fingerprint}\n` +
+                    `Asset: ${review.wallet.ticker} (${review.wallet.asset_id})\n` +
+                    `Completed Coin Prep session: ${review.wallet.session_id}\n` +
+                    `Original cumulative ceiling: ${formatFollowFeeMojos(review.prior_maximum_fee_mojos)}\n` +
+                    `New cumulative ceiling: ${formatFollowFeeMojos(review.proposed_maximum_fee_mojos)}\n` +
+                    `Already spent: ${formatFollowFeeMojos(review.spent_fee_mojos)}\n` +
+                    `Pending fee holds: ${formatFollowFeeMojos(review.held_fee_mojos)}\n` +
+                    `Protected cancellation reserve: ${formatFollowFeeMojos(review.protected_cancellation_fee_mojos)}\n` +
+                    `Available fee funding: ${formatFollowFeeMojos(review.fee_funding_mojos)}\n` +
+                    `Review expires: ${new Date(review.expires_at * 1000).toLocaleString()}\n` +
+                    `This records a ceiling only; it does not start Follow or send a wallet effect.`;
+                const accept = document.getElementById('prestartFollowFeeAccept');
+                accept.disabled = false;
+                accept.onchange = () => {
+                    document.getElementById('prestartFollowFeeConfirm').disabled =
+                        !accept.checked || !_prestartFollowFeeReview
+                        || Date.now() >= _prestartFollowFeeReview.expires_at * 1000;
+                };
+            } catch (error) {
+                output.textContent = String(error?.message || error);
+            } finally {
+                _prestartFollowFeeBusy = false;
+                button.disabled = false;
+            }
+        }
+
+        async function confirmPrestartFollowFeeReview() {
+            const review = _prestartFollowFeeReview;
+            const accept = document.getElementById('prestartFollowFeeAccept');
+            const confirm = document.getElementById('prestartFollowFeeConfirm');
+            if (_prestartFollowFeeBusy || !review || !accept.checked
+                || Date.now() >= review.expires_at * 1000
+                || followRunFeeCapMojos(document.getElementById('prestartFollowFeeXch').value)
+                    !== review.proposed_maximum_fee_mojos) {
+                invalidatePrestartFollowFeeReview();
+                return;
+            }
+            _prestartFollowFeeBusy = true;
+            confirm.disabled = true;
+            try {
+                const result = await window.pywebview.api.confirm_prestart_follow_fee_ceiling_review({
+                    preview_id: review.preview_id,
+                    review_sha256: review.review_sha256,
+                    accepted: true,
+                });
+                if (result?.success !== true || result.total_fee_mojos !== review.proposed_maximum_fee_mojos
+                    || result.dispatch_authorized !== false) {
+                    throw new Error(result?.reason || 'The initial ceiling was not recorded. Refresh the review.');
+                }
+                closePrestartFollowFeeReview();
+                showToast('Initial cumulative fee ceiling recorded. Review Follow separately before starting.', 'success');
+                await prepareFollowRunReview();
+            } catch (error) {
+                invalidatePrestartFollowFeeReview();
+                document.getElementById('prestartFollowFeeText').textContent = String(error?.message || error);
+            } finally {
+                _prestartFollowFeeBusy = false;
+            }
         }
 
         async function prepareFollowFeeCeilingReview() {

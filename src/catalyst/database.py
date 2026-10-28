@@ -22616,6 +22616,8 @@ def approve_coin_prep_fee_preview(
         ).fetchone()
         if preview is None:
             raise ValueError("FEE_PREVIEW_REQUIRED")
+        if "prestart_review" in json.loads(preview["quote_json"]):
+            raise ValueError("FEE_PRESTART_NATIVE_CONFIRMATION_REQUIRED")
         if preview["scope_sha256"] != scope or preview["plan_sha256"] != plan:
             raise ValueError("FEE_APPROVAL_STALE")
         prior = conn.execute(
@@ -22684,6 +22686,169 @@ def approve_coin_prep_fee_preview(
         "preview_id": preview_id,
         "idempotent": idempotent,
     }
+
+
+def confirm_prestart_follow_fee_ceiling_review(
+    *, preview_id: str, current_fee_funding_mojos: int
+) -> Dict[str, Any]:
+    """Consume one completed-scope ceiling review under the fee ledger lock.
+
+    This changes consent only. It cannot dispatch a wallet effect or create a
+    Follow run, and it refuses any accounting or session drift after preview.
+    """
+    preview_id = _fee_digest(preview_id)
+    funding = _fee_amount(current_fee_funding_mojos)
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _fee_amount(int(time.time()))
+        preview = conn.execute(
+            "SELECT * FROM coin_prep_fee_previews WHERE preview_id=?", (preview_id,)
+        ).fetchone()
+        if preview is None:
+            raise ValueError("FEE_PREVIEW_REQUIRED")
+        quote = json.loads(preview["quote_json"])
+        review = quote.get("prestart_review")
+        if type(review) is not dict:
+            raise ValueError("FEE_PRESTART_REVIEW_REQUIRED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_fee_consents WHERE preview_id=?", (preview_id,)
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FEE_PRESTART_REVIEW_USED")
+        if not preview["observed_at"] <= now < preview["expires_at"]:
+            raise ValueError("FEE_PREVIEW_STALE")
+        prior_id = _fee_digest(review.get("prior_approval_id"))
+        prior = conn.execute(
+            "SELECT * FROM fee_approvals WHERE approval_id=?", (prior_id,)
+        ).fetchone()
+        if prior is None:
+            raise ValueError("FEE_APPROVAL_REQUIRED")
+        if (
+            prior["scope_sha256"] != preview["scope_sha256"]
+            or prior["plan_sha256"] != preview["plan_sha256"]
+            or prior["total_fee_mojos"] != review.get("prior_maximum_fee_mojos")
+            or prior["version"]
+            != conn.execute(
+                "SELECT MAX(version) FROM fee_approvals WHERE scope_sha256=?",
+                (prior["scope_sha256"],),
+            ).fetchone()[0]
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        scope = json.loads(preview["scope_json"])
+        session_id = scope.get("session_id")
+        if scope.get("campaign_id") is not None or session_id is None:
+            raise ValueError("FEE_PRESTART_STANDALONE_REQUIRED")
+        completion = conn.execute(
+            "SELECT * FROM coin_prep_fee_session_completions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        session = conn.execute(
+            "SELECT identity_sha256 FROM coin_prep_fee_sessions WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        if completion is None or session is None:
+            raise ValueError("FEE_SESSION_INCOMPLETE")
+        latest_session = conn.execute(
+            "SELECT session_id FROM coin_prep_fee_sessions "
+            "WHERE identity_sha256=? ORDER BY generation DESC LIMIT 1",
+            (session["identity_sha256"],),
+        ).fetchone()
+        if (
+            latest_session["session_id"] != session_id
+            or completion["approval_id"] != prior_id
+            or completion["evidence_sha256"] != review.get("completion_evidence_sha256")
+            or completion["scope_sha256"] != prior["scope_sha256"]
+            or completion["plan_sha256"] != prior["plan_sha256"]
+        ):
+            raise ValueError("FEE_APPROVAL_STALE")
+        if (
+            conn.execute(
+                "SELECT 1 FROM follow_run_authorities AS run "
+                "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
+                "WHERE approval.scope_sha256=? LIMIT 1",
+                (prior["scope_sha256"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FEE_PRESTART_RUN_EXISTS")
+        totals = _fee_scope_totals(conn, prior["scope_sha256"])
+        protected = _fee_amount(review.get("protected_cancellation_fee_mojos"))
+        maximum = _fee_amount(review.get("proposed_maximum_fee_mojos"))
+        if (
+            totals["spent_fee_mojos"] != review.get("spent_fee_mojos")
+            or totals["held_fee_mojos"] != review.get("held_fee_mojos")
+            or prior["cancellation_reserve_mojos"] > protected
+        ):
+            raise ValueError("FEE_PRESTART_ACCOUNTING_CHANGED")
+        if (
+            maximum <= prior["total_fee_mojos"]
+            or maximum < totals["committed_fee_mojos"] + protected
+            or maximum - totals["committed_fee_mojos"]
+            > min(funding, _fee_amount(quote.get("fee_funding_mojos")))
+        ):
+            raise ValueError("FEE_PRESTART_FUNDING_INSUFFICIENT")
+        approval_id = _insert_fee_approval(
+            conn, prior["scope_sha256"], prior["plan_sha256"], maximum, protected
+        )
+        conn.execute(
+            "INSERT INTO coin_prep_fee_consents VALUES (?, ?, ?)",
+            (preview_id, approval_id, now),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        **get_fee_approval(approval_id),
+        "preview_id": preview_id,
+        "dispatch_authorized": False,
+    }
+
+
+def coin_prep_fee_preview_consumed(preview_id: str) -> bool:
+    """Read single-use consent state without granting any authority."""
+    preview_id = _fee_digest(preview_id)
+    conn = _stability_read_only_connection()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_fee_consents WHERE preview_id=?", (preview_id,)
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def get_latest_prestart_follow_fee_approval(prior_approval_id: str) -> Optional[str]:
+    """Read a completed session's latest native-reviewed initial Follow cap."""
+    prior_approval_id = _fee_digest(prior_approval_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT newer.approval_id FROM fee_approvals AS prior "
+            "JOIN fee_approvals AS newer ON newer.scope_sha256=prior.scope_sha256 "
+            "AND newer.plan_sha256=prior.plan_sha256 AND newer.version>prior.version "
+            "JOIN coin_prep_fee_consents AS consent ON consent.approval_id=newer.approval_id "
+            "JOIN coin_prep_fee_previews AS preview ON preview.preview_id=consent.preview_id "
+            "JOIN coin_prep_fee_session_completions AS completion "
+            "ON completion.session_id=json_extract(preview.scope_json, '$.session_id') "
+            "WHERE prior.approval_id=? "
+            "AND completion.approval_id=prior.approval_id "
+            "AND json_extract(preview.quote_json, '$.prestart_review.prior_approval_id')=prior.approval_id "
+            "AND newer.version=(SELECT MAX(latest.version) FROM fee_approvals AS latest "
+            "WHERE latest.scope_sha256=prior.scope_sha256) "
+            "ORDER BY newer.version DESC LIMIT 1",
+            (prior_approval_id,),
+        ).fetchone()
+        return row["approval_id"] if row is not None else None
+    finally:
+        conn.close()
 
 
 def get_coin_prep_fee_approval_context(approval_id: str) -> Dict[str, Any]:

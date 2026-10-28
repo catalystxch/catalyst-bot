@@ -1120,6 +1120,84 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:prepare_prestart_follow_fee_ceiling_review")
+    def prepare_prestart_follow_fee_ceiling_review(self, body=None):
+        """Freeze a completed Coin Prep scope's initial Follow cap for native review."""
+        import re
+        from prestart_follow_fee_ceiling import preview_prestart_follow_fee_ceiling
+
+        if (
+            type(body) is not dict
+            or set(body) != {"approval_id", "proposed_maximum_fee_mojos"}
+            or type(body["approval_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+            or type(body["proposed_maximum_fee_mojos"]) is not int
+        ):
+            return {"success": False, "reason": "FEE_PRESTART_REVIEW_INPUT_INVALID"}
+        try:
+            review = preview_prestart_follow_fee_ceiling(
+                body["approval_id"], body["proposed_maximum_fee_mojos"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FEE_APPROVAL_STALE",
+                "FEE_APPROVAL_REQUIRED",
+                "FEE_SESSION_INCOMPLETE",
+                "FEE_PRESTART_STANDALONE_REQUIRED",
+                "FEE_PRESTART_CEILING_MUST_INCREASE",
+                "FEE_PRESTART_TARGETS_CHANGED",
+                "FEE_PRESTART_FUNDING_INSUFFICIENT",
+                "FEE_WALLET_CONTEXT_CHANGED",
+                "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            }:
+                reason = "FEE_PRESTART_REVIEW_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**review, "success": True, "dispatch_authorized": False}
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_prestart_follow_fee_ceiling_review")
+    def confirm_prestart_follow_fee_ceiling_review(self, body=None):
+        """Consume one explicit native review; no worker, wallet effect or run."""
+        import re
+        from prestart_follow_fee_ceiling import confirm_prestart_follow_fee_ceiling
+
+        if (
+            type(body) is not dict
+            or set(body) != {"preview_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("preview_id", "review_sha256")
+            )
+        ):
+            return {"success": False, "reason": "FEE_PRESTART_CONFIRMATION_REQUIRED"}
+        try:
+            confirmed = confirm_prestart_follow_fee_ceiling(
+                body["preview_id"], body["review_sha256"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FEE_APPROVAL_STALE",
+                "FEE_PREVIEW_STALE",
+                "FEE_PRESTART_REVIEW_USED",
+                "FEE_PRESTART_REVIEW_CHANGED",
+                "FEE_PRESTART_REVIEW_REQUIRED",
+                "FEE_PRESTART_ACCOUNTING_CHANGED",
+                "FEE_PRESTART_FUNDING_INSUFFICIENT",
+                "FEE_PRESTART_TARGETS_CHANGED",
+                "FEE_PRESTART_RUN_EXISTS",
+                "FEE_SESSION_INCOMPLETE",
+                "FEE_WALLET_CONTEXT_CHANGED",
+                "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            }:
+                reason = "FEE_PRESTART_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**confirmed, "success": True, "dispatch_authorized": False}
+
+    @_safe
     @_mutation_guard("app_bridge:preview_follow_principal")
     def preview_follow_principal(self, body=None):
         """Read-only Follow principal proposal via the shared HTTP handler."""
@@ -2326,6 +2404,8 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "fresh_start",
     "live_config",
     "preview_coin_prep_fees",
+    "prepare_prestart_follow_fee_ceiling_review",
+    "confirm_prestart_follow_fee_ceiling_review",
     "preview_follow_principal",
     "prepare_follow_run_review",
     "confirm_follow_run_review",

@@ -636,6 +636,8 @@ def approve_coin_prep_fees(
     if cancellation_reserve_mojos > maximum_fee_mojos:
         raise ValueError("FEE_BUDGET_INSUFFICIENT")
     preview = database.get_coin_prep_fee_preview(preview_id)
+    if "prestart_review" in json.loads(preview["quote_json"]):
+        raise ValueError("FEE_PRESTART_NATIVE_CONFIRMATION_REQUIRED")
     persisted = canonical_fee_contract(
         json.loads(preview["scope_json"]), json.loads(preview["plan_json"])
     )
