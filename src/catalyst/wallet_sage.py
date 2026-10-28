@@ -1443,6 +1443,7 @@ def _get_sage_connection(timeout: int = 10):
         try:
             sock = getattr(conn, "sock", None)
             if sock is not None:
+                sock.settimeout(timeout)
                 conn.timeout = timeout
                 return conn
         except Exception:
