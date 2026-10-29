@@ -12,6 +12,7 @@ Tests /api/pnl, /api/pnl/reset-preview, /api/pnl/reset (POST),
 import os
 import sys
 import types
+import tempfile
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch, call
@@ -105,6 +106,23 @@ class _FlaskBase(unittest.TestCase):
         return self.client.get(path, **kwargs)
 
     def setUp(self):
+        # Reset previews and execution use a separate authoritative connection.
+        # Materialize a real disposable schema before tests mock view queries.
+        import database
+
+        database.close_connection()
+        self._database_dir = tempfile.TemporaryDirectory(prefix="pnl-endpoints-")
+        self.addCleanup(self._database_dir.cleanup)
+        self._database_path_patch = patch.object(
+            database, "DB_PATH", os.path.join(self._database_dir.name, "bot.db")
+        )
+        self._database_path_patch.start()
+        self.addCleanup(self._database_path_patch.stop)
+        self._database_init_patch = patch.object(database, "_db_initialized_path", "")
+        self._database_init_patch.start()
+        self.addCleanup(self._database_init_patch.stop)
+        self.addCleanup(database.close_connection)
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
