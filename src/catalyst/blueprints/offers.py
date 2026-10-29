@@ -3312,6 +3312,20 @@ def api_pnl_reset_preview():
             or net_position_cat != 0
         )
         has_data = bool(has_pnl_data or offer_history_rows > 0)
+        from database import guarded_reset_authoritative_state
+
+        pnl_reset = guarded_reset_authoritative_state(
+            dry_run=True,
+            clear_fills=True,
+            clear_round_trips=True,
+            clear_coins=True,
+            cancel_open_offers=True,
+            clear_price_history=True,
+            clear_inventory=True,
+        )
+        offer_reset = guarded_reset_authoritative_state(
+            dry_run=True, clear_terminal_offers=True
+        )
         return jsonify(
             {
                 "success": True,
@@ -3322,6 +3336,8 @@ def api_pnl_reset_preview():
                 "realised_pnl_xch": str(realised_pnl_xch),
                 "net_position_cat": str(net_position_cat),
                 "offer_history_rows": offer_history_rows,
+                "can_reset_pnl": pnl_reset["success"],
+                "can_reset_offer_history": offer_reset["success"],
             }
         )
     except Exception:

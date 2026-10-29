@@ -38221,7 +38221,7 @@ function closeCtgErrorModal() {
                 detailsEl.innerHTML = [
                     `<p style="margin: 0 0 8px 0;">You have existing data from prior runs:</p>`,
                     `<ul style="margin: 0 0 10px 18px; padding: 0;">${summaryBits.join('')}</ul>`,
-                    `<p style="margin: 0;">Tick anything you want to wipe before coin prep runs. Leave everything unchecked to preserve it all — that's the routine re-prep path.</p>`,
+                    `<p style="margin: 0;">Choose the available resets before coin prep. Protected trading and accounting history is preserved; unavailable resets cannot be selected. Leave everything unchecked to keep all data.</p>`,
                 ].join('');
             }
 
@@ -38237,8 +38237,16 @@ function closeCtgErrorModal() {
 
             if (pnlRow) pnlRow.style.display = hasPnl ? '' : 'none';
             if (offersRow) offersRow.style.display = hasOffers ? '' : 'none';
-            if (pnlCb) pnlCb.checked = false;
-            if (offersCb) offersCb.checked = false;
+            if (pnlCb) {
+                pnlCb.checked = false;
+                pnlCb.disabled = preview.can_reset_pnl !== true;
+                pnlCb.title = pnlCb.disabled ? 'Protected accounting history must be preserved.' : '';
+            }
+            if (offersCb) {
+                offersCb.checked = false;
+                offersCb.disabled = preview.can_reset_offer_history !== true;
+                offersCb.title = offersCb.disabled ? 'Protected offer history must be preserved.' : '';
+            }
             if (countersCb) countersCb.checked = false;
             if (pnlCount) {
                 pnlCount.textContent = hasPnl
@@ -38278,8 +38286,8 @@ function closeCtgErrorModal() {
                 continueBtn.onclick = () => cleanup({
                     action: 'proceed',
                     resets: {
-                        pnl: !!(pnlCb && pnlCb.checked),
-                        offers: !!(offersCb && offersCb.checked),
+                        pnl: !!(pnlCb && !pnlCb.disabled && pnlCb.checked),
+                        offers: !!(offersCb && !offersCb.disabled && offersCb.checked),
                         counters: !!(countersCb && countersCb.checked),
                     },
                 });

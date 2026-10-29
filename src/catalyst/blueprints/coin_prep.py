@@ -3275,16 +3275,13 @@ def _api_coin_prep_trigger_locked():
                 raise
 
         # Optional: reset in-memory runtime counters (sniper / fill-tracker /
-        # watchdog streaks / risk-manager position). Mirrors the counters
+        # watchdog streaks). Position is accounting state, not a counter:
+        # re-preparing coins must preserve accumulated exposure. Mirrors the counters
         # step of /api/reset/full. Best-effort — missing attrs aren't fatal.
         if _prep_reset_counters:
             _counters_reset = []
             try:
                 if bot is not None:
-                    _rm = getattr(bot, "risk_manager", None)
-                    if _rm is not None and hasattr(_rm, "reset_position"):
-                        _rm.reset_position()
-                        _counters_reset.append("risk_manager.position")
                     _sn = getattr(bot, "sniper", None)
                     if _sn is not None:
                         try:

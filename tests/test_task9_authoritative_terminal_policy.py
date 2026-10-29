@@ -1227,6 +1227,31 @@ def test_empty_database_reset_remains_compatible(isolated_database, monkeypatch)
     assert result["open_offers_cancelled"] == 0
 
 
+@pytest.mark.parametrize("protected", [False, True])
+def test_prep_history_preview_reports_guard_before_fee_approval(
+    isolated_database, monkeypatch, protected
+):
+    """The dialog must not offer resets that the authoritative guard refuses."""
+    if protected:
+        _insert_fill_with_downstream_fk()
+        _seed_created_intent()
+    else:
+        assert database.upsert_coin(OTHER_COIN, "xch", 500)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(api_server, "get_stats", lambda *a, **k: {})
+    before = list(database.get_connection().iterdump())
+    response = api_server.app.test_client().get(
+        "/api/pnl/reset-preview",
+        headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    )
+    assert response.status_code == 200
+    result = response.get_json()
+    assert result["can_reset_pnl"] is (not protected)
+    assert result["can_reset_offer_history"] is (not protected)
+    assert list(database.get_connection().iterdump()) == before
+
+
 def test_offer_history_reset_refuses_nonterminal_kernel_state(
     isolated_database,
     monkeypatch,

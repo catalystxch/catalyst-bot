@@ -2398,6 +2398,45 @@ def test_coin_prep_full_reset_conflict_preserves_proof_warning(page):
     assert page.evaluate("_cancelAllContext.resumeAfterCancel") is False
 
 
+@pytest.mark.parametrize("allowed", [False, True])
+def test_prep_history_choices_respect_authoritative_reset_capabilities(page, allowed):
+    """Protected history cannot be selected, while safe counters remain available."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+    page.evaluate(
+        """allowed => {
+            document.getElementById('startupOverlay')?.remove();
+            apiFetch = async () => new Response(JSON.stringify({
+                success: true, has_data: true, has_pnl_data: true,
+                fills: 2, offer_history_rows: 3,
+                can_reset_pnl: allowed, can_reset_offer_history: allowed,
+            }), {status: 200});
+            window.__historyResult = null;
+            askPrepHistoryChoice().then(result => window.__historyResult = result);
+        }""",
+        allowed,
+    )
+    pnl = page.locator("#prepResetPnlCb")
+    offers = page.locator("#prepResetOffersCb")
+    if allowed:
+        expect(pnl).to_be_enabled()
+        expect(offers).to_be_enabled()
+        pnl.check()
+        offers.check()
+    else:
+        expect(pnl).to_be_disabled()
+        expect(offers).to_be_disabled()
+        expect(page.locator("#prepHistoryChoiceDetails")).to_contain_text("preserved")
+    page.locator("#prepResetCountersCb").check()
+    page.locator("#prepHistoryContinueBtn").click()
+    page.wait_for_function("window.__historyResult !== null")
+    assert page.evaluate("window.__historyResult.resets") == {
+        "pnl": allowed,
+        "offers": allowed,
+        "counters": True,
+    }
+
+
 def test_coin_prep_offer_history_reset_requires_manual_safe_retry(page):
     """Offer-history reset must not auto-resume after cancellation creates proof."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

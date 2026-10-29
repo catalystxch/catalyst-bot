@@ -9841,6 +9841,7 @@ def reset_lifecycle_observability_stats() -> None:
 
 def guarded_reset_authoritative_state(
     *,
+    dry_run: bool = False,
     clear_fills: bool = False,
     clear_round_trips: bool = False,
     clear_coins: bool = False,
@@ -9855,9 +9856,11 @@ def guarded_reset_authoritative_state(
     reset would touch them, their offers, or their reservations, the complete
     transaction is refused with one stable conflict result.  Empty/legacy-only
     housekeeping remains compatible and append-only tables are never deleted.
+    ``dry_run`` evaluates these same checks and rolls back before any mutation.
     """
 
     options = {
+        "dry_run": dry_run,
         "clear_fills": clear_fills,
         "clear_round_trips": clear_round_trips,
         "clear_coins": clear_coins,
@@ -9874,7 +9877,7 @@ def guarded_reset_authoritative_state(
     init_database()
     conn = _stability_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN" if dry_run else "BEGIN IMMEDIATE")
 
         def count(sql: str, params: tuple[Any, ...] = ()) -> int:
             return int(conn.execute(sql, params).fetchone()[0])
@@ -9965,6 +9968,11 @@ def guarded_reset_authoritative_state(
             },
             "inventory_cleared": False,
         }
+        if dry_run:
+            # Preview uses the exact same conflict checks as execution, but
+            # cannot delete history or change any accounting state.
+            conn.rollback()
+            return summary
         # A positive fill count is refused above.  Keeping the statement out
         # entirely ensures no future FK topology can turn reset into data loss.
         if clear_fills and fill_assessment_count:
