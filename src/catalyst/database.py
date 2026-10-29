@@ -22002,6 +22002,8 @@ def _fee_operation_identity(value: Any) -> str:
 def _fee_scope_legacy_cancellation_holds(
     conn: sqlite3.Connection,
     scope: str,
+    *,
+    accounted_scopes: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Project unresolved pre-ledger effects without inventing reservations.
 
@@ -22098,10 +22100,11 @@ def _fee_scope_legacy_cancellation_holds(
         ).fetchone()
         if reservation is not None:
             if (
-                reservation["scope_sha256"],
+                reservation["scope_sha256"]
+                in (accounted_scopes or _fee_wallet_scopes(conn, scope)),
                 reservation["cancellation"],
                 reservation["fee_mojos"],
-            ) != (scope, 1, fee):
+            ) != (True, 1, fee):
                 raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
             continue  # The append-only reservation/outcome already accounts for this batch.
         if states == {"released"} or states == {"spent"} or not attempted:
@@ -22121,7 +22124,121 @@ def _fee_scope_legacy_cancellation_holds(
     return holds
 
 
-def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
+def _fee_wallet_scopes(conn, scope: str, scope_json: Optional[str] = None) -> List[str]:
+    """Bind accounting to the trusted fee-paying wallet, not a rotating plan.
+
+    Scope/plan digests remain operation authority. Pair, ticker, campaign and
+    standalone-session changes cannot create another allowance for this wallet.
+    A prospective preview supplies its canonical scope before it is persisted.
+    Legacy unbound ledger callers retain their single-scope contract.
+    """
+    if scope_json is None:
+        row = conn.execute(
+            "SELECT scope_json FROM coin_prep_fee_previews WHERE scope_sha256=? LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return [scope]
+        scope_json = row[0]
+    if hashlib.sha256(scope_json.encode()).hexdigest() != scope:
+        raise ValueError("FEE_PREVIEW_CONTRACT_MISMATCH")
+    identity = json.loads(scope_json)
+    fields = ("network", "wallet_type", "wallet_fingerprint", "xch_wallet_id")
+    if not all(key in identity for key in fields):
+        return [scope]
+    rows = conn.execute(
+        "SELECT DISTINCT scope_sha256 FROM coin_prep_fee_previews "
+        "WHERE json_extract(scope_json, '$.network')=? "
+        "AND json_extract(scope_json, '$.wallet_type')=? "
+        "AND json_extract(scope_json, '$.wallet_fingerprint')=? "
+        "AND json_extract(scope_json, '$.xch_wallet_id')=?",
+        tuple(identity[key] for key in fields),
+    ).fetchall()
+    return sorted({scope, *(row[0] for row in rows)})
+
+
+def _fee_wallet_limits(conn, scopes: List[str]) -> Dict[str, int]:
+    """Retain the protected pool and the latest serialized wallet consent.
+
+    Approval versions are local to each scope. The append-only approval
+    ledger's insertion order supplies ordering across scopes, including ties
+    in wall-clock timestamps. No new consent or accounting rows are created.
+    """
+    latest = None
+    protected = 0
+    for scope in scopes:
+        row = conn.execute(
+            "SELECT rowid AS approval_sequence, total_fee_mojos, "
+            "cancellation_reserve_mojos FROM fee_approvals "
+            "WHERE scope_sha256=? ORDER BY rowid DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if row is not None:
+            protected = max(protected, _fee_amount(row["cancellation_reserve_mojos"]))
+            if latest is None or row["approval_sequence"] > latest["approval_sequence"]:
+                latest = row
+    return {
+        "protected_cancellation_fee_mojos": protected,
+        "maximum_fee_mojos": _fee_amount(latest["total_fee_mojos"]) if latest else 0,
+    }
+
+
+def _fee_scope_totals(
+    conn: sqlite3.Connection, scope: str, scope_json: Optional[str] = None
+) -> Dict[str, int]:
+    """Count each original wallet scope once; never copy or reset its ledger."""
+    totals = {
+        "held_fee_mojos": 0,
+        "spent_fee_mojos": 0,
+        "committed_fee_mojos": 0,
+        "noncancellation_committed_fee_mojos": 0,
+    }
+    scopes = _fee_wallet_scopes(conn, scope, scope_json)
+    per_scope = {owned: _fee_single_scope_totals(conn, owned) for owned in scopes}
+    for raw in per_scope.values():
+        for key, value in raw.items():
+            totals[key] += value
+    for campaign, campaign_scopes in _fee_wallet_campaigns(conn, scopes).items():
+        # A campaign's authoritative journal already spans its scope aliases.
+        # Import only the missing spend, once, and leave unsettled ledger
+        # reservations held even when their journal confirmation has arrived.
+        authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
+            conn, campaign, held_scopes=scopes
+        )
+        already_spent = sum(
+            per_scope[owned]["spent_fee_mojos"] for owned in campaign_scopes
+        )
+        totals["spent_fee_mojos"] += max(0, authoritative - already_spent)
+        totals["held_fee_mojos"] += sum(
+            row["fee_mojos"]
+            for row in _fee_scope_legacy_cancellation_holds(
+                conn, campaign_scopes[0], accounted_scopes=scopes
+            )
+        )
+    totals["committed_fee_mojos"] = totals["spent_fee_mojos"] + totals["held_fee_mojos"]
+    return totals
+
+
+def _fee_wallet_campaigns(conn, scopes: List[str]) -> Dict[str, List[str]]:
+    campaigns: Dict[str, List[str]] = {}
+    for scope in scopes:
+        ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT json_extract(scope_json, '$.campaign_id') "
+                "FROM coin_prep_fee_previews WHERE scope_sha256=? "
+                "AND json_extract(scope_json, '$.campaign_id') IS NOT NULL",
+                (scope,),
+            )
+        }
+        if len(ids) > 1:
+            raise ValueError("fee scope has conflicting Bootstrap campaigns")
+        for campaign in ids:
+            campaigns.setdefault(campaign, []).append(scope)
+    return campaigns
+
+
+def _fee_single_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
     """Exact held/spent sums across every approval version in this scope."""
     held = spent = noncancel = 0
     for row in conn.execute(
@@ -22140,30 +22257,6 @@ def _fee_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, int]:
             held += fee
         if not row[1]:
             noncancel += fee
-    campaign_rows = conn.execute(
-        "SELECT DISTINCT json_extract(scope_json, '$.campaign_id') AS campaign_id "
-        "FROM coin_prep_fee_previews WHERE scope_sha256=? "
-        "AND json_extract(scope_json, '$.campaign_id') IS NOT NULL",
-        (scope,),
-    ).fetchall()
-    campaign_ids = {row[0] for row in campaign_rows}
-    if len(campaign_ids) > 1:
-        raise ValueError("fee scope has conflicting Bootstrap campaigns")
-    if campaign_ids:
-        # Older generic Cancel All effects were journalled authoritatively but
-        # did not create fee reservations.  Carry only that missing difference
-        # into the append-only scope totals: reservations already represented
-        # in both ledgers must never be counted twice.
-        authoritative = _bootstrap_campaign_authoritative_fee_spent_mojos(
-            conn,
-            campaign_ids.pop(),
-            held_scope=scope,
-        )
-        spent += max(0, authoritative - spent)
-        held += sum(
-            row["fee_mojos"]
-            for row in _fee_scope_legacy_cancellation_holds(conn, scope)
-        )
     return {
         "held_fee_mojos": held,
         "spent_fee_mojos": spent,
@@ -22177,12 +22270,8 @@ def _insert_fee_approval(
 ) -> str:
     """Insert an approval inside the caller's already serialized transaction."""
     totals = _fee_scope_totals(conn, scope)
-    protected = conn.execute(
-        "SELECT cancellation_reserve_mojos FROM fee_approvals "
-        "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
-        (scope,),
-    ).fetchone()
-    if protected is not None and reserve < protected[0]:
+    limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
+    if reserve < limits["protected_cancellation_fee_mojos"]:
         raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
     if totals["committed_fee_mojos"] > total or (
         totals["noncancellation_committed_fee_mojos"] > total - reserve
@@ -22200,7 +22289,9 @@ def _insert_fee_approval(
     return approval_id
 
 
-def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
+def get_fee_scope_budget(
+    scope_sha256: str, *, scope_json: Optional[str] = None
+) -> Dict[str, int]:
     """Read one consistent scope's prior protection and cumulative commitments.
 
     This is disclosure only. Confirmation and dispatch independently recheck
@@ -22210,16 +22301,12 @@ def get_fee_scope_budget(scope_sha256: str) -> Dict[str, int]:
     conn = _stability_read_only_connection()
     try:
         conn.execute("BEGIN")
-        protected = conn.execute(
-            "SELECT cancellation_reserve_mojos FROM fee_approvals "
-            "WHERE scope_sha256=? ORDER BY version DESC LIMIT 1",
-            (scope,),
-        ).fetchone()
+        limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope, scope_json))
         return {
-            **_fee_scope_totals(conn, scope),
-            "protected_cancellation_fee_mojos": _fee_amount(protected[0])
-            if protected
-            else 0,
+            **_fee_scope_totals(conn, scope, scope_json),
+            "protected_cancellation_fee_mojos": limits[
+                "protected_cancellation_fee_mojos"
+            ],
         }
     finally:
         conn.close()
@@ -24025,14 +24112,16 @@ def get_fee_approval(approval_id: str) -> Dict[str, Any]:
             raise ValueError("FEE_APPROVAL_REQUIRED")
         result = dict(row)
         result.update(_fee_scope_totals(conn, row["scope_sha256"]))
-        result["remaining_fee_mojos"] = (
-            row["total_fee_mojos"] - result["committed_fee_mojos"]
+        limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, row["scope_sha256"]))
+        maximum = min(row["total_fee_mojos"], limits["maximum_fee_mojos"])
+        protected = max(
+            row["cancellation_reserve_mojos"],
+            limits["protected_cancellation_fee_mojos"],
         )
+        result["remaining_fee_mojos"] = maximum - result["committed_fee_mojos"]
         result["remaining_preparation_fee_mojos"] = min(
             result["remaining_fee_mojos"],
-            row["total_fee_mojos"]
-            - row["cancellation_reserve_mojos"]
-            - result["noncancellation_committed_fee_mojos"],
+            maximum - protected - result["noncancellation_committed_fee_mojos"],
         )
         return result
     finally:
@@ -24092,23 +24181,37 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             session_completed = session["completed_session_id"] is not None
             session_current = session["current_session_id"] == session_id
 
-        rows = conn.execute(
-            "SELECT reservation.fee_mojos, reservation.cancellation, "
-            "outcome.state AS accounting_outcome, prep.outcome AS effect_outcome, "
-            "CASE WHEN dispatch.dispatch_token IS NULL THEN 0 ELSE 1 END AS dispatched "
-            "FROM approved_fee_reservations AS reservation "
-            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
-            "LEFT JOIN coin_prep_operations AS prep USING(operation_id) "
-            "LEFT JOIN wallet_effect_dispatches AS dispatch "
-            "ON dispatch.adapter_operation=reservation.operation_id "
-            "WHERE reservation.scope_sha256=? "
-            "ORDER BY reservation.rowid",
-            (context["scope_sha256"],),
-        ).fetchall()
+        def reservation_rows(owned_scope):
+            return conn.execute(
+                "SELECT reservation.fee_mojos, reservation.cancellation, "
+                "outcome.state AS accounting_outcome, prep.outcome AS effect_outcome, "
+                "CASE WHEN dispatch.dispatch_token IS NULL THEN 0 ELSE 1 END AS dispatched "
+                "FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "LEFT JOIN coin_prep_operations AS prep USING(operation_id) "
+                "LEFT JOIN wallet_effect_dispatches AS dispatch "
+                "ON dispatch.adapter_operation=reservation.operation_id "
+                "WHERE reservation.scope_sha256=? "
+                "ORDER BY reservation.rowid",
+                (owned_scope,),
+            ).fetchall()
+
+        scopes = _fee_wallet_scopes(conn, context["scope_sha256"])
+        rows = reservation_rows(context["scope_sha256"])
         unresolved = [row for row in rows if row["accounting_outcome"] is None]
-        unresolved.extend(
-            _fee_scope_legacy_cancellation_holds(conn, context["scope_sha256"])
-        )
+        for owned_scope in scopes:
+            if owned_scope != context["scope_sha256"]:
+                unresolved.extend(
+                    row
+                    for row in reservation_rows(owned_scope)
+                    if row["accounting_outcome"] is None
+                )
+        for campaign_scopes in _fee_wallet_campaigns(conn, scopes).values():
+            unresolved.extend(
+                _fee_scope_legacy_cancellation_holds(
+                    conn, campaign_scopes[0], accounted_scopes=scopes
+                )
+            )
         confirmed_count = sum(
             1 for row in rows if row["accounting_outcome"] == "CONFIRMED_SPENT"
         )
@@ -24116,12 +24219,18 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             1 for row in rows if row["accounting_outcome"] == "RELEASED_NO_EFFECT"
         )
         totals = _fee_scope_totals(conn, context["scope_sha256"])
-        remaining = int(context["total_fee_mojos"]) - totals["committed_fee_mojos"]
+        limits = _fee_wallet_limits(
+            conn, _fee_wallet_scopes(conn, context["scope_sha256"])
+        )
+        maximum = min(int(context["total_fee_mojos"]), limits["maximum_fee_mojos"])
+        protected = max(
+            int(context["cancellation_reserve_mojos"]),
+            limits["protected_cancellation_fee_mojos"],
+        )
+        remaining = maximum - totals["committed_fee_mojos"]
         remaining_preparation = min(
             remaining,
-            int(context["total_fee_mojos"])
-            - int(context["cancellation_reserve_mojos"])
-            - totals["noncancellation_committed_fee_mojos"],
+            maximum - protected - totals["noncancellation_committed_fee_mojos"],
         )
         stale = (
             int(context["version"]) != int(context["latest_version"])
@@ -24271,10 +24380,15 @@ def _reserve_approved_fee_locked(
     ):
         raise ValueError("FEE_APPROVAL_STALE")
     totals = _fee_scope_totals(conn, scope)
-    if totals["committed_fee_mojos"] + fee > approval["total_fee_mojos"] or (
+    limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
+    maximum = min(approval["total_fee_mojos"], limits["maximum_fee_mojos"])
+    protection = max(
+        approval["cancellation_reserve_mojos"],
+        limits["protected_cancellation_fee_mojos"],
+    )
+    if totals["committed_fee_mojos"] + fee > maximum or (
         not cancellation
-        and totals["noncancellation_committed_fee_mojos"] + fee
-        > approval["total_fee_mojos"] - approval["cancellation_reserve_mojos"]
+        and totals["noncancellation_committed_fee_mojos"] + fee > maximum - protection
     ):
         raise ValueError("FEE_BUDGET_EXCEEDED")
     conn.execute(
@@ -41765,6 +41879,7 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
     campaign_id: str,
     *,
     held_scope: Optional[str] = None,
+    held_scopes: Optional[List[str]] = None,
 ) -> int:
     """Aggregate terminal evidence in the caller's single accounting snapshot."""
     safe_id = _bootstrap_identity(campaign_id, "campaign_id")
@@ -41825,7 +41940,7 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
         prior = cancellation_batches.setdefault(cohort_id, fee)
         if prior != fee:
             raise ValueError("Bootstrap cancellation fee evidence conflicts")
-    if held_scope is not None:
+    if held_scope is not None or held_scopes:
         # Scope accounting already counts unsettled reservations as held. A
         # crash between journal confirmation and ledger settlement must not
         # import that same batch as additional spend. The public campaign view
@@ -41835,13 +41950,16 @@ def _bootstrap_campaign_authoritative_fee_spent_mojos(
                 f"coin-prep-cancel:{cohort_id}".encode()
             ).hexdigest()
             pending = conn.execute(
-                "SELECT reservation.fee_mojos FROM approved_fee_reservations AS reservation "
+                "SELECT reservation.fee_mojos, reservation.scope_sha256 "
+                "FROM approved_fee_reservations AS reservation "
                 "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
-                "WHERE reservation.operation_id=? AND reservation.scope_sha256=? "
+                "WHERE reservation.operation_id=? "
                 "AND reservation.cancellation=1 AND outcome.operation_id IS NULL",
-                (operation_id, held_scope),
+                (operation_id,),
             ).fetchone()
-            if pending is not None:
+            if pending is not None and pending["scope_sha256"] in (
+                held_scopes or [held_scope]
+            ):
                 if _fee_amount(pending[0]) != fee:
                     raise ValueError("FEE_CANCELLATION_EVIDENCE_CONFLICT")
                 del cancellation_batches[cohort_id]

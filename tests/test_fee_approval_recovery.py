@@ -371,6 +371,19 @@ def test_exact_journal_evidence_settles_once(
         database.record_fee_reservation_outcome(operation_id, "f" * 64)
     database.record_fee_reservation_outcome(operation_id, _evidence_id(operation))
     database.record_fee_reservation_outcome(operation_id, _evidence_id(operation))
+    # A new standalone scope must disclose settled spent/released outcomes,
+    # not just pending holds, even before its first preview is persisted.
+    previous = database.get_coin_prep_fee_approval_context(approval["approval_id"])
+    scope = {**json.loads(previous["scope_json"]), "session_id": "e" * 64}
+    contract = fee_service.canonical_fee_contract(
+        scope, json.loads(previous["plan_json"])
+    )
+    carried = database.get_fee_scope_budget(
+        contract["scope_sha256"], scope_json=contract["scope_json"]
+    )
+    assert carried["spent_fee_mojos"] == spent
+    assert carried["held_fee_mojos"] == 0
+    assert carried["protected_cancellation_fee_mojos"] == 20
     conn = database.get_connection()
     for statement in [
         "UPDATE approved_fee_outcomes SET evidence_json='{}'",

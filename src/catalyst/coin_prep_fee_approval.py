@@ -530,7 +530,9 @@ def estimate_coin_prep_fee_preview(
         available = False
         total = None
         observed, expires = now, now + 60
-    accounting = database.get_fee_scope_budget(contract["scope_sha256"])
+    accounting = database.get_fee_scope_budget(
+        contract["scope_sha256"], scope_json=contract["scope_json"]
+    )
     protected = minimum_cumulative = None
     if available:
         protected = max(
