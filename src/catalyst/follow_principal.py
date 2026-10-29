@@ -165,13 +165,19 @@ def _principal_from_observed_snapshot(observed: dict, *, fee_cap_mojos: int) -> 
     fee_rows = database.get_free_coins("xch")
     if type(fee_rows) is not list:
         raise ValueError("FOLLOW_FEE_POOL_UNAVAILABLE")
-    fee_ids = {
-        row["coin_id"]
-        for row in fee_rows
-        if type(row) is dict and row.get("purpose") == "fee_reserve"
-    }
-    if any(type(coin_id) is not str for coin_id in fee_ids):
-        raise ValueError("FOLLOW_FEE_POOL_UNAVAILABLE")
+    fee_ids = set()
+    for row in fee_rows:
+        if type(row) is not dict or row.get("purpose") != "fee_reserve":
+            continue
+        coin_id = row.get("coin_id")
+        if type(coin_id) is not str or re.fullmatch(
+            r"(?:0x)?[0-9a-fA-F]{64}", coin_id
+        ) is None:
+            raise ValueError("FOLLOW_FEE_POOL_UNAVAILABLE")
+        normalized_id = coin_id.lower().removeprefix("0x")
+        if normalized_id in fee_ids:
+            raise ValueError("FOLLOW_FEE_POOL_UNAVAILABLE")
+        fee_ids.add(normalized_id)
     if any(
         coin.coin_id in fee_ids and coin.purpose not in {"", "fee_reserve"}
         for coin in snapshot.coins

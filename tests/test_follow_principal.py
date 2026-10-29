@@ -113,7 +113,9 @@ def test_live_principal_reader_uses_verified_snapshot_and_durable_fee_purpose(
         database,
         "get_free_coins",
         lambda asset: (
-            [{"coin_id": "c" * 64, "purpose": "fee_reserve"}] if asset == "xch" else []
+            [{"coin_id": "0x" + "c" * 64, "purpose": "fee_reserve"}]
+            if asset == "xch"
+            else []
         ),
     )
     monkeypatch.setattr(
@@ -124,6 +126,7 @@ def test_live_principal_reader_uses_verified_snapshot_and_durable_fee_purpose(
     result = read_follow_principal_snapshot(fee_cap_mojos=50_000_000_000)
     assert result["maximum_trade_xch_mojos"] == 52_000_000_000
     assert result["maximum_trade_cat_atoms"] == 850_000
+    assert result["largest_spendable_fee_coin_mojos"] == 30_000_000_000
     assert result["identity"]["wallet_fingerprint"] == 123
     assert result["dispatch_authorized"] is False
     assert len(result["inventory_sha256"]) == 64
