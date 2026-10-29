@@ -169,7 +169,7 @@ def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[D
 
 
 def _coinset_fee_estimate(
-    target_seconds: int, cost: int, *, diagnostics=None
+    target_seconds: int, cost: int, *, diagnostics=None, force_refresh=False
 ) -> Optional[Dict]:
     """Query Coinset cloud API for a fee estimate.
 
@@ -201,7 +201,11 @@ def _coinset_fee_estimate(
     cache_key = (target_seconds, cost)
     now = time.time()
     cached = _COINSET_FEE_CACHE.get(cache_key)
-    if cached and 0 <= (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS:
+    if (
+        not force_refresh
+        and cached
+        and 0 <= (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS
+    ):
         return dict(cached[1])
 
     try:
@@ -279,7 +283,9 @@ def _coinset_fee_estimate(
         return unavailable("fee_provider_unavailable")
 
 
-def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) -> Dict:
+def get_suggested_transaction_fee(
+    target_seconds: int = None, cost: int = None, *, force_refresh=False
+) -> Dict:
     target = int(
         target_seconds
         if target_seconds is not None
@@ -294,7 +300,11 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
     now = time.time()
 
     cached = _SUGGESTED_FEE_CACHE.get(cache_key)
-    if cached and 0 <= (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS:
+    if (
+        not force_refresh
+        and cached
+        and 0 <= (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS
+    ):
         return dict(cached[1])
 
     env = get_wallet_fee_environment()
@@ -343,7 +353,9 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
             ),
         }
     )
-    coinset_result = _coinset_fee_estimate(target, cost_val, diagnostics=failures)
+    coinset_result = _coinset_fee_estimate(
+        target, cost_val, diagnostics=failures, force_refresh=force_refresh
+    )
     if coinset_result:
         _SUGGESTED_FEE_CACHE[cache_key] = (now, coinset_result)
         return dict(coinset_result)

@@ -202,6 +202,24 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(first["observed_at"], 100)
         self.assertEqual(refreshed["observed_at"], 150)
 
+    def test_forced_quote_refresh_bypasses_both_provider_caches(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True, "estimates": [123]}
+        )
+        clock = {"now": 100}
+        with (
+            patch("requests.post", return_value=response),
+            patch.object(self.tx_fees.time, "time", lambda: clock["now"]),
+        ):
+            first = self.tx_fees.get_suggested_transaction_fee(300, 20_000_000)
+            clock["now"] = 101
+            refreshed = self.tx_fees.get_suggested_transaction_fee(
+                300, 20_000_000, force_refresh=True
+            )
+        self.assertEqual(first["observed_at"], 100)
+        self.assertEqual(refreshed["observed_at"], 101)
+        self.assertEqual(refreshed["fee_mojos"], 123)
+
     def test_sage_without_full_node_reports_manual_fallback_environment(self):
         # Disable coinset so the test exercises the pure sage/no-full-node fallback path.
         # (COINSET_ENABLED defaults to True globally, but this test verifies the

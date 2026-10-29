@@ -462,3 +462,60 @@ def test_new_reserve_designation_is_checked_inside_atomic_hold(
     with pytest.raises(ValueError, match="FEE_EFFECT_NOT_DISPATCHABLE"):
         _reserve(exact_journal)
     assert utils._counts()["approved_fee_reservations"] == 0
+
+
+@pytest.mark.parametrize(
+    "refreshed_fee, expected",
+    [(20, True), (21, False), (None, False), ("exception", False), ("short", False)],
+)
+def test_slow_inventory_read_refreshes_exact_quote_without_resizing_plan(
+    approved, monkeypatch, refreshed_fee, expected
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1051
+        return result
+
+    def fresh_quote(cost, target_seconds, *, force_refresh=False):
+        assert force_refresh is True
+        if refreshed_fee is None:
+            return {"available": False}
+        if refreshed_fee == "exception":
+            raise TimeoutError("private transport details")
+        if refreshed_fee == "short":
+            return {
+                "available": True,
+                "source": "coinset",
+                "cost": cost,
+                "target_seconds": target_seconds,
+                "fee_mojos": 20,
+                "observed_at": 1001,
+                "expires_at": 1061,
+            }
+        return {
+            "available": True,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "fee_mojos": refreshed_fee,
+            "observed_at": 1051,
+            "expires_at": 1111,
+        }
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    monkeypatch.setattr(import_module("fee_estimation"), "quote_fee", fresh_quote)
+    result = _price(approved)
+    assert result["available"] is expected
+    if expected:
+        assert result["pricing"]["quote"]["observed_at"] == 1051
+        assert result["pricing"]["plan"].fee_mojos == 20
+        assert result["approval"]["remaining_preparation_fee_mojos"] == 40
+    assert utils._counts()["wallet_effect_claims"] == 0
+    assert utils._counts()["approved_fee_reservations"] == 0

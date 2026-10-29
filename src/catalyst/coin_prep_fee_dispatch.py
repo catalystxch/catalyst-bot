@@ -130,6 +130,42 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         )
     if pricing["transaction_required"] is True:
         fee = pricing["plan"].fee_mojos
+        # Slow inventory reads can leave a valid quote too close to expiry for
+        # the worker's pre-claim guard. Reprice the already inspected cost only;
+        # never renew a cached timestamp or resize an approved executable fee.
+        if is_current_fee_quote(
+            pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]
+        ) and not is_current_fee_quote(
+            pricing["quote"],
+            pricing["inspection"]["cost"],
+            plan["target_seconds"],
+            now=coin_prep_fee_pricing._now() + 10,
+        ):
+            from fee_estimation import quote_fee
+
+            try:
+                fresh = quote_fee(
+                    pricing["inspection"]["cost"],
+                    target_seconds=plan["target_seconds"],
+                    force_refresh=True,
+                )
+            except Exception:
+                fresh = None
+            if (
+                not is_current_fee_quote(
+                    fresh,
+                    pricing["inspection"]["cost"],
+                    plan["target_seconds"],
+                    now=coin_prep_fee_pricing._now() + 10,
+                )
+                or fresh["fee_mojos"] != fee
+            ):
+                return _paused(
+                    context,
+                    "FEE_ESTIMATE_UNAVAILABLE",
+                    diagnostic_stage="post_inventory_fresh_quote",
+                )
+            pricing = {**pricing, "quote": fresh}
         if not is_current_fee_quote(
             pricing["quote"], pricing["inspection"]["cost"], plan["target_seconds"]
         ):
