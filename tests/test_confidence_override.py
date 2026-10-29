@@ -117,6 +117,42 @@ def test_expired_evidence_rejected():
     assert override_price_range(confidence(), now=NOW, valid_until=NOW) is None
 
 
+def test_consented_hard_move_uses_fresh_book_inside_configured_price_band(monkeypatch):
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015"))
+    observed = confidence(
+        reason_codes=("hard_price_move_cap", "insufficient_bid_depth")
+    )
+    assert override_price_range(
+        observed, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    ) == (Decimal("0.00005"), Decimal("0.000065"), Decimal("0.00008"))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"observed_bid": Decimal("0.00003")},
+        {"observed_ask": Decimal("0.00016")},
+        {"derived_at": NOW - timedelta(seconds=31)},
+        {"reason_codes": ("hard_price_move_cap", "provider_price_conflict")},
+    ],
+)
+def test_hard_move_consent_does_not_escape_price_or_evidence_bounds(
+    monkeypatch, changes
+):
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015"))
+    observed = confidence(**({"reason_codes": ("hard_price_move_cap",)} | changes))
+    assert (
+        override_price_range(observed, now=NOW, valid_until=NOW + timedelta(seconds=20))
+        is None
+    )
+
+
 def test_candidate_rechecks_consent_and_preserves_profitability():
     from confidence_override import ConsentedConfidence
     from offer_manager import assess_offer_book_candidate

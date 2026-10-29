@@ -73,12 +73,20 @@ def test_scope_requires_real_follow_authority_and_records_audit_only(
     approved, monkeypatch
 ):
     complete(approved, monkeypatch)
+    monkeypatch.setattr(
+        approved["config"], "HARD_MIN_PRICE_XCH", "0.0000375", raising=False
+    )
+    monkeypatch.setattr(
+        approved["config"], "HARD_MAX_PRICE_XCH", "0.00015", raising=False
+    )
     calls = install_reader(monkeypatch)
     scope = policy.current_scope()
     assert calls
     assert scope["identity"]["wallet_fingerprint"] == 736588221
     assert scope["fee_cap_mojos"] == "50000000000"
     assert scope["protected_cancel_mojos"] == "123456789"
+    assert scope["hard_min_price_xch"] == "0.0000375"
+    assert scope["hard_max_price_xch"] == "0.00015"
     assert scope["follow_run_id"] == "a" * 64
     assert scope["financial_consent_id"] == "d" * 64
     permit = policy.RunConsent.confirm(

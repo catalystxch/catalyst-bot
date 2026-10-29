@@ -8397,7 +8397,7 @@
     <div id="confidenceOverrideModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="confidenceOverrideTitle" style="display:none">
         <div class="modal-content" style="max-width:620px;padding:24px;overflow:auto">
             <h2 id="confidenceOverrideTitle">Continue despite low market confidence</h2>
-            <p>Thin market depth can cause poor execution or losses. This permits continuous Follow at the reviewed limits and suppresses confidence-only withdrawals while current, valid prices remain available. RED warnings stay visible.</p>
+            <p>Thin market depth and a large move from the last trusted price can cause poor execution or losses. This permits continuous Follow at the reviewed limits when a current bid and ask both fit inside your configured hard price range. RED warnings stay visible.</p>
             <p>Wallet identity, coin ownership, protected fee funding, fee limits, price freshness and runtime safety still apply. Stop or a restart removes consent. Expiry or changed settings restore ordinary confidence policy.</p>
             <label>Override duration (hours, 1–168) <input id="confidenceOverrideHours" type="number" min="1" max="168" step="1" value="72" oninput="invalidateConfidenceOverrideReview()"></label>
             <pre id="confidenceOverrideReviewText" style="white-space:pre-wrap"></pre>
@@ -32894,6 +32894,8 @@
                     `Approved Follow run fee ceiling: ${scope.fee_cap_mojos} mojos
 ` +
                     `Protected cancellation reserve: ${scope.protected_cancel_mojos} mojos
+` +
+                    `Allowed observed bid/ask range: ${scope.hard_min_price_xch}–${scope.hard_max_price_xch} XCH per CAT
 ` +
                     `Retained reserves: ${scope.xch_reserve} XCH / ${scope.cat_reserve} CAT
 ` +

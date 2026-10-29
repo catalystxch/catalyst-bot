@@ -20,6 +20,7 @@ _ALLOWED_REASONS = frozenset(
         "insufficient_ask_depth",
         "single_provider_dependency",
         "out_of_range_depth_excluded",
+        "hard_price_move_cap",
     }
 )
 
@@ -99,8 +100,9 @@ class RunConsent:
         """Retain price persistence independently of the waived depth policy.
 
         A repeated read of the same observation never counts as confirmation.
-        Unknown failures, hard-cap moves and conflicting/manipulated prices
-        remain rejected by the strict price validator.
+        Unknown failures and conflicting/manipulated prices remain rejected.
+        A hard-cap move needs current bid/ask evidence inside the reviewed
+        absolute price band.
         """
         with self._lock:
             if self.revoked:
@@ -168,7 +170,7 @@ class RunConsent:
 
 
 def override_price_range(confidence, *, now, valid_until, allow_thin_pending=False):
-    """Allow low depth/redundancy, never manufacture or reuse price evidence."""
+    """Allow thin depth or bounded hard moves, never reuse price evidence."""
     try:
         current = _utc(now)
         derived = _utc(confidence.derived_at)
@@ -176,6 +178,7 @@ def override_price_range(confidence, *, now, valid_until, allow_thin_pending=Fal
         reasons = set(confidence.reason_codes)
         if (
             allow_thin_pending is True
+            and "hard_price_move_cap" not in reasons
             and "material_move_pending_confirmation" in reasons
             and reasons & {"insufficient_bid_depth", "insufficient_ask_depth"}
         ):
@@ -207,6 +210,20 @@ def override_price_range(confidence, *, now, valid_until, allow_thin_pending=Fal
             or bid > ask
         ):
             return None
+        if "hard_price_move_cap" in reasons:
+            from config import cfg
+
+            hard_min = Decimal(str(getattr(cfg, "HARD_MIN_PRICE_XCH", 0)))
+            hard_max = Decimal(str(getattr(cfg, "HARD_MAX_PRICE_XCH", 0)))
+            if (
+                not hard_min.is_finite()
+                or not hard_max.is_finite()
+                or hard_min <= 0
+                or hard_min >= hard_max
+                or bid < hard_min
+                or ask > hard_max
+            ):
+                return None
         return bid, (bid + ask) / Decimal(2), ask
     except (AttributeError, TypeError, ValueError, ArithmeticError):
         return None
@@ -275,6 +292,7 @@ def current_scope():
     """
     import database
     import mutation_gate
+    from config import cfg
     from coin_prep_fee_runtime import _configuration, _verified_identity
 
     configuration = _configuration()
@@ -361,6 +379,8 @@ def current_scope():
         "sell_limit": authority["sell_limit"],
         "xch_reserve": str(configuration["XCH_RESERVE"]),
         "cat_reserve": str(configuration["CAT_RESERVE"]),
+        "hard_min_price_xch": str(getattr(cfg, "HARD_MIN_PRICE_XCH", "")),
+        "hard_max_price_xch": str(getattr(cfg, "HARD_MAX_PRICE_XCH", "")),
         "tier_sizes_xch": {
             side.lower(): {
                 tier.lower(): str(configuration[f"{side}_{tier}_SIZE_XCH"])
