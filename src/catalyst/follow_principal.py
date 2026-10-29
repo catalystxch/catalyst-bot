@@ -170,9 +170,10 @@ def _principal_from_observed_snapshot(observed: dict, *, fee_cap_mojos: int) -> 
         if type(row) is not dict or row.get("purpose") != "fee_reserve":
             continue
         coin_id = row.get("coin_id")
-        if type(coin_id) is not str or re.fullmatch(
-            r"(?:0x)?[0-9a-fA-F]{64}", coin_id
-        ) is None:
+        if (
+            type(coin_id) is not str
+            or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", coin_id) is None
+        ):
             raise ValueError("FOLLOW_FEE_POOL_UNAVAILABLE")
         normalized_id = coin_id.lower().removeprefix("0x")
         if normalized_id in fee_ids:
