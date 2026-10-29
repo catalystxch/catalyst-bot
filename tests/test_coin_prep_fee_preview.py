@@ -19,7 +19,7 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr(fee_estimation.time, "time", lambda: 100)
 
     def provider(*, cost, target_seconds):
-        fees = {20_000_000: 30, 10_000_000: 10, 5_000_000: 5}
+        fees = {20_000_000: 30, 10_000_000: 10, 5_000_000: 5, 11_000_000_000: 90}
         return {
             "available": True,
             "source": "coinset",
@@ -132,6 +132,50 @@ def test_projected_upper_count_prices_total_without_charging_fee_principal(conte
     assert result["preparation_transaction_count_max"] == 3
     assert result["stages"][0]["cost_kind"] == "projected"
     assert result["stages"][1]["cost_kind"] == "exact_unsigned"
+
+
+def test_standalone_follow_shutdown_quote_floors_protection_and_fee_coin(context):
+    scope, plan, stages = context
+    quote = fee_estimation.quote_fee(11_000_000_000, target_seconds=300)
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is True
+    assert result["minimum_cancellation_reserve_mojos"] == 90
+    assert result["minimum_cumulative_fee_mojos"] == 160
+    assert result["follow_shutdown_fee_mojos"] == 90
+    plan["outputs"][0]["amount_mojos"] = 89
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is False
+    assert result["reason"] == "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL"
+
+
+def test_standalone_follow_shutdown_zero_quote_fails_closed(context):
+    scope, plan, stages = context
+    quote = fee_estimation.quote_fee(11_000_000_000, target_seconds=300)
+    quote["fee_mojos"] = 0
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is False
+    assert result["reason"] == "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE"
 
 
 @pytest.mark.parametrize(
