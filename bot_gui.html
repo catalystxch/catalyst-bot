@@ -6277,6 +6277,106 @@
             box-shadow: 0 32px 80px rgba(0,0,0,0.58);
         }
 
+        /* Follow approval uses the same readable controls as the v4 setup screens. */
+        .follow-review-modal .modal-content {
+            width: min(92vw, 680px);
+            max-width: 680px;
+            max-height: min(88vh, 760px);
+            padding: 0;
+            overflow-y: auto;
+            border-color: rgba(99, 102, 241, 0.38);
+        }
+        .follow-review-header {
+            padding: 26px 28px 18px;
+            border-bottom: 1px solid var(--border-default);
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.14), transparent 75%);
+        }
+        .follow-review-kicker {
+            margin-bottom: 7px;
+            color: var(--accent-primary);
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .follow-review-header h2 {
+            margin: 0 0 8px;
+            color: var(--text-primary);
+            font-size: clamp(1.35rem, 3vw, 1.7rem);
+            line-height: 1.2;
+        }
+        .follow-review-header p,
+        .follow-review-note {
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            line-height: 1.55;
+        }
+        .follow-review-body { padding: 20px 28px 24px; }
+        .follow-review-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+        }
+        .follow-review-field { display: block; min-width: 0; }
+        .follow-review-field span {
+            display: block;
+            margin-bottom: 7px;
+            color: var(--text-secondary);
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .follow-review-field input {
+            box-sizing: border-box;
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border-default);
+            border-radius: 10px;
+            background: rgba(2, 6, 23, 0.45);
+            color: var(--text-primary);
+            font: 600 0.96rem var(--font-ui);
+        }
+        .follow-review-check {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            margin: 16px 0;
+            color: var(--text-primary);
+            font-size: 0.88rem;
+            line-height: 1.45;
+        }
+        .follow-review-check input { flex: none; margin: 3px 0 0; accent-color: var(--accent-primary); }
+        .follow-review-note { margin-top: 15px; }
+        .follow-review-result {
+            min-height: 52px;
+            margin: 16px 0 0;
+            padding: 12px 14px;
+            border: 1px solid var(--border-default);
+            border-radius: 11px;
+            background: rgba(2, 6, 23, 0.32);
+            color: var(--text-secondary);
+            font: 0.82rem/1.5 var(--font-mono);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        .follow-review-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 9px;
+            margin-top: 18px;
+        }
+        .follow-review-actions .btn { min-height: 38px; }
+        .follow-review-actions .btn-primary { margin-left: auto; }
+        @media (max-width: 600px) {
+            .follow-review-header { padding: 20px 18px 15px; }
+            .follow-review-body { padding: 17px 18px 20px; }
+            .follow-review-grid { grid-template-columns: 1fr; }
+            .follow-review-actions .btn { flex: 1 1 100%; }
+            .follow-review-actions .btn-primary { margin-left: 0; }
+        }
+
         .v4-modal-shell {
             /* F30: bumped accent border from 0.28 → 0.55 alpha so the modal
                outline reads cleanly against dark backdrops. Was nearly
@@ -8310,23 +8410,32 @@
         </div>
     </div>
 
-    <div id="followRunReviewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="followRunReviewTitle" style="display:none">
-        <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
-            <h2 id="followRunReviewTitle">Review continuous Follow run</h2>
-            <p>Review the current wallet, prepared trading principal, offer slots and protected fee allowance. Recording this approval does not start trading.</p>
-            <label>BUY offers <input id="followRunBuyLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
-            <label>SELL offers <input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
-            <label><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"> Continue until I stop the run or its fee/safety limit is reached</label>
-            <label>Timed authority (hours, when continuous is unchecked) <input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
-            <label>Cumulative fee ceiling (XCH) <input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowRunReview()"></label>
-            <p>The 48-hour observation is separate from the run lifetime. A continuous run still stops when you stop it or a financial or safety gate requires it.</p>
-            <pre id="followRunReviewText" style="white-space:pre-wrap"></pre>
-            <label><input type="checkbox" id="followRunReviewAccept" disabled> I approve the exact wallet, trading limits and fee allowance shown above.</label>
-            <div style="margin-top:16px">
-                <button type="button" onclick="closeFollowRunReview()">Back</button>
-                <button type="button" id="followRunReviewPrepare" onclick="prepareFollowRunReview()">Refresh exact review</button>
-                <button type="button" id="prestartFollowFeeOpen" onclick="openPrestartFollowFeeReview()">Review initial fee ceiling</button>
-                <button type="button" id="followRunReviewConfirm" disabled onclick="confirmFollowRunReview()">Record approval</button>
+    <div id="followRunReviewModal" class="modal follow-review-modal" role="dialog" aria-modal="true" aria-labelledby="followRunReviewTitle" style="display:none">
+        <div class="modal-content">
+            <div class="follow-review-header">
+                <div class="follow-review-kicker">Financial review</div>
+                <h2 id="followRunReviewTitle">Review continuous Follow run</h2>
+                <p>Check the wallet, prepared trading principal, offer slots and protected fee allowance. Recording approval does not start trading.</p>
+            </div>
+            <div class="follow-review-body">
+                <div class="follow-review-grid">
+                    <label class="follow-review-field"><span>BUY offers</span><input id="followRunBuyLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+                    <label class="follow-review-field"><span>SELL offers</span><input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+                </div>
+                <label class="follow-review-check"><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"><span>Continue until I stop the run or its fee or safety limit is reached</span></label>
+                <div class="follow-review-grid">
+                    <label class="follow-review-field"><span>Timed authority (hours)</span><input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
+                    <label class="follow-review-field"><span>Cumulative fee ceiling (XCH)</span><input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowRunReview()"></label>
+                </div>
+                <p class="follow-review-note">Timed authority applies only when continuous is off. The 48-hour observation is separate from run lifetime.</p>
+                <pre id="followRunReviewText" class="follow-review-result" aria-live="polite"></pre>
+                <label class="follow-review-check"><input type="checkbox" id="followRunReviewAccept" disabled><span>I approve the exact wallet, trading limits and fee allowance shown above.</span></label>
+                <div class="follow-review-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeFollowRunReview()">Back</button>
+                    <button type="button" class="btn btn-secondary" id="followRunReviewPrepare" onclick="prepareFollowRunReview()">Refresh exact review</button>
+                    <button type="button" class="btn btn-secondary" id="prestartFollowFeeOpen" onclick="openPrestartFollowFeeReview()">Review fee ceiling</button>
+                    <button type="button" class="btn btn-primary" id="followRunReviewConfirm" disabled onclick="confirmFollowRunReview()">Record approval</button>
+                </div>
             </div>
         </div>
     </div>
