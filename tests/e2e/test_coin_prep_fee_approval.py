@@ -510,6 +510,74 @@ def test_history_cancel_records_no_fee_approval_or_trigger(page):
     assert result == ["/api/coin-prep/fee-preview"]
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "none",
+        "plan",
+        "scope",
+        "unfunded",
+        "over_cap",
+        "protection",
+        "unavailable",
+        "expired",
+    ],
+)
+def test_history_expiry_refreshes_same_plan_with_chosen_cap_only(page, change):
+    _open_gui(page)
+    result = page.evaluate(
+        """async ({preview, change}) => {
+            const originalNow = Date.now;
+            const now = Math.floor(Date.now() / 1000);
+            preview.observed_at = now;
+            preview.expires_at = now + 2;
+            const calls = [];
+            let count = 0;
+            window.apiFetch = async (path, options = {}) => {
+                const body = options.body ? JSON.parse(options.body) : null;
+                calls.push({path: String(path), body});
+                if (String(path).endsWith('/fee-preview')) {
+                    if (++count === 1) return new Response(JSON.stringify(preview));
+                    const fresh = {...preview, preview_id: 'e'.repeat(64),
+                        observed_at: now + 3, expires_at: now + 63};
+                    if (change === 'plan') fresh.plan_sha256 = 'f'.repeat(64);
+                    if (change === 'scope') fresh.scope_sha256 = 'f'.repeat(64);
+                    if (change === 'unfunded') fresh.funded = false;
+                    if (change === 'over_cap') fresh.minimum_cumulative_fee_mojos = '5000000001';
+                    if (change === 'protection') fresh.minimum_cancellation_reserve_mojos = '1';
+                    if (change === 'unavailable') fresh.available = false;
+                    if (change === 'expired') fresh.expires_at = now + 2;
+                    return new Response(JSON.stringify(fresh));
+                }
+                if (String(path).endsWith('/fee-approval')) {
+                    return new Response(JSON.stringify({success: false, reason: 'test stop'}), {status: 400});
+                }
+                throw new Error(`Unexpected wallet effect: ${path}`);
+            };
+            window.askPrepHistoryChoice = async () => {
+                Date.now = () => (now + 3) * 1000;
+                return {action: 'proceed', resets: {pnl: false, offers: false, counters: false}};
+            };
+            try {
+                await refreshCoinPrepFeePreview({coin_multiplier: '1'});
+                document.getElementById('cpFeeMaximumInput').value = '0.005';
+                await startCoinPrepFromModal();
+                return calls;
+            } finally { Date.now = originalNow; }
+        }""",
+        {"preview": _preview(), "change": change},
+    )
+    assert [call["path"] for call in result] == ["/api/coin-prep/fee-preview"] * 2 + (
+        ["/api/coin-prep/fee-approval"] if change == "none" else []
+    )
+    if change == "none":
+        assert result[-1]["body"] == {
+            "preview_id": "e" * 64,
+            "maximum_fee_mojos": "5000000000",
+            "cancellation_reserve_mojos": "4000000",
+        }
+
+
 def test_quote_expiring_during_history_choice_does_not_record_approval(page):
     _open_gui(page)
     preview = _preview()
@@ -542,7 +610,7 @@ def test_quote_expiring_during_history_choice_does_not_record_approval(page):
         }""",
         preview,
     )
-    assert result["calls"] == ["/api/coin-prep/fee-preview"]
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * 2
     assert result["disabled"] is True
 
 
@@ -590,7 +658,9 @@ def test_failed_history_review_restores_fee_review_without_wallet_effect(
     if history_failure == "expired":
         assert result["failed"]["disabled"] is True
     assert result["retryEnabled"] is True
-    assert result["calls"] == ["/api/coin-prep/fee-preview"] * 2
+    assert result["calls"] == ["/api/coin-prep/fee-preview"] * (
+        3 if history_failure == "expired" else 2
+    )
 
 
 def test_fee_endpoints_have_native_desktop_bridge_equivalence(page):

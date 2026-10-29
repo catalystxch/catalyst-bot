@@ -38416,7 +38416,7 @@ function closeCtgErrorModal() {
             }
             const maximumFeeMojos = validateCoinPrepFeeMaximum();
             if (maximumFeeMojos === null) return;
-            const confirmedPreview = _coinPrepFeePreview;
+            let confirmedPreview = _coinPrepFeePreview;
             const confirmedOptions = {..._coinPrepFeePreviewOptions};
             const recoveryIntent = _coinPrepFeeRecoveryIntent;
             _coinPrepFeeConfirmBusy = true;
@@ -38442,6 +38442,34 @@ function closeCtgErrorModal() {
 
                 if (confirmedPreview !== _coinPrepFeePreview) {
                     throw new Error('The fee estimate changed before approval. Review the refreshed estimate and try again.');
+                }
+                if (!updateCoinPrepFeeFreshness()) {
+                    const input = document.getElementById('cpFeeMaximumInput');
+                    if (coinPrepXchToMojos(input.value).toString() !== maximumFeeMojos) {
+                        throw new Error('The maximum changed while reviewing history. Review it before approving Coin Prep.');
+                    }
+                    const previousPreview = confirmedPreview;
+                    if (btn) btn.textContent = 'Refreshing fee estimate…';
+                    input.disabled = true;
+                    try {
+                        const refreshed = await refreshCoinPrepFeePreview(confirmedOptions);
+                        const fresh = _coinPrepFeePreview;
+                        if (!refreshed || !fresh || fresh.funded !== true
+                            || ['scope_sha256', 'plan_sha256'].some(key =>
+                                !/^[0-9a-f]{64}$/.test(String(previousPreview[key] || ''))
+                                || fresh[key] !== previousPreview[key])
+                            || canonicalCoinPrepMojos(fresh.minimum_cancellation_reserve_mojos
+                                ?? fresh.estimated_cancellation_fee_mojos)
+                                < canonicalCoinPrepMojos(previousPreview.minimum_cancellation_reserve_mojos
+                                    ?? previousPreview.estimated_cancellation_fee_mojos)) {
+                            throw new Error('The refreshed wallet, plan or cancellation protection changed. Review the estimate before approving Coin Prep.');
+                        }
+                        confirmedPreview = fresh;
+                    } finally {
+                        // Rendering a preview suggests a cap; preserve the cap actually confirmed.
+                        input.value = coinPrepMojosToXch(maximumFeeMojos);
+                        input.disabled = false;
+                    }
                 }
                 if (validateCoinPrepFeeMaximum() !== maximumFeeMojos) {
                     throw new Error('The fee estimate expired or the maximum changed while reviewing history. Refresh and review the estimate before approving Coin Prep.');
