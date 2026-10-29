@@ -46,6 +46,9 @@ def _setup(monkeypatch, *, running=False, review=None, proposal=None):
     monkeypatch.setattr(api_server, "_cancel_all_thread", None)
     monkeypatch.setattr(database, "get_follow_run_review", lambda _id: review)
     monkeypatch.setattr(
+        database, "get_follow_creation_authority", lambda **_kw: {"ready": False}
+    )
+    monkeypatch.setattr(
         follow_principal,
         "preview_approved_follow_principal",
         lambda _id, **_kw: proposal,
@@ -87,6 +90,39 @@ def test_native_confirmation_rechecks_and_consumes_exact_review(monkeypatch):
     ]
     assert result["run_id"] == "a" * 64
     assert result["dispatch_authorized"] is False
+
+
+def test_native_reapproval_checks_empty_sage_book_before_rebinding(monkeypatch):
+    import database
+    import follow_principal
+    import wallet
+
+    saved = _setup(monkeypatch)
+    old = {
+        "ready": True,
+        "run_id": "a" * 64,
+        "approval_id": "1" * 64,
+        "identity": _proposal()["identity"],
+        "configuration_sha256": "b" * 64,
+        "principal_review_sha256": "9" * 64,
+        "buy_limit": 24,
+        "sell_limit": 24,
+        "maximum_fee_mojos": 50_000_000_000,
+        "protected_shutdown_fee_mojos": 10_000_000_000,
+    }
+    monkeypatch.setattr(database, "get_follow_creation_authority", lambda **_kw: old)
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    monkeypatch.setattr(wallet, "get_all_offers", lambda *_a, **_kw: [])
+    follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
+    assert saved[0]["reapprove_run_id"] == old["run_id"]
+
+    saved.clear()
+    monkeypatch.setattr(
+        wallet, "get_all_offers", lambda *_a, **_kw: [{"status": "pending"}]
+    )
+    with pytest.raises(ValueError, match="FOLLOW_RUN_OVERLAP"):
+        follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
+    assert saved == []
 
 
 def test_native_bridge_requires_explicit_acceptance_and_forwards_only_review_ids(

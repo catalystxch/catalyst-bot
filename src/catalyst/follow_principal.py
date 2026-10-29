@@ -676,6 +676,41 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
             "maximum_fee_mojos": review["maximum_fee_mojos"],
             "protected_shutdown_fee_mojos": review["protected_shutdown_fee_mojos"],
         }
+        existing = database.get_follow_creation_authority(
+            identity=review["identity"],
+            configuration_sha256=review["configuration_sha256"],
+            now_epoch=now_epoch,
+        )
+        if existing.get("ready") is True:
+            if (
+                existing.get("approval_id") != approval_id
+                or existing.get("buy_limit") != buy_limit
+                or existing.get("sell_limit") != sell_limit
+                or existing.get("maximum_fee_mojos") != review["maximum_fee_mojos"]
+                or existing.get("protected_shutdown_fee_mojos")
+                != review["protected_shutdown_fee_mojos"]
+                or existing.get("principal_review_sha256")
+                == review["principal_review_sha256"]
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            from wallet import get_all_offers, get_pending_transactions
+
+            pending = get_pending_transactions()
+            offers = get_all_offers(include_completed=True, start=0, end=10000)
+            if (
+                type(pending) is not list
+                or pending
+                or type(offers) is not list
+                or len(offers) >= 10000
+                or any(
+                    type(offer) is not dict
+                    or str(offer.get("status", "")).lower()
+                    not in {"cancelled", "expired", "completed", "filled"}
+                    for offer in offers
+                )
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            terms["reapprove_run_id"] = existing["run_id"]
         authority = database.create_follow_run_authority(**terms)
         return {**authority, "dispatch_authorized": False}
 

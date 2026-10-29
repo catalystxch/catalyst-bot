@@ -66,6 +66,64 @@ def reviewed_run(**terms):
         )
 
 
+def test_reapproved_continuous_run_supersedes_old_hash_without_resetting_fee_scope(
+    approved,
+):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    terms = dict(
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    first = database.create_follow_run_review(**terms, continuous=True)
+    with patch.object(database.time, "time", return_value=1002):
+        old = database.create_follow_run_authority(
+            consent_id=first["review_id"], review_sha256=first["review_sha256"], **terms
+        )
+    renewed_terms = terms | {
+        "principal_review_sha256": "e" * 64,
+        "started_at_epoch": 1005,
+    }
+    renewed = database.create_follow_run_review(**renewed_terms, continuous=True)
+    with patch.object(database.time, "time", return_value=1006):
+        new = database.create_follow_run_authority(
+            consent_id=renewed["review_id"],
+            review_sha256=renewed["review_sha256"],
+            reapprove_run_id=old["run_id"],
+            **renewed_terms,
+        )
+    assert new["run_id"] == old["run_id"]
+    assert database.get_follow_run_review(renewed["review_id"])["consumed"] is True
+    active = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1007
+    )
+    assert active["run_id"] == new["run_id"]
+    assert active["consent_id"] == renewed["review_id"]
+    assert active["principal_review_sha256"] == "e" * 64
+
+
 def test_follow_review_is_exact_single_use_and_expires(approved):
     approval_id = approved["approval"]["approval_id"]
     scope = json.loads(

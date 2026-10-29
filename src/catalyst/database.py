@@ -2134,6 +2134,24 @@ CREATE TRIGGER IF NOT EXISTS follow_run_authorities_identity_guard
 BEFORE INSERT ON follow_run_authorities
 WHEN catalyst_sha256(NEW.identity_json) IS NOT NEW.identity_sha256
 BEGIN SELECT RAISE(ABORT, 'Follow run identity mismatch'); END;
+CREATE TABLE IF NOT EXISTS follow_run_reapprovals (
+    run_id TEXT NOT NULL REFERENCES follow_run_authorities(run_id),
+    review_id TEXT PRIMARY KEY NOT NULL REFERENCES follow_run_reviews(review_id),
+    prior_principal_sha256 TEXT NOT NULL
+        CHECK(length(prior_principal_sha256)=64 AND prior_principal_sha256 NOT GLOB '*[^0-9a-f]*'),
+    principal_review_sha256 TEXT NOT NULL
+        CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
+    confirmed_at_epoch INTEGER NOT NULL
+        CHECK(typeof(confirmed_at_epoch)='integer' AND confirmed_at_epoch>=0)
+);
+CREATE TRIGGER IF NOT EXISTS follow_run_reapprovals_no_update
+BEFORE UPDATE ON follow_run_reapprovals BEGIN
+    SELECT RAISE(ABORT, 'Follow reapproval is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS follow_run_reapprovals_no_delete
+BEFORE DELETE ON follow_run_reapprovals BEGIN
+    SELECT RAISE(ABORT, 'Follow reapproval is immutable');
+END;
 CREATE TABLE IF NOT EXISTS follow_run_stops (
     run_id TEXT PRIMARY KEY NOT NULL REFERENCES follow_run_authorities(run_id),
     stopped_at_epoch INTEGER NOT NULL
@@ -4676,6 +4694,13 @@ _STABILITY_REQUIRED_COLUMNS = {
         "review_expires_at_epoch",
     },
     "follow_run_stops": {"run_id", "stopped_at_epoch"},
+    "follow_run_reapprovals": {
+        "run_id",
+        "review_id",
+        "prior_principal_sha256",
+        "principal_review_sha256",
+        "confirmed_at_epoch",
+    },
     "follow_run_authorities": {
         "run_id",
         "consent_id",
@@ -8108,6 +8133,7 @@ def _migrate_stability_schema() -> None:
                 "offer_refresh_aborts",
                 "offer_refresh_published_cleanups",
                 "offer_refresh_abort_successions",
+                "follow_run_reapprovals",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",
                 "runtime_recovery_passes",
@@ -23133,8 +23159,10 @@ def get_follow_run_review(review_id: str) -> Dict[str, Any]:
     conn = _stability_read_only_connection()
     try:
         row = conn.execute(
-            "SELECT review.*, EXISTS(SELECT 1 FROM follow_run_authorities AS run "
-            "WHERE run.consent_id=review.review_id) AS consumed "
+            "SELECT review.*, (EXISTS(SELECT 1 FROM follow_run_authorities AS run "
+            "WHERE run.consent_id=review.review_id) OR EXISTS("
+            "SELECT 1 FROM follow_run_reapprovals AS renewal "
+            "WHERE renewal.review_id=review.review_id)) AS consumed "
             "FROM follow_run_reviews AS review WHERE review.review_id=?",
             (review_id,),
         ).fetchone()
@@ -23164,6 +23192,7 @@ def create_follow_run_authority(
     expires_at_epoch: int,
     maximum_fee_mojos: int,
     protected_shutdown_fee_mojos: int,
+    reapprove_run_id: str | None = None,
 ) -> Dict[str, Any]:
     """Bind an explicit native run review to one already-approved fee scope.
 
@@ -23175,6 +23204,7 @@ def create_follow_run_authority(
     approval = _fee_digest(approval_id)
     config_hash = _fee_digest(configuration_sha256)
     principal_hash = _fee_digest(principal_review_sha256)
+    reapprove = _fee_digest(reapprove_run_id) if reapprove_run_id is not None else None
     encoded_identity = _follow_identity_json(identity)
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
@@ -23206,7 +23236,9 @@ def create_follow_run_authority(
             raise ValueError("FOLLOW_REVIEW_REQUIRED")
         if (
             conn.execute(
-                "SELECT 1 FROM follow_run_authorities WHERE consent_id=?", (consent,)
+                "SELECT 1 FROM follow_run_authorities WHERE consent_id=? "
+                "UNION SELECT 1 FROM follow_run_reapprovals WHERE review_id=?",
+                (consent, consent),
             ).fetchone()
             is not None
         ):
@@ -23256,16 +23288,83 @@ def create_follow_run_authority(
         ).fetchone()[0]
         if approved["version"] != latest:
             raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
-        prior = conn.execute(
-            "SELECT 1 FROM follow_run_authorities WHERE identity_sha256=? "
-            "AND expires_at_epoch>? LIMIT 1",
-            (identity_hash, started_at_epoch),
-        ).fetchone()
-        if prior is not None:
-            raise ValueError("FOLLOW_RUN_OVERLAP")
         totals = _fee_scope_totals(conn, approved["scope_sha256"])
         if totals["committed_fee_mojos"] + protected > maximum:
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_UNFUNDED")
+        if (
+            conn.execute(
+                "SELECT 1 FROM approved_fee_reservations AS reservation "
+                "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+                "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL LIMIT 1",
+                (approved["scope_sha256"],),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("FOLLOW_UNRESOLVED_EFFECT")
+        prior = conn.execute(
+            "SELECT * FROM follow_run_authorities WHERE identity_sha256=? "
+            "AND expires_at_epoch>? ORDER BY started_at_epoch DESC LIMIT 1",
+            (identity_hash, started_at_epoch),
+        ).fetchone()
+        if prior is None and reapprove is not None:
+            raise ValueError("FOLLOW_RUN_OVERLAP")
+        if prior is not None:
+            if (
+                reapprove != prior["run_id"]
+                or prior["approval_id"] != approval
+                or prior["configuration_sha256"] != config_hash
+                or prior["buy_limit"] != buy_limit
+                or prior["sell_limit"] != sell_limit
+                or prior["maximum_fee_mojos"] != maximum
+                or prior["protected_shutdown_fee_mojos"] != protected
+                or prior["started_at_epoch"] >= started_at_epoch
+                or conn.execute(
+                    "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offers WHERE cat_asset_id=? "
+                    "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+                    (identity["asset_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offer_intents WHERE run_id=? "
+                    "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            latest = conn.execute(
+                "SELECT principal_review_sha256 FROM follow_run_reapprovals "
+                "WHERE run_id=? ORDER BY confirmed_at_epoch DESC, rowid DESC LIMIT 1",
+                (prior["run_id"],),
+            ).fetchone()
+            prior_hash = (
+                latest["principal_review_sha256"]
+                if latest is not None
+                else prior["principal_review_sha256"]
+            )
+            if prior_hash == principal_hash:
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            conn.execute(
+                "INSERT INTO follow_run_reapprovals VALUES (?,?,?,?,?)",
+                (
+                    prior["run_id"],
+                    consent,
+                    prior_hash,
+                    principal_hash,
+                    started_at_epoch,
+                ),
+            )
+            conn.commit()
+            return {
+                "run_id": prior["run_id"],
+                "consent_id": consent,
+                "dispatch_authorized": False,
+            }
         run_id = secrets.token_hex(32)
         conn.execute(
             "INSERT INTO follow_run_authorities VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -23386,6 +23485,15 @@ def get_follow_creation_authority(
                 "consent_id": row["consent_id"],
             }
         )
+        reapproval = conn.execute(
+            "SELECT review_id, prior_principal_sha256, principal_review_sha256 "
+            "FROM follow_run_reapprovals WHERE run_id=? "
+            "ORDER BY confirmed_at_epoch DESC, rowid DESC LIMIT 1",
+            (row["run_id"],),
+        ).fetchone()
+        if reapproval is not None:
+            result["consent_id"] = reapproval["review_id"]
+            result["principal_review_sha256"] = reapproval["principal_review_sha256"]
         if row["configuration_sha256"] != config_hash:
             result["reason_code"] = "FOLLOW_CONFIGURATION_CHANGED"
         elif (

@@ -42,6 +42,18 @@ def test_existing_watermark_allows_first_follow_install(isolated_db):
     database._migrate_stability_schema()
 
 
+def test_existing_follow_profile_installs_append_only_reapproval_table(isolated_db):
+    conn = database.get_connection()
+    conn.execute("DROP TABLE follow_run_reapprovals")
+    conn.commit()
+    database.close_connection()
+    database._migrate_stability_schema()
+    conn = database.get_connection()
+    assert (
+        conn.execute("SELECT count(*) FROM follow_run_reapprovals").fetchone()[0] == 0
+    )
+
+
 @pytest.mark.parametrize("table", TABLES)
 def test_follow_watermark_rejects_missing_installed_table(isolated_db, table):
     conn = database.get_connection()
