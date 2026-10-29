@@ -117,11 +117,15 @@ def test_follow_refresh_uses_new_ceiling_while_worker_approval_stays_historical(
 
 
 def test_follow_approval_rechecks_expired_quote_at_native_confirmation(page):
+    def route_local_file(route):
+        if route.request.url.startswith("file:"):
+            route.continue_()
+        else:
+            route.abort()
+
     page.route(
         "**/*",
-        lambda route: (
-            route.continue_() if route.request.url.startswith("file:") else route.abort()
-        ),
+        route_local_file,
     )
     page.goto(
         (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),
