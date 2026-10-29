@@ -31,6 +31,7 @@ def _proposal():
             "ready": True,
             "full_book_proven": False,
             "dispatch_authorized": False,
+            "expires_at": 1_000_060,
         },
         "dispatch_authorized": False,
     }
@@ -65,8 +66,8 @@ def test_review_freezes_server_derived_24_by_24_proposal(monkeypatch):
         duration_seconds=48 * 3600,
         requested_fee_cap_mojos=50_000_000_000,
     )
-    assert calls[0] == calls[2] == ("1" * 64, 24, 24)
-    assert calls[1] == {
+    assert calls[0] == calls[1] == ("1" * 64, 24, 24)
+    assert calls[2] == {
         "approval_id": "1" * 64,
         "identity": proposal["identity"],
         "configuration_sha256": proposal["configuration_sha256"],
@@ -174,6 +175,48 @@ def test_review_rejects_proposal_drift_after_persistence(monkeypatch):
             buy_limit=24,
             sell_limit=24,
             duration_seconds=48 * 3600,
+            requested_fee_cap_mojos=50_000_000_000,
+        )
+
+
+def test_review_returns_fresh_second_quote_and_rejects_near_expiry(monkeypatch):
+    import database
+    import follow_principal
+
+    first = _proposal()
+    second = _proposal()
+    first["shutdown_funding"] = {**first["shutdown_funding"], "expires_at": 1_000_008}
+    second["shutdown_funding"] = {**second["shutdown_funding"], "expires_at": 1_000_060}
+    reads = iter((first, second))
+    monkeypatch.setattr(follow_principal.time, "time", lambda: 1_000_000)
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda *_a, **_kw: next(reads),
+    )
+    monkeypatch.setattr(
+        database,
+        "create_follow_run_review",
+        lambda **_kw: {"review_id": "e" * 64, "review_sha256": "f" * 64},
+    )
+    result = follow_principal.prepare_follow_run_review(
+        "1" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        duration_seconds=None,
+        continuous=True,
+        requested_fee_cap_mojos=50_000_000_000,
+    )
+    assert result["shutdown_funding"]["expires_at"] == 1_000_060
+
+    reads = iter((first, first))
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE"):
+        follow_principal.prepare_follow_run_review(
+            "1" * 64,
+            buy_limit=24,
+            sell_limit=24,
+            duration_seconds=None,
+            continuous=True,
             requested_fee_cap_mojos=50_000_000_000,
         )
 

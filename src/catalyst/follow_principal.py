@@ -12,6 +12,20 @@ from decimal import Decimal, ROUND_CEILING
 from coin_prep_batch_plan import CoinSnapshot
 
 
+_VOLATILE_SHUTDOWN_QUOTE_FIELDS = frozenset(
+    {"quoted_fee_mojos", "observed_at", "expires_at"}
+)
+_FOLLOW_REVIEW_MIN_QUOTE_REMAINING_SECONDS = 20
+
+
+def _bound_shutdown_funding(funding: dict) -> dict:
+    return {
+        key: value
+        for key, value in funding.items()
+        if key not in _VOLATILE_SHUTDOWN_QUOTE_FIELDS
+    }
+
+
 def _floor_atoms(value: Decimal, decimals: int) -> int:
     if type(value) is not Decimal or not value.is_finite() or value < 0:
         raise ValueError("FOLLOW_PRINCIPAL_RESERVE_INVALID")
@@ -402,8 +416,13 @@ def preview_approved_follow_principal(
         "largest_planned_fee_coin_mojos": largest_planned_fee_coin_mojos,
         "shutdown_funding": shutdown_funding,
     }
+    # A network quote's amount and lifetime are live funding evidence, not
+    # economic authority. Bind the approved cap, reserve and funding result;
+    # recheck the exact current quote before every financial effect.
+    bound_terms = dict(review_terms)
+    bound_terms["shutdown_funding"] = _bound_shutdown_funding(shutdown_funding)
     proposal_sha256 = hashlib.sha256(
-        json.dumps(review_terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(bound_terms, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
         **principal,
@@ -512,7 +531,26 @@ def prepare_follow_run_review(
         return proposal
 
     proposal = _current_proposal()
+    refreshed = _current_proposal()
+
+    def _stable_view(value: dict) -> dict:
+        funding = value["shutdown_funding"]
+        return {
+            **value,
+            "shutdown_funding": _bound_shutdown_funding(funding),
+        }
+
+    if _stable_view(refreshed) != _stable_view(proposal):
+        raise ValueError("FOLLOW_REVIEW_PROPOSAL_CHANGED")
+    proposal = refreshed
     started_at_epoch = int(time.time())
+    quote_expires_at = proposal["shutdown_funding"].get("expires_at")
+    if (
+        type(quote_expires_at) is not int
+        or quote_expires_at - started_at_epoch
+        < _FOLLOW_REVIEW_MIN_QUOTE_REMAINING_SECONDS
+    ):
+        raise ValueError("FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE")
     terms = {
         "approval_id": approval_id,
         "identity": proposal["identity"],
@@ -530,8 +568,6 @@ def prepare_follow_run_review(
     if continuous:
         terms["continuous"] = True
     review = database.create_follow_run_review(**terms)
-    if _current_proposal() != proposal:
-        raise ValueError("FOLLOW_REVIEW_PROPOSAL_CHANGED")
     return {
         **proposal,
         **terms,

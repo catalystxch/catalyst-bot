@@ -114,3 +114,58 @@ def test_follow_refresh_uses_new_ceiling_while_worker_approval_stays_historical(
     assert request["approval_id"] == "b" * 64
     assert request["maximum_fee_mojos"] == 5_000_000_000
     assert request["buy_limit"] == request["sell_limit"] == 24
+
+
+def test_follow_approval_rechecks_expired_quote_at_native_confirmation(page):
+    page.route(
+        "**/*",
+        lambda route: (
+            route.continue_() if route.request.url.startswith("file:") else route.abort()
+        ),
+    )
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),
+        wait_until="domcontentloaded",
+    )
+    page.evaluate("""async () => {
+        document.querySelectorAll('.modal.active, #startupOverlay, #splashGateOverlay, #spacescanGateOverlay').forEach(e => e.style.display='none');
+        IS_DESKTOP = true;
+        window.__reviewNow = Date.now();
+        Date.now = () => window.__reviewNow;
+        window.__nativeConfirmCalls = 0;
+        window.pywebview = {api: {
+            get_coin_prep_status: async () => ({
+                success: true, follow_fee_approval_id: 'a'.repeat(64),
+                follow_fee_approval: {total_fee_mojos: 5000000000},
+            }),
+            prepare_follow_run_review: async () => ({
+                success: true, review_id: 'b'.repeat(64), review_sha256: 'c'.repeat(64),
+                buy_limit: 24, sell_limit: 24, continuous: true,
+                maximum_fee_mojos: 5000000000,
+                replacement_count_gate_passed: true, current_prep_targets_proven: true,
+                buy_slots_arithmetic_fit: 24, sell_slots_arithmetic_fit: 24,
+                shutdown_funding: {ready: true, full_book_proven: false,
+                    dispatch_authorized: false,
+                    quoted_fee_mojos: 123, expires_at: Math.floor(Date.now()/1000)+1},
+                review_expires_at_epoch: Math.floor(Date.now()/1000)+300,
+                identity: {wallet_fingerprint: 736588221, network: 'mainnet',
+                    ticker: 'MZ_XCH', asset_id: 'd'.repeat(64)},
+                maximum_trade_xch_mojos: 1000000000000,
+                maximum_trade_cat_atoms: 1000000,
+                protected_fee_principal_mojos: 100000000000,
+                cancellation_reserve_mojos: 675003900,
+                largest_spendable_fee_coin_mojos: 2000000000,
+            }),
+            confirm_follow_run_review: async () => {
+                window.__nativeConfirmCalls++;
+                return {success: true, dispatch_authorized: false};
+            },
+        }};
+        openFollowRunReview();
+        await prepareFollowRunReview();
+        Date.now = () => window.__reviewNow + 2000;
+    }""")
+    page.locator("#followRunReviewAccept").check()
+    expect(page.locator("#followRunReviewConfirm")).to_be_enabled()
+    page.locator("#followRunReviewConfirm").click()
+    assert page.evaluate("window.__nativeConfirmCalls") == 1

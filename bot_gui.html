@@ -33061,14 +33061,13 @@
                     `Largest selectable protected fee coin: ${formatFollowFeeMojos(review.largest_spendable_fee_coin_mojos)}\n` +
                     `Conservative one-block shutdown fee quote: ${formatFollowFeeMojos(review.shutdown_funding.quoted_fee_mojos)}\n` +
                     `Quote expires: ${new Date(review.shutdown_funding.expires_at * 1000).toISOString()}\n` +
-                    `Funding screen passed. The actual 48-offer cancellation cost and one-block fit are not yet proven; CATalyst must recheck the live book.\n` +
+                    `Funding screen passed. CATalyst rechecks the network quote when recording approval. The actual 48-offer cancellation cost and one-block fit are not yet proven; CATalyst must recheck the live book.\n` +
                     `Authority: ${continuous ? 'continuous until stopped or fee/safety limit' : 'expires ' + new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
                     `This exact review expires: ${new Date(review.review_expires_at_epoch * 1000).toISOString()}`;
                 accept.disabled = false;
                 accept.onchange = () => {
                     confirm.disabled = !accept.checked || !_followRunReview
-                        || Date.now() >= _followRunReview.review_expires_at_epoch * 1000
-                        || Date.now() >= _followRunReview.shutdown_funding.expires_at * 1000;
+                        || Date.now() >= _followRunReview.review_expires_at_epoch * 1000;
                 };
             } catch (error) {
                 output.textContent = error?.message || 'Could not verify this Follow run.';
@@ -33084,7 +33083,6 @@
             const confirm = document.getElementById('followRunReviewConfirm');
             if (_followRunReviewBusy || !review || !accept.checked
                 || Date.now() >= review.review_expires_at_epoch * 1000
-                || Date.now() >= review.shutdown_funding?.expires_at * 1000
                 || !IS_DESKTOP || !window.pywebview?.api?.confirm_follow_run_review) {
                 showToast('Review expired or native confirmation unavailable. Refresh the exact review.', 'warning');
                 return;

@@ -35,7 +35,7 @@ _SUGGESTED_FEE_CACHE_TTL_SECS = 30
 
 # Coinset fee estimate cache (separate TTL — less aggressive than coin queries)
 _COINSET_FEE_CACHE: Dict[tuple[int, int], tuple[float, Dict]] = {}
-_COINSET_FEE_CACHE_TTL_SECS = 60
+_COINSET_FEE_CACHE_TTL_SECS = 20
 
 
 def _decimal_or_zero(value) -> Decimal:

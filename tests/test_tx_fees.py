@@ -179,12 +179,28 @@ class TxFeesTests(unittest.TestCase):
                 "requests.post",
                 side_effect=AssertionError("cache must not query transport"),
             ),
-            patch.object(self.tx_fees.time, "time", return_value=150),
+            patch.object(self.tx_fees.time, "time", return_value=110),
         ):
             cached = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
         self.assertEqual(original["observed_at"], 100)
         self.assertEqual(cached["observed_at"], 100)
         self.assertEqual(cached["expires_at"], 160)
+
+    def test_coinset_cache_refreshes_before_quote_becomes_unusable_for_review(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True, "estimates": [123]}
+        )
+        clock = {"now": 100}
+        with (
+            patch("requests.post", return_value=response) as post,
+            patch.object(self.tx_fees.time, "time", lambda: clock["now"]),
+        ):
+            first = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+            clock["now"] = 150
+            refreshed = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(first["observed_at"], 100)
+        self.assertEqual(refreshed["observed_at"], 150)
 
     def test_sage_without_full_node_reports_manual_fallback_environment(self):
         # Disable coinset so the test exercises the pure sage/no-full-node fallback path.

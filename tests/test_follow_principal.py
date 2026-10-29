@@ -312,6 +312,52 @@ def test_approved_principal_preview_binds_scope_and_rechecks_fee_state(monkeypat
     assert counted["largest_planned_fee_coin_mojos"] == 30
     assert counted["shutdown_funding"]["ready"] is True
     assert counted["proposal_sha256"] != result["proposal_sha256"]
+    quote = {"fee_mojos": 7, "observed_at": 100, "expires_at": 160}
+    monkeypatch.setattr(
+        follow_shutdown_funding,
+        "preview_one_block_shutdown_funding",
+        lambda **_kwargs: {
+            "ready": True,
+            "reason": "one_block_funding_screen_passed",
+            "full_book_proven": False,
+            "dispatch_authorized": False,
+            "quoted_fee_mojos": quote["fee_mojos"],
+            "observed_at": quote["observed_at"],
+            "expires_at": quote["expires_at"],
+        },
+    )
+    first_quote = preview_approved_follow_principal(
+        approval_id, buy_limit=1, sell_limit=1
+    )
+    quote.update(observed_at=110, expires_at=170)
+    refreshed_quote = preview_approved_follow_principal(
+        approval_id, buy_limit=1, sell_limit=1
+    )
+    assert refreshed_quote["shutdown_funding"]["expires_at"] == 170
+    assert refreshed_quote["proposal_sha256"] == first_quote["proposal_sha256"]
+    quote["fee_mojos"] = 8
+    repriced = preview_approved_follow_principal(approval_id, buy_limit=1, sell_limit=1)
+    assert repriced["proposal_sha256"] == first_quote["proposal_sha256"]
+    quote["fee_mojos"] = 40_000_000_001
+    monkeypatch.setattr(
+        follow_shutdown_funding,
+        "preview_one_block_shutdown_funding",
+        lambda **_kwargs: {
+            "ready": False,
+            "reason": "FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT",
+            "full_book_proven": False,
+            "dispatch_authorized": False,
+            "quoted_fee_mojos": quote["fee_mojos"],
+        },
+    )
+    with pytest.raises(ValueError, match="FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT"):
+        follow_principal.prepare_follow_run_review(
+            approval_id,
+            buy_limit=1,
+            sell_limit=1,
+            duration_seconds=3600,
+            requested_fee_cap_mojos=50_000_000_000,
+        )
     with pytest.raises(ValueError, match="FOLLOW_SLOT_INVENTORY_SHORT"):
         preview_approved_follow_principal(approval_id, buy_limit=2, sell_limit=1)
     status["stale"] = True
