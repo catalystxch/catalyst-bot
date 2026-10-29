@@ -15,6 +15,54 @@ from cancel_outcomes import (
 import fee_approval_test_utils as utils
 
 
+@pytest.mark.parametrize("reserved", [False, True])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_same_campaign_scope_alias_does_not_duplicate_wallet_commitments(
+    approved_bootstrap, reserved, confirmed
+):
+    database = import_module("database")
+    service = import_module("coin_prep_fee_approval")
+    manifest, identity = _seed_cancel(approved_bootstrap, reserved=reserved)
+    if confirmed:
+        _confirm_cohort(manifest, identity)
+    old = database.get_coin_prep_fee_approval_context(
+        approved_bootstrap["approval"]["approval_id"]
+    )
+    contract = service.canonical_fee_contract(
+        {**json.loads(old["scope_json"]), "ticker": "ALIAS_XCH"},
+        json.loads(old["plan_json"]),
+    )
+    preview = database.store_coin_prep_fee_preview(
+        **{
+            k: contract[k]
+            for k in ("scope_sha256", "plan_sha256", "scope_json", "plan_json")
+        },
+        **{
+            k: old[k]
+            for k in ("request_options_json", "quote_json", "observed_at", "expires_at")
+        },
+    )
+    budget = database.get_fee_scope_budget(contract["scope_sha256"])
+    assert budget["committed_fee_mojos"] == 40
+    assert budget["spent_fee_mojos"] == (40 if confirmed and not reserved else 0)
+    assert budget["held_fee_mojos"] == (0 if confirmed and not reserved else 40)
+    approval = database.approve_coin_prep_fee_preview(
+        preview_id=preview["preview_id"],
+        scope_sha256=contract["scope_sha256"],
+        plan_sha256=contract["plan_sha256"],
+        maximum_fee_mojos=approved_bootstrap["approval"]["total_fee_mojos"] + 1000,
+        cancellation_reserve_mojos=approved_bootstrap["approval"][
+            "cancellation_reserve_mojos"
+        ],
+        now=old["observed_at"],
+    )
+    status = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+    assert status["held_fee_mojos"] == budget["held_fee_mojos"]
+    assert status["unresolved_operation_count"] == (
+        0 if confirmed and not reserved else 1
+    )
+
+
 def _seed_cancel(
     state,
     outcome=CANCEL_SUBMITTED_UNCONFIRMED,
