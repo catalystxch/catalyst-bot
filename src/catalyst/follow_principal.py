@@ -732,15 +732,21 @@ def _current_follow_fee_funding(run_id: str) -> dict:
     rows = database.get_free_coins("xch")
     if type(rows) is not list:
         raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
-    fee_ids = {
-        row["coin_id"]
-        for row in rows
-        if type(row) is dict and row.get("purpose") == "fee_reserve"
-    }
-    if not fee_ids or any(
-        type(coin_id) is not str or re.fullmatch(r"[0-9a-f]{64}", coin_id) is None
-        for coin_id in fee_ids
-    ):
+    fee_ids = set()
+    for row in rows:
+        if type(row) is not dict or row.get("purpose") != "fee_reserve":
+            continue
+        coin_id = row.get("coin_id")
+        if (
+            type(coin_id) is not str
+            or re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", coin_id) is None
+        ):
+            raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+        normalized_id = coin_id.lower().removeprefix("0x")
+        if normalized_id in fee_ids:
+            raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
+        fee_ids.add(normalized_id)
+    if not fee_ids:
         raise ValueError("FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE")
     seen = set()
     total = 0

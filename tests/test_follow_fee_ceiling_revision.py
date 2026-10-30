@@ -131,7 +131,10 @@ def test_ceiling_review_freezes_active_run_without_creating_authority(approved):
     )
 
 
-def test_service_funds_review_from_exact_selectable_fee_coin(approved, monkeypatch):
+@pytest.mark.parametrize("db_coin_prefix", ["", "0x"])
+def test_service_funds_review_from_exact_selectable_fee_coin(
+    approved, monkeypatch, db_coin_prefix
+):
     from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
     import coin_prep_fee_runtime
     import confidence_override
@@ -154,7 +157,9 @@ def test_service_funds_review_from_exact_selectable_fee_coin(approved, monkeypat
     monkeypatch.setattr(
         database,
         "get_free_coins",
-        lambda asset: [{"coin_id": coin_id, "purpose": "fee_reserve"}],
+        lambda asset: [
+            {"coin_id": db_coin_prefix + coin_id, "purpose": "fee_reserve"}
+        ],
     )
     monkeypatch.setattr(follow_principal.time, "time", lambda: 1002)
     review = follow_principal.prepare_follow_fee_ceiling_review(
