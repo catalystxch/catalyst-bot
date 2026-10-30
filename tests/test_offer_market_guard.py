@@ -97,6 +97,45 @@ def test_candidate_requires_valid_exact_snapshot_evidence():
         assert result["eligible"] is False
 
 
+def test_red_candidate_rechecks_fresh_scoped_view_before_price_assessment():
+    from confidence_override import ConsentedConfidence
+
+    prices = (Decimal("0.099"), Decimal("0.101"), Decimal("0.103"))
+    fresh = ConsentedConfidence(
+        _confidence(state="RED", data_valid=False),
+        lambda: True,
+        prices,
+    )
+    aged = ConsentedConfidence(
+        _confidence(
+            state="RED",
+            data_valid=False,
+            derived_at=NOW - timedelta(seconds=21),
+        ),
+        lambda: True,
+        prices,
+        current_view=lambda: fresh,
+    )
+    candidate = dict(
+        side="buy",
+        candidate_price=Decimal("0.1"),
+        size_xch=Decimal("1"),
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=0,
+        minimum_profit_xch=Decimal("0"),
+        now=NOW,
+    )
+    assert not assess_offer_book_candidate(**(candidate | {"confidence": aged}))[
+        "eligible"
+    ]
+    assert assess_offer_book_candidate(
+        **(
+            candidate
+            | {"confidence": offer_manager._current_candidate_confidence(aged)}
+        )
+    )["eligible"]
+
+
 def test_candidate_accepts_valid_restricted_single_provider_snapshot():
     result = assess_offer_book_candidate(
         side="buy",

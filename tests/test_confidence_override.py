@@ -251,6 +251,57 @@ def test_candidate_batch_defers_expensive_scope_check_until_effect(monkeypatch):
     assert effective.dispatch_allowed() is False
 
 
+def test_candidate_view_refreshes_aging_red_evidence_before_slot_check(monkeypatch):
+    import bot_loop
+
+    loop = runtime_loop(monkeypatch)
+    original = loop._effective_market_confidence()
+    clock = [NOW + timedelta(seconds=15)]
+    monkeypatch.setattr(
+        bot_loop,
+        "datetime",
+        type("Clock", (datetime,), {"now": classmethod(lambda cls, tz=None: clock[0])}),
+    )
+    refreshes = []
+
+    def refresh():
+        refreshes.append(clock[0])
+        loop._market_confidence_result = confidence(derived_at=clock[0])
+        loop._market_confidence_valid_until = clock[0] + timedelta(seconds=20)
+
+    monkeypatch.setattr(loop, "_refresh_offer_book_market", refresh)
+    fresh = original.current_view()
+    assert refreshes == [clock[0]]
+    assert fresh.data_valid is True
+    assert fresh.derived_at == clock[0]
+
+
+def test_candidate_view_fails_closed_when_market_refresh_fails(monkeypatch):
+    import bot_loop
+
+    loop = runtime_loop(monkeypatch)
+    original = loop._effective_market_confidence()
+    clock = NOW + timedelta(seconds=15)
+    monkeypatch.setattr(
+        bot_loop,
+        "datetime",
+        type("Clock", (datetime,), {"now": classmethod(lambda cls, tz=None: clock)}),
+    )
+    failures = []
+
+    def refresh():
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(loop, "_refresh_offer_book_market", refresh)
+    monkeypatch.setattr(
+        loop,
+        "_enforce_market_refresh_failure",
+        lambda **kwargs: failures.append(kwargs),
+    )
+    assert original.current_view() is None
+    assert len(failures) == 1
+
+
 def test_review_requires_exact_confirmation_and_cannot_be_replayed(monkeypatch):
     from confidence_override import prepare_review, confirm_review
 

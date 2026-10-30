@@ -1327,8 +1327,38 @@ class BotLoop:
             ),
             prices,
             candidate_authorize=candidate_authorized,
-            current_view=lambda: self._effective_market_confidence(),
+            current_view=self._fresh_effective_market_confidence,
         )
+
+    def _fresh_effective_market_confidence(self):
+        """Refresh an aging book before checking a RED override candidate.
+
+        Wallet sync and tier selection can consume the 20-second candidate
+        lifetime after the cycle's market refresh. A failed refresh must leave
+        the candidate without an authorized view.
+        """
+
+        raw, deadline = self._market_confidence_snapshot()
+        now = datetime.now(timezone.utc)
+        derived_at = getattr(raw, "derived_at", None)
+        if getattr(derived_at, "tzinfo", None) is None:
+            return None
+        try:
+            age = (now - derived_at.astimezone(timezone.utc)).total_seconds()
+            remaining = (
+                (deadline.astimezone(timezone.utc) - now).total_seconds()
+                if getattr(deadline, "tzinfo", None) is not None
+                else 0
+            )
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if age >= 10 or remaining <= 10:
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(now=now, error=exc)
+                return None
+        return self._effective_market_confidence()
 
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
         """Re-sample continuity at every outer-cycle mutation phase boundary."""

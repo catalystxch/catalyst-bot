@@ -399,6 +399,19 @@ def assess_offer_book_candidate(
     }
 
 
+def _current_candidate_confidence(confidence: Any) -> Any:
+    """Read a fresh scoped view before each RED candidate assessment."""
+
+    from confidence_override import ConsentedConfidence
+
+    if not isinstance(confidence, ConsentedConfidence):
+        return confidence
+    try:
+        return confidence.current_view()
+    except Exception:
+        return None
+
+
 def book_opportunity_size_cap(
     *, requested_size_xch: Decimal, confidence: Any
 ) -> Optional[Decimal]:
@@ -4854,11 +4867,12 @@ class OfferManager:
             market_guard = None
             purpose = "normal_lifecycle"
             if market_confidence is not None:
+                candidate_confidence = _current_candidate_confidence(market_confidence)
                 market_guard = assess_offer_book_candidate(
                     side=side,
                     candidate_price=price,
                     size_xch=size_xch,
-                    confidence=market_confidence,
+                    confidence=candidate_confidence,
                     network_fee_xch=network_fee_xch,
                     expected_cancel_requotes=expected_cancel_requotes,
                     minimum_profit_xch=minimum_profit_xch,
@@ -4875,7 +4889,7 @@ class OfferManager:
                 if market_guard.get("improves_book"):
                     opportunity_cap = book_opportunity_size_cap(
                         requested_size_xch=size_xch,
-                        confidence=market_confidence,
+                        confidence=candidate_confidence,
                     )
                     if opportunity_cap is None:
                         log_event(
@@ -4906,7 +4920,7 @@ class OfferManager:
                         side=side,
                         candidate_price=price,
                         size_xch=size_xch,
-                        confidence=market_confidence,
+                        confidence=candidate_confidence,
                         network_fee_xch=network_fee_xch,
                         expected_cancel_requotes=expected_cancel_requotes,
                         minimum_profit_xch=minimum_profit_xch,
@@ -5124,11 +5138,12 @@ class OfferManager:
         # effect so clamping or atomic rounding cannot evade the profit floor.
         if market_confidence is not None:
             for spec in offer_specs:
+                candidate_confidence = _current_candidate_confidence(market_confidence)
                 final_guard = assess_offer_book_candidate(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
-                    confidence=market_confidence,
+                    confidence=candidate_confidence,
                     network_fee_xch=network_fee_xch,
                     expected_cancel_requotes=expected_cancel_requotes,
                     minimum_profit_xch=minimum_profit_xch,
@@ -5193,11 +5208,12 @@ class OfferManager:
 
             market_guard = spec.get("market_guard") or {}
             if market_confidence is not None:
+                candidate_confidence = _current_candidate_confidence(market_confidence)
                 market_guard = assess_offer_book_candidate(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
-                    confidence=market_confidence,
+                    confidence=candidate_confidence,
                     network_fee_xch=network_fee_xch,
                     expected_cancel_requotes=expected_cancel_requotes,
                     minimum_profit_xch=minimum_profit_xch,
