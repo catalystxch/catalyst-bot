@@ -157,9 +157,7 @@ def test_service_funds_review_from_exact_selectable_fee_coin(
     monkeypatch.setattr(
         database,
         "get_free_coins",
-        lambda asset: [
-            {"coin_id": db_coin_prefix + coin_id, "purpose": "fee_reserve"}
-        ],
+        lambda asset: [{"coin_id": db_coin_prefix + coin_id, "purpose": "fee_reserve"}],
     )
     monkeypatch.setattr(follow_principal.time, "time", lambda: 1002)
     review = follow_principal.prepare_follow_fee_ceiling_review(
