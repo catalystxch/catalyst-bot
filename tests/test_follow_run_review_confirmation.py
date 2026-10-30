@@ -164,11 +164,13 @@ def test_native_confirmation_replaces_funded_old_scope_after_new_prep(monkeypatc
     saved = _setup(monkeypatch)
     old_id = "a" * 64
     monkeypatch.setattr(
-        database, "get_follow_creation_authority",
+        database,
+        "get_follow_creation_authority",
         lambda **_kw: {"ready": True, "run_id": old_id, "approval_id": "2" * 64},
     )
     monkeypatch.setattr(
-        database, "get_unexpired_follow_run_marker",
+        database,
+        "get_unexpired_follow_run_marker",
         lambda **_kw: {"run_id": old_id, "stopped": False},
     )
     monkeypatch.setattr(
