@@ -56,7 +56,9 @@ def test_explicit_continuous_review_survives_finite_window(approved):
 
 def reviewed_run(**terms):
     terms.setdefault("principal_review_sha256", "d" * 64)
-    review = database.create_follow_run_review(**terms)
+    review = database.create_follow_run_review(
+        **terms, continuous=terms["expires_at_epoch"] == CONTINUOUS_RUN_EXPIRY
+    )
     with patch.object(
         database.time, "time", return_value=terms["started_at_epoch"] + 1
     ):
@@ -65,6 +67,47 @@ def reviewed_run(**terms):
             review_sha256=review["review_sha256"],
             **terms,
         )
+
+
+def test_stopped_run_can_reuse_completed_coin_prep_approval(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    terms = dict(
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    first = reviewed_run(**terms)
+    database.stop_follow_run_authority(run_id=first["run_id"], stopped_at_epoch=1003)
+    later = terms | {"started_at_epoch": 1005}
+    second = reviewed_run(**later)
+    assert second["run_id"] != first["run_id"]
+    active = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1007
+    )
+    assert active["ready"] is True
+    assert active["run_id"] == second["run_id"]
 
 
 def test_reapproved_continuous_run_supersedes_old_hash_without_resetting_fee_scope(

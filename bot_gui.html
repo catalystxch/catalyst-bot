@@ -33101,7 +33101,7 @@
                     accepted: true,
                 });
                 if (result?.success !== true || result?.dispatch_authorized !== false) {
-                    throw new Error(result?.reason || 'Follow approval was not recorded.');
+                    throw new Error(result?.reason || result?.error || 'Follow approval was not recorded.');
                 }
                 closeFollowRunReview();
                 showToast('Follow run authority recorded. Review the Start action separately.', 'success');

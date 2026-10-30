@@ -54,6 +54,49 @@ def test_existing_follow_profile_installs_append_only_reapproval_table(isolated_
     )
 
 
+def test_legacy_unique_approval_schema_upgrades_once(tmp_path, monkeypatch):
+    database.close_connection()
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "legacy.db"))
+    monkeypatch.setattr(database, "_db_initialized_path", "")
+    current_sql = database.STABILITY_SCHEMA_SQL
+    prefix, authority_sql = current_sql.split(
+        "CREATE TABLE IF NOT EXISTS follow_run_authorities (", 1
+    )
+    legacy_sql = (
+        prefix
+        + "CREATE TABLE IF NOT EXISTS follow_run_authorities ("
+        + authority_sql.replace(
+            "approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+            "approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+            1,
+        )
+    )
+    assert legacy_sql != current_sql
+    monkeypatch.setattr(database, "STABILITY_SCHEMA_SQL", legacy_sql)
+    database.init_database()
+    database.close_connection()
+    monkeypatch.setattr(database, "STABILITY_SCHEMA_SQL", current_sql)
+
+    database._migrate_stability_schema()
+    database._migrate_stability_schema()
+    conn = database.get_connection()
+    definition = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='follow_run_authorities'"
+    ).fetchone()[0]
+    assert "approval_id TEXT NOT NULL REFERENCES" in definition
+    assert "approval_id TEXT UNIQUE NOT NULL REFERENCES" not in definition
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_follow_run_authorities_approval'"
+        ).fetchone()
+        is not None
+    )
+
+
 @pytest.mark.parametrize("table", TABLES)
 def test_follow_watermark_rejects_missing_installed_table(isolated_db, table):
     conn = database.get_connection()

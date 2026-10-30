@@ -2102,7 +2102,7 @@ CREATE TABLE IF NOT EXISTS follow_run_authorities (
         CHECK(length(run_id)=64 AND run_id NOT GLOB '*[^0-9a-f]*'),
     consent_id TEXT UNIQUE NOT NULL REFERENCES follow_run_reviews(review_id)
         CHECK(length(consent_id)=64 AND consent_id NOT GLOB '*[^0-9a-f]*'),
-    approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
+    approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id),
     identity_sha256 TEXT NOT NULL
         CHECK(length(identity_sha256)=64 AND identity_sha256 NOT GLOB '*[^0-9a-f]*'),
     identity_json TEXT NOT NULL CHECK(json_valid(identity_json) AND json_type(identity_json)='object'),
@@ -2122,6 +2122,8 @@ CREATE TABLE IF NOT EXISTS follow_run_authorities (
 );
 CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_identity
     ON follow_run_authorities(identity_sha256, started_at_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_follow_run_authorities_approval
+    ON follow_run_authorities(approval_id);
 CREATE TRIGGER IF NOT EXISTS follow_run_authorities_no_update
 BEFORE UPDATE ON follow_run_authorities BEGIN
     SELECT RAISE(ABORT, 'Follow run authority is immutable');
@@ -7834,6 +7836,74 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
     conn.execute(expected_sql)
 
 
+def _upgrade_follow_run_approval_reuse(conn: sqlite3.Connection) -> None:
+    """Allow a completed Coin Prep approval in sequential stopped Follow runs.
+
+    The run review remains single-use, and the authority transition still
+    rejects an unstopped overlapping run and unresolved wallet effects.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='follow_run_authorities'"
+    ).fetchone()
+    if row is None:
+        return
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(STABILITY_SCHEMA_SQL)
+        canonical = expected_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='follow_run_authorities'"
+        ).fetchone()[0]
+    finally:
+        expected_db.close()
+    installed = str(row[0])
+    if _normalized_schema_sql(installed) == _normalized_schema_sql(canonical):
+        return
+    legacy = canonical.replace(
+        "approval_id TEXT NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+        "approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
+        1,
+    )
+    if _normalized_schema_sql(installed) != _normalized_schema_sql(legacy):
+        raise RuntimeError("Follow run authority has unknown schema")
+    dependent = conn.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name!='follow_run_authorities' "
+        "AND sql LIKE '%follow_run_authorities%' ORDER BY name"
+    ).fetchall()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        for trigger in dependent:
+            conn.execute(f'DROP TRIGGER "{trigger[0]}"')
+        replacement = canonical.replace(
+            "follow_run_authorities (", "follow_run_authorities_reuse (", 1
+        )
+        if replacement == canonical:
+            raise RuntimeError("Follow run authority definition unavailable")
+        conn.execute(replacement)
+        conn.execute(
+            "INSERT INTO follow_run_authorities_reuse SELECT * "
+            "FROM follow_run_authorities"
+        )
+        conn.execute("DROP TABLE follow_run_authorities")
+        conn.execute(
+            "ALTER TABLE follow_run_authorities_reuse RENAME TO follow_run_authorities"
+        )
+        for trigger in dependent:
+            conn.execute(str(trigger[1]))
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("Follow run approval reuse broke foreign keys")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -7845,6 +7915,7 @@ def _migrate_stability_schema() -> None:
         _upgrade_legacy_fee_ledger_schema(conn)
         _upgrade_expired_subsequent_spend_outcome_schema(conn)
         _upgrade_offer_cancel_cohort_member_limit(conn)
+        _upgrade_follow_run_approval_reuse(conn)
         existing_tables = {
             str(row[0])
             for row in conn.execute(
