@@ -676,23 +676,8 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
             "maximum_fee_mojos": review["maximum_fee_mojos"],
             "protected_shutdown_fee_mojos": review["protected_shutdown_fee_mojos"],
         }
-        existing = database.get_follow_creation_authority(
-            identity=review["identity"],
-            configuration_sha256=review["configuration_sha256"],
-            now_epoch=now_epoch,
-        )
-        if existing.get("ready") is True:
-            if (
-                existing.get("approval_id") != approval_id
-                or existing.get("buy_limit") != buy_limit
-                or existing.get("sell_limit") != sell_limit
-                or existing.get("maximum_fee_mojos") != review["maximum_fee_mojos"]
-                or existing.get("protected_shutdown_fee_mojos")
-                != review["protected_shutdown_fee_mojos"]
-                or existing.get("principal_review_sha256")
-                == review["principal_review_sha256"]
-            ):
-                raise ValueError("FOLLOW_RUN_OVERLAP")
+
+        def prove_empty_wallet_book() -> None:
             from wallet import get_all_offers, get_pending_transactions
 
             pending = get_pending_transactions()
@@ -710,7 +695,48 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
                 )
             ):
                 raise ValueError("FOLLOW_RUN_OVERLAP")
+
+        existing = database.get_follow_creation_authority(
+            identity=review["identity"],
+            configuration_sha256=review["configuration_sha256"],
+            now_epoch=now_epoch,
+        )
+        same_run_terms = existing.get("ready") is True and (
+            existing.get("approval_id") == approval_id
+            and existing.get("buy_limit") == buy_limit
+            and existing.get("sell_limit") == sell_limit
+            and existing.get("maximum_fee_mojos") == review["maximum_fee_mojos"]
+            and existing.get("protected_shutdown_fee_mojos")
+            == review["protected_shutdown_fee_mojos"]
+        )
+        if same_run_terms:
+            if (
+                existing.get("principal_review_sha256")
+                == review["principal_review_sha256"]
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            prove_empty_wallet_book()
             terms["reapprove_run_id"] = existing["run_id"]
+        else:
+            marker = database.get_unexpired_follow_run_marker(
+                asset_id=review["identity"]["asset_id"], now_epoch=now_epoch
+            )
+            if existing.get("ready") is True and marker is None:
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            if marker is not None:
+                if (
+                    database.get_follow_run_identity(marker["run_id"])
+                    != review["identity"]
+                ):
+                    raise ValueError("FOLLOW_RUN_OVERLAP")
+                if (
+                    existing.get("ready") is True
+                    and marker["run_id"] != existing["run_id"]
+                ):
+                    raise ValueError("FOLLOW_RUN_OVERLAP")
+                prove_empty_wallet_book()
+                if not marker["stopped"]:
+                    terms["replace_run_id"] = marker["run_id"]
         authority = database.create_follow_run_authority(**terms)
         return {**authority, "dispatch_authorized": False}
 

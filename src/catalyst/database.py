@@ -23193,6 +23193,7 @@ def create_follow_run_authority(
     maximum_fee_mojos: int,
     protected_shutdown_fee_mojos: int,
     reapprove_run_id: str | None = None,
+    replace_run_id: str | None = None,
 ) -> Dict[str, Any]:
     """Bind an explicit native run review to one already-approved fee scope.
 
@@ -23205,6 +23206,9 @@ def create_follow_run_authority(
     config_hash = _fee_digest(configuration_sha256)
     principal_hash = _fee_digest(principal_review_sha256)
     reapprove = _fee_digest(reapprove_run_id) if reapprove_run_id is not None else None
+    replace = _fee_digest(replace_run_id) if replace_run_id is not None else None
+    if reapprove is not None and replace is not None:
+        raise ValueError("FOLLOW_RUN_OVERLAP")
     encoded_identity = _follow_identity_json(identity)
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
@@ -23302,12 +23306,38 @@ def create_follow_run_authority(
         ):
             raise ValueError("FOLLOW_UNRESOLVED_EFFECT")
         prior = conn.execute(
-            "SELECT * FROM follow_run_authorities WHERE identity_sha256=? "
-            "AND expires_at_epoch>? ORDER BY started_at_epoch DESC LIMIT 1",
+            "SELECT run.* FROM follow_run_authorities AS run "
+            "LEFT JOIN follow_run_stops AS stop USING(run_id) "
+            "WHERE run.identity_sha256=? AND run.expires_at_epoch>? "
+            "AND stop.run_id IS NULL "
+            "ORDER BY run.started_at_epoch DESC LIMIT 1",
             (identity_hash, started_at_epoch),
         ).fetchone()
-        if prior is None and reapprove is not None:
+        if prior is None and (reapprove is not None or replace is not None):
             raise ValueError("FOLLOW_RUN_OVERLAP")
+        if prior is not None and replace is not None:
+            if (
+                replace != prior["run_id"]
+                or prior["started_at_epoch"] >= started_at_epoch
+                or conn.execute(
+                    "SELECT 1 FROM offers WHERE cat_asset_id=? "
+                    "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+                    (identity["asset_id"],),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM offer_intents WHERE run_id=? "
+                    "AND lifecycle_state NOT IN ('terminal','creation_failed') LIMIT 1",
+                    (prior["run_id"],),
+                ).fetchone()
+                is not None
+            ):
+                raise ValueError("FOLLOW_RUN_OVERLAP")
+            conn.execute(
+                "INSERT INTO follow_run_stops VALUES (?,?)",
+                (prior["run_id"], int(time.time())),
+            )
+            prior = None
         if prior is not None:
             if (
                 reapprove != prior["run_id"]

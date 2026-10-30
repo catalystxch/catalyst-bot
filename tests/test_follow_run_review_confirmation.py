@@ -48,6 +48,7 @@ def _setup(monkeypatch, *, running=False, review=None, proposal=None):
     monkeypatch.setattr(
         database, "get_follow_creation_authority", lambda **_kw: {"ready": False}
     )
+    monkeypatch.setattr(database, "get_unexpired_follow_run_marker", lambda **_kw: None)
     monkeypatch.setattr(
         follow_principal,
         "preview_approved_follow_principal",
@@ -123,6 +124,60 @@ def test_native_reapproval_checks_empty_sage_book_before_rebinding(monkeypatch):
     with pytest.raises(ValueError, match="FOLLOW_RUN_OVERLAP"):
         follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
     assert saved == []
+
+
+def test_native_confirmation_replaces_dormant_old_scope_only_after_full_book_proof(
+    monkeypatch,
+):
+    import database
+    import follow_principal
+    import wallet
+
+    saved = _setup(monkeypatch)
+    old_id = "a" * 64
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kw: {"run_id": old_id, "stopped": False},
+    )
+    monkeypatch.setattr(
+        database, "get_follow_run_identity", lambda _id: _proposal()["identity"]
+    )
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    monkeypatch.setattr(wallet, "get_all_offers", lambda *_a, **_kw: [])
+    follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
+    assert saved[0]["replace_run_id"] == old_id
+    saved.clear()
+    monkeypatch.setattr(
+        wallet, "get_all_offers", lambda *_a, **_kw: [{"status": "pending"}]
+    )
+    with pytest.raises(ValueError, match="FOLLOW_RUN_OVERLAP"):
+        follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
+    assert saved == []
+
+
+def test_native_confirmation_replaces_funded_old_scope_after_new_prep(monkeypatch):
+    import database
+    import follow_principal
+    import wallet
+
+    saved = _setup(monkeypatch)
+    old_id = "a" * 64
+    monkeypatch.setattr(
+        database, "get_follow_creation_authority",
+        lambda **_kw: {"ready": True, "run_id": old_id, "approval_id": "2" * 64},
+    )
+    monkeypatch.setattr(
+        database, "get_unexpired_follow_run_marker",
+        lambda **_kw: {"run_id": old_id, "stopped": False},
+    )
+    monkeypatch.setattr(
+        database, "get_follow_run_identity", lambda _id: _proposal()["identity"]
+    )
+    monkeypatch.setattr(wallet, "get_pending_transactions", lambda: [])
+    monkeypatch.setattr(wallet, "get_all_offers", lambda *_a, **_kw: [])
+    follow_principal.confirm_follow_run_review("e" * 64, "f" * 64)
+    assert saved[0]["replace_run_id"] == old_id
 
 
 def test_native_bridge_requires_explicit_acceptance_and_forwards_only_review_ids(
