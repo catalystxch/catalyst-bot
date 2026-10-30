@@ -37,7 +37,7 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
                     success: true, preview_id: 'b'.repeat(64), review_sha256: 'c'.repeat(64),
                     prior_approval_id: 'a'.repeat(64),
                     prior_maximum_fee_mojos: 4059096837,
-                    proposed_maximum_fee_mojos: 5000000000,
+                    proposed_maximum_fee_mojos: body.proposed_maximum_fee_mojos,
                     spent_fee_mojos: 774766315, held_fee_mojos: 0,
                     protected_cancellation_fee_mojos: 1037763168,
                     fee_funding_mojos: 10000000000,
@@ -50,16 +50,23 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
             },
             confirm_prestart_follow_fee_ceiling_review: async body => {
                 window.__prestartCalls.push(['confirm', body]);
-                return {success: true, total_fee_mojos: 5000000000,
+                return {success: true, total_fee_mojos: 10000000000,
                     dispatch_authorized: false};
             },
         }};
         openPrestartFollowFeeReview();
-        await preparePrestartFollowFeeReview();
     }""")
+    amount = page.locator("#prestartFollowFeeXch")
+    expect(amount).to_be_editable()
+    amount.fill("0.01")
+    page.evaluate("preparePrestartFollowFeeReview()")
     output = page.locator("#prestartFollowFeeText")
     expect(output).to_contain_text("Original cumulative ceiling: 0.004059096837 XCH")
-    expect(output).to_contain_text("New cumulative ceiling: 0.005 XCH")
+    expect(output).to_contain_text("New cumulative ceiling: 0.01 XCH")
+    assert (
+        page.evaluate("window.__prestartCalls[0][1].proposed_maximum_fee_mojos")
+        == 10_000_000_000
+    )
     expect(output).to_contain_text("Already spent: 0.000774766315 XCH")
     expect(output).to_contain_text("Pending fee holds: 0.0 XCH")
     expect(output).to_contain_text("Protected cancellation reserve: 0.001037763168 XCH")
@@ -75,6 +82,12 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
     }""")
     expect(page.locator("#prestartFollowFeeConfirm")).to_be_disabled()
     assert len(page.evaluate("window.__prestartCalls")) == 1
+    amount.fill("0.01")
+    page.evaluate("preparePrestartFollowFeeReview()")
+    page.locator("#prestartFollowFeeAccept").check()
+    page.locator("#prestartFollowFeeConfirm").click()
+    expect(page.locator("#followRunFeeCapXch")).to_have_value("0.01")
+    assert page.evaluate("window.__started === false")
 
 
 def test_follow_refresh_uses_new_ceiling_while_worker_approval_stays_historical(page):

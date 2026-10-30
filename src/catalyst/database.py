@@ -22969,8 +22969,6 @@ def confirm_prestart_follow_fee_ceiling_review(
         totals = _fee_scope_totals(conn, prior["scope_sha256"])
         protected = _fee_amount(review.get("protected_cancellation_fee_mojos"))
         maximum = _fee_amount(review.get("proposed_maximum_fee_mojos"))
-        if maximum != 5_000_000_000:
-            raise ValueError("FEE_PRESTART_INITIAL_CEILING_REQUIRED")
         if (
             totals["spent_fee_mojos"] != review.get("spent_fee_mojos")
             or totals["held_fee_mojos"] != review.get("held_fee_mojos")

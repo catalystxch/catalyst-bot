@@ -11,7 +11,7 @@ from fee_approval_test_utils import _coin
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
-def _completed_review(state):
+def _completed_review(state, *, maximum=5_000_000_000, fee_coin_mojos=10_000_000_000):
     global database
     database = import_module("database")
     from coin_prep_fee_approval import complete_coin_prep_fee_session
@@ -32,9 +32,9 @@ def _completed_review(state):
         for index, target in enumerate(targets)
         if target.asset == "cat"
     ]
-    state["xch"].append(_coin(40000, str(10_000_000_000)))
+    state["xch"].append(_coin(40000, str(fee_coin_mojos)))
     complete_coin_prep_fee_session(prior["approval_id"])
-    return preview_prestart_follow_fee_ceiling(prior["approval_id"], 5_000_000_000)
+    return preview_prestart_follow_fee_ceiling(prior["approval_id"], maximum)
 
 
 def test_completed_prep_can_review_exact_prestart_ceiling_without_wallet_effect(
@@ -98,20 +98,35 @@ def test_completed_session_accepts_only_one_initial_ceiling_revision(approved):
         preview_prestart_follow_fee_ceiling(confirmed["approval_id"], 5_000_000_000)
 
 
-@pytest.mark.parametrize("amount", [4_500_000_000, 6_000_000_000])
-def test_prestart_review_requires_exact_initial_ceiling(approved, amount):
+def test_completed_prep_can_review_a_higher_exact_initial_ceiling(approved):
+    from prestart_follow_fee_ceiling import confirm_prestart_follow_fee_ceiling
+
+    review = _completed_review(
+        approved, maximum=10_000_000_000, fee_coin_mojos=20_000_000_000
+    )
+    assert review["proposed_maximum_fee_mojos"] == 10_000_000_000
+    assert review["dispatch_authorized"] is False
+    confirmed = confirm_prestart_follow_fee_ceiling(
+        review["preview_id"], review["review_sha256"]
+    )
+    assert confirmed["total_fee_mojos"] == 10_000_000_000
+    assert confirmed["dispatch_authorized"] is False
+
+
+@pytest.mark.parametrize("amount", [0, 80])
+def test_prestart_review_rejects_a_nonincreasing_ceiling(approved, amount):
     from prestart_follow_fee_ceiling import preview_prestart_follow_fee_ceiling
 
     _completed_review(approved)
-    with pytest.raises(ValueError, match="FEE_PRESTART_INITIAL_CEILING_REQUIRED"):
+    with pytest.raises(ValueError, match="FEE_PRESTART_CEILING_MUST_INCREASE"):
         preview_prestart_follow_fee_ceiling(approved["approval"]["approval_id"], amount)
 
 
-def test_ledger_rejects_a_nonstandard_prestart_ceiling_quote(approved):
+def test_ledger_rejects_an_unfunded_prestart_ceiling_quote(approved):
     review = _completed_review(approved)
     stored = database.get_coin_prep_fee_preview(review["preview_id"])
     quote = json.loads(stored["quote_json"])
-    quote["prestart_review"]["proposed_maximum_fee_mojos"] = 6_000_000_000
+    quote["prestart_review"]["proposed_maximum_fee_mojos"] = 100_000_000_000
     forged = database.store_coin_prep_fee_preview(
         scope_sha256=stored["scope_sha256"],
         plan_sha256=stored["plan_sha256"],
@@ -122,7 +137,7 @@ def test_ledger_rejects_a_nonstandard_prestart_ceiling_quote(approved):
         observed_at=stored["observed_at"],
         expires_at=stored["expires_at"],
     )
-    with pytest.raises(ValueError, match="FEE_PRESTART_INITIAL_CEILING_REQUIRED"):
+    with pytest.raises(ValueError, match="FEE_PRESTART_FUNDING_INSUFFICIENT"):
         database.confirm_prestart_follow_fee_ceiling_review(
             preview_id=forged["preview_id"],
             current_fee_funding_mojos=10_000_000_000,

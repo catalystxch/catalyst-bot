@@ -16,8 +16,6 @@ from coin_prep_fee_approval import (
     _canonical_json,
 )
 
-INITIAL_FOLLOW_FEE_CEILING_MOJOS = 5_000_000_000
-
 
 def _review_from_preview(preview: dict) -> dict:
     quote = json.loads(preview["quote_json"])
@@ -52,8 +50,6 @@ def preview_prestart_follow_fee_ceiling(
     """Quote the original completed plan without minting a new prep session."""
     _digest(approval_id)
     maximum = _exact_int(proposed_maximum_fee_mojos)
-    if maximum != INITIAL_FOLLOW_FEE_CEILING_MOJOS:
-        raise ValueError("FEE_PRESTART_INITIAL_CEILING_REQUIRED")
     from coin_prep_fee_runtime import read_approved_prep_fee_snapshot
     from coin_prep_fee_funding import prepare_fee_inventory
 

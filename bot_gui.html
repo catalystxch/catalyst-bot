@@ -8440,17 +8440,23 @@
         </div>
     </div>
 
-    <div id="prestartFollowFeeModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="prestartFollowFeeTitle" style="display:none">
-        <div class="modal-content" style="max-width:680px;padding:24px;overflow:auto">
-            <h2 id="prestartFollowFeeTitle">Review initial Follow fee ceiling</h2>
-            <p>Coin Prep is complete. Review the original wallet, fees already spent or held, protected cancellation reserve, and the exact new cumulative ceiling. Recording this approval does not start trading or send a wallet transaction.</p>
-            <label>Initial cumulative fee ceiling (XCH) <input id="prestartFollowFeeXch" type="text" value="0.005" readonly oninput="invalidatePrestartFollowFeeReview()"></label>
-            <pre id="prestartFollowFeeText" style="white-space:pre-wrap"></pre>
-            <label><input type="checkbox" id="prestartFollowFeeAccept" disabled> I approve the exact cumulative ceiling shown above for this completed Coin Prep session.</label>
-            <div style="margin-top:16px">
-                <button type="button" onclick="closePrestartFollowFeeReview()">Back</button>
-                <button type="button" id="prestartFollowFeePrepare" onclick="preparePrestartFollowFeeReview()">Refresh exact review</button>
-                <button type="button" id="prestartFollowFeeConfirm" disabled onclick="confirmPrestartFollowFeeReview()">Record initial ceiling</button>
+    <div id="prestartFollowFeeModal" class="modal follow-review-modal" role="dialog" aria-modal="true" aria-labelledby="prestartFollowFeeTitle" style="display:none">
+        <div class="modal-content">
+            <div class="follow-review-header">
+                <div class="follow-review-kicker">Financial review</div>
+                <h2 id="prestartFollowFeeTitle">Review initial Follow fee ceiling</h2>
+                <p>Coin Prep is complete. Review the original wallet, fees already spent or held, protected cancellation reserve, and the exact new cumulative ceiling. Recording this approval does not start trading or send a wallet transaction.</p>
+            </div>
+            <div class="follow-review-body">
+                <label class="follow-review-field"><span>Initial cumulative fee ceiling (XCH)</span><input id="prestartFollowFeeXch" type="text" inputmode="decimal" value="0.005" oninput="invalidatePrestartFollowFeeReview()"></label>
+                <p class="follow-review-note">Enter a ceiling above the completed Coin Prep ceiling, then refresh the exact wallet review.</p>
+                <pre id="prestartFollowFeeText" class="follow-review-result" aria-live="polite"></pre>
+                <label class="follow-review-check"><input type="checkbox" id="prestartFollowFeeAccept" disabled><span>I approve the exact cumulative ceiling shown above for this completed Coin Prep session.</span></label>
+                <div class="follow-review-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closePrestartFollowFeeReview()">Back</button>
+                    <button type="button" class="btn btn-secondary" id="prestartFollowFeePrepare" onclick="preparePrestartFollowFeeReview()">Refresh exact review</button>
+                    <button type="button" class="btn btn-primary" id="prestartFollowFeeConfirm" disabled onclick="confirmPrestartFollowFeeReview()">Record initial ceiling</button>
+                </div>
             </div>
         </div>
     </div>
@@ -33202,10 +33208,6 @@
                 output.textContent = 'Enter a positive exact XCH amount with at most 12 decimal places.';
                 return;
             }
-            if (proposed !== 5000000000) {
-                output.textContent = 'The initial cumulative fee ceiling must be exactly 0.005 XCH.';
-                return;
-            }
             _prestartFollowFeeBusy = true;
             button.disabled = true;
             output.textContent = 'Checking the completed session, wallet and exact fee accounting…';
@@ -33218,6 +33220,10 @@
                     || status?.fee_approval?.session_completed !== true
                     || status?.follow_fee_approval_id) {
                     throw new Error('A completed Coin Prep session without an initial Follow ceiling review is required.');
+                }
+                const priorCeiling = status?.fee_approval?.total_fee_mojos;
+                if (Number.isSafeInteger(priorCeiling) && proposed <= priorCeiling) {
+                    throw new Error(`Enter a ceiling above the completed Coin Prep ceiling of ${formatFollowFeeMojos(priorCeiling)}.`);
                 }
                 const review = await window.pywebview.api.prepare_prestart_follow_fee_ceiling_review({
                     approval_id: approvalId,
@@ -33284,6 +33290,8 @@
                     || result.dispatch_authorized !== false) {
                     throw new Error(result?.reason || 'The initial ceiling was not recorded. Refresh the review.');
                 }
+                document.getElementById('followRunFeeCapXch').value =
+                    document.getElementById('prestartFollowFeeXch').value;
                 closePrestartFollowFeeReview();
                 showToast('Initial cumulative fee ceiling recorded. Review Follow separately before starting.', 'success');
                 await prepareFollowRunReview();
