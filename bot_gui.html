@@ -8912,6 +8912,9 @@
             <div id="splashGateUpdateNotice" style="display: none; margin-top: 14px; padding: 11px 14px; background: rgba(251,191,36,0.1); border: 1px solid rgba(251,191,36,0.25); border-radius: 10px; font-size: 13px; color: var(--warning-300);">
                 <strong>Update available:</strong> <span id="splashGateUpdateText"></span>
                 &nbsp;&mdash;&nbsp;<a href="https://github.com/dexie-space/splash/releases" target="_blank" rel="noopener" style="color: var(--accent-cyan); text-decoration: none;">View on GitHub &rarr;</a>
+                <button id="splashGateUpgradeBtn" onclick="splashGateUpgrade()" style="display: block; margin-top: 12px; padding: 12px 24px; border-radius: 10px; border: 1px solid var(--accent-cyan); background: transparent; color: var(--accent-cyan); cursor: pointer;">Upgrade Splash</button>
+                <div id="splashGateUpgradeMsg" role="status" aria-live="polite" style="margin-top: 10px;"></div>
+                <progress id="splashGateUpgradeProgress" max="100" value="0" style="display: none; width: 100%; margin-top: 10px;"></progress>
             </div>
 
             <!-- Skip Splash button -->
@@ -40877,6 +40880,8 @@ async function pollSplashProgress() {
 
 const DEXIE_ONLY_BETA = false;
 let _splashGatePhase = 'checking';  // checking | not_installed | installed | starting | running | done
+let _splashUpgradeBusy = false;
+let _splashUpgradePending = false;
 let _splashGatePollTimer = null;
 
 function splashGateSetPhase(phase, title, subtitle, statusText) {
@@ -40987,14 +40992,8 @@ async function splashGateBegin() {
                 'style="color: var(--accent-cyan); font-size: 12px; text-decoration: none;">' +
                 'Learn more about Dexie Splash →</a>';
             // Check for update in background — extend dismiss window if one is found
-            let dismissed = false;
-            const dismissTimer = setTimeout(() => { dismissed = true; splashGateDismiss(); }, 1500);
-            splashGateCheckForUpdate(checkData.version).then(hasUpdate => {
-                if (!dismissed && hasUpdate) {
-                    clearTimeout(dismissTimer);
-                    setTimeout(() => splashGateDismiss(), 5000);
-                }
-            });
+            const hasUpdate = await splashGateCheckForUpdate(checkData.version);
+            if (!hasUpdate) setTimeout(() => splashGateDismiss(), 1500);
             return;
         }
 
@@ -41031,6 +41030,12 @@ async function splashGateCheckForUpdate(installedVersion) {
             const text = document.getElementById('splashGateUpdateText');
             if (text) text.textContent = 'v' + installed + ' installed — v' + latestTag + ' available';
             if (notice) notice.style.display = 'block';
+            const upgrade = document.getElementById('splashGateUpgradeBtn');
+            const message = document.getElementById('splashGateUpgradeMsg');
+            if (upgrade) upgrade.disabled = ['running', 'starting'].includes(_splashGatePhase);
+            if (message) message.textContent = _splashGatePhase === 'running'
+                ? 'Stop Splash before upgrading. The running node will not be interrupted.'
+                : 'Download and verify the update, then start Splash when you are ready.';
             debugLog('[SPLASH GATE] Update available: v' + installed + ' → v' + latestTag);
             return true;
         }
@@ -41039,6 +41044,75 @@ async function splashGateCheckForUpdate(installedVersion) {
         debugLog('[SPLASH GATE] Update check failed (offline?): ' + (e.message || e));
     }
     return false;
+}
+
+async function splashGateUpgrade() {
+    if (DEXIE_ONLY_BETA || _splashUpgradeBusy || _splashGatePhase === 'starting') return;
+    const btn = document.getElementById('splashGateUpgradeBtn');
+    const msg = document.getElementById('splashGateUpgradeMsg');
+    const progress = document.getElementById('splashGateUpgradeProgress');
+    const start = document.getElementById('splashGateStartBtn');
+    _splashUpgradeBusy = true;
+    btn.disabled = true;
+    start.disabled = true;
+    try {
+        if (!_splashUpgradePending) {
+            const nodeResponse = await apiFetch(API_URL + '/splash/node', {signal: AbortSignal.timeout(10000)});
+            if (!nodeResponse.ok) throw new Error('Could not check Splash process status');
+            const node = await nodeResponse.json();
+            if (node.process_running !== false) {
+                msg.textContent = 'Stop Splash before upgrading. The running node will not be interrupted.';
+                return;
+            }
+            msg.textContent = 'Downloading and verifying Splash update...';
+            progress.style.display = 'block';
+            progress.value = 0;
+            // A lost response can still mean the download started. Keep Start
+            // blocked until progress establishes a terminal result.
+            _splashUpgradePending = true;
+            const response = await apiFetch(API_URL + '/splash/setup/download', {method: 'POST', signal: AbortSignal.timeout(10000)});
+            const result = await response.json();
+            if (!response.ok || result.started !== true) {
+                // An explicit rejection (including an existing download) still
+                // requires observing progress before allowing a node start.
+                throw new Error(result.error || 'Upgrade request failed');
+            }
+        }
+        while (_splashUpgradePending) {
+            const response = await apiFetch(API_URL + '/splash/setup/progress', {signal: AbortSignal.timeout(10000)});
+            if (!response.ok) throw new Error('Could not read upgrade progress');
+            const status = await response.json();
+            progress.value = Math.max(0, Math.min(100, Number(status.percent) || 0));
+            msg.textContent = status.message || 'Downloading and verifying Splash update...';
+            if (status.in_progress === true) {
+                btn.textContent = 'Upgrading Splash... ' + progress.value + '%';
+                await new Promise(resolve => setTimeout(resolve, 500));
+                continue;
+            }
+            if (status.in_progress === false && status.result === null) {
+                _splashUpgradePending = false;
+                throw new Error('No upgrade is running; retry the upgrade');
+            }
+            if (status.in_progress !== false || typeof status.result?.success !== 'boolean') {
+                throw new Error('Upgrade completion is not confirmed');
+            }
+            _splashUpgradePending = false;
+            if (!status.result.success) throw new Error(status.result.message || 'Upgrade failed');
+            msg.textContent = 'Splash upgraded: ' + (status.result.version || status.result.message || 'verified successfully') + '. Ready to start.';
+            btn.style.display = 'none';
+            document.getElementById('splashGateUpdateText').textContent = 'Upgrade complete';
+            progress.value = 100;
+        }
+    } catch (error) {
+        msg.textContent = 'Upgrade failed: ' + error.message + (_splashUpgradePending
+            ? '. Check upgrade status before starting Splash.'
+            : '. The installed version was preserved. You can retry the upgrade.');
+    } finally {
+        _splashUpgradeBusy = false;
+        btn.disabled = false;
+        btn.textContent = _splashUpgradePending ? 'Check upgrade status' : 'Upgrade Splash';
+        start.disabled = _splashUpgradePending;
+    }
 }
 
 async function splashGateInstall() {
@@ -41140,7 +41214,7 @@ async function splashGatePollDownload() {
 }
 
 async function splashGateStart() {
-    if (DEXIE_ONLY_BETA) return;
+    if (DEXIE_ONLY_BETA || _splashUpgradeBusy || _splashUpgradePending) return;
     debugLog('[SPLASH GATE] Starting Splash node...');
     const btn = document.getElementById('splashGateStartBtn');
     btn.disabled = true;
@@ -41154,6 +41228,7 @@ async function splashGateStart() {
     document.getElementById('splashGateProgressTrack').style.display = 'block';
     splashGateShowProgress(null);
     splashGateSetPhase('starting', 'Starting Splash Node', 'Launching P2P node process...', '');
+    document.getElementById('splashGateUpgradeBtn').disabled = true;
 
     try {
         const resp = await apiFetch(API_URL + '/splash/node/start', {
@@ -41249,6 +41324,7 @@ function splashGatePollUntilRunning() {
 }
 
 function splashGateDismiss() {
+    if (_splashUpgradeBusy || _splashUpgradePending) return;
     if (_splashGatePollTimer) {
         clearTimeout(_splashGatePollTimer);
         _splashGatePollTimer = null;
