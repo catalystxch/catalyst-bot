@@ -69,6 +69,8 @@ def preview_prestart_follow_fee_ceiling(
     prior = approved["approval"]
     if maximum <= prior["total_fee_mojos"]:
         raise ValueError("FEE_PRESTART_CEILING_MUST_INCREASE")
+    if database.prestart_follow_scope_blocked(prior["scope_sha256"], scope["asset_id"]):
+        raise ValueError("FEE_PRESTART_RUN_EXISTS")
     first_targets = _prove_approved_coin_prep_targets(approved)
     after = read_approved_prep_fee_snapshot(approval_id)
     if (

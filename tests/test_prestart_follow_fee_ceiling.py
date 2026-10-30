@@ -2,6 +2,7 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from importlib import import_module
 
 import pytest
@@ -250,6 +251,55 @@ def test_existing_follow_run_blocks_prestart_confirmation(approved):
         )
         is None
     )
+
+
+def test_existing_follow_run_blocks_new_ceiling_at_preview(approved):
+    from prestart_follow_fee_ceiling import preview_prestart_follow_fee_ceiling
+    from test_follow_fee_cancellation import _run
+
+    _completed_review(approved)
+    _run(approved)
+    with pytest.raises(ValueError, match="FEE_PRESTART_RUN_EXISTS"):
+        preview_prestart_follow_fee_ceiling(
+            approved["approval"]["approval_id"], 5_000_000_000
+        )
+
+
+def test_stopped_terminal_follow_run_allows_new_ceiling_review(approved):
+    from prestart_follow_fee_ceiling import confirm_prestart_follow_fee_ceiling
+    from test_follow_fee_cancellation import _run
+
+    review = _completed_review(approved)
+    run_id, _identity = _run(approved)
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+
+    confirmed = confirm_prestart_follow_fee_ceiling(
+        review["preview_id"], review["review_sha256"]
+    )
+    assert confirmed["total_fee_mojos"] == review["proposed_maximum_fee_mojos"]
+    assert confirmed["dispatch_authorized"] is False
+
+
+def test_stopped_follow_run_with_open_offer_blocks_new_ceiling(approved):
+    from prestart_follow_fee_ceiling import confirm_prestart_follow_fee_ceiling
+    from test_follow_fee_cancellation import _run
+
+    review = _completed_review(approved)
+    run_id, identity = _run(approved)
+    database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=1002)
+    assert database.add_offer(
+        "e" * 64,
+        "buy",
+        Decimal("0.0001"),
+        Decimal("1"),
+        Decimal("10000"),
+        identity["asset_id"],
+    )
+
+    with pytest.raises(ValueError, match="FEE_PRESTART_RUN_EXISTS"):
+        confirm_prestart_follow_fee_ceiling(
+            review["preview_id"], review["review_sha256"]
+        )
 
 
 def test_changed_wallet_identity_blocks_prestart_confirmation(approved):

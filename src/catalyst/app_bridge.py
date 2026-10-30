@@ -1149,6 +1149,7 @@ class AppBridge:
                 "FEE_PRESTART_INITIAL_CEILING_REQUIRED",
                 "FEE_PRESTART_TARGETS_CHANGED",
                 "FEE_PRESTART_FUNDING_INSUFFICIENT",
+                "FEE_PRESTART_RUN_EXISTS",
                 "FEE_WALLET_CONTEXT_CHANGED",
                 "FEE_WALLET_IDENTITY_UNAVAILABLE",
             }:

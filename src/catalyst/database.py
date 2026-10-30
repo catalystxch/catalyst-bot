@@ -22880,6 +22880,52 @@ def approve_coin_prep_fee_preview(
     }
 
 
+def _prestart_follow_scope_blocked(
+    conn: sqlite3.Connection, scope_sha256: str, asset_id: str
+) -> bool:
+    """Fence live or unsettled Follow effects before a new session cap."""
+    active_run = conn.execute(
+        "SELECT 1 FROM follow_run_authorities AS run "
+        "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
+        "LEFT JOIN follow_run_stops AS stop ON stop.run_id=run.run_id "
+        "WHERE approval.scope_sha256=? AND stop.run_id IS NULL LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    open_offer = conn.execute(
+        "SELECT 1 FROM offers WHERE cat_asset_id=? "
+        "AND status NOT IN ('cancelled','expired','filled') LIMIT 1",
+        (asset_id,),
+    ).fetchone()
+    unresolved_intent = conn.execute(
+        "SELECT 1 FROM offer_intents AS intent "
+        "JOIN follow_run_authorities AS run ON run.run_id=intent.run_id "
+        "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
+        "WHERE approval.scope_sha256=? "
+        "AND intent.lifecycle_state NOT IN "
+        "('terminal','creation_failed','rejected','cancelled','filled','expired') "
+        "LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    unresolved_fee = conn.execute(
+        "SELECT 1 FROM approved_fee_reservations AS reservation "
+        "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+        "WHERE reservation.scope_sha256=? AND outcome.operation_id IS NULL LIMIT 1",
+        (scope_sha256,),
+    ).fetchone()
+    return any((active_run, open_offer, unresolved_intent, unresolved_fee))
+
+
+def prestart_follow_scope_blocked(scope_sha256: str, asset_id: str) -> bool:
+    """Read-only early blocker; confirmation repeats this inside its DB lock."""
+    scope = _fee_digest(scope_sha256)
+    asset = _fee_digest(asset_id)
+    conn = _stability_read_only_connection()
+    try:
+        return _prestart_follow_scope_blocked(conn, scope, asset)
+    finally:
+        conn.close()
+
+
 def confirm_prestart_follow_fee_ceiling_review(
     *, preview_id: str, current_fee_funding_mojos: int
 ) -> Dict[str, Any]:
@@ -22956,16 +23002,6 @@ def confirm_prestart_follow_fee_ceiling_review(
             or completion["plan_sha256"] != prior["plan_sha256"]
         ):
             raise ValueError("FEE_APPROVAL_STALE")
-        if (
-            conn.execute(
-                "SELECT 1 FROM follow_run_authorities AS run "
-                "JOIN fee_approvals AS approval ON approval.approval_id=run.approval_id "
-                "WHERE approval.scope_sha256=? LIMIT 1",
-                (prior["scope_sha256"],),
-            ).fetchone()
-            is not None
-        ):
-            raise ValueError("FEE_PRESTART_RUN_EXISTS")
         totals = _fee_scope_totals(conn, prior["scope_sha256"])
         protected = _fee_amount(review.get("protected_cancellation_fee_mojos"))
         maximum = _fee_amount(review.get("proposed_maximum_fee_mojos"))
@@ -22975,6 +23011,12 @@ def confirm_prestart_follow_fee_ceiling_review(
             or prior["cancellation_reserve_mojos"] > protected
         ):
             raise ValueError("FEE_PRESTART_ACCOUNTING_CHANGED")
+        # A stopped run may reuse its completed Coin Prep session only after
+        # its tracked offers and effects are terminal.
+        if _prestart_follow_scope_blocked(
+            conn, prior["scope_sha256"], scope["asset_id"]
+        ):
+            raise ValueError("FEE_PRESTART_RUN_EXISTS")
         if (
             maximum <= prior["total_fee_mojos"]
             or maximum < totals["committed_fee_mojos"] + protected
