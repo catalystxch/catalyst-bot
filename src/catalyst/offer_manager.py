@@ -5240,11 +5240,37 @@ class OfferManager:
             )
             from confidence_override import ConsentedConfidence
 
+            market_authorizer = None
+            if isinstance(market_confidence, ConsentedConfidence):
+
+                def market_authorizer():
+                    try:
+                        if not market_confidence.dispatch_allowed():
+                            return False
+                        current = market_confidence.current_view()
+                        if not isinstance(current, ConsentedConfidence):
+                            return False
+                        return (
+                            assess_offer_book_candidate(
+                                side=side,
+                                candidate_price=spec["price"],
+                                size_xch=spec["size_xch"],
+                                confidence=current,
+                                network_fee_xch=network_fee_xch,
+                                expected_cancel_requotes=expected_cancel_requotes,
+                                minimum_profit_xch=minimum_profit_xch,
+                                now=datetime.now(timezone.utc),
+                            ).get("eligible")
+                            is True
+                        )
+                    except Exception:
+                        return False
+
             res = self.create_offer_with_retry(
                 spec["offer_dict"],
                 **(
-                    {"market_authorizer": market_confidence.dispatch_allowed}
-                    if isinstance(market_confidence, ConsentedConfidence)
+                    {"market_authorizer": market_authorizer}
+                    if market_authorizer is not None
                     else {}
                 ),
                 expiry_offset=spec["stagger"],

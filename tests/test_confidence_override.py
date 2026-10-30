@@ -229,6 +229,28 @@ def test_effective_candidate_view_keeps_raw_red(monkeypatch):
     assert effective.data_valid is False
 
 
+def test_candidate_batch_defers_expensive_scope_check_until_effect(monkeypatch):
+    loop = runtime_loop(monkeypatch)
+    checks = []
+
+    def checked_scope():
+        checks.append(True)
+        return SCOPE
+
+    monkeypatch.setattr("confidence_override.current_scope", checked_scope)
+    effective = loop._effective_market_confidence()
+    initial_checks = len(checks)
+    assert initial_checks > 0
+    for _ in range(48):
+        assert effective.data_valid is True
+    assert len(checks) == initial_checks
+    assert effective.dispatch_allowed() is True
+    assert len(checks) > initial_checks
+    loop._confidence_override_consent.revoke()
+    assert effective.data_valid is False
+    assert effective.dispatch_allowed() is False
+
+
 def test_review_requires_exact_confirmation_and_cannot_be_replayed(monkeypatch):
     from confidence_override import prepare_review, confirm_review
 

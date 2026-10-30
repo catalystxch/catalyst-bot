@@ -1302,16 +1302,32 @@ class BotLoop:
         )
         if prices is None:
             return raw
+
+        def candidate_authorized():
+            # Building a 48-slot batch must not repeat Sage identity and fee
+            # ledger RPCs for each price candidate. The full scope is checked
+            # again at the durable wallet effect boundary.
+            current_raw, current_deadline = self._market_confidence_snapshot()
+            current_time = datetime.now(timezone.utc)
+            return bool(
+                self._running
+                and current_raw is raw
+                and consent.candidate_active(now=current_time)
+                and consent.price_range(
+                    raw, now=current_time, valid_until=current_deadline
+                )
+                is not None
+            )
+
         return ConsentedConfidence(
             raw,
             lambda: (
-                self._confidence_override_active()
-                and consent.price_range(
-                    raw, now=datetime.now(timezone.utc), valid_until=deadline
-                )
-                is not None
+                self._enter_runtime_effect_phase("create")
+                and self._confidence_override_active()
             ),
             prices,
+            candidate_authorize=candidate_authorized,
+            current_view=lambda: self._effective_market_confidence(),
         )
 
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
@@ -1355,7 +1371,7 @@ class BotLoop:
         seconds_remaining = (
             valid_until.astimezone(timezone.utc) - current_time
         ).total_seconds()
-        if 0 < seconds_remaining <= 5:
+        if seconds_remaining <= 5:
             try:
                 self._refresh_offer_book_market()
             except Exception as exc:

@@ -96,6 +96,22 @@ class RunConsent:
                 self.revoked = True
             return valid
 
+    def candidate_active(self, *, now):
+        """Cheap prefilter; the wallet effect still checks the complete scope."""
+        with self._lock:
+            try:
+                current = _utc(now)
+                elapsed = time.monotonic() - self._started
+                return bool(
+                    not self.revoked
+                    and self.approved_at <= current < self.expires_at
+                    and 0
+                    <= elapsed
+                    < (self.expires_at - self.approved_at).total_seconds()
+                )
+            except (TypeError, ValueError):
+                return False
+
     def price_range(self, confidence, *, now, valid_until):
         """Retain price persistence independently of the waived depth policy.
 
@@ -236,15 +252,28 @@ class ConsentedConfidence:
     The view never survives a run or supplies authority independently of it.
     """
 
-    def __init__(self, raw, authorize, price_range):
+    def __init__(
+        self,
+        raw,
+        authorize,
+        price_range,
+        *,
+        candidate_authorize=None,
+        current_view=None,
+    ):
         self._raw, self._authorize, self._range = raw, authorize, price_range
+        self._candidate_authorize = candidate_authorize or authorize
+        self._current_view = current_view
 
     def dispatch_allowed(self):
         return self._authorize() is True
 
+    def current_view(self):
+        return self._current_view() if self._current_view is not None else self
+
     def __getattr__(self, key):
         if key == "data_valid":
-            return self._authorize() is True
+            return self._candidate_authorize() is True
         if key in {"trusted_bid", "trusted_midpoint", "trusted_ask"}:
             return self._range[
                 {"trusted_bid": 0, "trusted_midpoint": 1, "trusted_ask": 2}[key]

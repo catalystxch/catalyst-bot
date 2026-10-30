@@ -1075,6 +1075,39 @@ def test_bot_refreshes_aging_confidence_before_mutation(monkeypatch):
     assert refreshed == [True]
 
 
+def test_bot_rechecks_expired_confidence_before_mutation(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(can_create=True, can_requote=True)
+    loop._market_confidence_result = SimpleNamespace(
+        state="GREEN", derived_at=datetime.now(timezone.utc) - timedelta(seconds=31)
+    )
+    loop._market_confidence_valid_until = datetime.now(timezone.utc) - timedelta(
+        seconds=1
+    )
+    monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
+    loop._runtime_recovery_monotonic = lambda: 1
+    loop._runtime_recovery_wall_clock = lambda: NOW
+    loop._runtime_recovery_gap_seconds = 10
+    loop._runtime_recovery_skew_seconds = 2
+    refreshed = []
+
+    def refresh():
+        refreshed.append(True)
+        loop._market_confidence_result = SimpleNamespace(
+            state="GREEN", derived_at=datetime.now(timezone.utc)
+        )
+        loop._market_confidence_valid_until = datetime.now(timezone.utc) + timedelta(
+            seconds=30
+        )
+
+    loop._refresh_offer_book_market = refresh
+    assert loop._enter_runtime_effect_phase("create") is True
+    assert refreshed == [True]
+
+
 def test_active_cycle_wait_refreshes_market_evidence_every_five_seconds(monkeypatch):
     import bot_loop
 
