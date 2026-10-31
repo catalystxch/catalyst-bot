@@ -92,6 +92,20 @@ def test_restricted_window_fences_http_and_bridge(monkeypatch):
     assert b"Confirm database-only recovery" in response.data
 
 
+def test_restricted_startup_does_not_request_trading_authorization(monkeypatch):
+    import api_server
+
+    desktop = _desktop(monkeypatch)
+    monkeypatch.setattr(api_server, "_no_effect_creation_recovery_active", True)
+
+    def forbidden():
+        raise AssertionError("restricted recovery must not initialize normal trading")
+
+    monkeypatch.setattr(api_server, "initialize_mutation_runtime", forbidden)
+    monkeypatch.setattr(api_server, "_start_owned_runtime_services", forbidden)
+    desktop._start_owned_runtime_services()
+
+
 def test_desktop_routes_exact_creation_to_restricted_owner(monkeypatch):
     import api_server
     import database

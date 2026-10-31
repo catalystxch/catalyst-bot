@@ -957,6 +957,7 @@ def _start_owned_runtime_services() -> None:
         or api_server._refresh_abort_recovery_active
         or api_server._registry_terminal_recovery_active
         or api_server._cancel_latch_review_recovery_active
+        or api_server._no_effect_creation_recovery_active
     ):
         return
     authorization = api_server.initialize_mutation_runtime()
@@ -2316,7 +2317,7 @@ def main(argv=None):
             print(f"  Details saved to: {crash_log}")
             try:
                 input("\n  Press Enter to close...")
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt, RuntimeError):
                 pass
         return 1
 
