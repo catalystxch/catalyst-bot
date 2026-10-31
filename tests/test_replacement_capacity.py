@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -363,6 +364,149 @@ def _target_contract():
     }
 
 
+@pytest.mark.parametrize(
+    "fault", [None, "claimed_output", "wrong_amount", "authority_failure"]
+)
+def test_confirmation_batch_bounds_writer_work_and_preserves_fences(
+    isolated_database, monkeypatch, fault
+):
+    """Repeated global scans starve writers; batching must not weaken fences."""
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="bounded-confirmation")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"bounded-source").hexdigest()
+    assert database.upsert_coin(source, "xch", 100, purpose="replacement")
+    outputs = [
+        {
+            "coin_id": hashlib.sha256(f"bounded-output-{i}".encode()).hexdigest(),
+            "amount_mojos": 3,
+            "purpose": "replacement",
+        }
+        for i in range(30)
+    ]
+    outputs.append(
+        {
+            "coin_id": hashlib.sha256(b"bounded-fee-output").hexdigest(),
+            "amount_mojos": 10,
+            "purpose": "fee_reserve",
+        }
+    )
+    target = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": i,
+                "amount_mojos": item["amount_mojos"],
+                "purpose": item["purpose"],
+            }
+            for i, item in enumerate(outputs)
+        ],
+    }
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"], source_coin_ids=[source]
+    )
+    database.prepare_coin_prep_operation(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )
+    if fault in {"claimed_output", "wrong_amount"}:
+        assert database.upsert_coin(
+            outputs[-1]["coin_id"],
+            "xch",
+            11 if fault == "wrong_amount" else 10,
+            purpose="fee_reserve",
+        )
+    if fault == "claimed_output":
+        assert database.claim_wallet_effect(
+            operation_id="a" * 64, source_coin_ids=[outputs[-1]["coin_id"]]
+        )
+    evidence = {
+        "reason_code": "AUTHORITATIVE_POST_VIEW_CONFIRMED",
+        "effect_claim_token": claim["claim_token"],
+        "effect_claim_generation": claim["generation"],
+        "source_coin_ids": [source],
+        "expected_outputs": outputs,
+        "expected_wallet_identity": identity,
+        "authoritative_view": {
+            "fresh": True,
+            "complete": True,
+            "wallet_identity": identity,
+            "observed_at": "2026-08-21T12:00:01.000000Z",
+            "expires_at": "2026-08-21T12:00:16.000000Z",
+            "coins": outputs,
+        },
+    }
+    original_scan = database._nonterminal_registry_coin_ids
+    scans = []
+
+    def costly_real_scan(conn):
+        assert conn.in_transaction
+        scans.append(1)
+        if fault == "authority_failure":
+            raise RuntimeError("synthetic authority unavailable")
+        if fault is None:
+            time.sleep(
+                0.1
+            )  # Controlled slow authority, not a changed protection decision.
+        return original_scan(conn)
+
+    monkeypatch.setattr(database, "_nonterminal_registry_coin_ids", costly_real_scan)
+    before = time.monotonic()
+    if fault is None:
+        result = database.record_coin_prep_operation_outcome(
+            contract["operation_id"], outcome="CONFIRMED", evidence_json=evidence
+        )
+        elapsed = time.monotonic() - before
+        assert result["operation"]["outcome"] == "CONFIRMED"
+        assert elapsed < 2.5, f"writer transaction occupied {elapsed:.3f}s"
+        assert len(scans) == 1
+    else:
+        expected_error, expected_reason = {
+            "claimed_output": (ValueError, "protected permanent history"),
+            "wrong_amount": (ValueError, "contradicts durable coin state"),
+            "authority_failure": (RuntimeError, "synthetic authority unavailable"),
+        }[fault]
+        with pytest.raises(expected_error, match=expected_reason):
+            database.record_coin_prep_operation_outcome(
+                contract["operation_id"], outcome="CONFIRMED", evidence_json=evidence
+            )
+        assert len(scans) == 1
+        conn = database.get_connection()
+        assert (
+            conn.execute(
+                "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+                (contract["operation_id"],),
+            ).fetchone()[0]
+            == "PREPARED"
+        )
+        assert (
+            conn.execute(
+                "SELECT status FROM coins WHERE coin_id=?",
+                (database.norm_coin_id(source),),
+            ).fetchone()[0]
+            == "free"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM coins WHERE coin_id=?",
+                (database.norm_coin_id(outputs[0]["coin_id"]),),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_split_and_combine_identities_are_deterministic_and_purpose_bound():
     """Catches restart creating a new identity for the same prep effect."""
 
@@ -505,6 +649,39 @@ def test_batch_contract_round_trip_binds_plan_hash_and_exact_outputs():
             source_coin_ids=[source],
             target_contract=tampered,
         )
+
+
+def test_batch_attempt_identity_does_not_change_economics_or_legacy_identity():
+    args = dict(
+        operation_kind="split",
+        purpose="replacement",
+        source_coin_ids=["a" * 64],
+        target_contract=_batch_target(),
+    )
+    legacy = replacement_capacity.canonical_coin_prep_contract(**args)
+    first = replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="1" * 32
+    )
+    second = replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="2" * 32
+    )
+    assert (
+        len({legacy["operation_id"], first["operation_id"], second["operation_id"]})
+        == 3
+    )
+    assert (
+        legacy["target_contract"]
+        == first["target_contract"]
+        == second["target_contract"]
+    )
+    assert first == replacement_capacity.canonical_coin_prep_contract(
+        **args, attempt_id="1" * 32
+    )
+    for invalid in ("", "1" * 31, "G" * 32, 1):
+        with pytest.raises(ValueError, match="attempt_id"):
+            replacement_capacity.canonical_coin_prep_contract(
+                **args, attempt_id=invalid
+            )
 
 
 def test_batch_constructed_outputs_bind_once_before_dispatch(
@@ -693,14 +870,13 @@ def test_batch_confirmation_requires_bound_output_ids_and_tracks_both_assets(
         assert database.upsert_coin(output_cat, "cat", 90, purpose="replacement")
         assert database.lock_coin(output_cat, "terminal-trade")
         assert database.mark_coin_spent(output_cat)
-        original_terminal_guard = database._coin_terminal_mutation_is_protected
+        original_terminal_guard = database._batch_coin_terminal_mutation_protection
         monkeypatch.setattr(
             database,
-            "_coin_terminal_mutation_is_protected",
-            lambda conn, coin_id: (
-                True
-                if database.norm_coin_id(coin_id) == database.norm_coin_id(output_cat)
-                else original_terminal_guard(conn, coin_id)
+            "_batch_coin_terminal_mutation_protection",
+            lambda conn, coin_ids: (
+                original_terminal_guard(conn, coin_ids)
+                | {database.norm_coin_id(output_cat)}
             ),
         )
     database.bind_coin_prep_constructed_outputs(
@@ -966,6 +1142,9 @@ def test_submitted_coin_prep_can_resolve_no_effect_only_from_exact_selectable_co
         "selectable_coin_ids": sorted([source, fee_source]),
         "pending_transaction_ids": [],
     }
+    assert not database.recover_coin_prep_predispatch_no_effect(
+        prepared["operation"]["operation_id"], view
+    )
 
     with pytest.raises(ValueError, match="selectable cohort"):
         database.record_coin_prep_operation_outcome(
@@ -1059,6 +1238,189 @@ def test_submitted_coin_prep_can_resolve_no_effect_only_from_exact_selectable_co
         )
         is not None
     )
+
+
+@pytest.mark.parametrize("journal_outcome", ["PREPARED", "SUBMITTED_UNKNOWN"])
+@pytest.mark.parametrize(
+    "persist_failure",
+    ["COIN_PREP_PREPARED_PERSIST_FAILED", "DIRECT_BATCH_PREPARED_PERSIST_FAILED"],
+)
+@pytest.mark.parametrize("intervening_startup", [False, True])
+@pytest.mark.parametrize("recovery_fault", [None, "prior_effect", "identity", "reason"])
+def test_prepared_prep_without_dispatch_releases_only_from_exact_fresh_no_effect_view(
+    isolated_database,
+    monkeypatch,
+    journal_outcome,
+    persist_failure,
+    intervening_startup,
+    recovery_fault,
+):
+    """A rejected pre-dispatch fee check must not permanently fence untouched coins."""
+
+    database.init_database()
+    binding = _activate_wallet_authority(monkeypatch, run_id="predispatch-quote")
+    identity = mutation_gate.wallet_identity_binding_payload(binding)
+    source = hashlib.sha256(b"predispatch-cat").hexdigest()
+    fee = hashlib.sha256(b"predispatch-fee").hexdigest()
+    assert database.upsert_coin(source, "cat", 100, purpose="replacement")
+    assert database.upsert_coin(fee, "xch", 100_000_000, purpose="fee_reserve")
+    target = {
+        "wallet_type": "cat",
+        "outputs": [{"output_index": 0, "amount_mojos": 100, "purpose": "replacement"}],
+    }
+    contract = replacement_capacity.canonical_coin_prep_contract(
+        operation_kind="combine",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+    )
+    claim = database.claim_wallet_effect(
+        operation_id=contract["operation_id"],
+        source_coin_ids=[source],
+        fee_coin_ids=[fee],
+    )
+    operation = database.prepare_coin_prep_operation(
+        operation_kind="combine",
+        purpose="replacement",
+        source_coin_ids=[source],
+        target_contract=target,
+        wallet_identity_json=identity,
+        evidence_json={"pre_view_coin_ids": [source, fee]},
+        effect_claim_token=claim["claim_token"],
+        effect_claim_generation=claim["generation"],
+    )["operation"]
+    assert database.retain_wallet_effect_claim_for_reconciliation(
+        claim["claim_token"],
+        claim["generation"],
+        reason_code="DIRECT_BATCH_FEE_APPROVAL_FAILED",
+    )
+    database.close_connection()
+    database._db_initialized_path = ""
+    database.init_database()
+    if journal_outcome == "SUBMITTED_UNKNOWN":
+        database.record_coin_prep_operation_outcome(
+            operation["operation_id"],
+            outcome="SUBMITTED_UNKNOWN",
+            evidence_json={
+                "reason_code": "authoritative_observation_unavailable",
+                "effect_claim_token": claim["claim_token"],
+                "effect_claim_generation": claim["generation"],
+                "dispatch_outcome": "PREPARED",
+            },
+        )
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:00.000000Z",
+        "expires_at": "2026-08-21T12:00:15.000000Z",
+        "selectable_coin_ids": sorted([source, fee]),
+        "pending_transaction_ids": [],
+    }
+    assert not database.recover_coin_prep_predispatch_no_effect(
+        operation["operation_id"], {**view, "selectable_coin_ids": [source]}
+    )
+    assert not database.recover_coin_prep_predispatch_no_effect(
+        operation["operation_id"],
+        {**view, "pending_transaction_ids": [hashlib.sha256(b"pending").hexdigest()]},
+    )
+    assert not database.recover_coin_prep_predispatch_no_effect(
+        operation["operation_id"],
+        {
+            **view,
+            "observed_at": "2026-08-21T11:59:44.000000Z",
+            "expires_at": "2026-08-21T11:59:59.000000Z",
+        },
+    )
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    import coin_prep_worker
+
+    worker = coin_prep_worker.CoinPrepWorker.__new__(coin_prep_worker.CoinPrepWorker)
+    worker.log = lambda *_args, **_kwargs: None
+    assert worker._recover_coin_prep_operations_read_only(
+        lambda _operation: {"no_effect_view": view}
+    )
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert database.get_recoverable_coin_prep_operations() == []
+    assert {coin["coin_id"] for coin in database.get_free_coins("cat")} == {
+        database.norm_coin_id(source)
+    }
+    assert {coin["coin_id"] for coin in database.get_free_coins("xch")} == {
+        database.norm_coin_id(fee)
+    }
+    retry = database.claim_wallet_effect(
+        operation_id=contract["operation_id"],
+        source_coin_ids=[source],
+        fee_coin_ids=[fee],
+    )
+    assert retry is not None
+    with pytest.raises(ValueError, match="different durable contract"):
+        database.prepare_coin_prep_operation(
+            operation_kind="combine",
+            purpose="replacement",
+            source_coin_ids=[source],
+            target_contract=target,
+            wallet_identity_json=identity,
+            evidence_json={"pre_view_coin_ids": [source, fee]},
+            effect_claim_token=retry["claim_token"],
+            effect_claim_generation=retry["generation"],
+        )
+    assert database.retain_wallet_effect_claim_for_reconciliation(
+        retry["claim_token"],
+        retry["generation"],
+        reason_code=persist_failure,
+    )
+    if intervening_startup:
+        database._reassert_unresolved_wallet_effect_claims(database.get_connection())
+        assert database.get_runtime_safety_latch()["reason_code"] == (
+            "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED"
+        )
+    conn = database.get_connection()
+    if recovery_fault == "prior_effect":
+        conn.execute(
+            "UPDATE coin_prep_operations SET outcome_evidence_json="
+            "json_set(outcome_evidence_json, '$.effect_attempted', json('true')) "
+            "WHERE operation_id=?",
+            (contract["operation_id"],),
+        )
+    elif recovery_fault == "identity":
+        conn.execute(
+            "UPDATE coin_prep_operations SET wallet_identity_json="
+            "json_set(wallet_identity_json, '$.network_id', 'testnet11') "
+            "WHERE operation_id=?",
+            (contract["operation_id"],),
+        )
+    elif recovery_fault == "reason":
+        conn.execute("UPDATE runtime_safety_latch SET reason='unrelated failure'")
+    conn.commit()
+    if recovery_fault is not None:
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 0
+        assert database.get_runtime_safety_latch()["state"] == "tripped"
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+                (retry["claim_token"],),
+            ).fetchone()[0]
+            == 0
+        )
+        return
+    if intervening_startup:
+        database.close_connection()
+        database._db_initialized_path = ""
+        database.init_database()
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 0
+    else:
+        assert database.recover_coin_prep_predispatch_retry_collisions() == 1
+    resolution = (
+        database.get_connection()
+        .execute(
+            "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (retry["claim_token"],),
+        )
+        .fetchone()
+    )
+    assert resolution[0] == "RELEASED_NO_EFFECT"
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
 
 
 def test_prepared_operation_must_bind_active_effect_claim_and_fences_capacity(

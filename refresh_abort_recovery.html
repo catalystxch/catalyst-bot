@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CATalyst | Fenced offer recovery</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101723; color: #f2f5fa; }
+    main { max-width: 880px; margin: 3rem auto; padding: 0 1.25rem; }
+    h1 { font-size: 1.8rem; }
+    p { line-height: 1.5; }
+    .notice { padding: 1rem; border: 1px solid #e7b44d; border-radius: .6rem; background: #332817; }
+    dl { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: .7rem; }
+    dt { color: #a9bacd; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    button { padding: .7rem 1rem; background: #385d8a; border: 0; border-radius: .4rem; color: white; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    code { overflow-wrap: anywhere; }
+    @media (max-width: 560px) { dl { grid-template-columns: 1fr; gap: .2rem; } dd { margin-bottom: .7rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fenced offer recovery</h1>
+    <p class="notice">Trading remains stopped. This page can recover only the fenced offer lineage shown below. A replacement may already have been broadcast, so recovery requires proof that every active wallet offer is cancelled. Each cancellation needs a fresh wallet and safety check and a separate confirmation.</p>
+    <button type="button" id="refresh">Refresh proof</button>
+    <p id="status" role="status" aria-live="polite">Reading recovery state…</p>
+    <dl>
+      <dt>Stage</dt><dd id="stage">—</dd>
+      <dt>Wallet</dt><dd id="wallet">—</dd>
+      <dt>Asset</dt><dd id="asset">—</dd>
+      <dt>Safety</dt><dd id="safety">—</dd>
+      <dt>Lease owned</dt><dd id="lease">—</dd>
+      <dt>Pending transactions</dt><dd id="pending">—</dd>
+      <dt>Sage active offers</dt><dd id="offers">—</dd>
+      <dt>Last observation</dt><dd id="observed">—</dd>
+    </dl>
+    <h2>Exact cleanup</h2>
+    <p id="scope">No fenced cleanup is ready.</p>
+    <label id="campaignRow" hidden>Stopped campaign
+      <select id="campaign"></select>
+    </label>
+    <div id="feeRow" hidden>
+      <p id="feeEstimate">—</p>
+      <label>Maximum total fee (XCH) <input id="feeMaximum" inputmode="decimal" autocomplete="off"></label>
+      <label>Cancellation reserve (XCH) <input id="feeReserve" inputmode="decimal" autocomplete="off"></label>
+    </div>
+    <p><button type="button" id="advance" disabled>Review exact recovery</button></p>
+  </main>
+  <script>
+    const fields = Object.fromEntries(
+      ['stage', 'wallet', 'asset', 'safety', 'lease', 'pending', 'offers', 'observed', 'status']
+        .map(key => [key, document.getElementById(key)])
+    );
+    const button = document.getElementById('refresh');
+    const advance = document.getElementById('advance');
+    const campaignRow = document.getElementById('campaignRow');
+    const campaignSelect = document.getElementById('campaign');
+    const feeRow = document.getElementById('feeRow');
+    const feeMaximum = document.getElementById('feeMaximum');
+    const feeReserve = document.getElementById('feeReserve');
+    const feeEstimate = document.getElementById('feeEstimate');
+    let proof = null;
+    let feeQuote = null;
+    let nextAction = null;
+    const show = (key, value) => { fields[key].textContent = String(value ?? '—'); };
+    const asXch = value => {
+      const mojos = BigInt(String(value));
+      const whole = mojos / 1000000000000n;
+      const fraction = (mojos % 1000000000000n).toString().padStart(12, '0').replace(/0+$/, '');
+      return `${whole}${fraction ? '.' + fraction : ''}`;
+    };
+    const asMojos = value => {
+      if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,12})?$/.test(value)) throw new Error('Enter an exact XCH amount with at most 12 decimals.');
+      const [whole, fraction = ''] = value.split('.');
+      return (BigInt(whole) * 1000000000000n + BigInt(fraction.padEnd(12, '0'))).toString();
+    };
+    async function postExact(action, body) {
+      const response = await fetch(`/api/offers/refresh_abort/${action}`, {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+        headers: {'Content-Type': 'application/json', Accept: 'application/json'},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok || data.success !== true) throw new Error(data.error || data.reason || data.stage || 'Exact recovery unavailable');
+      return data;
+    }
+    const abortScope = data => ({
+      abort_id: data.abort.abort_id,
+      expected_latch_generation: data.abort.latch_generation,
+      expected_trade_ids: data.wallet.active_trade_ids
+    });
+    function renderAction(data) {
+      proof = data;
+      feeQuote = null;
+      nextAction = null;
+      feeRow.hidden = true;
+      campaignRow.hidden = true;
+      advance.disabled = true;
+      const trades = data.wallet?.active_trade_ids;
+      const ready = data.safety?.lease_owned === true && data.safety?.state === 'tripped'
+        && data.wallet?.pending_transaction_count === 0 && Array.isArray(trades);
+      document.getElementById('scope').textContent = data.abort
+        ? `Abort ${data.abort.abort_id} · campaign ${data.abort.campaign_id} · ${trades.length} active Sage offers${data.candidate?.published_cleanup ? ' · replacement potentially public' : ''}`
+        : data.candidate
+          ? `Submitted parent ${data.candidate.parent_intent_id} · replacement ${data.candidate.published_cleanup ? 'dispatched to a provider; potentially public' : 'has no completed provider dispatch'}`
+          : 'No exact fenced cleanup candidate.';
+      if (!ready) return;
+      if (data.stage === 'submitted_parent_proof' && data.candidate) {
+        const campaigns = data.stopped_campaigns || [];
+        campaignSelect.replaceChildren();
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Choose the reviewed stopped campaign';
+        campaignSelect.append(placeholder);
+        for (const campaign of campaigns) {
+          const option = document.createElement('option');
+          option.value = campaign.campaign_id;
+          option.textContent = `${campaign.campaign_id} · fee budget ${campaign.fee_budget_xch} XCH`;
+          campaignSelect.append(option);
+        }
+        campaignRow.hidden = false;
+        nextAction = 'begin';
+        advance.textContent = 'Verify parent cancellation';
+        advance.disabled = true;
+      } else if (data.stage === 'fenced' && data.abort && data.candidate) {
+        nextAction = 'retry_parent_proof';
+        advance.textContent = 'Retry submitted parent proof';
+        advance.disabled = false;
+      } else if (data.abort && data.stage === 'parent_terminal') {
+        if (data.next_target_journal) {
+          nextAction = 'reconcile_target';
+          advance.textContent = 'Check submitted cancellation proof';
+        } else if (data.next_expired_target_trade_id) {
+          nextAction = 'prove_expiry';
+          advance.textContent = 'Check natural expiry proof';
+        } else if (trades.length === 0) {
+          nextAction = 'complete';
+          advance.textContent = 'Verify empty book and complete recovery';
+        } else {
+          const campaign = (data.stopped_campaigns || []).find(c => c.campaign_id === data.abort.campaign_id);
+          nextAction = campaign?.fee_approval_id ? 'cancel_next' : 'fee_preview';
+          advance.textContent = nextAction === 'cancel_next'
+            ? `Review cancellation of ${trades[0]}` : 'Review cancellation-only fee estimate';
+        }
+        advance.disabled = false;
+      }
+    }
+    async function refreshProof() {
+      button.disabled = true;
+      show('status', 'Reading recovery state…');
+      try {
+        const response = await fetch('/api/offers/refresh_abort/preview', {
+          credentials: 'same-origin', cache: 'no-store', headers: {Accept: 'application/json'}
+        });
+        const data = await response.json();
+        if (!response.ok || data.success !== true) throw new Error('Authoritative preview unavailable');
+        show('stage', data.stage);
+        show('wallet', `${data.wallet?.fingerprint ?? '—'} · ${data.wallet?.network ?? '—'}`);
+        show('asset', data.wallet?.asset_id);
+        show('safety', `${data.safety?.state ?? '—'} · ${data.safety?.reason_code ?? '—'}`);
+        show('lease', data.safety?.lease_owned === true ? 'Yes' : 'No');
+        show('pending', data.wallet?.pending_transaction_count);
+        show('offers', Array.isArray(data.wallet?.active_trade_ids)
+          ? data.wallet.active_trade_ids.join('\n') || 'None' : 'Unavailable');
+        show('observed', data.wallet?.observed_at);
+        renderAction(data);
+        show('status', 'Exact proof loaded. Review the next action before proceeding.');
+      } catch (_) {
+        proof = null;
+        nextAction = null;
+        advance.disabled = true;
+        feeRow.hidden = true;
+        campaignRow.hidden = true;
+        show('status', 'Recovery proof is unavailable. Trading remains stopped.');
+        for (const key of ['stage', 'wallet', 'asset', 'safety', 'lease', 'pending', 'offers', 'observed']) show(key, 'Unavailable');
+      } finally {
+        button.disabled = false;
+      }
+    }
+    campaignSelect.addEventListener('change', () => {
+      advance.disabled = nextAction !== 'begin' || !campaignSelect.value;
+    });
+    advance.addEventListener('click', async () => {
+      if (!proof || !nextAction || advance.disabled) return;
+      advance.disabled = true;
+      try {
+        const action = nextAction;
+        if (action === 'begin' || action === 'retry_parent_proof') {
+          const campaignId = action === 'begin' ? campaignSelect.value : proof.abort.campaign_id;
+          if (!window.confirm(`Verify the submitted parent for only campaign ${campaignId}?`)) return;
+          await postExact('begin', {
+            confirmation: true,
+            parent_intent_id: proof.candidate.parent_intent_id,
+            child_intent_id: proof.candidate.child_intent_id,
+            campaign_id: campaignId,
+            expected_latch_generation: proof.safety.generation,
+            expected_trade_ids: proof.wallet.active_trade_ids,
+            published_cleanup: proof.candidate.published_cleanup === true
+          });
+        } else if (action === 'fee_preview') {
+          feeQuote = await postExact('fee_preview', abortScope(proof));
+          if (feeQuote.preparation_transaction_count_min !== 0) throw new Error('Cancellation-only quote unavailable');
+          feeMaximum.value = asXch(feeQuote.suggested_maximum_fee_mojos);
+          feeReserve.value = asXch(feeQuote.minimum_cancellation_reserve_mojos);
+          feeEstimate.textContent = `Cancellation only: zero preparation transactions. Suggested maximum ${feeMaximum.value} XCH; minimum cancellation reserve ${feeReserve.value} XCH.`;
+          feeRow.hidden = false;
+          nextAction = 'fee_approval';
+          advance.textContent = 'Approve cancellation fee budget';
+          show('status', 'Review the exact fee amounts, then approve this campaign only.');
+          return;
+        } else if (action === 'fee_approval') {
+          if (!feeQuote || !window.confirm('Approve this cancellation-only fee budget for the displayed campaign? No coins will be prepared.')) return;
+          await postExact('fee_approval', {
+            ...abortScope(proof), confirmation: true, preview_id: feeQuote.preview_id,
+            maximum_fee_mojos: asMojos(feeMaximum.value),
+            cancellation_reserve_mojos: asMojos(feeReserve.value)
+          });
+        } else if (action === 'cancel_next') {
+          const target = proof.wallet.active_trade_ids[0];
+          const campaign = proof.stopped_campaigns.find(c => c.campaign_id === proof.abort.campaign_id);
+          if (!window.confirm(`Cancel only Sage offer ${target}? This is a wallet transaction and may incur a fee.`)) return;
+          await postExact('cancel_next', {
+            ...abortScope(proof), confirmation: true, expected_next_trade_id: target,
+            fee_approval_id: campaign.fee_approval_id
+          });
+        } else if (action === 'reconcile_target') {
+          await postExact('reconcile_target', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            trade_id: proof.next_target_journal.trade_id
+          });
+        } else if (action === 'prove_expiry') {
+          await postExact('reconcile_target', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            trade_id: proof.next_expired_target_trade_id
+          });
+        } else if (action === 'complete') {
+          if (!window.confirm('Verify the empty Sage book and complete only this fenced recovery?')) return;
+          await postExact('complete', {
+            abort_id: proof.abort.abort_id,
+            expected_latch_generation: proof.abort.latch_generation,
+            confirmation: true
+          });
+        }
+        await refreshProof();
+      } catch (error) {
+        show('status', `Action held: ${error.message}. Refresh proof before retrying.`);
+        nextAction = null;
+      } finally {
+        advance.disabled = !nextAction || (nextAction === 'begin' && !campaignSelect.value);
+      }
+    });
+    button.addEventListener('click', refreshProof);
+    refreshProof();
+  </script>
+</body>
+</html>

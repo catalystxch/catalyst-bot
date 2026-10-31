@@ -368,6 +368,55 @@ class TestCancelAllConfirmed(_TempDB):
         self.assertEqual([group["trade_ids"] for group in groups], [[first], [second]])
         self.assertNotEqual(groups[0]["campaign_id"], groups[1]["campaign_id"])
 
+    def test_cancel_all_defers_follow_until_ordinary_cohort_is_terminal(self):
+        ordinary_id, follow_id = "a" * 64, "b" * 64
+        run_id = "c" * 64
+        _add_offer(follow_id)
+
+        def wallet_row(trade_id):
+            return {
+                "trade_id": trade_id,
+                "status": "PENDING_ACCEPT",
+                "summary": {"offered": {"xch": 1000}, "requested": {_ASSET: 100}},
+            }
+
+        wallet_rows = [wallet_row(ordinary_id), wallet_row(follow_id)]
+        calls = []
+
+        def history(**_kwargs):
+            return {
+                "success": True,
+                "offers": wallet_rows,
+                "total": len(wallet_rows),
+                "end_of_history": True,
+            }
+
+        def cancel_ids(trade_ids, **kwargs):
+            calls.append((tuple(trade_ids), kwargs))
+            return {trade_id: {"success": True} for trade_id in trade_ids}
+
+        with (
+            patch.object(_om_mod, "cfg", _fake_cfg()),
+            patch.object(
+                _db,
+                "get_offer_intent_by_trade_id",
+                side_effect=lambda tid: {
+                    "purpose": f"follow:{run_id}:normal_lifecycle"
+                    if tid == follow_id
+                    else "normal_lifecycle"
+                },
+            ),
+            patch.object(OfferManager, "cancel_offers", side_effect=cancel_ids),
+            patch("wallet.get_authoritative_offer_history", side_effect=history),
+        ):
+            manager = OfferManager()
+            manager.cancel_all(cat_asset_id=_ASSET)
+            self.assertEqual(calls[0][0], (ordinary_id,))
+            wallet_rows[:] = [wallet_row(follow_id)]
+            manager.cancel_all(cat_asset_id=_ASSET)
+            self.assertEqual(calls[1][0], (follow_id,))
+            self.assertEqual(calls[1][1]["reason"], "cancel_all")
+
 
 # ---------------------------------------------------------------------------
 # 2. cancel_all() — pending-cancel path (submitted but not confirmed)

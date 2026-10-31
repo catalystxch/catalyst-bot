@@ -121,6 +121,62 @@ def test_manual_fee_mode_cannot_bypass_unavailable_network_estimate(
     assert utils._counts()["coin_prep_operations"] == 0
 
 
+def test_unavailable_pricing_identifies_provider_failure_without_raw_details(
+    approved, monkeypatch
+):
+    monkeypatch.setattr(
+        import_module("coin_prep_fee_pricing"),
+        "quote_fee",
+        lambda *_args, **_kwargs: {
+            "available": False,
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+            "raw": "private provider response",
+        },
+    )
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["diagnostic_stage"] == "unsigned_pricing"
+    assert result["provider_failures"] == [
+        {
+            "source": "coinset",
+            "reason": "fee_provider_rate_limited",
+            "observed_at": 1000,
+        }
+    ]
+    assert "private provider response" not in str(result)
+    assert utils._counts()["wallet_effect_claims"] == 0
+
+
+def test_quote_expiry_after_inventory_recheck_has_distinct_diagnostic(
+    approved, monkeypatch
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1060
+        return result
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    result = _price(approved)
+    assert result["available"] is False
+    assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
+    assert result["diagnostic_stage"] == "post_inventory_quote_recheck"
+    assert result["quote_timing"] == {
+        "observed_at": 1000,
+        "expires_at": 1060,
+        "checked_at": 1060,
+    }
+    assert utils._counts()["wallet_effect_claims"] == 0
+
+
 def test_configuration_changed_while_building_unsigned_bundle_cannot_be_priced(
     approved, monkeypatch
 ):
@@ -279,6 +335,18 @@ def test_different_operation_cannot_inherit_valid_unsigned_fee(exact_journal):
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
+def test_different_attempt_cannot_inherit_prepared_journal_fee(exact_journal):
+    boundary = import_module("coin_prep_fee_dispatch").reserve_approved_prep_dispatch
+    with pytest.raises(ValueError, match="FEE_DISPATCH_PLAN_MISMATCH"):
+        boundary(
+            approval_id=exact_journal["approval"]["approval_id"],
+            operation_id=exact_journal["operation_id"],
+            priced_batch=exact_journal["priced"],
+            attempt_id="1" * 32,
+        )
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
 def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journal):
     account = exact_journal["approval"]
     database.reserve_approved_fee(
@@ -393,4 +461,61 @@ def test_new_reserve_designation_is_checked_inside_atomic_hold(
     )
     with pytest.raises(ValueError, match="FEE_EFFECT_NOT_DISPATCHABLE"):
         _reserve(exact_journal)
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
+@pytest.mark.parametrize(
+    "refreshed_fee, expected",
+    [(20, True), (21, False), (None, False), ("exception", False), ("short", False)],
+)
+def test_slow_inventory_read_refreshes_exact_quote_without_resizing_plan(
+    approved, monkeypatch, refreshed_fee, expected
+):
+    service = import_module("coin_prep_fee_dispatch")
+    original = service.read_approved_prep_fee_snapshot
+    calls = 0
+
+    def slow_read(approval_id):
+        nonlocal calls
+        result = original(approval_id)
+        calls += 1
+        if calls == 2:
+            approved["now"] = 1051
+        return result
+
+    def fresh_quote(cost, target_seconds, *, force_refresh=False):
+        assert force_refresh is True
+        if refreshed_fee is None:
+            return {"available": False}
+        if refreshed_fee == "exception":
+            raise TimeoutError("private transport details")
+        if refreshed_fee == "short":
+            return {
+                "available": True,
+                "source": "coinset",
+                "cost": cost,
+                "target_seconds": target_seconds,
+                "fee_mojos": 20,
+                "observed_at": 1001,
+                "expires_at": 1061,
+            }
+        return {
+            "available": True,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "fee_mojos": refreshed_fee,
+            "observed_at": 1051,
+            "expires_at": 1111,
+        }
+
+    monkeypatch.setattr(service, "read_approved_prep_fee_snapshot", slow_read)
+    monkeypatch.setattr(import_module("fee_estimation"), "quote_fee", fresh_quote)
+    result = _price(approved)
+    assert result["available"] is expected
+    if expected:
+        assert result["pricing"]["quote"]["observed_at"] == 1051
+        assert result["pricing"]["plan"].fee_mojos == 20
+        assert result["approval"]["remaining_preparation_fee_mojos"] == 40
+    assert utils._counts()["wallet_effect_claims"] == 0
     assert utils._counts()["approved_fee_reservations"] == 0

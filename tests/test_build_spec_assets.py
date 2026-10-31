@@ -16,3 +16,12 @@ def test_pyinstaller_spec_bundles_gui_asset_references():
         if (root / "assets" / asset).is_file() and asset not in spec
     )
     assert missing == []
+
+
+def test_pyinstaller_spec_bundles_restricted_recovery_page():
+    root = Path(__file__).resolve().parents[1]
+    spec = (root / "catalyst.spec").read_text(encoding="utf-8")
+    recovery_page = root / "refresh_abort_recovery.html"
+
+    assert recovery_page.is_file()
+    assert "(os.path.join(_HERE, 'refresh_abort_recovery.html'), '.')" in spec

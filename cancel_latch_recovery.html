@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CATalyst | Review confirmed cancellations</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101723; color: #f2f5fa; }
+    main { max-width: 900px; margin: 2.5rem auto; padding: 0 1.25rem; }
+    h1 { font-size: 1.8rem; }
+    p { line-height: 1.5; }
+    .notice { padding: 1rem; border: 1px solid #e7b44d; border-radius: .6rem; background: #332817; }
+    dl { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: .7rem; }
+    dt { color: #a9bacd; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    button { padding: .7rem 1rem; margin: .5rem .5rem .5rem 0; background: #385d8a; border: 0; border-radius: .4rem; color: white; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    li { overflow-wrap: anywhere; margin: .6rem 0; }
+    @media (max-width: 640px) { dl { grid-template-columns: 1fr; gap: .2rem; } dd { margin-bottom: .7rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Review confirmed cancellations</h1>
+    <p class="notice">Trading stays stopped in this recovery session. Review the exact wallet, cancelled offers, and safety generation before confirming. Checking submitted cancellations records verified local terminal proof and may resolve this database safety latch. It sends no wallet transaction. Restart CATalyst separately after reviewing the result.</p>
+    <button type="button" id="refresh">Refresh exact proof</button>
+    <button type="button" id="checkSubmitted" disabled>Confirm database-only cancellation recovery</button>
+    <button type="button" id="confirm" disabled>Confirm database-only latch release</button>
+    <p id="status" role="status" aria-live="polite">Checking Sage and local proof…</p>
+    <dl>
+      <dt>Wallet fingerprint</dt><dd id="wallet">—</dd>
+      <dt>Network</dt><dd id="network">—</dd>
+      <dt>Safety generation</dt><dd id="generation">—</dd>
+      <dt>Review digest</dt><dd id="digest">—</dd>
+    </dl>
+    <h2>Exact cancelled offers</h2>
+    <ul id="proofs"></ul>
+  </main>
+  <script>
+    const refreshButton = document.getElementById('refresh');
+    const confirmButton = document.getElementById('confirm');
+    const checkButton = document.getElementById('checkSubmitted');
+    const status = document.getElementById('status');
+    let reviewed = null;
+    let submittedScope = null;
+
+    async function readJson(path, options) {
+      const response = await fetch(path, {
+        credentials: 'same-origin', cache: 'no-store',
+        headers: {Accept: 'application/json', ...(options?.headers || {})},
+        ...options
+      });
+      const data = await response.json();
+      if (!response.ok || data?.success !== true) {
+        throw new Error(data?.reason_code || data?.error || 'Exact proof unavailable');
+      }
+      return data;
+    }
+
+    async function refresh() {
+      reviewed = null;
+      submittedScope = null;
+      confirmButton.disabled = true;
+      checkButton.disabled = true;
+      refreshButton.disabled = true;
+      status.textContent = 'Rechecking the wallet, pending transactions, journal, and Sage offers…';
+      document.getElementById('proofs').replaceChildren();
+      try {
+        const data = await readJson('/api/safety/cancel-latch-review');
+        const review = data.review;
+        if (review?.ready === false
+            && review.reason_code === 'CANCELLATION_PROOF_INCOMPLETE'
+            && Number.isInteger(review.generation)
+            && Array.isArray(review.operation_ids)
+            && review.operation_ids.length > 0
+            && /^[0-9a-f]{64}$/.test(review.scope_digest || '')) {
+          document.getElementById('wallet').textContent = String(review.wallet_fingerprint);
+          document.getElementById('network').textContent = String(review.network);
+          document.getElementById('generation').textContent = String(review.generation);
+          const proofs = document.getElementById('proofs');
+          for (const operationId of review.operation_ids) {
+            const item = document.createElement('li');
+            item.textContent = `${operationId}: submitted cancellation awaiting local proof`;
+            proofs.append(item);
+          }
+          submittedScope = review;
+          checkButton.disabled = false;
+          status.textContent = 'Sage reports these cancellations complete. Confirm the exact database-only recovery; no new cancellation will be sent.';
+          return;
+        }
+        if (review?.ready !== true || !Array.isArray(review.proofs)
+            || review.proofs.length !== review.operation_ids?.length) {
+          throw new Error(review?.reason_code || 'CANCELLATION_PROOF_INCOMPLETE');
+        }
+        document.getElementById('wallet').textContent = String(review.wallet_fingerprint);
+        document.getElementById('network').textContent = String(review.network);
+        document.getElementById('generation').textContent = String(review.generation);
+        document.getElementById('digest').textContent = String(review.review_digest);
+        const proofs = document.getElementById('proofs');
+        for (const proof of review.proofs) {
+          const item = document.createElement('li');
+          item.textContent = `${proof.operation_id}: ${proof.outcome}, Sage ${proof.sage_status}, evidence ${proof.evidence_sha256}`;
+          proofs.append(item);
+        }
+        reviewed = review;
+        status.textContent = `${review.proofs.length} exact cancellations proven. Trading remains stopped.`;
+        confirmButton.disabled = false;
+      } catch (error) {
+        status.textContent = `Review refused: ${error.message}. Keep trading stopped.`;
+      } finally {
+        refreshButton.disabled = false;
+      }
+    }
+
+    async function checkSubmitted() {
+      if (!submittedScope || checkButton.disabled) return;
+      const exact = submittedScope;
+      const approved = window.confirm(
+        `Wallet ${exact.wallet_fingerprint}, ${exact.network}\n` +
+        `Safety generation ${exact.generation}\n` +
+        `${exact.operation_ids.join('\n')}\n\n` +
+        'Confirm database-only recovery of these submitted cancellations? Verified Task 9 proof may resolve this safety latch. No new wallet transaction will be sent. Trading remains stopped.'
+      );
+      if (!approved) return;
+      submittedScope = null;
+      checkButton.disabled = true;
+      refreshButton.disabled = true;
+      status.textContent = 'Checking the exact submitted cancellations against Sage…';
+      let recovered = false;
+      try {
+        const result = await readJson('/api/safety/check-submitted-cancellations', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            expected_generation: exact.generation,
+            operation_ids: exact.operation_ids,
+            scope_digest: exact.scope_digest
+          })
+        });
+        if (result.recovered !== true || result.generation !== exact.generation) {
+          throw new Error('CANCELLATION_RECOVERY_INCOMPLETE');
+        }
+        status.textContent = 'Exact local cancellations proven and database safety latch resolved. Trading remains stopped. Close this session and review startup before any restart.';
+        recovered = true;
+        confirmButton.disabled = true;
+        return;
+      } catch (error) {
+        status.textContent = `Proof check refused: ${error.message}. Trading remains stopped.`;
+      } finally {
+        refreshButton.disabled = recovered;
+      }
+      await refresh();
+    }
+
+    async function confirmRelease() {
+      if (!reviewed || confirmButton.disabled) return;
+      const exact = reviewed;
+      const approved = window.confirm(
+        `Wallet ${exact.wallet_fingerprint}, ${exact.network}\n` +
+        `Safety generation ${exact.generation}\n` +
+        `${exact.operation_ids.join('\n')}\n\n` +
+        'Confirm database-only latch release? No wallet transaction will be sent. Trading remains stopped.'
+      );
+      if (!approved) return;
+      reviewed = null;
+      confirmButton.disabled = true;
+      refreshButton.disabled = true;
+      status.textContent = 'Rechecking exact proof before local safety release…';
+      try {
+        const result = await readJson('/api/safety/confirm-cancel-latch-review', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            expected_generation: exact.generation,
+            review_digest: exact.review_digest
+          })
+        });
+        status.textContent = result.released === true
+          ? 'Local safety latch released. Trading remains stopped. Close this session and review startup before any restart.'
+          : 'Release refused. Refresh the exact proof.';
+      } catch (error) {
+        status.textContent = `Release refused: ${error.message}. Refresh the exact proof.`;
+      } finally {
+        refreshButton.disabled = false;
+      }
+    }
+
+    refreshButton.addEventListener('click', refresh);
+    checkButton.addEventListener('click', checkSubmitted);
+    confirmButton.addEventListener('click', confirmRelease);
+    refresh();
+  </script>
+</body>
+</html>

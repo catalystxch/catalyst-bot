@@ -1443,6 +1443,7 @@ def _get_sage_connection(timeout: int = 10):
         try:
             sock = getattr(conn, "sock", None)
             if sock is not None:
+                sock.settimeout(timeout)
                 conn.timeout = timeout
                 return conn
         except Exception:
@@ -4872,6 +4873,20 @@ def cancel_offer(
         )
     )
 
+    # A secure cancellation must have a relay fee. If an explicitly planned
+    # bulk fee cannot be funded, never silently submit a zero-fee single
+    # cancellation and leave its offer pending behind a safety latch.
+    if secure and resolved_fee <= 0:
+        return cancellation_result(
+            CANCEL_FAILED,
+            method="single_rpc",
+            raw_response={
+                "success": False,
+                "error_code": "FEE_CANCELLATION_FUNDING_REQUIRED",
+            },
+            error="FEE_CANCELLATION_FUNDING_REQUIRED",
+        )
+
     payload = {
         "offer_id": trade_id,  # Sage uses offer_id, not trade_id
         "fee": str(int(resolved_fee)),  # REQUIRED — Sage 422s without fee field
@@ -5812,12 +5827,23 @@ def build_cancel_offers_batch_unsigned(
         and not cancel_result.get("error")
         and cancel_result.get("coin_spends")
     ):
-        return cancel_result
+        return (
+            {
+                **cancel_result,
+                "_catalyst_cancel_pricing_stage": "cancel_component",
+            }
+            if type(cancel_result) is dict
+            else cancel_result
+        )
 
-    def _seal_unsigned(result):
+    def _seal_unsigned(result, *, stage):
         cost = estimate_unsigned_transaction_cost(result)
         if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
-            return {"success": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            return {
+                "success": False,
+                "reason": "FEE_UNSIGNED_COST_UNAVAILABLE",
+                "_catalyst_cancel_pricing_stage": stage,
+            }
         sealed_result = dict(result)
         sealed_result["_catalyst_validated_cancel_unsigned"] = True
         sealed_result["_catalyst_exact_unsigned_cost"] = cost
@@ -5837,7 +5863,7 @@ def build_cancel_offers_batch_unsigned(
     # manufacture an empty fee transaction or consume the protected fee coin
     # merely to discover the cancellation bundle's exact CLVM cost.
     if fee_mojos == 0:
-        return _seal_unsigned(cancel_result)
+        return _seal_unsigned(cancel_result, stage="cancel_cost")
 
     if _identity_recheck is not None:
         _identity_recheck("cancel_offers:fee_build")
@@ -5863,7 +5889,14 @@ def build_cancel_offers_batch_unsigned(
         and not fee_result.get("error")
         and fee_result.get("coin_spends")
     ):
-        return fee_result
+        return (
+            {
+                **fee_result,
+                "_catalyst_cancel_pricing_stage": "fee_component",
+            }
+            if type(fee_result) is dict
+            else fee_result
+        )
 
     combined = {
         "summary": {
@@ -5880,8 +5913,15 @@ def build_cancel_offers_batch_unsigned(
         [*normalized_source_ids, normalized_fee_coin_id],
     )
     if type(combined) is not dict or combined.get("success") is False:
-        return combined
-    return _seal_unsigned(combined)
+        return (
+            {
+                **combined,
+                "_catalyst_cancel_pricing_stage": "combined_component",
+            }
+            if type(combined) is dict
+            else combined
+        )
+    return _seal_unsigned(combined, stage="combined_cost")
 
 
 def cancel_offers_batch(

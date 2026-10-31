@@ -191,6 +191,9 @@ class _DummySplashManager:
     def queue_post(self, *args, **kwargs):
         pass
 
+    def set_peer_readiness_provider(self, provider):
+        self.peer_readiness_provider = provider
+
     def flush_queue(self):
         return {"posted": 0, "failed": 0, "skipped": 0}
 
@@ -200,7 +203,8 @@ class _DummySplashManager:
 
 
 class _DummySplashNode:
-    pass
+    def get_metrics(self):
+        return {"reachable": False, "peers": 0}
 
 
 class _DummyCoinsetClient:
@@ -412,6 +416,13 @@ class ProbeAnchorTests(unittest.TestCase):
             bot_loop.BotLoop, "_enter_runtime_effect_phase", return_value=True
         )
         self._effect_gate_patcher.start()
+        # Probe arithmetic starts after durable Follow authorization; its
+        # positive and negative policy cases live in the authority suites.
+        authority = patch.object(
+            bot_loop.BotLoop, "_require_follow_creation_run_id", return_value="f" * 64
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
 
     def tearDown(self):
         self._effect_gate_patcher.stop()

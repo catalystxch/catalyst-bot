@@ -10,6 +10,7 @@ import database
 import offer_manager
 import pytest
 from offer_manager import assess_offer_book_candidate, book_opportunity_size_cap
+from ladder_sizing import ladder_price_for_slot
 
 
 ASSET_ID = "b8" * 32
@@ -97,6 +98,45 @@ def test_candidate_requires_valid_exact_snapshot_evidence():
         assert result["eligible"] is False
 
 
+def test_red_candidate_rechecks_fresh_scoped_view_before_price_assessment():
+    from confidence_override import ConsentedConfidence
+
+    prices = (Decimal("0.099"), Decimal("0.101"), Decimal("0.103"))
+    fresh = ConsentedConfidence(
+        _confidence(state="RED", data_valid=False),
+        lambda: True,
+        prices,
+    )
+    aged = ConsentedConfidence(
+        _confidence(
+            state="RED",
+            data_valid=False,
+            derived_at=NOW - timedelta(seconds=21),
+        ),
+        lambda: True,
+        prices,
+        current_view=lambda: fresh,
+    )
+    candidate = dict(
+        side="buy",
+        candidate_price=Decimal("0.1"),
+        size_xch=Decimal("1"),
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=0,
+        minimum_profit_xch=Decimal("0"),
+        now=NOW,
+    )
+    assert not assess_offer_book_candidate(**(candidate | {"confidence": aged}))[
+        "eligible"
+    ]
+    assert assess_offer_book_candidate(
+        **(
+            candidate
+            | {"confidence": offer_manager._current_candidate_confidence(aged)}
+        )
+    )["eligible"]
+
+
 def test_candidate_accepts_valid_restricted_single_provider_snapshot():
     result = assess_offer_book_candidate(
         side="buy",
@@ -130,6 +170,81 @@ def test_profitable_candidate_only_competes_when_it_improves_trusted_book():
 
     assert result["eligible"] is True
     assert result["improves_book"] is False
+
+
+def test_passive_red_ladder_keeps_all_24_prices_behind_the_observed_book():
+    from confidence_override import ConsentedConfidence
+
+    bid = Decimal("0.00005025")
+    ask = Decimal("0.00012000")
+    midpoint = Decimal("0.000075")
+    raw = _confidence(state="RED", data_valid=False)
+    scoped = ConsentedConfidence(raw, lambda: True, (bid, (bid + ask) / 2, ask))
+    prices = {}
+    for side in ("buy", "sell"):
+        inner = ladder_price_for_slot(0, side, midpoint, Decimal("0.126"), 24)
+        prices[side] = [
+            offer_manager.passive_red_ladder_price(
+                price=ladder_price_for_slot(slot, side, midpoint, Decimal("0.126"), 24),
+                inner_price=inner,
+                side=side,
+                confidence=scoped,
+                hard_min_price=Decimal("0.0000375"),
+                hard_max_price=Decimal("0.00015"),
+            )
+            for slot in range(24)
+        ]
+    assert len(set(prices["buy"])) == len(set(prices["sell"])) == 24
+    assert all(Decimal("0.0000375") <= p <= bid for p in prices["buy"])
+    assert all(ask <= p <= Decimal("0.00015") for p in prices["sell"])
+    assert (
+        offer_manager.passive_red_ladder_price(
+            price=Decimal("0.000043"),
+            inner_price=Decimal("0.000073"),
+            side="buy",
+            confidence=scoped,
+            hard_min_price=Decimal("0.000045"),
+            hard_max_price=Decimal("0.00015"),
+        )
+        is None
+    )
+
+
+def test_red_candidate_cannot_improve_book_after_price_or_coin_rounding(monkeypatch):
+    from confidence_override import ConsentedConfidence
+
+    bid, midpoint, ask = Decimal("0.099"), Decimal("0.101"), Decimal("0.103")
+    scoped = ConsentedConfidence(
+        _confidence(state="RED", data_valid=False),
+        lambda: True,
+        (bid, midpoint, ask),
+    )
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.09"))
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.11"))
+    candidate = dict(
+        side="buy",
+        size_xch=Decimal("1"),
+        confidence=scoped,
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=0,
+        minimum_profit_xch=Decimal("0"),
+        now=NOW,
+    )
+    passive = offer_manager.assess_passive_red_candidate(
+        **candidate, candidate_price=bid
+    )
+    improved = offer_manager.assess_passive_red_candidate(
+        **candidate, candidate_price=bid + Decimal("0.000000001")
+    )
+    assert passive["eligible"] is True
+    assert passive["improves_book"] is False
+    assert improved["eligible"] is False
+    assert improved["reason_code"] == "red_quote_would_improve_book"
+    outside = offer_manager.assess_passive_red_candidate(
+        **candidate, candidate_price=Decimal("0.089")
+    )
+    assert outside["eligible"] is False
+    assert outside["reason_code"] == "red_quote_outside_hard_price_band"
 
 
 def test_book_opportunity_size_is_exactly_bounded_by_size_and_confirmed_depth():
@@ -228,7 +343,7 @@ def test_all_production_ladder_paths_forward_current_confidence():
     create = inspect.getsource(bot_loop.BotLoop._create_offers_if_needed)
     manager_requote = inspect.getsource(offer_manager.OfferManager.requote_side)
 
-    assert "market_confidence=self._market_confidence_result" in cycle
-    assert "market_confidence=self._market_confidence_result" in requote
-    assert "market_confidence=self._market_confidence_result" in create
+    assert "market_confidence=self._effective_market_confidence(" in cycle
+    assert "market_confidence=self._effective_market_confidence(" in requote
+    assert "market_confidence=self._effective_market_confidence(" in create
     assert manager_requote.count("market_confidence=market_confidence") == 2

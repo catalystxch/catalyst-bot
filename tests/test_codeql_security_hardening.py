@@ -319,6 +319,10 @@ def test_bot_start_warnings_do_not_expose_exception_details(monkeypatch):
 
     with (
         api_mutations_permitted(api_server),
+        # Isolate warning redaction after the independently tested review gate.
+        patch.object(
+            bot_routes, "_reviewed_follow_start_readiness", return_value={"ready": True}
+        ),
         patch("database.list_active_bootstrap_campaigns_for_asset", return_value=[]),
         patch.object(
             bot_routes,
@@ -804,6 +808,26 @@ def test_parameterized_safety_record_requires_local_credential():
         handler.assert_not_called()
         allowed = client.get(
             path,
+            environ_base=loopback,
+            headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
+        )
+        assert allowed.status_code == 200
+        handler.assert_called_once()
+
+
+def test_refresh_abort_preview_requires_local_credential():
+    client, loopback = _api_client()
+    rule = next(
+        rule
+        for rule in api_server.app.url_map.iter_rules()
+        if rule.rule == "/api/offers/refresh_abort/preview"
+    )
+    handler = MagicMock(return_value={"probe": True})
+    with patch.dict(api_server.app.view_functions, {rule.endpoint: handler}):
+        assert client.get(rule.rule, environ_base=loopback).status_code == 401
+        handler.assert_not_called()
+        allowed = client.get(
+            rule.rule,
             environ_base=loopback,
             headers={"X-Bot-Local-Token": api_server._LOCAL_API_TOKEN},
         )

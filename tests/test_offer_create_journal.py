@@ -7,7 +7,7 @@ import hashlib
 import json
 import pickle
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +16,7 @@ import database
 import mutation_gate
 import offer_manager
 import wallet
+import bootstrap_fee_authority
 
 
 COIN_A = "a" * 64
@@ -534,6 +535,93 @@ def test_finalize_updates_selected_coin_reservation_only_for_proven_outcome(
     assert reservation["trade_id"] == (trade_id if expected_status == "bound" else None)
 
 
+def test_exact_no_effect_recovery_closes_only_unknown_creation_and_latch(
+    isolated_database,
+):
+    now = datetime.now(timezone.utc)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-test",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+        lease_expires_at=now + timedelta(minutes=5),
+        now=now,
+    )
+    assert lease["acquired"] is True
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    _prepare(intent_id="intent-a", operation_id="create:intent-a", coin_id=COIN_A)
+    database.finalize_offer_intent(
+        intent_id="intent-a",
+        operation_id="create:intent-a",
+        event_id="final:unknown-recovery",
+        lifecycle_state="creation_unknown",
+        outcome="UNKNOWN",
+        wallet_identity_json={"binding_digest": "d" * 64},
+        evidence_json={"effect_attempted": True},
+        reason_code="CREATE_RESPONSE_AMBIGUOUS",
+        finalized_at="2026-08-16T12:00:01Z",
+        finalize_selected_coin_reservations=True,
+    )
+    latch = database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["create:intent-a"],
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+        tripped_at="2026-08-16T12:00:02Z",
+    )
+    proof = {
+        "intent_id": "intent-a",
+        "operation_id": "create:intent-a",
+        "row_version": 1,
+        "latch_generation": latch["generation"],
+        "wallet_fingerprint_hash": "f" * 64,
+        "network": "mainnet",
+        "lease_owner_run_id": "run-test",
+        "lease_version": lease["lease"]["lease_version"],
+        "lease_owner_pid": os.getpid(),
+        "lease_owner_host": socket.gethostname(),
+        "selected_coin_id": COIN_A,
+        "requested_amount_atomic": 2000,
+        "sage_stable": [
+            123456789,
+            "mainnet",
+            42,
+            1.0,
+            "C:/Sage/sage-tauri.exe",
+            1000,
+            "xch",
+            "e" * 64,
+            2,
+        ],
+    }
+    proof["proof_digest"] = hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    bad = dict(proof, latch_generation=latch["generation"] + 1)
+    with pytest.raises(ValueError):
+        database.settle_no_effect_offer_creation(proof=bad)
+    assert (
+        database.get_offer_intent("intent-a")["lifecycle_state"] == "creation_unknown"
+    )
+    assert (
+        database.get_offer_intent_coin_reservations("intent-a")[0]["status"]
+        == "reserved"
+    )
+
+    result = database.settle_no_effect_offer_creation(proof=proof)
+    assert result["applied"] is True
+    assert database.get_offer_intent("intent-a")["lifecycle_state"] == "creation_failed"
+    assert (
+        database.get_offer_intent_coin_reservations("intent-a")[0]["status"]
+        == "released"
+    )
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert database.get_unresolved_offer_operation_blockers() == []
+    assert database.settle_no_effect_offer_creation(proof=proof)["applied"] is False
+
+
 def test_offer_creation_continuation_journals_authority_and_is_single_use(
     monkeypatch,
 ):
@@ -541,7 +629,7 @@ def test_offer_creation_continuation_journals_authority_and_is_single_use(
     effects = []
 
     def create_effect(*args, **kwargs):
-        kwargs["_identity_recheck"]("make_offer")
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
         effects.append((args, kwargs))
         return {
             "success": True,
@@ -673,7 +761,7 @@ def test_offer_creation_continuation_journals_authority_and_is_single_use(
         (permit, "wallet:create_offer", "create:intent-a", "intent-a"),
         (
             permit,
-            "wallet:create_offer:make_offer:identity",
+            "wallet:create_offer:rpc:make_offer:send:identity",
             "create:intent-a",
             "intent-a",
         ),
@@ -813,7 +901,7 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
     monkeypatch,
 ):
     def explode(*_args, **_kwargs):
-        _kwargs["_identity_recheck"]("make_offer")
+        _kwargs["_identity_recheck"]("rpc:make_offer:send")
         raise RuntimeError("response lost")
 
     permit, identities, exits, checks = _stub_continuation_authority(
@@ -843,7 +931,7 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
         (permit, "wallet:create_offer", "create:intent-a", "intent-a"),
         (
             permit,
-            "wallet:create_offer:make_offer:identity",
+            "wallet:create_offer:rpc:make_offer:send:identity",
             "create:intent-a",
             "intent-a",
         ),
@@ -910,6 +998,119 @@ def test_offer_creation_continuation_is_unserializable_and_explicit_close_is_onc
     assert exits == [permit]
     assert checks == []
     assert identities == []
+
+
+@pytest.mark.parametrize("revocation", ["fee", "campaign"])
+def test_bootstrap_authority_revoked_after_start_blocks_wallet_effect(
+    isolated_database, monkeypatch, revocation
+):
+    """A later cycle must recheck consent and campaign at the wallet boundary."""
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+    begun, closed = _stub_offer_manager_wallet(
+        monkeypatch, effect=lambda *_args, **_kwargs: effects.append(True)
+    )
+    manager = offer_manager.OfferManager()
+    campaign_id = "a" * 64
+    bootstrap_context = {
+        **CREATION_CONTEXT,
+        "purpose": f"bootstrap:{campaign_id}:revision:0",
+    }
+    campaign = {
+        "campaign_id": campaign_id,
+        "revision": 0,
+        "fee_budget_xch": "0.05",
+    }
+    authority_calls = []
+    fee_checked = []
+
+    def check_campaign(**_kwargs):
+        authority_calls.append(True)
+        if revocation == "campaign" and fee_checked:
+            raise ValueError("Bootstrap campaign revision is no longer active")
+        return {"campaign_id": campaign_id, "campaign_revision": 0}
+
+    def check_fee(_campaign):
+        fee_checked.append(True)
+        return (
+            {"ready": True, "approval_id": "b" * 64}
+            if revocation == "campaign"
+            else {
+                "ready": False,
+                "reason": "bootstrap_cancellation_fee_approval_stale",
+            }
+        )
+
+    monkeypatch.setattr(
+        offer_manager, "require_active_bootstrap_intent_authority", check_campaign
+    )
+    original_get_campaign = database.get_bootstrap_campaign
+    monkeypatch.setattr(
+        database,
+        "get_bootstrap_campaign",
+        lambda exact_id: (
+            campaign if exact_id == campaign_id else original_get_campaign(exact_id)
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap_fee_authority,
+        "cancellation_fee_readiness",
+        check_fee,
+    )
+
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        max_retries=2,
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=bootstrap_context,
+    )
+
+    assert result["success"] is False
+    assert fee_checked == [True]
+    assert len(authority_calls) >= 2
+    assert effects == []
+    assert len(begun) == 1
+    assert len(closed) == 1
+    intent = database.get_offer_intent(begun[0]["intent_id"])
+    assert intent["lifecycle_state"] == "creation_failed"
+
+
+def test_follow_run_revoked_after_prepare_blocks_wallet_effect(
+    isolated_database, monkeypatch
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    effects = []
+    begun, closed = _stub_offer_manager_wallet(
+        monkeypatch, effect=lambda *_args, **_kwargs: effects.append(True)
+    )
+    checks = []
+
+    def check_follow(**_kwargs):
+        checks.append(True)
+        if len(checks) == 3:
+            raise ValueError("FOLLOW_RUN_STOPPED")
+        return {"run_id": "a" * 64, "classification": "normal_lifecycle"}
+
+    monkeypatch.setattr(
+        offer_manager, "require_active_follow_intent_authority", check_follow
+    )
+    result = offer_manager.OfferManager().create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        max_retries=2,
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context={
+            **CREATION_CONTEXT,
+            "purpose": f"follow:{'a' * 64}:normal_lifecycle",
+        },
+    )
+    assert result["success"] is False
+    assert len(checks) >= 3
+    assert effects == []
+    assert len(begun) == len(closed) == 1
 
 
 def test_offer_manager_prepares_before_effect_and_finalizes_exact_evidence(
@@ -3037,7 +3238,7 @@ def test_offer_manager_real_gate_and_wallet_continuation_cross_prepared_blocker(
     effects = []
 
     def create_effect(*_args, **kwargs):
-        kwargs["_identity_recheck"]("make_offer")
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
         effects.append(True)
         return {
             "success": True,
@@ -3152,3 +3353,100 @@ def test_offer_manager_adapter_local_rejection_finalizes_failed_and_releases(
         == "released"
     )
     assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+@pytest.mark.parametrize("approved", [False, "raises", True])
+def test_confidence_consent_rechecked_after_wallet_identity_read(monkeypatch, approved):
+    effects = []
+
+    def effect(*args, **kwargs):
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
+        effects.append(True)
+        return {"success": True}
+
+    _stub_continuation_authority(monkeypatch, effect=effect, identity_count=3)
+    continuation = wallet.begin_offer_creation_continuation(
+        operation_id="create:override", intent_id="override"
+    )
+
+    def authorize():
+        if approved == "raises":
+            raise ValueError("review expired")
+        return approved
+
+    result = wallet.create_offer(
+        {"1": -1000, "2": 2000},
+        _creation_continuation=continuation,
+        _creation_operation_id="create:override",
+        _creation_intent_id="override",
+        _market_authorizer=authorize,
+    )
+    assert effects == ([True] if approved is True else [])
+    assert result["_catalyst_effect_attempted"] is (approved is True)
+
+
+@pytest.mark.parametrize("step", ["create_offer", "rpc:make_offer"])
+def test_sage_creation_blocked_before_http_send_is_not_an_ambiguous_effect(
+    monkeypatch, step
+):
+    def blocked_before_send(*_args, **kwargs):
+        kwargs["_identity_recheck"](step)
+        raise mutation_gate.MutationBlocked(
+            "MUTATION_GATE_SAFETY_STOP", "wallet:create_offer"
+        )
+
+    _stub_continuation_authority(
+        monkeypatch, effect=blocked_before_send, identity_count=3
+    )
+    continuation = wallet.begin_offer_creation_continuation(
+        operation_id="create:pre-send", intent_id="pre-send"
+    )
+    result = wallet.create_offer(
+        {"1": -1000, "2": 2000},
+        _creation_continuation=continuation,
+        _creation_operation_id="create:pre-send",
+        _creation_intent_id="pre-send",
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "MUTATION_GATE_SAFETY_STOP"
+    assert result["_catalyst_effect_attempted"] is False
+
+
+def test_manager_carries_confidence_guard_through_prepared_wallet_dispatch(
+    isolated_database, monkeypatch
+):
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    checked = []
+
+    def guard():
+        checked.append("at-dispatch")
+        return False
+
+    def effect(offer_dict, **kwargs):
+        assert kwargs["_market_authorizer"] is guard
+        assert kwargs["_market_authorizer"]() is False
+        return {
+            "success": False,
+            "reason": "MARKET_CONFIDENCE_OVERRIDE_INACTIVE",
+            "_catalyst_effect_attempted": False,
+        }
+
+    _stub_offer_manager_wallet(monkeypatch, effect=effect)
+    manager = offer_manager.OfferManager()
+    result = manager.create_offer_with_retry(
+        {"1": -1000, "2": 2000},
+        coin_ids_enabled=True,
+        selected_coin_id=COIN_A,
+        preferred_tier="inner",
+        creation_context=CREATION_CONTEXT,
+        market_authorizer=guard,
+    )
+    assert result["success"] is False and result["_catalyst_effect_attempted"] is False
+    assert checked == ["at-dispatch"]
+    intent = database.get_offer_intent(result["_catalyst_intent_id"])
+    assert intent["lifecycle_state"] == "creation_failed"
+    assert (
+        database.get_offer_intent_coin_reservations(intent["intent_id"])[0]["status"]
+        == "released"
+    )

@@ -84,7 +84,7 @@ def test_cancellation_price_converges_on_actual_unsigned_cost_without_dispatch(
     )
 
 
-def test_cancellation_price_preserves_available_zero_fee_without_extra_build(
+def test_cancellation_price_refuses_zero_fee_before_wallet_effect(
     approved, monkeypatch
 ):
     calls = _builder(monkeypatch, approved)
@@ -92,9 +92,9 @@ def test_cancellation_price_preserves_available_zero_fee_without_extra_build(
 
     result = _price(approved)
 
-    assert result["available"] is True
-    assert result["fee_mojos"] == 0
-    assert result["quote"]["source"] == "coinset"
+    assert result["available"] is False
+    assert result["reason"] == "FEE_CANCELLATION_FUNDING_REQUIRED"
+    assert result["dispatch_authorized"] is False
     assert calls == [0]
 
 
@@ -126,6 +126,49 @@ def test_cancellation_price_fails_closed_when_guidance_is_unavailable(
     assert result["available"] is False
     assert result["reason"] == "FEE_ESTIMATE_UNAVAILABLE"
     assert calls == [0]
+
+
+def test_cancellation_price_reports_unsigned_refusal_stage_without_rpc_details(
+    approved, monkeypatch
+):
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "reason": "SAGE_BULK_CANCEL_UNSIGNED_UNSAFE",
+            "_catalyst_cancel_pricing_stage": "cancel_component",
+            "coin_spends": ["private unsigned bundle"],
+        },
+    )
+
+    result = _price(approved)
+
+    assert result["available"] is False
+    assert result["reason"] == "FEE_UNSIGNED_COST_UNAVAILABLE"
+    assert result["diagnostic_stage"] == "cancel_component"
+    assert "coin_spends" not in result
+
+
+def test_cancellation_price_ignores_untrusted_unsigned_refusal_stage(
+    approved, monkeypatch
+):
+    wallet = import_module("wallet")
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "_catalyst_cancel_pricing_stage": ["private Sage response"],
+        },
+    )
+
+    result = _price(approved)
+
+    assert result["available"] is False
+    assert result["reason"] == "FEE_UNSIGNED_COST_UNAVAILABLE"
+    assert "diagnostic_stage" not in result
 
 
 def test_context_change_during_cancellation_pricing_invalidates_result(
@@ -255,6 +298,83 @@ def test_prepared_coin_prep_cancel_reserves_exact_protected_fee(approved):
     assert hold["fee_mojos"] == 20
     assert hold["cancellation"] == 1
     assert hold["dispatch_authorized"] is False
+
+
+def test_refresh_abort_admits_only_its_own_prepared_cancellation_fee_hold(approved):
+    manifest, contract, quote = _prepared_cancel_cohort(approved, member_count=1)
+    hold = _reserve_cancel(approved, manifest, contract, quote)
+    member = manifest["members"][0]
+    preview = database.get_coin_prep_fee_preview(approved["preview"]["preview_id"])
+    campaign_id = json.loads(preview["scope_json"])["campaign_id"]
+
+    conn = database._stability_read_only_connection()
+    try:
+        exact_hold = database._refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=member["operation_id"],
+            trade_id=member["trade_id"],
+            intent_id=member["intent_id"],
+            campaign_id=campaign_id,
+        )
+        assert exact_hold == hold["operation_id"]
+        database._assert_refresh_abort_effect_scope(
+            conn, {member["operation_id"]}, exact_hold
+        )
+        with pytest.raises(ValueError, match="unrelated wallet effect"):
+            database._assert_refresh_abort_effect_scope(conn, {member["operation_id"]})
+        with pytest.raises(ValueError, match="hold differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id="f" * 64,
+            )
+    finally:
+        conn.close()
+
+
+def test_refresh_abort_admits_exact_submitted_parent_fee_hold(approved):
+    manifest, contract, quote = _prepared_cancel_cohort(approved, member_count=1)
+    hold = _reserve_cancel(approved, manifest, contract, quote)
+    _finalize_submitted(manifest)
+    member = manifest["members"][0]
+    preview = database.get_coin_prep_fee_preview(approved["preview"]["preview_id"])
+    campaign_id = json.loads(preview["scope_json"])["campaign_id"]
+
+    conn = database._stability_read_only_connection()
+    try:
+        with pytest.raises(ValueError, match="fee journal differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id=campaign_id,
+            )
+        exact_hold = database._refresh_abort_prepared_fee_hold(
+            conn,
+            prepared_operation_id=member["operation_id"],
+            trade_id=member["trade_id"],
+            intent_id=member["intent_id"],
+            campaign_id=campaign_id,
+            allow_submitted_parent=True,
+        )
+        assert exact_hold == hold["operation_id"]
+        database._assert_refresh_abort_effect_scope(
+            conn, {member["operation_id"]}, exact_hold
+        )
+        with pytest.raises(ValueError, match="hold differs"):
+            database._refresh_abort_prepared_fee_hold(
+                conn,
+                prepared_operation_id=member["operation_id"],
+                trade_id=member["trade_id"],
+                intent_id=member["intent_id"],
+                campaign_id="f" * 64,
+                allow_submitted_parent=True,
+            )
+    finally:
+        conn.close()
 
 
 def test_unrelated_cancel_cannot_charge_coin_prep_approval(approved):

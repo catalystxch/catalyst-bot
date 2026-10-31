@@ -12,6 +12,7 @@ Tests /api/pnl, /api/pnl/reset-preview, /api/pnl/reset (POST),
 import os
 import sys
 import types
+import tempfile
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch, call
@@ -36,6 +37,7 @@ except (ModuleNotFoundError, ImportError) as exc:
 
 def _fake_stats():
     return {
+        "history_scope": "fresh_run",
         "realised_pnl_xch": "0.05",
         "total_fills": 10,
         "buy_fills": 5,
@@ -104,6 +106,23 @@ class _FlaskBase(unittest.TestCase):
         return self.client.get(path, **kwargs)
 
     def setUp(self):
+        # Reset previews and execution use a separate authoritative connection.
+        # Materialize a real disposable schema before tests mock view queries.
+        import database
+
+        database.close_connection()
+        self._database_dir = tempfile.TemporaryDirectory(prefix="pnl-endpoints-")
+        self.addCleanup(self._database_dir.cleanup)
+        self._database_path_patch = patch.object(
+            database, "DB_PATH", os.path.join(self._database_dir.name, "bot.db")
+        )
+        self._database_path_patch.start()
+        self.addCleanup(self._database_path_patch.stop)
+        self._database_init_patch = patch.object(database, "_db_initialized_path", "")
+        self._database_init_patch.start()
+        self.addCleanup(self._database_init_patch.stop)
+        self.addCleanup(database.close_connection)
+        database.init_database()
         api_server.app.testing = True
         self.client = api_server.app.test_client()
         self.token = api_server._LOCAL_API_TOKEN
@@ -201,6 +220,7 @@ class TestPnlGet(_FlaskBase):
             resp = self._get("/api/pnl", environ_base=self._LOOPBACK)
         body = resp.get_json()
         for key in (
+            "history_scope",
             "realised_pnl_xch",
             "total_fills",
             "buy_fills",
@@ -213,6 +233,7 @@ class TestPnlGet(_FlaskBase):
             "max_position_xch",
         ):
             self.assertIn(key, body)
+        self.assertEqual(body["history_scope"], "fresh_run")
 
     def test_response_exposes_live_position_limit(self):
         with (

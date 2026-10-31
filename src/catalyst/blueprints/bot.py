@@ -27,6 +27,9 @@ from flask import Blueprint, Response, current_app, jsonify, request
 
 import api_server
 from config import cfg
+from follow_principal import (
+    reviewed_follow_start_readiness as _reviewed_follow_start_readiness,
+)
 from database import (
     backup_database,
     get_post_tibet_migration_report,
@@ -344,6 +347,15 @@ def _bootstrap_start_block(campaign: dict[str, Any] | None) -> dict[str, Any] | 
     }
 
 
+def _bootstrap_cancellation_fee_start_readiness(
+    campaign: dict[str, Any],
+) -> dict[str, Any]:
+    """Check current ordinary consent before enabling Bootstrap trading."""
+    from bootstrap_fee_authority import cancellation_fee_readiness
+
+    return cancellation_fee_readiness(campaign)
+
+
 def _bootstrap_coin_prep_start_readiness(cfg_obj) -> dict[str, Any]:
     """Re-run exact active-campaign Coin Prep verification before start.
 
@@ -411,7 +423,9 @@ def _bootstrap_existing_offer_resume_readiness(
     are locked by the campaign's already-live offers.  That is safe to bypass
     only for an explicit resume request, and only when durable intent, local
     open-book, and a fresh complete Sage snapshot agree on the exact nonempty
-    trade-id set for the current campaign revision.
+    trade-id set for one campaign revision. Policy-only campaign revisions
+    do not change the identity of offers already published under an earlier
+    revision.
     """
     asset_id = str(getattr(cfg_obj, "CAT_ASSET_ID", "") or "").strip().lower()
     campaign_id = str(campaign.get("campaign_id") or "").strip()
@@ -424,10 +438,14 @@ def _bootstrap_existing_offer_resume_readiness(
     ):
         return {"ready": False, "reason": "campaign_identity_invalid"}
 
-    purpose = f"bootstrap:{campaign_id}:revision:{revision}"
+    purpose_prefix = f"bootstrap:{campaign_id}:revision:"
     active_states = {"created", "visible"}
     try:
-        from database import get_offer_intents_for_registry, get_open_offers
+        from database import (
+            bootstrap_campaign_immutable_authority_valid,
+            get_offer_intents_for_registry,
+            get_open_offers,
+        )
         from wallet import (
             classify_offers_from_list,
             get_authoritative_offer_history,
@@ -435,17 +453,38 @@ def _bootstrap_existing_offer_resume_readiness(
 
         intents = get_offer_intents_for_registry()
         db_offers = get_open_offers(cat_asset_id=asset_id)
-        history = get_authoritative_offer_history(
-            include_completed=False, start=0, end=500
-        )
         if type(intents) is not list or type(db_offers) is not list:
             raise ValueError("Durable offer authority is unavailable")
         if any(type(row) is not dict for row in [*intents, *db_offers]):
             raise ValueError("Durable offer authority is malformed")
 
         current_intents = [
-            row for row in intents if str(row.get("purpose") or "") == purpose
+            row
+            for row in intents
+            if str(row.get("purpose") or "").startswith(purpose_prefix)
         ]
+        intent_revisions = set()
+        for row in current_intents:
+            suffix = str(row["purpose"])[len(purpose_prefix) :]
+            if not suffix.isdecimal() or str(int(suffix)) != suffix:
+                raise ValueError("Campaign intent revision is malformed")
+            intent_revision = int(suffix)
+            if intent_revision > revision:
+                raise ValueError("Campaign intent revision exceeds current authority")
+            if str(row.get("lifecycle_state") or "").strip().lower() in active_states:
+                intent_revisions.add(intent_revision)
+        if len(intent_revisions) != 1:
+            raise ValueError("Campaign active offer revisions are incomplete or mixed")
+        active_revision = next(iter(intent_revisions))
+        if active_revision < revision and (
+            campaign.get("status") != "active"
+            or campaign.get("stage")
+            not in {"bootstrap", "discovery_25", "discovery_50", "established"}
+            or not bootstrap_campaign_immutable_authority_valid(campaign)
+        ):
+            raise ValueError(
+                "Earlier offer revision lacks immutable campaign authority"
+            )
         if any(
             str(row.get("asset_id") or "").strip().lower() != asset_id
             for row in current_intents
@@ -456,7 +495,7 @@ def _bootstrap_existing_offer_resume_readiness(
             not in active_states | {"terminal"}
             for row in current_intents
         ):
-            raise ValueError("Current campaign revision has unresolved offer intents")
+            raise ValueError("Campaign has unresolved offer intents")
         active_intents = [
             row
             for row in current_intents
@@ -476,6 +515,10 @@ def _bootstrap_existing_offer_resume_readiness(
             or len(set(db_ids)) != len(db_ids)
         ):
             raise ValueError("Campaign offer identities are incomplete or duplicated")
+
+        history = get_authoritative_offer_history(
+            include_completed=False, start=0, end=500
+        )
 
         if type(history) is dict:
             wallet_offers = history.get("offers")
@@ -705,6 +748,37 @@ def api_bot_start():
         return jsonify({"success": True, "status": "already_running"})
 
     request_payload = request.get_json(silent=True)
+    if (
+        type(request_payload) is dict
+        and request_payload.get("review_confidence_override") is True
+    ):
+        from confidence_override import prepare_review
+
+        try:
+            review = prepare_review(
+                bot, duration_hours=request_payload.get("duration_hours", 48)
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CONFIDENCE_OVERRIDE_REVIEW_REQUIRED",
+                    "confidence_override_review": review,
+                }
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            message = (
+                "A matching approved Follow run and protected fee budget are required before reviewing this override."
+                if str(exc).startswith("FOLLOW_FEE_AUTHORITY")
+                else str(exc)
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "CONFIDENCE_OVERRIDE_REVIEW_UNAVAILABLE",
+                    "error": message,
+                }
+            ), 409
+
     resume_existing_offers = bool(
         type(request_payload) is dict
         and request_payload.get("resume_existing_offers") is True
@@ -1124,6 +1198,28 @@ def api_bot_start():
             )
         return jsonify(payload), 400
 
+    if bootstrap_campaign is not None:
+        fee_readiness = _bootstrap_cancellation_fee_start_readiness(bootstrap_campaign)
+        if fee_readiness.get("ready") is not True:
+            reason = str(
+                fee_readiness.get("reason")
+                or "bootstrap_cancellation_fee_approval_stale"
+            )
+            error = (
+                "Review and approve this campaign's cancellation fee budget "
+                "before starting live offers"
+            )
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": reason,
+                    "error": error,
+                    "errors": [error],
+                    "warnings": warnings,
+                }
+            ), 409
+
     # Cancel All may have begun after the initial is_running() check while
     # pre-start validation was reading Sage. Serialize this final transition
     # with Cancel All's stopped-book check and worker reservation.
@@ -1139,6 +1235,26 @@ def api_bot_start():
                     "error": "Wait for coin maintenance to finish before starting the bot",
                 }
             ), 409
+        if bootstrap_campaign is None:
+            follow_readiness = _reviewed_follow_start_readiness(
+                cfg, resume_existing_offers=resume_existing_offers
+            )
+            if follow_readiness.get("ready") is not True:
+                reason = follow_readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
+                error = (
+                    "CATalyst has an unresolved local offer for this wallet and CAT. "
+                    "Review exact Sage terminal proof before starting"
+                    if reason == "FOLLOW_LOCAL_OFFERS_UNRESOLVED"
+                    else "Review the current Follow wallet, prepared slots and fee ceiling before starting"
+                )
+                return jsonify(
+                    {
+                        "success": False,
+                        "status": "error",
+                        "reason": reason,
+                        "error": error,
+                    }
+                ), 409
         # A stale flag would hide live-book recovery on restart. Fail before
         # bot.start(), since a failed cleanup after start would be too late.
         try:
@@ -1158,8 +1274,37 @@ def api_bot_start():
                     "error": "Fresh-start choice could not be cleared from the user data directory",
                 }
             ), 500
+        previous = getattr(bot, "_confidence_override_consent", None)
+        if previous is not None:
+            previous.revoke()
+        bot._confidence_override_pending = None
+        if type(request_payload) is dict and "confidence_override" in request_payload:
+            from confidence_override import confirm_review, current_scope
+            import database
+
+            try:
+                consent = confirm_review(bot, request_payload["confidence_override"])
+                scope = current_scope()
+                if not consent.active(scope=scope, now=datetime.now(timezone.utc)):
+                    raise ValueError("CONFIDENCE_OVERRIDE_REVIEW_CHANGED")
+                database.record_confidence_override_consent(consent.record(), scope)
+                bot._confidence_override_pending = consent
+            except (ValueError, TypeError, KeyError) as exc:
+                return jsonify(
+                    {
+                        "success": False,
+                        "reason": "CONFIDENCE_OVERRIDE_CONFIRMATION_REQUIRED",
+                        "error": str(exc),
+                    }
+                ), 409
         server._reset_runtime_session_stats()
         started = bot.start()
+        if (
+            not started
+            and getattr(bot, "_confidence_override_pending", None) is not None
+        ):
+            bot._confidence_override_pending.revoke()
+            bot._confidence_override_pending = None
     if not started:
         state = {}
         try:
@@ -1191,7 +1336,12 @@ def api_bot_stop():
     bot = server.bot
     slog("GUI_ACTION", ">>> BUTTON: Stop Bot")
     if not bot:
-        return jsonify({"error": "Bot not initialised"}), 500
+        # Wallet setup can display the desktop shell before a BotLoop exists.
+        # In that state there is no bot work to stop. The later shutdown route
+        # still proves mutation quiescence before it closes the process.
+        return jsonify(
+            {"status": "stopped", "running": False, "bot_initialized": False}
+        )
 
     bot.stop(wait=False)
     try:
@@ -1827,6 +1977,7 @@ def api_status():
             "loop_count": raw.get("loop_count", 0),
             "uptime_seconds": _uptime,
             "last_loop_time": raw.get("loop_duration") or raw.get("last_loop_time", 0),
+            "history_scope": db_stats.get("history_scope", "lifetime"),
             "total_fills": db_stats.get("total_fills", 0),
             "errors": db_stats.get("errors", 0),
         }

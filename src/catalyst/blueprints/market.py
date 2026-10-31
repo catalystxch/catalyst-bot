@@ -967,8 +967,20 @@ def api_market_confidence():
     degraded_active = bool(degraded and degraded.get("degraded_since"))
     can_create = bool(confidence.get("data_valid")) and not degraded_active
     can_requote = bool(confidence.get("data_valid")) and not degraded_active
+    consent = getattr(api_server.bot, "_confidence_override_consent", None)
+    override_active = bool(
+        getattr(api_server.bot, "_confidence_override_active", lambda: False)()
+    )
+    override_status = {
+        "approved": consent is not None and not consent.revoked,
+        "active": override_active,
+        "expires_at": consent.expires_at.isoformat() if consent is not None else None,
+    }
+    if override_active:
+        can_create = can_requote = True
     payload = {
         "market_model": "offer_book",
+        "confidence_override": override_status,
         "asset_id": asset_id,
         "generated_at": current_time.isoformat(),
         "confidence": confidence,

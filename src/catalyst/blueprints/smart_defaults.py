@@ -37,7 +37,12 @@ bp = Blueprint("smart_defaults", __name__)
 def derive_bootstrap_smart_settings(*, campaign, decision, balances) -> dict:
     """Return the exact Bootstrap plan without consulting Follow capacity."""
 
-    plan = derive_bootstrap_plan(campaign, decision, balances)
+    plan = derive_bootstrap_plan(
+        campaign,
+        decision,
+        balances,
+        cat_decimals=int(getattr(cfg, "CAT_DECIMALS", 3)),
+    )
     return {
         **plan,
         "market_mode": "bootstrap",

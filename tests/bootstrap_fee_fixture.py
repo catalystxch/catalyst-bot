@@ -13,6 +13,9 @@ from fee_staged_preview_utils import prepare_unsigned_wallet
 
 @pytest.fixture
 def approved_bootstrap(tmp_path, monkeypatch):
+    # Other tests reload API modules in xdist workers. Re-establish the
+    # api_server-first import order before loading the coin-prep blueprint.
+    import_module("api_server")
     database = import_module("database")
     runtime = import_module("coin_prep_fee_runtime")
     service = import_module("coin_prep_fee_approval")

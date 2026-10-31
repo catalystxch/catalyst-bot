@@ -253,7 +253,7 @@ def test_coin_prep_preflight_verifies_trade_headroom_but_exact_fee_size():
     """Trade tiers use headroom; the configured fee denomination does not."""
     html = GUI.read_text(encoding="utf-8", errors="replace")
 
-    check_start = html.index("async function checkIfCoinPrepNeeded(config)")
+    check_start = html.index("async function checkIfCoinPrepNeeded(config")
     check_end = html.index("function showCoinPrepConfirm(config", check_start)
     check_block = html[check_start:check_end]
 

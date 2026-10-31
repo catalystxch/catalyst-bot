@@ -155,6 +155,10 @@ class _TempDB(unittest.TestCase):
             ),
             patch.object(api_server.cfg, "CAT_ASSET_ID", _FAKE_ASSET),
             patch.object(api_server.cfg, "SPREAD_BPS", 50),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
             patch("api_server.events") as mock_events,
         ):
             resp = self.client.post(

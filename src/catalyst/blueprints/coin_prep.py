@@ -61,6 +61,64 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 bp = Blueprint("coin_prep", __name__)
 
 
+def _historical_stopped_campaign_fee_approval(accounting: object) -> bool:
+    """Recognize a discharged campaign's fee history without granting authority.
+
+    The status file can retain a campaign approval after that campaign stops.
+    Its paid fees must stay visible, but it cannot resume preparation for a
+    different Follow plan. If any local offer, intent, abort, or fee effect is
+    unresolved, keep the existing overlap block. Coin Prep's final trigger
+    separately proves the complete Sage offer book before a wallet effect.
+    """
+
+    if type(accounting) is not dict or accounting.get("campaign_id") is None:
+        return False
+    if accounting.get("state") not in {"approved", "paused_budget"}:
+        return False
+    if accounting.get("unresolved_operation_count") != 0:
+        return False
+    try:
+        import database
+        from mutation_gate import wallet_fingerprint_hash
+
+        campaign_id = accounting["campaign_id"]
+        campaign = database.get_bootstrap_campaign(campaign_id)
+        if (
+            type(campaign) is not dict
+            or campaign.get("status") != "stopped"
+            or campaign.get("stage") != "stopped"
+            or campaign.get("asset_id")
+            != str(getattr(cfg, "CAT_ASSET_ID", "") or "").lower()
+            or database.get_open_offers(include_elapsed=True)
+        ):
+            return False
+        terminal_states = {
+            "terminal",
+            "creation_failed",
+            "rejected",
+            "cancelled",
+            "filled",
+            "expired",
+        }
+        for intent in database.get_offer_intents_for_registry():
+            if (
+                type(intent) is not dict
+                or intent.get("lifecycle_state") not in terminal_states
+            ):
+                return False
+        if database.list_incomplete_refresh_aborts(
+            asset_id=campaign["asset_id"],
+            wallet_fingerprint_hash=wallet_fingerprint_hash(
+                campaign["wallet_fingerprint"]
+            ),
+            network=campaign["network"],
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _public_fee_reason(exc: ValueError, fallback: str) -> str:
     """Translate internal exceptions to fixed public reason-code literals."""
     value = str(exc)
@@ -115,13 +173,203 @@ def _fee_json_amounts(value):
     if type(value) is dict:
         return {
             key: str(item)
-            if key.endswith("_mojos") and type(item) is int
+            if key.endswith(("_mojos", "_atoms")) and type(item) is int
             else _fee_json_amounts(item)
             for key, item in value.items()
         }
     if type(value) is list:
         return [_fee_json_amounts(item) for item in value]
     return value
+
+
+@bp.route("/api/follow/principal-preview", methods=["POST"])
+def api_follow_principal_preview():
+    """Read the current approved Follow principal without consent or effects."""
+    from follow_principal import preview_approved_follow_principal
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if (
+        type(body) is not dict
+        or set(body)
+        not in (
+            {"approval_id"},
+            {"approval_id", "buy_limit", "sell_limit"},
+        )
+        or type(body["approval_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+        or (
+            "buy_limit" in body
+            and (
+                type(body["buy_limit"]) is not int
+                or type(body["sell_limit"]) is not int
+                or not 1 <= body["buy_limit"] <= 50
+                or not 1 <= body["sell_limit"] <= 50
+            )
+        )
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_PRINCIPAL_REQUEST_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
+    try:
+        limits = (
+            {"buy_limit": body["buy_limit"], "sell_limit": body["sell_limit"]}
+            if "buy_limit" in body
+            else {}
+        )
+        result = preview_approved_follow_principal(body["approval_id"], **limits)
+        return jsonify(_fee_json_amounts({**result, "success": True}))
+    except ValueError as exc:
+        reason = str(exc)
+        if reason not in {
+            "FOLLOW_FEE_APPROVAL_STALE",
+            "FEE_APPROVAL_STALE",
+            "FEE_SESSION_INCOMPLETE",
+            "FOLLOW_FEE_SCOPE_INVALID",
+            "FOLLOW_PRINCIPAL_REVIEW_CHANGED",
+            "FOLLOW_SLOT_INVENTORY_SHORT",
+            "FOLLOW_SLOT_INPUT_INVALID",
+            "FOLLOW_SLOT_PLAN_INVALID",
+            "FOLLOW_SLOT_TIER_COUNTS_INVALID",
+            "FOLLOW_SLOT_PRICE_INVALID",
+            "FOLLOW_SLOT_PRICE_UNAVAILABLE",
+            "FOLLOW_SLOT_PRICE_CHANGED",
+            "FOLLOW_SLOT_AMOUNT_INVALID",
+            "FOLLOW_SLOT_DENOMINATION_SHORT",
+            "FOLLOW_SLOT_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_CONFIGURATION_MISMATCH",
+            "FOLLOW_FEE_PRINCIPAL_UNAVAILABLE",
+            "FOLLOW_TRADING_PRINCIPAL_UNAVAILABLE",
+            "FOLLOW_PRINCIPAL_INVENTORY_INVALID",
+            "FOLLOW_FEE_POOL_UNAVAILABLE",
+            "FEE_WALLET_INVENTORY_UNAVAILABLE",
+            "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            "FEE_WALLET_ASSET_UNAVAILABLE",
+        }:
+            reason = "FOLLOW_PRINCIPAL_UNAVAILABLE"
+        return jsonify(
+            {"success": False, "reason": reason, "dispatch_authorized": False}
+        ), 409
+    except Exception:
+        slog("FOLLOW", "Principal preview could not read current wallet", level="error")
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_PRINCIPAL_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        ), 503
+
+
+@bp.route("/api/follow/run-review", methods=["POST"])
+def api_follow_run_review():
+    """Freeze exact server-derived Follow terms for later native consent.
+
+    This route creates only immutable display data. It does not consume that
+    review, start trading, or authorize a wallet effect.
+    """
+    from follow_principal import prepare_follow_run_review
+    from super_log import slog
+
+    body = request.get_json(silent=True)
+    if (
+        type(body) is not dict
+        or set(body)
+        not in (
+            {
+                "approval_id",
+                "buy_limit",
+                "sell_limit",
+                "duration_seconds",
+                "maximum_fee_mojos",
+            },
+            {
+                "approval_id",
+                "buy_limit",
+                "sell_limit",
+                "continuous",
+                "maximum_fee_mojos",
+            },
+        )
+        or type(body["approval_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+        or any(
+            type(body[key]) is not int
+            for key in (
+                "buy_limit",
+                "sell_limit",
+                "maximum_fee_mojos",
+            )
+        )
+        or (
+            body.get("continuous") is not True
+            if "continuous" in body
+            else (
+                type(body.get("duration_seconds")) is not int
+                or not 1 <= body["duration_seconds"] <= 48 * 3600
+            )
+        )
+        or not 1 <= body["buy_limit"] <= 50
+        or not 1 <= body["sell_limit"] <= 50
+        or not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1
+    ):
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_REQUEST_INVALID",
+                "dispatch_authorized": False,
+            }
+        ), 400
+    try:
+        result = prepare_follow_run_review(
+            body["approval_id"],
+            buy_limit=body["buy_limit"],
+            sell_limit=body["sell_limit"],
+            duration_seconds=body.get("duration_seconds"),
+            requested_fee_cap_mojos=body["maximum_fee_mojos"],
+            **({"continuous": True} if body.get("continuous") is True else {}),
+        )
+        return jsonify(_fee_json_amounts({**result, "success": True}))
+    except ValueError as exc:
+        reason = str(exc)
+        if reason not in {
+            "FOLLOW_REVIEW_PROPOSAL_INVALID",
+            "FOLLOW_REVIEW_PROPOSAL_CHANGED",
+            "FOLLOW_FEE_APPROVAL_STALE",
+            "FOLLOW_FEE_APPROVAL_REQUIRED",
+            "FOLLOW_FEE_APPROVAL_MISMATCH",
+            "FOLLOW_SLOT_INVENTORY_SHORT",
+            "FOLLOW_SLOT_DENOMINATION_SHORT",
+            "FOLLOW_SLOT_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_SOURCE_PRINCIPAL_SHORT",
+            "FOLLOW_SLOT_CONFIGURATION_MISMATCH",
+            "FOLLOW_SLOT_PRICE_UNAVAILABLE",
+            "FOLLOW_SLOT_PRICE_CHANGED",
+            "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE",
+            "FOLLOW_SHUTDOWN_FEE_FUNDING_REQUIRED",
+            "FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT",
+            "FOLLOW_SHUTDOWN_RESERVE_INSUFFICIENT",
+            "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL",
+            "FEE_SESSION_INCOMPLETE",
+        }:
+            reason = "FOLLOW_REVIEW_UNAVAILABLE"
+        return jsonify(
+            {"success": False, "reason": reason, "dispatch_authorized": False}
+        ), 409
+    except Exception:
+        slog("FOLLOW", "Run review could not verify current terms", level="error")
+        return jsonify(
+            {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        ), 503
 
 
 @bp.route("/api/coin-prep/fee-preview", methods=["POST"])
@@ -380,7 +628,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         derive_bootstrap_coin_prep_wave_counts,
         derive_bootstrap_runtime,
     )
-    from tx_fees import get_effective_transaction_fee_mojos
+    from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
     from wallet import get_wallet_balance
 
     try:
@@ -416,6 +664,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
     balances = {
         "xch_available": Decimal(xch_balance_mojos) / Decimal(10**12),
         "cat_available": Decimal(cat_balance_mojos) / Decimal(10**cat_decimals),
+        "cat_decimals": cat_decimals,
         "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
         "subsidy_spent_xch": Decimal("0"),
         "network_fee_xch": Decimal(effective_fee_mojos) / Decimal(10**12),
@@ -425,6 +674,7 @@ def _active_bootstrap_coin_prep_context(body: dict) -> dict | None:
         "fee_coin_size_xch": Decimal(
             str(getattr(cfg, "FEE_COIN_SIZE_XCH", "0.001") or "0.001")
         ),
+        "fee_pool_enabled": fee_pool_enabled(),
         "expected_cancel_requotes": int(
             getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 1) or 1
         ),
@@ -1951,9 +2201,15 @@ def api_coin_prep_status():
                     "paused_budget",
                 }
                 if durable_fee.get("state") in active_fee_states:
-                    result["overlapping_coin_prep_blocked"] = True
-                    if not result.get("running"):
-                        result["fee_resume_required"] = True
+                    if not result.get(
+                        "running"
+                    ) and _historical_stopped_campaign_fee_approval(durable_fee):
+                        result["historical_campaign_fee_approval"] = True
+                        result["fee_approval"]["state"] = "historical"
+                    else:
+                        result["overlapping_coin_prep_blocked"] = True
+                        if not result.get("running"):
+                            result["fee_resume_required"] = True
             except Exception:
                 result["fee_approval"] = {
                     "approval_id": worker_fee_approval_id,
@@ -1962,6 +2218,28 @@ def api_coin_prep_status():
                     "dispatch_authorized": False,
                 }
                 result["overlapping_coin_prep_blocked"] = True
+
+            # A native pre-start review may append a higher Follow ceiling to
+            # the same completed scope. Keep the worker's original approval
+            # visible as completion evidence; expose the new version only for
+            # Follow review, never as a Coin Prep resume permit.
+            if campaign_id is None:
+                try:
+                    from database import (
+                        get_coin_prep_fee_approval_status,
+                        get_latest_prestart_follow_fee_approval,
+                    )
+
+                    follow_id = get_latest_prestart_follow_fee_approval(
+                        worker_fee_approval_id
+                    )
+                    if follow_id is not None:
+                        result["follow_fee_approval_id"] = follow_id
+                        result["follow_fee_approval"] = _fee_json_amounts(
+                            get_coin_prep_fee_approval_status(follow_id)
+                        )
+                except Exception:
+                    result["follow_fee_approval_lookup_unavailable"] = True
 
         # Optionally refresh live coin counts (when not actively prepping)
         refresh = request.args.get("refresh", "false").lower() == "true"
@@ -2148,6 +2426,7 @@ def api_coin_prep_verify(_args=None):
             cat_balance_mojos = _safe_non_negative_int(projected)
 
         xch_coins = []
+        xch_coin_records = []
         if xch_result and xch_result.get("success"):
             for r in xch_result.get("records", []):
                 if not isinstance(r, dict):
@@ -2158,6 +2437,7 @@ def api_coin_prep_verify(_args=None):
                 amt = _safe_non_negative_int(coin.get("amount", 0))
                 if amt > 0:
                     xch_coins.append(amt)
+                    xch_coin_records.append((r, amt))
 
         cat_coins = []
         if cat_result and cat_result.get("success"):
@@ -2373,12 +2653,64 @@ def api_coin_prep_verify(_args=None):
                 if bootstrap_context is not None
                 else frozenset()
             )
-            xch_allocated = allocate_matching_counts(
-                xch_coins,
-                xch_requests,
-                tolerance,
-                minimum_target_tiers=strict_xch_tiers,
-            )
+            if bootstrap_context is not None and "fees" in tier_specs:
+                # A fee-sized wallet coin is not necessarily available to
+                # protected cancellation. The runtime fee pool accepts only
+                # selectable coins designated fee_reserve in the durable DB.
+                from coin_manager import _coin_id_from_record
+                from database import get_free_coins
+                from tx_fees import get_fee_coin_size_mojos
+
+                def _normal_coin_id(value):
+                    value = str(value or "").strip().lower()
+                    return "0x" + value.removeprefix("0x") if value else ""
+
+                try:
+                    reserve_ids = {
+                        _normal_coin_id(row.get("coin_id"))
+                        for row in get_free_coins("xch")
+                        if row.get("purpose") == "fee_reserve"
+                    }
+                    runtime_fee_size = int(get_fee_coin_size_mojos())
+                except Exception:
+                    reserve_ids = set()
+                    runtime_fee_size = 0
+                fee_records = []
+                non_fee_coins = []
+                seen_fee_ids = set()
+                for record, amount in xch_coin_records:
+                    coin_id = _normal_coin_id(_coin_id_from_record(record))
+                    if (
+                        coin_id in reserve_ids
+                        and runtime_fee_size > 0
+                        and runtime_fee_size * 4 // 5
+                        <= amount
+                        <= runtime_fee_size * 6 // 5
+                    ):
+                        if coin_id not in seen_fee_ids:
+                            fee_records.append(amount)
+                            seen_fee_ids.add(coin_id)
+                    else:
+                        non_fee_coins.append(amount)
+                xch_allocated = allocate_matching_counts(
+                    non_fee_coins,
+                    [request for request in xch_requests if request[0] != "fees"],
+                    tolerance,
+                    minimum_target_tiers=strict_xch_tiers,
+                )
+                fee_request = [
+                    request for request in xch_requests if request[0] == "fees"
+                ]
+                xch_allocated.update(
+                    allocate_matching_counts(fee_records, fee_request, tolerance)
+                )
+            else:
+                xch_allocated = allocate_matching_counts(
+                    xch_coins,
+                    xch_requests,
+                    tolerance,
+                    minimum_target_tiers=strict_xch_tiers,
+                )
             cat_allocated = allocate_matching_counts(
                 cat_coins,
                 cat_requests,
@@ -2943,16 +3275,13 @@ def _api_coin_prep_trigger_locked():
                 raise
 
         # Optional: reset in-memory runtime counters (sniper / fill-tracker /
-        # watchdog streaks / risk-manager position). Mirrors the counters
+        # watchdog streaks). Position is accounting state, not a counter:
+        # re-preparing coins must preserve accumulated exposure. Mirrors the counters
         # step of /api/reset/full. Best-effort — missing attrs aren't fatal.
         if _prep_reset_counters:
             _counters_reset = []
             try:
                 if bot is not None:
-                    _rm = getattr(bot, "risk_manager", None)
-                    if _rm is not None and hasattr(_rm, "reset_position"):
-                        _rm.reset_position()
-                        _counters_reset.append("risk_manager.position")
                     _sn = getattr(bot, "sniper", None)
                     if _sn is not None:
                         try:

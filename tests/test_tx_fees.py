@@ -35,6 +35,12 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(effective, 500_000)
         self.assertTrue(self.tx_fees.fee_pool_enabled())
 
+    def test_configured_fee_reserves_remain_enabled_with_zero_manual_fee(self):
+        self.cfg.TRANSACTION_FEE_XCH = Decimal("0")
+        self.assertEqual(self.tx_fees.get_effective_transaction_fee_mojos(), 0)
+        self.assertTrue(self.tx_fees.fee_pool_enabled())
+        self.assertTrue(self.tx_fees.get_fee_pool_plan()["enabled"])
+
     def test_auto_fee_mode_prefers_suggested_fee(self):
         self.cfg.TRANSACTION_FEE_MODE = "auto"
         with patch.object(
@@ -173,12 +179,46 @@ class TxFeesTests(unittest.TestCase):
                 "requests.post",
                 side_effect=AssertionError("cache must not query transport"),
             ),
-            patch.object(self.tx_fees.time, "time", return_value=150),
+            patch.object(self.tx_fees.time, "time", return_value=110),
         ):
             cached = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
         self.assertEqual(original["observed_at"], 100)
         self.assertEqual(cached["observed_at"], 100)
         self.assertEqual(cached["expires_at"], 160)
+
+    def test_coinset_cache_refreshes_before_quote_becomes_unusable_for_review(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True, "estimates": [123]}
+        )
+        clock = {"now": 100}
+        with (
+            patch("requests.post", return_value=response) as post,
+            patch.object(self.tx_fees.time, "time", lambda: clock["now"]),
+        ):
+            first = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+            clock["now"] = 150
+            refreshed = self.tx_fees._coinset_fee_estimate(300, 20_000_000)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(first["observed_at"], 100)
+        self.assertEqual(refreshed["observed_at"], 150)
+
+    def test_forced_quote_refresh_bypasses_both_provider_caches(self):
+        response = types.SimpleNamespace(
+            status_code=200, json=lambda: {"success": True, "estimates": [123]}
+        )
+        clock = {"now": 100}
+        with (
+            patch("requests.post", return_value=response),
+            patch.object(self.tx_fees.time, "time", lambda: clock["now"]),
+        ):
+            first = self.tx_fees.get_suggested_transaction_fee(300, 20_000_000)
+            clock["now"] = 101
+            refreshed = self.tx_fees.get_suggested_transaction_fee(
+                300, 20_000_000, force_refresh=True
+            )
+        self.assertEqual(first["observed_at"], 100)
+        self.assertEqual(refreshed["observed_at"], 101)
+        self.assertEqual(refreshed["fee_mojos"], 123)
 
     def test_sage_without_full_node_reports_manual_fallback_environment(self):
         # Disable coinset so the test exercises the pure sage/no-full-node fallback path.
@@ -190,6 +230,14 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(snapshot["wallet_type"], "sage")
         self.assertFalse(snapshot["environment"]["supports_auto_estimate"])
         self.assertEqual(snapshot["suggested"]["source"], "manual_fallback_only")
+
+    def test_sage_without_full_node_describes_coinset_when_enabled(self):
+        self.cfg.COINSET_ENABLED = True
+        environment = self.tx_fees.get_wallet_fee_environment()
+        self.assertFalse(environment["supports_auto_estimate"])
+        self.assertTrue(environment["supports_cloud_estimate"])
+        self.assertIn("Coinset", environment["message"])
+        self.assertNotIn("falls back to the manual fee", environment["message"])
 
 
 if __name__ == "__main__":

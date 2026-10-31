@@ -171,7 +171,7 @@ def normalize_fee_response(response, *, cost, target_seconds, source, observed_a
     return result
 
 
-def quote_fee(cost: int, target_seconds: int = 300) -> dict:
+def quote_fee(cost: int, target_seconds: int = 300, *, force_refresh=False) -> dict:
     """Get configured network guidance, retaining its original observation time.
 
     This read-only quote does not authorize a wallet effect or a manual fallback.
@@ -190,7 +190,10 @@ def quote_fee(cost: int, target_seconds: int = 300) -> dict:
         return invalid
     from tx_fees import get_suggested_transaction_fee
 
-    snapshot = get_suggested_transaction_fee(cost=cost, target_seconds=target_seconds)
+    options = {"force_refresh": True} if force_refresh else {}
+    snapshot = get_suggested_transaction_fee(
+        cost=cost, target_seconds=target_seconds, **options
+    )
     now = int(time.time())
     quote = normalize_fee_response(
         snapshot.get("raw") if snapshot.get("available") is True else None,

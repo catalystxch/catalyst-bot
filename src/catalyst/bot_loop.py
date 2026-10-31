@@ -506,6 +506,7 @@ class BotLoop:
         self.dexie_manager = DexieManager()
         self.splash_manager = SplashManager()
         self.splash_node = SplashNode()
+        self.splash_manager.set_peer_readiness_provider(self.splash_node.get_metrics)
         self.coinset_client = CoinsetClient()
         self.market_toxicity_guard = MarketToxicityGuard()
         self._market_runtime_required = True
@@ -514,6 +515,8 @@ class BotLoop:
         self._market_runtime_risk_preset = ""
         self._market_runtime_refresh_cadence = 0
         self._market_runtime_minimum_provider_count = 0
+        self._confidence_override_consent = None
+        self._confidence_override_review = None
         self._market_confidence_result = None
         self._market_degraded_decision = None
         self._market_confidence_valid_until = None
@@ -1054,6 +1057,58 @@ class BotLoop:
             dispatch_authorizer=self._authorize_publication_claim,
         )
 
+    def _override_intent_matches(
+        self, intent: dict, *, publication: bool = False
+    ) -> bool:
+        consent = getattr(self, "_confidence_override_consent", None)
+        run_id = getattr(consent, "follow_run_id", None)
+        if type(run_id) is not str or len(run_id) != 64:
+            return False
+        states = {"created", "confirmed", "visible"}
+        if not publication:
+            states.add("cancel_requested")
+        trade_id = intent.get("sage_trade_id") if type(intent) is dict else None
+        return bool(
+            type(intent) is dict
+            and intent.get("purpose")
+            in {
+                f"follow:{run_id}:normal_lifecycle",
+                f"follow:{run_id}:book_opportunity",
+            }
+            and intent.get("asset_id") == getattr(cfg, "CAT_ASSET_ID", None)
+            and "terminal_at" in intent
+            and intent["terminal_at"] is None
+            and intent.get("lifecycle_state") in states
+            and type(trade_id) is str
+            and len(trade_id) == 64
+            and all(c in "0123456789abcdef" for c in trade_id)
+        )
+
+    def _override_authorizes_publication(self, claim: dict) -> bool:
+        if type(claim) is not dict or not self._confidence_override_active():
+            return False
+        try:
+            intent = database.get_offer_intent(str(claim.get("intent_id") or ""))
+        except Exception:
+            return False
+        return (
+            self._override_intent_matches(intent, publication=True)
+            and self._confidence_override_active()
+        )
+
+    def _override_protected_trade_ids(self) -> set[str]:
+        if not self._confidence_override_active():
+            return set()
+        try:
+            protected = {
+                row["sage_trade_id"]
+                for row in database.get_offer_intents_for_registry()
+                if self._override_intent_matches(row)
+            }
+        except Exception:
+            return set()
+        return protected if self._confidence_override_active() else set()
+
     def _authorize_publication_claim(self, claim: dict) -> bool:
         """Authorize one exact durable publication at its effect boundary.
 
@@ -1065,7 +1120,15 @@ class BotLoop:
         """
 
         if self._enter_runtime_effect_phase("publication"):
-            return True
+            consent = getattr(self, "_confidence_override_consent", None)
+            decision = getattr(self, "_market_degraded_decision", None)
+            if (
+                consent is None
+                or not getattr(self, "_market_runtime_required", False)
+                or bool(getattr(decision, "can_create", False))
+            ):
+                return True
+            return self._override_authorizes_publication(claim)
         if type(claim) is not dict or not self._runtime_recovery_cycle_boundary():
             return False
         context = self._bootstrap_campaign_context()
@@ -1185,6 +1248,118 @@ class BotLoop:
         )
         return False
 
+    def _market_confidence_snapshot(self):
+        lock = getattr(self, "_market_refresh_lock", None)
+        if lock is None:
+            return (
+                getattr(self, "_market_confidence_result", None),
+                getattr(self, "_market_confidence_valid_until", None),
+            )
+        with lock:
+            return (self._market_confidence_result, self._market_confidence_valid_until)
+
+    def _confidence_override_active(self) -> bool:
+        from confidence_override import current_scope
+
+        consent = getattr(self, "_confidence_override_consent", None)
+        if consent is None or consent.revoked or not getattr(self, "_running", False):
+            return False
+        try:
+            scope = current_scope()
+            raw, deadline = self._market_confidence_snapshot()
+            now = datetime.now(timezone.utc)
+            if not consent.active(scope=scope, now=now):
+                return False
+            return (
+                consent.price_range(
+                    raw,
+                    now=now,
+                    valid_until=deadline,
+                )
+                is not None
+            )
+        except ValueError as exc:
+            if str(exc) != "CONFIDENCE_OVERRIDE_OPERATION_PENDING":
+                consent.revoke()
+            return False
+        except Exception:
+            consent.revoke()
+            return False
+
+    def _effective_market_confidence(self, confidence=None, valid_until=None):
+        from confidence_override import ConsentedConfidence
+
+        raw, deadline = self._market_confidence_snapshot()
+        if confidence is not None:
+            raw, deadline = confidence, valid_until
+        if raw is None or not self._confidence_override_active():
+            return raw
+        consent = self._confidence_override_consent
+        prices = consent.price_range(
+            raw,
+            now=datetime.now(timezone.utc),
+            valid_until=deadline,
+        )
+        if prices is None:
+            return raw
+
+        def candidate_authorized():
+            # Building a 48-slot batch must not repeat Sage identity and fee
+            # ledger RPCs for each price candidate. The full scope is checked
+            # again at the durable wallet effect boundary.
+            current_raw, current_deadline = self._market_confidence_snapshot()
+            current_time = datetime.now(timezone.utc)
+            return bool(
+                self._running
+                and current_raw is raw
+                and consent.candidate_active(now=current_time)
+                and consent.price_range(
+                    raw, now=current_time, valid_until=current_deadline
+                )
+                is not None
+            )
+
+        return ConsentedConfidence(
+            raw,
+            lambda: (
+                self._enter_runtime_effect_phase("create")
+                and self._confidence_override_active()
+            ),
+            prices,
+            candidate_authorize=candidate_authorized,
+            current_view=self._fresh_effective_market_confidence,
+        )
+
+    def _fresh_effective_market_confidence(self):
+        """Refresh an aging book before checking a RED override candidate.
+
+        Wallet sync and tier selection can consume the 20-second candidate
+        lifetime after the cycle's market refresh. A failed refresh must leave
+        the candidate without an authorized view.
+        """
+
+        raw, deadline = self._market_confidence_snapshot()
+        now = datetime.now(timezone.utc)
+        derived_at = getattr(raw, "derived_at", None)
+        if getattr(derived_at, "tzinfo", None) is None:
+            return None
+        try:
+            age = (now - derived_at.astimezone(timezone.utc)).total_seconds()
+            remaining = (
+                (deadline.astimezone(timezone.utc) - now).total_seconds()
+                if getattr(deadline, "tzinfo", None) is not None
+                else 0
+            )
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if age >= 10 or remaining <= 10:
+            try:
+                self._refresh_offer_book_market()
+            except Exception as exc:
+                self._enforce_market_refresh_failure(now=now, error=exc)
+                return None
+        return self._effective_market_confidence()
+
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
         """Re-sample continuity at every outer-cycle mutation phase boundary."""
 
@@ -1226,7 +1401,7 @@ class BotLoop:
         seconds_remaining = (
             valid_until.astimezone(timezone.utc) - current_time
         ).total_seconds()
-        if 0 < seconds_remaining <= 5:
+        if seconds_remaining <= 5:
             try:
                 self._refresh_offer_book_market()
             except Exception as exc:
@@ -1255,6 +1430,8 @@ class BotLoop:
                 ),
             )
             return False
+        if getattr(self, "_confidence_override_active", lambda: False)():
+            return True
         if phase_name == "requote":
             return bool(getattr(decision, "can_requote", False))
         if phase_name in {"create", "publication"}:
@@ -1276,7 +1453,10 @@ class BotLoop:
         if not bool(getattr(self, "_market_runtime_required", False)):
             return True
         decision = getattr(self, "_market_degraded_decision", None)
-        if decision is None or not bool(getattr(decision, "can_create", False)):
+        if decision is None or not (
+            bool(getattr(decision, "can_create", False))
+            or getattr(self, "_confidence_override_active", lambda: False)()
+        ):
             return False
         confidence = getattr(self, "_market_confidence_result", None)
         derived_at = getattr(confidence, "derived_at", None)
@@ -1409,7 +1589,9 @@ class BotLoop:
         protected_bootstrap_trade_ids: set[str] = set()
         try:
             context = self._bootstrap_campaign_context()
-            if context.get("active") is True and context.get("blocked") is False:
+            # The durable campaign and intent purpose still identify its offers
+            # when Sage temporarily cannot prove the active wallet identity.
+            if context.get("active") is True and context.get("campaign"):
                 campaign = context.get("campaign") or {}
                 expected_purpose = (
                     f"bootstrap:{campaign.get('campaign_id')}:"
@@ -1427,6 +1609,7 @@ class BotLoop:
             protected_bootstrap_trade_ids = set()
 
         rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        protected_follow_trade_ids = self._override_protected_trade_ids()
         trade_ids = [
             str(row.get("trade_id") or "").strip()
             for row in rows
@@ -1435,6 +1618,7 @@ class BotLoop:
             and str(row.get("trade_id") or "").strip() not in attempted_trade_ids
             and str(row.get("trade_id") or "").strip()
             not in protected_bootstrap_trade_ids
+            and str(row.get("trade_id") or "").strip() not in protected_follow_trade_ids
         ]
         capacity_fn = getattr(self.offer_manager, "get_sage_bulk_cancel_capacity", None)
         if (
@@ -2764,6 +2948,22 @@ class BotLoop:
     def _apply_market_follow_capacity(self, targets: Dict[str, int]) -> Dict[str, int]:
         """Apply the current Follow confidence cap to a pair of targets."""
         confidence = getattr(self, "_market_confidence_result", None)
+        if self._confidence_override_active():
+            return {
+                side: min(
+                    int((targets or {}).get(side, 0) or 0),
+                    int(
+                        getattr(
+                            cfg,
+                            "MAX_ACTIVE_BUY_OFFERS"
+                            if side == "buy"
+                            else "MAX_ACTIVE_SELL_OFFERS",
+                            0,
+                        )
+                    ),
+                )
+                for side in ("buy", "sell")
+            }
         return {
             side: market_follow_offer_target(
                 int((targets or {}).get(side, 0) or 0), confidence
@@ -5720,11 +5920,12 @@ class BotLoop:
 
     def _fresh_wallet_offer_book_for_start(self) -> bool:
         """Reject a cached or failed Sage offer read before spawning workers."""
+        self._fresh_start_active_offer_count = None
         try:
             offers, meta = self.offer_manager.sync_from_wallet_with_meta()
         except Exception:
             return False
-        return (
+        valid = (
             type(offers) is tuple
             and len(offers) == 3
             and all(type(rows) is list for rows in offers)
@@ -5732,6 +5933,9 @@ class BotLoop:
             and meta.get("fresh") is True
             and meta.get("using_cache") is False
         )
+        if valid:
+            self._fresh_start_active_offer_count = len(offers[0]) + len(offers[1])
+        return valid
 
     def _detect_fills_for_wallet_cycle(self, current_buy_ids, current_sell_ids):
         """Only a fresh offer book can advance fill detection state."""
@@ -5760,6 +5964,13 @@ class BotLoop:
             )
             return False
 
+        previous_consent = getattr(self, "_confidence_override_consent", None)
+        if previous_consent is not None:
+            previous_consent.revoke()
+        self._confidence_override_consent = getattr(
+            self, "_confidence_override_pending", None
+        )
+        self._confidence_override_pending = None
         try:
             mutation_gate.require_allowed("startup:bot_loop_recovery")
         except mutation_gate.MutationBlocked as exc:
@@ -5931,6 +6142,49 @@ class BotLoop:
             )
             return False
 
+        # The HTTP Start route makes this check too, but a direct in-process
+        # caller must not bypass the reviewed financial run before workers
+        # start. A fresh Sage active book requires a separate exact resume
+        # review; it cannot silently inherit a new run's free-coin approval.
+        reviewed_follow_run_id = None
+        try:
+            bootstrap_context = self._bootstrap_campaign_context()
+            if type(bootstrap_context) is not dict:
+                raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+            if bootstrap_context.get("active") is True:
+                if bootstrap_context.get("blocked") is not False:
+                    raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+            elif bootstrap_context.get("active") is False:
+                from follow_principal import reviewed_follow_start_readiness
+
+                active_count = getattr(self, "_fresh_start_active_offer_count", None)
+                if type(active_count) is not int or active_count < 0:
+                    raise ValueError("FOLLOW_WALLET_BOOK_UNAVAILABLE")
+                readiness = reviewed_follow_start_readiness(
+                    cfg, resume_existing_offers=active_count > 0
+                )
+                if readiness.get("ready") is not True:
+                    raise ValueError(
+                        readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
+                    )
+                reviewed_follow_run_id = readiness.get("run_id")
+            else:
+                raise ValueError("BOOTSTRAP_AUTHORITY_UNAVAILABLE")
+        except Exception as exc:
+            reason = (
+                str(exc) if isinstance(exc, ValueError) else "FOLLOW_REVIEW_UNAVAILABLE"
+            )
+            self._set_state(running=False, status="blocked", error=reason)
+            log_event(
+                "error",
+                "bot_start_review_unavailable",
+                "Bot start blocked because reviewed financial authority is unavailable",
+                data={"reason_code": reason},
+            )
+            return False
+
+        self._reviewed_follow_run_id = reviewed_follow_run_id
+
         self._watcher_stop_event.clear()
         self._running = True
         self._start_time = time.time()
@@ -6050,11 +6304,203 @@ class BotLoop:
         )
         return True
 
+    def _record_reviewed_follow_stop(self) -> bool:
+        """Revoke new Follow creation while retaining its cleanup fee scope."""
+        run_id = getattr(self, "_reviewed_follow_run_id", None)
+        if run_id is None:
+            return True
+        try:
+            import database
+
+            result = database.stop_follow_run_authority(
+                run_id=run_id, stopped_at_epoch=int(time.time())
+            )
+            if result.get("run_id") != run_id:
+                raise ValueError("FOLLOW_RUN_STOP_NOT_RECORDED")
+            return True
+        except Exception as exc:
+            log_event(
+                "error",
+                "follow_run_stop_not_recorded",
+                "Reviewed Follow run could not record its durable Stop; "
+                "the bot remains in stopping state",
+                data={"run_id": run_id, "error_type": type(exc).__name__},
+            )
+            return False
+
+    def _cancel_reserve_floor_offers(self, trade_ids: set[str]) -> bool:
+        """Halt a reviewed Follow run before using its shutdown allowance.
+
+        Return False after a Follow stop so the current cycle exits. Never
+        discard local offer IDs: only wallet proof may retire those slots.
+        """
+        follow_run_id = getattr(self, "_reviewed_follow_run_id", None)
+        if not trade_ids and follow_run_id is None:
+            return True
+        cancel_phase_allowed = self._enter_runtime_effect_phase("cancel")
+        if follow_run_id is None and not cancel_phase_allowed:
+            return False
+        if follow_run_id is not None:
+            # stop(wait=False) cannot join this trading thread. It revokes
+            # creation immediately and lets the finalizer wait for us.
+            if not self.stop(wait=False) or not self._record_reviewed_follow_stop():
+                return False
+            if not cancel_phase_allowed:
+                return False
+            try:
+                self.offer_manager.wait_for_offer_creation_quiescence()
+                rows = database.get_offer_intents_for_registry()
+                current = set()
+                for row in rows:
+                    if (
+                        row.get("purpose")
+                        not in {
+                            f"follow:{follow_run_id}:normal_lifecycle",
+                            f"follow:{follow_run_id}:book_opportunity",
+                        }
+                        or row.get("terminal_at") is not None
+                    ):
+                        continue
+                    trade_id = row.get("sage_trade_id")
+                    if (
+                        row.get("lifecycle_state")
+                        not in {"created", "confirmed", "visible", "cancel_requested"}
+                        or type(trade_id) is not str
+                        or len(trade_id) != 64
+                        or any(ch not in "0123456789abcdef" for ch in trade_id)
+                    ):
+                        raise ValueError("FOLLOW_RESERVE_FLOOR_BOOK_UNVERIFIED")
+                    current.add(trade_id)
+                if not set(trade_ids).issubset(current):
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_BOOK_UNVERIFIED")
+                trade_ids = current
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "reserve_floor_shutdown_unverified",
+                    "Follow run stopped; exact offer book could not be proved for reserve-floor cancellation",
+                    data={"error_type": type(exc).__name__},
+                )
+                return False
+        if trade_ids:
+            try:
+                if follow_run_id is not None:
+                    BotLoop._cancel_follow_reserve_floor_cohorts(
+                        self, sorted(trade_ids)
+                    )
+                else:
+                    self.offer_manager.cancel_offers(
+                        sorted(trade_ids),
+                        reason="reserve_floor_breached",
+                        force_storm=True,
+                    )
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "reserve_floor_cancel_failed",
+                    "Reserve-floor cancellation failed; offers remain tracked for proof and retry",
+                    data={"error_type": type(exc).__name__},
+                )
+                return False
+        return follow_run_id is None
+
+    def _cancel_follow_reserve_floor_cohorts(self, trade_ids: list[str]) -> None:
+        """Split an oversized stopped Follow book without crossing unproved effects.
+
+        The normal dispatcher prices each exact cohort before preparing its
+        durable journal. An unsigned-cost refusal may bisect a cohort only if
+        no unresolved cancellation is journaled. A later wallet effect waits
+        for Task 9 terminal proof of every member of the previous one.
+        """
+
+        run_id = self._reviewed_follow_run_id
+        identity = database.get_follow_run_identity(run_id)
+        pending = [trade_ids]
+        while pending:
+            coin_manager = getattr(self, "coin_manager", None)
+            refresh_fee_pool = getattr(
+                coin_manager, "refresh_fee_pool_from_wallet", None
+            )
+            if callable(refresh_fee_pool):
+                refresh_fee_pool()
+            expected_ids = [trade_id for batch in pending for trade_id in batch]
+            preview = self.offer_manager.preview_follow_cancel_book(
+                pending,
+                run_id=run_id,
+                identity=identity,
+                recovery_action="cancel_all",
+            )
+            if (
+                type(preview) is not dict
+                or preview.get("dispatch_authorized") is not False
+                or type(preview.get("cohorts")) is not list
+                or [trade_id for batch in preview["cohorts"] for trade_id in batch]
+                != expected_ids
+            ):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_PREVIEW_INVALID")
+            pending = [list(batch) for batch in preview["cohorts"]]
+            cohort = pending.pop(0)
+            try:
+                results = self.offer_manager.cancel_offers(
+                    cohort,
+                    reason="reserve_floor_breached",
+                    force_storm=True,
+                )
+            except ValueError as exc:
+                if (
+                    str(exc)
+                    not in {
+                        "FEE_CANCELLATION_BATCH_OVER_BLOCK_LIMIT",
+                        "FEE_UNSIGNED_COST_UNAVAILABLE",
+                    }
+                    or len(cohort) == 1
+                ):
+                    raise
+                # A late error cannot be treated as a read-only size probe if
+                # any durable cancellation operation may already have begun.
+                if database.get_unresolved_offer_operation_blockers():
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_COHORT_UNRESOLVED") from exc
+                midpoint = len(cohort) // 2
+                pending[0:0] = [cohort[:midpoint], cohort[midpoint:]]
+                continue
+            if type(results) is not dict or set(results) != set(cohort):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_CANCEL_RESULT_INVALID")
+            if all(
+                type(results[trade_id]) is dict
+                and results[trade_id].get("outcome") == "CANCEL_FAILED"
+                and results[trade_id].get("submitted") is False
+                and results[trade_id].get("reconciliation_required") is False
+                for trade_id in cohort
+            ):
+                raise ValueError("FOLLOW_RESERVE_FLOOR_CANCEL_PRE_EFFECT_FAILED")
+            deadline = time.monotonic() + 300
+            while True:
+                self.offer_manager.reconcile_submitted_cancels_only()
+                records = database.get_authoritative_terminal_records(cohort)
+                if type(records) is not dict:
+                    raise ValueError("FOLLOW_RESERVE_FLOOR_PROOF_UNAVAILABLE")
+                if all(
+                    type(records.get(trade_id)) is dict
+                    and records[trade_id].get("sage_trade_id") == trade_id
+                    and records[trade_id].get("outcome")
+                    in {"CANCELLED_PROVEN", "FILLED_PROVEN", "EXPIRED_PROVEN"}
+                    for trade_id in cohort
+                ):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("FOLLOW_RESERVE_FLOOR_COHORT_UNCONFIRMED")
+                time.sleep(min(1.0, remaining))
+
     def stop(self, wait: bool = True) -> bool:
         """Stop the bot loop gracefully.
 
         Returns True if stopped, False if not running.
         """
+        consent = getattr(self, "_confidence_override_consent", None)
+        if consent is not None:
+            consent.revoke()
+        self._confidence_override_review = None
         if not self._running:
             finalizer = self._stop_finalize_thread
             if finalizer and finalizer.is_alive():
@@ -6086,6 +6532,7 @@ class BotLoop:
         # minutes after stop() returns, because the 10s join timeout
         # expires but the thread is still alive creating offers.
         self.offer_manager._stop_requested = True
+        self._record_reviewed_follow_stop()
 
         # Wake sleeping threads promptly. For GUI/API stop we return after
         # this signal and let the finalizer perform joins/cleanup.
@@ -6205,6 +6652,13 @@ class BotLoop:
             self._set_state(running=False, status="stopping")
             return False
 
+        if not self._record_reviewed_follow_stop():
+            self._set_state(
+                running=False,
+                status="stopping",
+                error="FOLLOW_RUN_STOP_NOT_RECORDED",
+            )
+            return False
         self._set_state(status="stopped")
 
         # Clear all operational alerts so they don't linger on the GUI after stop
@@ -6322,6 +6776,13 @@ class BotLoop:
                 self._set_state(running=False, status="stopping")
                 return
 
+            if not self._record_reviewed_follow_stop():
+                self._set_state(
+                    running=False,
+                    status="stopping",
+                    error="FOLLOW_RUN_STOP_NOT_RECORDED",
+                )
+                return
             self._set_state(running=False, status="stopped")
 
             for alert_id in (
@@ -7627,7 +8088,10 @@ class BotLoop:
         try:
             market_result = self._refresh_offer_book_market()
             fresh_mid = (
-                market_result.confidence.trusted_midpoint
+                self._effective_market_confidence(
+                    market_result.confidence,
+                    getattr(market_result, "valid_until", None),
+                ).trusted_midpoint
                 if market_result is not None
                 else None
             )
@@ -8178,7 +8642,10 @@ class BotLoop:
         try:
             startup_market = self._refresh_offer_book_market()
             startup_mid = (
-                startup_market.confidence.trusted_midpoint
+                self._effective_market_confidence(
+                    startup_market.confidence,
+                    getattr(startup_market, "valid_until", None),
+                ).trusted_midpoint
                 if startup_market is not None
                 else None
             )
@@ -9704,7 +10171,11 @@ class BotLoop:
                 now=datetime.now(timezone.utc), error=market_error
             )
         trusted_midpoint = (
-            market_result.confidence.trusted_midpoint if market_result else None
+            self._effective_market_confidence(
+                market_result.confidence, getattr(market_result, "valid_until", None)
+            ).trusted_midpoint
+            if market_result
+            else None
         )
         price_data = (
             {
@@ -11325,7 +11796,7 @@ class BotLoop:
                         price_floor=price_floor,
                         live_offer_ids=_live_ids,
                         force_cancel_storm=True,
-                        market_confidence=self._market_confidence_result,
+                        market_confidence=self._effective_market_confidence(),
                     )
                     # Note: do NOT add to _requoted_this_cycle until we
                     # know progress was made. Previously we stamped this
@@ -11740,14 +12211,8 @@ class BotLoop:
                         action_label="Stop Bot",
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
-                    if _all_open:
-                        if not self._enter_runtime_effect_phase("cancel"):
-                            return False
-                        self.offer_manager.cancel_offers(
-                            _all_open, reason="reserve_floor_breached", force_storm=True
-                        )
-                        current_buy_ids.clear()
-                        current_sell_ids.clear()
+                    if not self._cancel_reserve_floor_offers(set(_all_open)):
+                        return False
                     _reserve_skip_create = True
                 elif _xch_total <= _xch_near_floor:
                     log_event(
@@ -11807,14 +12272,8 @@ class BotLoop:
                         action_label="Stop Bot",
                     )
                     _all_open = list(current_buy_ids | current_sell_ids)
-                    if _all_open:
-                        if not self._enter_runtime_effect_phase("cancel"):
-                            return False
-                        self.offer_manager.cancel_offers(
-                            _all_open, reason="reserve_floor_breached", force_storm=True
-                        )
-                        current_buy_ids.clear()
-                        current_sell_ids.clear()
+                    if not self._cancel_reserve_floor_offers(set(_all_open)):
+                        return False
                     _reserve_skip_create = True
                 elif _cat_total <= _cat_near_floor:
                     log_event(
@@ -12636,7 +13095,7 @@ class BotLoop:
                         RequoteSeverity.FULL,
                         RequoteSeverity.EMERGENCY,
                     ),
-                    market_confidence=self._market_confidence_result,
+                    market_confidence=self._effective_market_confidence(),
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force
@@ -12847,6 +13306,7 @@ class BotLoop:
                 "blocked": True,
                 "reason": "bootstrap_authority_ambiguous",
             }
+        campaign = campaigns[0]
         try:
             from wallet import get_wallet_identity
 
@@ -12858,6 +13318,7 @@ class BotLoop:
                 "active": True,
                 "blocked": True,
                 "reason": "bootstrap_wallet_identity_unavailable",
+                "campaign": campaign,
             }
         network_id = str(snapshot.get("network_id") or "").strip().lower()
         network = (
@@ -12874,7 +13335,6 @@ class BotLoop:
             "wallet_id": getattr(cfg, "CAT_WALLET_ID", None),
             "asset_id": asset_id,
         }
-        campaign = campaigns[0]
         if any(campaign.get(key) != identity.get(key) for key in identity):
             return {
                 "active": True,
@@ -13020,6 +13480,7 @@ class BotLoop:
         revision = database.update_bootstrap_campaign_state(
             campaign["campaign_id"],
             expected_revision=campaign["revision"],
+            expected_state_revision=campaign["state_revision"],
             record=state_update,
         )
         occurred_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -13030,6 +13491,8 @@ class BotLoop:
                 "occurred_at": occurred_at,
                 "data": {
                     "revision": revision,
+                    "state_revision": campaign["state_revision"] + 1,
+                    "offer_authority_changed": revision != campaign["revision"],
                     "stage": state_update["stage"],
                     "deployment_fraction": state_update["deployment_fraction"],
                     "confirmed_fills": state_update["confirmed_fills"],
@@ -13040,12 +13503,17 @@ class BotLoop:
             }
         )
         refreshed = database.get_bootstrap_campaign(campaign["campaign_id"])
-        if type(refreshed) is not dict or refreshed.get("revision") != revision:
+        if (
+            type(refreshed) is not dict
+            or refreshed.get("revision") != revision
+            or refreshed.get("state_revision") != campaign["state_revision"] + 1
+        ):
             raise RuntimeError("Bootstrap evidence update could not be reloaded")
         log_event(
             "info",
             "bootstrap_authoritative_evidence_materialized",
-            f"Market Bootstrap advanced to {refreshed['stage']} at revision {revision}",
+            f"Market Bootstrap materialized {refreshed['stage']} evidence at "
+            f"offer revision {revision}, state revision {refreshed['state_revision']}",
             data={
                 "campaign_id": campaign["campaign_id"],
                 "confirmed_fills": refreshed["confirmed_fills"],
@@ -13091,7 +13559,7 @@ class BotLoop:
             )
             return empty
 
-        from tx_fees import get_effective_transaction_fee_mojos
+        from tx_fees import fee_pool_enabled, get_effective_transaction_fee_mojos
         from wallet import get_wallet_balance
 
         try:
@@ -13123,6 +13591,7 @@ class BotLoop:
         balances = {
             "xch_available": xch_available,
             "cat_available": cat_available,
+            "cat_decimals": int(getattr(cfg, "CAT_DECIMALS", 3)),
             "fee_spent_xch": Decimal(str(campaign.get("fee_spent_xch", "0"))),
             "subsidy_spent_xch": Decimal("0"),
             "network_fee_xch": Decimal(get_effective_transaction_fee_mojos())
@@ -13133,6 +13602,7 @@ class BotLoop:
             "fee_coin_size_xch": Decimal(
                 str(getattr(cfg, "FEE_COIN_SIZE_XCH", Decimal("0")))
             ),
+            "fee_pool_enabled": fee_pool_enabled(),
             "expected_cancel_requotes": int(
                 getattr(cfg, "EXPECTED_CANCEL_REQUOTES", 0) or 0
             ),
@@ -13175,6 +13645,13 @@ class BotLoop:
             live_trade_ids=current_buy_ids | current_sell_ids,
         )
         if superseded:
+            # Earlier cancellations may have spent the pool's reserved coin.
+            # Refresh against Sage before planning another protected cancel.
+            refresh_fee_pool = getattr(
+                self.coin_manager, "refresh_fee_pool_from_wallet", None
+            )
+            if callable(refresh_fee_pool):
+                refresh_fee_pool()
             self.offer_manager.cancel_offers(
                 list(superseded),
                 reason="bootstrap_revision_superseded",
@@ -13204,6 +13681,11 @@ class BotLoop:
                 }
             )
             if trade_ids:
+                refresh_fee_pool = getattr(
+                    self.coin_manager, "refresh_fee_pool_from_wallet", None
+                )
+                if callable(refresh_fee_pool):
+                    refresh_fee_pool()
                 self.offer_manager.cancel_offers(
                     trade_ids,
                     reason=runtime["transition"]["cancel_reason"],
@@ -13286,6 +13768,22 @@ class BotLoop:
             len(plan["sides"][side]["levels"]) for side in allowed_sides
         ):
             return empty
+        from bootstrap_fee_authority import cancellation_fee_readiness
+
+        fee_readiness = cancellation_fee_readiness(campaign)
+        if fee_readiness.get("ready") is not True:
+            signature = (campaign["revision"], repr(sorted(fee_readiness.items())))
+            if getattr(self, "_bootstrap_fee_readiness_block", None) != signature:
+                log_event(
+                    "warning",
+                    "bootstrap_cancellation_fee_review_required",
+                    "Bootstrap replacement offers paused: review cancellation "
+                    "fee consent before adding exposure; no wallet call was made",
+                    data=fee_readiness,
+                )
+                self._bootstrap_fee_readiness_block = signature
+            return empty
+        self._bootstrap_fee_readiness_block = None
         created = self.offer_manager.create_bootstrap_plan(
             plan,
             campaign_authority=campaign,
@@ -13360,6 +13858,21 @@ class BotLoop:
                 f"enable_{side_norm}": side_enabled,
             },
         )
+
+    @staticmethod
+    def _require_follow_creation_run_id() -> str:
+        """Read the durable, current Follow scope before producing an offer."""
+        from confidence_override import current_scope
+
+        scope = current_scope()
+        run_id = scope.get("follow_run_id") if type(scope) is dict else None
+        if (
+            type(run_id) is not str
+            or len(run_id) != 64
+            or any(char not in "0123456789abcdef" for char in run_id)
+        ):
+            raise ValueError("FOLLOW_FEE_AUTHORITY_REQUIRED")
+        return run_id
 
     def _create_offers_if_needed(
         self,
@@ -13828,6 +14341,16 @@ class BotLoop:
             )[:needed]
             if not self._enter_runtime_effect_phase("create"):
                 return
+            try:
+                follow_run_id = self._require_follow_creation_run_id()
+            except Exception as exc:
+                log_event(
+                    "warning",
+                    "follow_create_authority_missing",
+                    "Follow offer creation paused until the reviewed run is funded",
+                    data={"reason_code": str(exc)[:120]},
+                )
+                return
             offers = self.offer_manager.create_ladder(
                 ladder_mid_price,
                 side,
@@ -13841,7 +14364,8 @@ class BotLoop:
                 price_floor=price_floor,
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
-                market_confidence=self._market_confidence_result,
+                market_confidence=self._effective_market_confidence(),
+                follow_run_id=follow_run_id,
             )
             _parallel_results[side] = offers or []
 
@@ -17367,7 +17891,10 @@ class BotLoop:
             if mid_price <= 0:
                 market_result = self._refresh_offer_book_market()
                 if market_result is not None:
-                    trusted_midpoint = market_result.confidence.trusted_midpoint
+                    trusted_midpoint = self._effective_market_confidence(
+                        market_result.confidence,
+                        getattr(market_result, "valid_until", None),
+                    ).trusted_midpoint
                     if trusted_midpoint is not None:
                         mid_price = trusted_midpoint
 

@@ -16,6 +16,15 @@ import wallet
 
 
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
+_UNSIGNED_REFUSAL_STAGES = frozenset(
+    {
+        "cancel_component",
+        "cancel_cost",
+        "fee_component",
+        "combined_component",
+        "combined_cost",
+    }
+)
 _CONTEXT_KEYS = (
     "identity",
     "configuration",
@@ -73,7 +82,9 @@ def price_approved_cancellation(
         context = {"approval": accounting}
         return _unavailable(context, "FEE_EFFECT_RECOVERY_REQUIRED")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     target_seconds = context["recipe"]["economic_plan"]["target_seconds"]
     fee = 0
@@ -91,7 +102,20 @@ def price_approved_cancellation(
             else None
         )
         if type(cost) is not int or isinstance(cost, bool) or cost <= 0:
-            return _unavailable(context, "FEE_UNSIGNED_COST_UNAVAILABLE")
+            stage = (
+                built.get("_catalyst_cancel_pricing_stage")
+                if type(built) is dict
+                else None
+            )
+            return _unavailable(
+                context,
+                "FEE_UNSIGNED_COST_UNAVAILABLE",
+                **(
+                    {"diagnostic_stage": stage}
+                    if type(stage) is str and stage in _UNSIGNED_REFUSAL_STAGES
+                    else {}
+                ),
+            )
         try:
             quote = quote_fee(cost, target_seconds=target_seconds)
         except Exception:
@@ -99,8 +123,12 @@ def price_approved_cancellation(
         if not is_current_fee_quote(quote, cost, target_seconds):
             return _unavailable(context, "FEE_ESTIMATE_UNAVAILABLE")
         if quote["fee_mojos"] == fee:
+            if fee == 0:
+                return _unavailable(context, "FEE_CANCELLATION_FUNDING_REQUIRED")
             after = read_approved_prep_fee_snapshot(
-                approval_id, expected_recovery_action=expected_recovery_action
+                approval_id,
+                expected_recovery_action=expected_recovery_action,
+                allow_policy_only_revision=True,
             )
             if any(after[key] != context[key] for key in _CONTEXT_KEYS):
                 raise ValueError("FEE_APPROVAL_STALE")
@@ -171,7 +199,9 @@ def reserve_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")
@@ -233,7 +263,9 @@ def recheck_reserved_approved_cancellation(
     ):
         raise ValueError("FEE_CANCELLATION_PLAN_INVALID")
     context = read_approved_prep_fee_snapshot(
-        approval_id, expected_recovery_action=expected_recovery_action
+        approval_id,
+        expected_recovery_action=expected_recovery_action,
+        allow_policy_only_revision=True,
     )
     if any(priced_cancellation.get(key) != context[key] for key in _CONTEXT_KEYS):
         raise ValueError("FEE_APPROVAL_STALE")

@@ -19,7 +19,7 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr(fee_estimation.time, "time", lambda: 100)
 
     def provider(*, cost, target_seconds):
-        fees = {20_000_000: 30, 10_000_000: 10, 5_000_000: 5}
+        fees = {20_000_000: 30, 10_000_000: 10, 5_000_000: 5, 11_000_000_000: 90}
         return {
             "available": True,
             "source": "coinset",
@@ -134,6 +134,167 @@ def test_projected_upper_count_prices_total_without_charging_fee_principal(conte
     assert result["stages"][1]["cost_kind"] == "exact_unsigned"
 
 
+def test_standalone_follow_shutdown_quote_floors_protection_and_fee_coin(context):
+    scope, plan, stages = context
+    quote = fee_estimation.quote_fee(11_000_000_000, target_seconds=300)
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is True
+    assert result["minimum_cancellation_reserve_mojos"] == 90
+    assert result["minimum_cumulative_fee_mojos"] == 160
+    assert result["follow_shutdown_fee_mojos"] == 90
+    plan["outputs"][0]["amount_mojos"] = 89
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is False
+    assert result["reason"] == "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL"
+
+
+def test_standalone_follow_shutdown_zero_quote_fails_closed(context):
+    scope, plan, stages = context
+    quote = fee_estimation.quote_fee(11_000_000_000, target_seconds=300)
+    quote["fee_mojos"] = 0
+    result = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=200,
+        request_options={"coin_multiplier": "1"},
+        follow_shutdown_quote=quote,
+    )
+    assert result["available"] is False
+    assert result["reason"] == "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE"
+
+
+def _hold(preview, approval, operation, fee, cancellation=False):
+    return database.reserve_approved_fee(
+        approval_id=approval["approval_id"],
+        scope_sha256=preview["scope_sha256"],
+        plan_sha256=preview["plan_sha256"],
+        operation_id=operation * 64,
+        fee_mojos=fee,
+        cancellation=cancellation,
+    )
+
+
+def _approve(preview, maximum=200, reserve=40):
+    return database.approve_coin_prep_fee_preview(
+        preview_id=preview["preview_id"],
+        scope_sha256=preview["scope_sha256"],
+        plan_sha256=preview["plan_sha256"],
+        maximum_fee_mojos=maximum,
+        cancellation_reserve_mojos=reserve,
+        now=100,
+    )
+
+
+@pytest.mark.parametrize("change", ["session", "pair", "campaign"])
+def test_wallet_commitments_and_protection_survive_new_economic_scope(context, change):
+    first = _preview(context, funding=1000)
+    approval = _approve(first)
+    _hold(first, approval, "1", 30)
+    _hold(first, approval, "2", 20, cancellation=True)
+    scope, plan, _ = context
+    scope["session_id"] = "e" * 64
+    if change == "pair":
+        scope.update(wallet_id=3, asset_id="a" * 64, ticker="OTHER_XCH")
+    elif change == "campaign":
+        scope.update(session_id=None, campaign_id="f" * 64)
+        plan["campaign_revision"] = 0
+    second = _preview(context, funding=1000)
+    assert second["scope_sha256"] != first["scope_sha256"]
+    assert second["fee_accounting"]["held_fee_mojos"] == 50
+    assert second["minimum_cancellation_reserve_mojos"] == 40
+    assert second["minimum_cumulative_fee_mojos"] == (
+        160 if change == "campaign" else 140
+    )
+    with pytest.raises(ValueError, match="FEE_BUDGET_INSUFFICIENT"):
+        _approve(second, maximum=100)
+    renewed = _approve(second)
+    assert renewed["committed_fee_mojos"] == 50
+    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+        _hold(second, renewed, "3", 131)
+    assert database.get_fee_approval(approval["approval_id"])["held_fee_mojos"] == 50
+
+
+def test_new_wallet_ceiling_also_bounds_old_scope_dispatch(context):
+    first = _preview(context, funding=1000)
+    old = _approve(first)
+    _hold(first, old, "1", 30)
+    context[0]["session_id"] = "e" * 64
+    second = _preview(context, funding=1000)
+    _approve(second, maximum=140)
+    assert database.get_fee_approval(old["approval_id"])["remaining_fee_mojos"] == 110
+    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+        _hold(first, old, "2", 71)
+
+
+def test_other_wallet_does_not_inherit_fee_commitments(context):
+    first = _preview(context, funding=1000)
+    old = _approve(first)
+    _hold(first, old, "1", 30)
+    context[0]["wallet_fingerprint"] = 3702373391
+    context[0]["session_id"] = "e" * 64
+    second = _preview(context, funding=1000)
+    assert second["fee_accounting"]["committed_fee_mojos"] == 0
+    assert second["minimum_cancellation_reserve_mojos"] == 10
+
+
+def test_competing_wallet_scopes_share_one_serialized_remainder(context):
+    from concurrent.futures import ThreadPoolExecutor
+
+    first = _preview(context, funding=1000)
+    old = _approve(first)
+    _hold(first, old, "1", 30)
+    context[0]["session_id"] = "e" * 64
+    second = _preview(context, funding=1000)
+    new = _approve(second)
+
+    def reserve(args):
+        preview, approval, operation = args
+        try:
+            _hold(preview, approval, operation, 80)
+            return "held"
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(reserve, [(first, old, "2"), (second, new, "3")]))
+    assert sorted(results) == ["FEE_BUDGET_EXCEEDED", "held"]
+    assert database.get_fee_approval(new["approval_id"])["held_fee_mojos"] == 110
+
+
+def test_exact_point_zero_zero_five_wallet_cap_cannot_be_renewed_by_session(context):
+    first = _preview(context, funding=10_000_000_000)
+    old = _approve(first, maximum=5_000_000_000, reserve=1_037_763_168)
+    _hold(first, old, "1", 774_766_315)
+    context[0]["session_id"] = "e" * 64
+    second = _preview(context, funding=10_000_000_000)
+    new = _approve(second, maximum=5_000_000_000, reserve=1_037_763_168)
+    assert new["held_fee_mojos"] == 774_766_315
+    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+        _hold(second, new, "2", 3_187_470_518)
+    with pytest.raises(ValueError, match="FEE_CANCEL_PROTECTION_DECREASED"):
+        database.create_fee_approval(
+            scope_sha256=second["scope_sha256"],
+            plan_sha256=second["plan_sha256"],
+            total_fee_mojos=5_000_000_000,
+            cancellation_reserve_mojos=1_037_763_167,
+        )
+
+
 @pytest.mark.parametrize(
     "prep_held,cancel_held,want_cap,want_funding",
     [
@@ -189,6 +350,62 @@ def test_renewal_preserves_protection_and_prices_a_cumulative_ceiling(
     )
     assert renewed["version"] == 2
     assert renewed["remaining_fee_mojos"] == want_funding
+
+
+def test_bootstrap_renewal_replenishes_full_reserve_after_prior_cancellation(context):
+    scope, plan, stages = context
+    scope["campaign_id"] = "a" * 64
+    scope["session_id"] = None
+    plan["campaign_revision"] = 0
+    contract = service.canonical_fee_contract(scope, plan)
+    prior = database.create_fee_approval(
+        scope_sha256=contract["scope_sha256"],
+        plan_sha256=contract["plan_sha256"],
+        total_fee_mojos=200,
+        cancellation_reserve_mojos=40,
+    )
+    for operation_id, fee, cancellation in (
+        ("1" * 64, 30, False),
+        ("2" * 64, 20, True),
+    ):
+        database.reserve_approved_fee(
+            approval_id=prior["approval_id"],
+            scope_sha256=contract["scope_sha256"],
+            plan_sha256=contract["plan_sha256"],
+            operation_id=operation_id,
+            fee_mojos=fee,
+            cancellation=cancellation,
+        )
+
+    preview = service.estimate_coin_prep_fee_preview(
+        scope=scope,
+        economic_plan=plan,
+        stages=stages,
+        fee_funding_mojos=1_000,
+        request_options={"bootstrap_campaign_id": scope["campaign_id"]},
+    )
+    assert preview["estimated_preparation_fee_mojos"] == 70
+    assert preview["minimum_cancellation_reserve_mojos"] == 40
+    assert preview["fee_accounting"]["committed_fee_mojos"] == 50
+    assert preview["minimum_cumulative_fee_mojos"] == 160
+    with pytest.raises(ValueError, match="FEE_BUDGET_INSUFFICIENT"):
+        database.approve_coin_prep_fee_preview(
+            preview_id=preview["preview_id"],
+            scope_sha256=preview["scope_sha256"],
+            plan_sha256=preview["plan_sha256"],
+            maximum_fee_mojos=140,
+            cancellation_reserve_mojos=40,
+            now=100,
+        )
+    renewed = database.approve_coin_prep_fee_preview(
+        preview_id=preview["preview_id"],
+        scope_sha256=preview["scope_sha256"],
+        plan_sha256=preview["plan_sha256"],
+        maximum_fee_mojos=160,
+        cancellation_reserve_mojos=40,
+        now=100,
+    )
+    assert renewed["remaining_fee_mojos"] - 70 == 40
 
 
 def test_other_wallet_scope_does_not_inflate_renewal_disclosure(context):

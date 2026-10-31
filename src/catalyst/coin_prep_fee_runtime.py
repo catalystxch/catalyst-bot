@@ -260,7 +260,9 @@ def read_fee_wallet_snapshot() -> dict:
     ids = [row["coin_id"] for rows in observed.values() for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("FEE_WALLET_INVENTORY_UNAVAILABLE")
-    reconciliation = set(database.get_coin_reconciliation_protected_ids(ids))
+    reconciliation = {
+        _hex(coin_id) for coin_id in database.get_coin_preparation_protected_ids(ids)
+    }
     coins = []
     for asset, rows in observed.items():
         reserves = {_hex(row["coin_id"]) for row in database.get_reserve_coins(asset)}
@@ -299,6 +301,82 @@ def _campaign_is_stopped_for_fee_recovery(campaign: object) -> bool:
         campaign.get("status") == "stopped"
         or (campaign.get("status") == "active" and campaign.get("stage") == "stopped")
     )
+
+
+def _outstanding_campaign_cancel_assets(campaign_id: str) -> dict[str, str]:
+    """Bind cancellation cover to durable nonterminal campaign offer intents."""
+    from blueprints.bootstrap import _campaign_trade_ids
+
+    prefix = f"bootstrap:{campaign_id}:revision:"
+    assets = {}
+    for trade_id in _campaign_trade_ids(campaign_id):
+        intent = database.get_offer_intent_by_trade_id(trade_id)
+        if type(intent) is not dict or not str(intent.get("purpose") or "").startswith(
+            prefix
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        side = intent.get("side")
+        if side not in {"buy", "sell"}:
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        assets[trade_id] = "xch" if side == "buy" else "cat"
+    # A fenced refresh can outlive the campaign that created its offers. The
+    # ordinary intents can have a normal_lifecycle purpose; the append-only
+    # abort target set is the authority for their cancellation-only quote.
+    from mutation_gate import wallet_fingerprint_hash
+    import wallet
+
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    if type(campaign) is not dict or not _campaign_is_stopped_for_fee_recovery(
+        campaign
+    ):
+        return assets
+    identity_hash = wallet_fingerprint_hash(campaign["wallet_fingerprint"])
+    aborts = [
+        row
+        for row in database.list_incomplete_refresh_aborts(
+            asset_id=campaign["asset_id"],
+            wallet_fingerprint_hash=identity_hash,
+            network=campaign["network"],
+        )
+        if row["campaign_id"] == campaign_id and row["state"] == "parent_terminal"
+    ]
+    if not aborts:
+        return assets
+    if len(aborts) != 1:
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    abort = aborts[0]
+    latch = database.get_runtime_safety_latch()
+    if (
+        type(latch) is not dict
+        or latch.get("state") != "tripped"
+        or latch.get("reason_code") != "REFRESH_ABORT_CLEANUP"
+        or latch.get("generation") != abort["latch_generation"]
+    ):
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    snapshot = wallet._read_refresh_abort_cleanup_snapshot()
+    trades = snapshot["trade_ids"]
+    targets = json.loads(abort["target_trade_ids_json"])
+    if (
+        snapshot["pending_transaction_ids"]
+        or not trades
+        or trades != sorted(set(trades))
+        or not set(trades).issubset(targets)
+        or not set(assets).issubset(trades)
+    ):
+        raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+    for trade_id in trades:
+        intent = database.get_offer_intent_by_trade_id(trade_id)
+        if (
+            type(intent) is not dict
+            or intent.get("sage_trade_id") != trade_id
+            or intent.get("asset_id") != campaign["asset_id"]
+            or intent.get("network") != campaign["network"]
+            or intent.get("wallet_fingerprint_hash") != identity_hash
+            or intent.get("side") not in {"buy", "sell"}
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        assets[trade_id] = "xch" if intent["side"] == "buy" else "cat"
+    return assets
 
 
 def read_fee_economic_snapshot(request_options: dict) -> dict:
@@ -344,10 +422,8 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             # cancellation-only renewal quote whenever cleanup is genuinely
             # outstanding. This also covers an operator pressing wallet-wide
             # Cancel All before explicitly stopping an otherwise active campaign.
-            from blueprints.bootstrap import _campaign_trade_ids
-
             campaign_has_cleanup = bool(
-                _campaign_trade_ids(options["bootstrap_campaign_id"])
+                _outstanding_campaign_cancel_assets(options["bootstrap_campaign_id"])
             )
         server_recovery_ready = campaign_has_cleanup or (
             recovery_action == "bootstrap_stop"
@@ -374,59 +450,110 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             options["bootstrap_campaign_id"]
         )
         if approval_id is None:
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        consent = database.get_coin_prep_fee_approval_context(approval_id)
-        scope = json.loads(consent["scope_json"])
-        plan = json.loads(consent["plan_json"])
-        binding = json.loads(consent["quote_json"]).get("execution_context")
-        from coin_prep_fee_execution import (
-            cancellation_recovery_configuration_matches,
-            encode_execution_configuration,
-            validate_execution_context,
-        )
-
-        approved_revision = plan.get("campaign_revision")
-        requested_revision = options["bootstrap_campaign_revision"]
-        recovery_revision_matches = approved_revision == requested_revision or (
-            (campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(stopped))
-            and stopped.get("revision") == requested_revision
-            and type(approved_revision) is int
-            and requested_revision > approved_revision
-        )
-
-        if (
-            scope.get("campaign_id") != options["bootstrap_campaign_id"]
-            or not recovery_revision_matches
-            or options["target_seconds"] != plan.get("target_seconds")
-            or any(identity.get(key) != scope.get(key) for key in identity)
-            or binding is None
-            or type(binding.get("configuration")) is not dict
-            or not cancellation_recovery_configuration_matches(
-                encode_execution_configuration(config), binding.get("configuration")
+            # A campaign may reuse coins prepared under an earlier campaign.
+            # It then owns real offers but has no campaign-bound preparation
+            # approval to renew. An active campaign can freeze its current
+            # trusted ladder. Once creation authority has stopped, quote only
+            # the still-live offer cancellations with *no* preparation outputs;
+            # mutable settings must never reconstruct a stopped ladder.
+            if type(stopped) is not dict:
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            if _campaign_is_stopped_for_fee_recovery(stopped):
+                if not campaign_has_cleanup:
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+                bootstrap = {
+                    "campaign": stopped,
+                    "worker_args": {
+                        "xch_target": 0,
+                        "cat_target": 0,
+                        "buy_tier_sizes": "",
+                        "cat_tier_sizes": "",
+                        "tier_counts_xch": "",
+                        "tier_counts_cat": "",
+                        "prep_headroom_pct": "0",
+                    },
+                    "recovery_only": True,
+                }
+            else:
+                if stopped.get("status") != "active":
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+                ordinary_options = {
+                    key: value
+                    for key, value in options.items()
+                    if key != "cancellation_recovery_action"
+                }
+                bootstrap = _active_bootstrap_coin_prep_context(ordinary_options)
+                if type(bootstrap) is not dict or bootstrap.get("campaign") != stopped:
+                    raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            recovery_recipe = build_exact_prep_economics(
+                configuration=config,
+                worker_args=bootstrap["worker_args"],
+                campaign_revision=stopped["revision"],
+                target_seconds=options["target_seconds"],
             )
-            or binding.get("receive_address") != context["receive_address"]
-        ):
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        # A stopped campaign can be recovered after startup/session projection
-        # has changed ordinary trading settings (for example, two-sided to
-        # buy-only).  Cancellation-only renewal reuses the validated frozen
-        # recipe and creates a fresh approval bound to the current wallet
-        # snapshot, so old-vs-current trading configuration equality is not an
-        # authority boundary here. Identity and receive-address equality above
-        # remain mandatory.
-        recovery_recipe = validate_execution_context(binding, scope, plan)
-        recovery_execution_context = binding
-        campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
-        if type(campaign) is not dict or campaign.get("status") not in {
-            "active",
-            "stopped",
-        }:
-            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
-        bootstrap = {
-            "campaign": campaign,
-            "worker_args": dict(recovery_recipe["worker_args"]),
-            "recovery_only": True,
-        }
+            from coin_prep_fee_execution import freeze_execution_context
+
+            recovery_execution_context = freeze_execution_context(
+                {
+                    **context,
+                    "recipe": recovery_recipe,
+                    "recovery_only": False,
+                }
+            )
+            bootstrap = {**bootstrap, "recovery_only": True}
+        else:
+            consent = database.get_coin_prep_fee_approval_context(approval_id)
+            scope = json.loads(consent["scope_json"])
+            plan = json.loads(consent["plan_json"])
+            binding = json.loads(consent["quote_json"]).get("execution_context")
+            from coin_prep_fee_execution import (
+                cancellation_recovery_configuration_matches,
+                encode_execution_configuration,
+                validate_execution_context,
+            )
+
+            approved_revision = plan.get("campaign_revision")
+            requested_revision = options["bootstrap_campaign_revision"]
+            recovery_revision_matches = approved_revision == requested_revision or (
+                (campaign_has_cleanup or _campaign_is_stopped_for_fee_recovery(stopped))
+                and stopped.get("revision") == requested_revision
+                and type(approved_revision) is int
+                and requested_revision > approved_revision
+            )
+
+            if (
+                scope.get("campaign_id") != options["bootstrap_campaign_id"]
+                or not recovery_revision_matches
+                or options["target_seconds"] != plan.get("target_seconds")
+                or any(identity.get(key) != scope.get(key) for key in identity)
+                or binding is None
+                or type(binding.get("configuration")) is not dict
+                or not cancellation_recovery_configuration_matches(
+                    encode_execution_configuration(config), binding.get("configuration")
+                )
+                or binding.get("receive_address") != context["receive_address"]
+            ):
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            # A stopped campaign can be recovered after startup/session projection
+            # has changed ordinary trading settings (for example, two-sided to
+            # buy-only).  Cancellation-only renewal reuses the validated frozen
+            # recipe and creates a fresh approval bound to the current wallet
+            # snapshot, so old-vs-current trading configuration equality is not an
+            # authority boundary here. Identity and receive-address equality above
+            # remain mandatory.
+            recovery_recipe = validate_execution_context(binding, scope, plan)
+            recovery_execution_context = binding
+            campaign = database.get_bootstrap_campaign(options["bootstrap_campaign_id"])
+            if type(campaign) is not dict or campaign.get("status") not in {
+                "active",
+                "stopped",
+            }:
+                raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE") from exc
+            bootstrap = {
+                "campaign": campaign,
+                "worker_args": dict(recovery_recipe["worker_args"]),
+                "recovery_only": True,
+            }
     campaign = None
     if bootstrap is not None:
         campaign = bootstrap["campaign"]
@@ -489,7 +616,10 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
 
 
 def read_approved_prep_fee_snapshot(
-    approval_id: str, *, expected_recovery_action: str | None = None
+    approval_id: str,
+    *,
+    expected_recovery_action: str | None = None,
+    allow_policy_only_revision: bool = False,
 ) -> dict:
     """Read fresh selectable inventory under immutable approved economics.
 
@@ -498,7 +628,9 @@ def read_approved_prep_fee_snapshot(
     price a bundle, claim inputs or authorize signing. Dispatch must inspect its
     exact executable effect, use authoritative operation evidence and reserve
     its fresh final fee. Changed configuration/identity/address/campaign requires
-    new consent rather than silently substituting a new recipe.
+    new consent rather than silently substituting a new recipe. Preparation
+    dispatch remains bound to the exact campaign revision. Protected cancellation
+    may opt into later policy-only revisions of the same immutable campaign.
     """
     from coin_prep_fee_approval import canonical_fee_contract, validate_fee_consent
     from coin_prep_fee_execution import (
@@ -613,8 +745,23 @@ def read_approved_prep_fee_snapshot(
             and type(campaign.get("revision")) is int
             and campaign.get("revision") > approved_revision
         )
+        ordinary_policy_revision = (
+            # Bot policy evidence advances revision after Start Bot without
+            # changing the fixed campaign terms or the approved prep recipe.
+            # Only cancellation/readiness callers opt in; prep dispatch stays
+            # exact-revision and stopped/unsafe policy never gains authority.
+            allow_policy_only_revision is True
+            and not allow_campaign_fee_recovery
+            and type(approved_revision) is int
+            and type(campaign) is dict
+            and type(campaign.get("revision")) is int
+            and campaign["revision"] >= approved_revision
+            and campaign.get("stage")
+            in {"bootstrap", "discovery_25", "discovery_50", "established"}
+        )
         if (
             type(campaign) is not dict
+            or not database.bootstrap_campaign_immutable_authority_valid(campaign)
             or campaign.get("status")
             not in (
                 ("active", "stopped") if allow_campaign_fee_recovery else ("active",)
@@ -622,6 +769,7 @@ def read_approved_prep_fee_snapshot(
             or (
                 campaign.get("revision") != approved_revision
                 and not cleanup_recovery_revision
+                and not ordinary_policy_revision
             )
             or any(
                 campaign.get(key) != scope[key]
@@ -818,17 +966,23 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             templates.setdefault(assets[spend.coin.name().hex()], spend.puzzle_reveal)
         return True
 
-    native_prerequisite = (
+    prerequisite = (
         plan is not None
         and plan.transaction_required
-        and plan.asset == "xch"
         and bool(plan.outputs)
-        and all(o.ordinal < 0 and o.purpose == "change" for o in plan.outputs)
+        and all(
+            o.ordinal < 0 and o.purpose in {"change", "fee_change"}
+            for o in plan.outputs
+        )
     )
+    native_prerequisite = prerequisite and plan.asset == "xch"
+    cat_prerequisite = prerequisite and plan.asset == "cat"
     if plan is not None and plan.transaction_required:
         inspection = context["pricing"]["inspection"]
         remember(inspection)
-        name = "prep_xch_consolidation" if native_prerequisite else f"prep_{plan.asset}"
+        name = (
+            f"prep_{plan.asset}_consolidation" if prerequisite else f"prep_{plan.asset}"
+        )
         stages.append(
             {
                 "stage_id": name,
@@ -848,11 +1002,37 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         )
         for asset in ("xch", "cat")
     }
+    outstanding_cancel_assets = None
+    if recovery_only and not context["recipe"]["targets"]:
+        campaign = context.get("campaign")
+        if type(campaign) is not dict or not _campaign_is_stopped_for_fee_recovery(
+            campaign
+        ):
+            raise ValueError("FEE_CANCELLATION_SCOPE_INVALID")
+        outstanding_cancel_assets = _outstanding_campaign_cancel_assets(
+            campaign["campaign_id"]
+        )
+        if not outstanding_cancel_assets:
+            raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        cancellation_counts = {
+            asset: sum(
+                offered_asset == asset
+                for offered_asset in outstanding_cancel_assets.values()
+            )
+            for asset in ("xch", "cat")
+        }
     missing_native = [
         t
         for t in context["recipe"]["targets"]
         if plan is not None
         and t.asset == "xch"
+        and (t.asset, t.ordinal) not in plan.reused_target_ids
+    ]
+    missing_cat = [
+        t
+        for t in context["recipe"]["targets"]
+        if plan is not None
+        and t.asset == "cat"
         and (t.asset, t.ordinal) not in plan.reused_target_ids
     ]
     need_future_native = (
@@ -864,7 +1044,7 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
     needed_templates = (
         {"xch"} if need_future_native or any(cancellation_counts.values()) else set()
     )
-    if cancellation_counts["cat"]:
+    if cancellation_counts["cat"] or cat_prerequisite:
         needed_templates.add("cat")
     for asset in sorted(needed_templates - templates.keys()):
         coin = next(
@@ -954,6 +1134,89 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
             )
         return None
 
+    future_amounts = (
+        []
+        if plan is None
+        else [
+            c.amount_mojos
+            for c in context["funding"]["snapshot"].coins
+            if c.asset == "xch"
+            and c.selectable
+            and not c.protected
+            and c.coin_id not in plan.reused_coin_ids
+            and c.coin_id not in plan.source_coin_ids
+            and c.coin_id != plan.fee_source_id
+        ]
+        + [
+            o.amount_mojos
+            for o in plan.outputs
+            if o.asset == "xch" and o.purpose in {"change", "fee_change"}
+        ]
+    )
+    future_cat_fee_steps = []
+    if cat_prerequisite:
+        # Only amounts of future confirmed roots are used for coverage, never
+        # invented selectable identities. CAT consolidation loses no CAT value.
+        future_cat = [
+            c.amount_mojos
+            for c in context["funding"]["snapshot"].coins
+            if c.asset == "cat"
+            and c.selectable
+            and not c.protected
+            and c.coin_id not in plan.reused_coin_ids
+            and c.coin_id not in plan.source_coin_ids
+        ] + [o.amount_mojos for o in plan.outputs if o.asset == "cat"]
+        principal = sum(t.amount_mojos for t in missing_cat)
+        if sum(future_cat) < principal:
+            return unavailable("FEE_FUTURE_CAT_FUNDING_UNAVAILABLE")
+        # The validated standard profile covers <=50 CAT returns. Refuse a
+        # wider final output shape instead of treating it as covered authority.
+        if len(missing_cat) + 1 > 50:
+            return unavailable("FEE_PROJECTION_PROFILE_INVALID")
+        if sum(sorted(future_cat, reverse=True)[:50]) < principal:
+            maximum = (len(future_cat) - 50 + 48) // 49
+            reason = add_projection(
+                "prep_cat_consolidation_remaining",
+                xch_inputs=1,
+                cat_inputs=50,
+                xch_outputs=1,
+                count=maximum,
+            )
+            if reason:
+                return unavailable(reason)
+            profiles["prep_cat_consolidation_remaining"]["assumptions"].append(
+                "bounded_cat_50_to_1_prerequisites_no_cat_fee_loss"
+            )
+            future_cat_fee_steps.extend(
+                [quotes["prep_cat_consolidation_remaining"]["fee_mojos"]] * maximum
+            )
+        reason = add_projection(
+            "prep_cat",
+            xch_inputs=1,
+            cat_inputs=50,
+            xch_outputs=1,
+        )
+        if reason:
+            return unavailable(reason)
+        future_cat_fee_steps.append(quotes["prep_cat"]["fee_mojos"])
+        # Aggregate XCH is insufficient: every CAT step needs one eligible
+        # fee root. Reserve exact native target denominations as the planner
+        # does, and simulate only confirmed change amounts, never identities.
+        for fee in future_cat_fee_steps:
+            if fee == 0:
+                continue
+            eligible = list(future_amounts)
+            for target in missing_native:
+                if target.amount_mojos in eligible:
+                    eligible.remove(target.amount_mojos)
+            candidates = [amount for amount in eligible if amount >= fee]
+            if not candidates:
+                return unavailable("FEE_FUTURE_CAT_FEE_SOURCE_UNAVAILABLE")
+            source = min(candidates)
+            future_amounts.remove(source)
+            if source > fee:
+                future_amounts.append(source - fee)
+
     if need_future_native:
         # Confirmation changes the fee root to change, never a known selectable
         # future coin. Bound possible roots and explicitly include intermediate
@@ -978,21 +1241,6 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         # Inspect only future amounts, not invented selectable coin identities.
         # The CAT fee root is consumed; its validated change replaces it only
         # after confirmation. The later exact batch must refresh that evidence.
-        future_amounts = [
-            c.amount_mojos
-            for c in context["funding"]["snapshot"].coins
-            if c.asset == "xch"
-            and c.selectable
-            and not c.protected
-            and c.coin_id not in plan.reused_coin_ids
-            and c.coin_id not in plan.source_coin_ids
-            and c.coin_id != plan.fee_source_id
-        ]
-        future_amounts += [
-            o.amount_mojos
-            for o in plan.outputs
-            if o.asset == "xch" and o.purpose in {"change", "fee_change"}
-        ]
         principal = sum(t.amount_mojos for t in missing_native)
         largest = sum(sorted(future_amounts, reverse=True)[:50])
         if largest < principal + quotes["prep_xch"]["fee_mojos"]:
@@ -1054,6 +1302,10 @@ def read_staged_prep_fee_snapshot(request_options: dict, *, quote_provider) -> d
         after = read_fee_economic_snapshot(context["request_options"])
     except ValueError:
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED") from None
+    if outstanding_cancel_assets is not None and outstanding_cancel_assets != (
+        _outstanding_campaign_cancel_assets(context["campaign"]["campaign_id"])
+    ):
+        raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     if any(
         after[key] != context[key]
         for key in (
