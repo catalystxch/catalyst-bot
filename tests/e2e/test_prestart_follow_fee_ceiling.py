@@ -132,9 +132,11 @@ def test_follow_refresh_uses_new_ceiling_while_worker_approval_stays_historical(
 def test_follow_review_uses_current_approved_ceiling_instead_of_stale_default(page):
     page.route(
         "**/*",
-        lambda route: route.continue_()
-        if route.request.url.startswith("file:")
-        else route.abort(),
+        lambda route: (
+            route.continue_()
+            if route.request.url.startswith("file:")
+            else route.abort()
+        ),
     )
     page.goto(
         (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),
@@ -166,9 +168,11 @@ def test_follow_review_uses_current_approved_ceiling_instead_of_stale_default(pa
 def test_follow_review_preserves_an_explicit_fee_edit(page):
     page.route(
         "**/*",
-        lambda route: route.continue_()
-        if route.request.url.startswith("file:")
-        else route.abort(),
+        lambda route: (
+            route.continue_()
+            if route.request.url.startswith("file:")
+            else route.abort()
+        ),
     )
     page.goto(
         (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),

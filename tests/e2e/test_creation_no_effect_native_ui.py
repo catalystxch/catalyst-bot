@@ -40,14 +40,14 @@ def test_no_effect_creation_review_and_local_commit(page):
         }"""
     )
     page.locator('button[data-view="offers"]').click()
-    page.locator('#noEffectCreationReviewEntry').click()
-    expect(page.locator('#noEffectCreationPanel')).to_be_visible()
-    expect(page.locator('#noEffectCreationCommitBtn')).to_be_enabled()
-    expect(page.locator('#cancelAllConfirmBtn')).to_be_disabled()
-    expect(page.locator('#noEffectCreationSummary')).to_contain_text('694')
-    page.locator('#noEffectCreationCommitBtn').click()
-    expect(page.locator('#cancelConfirmModal')).not_to_have_class('modal active')
-    assert page.evaluate('window.__creationCommits.length') == 1
+    page.locator("#noEffectCreationReviewEntry").click()
+    expect(page.locator("#noEffectCreationPanel")).to_be_visible()
+    expect(page.locator("#noEffectCreationCommitBtn")).to_be_enabled()
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
+    expect(page.locator("#noEffectCreationSummary")).to_contain_text("694")
+    page.locator("#noEffectCreationCommitBtn").click()
+    expect(page.locator("#cancelConfirmModal")).not_to_have_class("modal active")
+    assert page.evaluate("window.__creationCommits.length") == 1
 
 
 def test_no_effect_creation_preview_failure_remains_fenced(page):
@@ -65,7 +65,7 @@ def test_no_effect_creation_preview_failure_remains_fenced(page):
         }"""
     )
     page.locator('button[data-view="offers"]').click()
-    page.locator('#noEffectCreationReviewEntry').click()
-    expect(page.locator('#noEffectCreationPanel')).to_be_visible()
-    expect(page.locator('#noEffectCreationCommitBtn')).to_be_disabled()
-    expect(page.locator('#cancelAllConfirmBtn')).to_be_disabled()
+    page.locator("#noEffectCreationReviewEntry").click()
+    expect(page.locator("#noEffectCreationPanel")).to_be_visible()
+    expect(page.locator("#noEffectCreationCommitBtn")).to_be_disabled()
+    expect(page.locator("#cancelAllConfirmBtn")).to_be_disabled()
