@@ -208,6 +208,13 @@ def _post_build():
         raise SystemExit(1)
 
     if not any(
+        os.path.isfile(os.path.join(root, "creation_no_effect_recovery.html"))
+        for root in data_roots
+    ):
+        print("\n  ERROR: creation_no_effect_recovery.html not found in the bundle.")
+        raise SystemExit(1)
+
+    if not any(
         os.path.isfile(os.path.join(root, "certifi", "cacert.pem"))
         for root in data_roots
     ):

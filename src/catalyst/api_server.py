@@ -423,6 +423,7 @@ _read_only_diagnostics_active = False
 _refresh_abort_recovery_active = False
 _registry_terminal_recovery_active = False
 _cancel_latch_review_recovery_active = False
+_no_effect_creation_recovery_active = False
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -3952,6 +3953,51 @@ def has_exact_cancel_latch_review_startup_candidate() -> bool:
         return False
 
 
+def has_exact_no_effect_creation_startup_candidate() -> bool:
+    """Identify one creation blocker before allowing a fenced proof review."""
+
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return False
+        wallet_hash, network = _configured_mutation_binding()
+        latch = database.get_runtime_safety_latch()
+        blockers = database.get_unresolved_offer_operation_blockers()
+        if type(latch) is not dict or type(blockers) is not list or len(blockers) != 1:
+            return False
+        if type(blockers[0]) is not dict:
+            return False
+        operation_id = blockers[0].get("operation_id")
+        if (
+            type(operation_id) is not str
+            or re.fullmatch(r"create:[0-9a-f]{64}", operation_id) is None
+        ):
+            return False
+        if (
+            latch.get("state") != "tripped"
+            or latch.get("reason_code") != "UNRESOLVED_OPERATIONS"
+            or latch.get("wallet_fingerprint_hash") != wallet_hash
+            or latch.get("network") != network
+            or json.loads(latch.get("blocking_operation_ids_json", ""))
+            != [operation_id]
+        ):
+            return False
+        journal = database.validate_offer_operation_event(blockers[0])
+        intent = database.get_offer_intent(operation_id.removeprefix("create:"))
+        return bool(
+            type(journal) is dict
+            and journal.get("operation_type") == "CREATE"
+            and journal.get("outcome") == "UNKNOWN"
+            and journal.get("blocks_mutation") == 1
+            and type(intent) is dict
+            and intent.get("lifecycle_state") == "creation_unknown"
+            and intent.get("sage_trade_id") is None
+            and intent.get("wallet_fingerprint_hash") == wallet_hash
+            and intent.get("network") == network
+        )
+    except Exception:
+        return False
+
+
 def has_exact_refresh_abort_startup_candidate(
     *, allow_active_owner_run_id: Optional[str] = None
 ) -> bool:
@@ -4533,6 +4579,81 @@ def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
                 _mutation_runtime_db_path = None
 
 
+def activate_no_effect_creation_restricted_startup(authorization: Any) -> bool:
+    """Open only an exact, database-only creation review under a fenced lease."""
+
+    global _mutation_runtime, _mutation_runtime_db_path
+    global _no_effect_creation_recovery_active, _stability_startup_status
+
+    if (
+        type(authorization) is not dict
+        or authorization.get("allowed") is not False
+        or authorization.get("reason_code") != "UNRESOLVED_OPERATIONS"
+    ):
+        return False
+    with _mutation_runtime_init_lock:
+        if (
+            _no_effect_creation_recovery_active
+            or bot is not None
+            or mutation_gate.current_runtime() is not None
+            or not has_exact_no_effect_creation_startup_candidate()
+        ):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash,
+                network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=get_wallet_adapter_authority(),
+                acquire_lease=True,
+                start_heartbeat=False,
+            )
+            acquired = runtime.last_acquire_result.get("acquired") is True
+            status = runtime.status().to_dict()
+            lease = status.get("lease") or {}
+            if (
+                not acquired
+                or status.get("reason_code") != "UNRESOLVED_OPERATIONS"
+                or status.get("source") != "durable_latch"
+                or lease.get("owned_by_this_run") is not True
+                or not has_exact_no_effect_creation_startup_candidate()
+            ):
+                return False
+            _no_effect_creation_recovery_active = True
+            from creation_no_effect_recovery import collect_no_effect_creation_proof
+
+            # This new process has never constructed a bot or offer manager.
+            # The exclusive lease and complete Sage witness replace the
+            # ordinary in-process creation lock for this restricted window.
+            collect_no_effect_creation_proof()
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(
+                os.path.abspath(database.DB_PATH)
+            )
+            _stability_startup_status = _redacted_startup_status(status)
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated:
+                _no_effect_creation_recovery_active = False
+                if runtime is not None:
+                    mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
 def activate_registry_terminal_restricted_startup(authorization: Any) -> bool:
     """Adopt only one fenced terminal cohort after two independent Sage proofs."""
 
@@ -4934,6 +5055,12 @@ def enforce_local_runtime_guard():
         if (request.method, path) not in recovery_routes:
             return jsonify({"success": False, "error": "cancel_latch_review_only"}), 423
 
+    if _no_effect_creation_recovery_active and (request.method, path) not in {
+        ("GET", "/"),
+        ("GET", "/api/safety/status"),
+    }:
+        return jsonify({"success": False, "error": "creation_recovery_only"}), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -5054,6 +5181,12 @@ def serve_gui():
         if not _has_valid_local_token():
             return Response("Unauthorized", status=401, mimetype="text/plain")
         response = _serve_bootstrapped_html("cancel_latch_recovery.html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    if _no_effect_creation_recovery_active:
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        response = _serve_bootstrapped_html("creation_no_effect_recovery.html")
         response.headers["Cache-Control"] = "no-store"
         return response
     if not _has_valid_local_token():

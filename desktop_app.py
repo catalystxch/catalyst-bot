@@ -986,6 +986,7 @@ def start_flask_server(reservation):
         and not api_server._refresh_abort_recovery_active
         and not api_server._registry_terminal_recovery_active
         and not api_server._cancel_latch_review_recovery_active
+        and not api_server._no_effect_creation_recovery_active
     ):
         api_server.create_bot()
 
@@ -1033,6 +1034,21 @@ def _create_desktop_bridge():
     """The fenced recovery window never receives the trading native API."""
 
     import api_server
+
+    if api_server._no_effect_creation_recovery_active:
+        from app_bridge import AppBridge
+
+        class CreationRecoveryBridge:
+            def __init__(self):
+                self._bridge = AppBridge()
+
+            def preview_no_effect_creation(self):
+                return self._bridge.preview_no_effect_creation()
+
+            def commit_no_effect_creation(self, body=None):
+                return self._bridge.commit_no_effect_creation(body)
+
+        return CreationRecoveryBridge()
 
     if (
         api_server._refresh_abort_recovery_active
@@ -1946,11 +1962,17 @@ def _initialize_startup_ownership() -> dict:
         and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
         and api_server.has_exact_cancel_latch_review_startup_candidate()
     )
+    exact_creation_review = (
+        authorization.get("allowed") is False
+        and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+        and api_server.has_exact_no_effect_creation_startup_candidate()
+    )
     if (
         authorization.get("allowed") is False
         and authorization.get("failed_check") == "unresolved_operations"
         and authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
         and not exact_cancel_review
+        and not exact_creation_review
     ):
         try:
             from offer_manager import (
@@ -1981,13 +2003,16 @@ def _initialize_startup_ownership() -> dict:
         authorization.get("allowed") is False
         and authorization.get("reason_code") in legacy_recovery_reasons
         and not exact_cancel_review
+        and not exact_creation_review
     ):
         exact_abort_candidate = (
             authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
             and api_server.has_exact_refresh_abort_startup_candidate()
         )
         for attempt in range(
-            0 if exact_abort_candidate else _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS
+            0
+            if exact_abort_candidate or exact_creation_review
+            else _LEGACY_STARTUP_RECOVERY_MAX_ATTEMPTS
         ):
             recovery = None
             try:
@@ -2071,6 +2096,13 @@ def _authorize_desktop_startup() -> bool:
             if (
                 authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
                 and api_server.activate_cancel_latch_review_restricted_startup(
+                    authorization
+                )
+            ):
+                return True
+            if (
+                authorization.get("reason_code") == "UNRESOLVED_OPERATIONS"
+                and api_server.activate_no_effect_creation_restricted_startup(
                     authorization
                 )
             ):

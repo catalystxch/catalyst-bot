@@ -361,16 +361,20 @@ def collect_no_effect_creation_proof() -> dict[str, Any]:
     if status.get("lease", {}).get("owned_by_this_run") is not True:
         raise ValueError("creation recovery lease is not owned")
     bot = api_server.bot
-    if bot is None or not callable(getattr(bot, "is_running", None)):
+    restricted_startup = api_server._no_effect_creation_recovery_active and bot is None
+    if not restricted_startup and (
+        bot is None or not callable(getattr(bot, "is_running", None))
+    ):
         raise ValueError("creation recovery bot is unavailable")
     with api_server._bot_cancel_lifecycle_lock:
-        if bot.is_running():
+        if bot is not None and bot.is_running():
             raise ValueError("creation recovery requires a stopped bot")
-        manager = getattr(bot, "offer_manager", None)
-        wait = getattr(manager, "wait_for_offer_creation_quiescence", None)
-        if not callable(wait):
-            raise ValueError("creation recovery quiescence fence is unavailable")
-        wait()
+        if bot is not None:
+            manager = getattr(bot, "offer_manager", None)
+            wait = getattr(manager, "wait_for_offer_creation_quiescence", None)
+            if not callable(wait):
+                raise ValueError("creation recovery quiescence fence is unavailable")
+            wait()
         latch = database.get_runtime_safety_latch()
         blockers = database.get_unresolved_offer_operation_blockers()
         if type(blockers) is not list or len(blockers) != 1:
@@ -408,7 +412,7 @@ def collect_no_effect_creation_proof() -> dict[str, Any]:
             or database.get_offer_intent_coin_reservations(intent["intent_id"])
             != reservations
             or database.get_unresolved_offer_operation_blockers() != blockers
-            or bot.is_running()
+            or (bot is not None and bot.is_running())
         ):
             raise ValueError("creation recovery local state changed")
         proof = classify_no_effect_creation(
