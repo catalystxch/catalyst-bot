@@ -56,6 +56,9 @@ class TestBuildPostBuild(unittest.TestCase):
             (internal / "cancel_latch_recovery.html").write_text(
                 "<html></html>", encoding="utf-8"
             )
+            (internal / "creation_no_effect_recovery.html").write_text(
+                "<html></html>", encoding="utf-8"
+            )
             certifi_dir = internal / "certifi"
             certifi_dir.mkdir()
             (certifi_dir / "cacert.pem").write_text("test CA bundle", encoding="utf-8")
@@ -96,6 +99,9 @@ class TestBuildPostBuild(unittest.TestCase):
                 "<html></html>", encoding="utf-8"
             )
             (internal / "cancel_latch_recovery.html").write_text(
+                "<html></html>", encoding="utf-8"
+            )
+            (internal / "creation_no_effect_recovery.html").write_text(
                 "<html></html>", encoding="utf-8"
             )
             env_example = root / ".env.example"
@@ -140,6 +146,34 @@ class TestBuildPostBuild(unittest.TestCase):
 
             self.assertEqual(raised.exception.code, 1)
             self.assertIn("refresh_abort_recovery.html", buf.getvalue())
+
+    def test_rejects_bundle_missing_creation_recovery_page(self):
+        build = _load_build_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "dist" / "Catalyst"
+            internal = output / "_internal"
+            internal.mkdir(parents=True)
+            (output / ("Catalyst.exe" if os.name == "nt" else "Catalyst")).write_text(
+                ""
+            )
+            for name in (
+                "bot_gui.html",
+                "refresh_abort_recovery.html",
+                "cancel_latch_recovery.html",
+            ):
+                (internal / name).write_text("<html></html>", encoding="utf-8")
+            buf = io.StringIO()
+            with (
+                patch.object(build, "OUTPUT_DIR", str(output)),
+                patch.object(build, "ENV_EXAMPLE", str(root / ".env.example")),
+                contextlib.redirect_stdout(buf),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                build._post_build()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("creation_no_effect_recovery.html", buf.getvalue())
 
 
 if __name__ == "__main__":
