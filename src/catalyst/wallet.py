@@ -988,8 +988,7 @@ def _run_offer_operation_continuation(
             if (
                 wallet_operation != "wallet:create_offer"
                 or WALLET_TYPE != "sage"
-                or safe_step
-                in {"rpc:make_offer:send", "rpc:make_offer:retry_send"}
+                or safe_step in {"rpc:make_offer:send", "rpc:make_offer:retry_send"}
             ):
                 effect_attempted = True
 
