@@ -4549,7 +4549,7 @@ def test_offer_page_cap_precedes_hostile_row_traversal():
         get_all_offers=lambda **_kwargs: rows,
         include_completed=True,
         clock=_clock_at(),
-        page_size=reconciliation._MAX_HISTORY_RECORDS,
+        page_size=reconciliation._MAX_HISTORY_PAGE_SIZE,
         max_pages=1,
         max_records=reconciliation._MAX_HISTORY_RECORDS,
     )
@@ -4557,6 +4557,28 @@ def test_offer_page_cap_precedes_hostile_row_traversal():
     assert source["complete"] is False
     assert source["read_error"] == "source_limit_exceeded"
     assert source["records"] == []
+
+
+def test_complete_sage_history_accepts_more_than_4096_offers():
+    rows = [
+        _offer(status=1, trade_id=f"{index:064x}", transaction_id="")
+        for index in range(4164)
+    ]
+    source = load_sage_offer_history(
+        get_all_offers=lambda **_kwargs: {
+            "success": True,
+            "offers": rows,
+            "total": len(rows),
+            "end_of_history": True,
+        },
+        include_completed=True,
+        clock=_clock_at(),
+        page_size=500,
+        max_pages=20,
+    )
+    assert source["complete"] is True, source["read_error"]
+    assert source["read_error"] is None
+    assert len(source["records"]) == 4164
 
 
 def test_transaction_page_cap_precedes_hostile_row_traversal():
@@ -4574,7 +4596,7 @@ def test_transaction_page_cap_precedes_hostile_row_traversal():
         },
         wallet_ids=(1,),
         clock=_clock_at(),
-        page_size=reconciliation._MAX_HISTORY_RECORDS,
+        page_size=reconciliation._MAX_HISTORY_PAGE_SIZE,
         max_pages=1,
         max_records=reconciliation._MAX_HISTORY_RECORDS,
     )

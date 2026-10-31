@@ -30365,6 +30365,217 @@ def finalize_offer_intent(
         conn.close()
 
 
+def settle_no_effect_offer_creation(*, proof: Any) -> Dict[str, Any]:
+    """Atomically close one reviewed unknown creation proven absent in Sage.
+
+    The caller must re-collect the complete wallet proof immediately before
+    this transaction. This boundary rechecks every durable intent, coin,
+    journal, latch and lease field and never sends a wallet operation.
+    """
+
+    required = {
+        "intent_id",
+        "operation_id",
+        "row_version",
+        "latch_generation",
+        "wallet_fingerprint_hash",
+        "network",
+        "selected_coin_id",
+        "requested_amount_atomic",
+        "sage_stable",
+        "lease_owner_run_id",
+        "lease_owner_pid",
+        "lease_owner_host",
+        "lease_version",
+        "proof_digest",
+    }
+    if type(proof) is not dict or set(proof) != required:
+        raise ValueError("no-effect creation proof fields are invalid")
+    digest = _required_stability_text(proof["proof_digest"], "proof_digest")
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("no-effect creation digest is invalid")
+    material = {key: value for key, value in proof.items() if key != "proof_digest"}
+    canonical = _canonical_json_text(
+        material, "no-effect creation proof", expected_type=dict
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != digest:
+        raise ValueError("no-effect creation proof digest changed")
+    intent_id = _required_stability_text(proof["intent_id"], "intent_id")
+    operation_id = _required_stability_text(proof["operation_id"], "operation_id")
+    if operation_id != f"create:{intent_id}":
+        raise ValueError("no-effect creation operation identity differs")
+    expected_version = _exact_integer(proof["row_version"], "row_version")
+    generation = _exact_integer(proof["latch_generation"], "latch_generation")
+    expected_lease_version = _exact_integer(
+        proof["lease_version"], "lease_version", minimum=1
+    )
+    expected_pid = _exact_integer(
+        proof["lease_owner_pid"], "lease_owner_pid", minimum=1
+    )
+    selected_coin = norm_coin_id(
+        _required_stability_text(proof["selected_coin_id"], "selected_coin_id")
+    )
+    requested = _exact_integer(
+        proof["requested_amount_atomic"], "requested_amount_atomic", minimum=1
+    )
+    wallet_hash = _required_stability_text(
+        proof["wallet_fingerprint_hash"], "wallet_fingerprint_hash"
+    )
+    network = _required_stability_text(proof["network"], "network")
+    when = _stability_timestamp_or_now(None, "no-effect creation recovery")
+    event_id = f"{operation_id}:recovered:no-effect"
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        intent_row = conn.execute(
+            "SELECT * FROM offer_intents WHERE intent_id=?", (intent_id,)
+        ).fetchone()
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latest_row = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE operation_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if any(row is None for row in (intent_row, latch_row, lease_row, latest_row)):
+            raise ValueError("no-effect creation durable authority is missing")
+        intent, latch, lease, latest = map(
+            dict, (intent_row, latch_row, lease_row, latest_row)
+        )
+        existing = conn.execute(
+            "SELECT * FROM offer_operation_journal WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing is not None:
+            evidence = json.loads(existing["evidence_json"])
+            if (
+                intent["lifecycle_state"] == "creation_failed"
+                and latch["state"] == "resolved"
+                and evidence == proof
+                and existing["blocks_mutation"] == 0
+            ):
+                conn.commit()
+                return {
+                    "applied": False,
+                    "intent_id": intent_id,
+                    "operation_id": operation_id,
+                    "wallet_effect_started": False,
+                }
+            raise ValueError("no-effect creation replay differs")
+        if (
+            intent["lifecycle_state"] != "creation_unknown"
+            or intent["row_version"] != expected_version
+            or intent["sage_trade_id"] is not None
+            or intent["wallet_fingerprint_hash"] != wallet_hash
+            or intent["network"] != network
+            or int(intent["requested_amount_atomic"]) != requested
+            or json.loads(intent["selected_coin_ids_json"])
+            != [proof["selected_coin_id"]]
+            or latch["state"] != "tripped"
+            or latch["generation"] != generation
+            or latch["reason_code"] != "UNRESOLVED_OPERATIONS"
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != network
+            or json.loads(latch["blocking_operation_ids_json"]) != [operation_id]
+            or latest["intent_id"] != intent_id
+            or latest["operation_type"] != "CREATE"
+            or latest["outcome"] != "UNKNOWN"
+            or latest["blocks_mutation"] != 1
+        ):
+            raise ValueError("no-effect creation durable scope changed")
+        if (
+            lease["active"] != 1
+            or lease["owner_run_id"] != proof["lease_owner_run_id"]
+            or lease["owner_pid"] != expected_pid
+            or lease["owner_host"] != proof["lease_owner_host"]
+            or lease["wallet_fingerprint_hash"] != wallet_hash
+            or lease["network"] != network
+            or lease["lease_version"] < expected_lease_version
+            or lease["expires_at"] <= when
+        ):
+            raise ValueError("no-effect creation runtime lease changed")
+        other_blocker = conn.execute(
+            "SELECT 1 FROM offer_operation_journal AS journal JOIN "
+            "(SELECT operation_id,MAX(sequence) AS latest_sequence "
+            "FROM offer_operation_journal GROUP BY operation_id) AS current "
+            "ON current.operation_id=journal.operation_id "
+            "AND current.latest_sequence=journal.sequence "
+            "WHERE journal.blocks_mutation=1 AND journal.operation_id<>? LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if other_blocker is not None:
+            raise ValueError("another unresolved operation remains")
+        coin = conn.execute(
+            "SELECT status,trade_id FROM coins WHERE coin_id=?", (selected_coin,)
+        ).fetchone()
+        if (
+            coin is None
+            or coin["status"] != "locked"
+            or coin["trade_id"] != f"intent:{intent_id}"
+        ):
+            raise ValueError("selected coin reservation changed")
+        cursor = conn.execute(
+            "UPDATE offer_intents SET lifecycle_state='creation_failed', "
+            "row_version=row_version+1, terminal_at=?, updated_at=? "
+            "WHERE intent_id=? AND row_version=? AND lifecycle_state='creation_unknown'",
+            (when, when, intent_id, expected_version),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("creation intent compare-and-set failed")
+        cursor = conn.execute(
+            "UPDATE coins SET status='free',trade_id=NULL,last_seen=? "
+            "WHERE coin_id=? AND status='locked' AND trade_id=?",
+            (when, selected_coin, f"intent:{intent_id}"),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("selected coin release compare-and-set failed")
+        event = _journal_values(
+            event_id=event_id,
+            operation_id=operation_id,
+            intent_id=intent_id,
+            operation_type="CREATE",
+            attempt=int(latest["attempt"]) + 1,
+            phase="RECOVERED",
+            outcome="FAILED",
+            request_timestamp=when,
+            wallet_identity_json={
+                "wallet_fingerprint_hash": wallet_hash,
+                "network": network,
+            },
+            transaction_id=None,
+            spend_identity=None,
+            evidence_json=proof,
+            evidence_sha256=None,
+            reason_code="AUTHORITATIVE_NO_EFFECT_CONFIRMED",
+            blocks_mutation=False,
+            created_at=when,
+        )
+        _insert_offer_operation_event(conn, event)
+        cursor = conn.execute(
+            "UPDATE runtime_safety_latch SET state='resolved',reason_code=NULL,"
+            "reason=NULL,blocking_operation_ids_json='[]',resolved_at=?,"
+            "updated_at=? WHERE singleton_id=1 AND generation=? AND state='tripped'",
+            (when, when, generation),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("runtime latch compare-and-set failed")
+        conn.commit()
+        return {
+            "applied": True,
+            "intent_id": intent_id,
+            "operation_id": operation_id,
+            "wallet_effect_started": False,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 _RECONCILE_TERMINAL_OUTCOMES = frozenset(
     {"FILLED_PROVEN", "CANCELLED_PROVEN", "EXPIRED_PROVEN"}
 )

@@ -58,7 +58,7 @@ _EXPIRED_STATUSES = frozenset({5, "expired"})
 _TERMINAL_STATUSES = _FILLED_STATUSES | _CANCELLED_STATUSES | _EXPIRED_STATUSES
 _MAX_EVIDENCE_AGE_SECONDS = 300
 _MAX_SOURCE_SKEW_SECONDS = 60
-_MAX_HISTORY_RECORDS = 4096
+_MAX_HISTORY_RECORDS = 16384
 _MAX_HISTORY_PAGE_SIZE = 4096
 _MAX_HISTORY_PAGES = 20
 _MAX_WALLET_IDS = 64
@@ -159,6 +159,8 @@ def _validate_provider_value_bounds(
     *,
     depth: int = 0,
     state: dict[str, int] | None = None,
+    max_history_list_items: int = _MAX_PROVIDER_CONTAINER_ITEMS,
+    max_text_bytes: int = _MAX_PROVIDER_TOTAL_TEXT_BYTES,
 ) -> None:
     """Preflight exact provider shapes before normalization or copying."""
 
@@ -171,14 +173,14 @@ def _validate_provider_value_bounds(
         if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
             raise _SourceLimitError("provider text exceeds source limit")
         state["text_bytes_upper"] += len(value) * 4
-        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+        if state["text_bytes_upper"] > max_text_bytes:
             raise _SourceLimitError("provider text exceeds source limit")
         return
     if type(value) is bytes:
         if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
             raise _SourceLimitError("provider bytes exceed source limit")
         state["text_bytes_upper"] += len(value)
-        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+        if state["text_bytes_upper"] > max_text_bytes:
             raise _SourceLimitError("provider bytes exceed source limit")
         return
     if type(value) is int:
@@ -196,15 +198,30 @@ def _validate_provider_value_bounds(
             if len(key) > _MAX_PROVIDER_SCALAR_CHARS:
                 raise _SourceLimitError("provider object key exceeds source limit")
             state["text_bytes_upper"] += len(key) * 4
-            if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+            if state["text_bytes_upper"] > max_text_bytes:
                 raise _SourceLimitError("provider text exceeds source limit")
-            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+            _validate_provider_value_bounds(
+                item,
+                depth=depth + 1,
+                state=state,
+                max_history_list_items=max_history_list_items,
+                max_text_bytes=max_text_bytes,
+            )
         return
     if type(value) is list:
-        if len(value) > _MAX_PROVIDER_CONTAINER_ITEMS:
+        list_limit = (
+            max_history_list_items if depth <= 1 else _MAX_PROVIDER_CONTAINER_ITEMS
+        )
+        if len(value) > list_limit:
             raise _SourceLimitError("provider list exceeds source limit")
         for item in value:
-            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+            _validate_provider_value_bounds(
+                item,
+                depth=depth + 1,
+                state=state,
+                max_history_list_items=max_history_list_items,
+                max_text_bytes=max_text_bytes,
+            )
         return
     raise ValueError("provider value must use exact bounded JSON scalar types")
 
@@ -217,8 +234,17 @@ def _provider_value_within_bounds(value: Any) -> bool:
     return True
 
 
-def _require_provider_bounds(value: Any) -> None:
-    _validate_provider_value_bounds(value)
+def _require_provider_bounds(
+    value: Any,
+    *,
+    max_history_list_items: int = _MAX_PROVIDER_CONTAINER_ITEMS,
+    max_text_bytes: int = _MAX_PROVIDER_TOTAL_TEXT_BYTES,
+) -> None:
+    _validate_provider_value_bounds(
+        value,
+        max_history_list_items=max_history_list_items,
+        max_text_bytes=max_text_bytes,
+    )
 
 
 def _norm_id(value: Any) -> str:
@@ -1894,7 +1920,11 @@ def _offer_list(
         return None
     if any(len(row) > _MAX_PROVIDER_RECORD_FIELDS for row in rows):
         raise _SourceLimitError("offer record fields exceed source limit")
-    _require_provider_bounds(result)
+    _require_provider_bounds(
+        result,
+        max_history_list_items=_MAX_HISTORY_RECORDS,
+        max_text_bytes=32 * 1024 * 1024,
+    )
     return rows
 
 

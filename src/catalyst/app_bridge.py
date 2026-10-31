@@ -162,6 +162,33 @@ def _mutation_guard(operation: str):
     return decorate
 
 
+def _proof_recovery_guard(operation: str):
+    """Allow a database-only proof recovery while the mutation latch is up."""
+
+    def decorate(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            api = _bridge_runtime_api(self)
+            api._ensure_mutation_runtime()
+            runtime = api.mutation_gate.current_runtime()
+            if runtime is None or (
+                runtime.status().to_dict().get("lease", {}).get("owned_by_this_run")
+                is not True
+            ):
+                return {
+                    "success": False,
+                    "error": "recovery_authority_unavailable",
+                    "operation": operation,
+                }
+            return func(self, *args, **kwargs)
+
+        wrapper._mutation_operation = operation
+        _mutation_guarded_functions.add(wrapper)
+        return wrapper
+
+    return decorate
+
+
 class AppBridge:
     """
     JS bridge — exposes bot functionality to the PyWebView frontend.
@@ -619,6 +646,29 @@ class AppBridge:
             "success": True,
             "review": external_cancel_recovery.preview_external_cancellation(),
         }
+
+    @_safe
+    def preview_no_effect_creation(self):
+        """Read a complete Sage no-effect creation proof for native review."""
+        import creation_no_effect_recovery
+
+        return {
+            "success": True,
+            "review": creation_no_effect_recovery.preview_no_effect_creation(),
+        }
+
+    @_safe
+    @_proof_recovery_guard("app_bridge:commit_no_effect_creation")
+    def commit_no_effect_creation(self, body=None):
+        """Apply only a freshly reverified local no-effect transition."""
+        import creation_no_effect_recovery
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = creation_no_effect_recovery.commit_no_effect_creation(body["reviewed"])
+        return {"success": True, **result}
 
     @_safe
     @_mutation_guard("app_bridge:commit_external_cancellation")
@@ -2415,6 +2465,7 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "prepare_follow_fee_ceiling_review",
     "confirm_follow_fee_ceiling_review",
     "commit_external_cancellation",
+    "commit_no_effect_creation",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",
@@ -2529,6 +2580,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "preview_completed_bootstrap_offers",
     "preview_terminal_offers",
     "preview_external_cancellation",
+    "preview_no_effect_creation",
     "refresh_balances",
     "run_doctor",
     "validate_config",

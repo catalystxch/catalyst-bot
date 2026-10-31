@@ -7,3 +7,4 @@ plyer>=2.1,<3
 Pillow>=13.0,<14
 cryptography>=50.0.0,<51
 chia_rs>=0.30,<0.31
+psutil>=7.0,<8

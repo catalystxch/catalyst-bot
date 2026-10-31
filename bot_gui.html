@@ -10117,6 +10117,7 @@
                 </div>
                 <div style="display: flex; gap: 8px; align-items: center;">
                     <button class="btn-small" type="button" id="externalCancelReviewEntry">Review Sage cancellation</button>
+                    <button class="btn-small" type="button" id="noEffectCreationReviewEntry">Review fenced creation</button>
                     <button class="btn-small" onclick="exportFills()" title="Export fill history to CSV" style="font-size: 0.8em; padding: 4px 10px; opacity: 0.8;">Export Fills</button>
                 </div>
             </div>
@@ -12348,6 +12349,13 @@
                     <p id="externalCancelFee" style="overflow-wrap: anywhere;"></p>
                     <p id="externalCancelDigest" style="overflow-wrap: anywhere;"></p>
                     <button type="button" id="externalCancelCommitBtn" class="btn btn-cancel btn-danger" disabled>Confirm local records only</button>
+                </div>
+                <div id="noEffectCreationPanel" class="v4-modal-panel v4-modal-panel--warning" hidden>
+                    <strong>Unresolved offer creation</strong>
+                    <p id="noEffectCreationSummary" style="overflow-wrap: anywhere;"></p>
+                    <p id="noEffectCreationIdentity" style="overflow-wrap: anywhere;"></p>
+                    <p id="noEffectCreationDigest" style="overflow-wrap: anywhere;"></p>
+                    <button type="button" id="noEffectCreationCommitBtn" class="btn btn-cancel btn-danger" disabled>Confirm no-effect local recovery</button>
                 </div>
                 <div class="v4-modal-actions v4-modal-actions--center">
                     <button class="btn btn-config btn-secondary" onclick="closeCancelConfirm()" style="flex: 1; max-width: 170px;">Keep Offers</button>
@@ -33836,6 +33844,85 @@
         let _cancelAllRecoveryOnly = false;
         let _refreshAbortPreview = null;
         let _externalCancelReview = null;
+        let _noEffectCreationReview = null;
+        let _noEffectCreationOnly = false;
+
+        document.getElementById('noEffectCreationReviewEntry')?.addEventListener('click', () => {
+            cancelAllOffers({source: 'no_effect_creation'});
+        });
+
+        async function loadNoEffectCreationReview() {
+            const panel = document.getElementById('noEffectCreationPanel');
+            const confirm = document.getElementById('noEffectCreationCommitBtn');
+            panel.hidden = true;
+            confirm.disabled = true;
+            _noEffectCreationReview = null;
+            if (!_noEffectCreationOnly) return;
+            document.getElementById('externalCancelPanel').hidden = true;
+            document.getElementById('externalCancelCommitBtn').disabled = true;
+            document.getElementById('cancelAllConfirmBtn').disabled = true;
+            try {
+                if (!IS_DESKTOP || typeof window.pywebview?.api?.preview_no_effect_creation !== 'function') {
+                    throw new Error('Native proof is unavailable');
+                }
+                const response = await window.pywebview.api.preview_no_effect_creation();
+                if (!document.getElementById('cancelConfirmModal').classList.contains('active')) return;
+                if (response?.success !== true || !response.review) throw new Error('Proof unavailable');
+                const review = response.review;
+                if (review.wallet_effect_started !== false
+                        || typeof review.intent_id !== 'string'
+                        || typeof review.operation_id !== 'string'
+                        || typeof review.selected_coin_id !== 'string'
+                        || typeof review.proof_digest !== 'string'
+                        || !Array.isArray(review.sage_stable)
+                        || review.sage_stable.length !== 9
+                        || !Number.isInteger(review.latch_generation)
+                        || !Number.isFinite(review.expires_at_epoch)) {
+                    throw new Error('Proof invalid');
+                }
+                document.getElementById('cancelConfirmTitle').textContent = 'Review unresolved creation';
+                document.getElementById('cancelConfirmCopy').textContent =
+                    'Two complete Sage observations found no effect for this exact creation. This only closes its local intent and safety latch. Existing live offers remain live; no wallet transaction is sent.';
+                document.getElementById('noEffectCreationSummary').textContent =
+                    `Latch ${review.latch_generation}, intent ${review.intent_id}, selected coin ${review.selected_coin_id}; ` +
+                    `the complete Sage book contains ${review.sage_stable[8]} offers and no matching creation.`;
+                document.getElementById('noEffectCreationIdentity').textContent =
+                    `Sage wallet ${review.sage_stable[0]} on ${review.network}; process ${review.sage_stable[2]}. ` +
+                    'Pending transactions: 0. No wallet transaction will be sent.';
+                document.getElementById('noEffectCreationDigest').textContent =
+                    `Exact proof ${review.proof_digest}; expires ${new Date(review.expires_at_epoch * 1000).toLocaleString()}.`;
+                _noEffectCreationReview = review;
+                confirm.disabled = false;
+            } catch (_) {
+                document.getElementById('noEffectCreationSummary').textContent =
+                    'Complete no-effect proof is unavailable. The safety fence and wallet remain unchanged.';
+                document.getElementById('noEffectCreationIdentity').textContent = '';
+                document.getElementById('noEffectCreationDigest').textContent = '';
+            }
+            panel.hidden = false;
+        }
+
+        document.getElementById('noEffectCreationCommitBtn').addEventListener('click', async () => {
+            const reviewed = _noEffectCreationReview;
+            if (!reviewed || bot_state?.running) return;
+            _noEffectCreationReview = null;
+            const button = document.getElementById('noEffectCreationCommitBtn');
+            button.disabled = true;
+            try {
+                const response = await window.pywebview.api.commit_no_effect_creation({ reviewed });
+                if (response?.success !== true || response.applied !== true
+                        || response.wallet_effect_started !== false) {
+                    throw new Error('Exact no-effect proof changed');
+                }
+                showToast('No-effect creation proven; local safety records recovered.', 'success');
+                closeCancelConfirm();
+                await fetchStatus();
+            } catch (_) {
+                document.getElementById('noEffectCreationSummary').textContent =
+                    'Proof changed or local recovery was blocked. Refresh the review before trying again.';
+                showToast('Creation recovery needs a fresh review.', 'warning');
+            }
+        });
 
         document.getElementById('externalCancelReviewEntry')?.addEventListener('click', () => {
             cancelAllOffers({source: 'external_recovery'});
@@ -34165,7 +34252,8 @@
                 return;
             }
 
-            _cancelAllRecoveryOnly = context?.source === 'external_recovery';
+            _cancelAllRecoveryOnly = ['external_recovery', 'no_effect_creation'].includes(context?.source);
+            _noEffectCreationOnly = context?.source === 'no_effect_creation';
             _cancelAllContext = context && context.source === 'coin_prep'
                 ? context
                 : null;
@@ -34190,8 +34278,11 @@
             const confirmBtn = document.getElementById('cancelAllConfirmBtn');
             if (confirmBtn) confirmBtn.disabled = true;
             if (_cancelAllRecoveryOnly) {
-                if (titleEl) titleEl.textContent = 'Review Sage cancellation proof';
-                if (copyEl) copyEl.textContent = 'Review one exact Sage-only cancellation for local record recovery. This review cannot send a wallet transaction.';
+                if (titleEl) titleEl.textContent = _noEffectCreationOnly
+                    ? 'Review unresolved creation' : 'Review Sage cancellation proof';
+                if (copyEl) copyEl.textContent = _noEffectCreationOnly
+                    ? 'Review the exact no-effect creation proof. This review cannot send a wallet transaction.'
+                    : 'Review one exact Sage-only cancellation for local record recovery. This review cannot send a wallet transaction.';
                 if (noteEl) noteEl.textContent = 'Only a fresh exact proof can enable a separate local-record confirmation.';
                 if (confirmBtn) confirmBtn.textContent = 'Wallet cancellation unavailable';
             } else if (_cancelAllContext) {
@@ -34232,13 +34323,17 @@
             } else {
                 await loadRefreshAbortReview();
             }
-            await loadExternalCancelReview();
+            if (!_noEffectCreationOnly) await loadExternalCancelReview();
+            await loadNoEffectCreationReview();
         }
         
         function closeCancelConfirm({ clearContext = true } = {}) {
             document.getElementById('cancelConfirmModal').classList.remove('active');
             _externalCancelReview = null;
             document.getElementById('externalCancelCommitBtn').disabled = true;
+            _noEffectCreationReview = null;
+            document.getElementById('noEffectCreationCommitBtn').disabled = true;
+            _noEffectCreationOnly = false;
             _cancelAllRecoveryOnly = false;
             if (clearContext) _cancelAllContext = null;
         }

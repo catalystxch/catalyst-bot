@@ -7,7 +7,7 @@ import hashlib
 import json
 import pickle
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -533,6 +533,93 @@ def test_finalize_updates_selected_coin_reservation_only_for_proven_outcome(
     reservation = database.get_offer_intent_coin_reservations("intent-a")[0]
     assert reservation["status"] == expected_status
     assert reservation["trade_id"] == (trade_id if expected_status == "bound" else None)
+
+
+def test_exact_no_effect_recovery_closes_only_unknown_creation_and_latch(
+    isolated_database,
+):
+    now = datetime.now(timezone.utc)
+    lease = database.acquire_runtime_mutation_lease(
+        owner_run_id="run-test",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+        lease_expires_at=now + timedelta(minutes=5),
+        now=now,
+    )
+    assert lease["acquired"] is True
+    assert database.upsert_coin(COIN_A, "xch", 1000, designation="tier_spare")
+    _prepare(intent_id="intent-a", operation_id="create:intent-a", coin_id=COIN_A)
+    database.finalize_offer_intent(
+        intent_id="intent-a",
+        operation_id="create:intent-a",
+        event_id="final:unknown-recovery",
+        lifecycle_state="creation_unknown",
+        outcome="UNKNOWN",
+        wallet_identity_json={"binding_digest": "d" * 64},
+        evidence_json={"effect_attempted": True},
+        reason_code="CREATE_RESPONSE_AMBIGUOUS",
+        finalized_at="2026-08-16T12:00:01Z",
+        finalize_selected_coin_reservations=True,
+    )
+    latch = database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=["create:intent-a"],
+        wallet_fingerprint_hash="f" * 64,
+        network="mainnet",
+        tripped_at="2026-08-16T12:00:02Z",
+    )
+    proof = {
+        "intent_id": "intent-a",
+        "operation_id": "create:intent-a",
+        "row_version": 1,
+        "latch_generation": latch["generation"],
+        "wallet_fingerprint_hash": "f" * 64,
+        "network": "mainnet",
+        "lease_owner_run_id": "run-test",
+        "lease_version": lease["lease"]["lease_version"],
+        "lease_owner_pid": os.getpid(),
+        "lease_owner_host": socket.gethostname(),
+        "selected_coin_id": COIN_A,
+        "requested_amount_atomic": 2000,
+        "sage_stable": [
+            123456789,
+            "mainnet",
+            42,
+            1.0,
+            "C:/Sage/sage-tauri.exe",
+            1000,
+            "xch",
+            "e" * 64,
+            2,
+        ],
+    }
+    proof["proof_digest"] = hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    bad = dict(proof, latch_generation=latch["generation"] + 1)
+    with pytest.raises(ValueError):
+        database.settle_no_effect_offer_creation(proof=bad)
+    assert (
+        database.get_offer_intent("intent-a")["lifecycle_state"] == "creation_unknown"
+    )
+    assert (
+        database.get_offer_intent_coin_reservations("intent-a")[0]["status"]
+        == "reserved"
+    )
+
+    result = database.settle_no_effect_offer_creation(proof=proof)
+    assert result["applied"] is True
+    assert database.get_offer_intent("intent-a")["lifecycle_state"] == "creation_failed"
+    assert (
+        database.get_offer_intent_coin_reservations("intent-a")[0]["status"]
+        == "released"
+    )
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+    assert database.get_unresolved_offer_operation_blockers() == []
+    assert database.settle_no_effect_offer_creation(proof=proof)["applied"] is False
 
 
 def test_offer_creation_continuation_journals_authority_and_is_single_use(
