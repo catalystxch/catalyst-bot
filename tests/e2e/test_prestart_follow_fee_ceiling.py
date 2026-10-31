@@ -129,6 +129,79 @@ def test_follow_refresh_uses_new_ceiling_while_worker_approval_stays_historical(
     assert request["buy_limit"] == request["sell_limit"] == 24
 
 
+def test_follow_review_uses_current_approved_ceiling_instead_of_stale_default(page):
+    page.route(
+        "**/*",
+        lambda route: route.continue_()
+        if route.request.url.startswith("file:")
+        else route.abort(),
+    )
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),
+        wait_until="domcontentloaded",
+    )
+    request = page.evaluate("""async () => {
+        document.querySelectorAll('.modal.active, #startupOverlay, #splashGateOverlay, #spacescanGateOverlay').forEach(e => e.style.display='none');
+        IS_DESKTOP = true;
+        window.__followRequest = null;
+        window.pywebview = {api: {
+            get_coin_prep_status: async () => ({
+                success: true, follow_fee_approval_id: 'a'.repeat(64),
+                follow_fee_approval: {total_fee_mojos: 50000000000},
+            }),
+            confirm_follow_run_review: async () => ({success: false}),
+            prepare_follow_run_review: async body => {
+                window.__followRequest = body;
+                return {success: false, reason: 'TEST_STOP'};
+            },
+        }};
+        openFollowRunReview();
+        await prepareFollowRunReview();
+        return window.__followRequest;
+    }""")
+    assert request["maximum_fee_mojos"] == 50_000_000_000
+    expect(page.locator("#followRunFeeCapXch")).to_have_value("0.05")
+
+
+def test_follow_review_preserves_an_explicit_fee_edit(page):
+    page.route(
+        "**/*",
+        lambda route: route.continue_()
+        if route.request.url.startswith("file:")
+        else route.abort(),
+    )
+    page.goto(
+        (Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri(),
+        wait_until="domcontentloaded",
+    )
+    result = page.evaluate("""async () => {
+        document.querySelectorAll('.modal.active, #startupOverlay, #splashGateOverlay, #spacescanGateOverlay').forEach(e => e.style.display='none');
+        IS_DESKTOP = true;
+        window.__followRequest = null;
+        window.pywebview = {api: {
+            get_coin_prep_status: async () => ({
+                success: true, follow_fee_approval_id: 'a'.repeat(64),
+                follow_fee_approval: {total_fee_mojos: 50000000000},
+            }),
+            confirm_follow_run_review: async () => ({success: false}),
+            prepare_follow_run_review: async body => {
+                window.__followRequest = body;
+                return {success: false, reason: 'TEST_STOP'};
+            },
+        }};
+        openFollowRunReview();
+        const input = document.getElementById('followRunFeeCapXch');
+        input.value = '0.04';
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+        await prepareFollowRunReview();
+        return {value: input.value, request: window.__followRequest,
+            message: document.getElementById('followRunReviewText').textContent};
+    }""")
+    assert result["value"] == "0.04"
+    assert result["request"] is None
+    assert "0.05 XCH" in result["message"]
+
+
 def test_follow_approval_rechecks_expired_quote_at_native_confirmation(page):
     def route_local_file(route):
         if route.request.url.startswith("file:"):

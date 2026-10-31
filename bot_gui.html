@@ -8425,7 +8425,7 @@
                 <label class="follow-review-check"><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"><span>Continue until I stop the run or its fee or safety limit is reached</span></label>
                 <div class="follow-review-grid">
                     <label class="follow-review-field"><span>Timed authority (hours)</span><input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
-                    <label class="follow-review-field"><span>Cumulative fee ceiling (XCH)</span><input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="invalidateFollowRunReview()"></label>
+                    <label class="follow-review-field"><span>Cumulative fee ceiling (XCH)</span><input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="markFollowRunFeeCapEdited()"></label>
                 </div>
                 <p class="follow-review-note">Timed authority applies only when continuous is off. The 48-hour observation is separate from run lifetime.</p>
                 <pre id="followRunReviewText" class="follow-review-result" aria-live="polite"></pre>
@@ -32932,6 +32932,11 @@
         let _followRunReview = null;
         let _followRunReviewBusy = false;
 
+        function markFollowRunFeeCapEdited() {
+            document.getElementById('followRunFeeCapXch').dataset.reviewFeeEdited = 'true';
+            invalidateFollowRunReview();
+        }
+
         function invalidateFollowRunReview() {
             _followRunReview = null;
             const accept = document.getElementById('followRunReviewAccept');
@@ -32962,6 +32967,7 @@
                 return;
             }
             closeFollowRunReview();
+            document.getElementById('followRunFeeCapXch').dataset.reviewFeeEdited = 'false';
             document.getElementById('followRunReviewText').textContent =
                 'Refresh the exact review after Coin Prep completes. This review does not start trading.';
             document.getElementById('followRunReviewModal').style.display = 'flex';
@@ -32991,11 +32997,9 @@
             const sellLimit = Number(document.getElementById('followRunSellLimit').value);
             const hours = Number(document.getElementById('followRunHours').value);
             const continuous = document.getElementById('followRunContinuous').checked;
-            const requestedFeeCap = followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value);
             if (![buyLimit, sellLimit].every(Number.isSafeInteger)
                 || buyLimit < 1 || buyLimit > 50 || sellLimit < 1 || sellLimit > 50
-                || (!continuous && (!Number.isSafeInteger(hours) || hours < 1 || hours > 48))
-                || requestedFeeCap === null) {
+                || (!continuous && (!Number.isSafeInteger(hours) || hours < 1 || hours > 48))) {
                 output.textContent = 'Enter 1–50 offers per side, a valid timed duration if selected, and a positive fee ceiling of up to 12 decimal places.';
                 return;
             }
@@ -33012,8 +33016,16 @@
                     || !Number.isSafeInteger(feeCap) || feeCap <= 0) {
                     throw new Error('A completed, current Coin Prep fee approval is required. Review Coin Prep first.');
                 }
+                const feeInput = document.getElementById('followRunFeeCapXch');
+                if (feeInput.dataset.reviewFeeEdited !== 'true') {
+                    feeInput.value = coinPrepMojosToXch(feeCap);
+                }
+                const requestedFeeCap = followRunFeeCapMojos(feeInput.value);
+                if (requestedFeeCap === null) {
+                    throw new Error('Enter a positive exact XCH fee ceiling with up to 12 decimal places.');
+                }
                 if (feeCap !== requestedFeeCap) {
-                    throw new Error('The Coin Prep fee approval has a different cumulative ceiling. Review the exact approved amount before continuing.');
+                    throw new Error(`The approved cumulative ceiling is ${coinPrepMojosToXch(feeCap)} XCH. Adjust Follow fee to change it before reviewing this run.`);
                 }
                 const response = await apiFetch(`${API_URL}/follow/run-review`, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
