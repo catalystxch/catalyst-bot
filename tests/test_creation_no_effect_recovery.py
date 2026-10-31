@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -179,6 +180,40 @@ def test_no_effect_review_digest_changes_with_latch_generation():
         classify_no_effect_creation(*changed)["proof_digest"]
         != (classify_no_effect_creation(*original)["proof_digest"])
     )
+
+
+def test_native_no_effect_proof_survives_json_bridge_round_trip(monkeypatch):
+    import database
+
+    recovery._clear_pending_review_for_test()
+    current = classify_no_effect_creation(*proof())
+    current.update(
+        {
+            "lease_owner_run_id": "test-run",
+            "lease_owner_pid": 42,
+            "lease_owner_host": "test-host",
+            "lease_version": 1,
+        }
+    )
+    material = {key: value for key, value in current.items() if key != "proof_digest"}
+    import hashlib
+
+    current["proof_digest"] = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    monkeypatch.setattr(recovery, "collect_no_effect_creation_proof", lambda: current)
+    monkeypatch.setattr(
+        database,
+        "settle_no_effect_offer_creation",
+        lambda *, proof: {
+            "applied": True,
+            "wallet_effect_started": False,
+        },
+    )
+    review = recovery.preview_no_effect_creation()
+    assert type(review["sage_stable"]) is list
+    from_native_js = json.loads(json.dumps(review))
+    assert recovery.commit_no_effect_creation(from_native_js)["applied"] is True
 
 
 def test_sage_process_identity_requires_one_listener(monkeypatch):

@@ -332,7 +332,7 @@ def classify_no_effect_creation(
         "network": intent["network"],
         "selected_coin_id": selected[0],
         "requested_amount_atomic": requested,
-        "sage_stable": stable[0],
+        "sage_stable": list(stable[0]),
     }
     canonical = json.dumps(digest_input, sort_keys=True, separators=(",", ":"))
     return {
