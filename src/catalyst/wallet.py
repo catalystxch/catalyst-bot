@@ -982,7 +982,16 @@ def _run_offer_operation_continuation(
                 raise mutation_gate.MutationBlocked(
                     "FEE_FOLLOW_AUTHORITY_REQUIRED", wallet_operation
                 )
-            effect_attempted = True
+            # Sage's create_offer rechecks identity while preparing the RPC.
+            # Only the final send check can precede a wallet effect. A safety
+            # stop during preparation must remain a proven pre-send failure.
+            if (
+                wallet_operation != "wallet:create_offer"
+                or WALLET_TYPE != "sage"
+                or safe_step
+                in {"rpc:make_offer:send", "rpc:make_offer:retry_send"}
+            ):
+                effect_attempted = True
 
         callback_kwargs["_identity_recheck"] = identity_recheck
         callback = getattr(adapter, adapter_method)

@@ -542,7 +542,7 @@ def test_offer_creation_continuation_journals_authority_and_is_single_use(
     effects = []
 
     def create_effect(*args, **kwargs):
-        kwargs["_identity_recheck"]("make_offer")
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
         effects.append((args, kwargs))
         return {
             "success": True,
@@ -674,7 +674,7 @@ def test_offer_creation_continuation_journals_authority_and_is_single_use(
         (permit, "wallet:create_offer", "create:intent-a", "intent-a"),
         (
             permit,
-            "wallet:create_offer:make_offer:identity",
+            "wallet:create_offer:rpc:make_offer:send:identity",
             "create:intent-a",
             "intent-a",
         ),
@@ -814,7 +814,7 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
     monkeypatch,
 ):
     def explode(*_args, **_kwargs):
-        _kwargs["_identity_recheck"]("make_offer")
+        _kwargs["_identity_recheck"]("rpc:make_offer:send")
         raise RuntimeError("response lost")
 
     permit, identities, exits, checks = _stub_continuation_authority(
@@ -844,7 +844,7 @@ def test_offer_creation_continuation_backend_exception_closes_after_attempt(
         (permit, "wallet:create_offer", "create:intent-a", "intent-a"),
         (
             permit,
-            "wallet:create_offer:make_offer:identity",
+            "wallet:create_offer:rpc:make_offer:send:identity",
             "create:intent-a",
             "intent-a",
         ),
@@ -3151,7 +3151,7 @@ def test_offer_manager_real_gate_and_wallet_continuation_cross_prepared_blocker(
     effects = []
 
     def create_effect(*_args, **kwargs):
-        kwargs["_identity_recheck"]("make_offer")
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
         effects.append(True)
         return {
             "success": True,
@@ -3273,7 +3273,7 @@ def test_confidence_consent_rechecked_after_wallet_identity_read(monkeypatch, ap
     effects = []
 
     def effect(*args, **kwargs):
-        kwargs["_identity_recheck"]("make_offer")
+        kwargs["_identity_recheck"]("rpc:make_offer:send")
         effects.append(True)
         return {"success": True}
 
@@ -3296,6 +3296,34 @@ def test_confidence_consent_rechecked_after_wallet_identity_read(monkeypatch, ap
     )
     assert effects == ([True] if approved is True else [])
     assert result["_catalyst_effect_attempted"] is (approved is True)
+
+
+@pytest.mark.parametrize("step", ["create_offer", "rpc:make_offer"])
+def test_sage_creation_blocked_before_http_send_is_not_an_ambiguous_effect(
+    monkeypatch, step
+):
+    def blocked_before_send(*_args, **kwargs):
+        kwargs["_identity_recheck"](step)
+        raise mutation_gate.MutationBlocked(
+            "MUTATION_GATE_SAFETY_STOP", "wallet:create_offer"
+        )
+
+    _stub_continuation_authority(
+        monkeypatch, effect=blocked_before_send, identity_count=3
+    )
+    continuation = wallet.begin_offer_creation_continuation(
+        operation_id="create:pre-send", intent_id="pre-send"
+    )
+    result = wallet.create_offer(
+        {"1": -1000, "2": 2000},
+        _creation_continuation=continuation,
+        _creation_operation_id="create:pre-send",
+        _creation_intent_id="pre-send",
+    )
+
+    assert result["success"] is False
+    assert result["reason"] == "MUTATION_GATE_SAFETY_STOP"
+    assert result["_catalyst_effect_attempted"] is False
 
 
 def test_manager_carries_confidence_guard_through_prepared_wallet_dispatch(
