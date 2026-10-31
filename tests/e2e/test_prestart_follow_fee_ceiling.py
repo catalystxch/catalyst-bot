@@ -8,6 +8,77 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.e2e
 
 
+def test_initial_follow_fee_opens_with_exact_suggested_review(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate("""() => {
+        document.getElementById('startupOverlay').style.display = 'none';
+        IS_DESKTOP = true;
+        window.__suggestedReviews = [];
+        window.pywebview = {api: {
+            get_coin_prep_status: async () => ({
+                success: true, fee_approval_id: 'a'.repeat(64),
+                fee_approval: {session_completed: true, total_fee_mojos: 5000000000}
+            }),
+            prepare_prestart_follow_fee_ceiling_review: async body => {
+                window.__suggestedReviews.push(body);
+                return {
+                    success: true, preview_id: 'b'.repeat(64), review_sha256: 'c'.repeat(64),
+                    prior_maximum_fee_mojos: 5000000000,
+                    proposed_maximum_fee_mojos: body.proposed_maximum_fee_mojos,
+                    spent_fee_mojos: 1000000000, held_fee_mojos: 0,
+                    protected_cancellation_fee_mojos: 4000000000,
+                    fee_funding_mojos: 60000000000,
+                    expires_at: Math.floor(Date.now()/1000) + 50,
+                    wallet: {wallet_type: 'sage', network: 'mainnet',
+                        wallet_fingerprint: 736588221, ticker: 'MZ',
+                        asset_id: 'd'.repeat(64), session_id: 'e'.repeat(64)},
+                    dispatch_authorized: false
+                };
+            },
+            confirm_prestart_follow_fee_ceiling_review: async () => {
+                throw new Error('must not approve without click');
+            }
+        }};
+        openPrestartFollowFeeReview();
+    }""")
+    expect(page.locator("#prestartFollowFeeXch")).to_have_value("0.05")
+    expect(page.locator("#prestartFollowFeeText")).to_contain_text(
+        "New cumulative ceiling: 0.05 XCH"
+    )
+    assert page.evaluate("window.__suggestedReviews.length") == 1
+    assert (
+        page.evaluate("window.__suggestedReviews[0].proposed_maximum_fee_mojos")
+        == 50_000_000_000
+    )
+    expect(page.locator("#prestartFollowFeeConfirm")).to_be_disabled()
+
+
+def test_recorded_follow_ceiling_does_not_open_fee_review_again(page):
+    page.goto((Path(__file__).resolve().parents[2] / "bot_gui.html").as_uri())
+    page.evaluate("""async () => {
+        document.getElementById('startupOverlay').style.display = 'none';
+        IS_DESKTOP = true;
+        window.__extraFeeReviews = 0;
+        window.pywebview = {api: {
+            get_coin_prep_status: async () => ({
+                success: true, fee_approval_id: 'a'.repeat(64),
+                fee_approval: {session_completed: true, total_fee_mojos: 5000000000},
+                follow_fee_approval_id: 'b'.repeat(64),
+                follow_fee_approval: {session_completed: true, total_fee_mojos: 50000000000}
+            }),
+            prepare_prestart_follow_fee_ceiling_review: async () => {
+                window.__extraFeeReviews++;
+                throw new Error('fee review should be reused');
+            },
+            confirm_prestart_follow_fee_ceiling_review: async () => ({success: false})
+        }};
+        await openPrestartFollowFeeReview();
+    }""")
+    expect(page.locator("#prestartFollowFeeModal")).to_be_hidden()
+    assert page.evaluate("window.__extraFeeReviews") == 0
+    expect(page.locator("#followRunFeeCapXch")).to_have_value("0.05")
+
+
 def test_completed_session_prestart_review_is_native_and_single_use(page):
     page.route(
         "**/*",
@@ -54,7 +125,7 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
                     dispatch_authorized: false};
             },
         }};
-        openPrestartFollowFeeReview();
+        await openPrestartFollowFeeReview();
     }""")
     amount = page.locator("#prestartFollowFeeXch")
     expect(amount).to_be_editable()
@@ -64,7 +135,7 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
     expect(output).to_contain_text("Original cumulative ceiling: 0.004059096837 XCH")
     expect(output).to_contain_text("New cumulative ceiling: 0.01 XCH")
     assert (
-        page.evaluate("window.__prestartCalls[0][1].proposed_maximum_fee_mojos")
+        page.evaluate("window.__prestartCalls[1][1].proposed_maximum_fee_mojos")
         == 10_000_000_000
     )
     expect(output).to_contain_text("Already spent: 0.000774766315 XCH")
@@ -81,7 +152,7 @@ def test_completed_session_prestart_review_is_native_and_single_use(page):
         input.dispatchEvent(new Event('input', {bubbles: true}));
     }""")
     expect(page.locator("#prestartFollowFeeConfirm")).to_be_disabled()
-    assert len(page.evaluate("window.__prestartCalls")) == 1
+    assert len(page.evaluate("window.__prestartCalls")) == 2
     amount.fill("0.01")
     page.evaluate("preparePrestartFollowFeeReview()")
     page.locator("#prestartFollowFeeAccept").check()

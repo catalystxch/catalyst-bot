@@ -8448,8 +8448,8 @@
                 <p>Coin Prep is complete. Review the original wallet, fees already spent or held, protected cancellation reserve, and the exact new cumulative ceiling. Recording this approval does not start trading or send a wallet transaction.</p>
             </div>
             <div class="follow-review-body">
-                <label class="follow-review-field"><span>Initial cumulative fee ceiling (XCH)</span><input id="prestartFollowFeeXch" type="text" inputmode="decimal" value="0.005" oninput="invalidatePrestartFollowFeeReview()"></label>
-                <p class="follow-review-note">Enter a ceiling above the completed Coin Prep ceiling, then refresh the exact wallet review.</p>
+                <label class="follow-review-field"><span>Suggested initial cumulative fee ceiling (XCH)</span><input id="prestartFollowFeeXch" type="text" inputmode="decimal" value="0.05" oninput="invalidatePrestartFollowFeeReview()"></label>
+                <p class="follow-review-note">This is a maximum for all network fees in this wallet, including prior spend and protected cancellation. The exact wallet review checks funding before you can agree. You may lower the suggestion and refresh it.</p>
                 <pre id="prestartFollowFeeText" class="follow-review-result" aria-live="polite"></pre>
                 <label class="follow-review-check"><input type="checkbox" id="prestartFollowFeeAccept" disabled><span>I approve the exact cumulative ceiling shown above for this completed Coin Prep session.</span></label>
                 <div class="follow-review-actions">
@@ -33206,16 +33206,35 @@
             document.getElementById('prestartFollowFeeModal').style.display = 'none';
         }
 
-        function openPrestartFollowFeeReview() {
+        async function openPrestartFollowFeeReview() {
             if (!IS_DESKTOP || !window.pywebview?.api?.prepare_prestart_follow_fee_ceiling_review
                 || !window.pywebview?.api?.confirm_prestart_follow_fee_ceiling_review) {
                 showToast('Initial fee ceiling review requires the native desktop app.', 'warning');
                 return;
             }
+            try {
+                const response = await apiFetch(`${API_URL}/coin-prep/status`);
+                const status = await response.json();
+                const ceiling = Number(status?.follow_fee_approval?.total_fee_mojos);
+                if (response.ok && status?.success === true
+                    && /^[0-9a-f]{64}$/.test(status?.follow_fee_approval_id || '')
+                    && Number.isSafeInteger(ceiling) && ceiling > 0) {
+                    const input = document.getElementById('followRunFeeCapXch');
+                    if (input.dataset.reviewFeeEdited !== 'true') {
+                        input.value = coinPrepMojosToXch(ceiling);
+                    }
+                    showToast('This wallet already has a Follow fee ceiling. Review the run, or use Adjust Follow fee if a higher ceiling is needed.', 'info');
+                    return;
+                }
+            } catch (_) {
+                // The exact review below will surface an unavailable status.
+            }
             invalidatePrestartFollowFeeReview();
+            document.getElementById('prestartFollowFeeXch').value = '0.05';
             document.getElementById('prestartFollowFeeText').textContent =
-                'Refresh to inspect the completed Coin Prep scope and exact fee accounting.';
+                'Checking the suggested cumulative ceiling against the current wallet…';
             document.getElementById('prestartFollowFeeModal').style.display = 'flex';
+            await preparePrestartFollowFeeReview();
         }
 
         async function preparePrestartFollowFeeReview() {
