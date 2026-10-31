@@ -24,7 +24,7 @@ import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
 from config import cfg
@@ -397,6 +397,90 @@ def assess_offer_book_candidate(
         "improves_book": improves_book,
         "evidence_digest": evidence_digest,
     }
+
+
+def assess_passive_red_candidate(
+    *,
+    side: str,
+    candidate_price: Decimal,
+    size_xch: Decimal,
+    confidence: Any,
+    network_fee_xch: Decimal,
+    expected_cancel_requotes: int,
+    minimum_profit_xch: Decimal,
+    now: Optional[datetime] = None,
+    max_confidence_age_seconds: int = 20,
+) -> Dict[str, Any]:
+    """Keep a consented RED quote passive at every wallet-effect boundary."""
+
+    from confidence_override import ConsentedConfidence
+
+    result = assess_offer_book_candidate(
+        side=side,
+        candidate_price=candidate_price,
+        size_xch=size_xch,
+        confidence=confidence,
+        network_fee_xch=network_fee_xch,
+        expected_cancel_requotes=expected_cancel_requotes,
+        minimum_profit_xch=minimum_profit_xch,
+        now=now,
+        max_confidence_age_seconds=max_confidence_age_seconds,
+    )
+    if isinstance(confidence, ConsentedConfidence) and confidence.state == "RED":
+        if result.get("improves_book") is True:
+            return {
+                **result,
+                "eligible": False,
+                "reason_code": "red_quote_would_improve_book",
+            }
+        if (
+            candidate_price < cfg.HARD_MIN_PRICE_XCH
+            or candidate_price > cfg.HARD_MAX_PRICE_XCH
+        ):
+            return {
+                **result,
+                "eligible": False,
+                "reason_code": "red_quote_outside_hard_price_band",
+            }
+    return result
+
+
+def passive_red_ladder_price(
+    *,
+    price: Decimal,
+    inner_price: Decimal,
+    side: str,
+    confidence: Any,
+    hard_min_price: Decimal,
+    hard_max_price: Decimal,
+) -> Optional[Decimal]:
+    """Move a RED ladder behind the observed book without flattening its slots."""
+
+    from confidence_override import ConsentedConfidence
+
+    if not isinstance(confidence, ConsentedConfidence) or confidence.state != "RED":
+        return price
+    bid = confidence.trusted_bid
+    ask = confidence.trusted_ask
+    if (
+        side not in {"buy", "sell"}
+        or any(
+            type(value) is not Decimal or not value.is_finite() or value <= 0
+            for value in (price, inner_price, bid, ask, hard_min_price, hard_max_price)
+        )
+        or bid > ask
+        or hard_min_price >= hard_max_price
+    ):
+        return None
+    if side == "buy":
+        price -= max(Decimal("0"), inner_price - bid)
+        if price > bid:
+            return None
+    else:
+        price += max(Decimal("0"), ask - inner_price)
+        if price < ask:
+            return None
+    return price if hard_min_price <= price <= hard_max_price else None
 
 
 def _current_candidate_confidence(confidence: Any) -> Any:
@@ -4735,7 +4819,16 @@ class OfferManager:
         minimum_profit_xch = Decimal(
             str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
         )
+        from confidence_override import ConsentedConfidence
+
+        scoped_red = (
+            isinstance(market_confidence, ConsentedConfidence)
+            and market_confidence.state == "RED"
+        )
         offer_specs = []
+        grid_inner_price = self._get_ladder_price(
+            0, side, mid_price, half_spread, total_slots
+        )
         for i in range(num):
             if self._stop_requested:
                 log_event(
@@ -4794,6 +4887,15 @@ class OfferManager:
                 price_cap=price_cap,
                 price_floor=price_floor,
             )
+            if price is not None and market_confidence is not None:
+                price = passive_red_ladder_price(
+                    price=price,
+                    inner_price=grid_inner_price,
+                    side=side,
+                    confidence=_current_candidate_confidence(market_confidence),
+                    hard_min_price=cfg.HARD_MIN_PRICE_XCH,
+                    hard_max_price=cfg.HARD_MAX_PRICE_XCH,
+                )
             if price is None or price <= 0:
                 continue
 
@@ -4852,6 +4954,34 @@ class OfferManager:
             cat_mojos = cat_to_mojos(cat_amount, decimals)
             cat_amount = mojos_to_cat(cat_mojos, decimals)
             xch_mojos = xch_to_mojos(size_xch)
+            if scoped_red:
+                # The exact on-chain ratio must stay passive after converting
+                # amounts to atomic units. Requested amounts round upward.
+                if side == "buy":
+                    cat_mojos = max(
+                        cat_mojos,
+                        int(
+                            (
+                                mojos_to_xch(xch_mojos) / price * Decimal(10**decimals)
+                            ).to_integral_value(rounding=ROUND_CEILING)
+                        ),
+                    )
+                else:
+                    xch_mojos = max(
+                        xch_mojos,
+                        int(
+                            (
+                                mojos_to_cat(cat_mojos, decimals)
+                                * price
+                                * Decimal(10**12)
+                            ).to_integral_value(rounding=ROUND_CEILING)
+                        ),
+                    )
+                if cat_mojos <= 0 or xch_mojos <= 0:
+                    continue
+                size_xch = mojos_to_xch(xch_mojos)
+                cat_amount = mojos_to_cat(cat_mojos, decimals)
+                price = size_xch / cat_amount
 
             if side == "buy":
                 offer_dict = {
@@ -4868,7 +4998,7 @@ class OfferManager:
             purpose = "normal_lifecycle"
             if market_confidence is not None:
                 candidate_confidence = _current_candidate_confidence(market_confidence)
-                market_guard = assess_offer_book_candidate(
+                market_guard = assess_passive_red_candidate(
                     side=side,
                     candidate_price=price,
                     size_xch=size_xch,
@@ -4916,7 +5046,7 @@ class OfferManager:
                             str(wallet_cat): -int(cat_mojos),
                             str(cfg.WALLET_ID_XCH): int(xch_mojos),
                         }
-                    market_guard = assess_offer_book_candidate(
+                    market_guard = assess_passive_red_candidate(
                         side=side,
                         candidate_price=price,
                         size_xch=size_xch,
@@ -5065,6 +5195,12 @@ class OfferManager:
                                 exact_cat_mojos = cat_to_mojos(
                                     exact_cat_amount, decimals
                                 )
+                                if scoped_red:
+                                    exact_cat_mojos = int(
+                                        (
+                                            exact_cat_amount * Decimal(10**decimals)
+                                        ).to_integral_value(rounding=ROUND_CEILING)
+                                    )
                                 spec["size_xch"] = exact_size_xch
                                 spec["cat_amount"] = mojos_to_cat(
                                     exact_cat_mojos, decimals
@@ -5080,6 +5216,14 @@ class OfferManager:
                                 exact_xch_mojos = xch_to_mojos(
                                     exact_cat_amount * spec["price"]
                                 )
+                                if scoped_red:
+                                    exact_xch_mojos = int(
+                                        (
+                                            exact_cat_amount
+                                            * spec["price"]
+                                            * Decimal(10**12)
+                                        ).to_integral_value(rounding=ROUND_CEILING)
+                                    )
                                 spec["size_xch"] = mojos_to_xch(exact_xch_mojos)
                                 spec["cat_amount"] = exact_cat_amount
                                 spec["offer_dict"] = {
@@ -5139,7 +5283,7 @@ class OfferManager:
         if market_confidence is not None:
             for spec in offer_specs:
                 candidate_confidence = _current_candidate_confidence(market_confidence)
-                final_guard = assess_offer_book_candidate(
+                final_guard = assess_passive_red_candidate(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
@@ -5209,7 +5353,7 @@ class OfferManager:
             market_guard = spec.get("market_guard") or {}
             if market_confidence is not None:
                 candidate_confidence = _current_candidate_confidence(market_confidence)
-                market_guard = assess_offer_book_candidate(
+                market_guard = assess_passive_red_candidate(
                     side=side,
                     candidate_price=spec["price"],
                     size_xch=spec["size_xch"],
@@ -5267,7 +5411,7 @@ class OfferManager:
                         if not isinstance(current, ConsentedConfidence):
                             return False
                         return (
-                            assess_offer_book_candidate(
+                            assess_passive_red_candidate(
                                 side=side,
                                 candidate_price=spec["price"],
                                 size_xch=spec["size_xch"],

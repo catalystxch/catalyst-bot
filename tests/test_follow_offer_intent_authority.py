@@ -219,3 +219,123 @@ def test_follow_book_opportunity_retains_its_classification(monkeypatch):
         follow_run_id=RUN_ID,
     )
     assert seen == [f"follow:{RUN_ID}:book_opportunity"]
+
+
+def test_consented_red_follow_ladder_dispatches_only_passive_quotes(monkeypatch):
+    from types import SimpleNamespace
+
+    from confidence_override import ConsentedConfidence
+
+    bid = Decimal("0.00005025")
+    ask = Decimal("0.00012000")
+    observed = datetime.now(timezone.utc)
+    raw = SimpleNamespace(
+        state="RED",
+        derived_at=observed,
+        evidence_digests=("a" * 64,),
+    )
+    scoped = ConsentedConfidence(
+        raw,
+        lambda: True,
+        (bid, (bid + ask) / Decimal(2), ask),
+    )
+    monkeypatch.setattr(offer_manager.cfg, "TIER_ENABLED", False)
+    monkeypatch.setattr(offer_manager.cfg, "DEFAULT_TRADE_XCH", Decimal("0.1"))
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375"))
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015"))
+    seen = []
+
+    def capture(_self, offer_dict, **kwargs):
+        seen.append((offer_dict, kwargs["creation_context"]["purpose"]))
+        return {"success": False, "error": "test stop before wallet"}
+
+    monkeypatch.setattr(offer_manager.OfferManager, "create_offer_with_retry", capture)
+    manager = offer_manager.OfferManager()
+    for side in ("buy", "sell"):
+        manager.create_ladder(
+            mid_price=Decimal("0.000075"),
+            side=side,
+            num_offers=24,
+            total_slots=24,
+            trade_size_xch=Decimal("0.1"),
+            spread_fraction=Decimal("0.126"),
+            cat_asset_id=ASSET_ID,
+            cat_wallet_id=2,
+            market_confidence=scoped,
+            follow_run_id=RUN_ID,
+        )
+    assert len(seen) == 48
+    assert all(purpose == f"follow:{RUN_ID}:normal_lifecycle" for _, purpose in seen)
+    buy_prices = [
+        offer_manager.mojos_to_xch(-offer["1"])
+        / offer_manager.mojos_to_cat(offer["2"], offer_manager.cfg.CAT_DECIMALS)
+        for offer, _ in seen
+        if offer["1"] < 0
+    ]
+    sell_prices = [
+        offer_manager.mojos_to_xch(offer["1"])
+        / offer_manager.mojos_to_cat(-offer["2"], offer_manager.cfg.CAT_DECIMALS)
+        for offer, _ in seen
+        if offer["2"] < 0
+    ]
+    assert len(buy_prices) == len(sell_prices) == 24
+    assert all(Decimal("0.0000375") <= price <= bid for price in buy_prices)
+    assert all(ask <= price <= Decimal("0.00015") for price in sell_prices)
+
+
+def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(monkeypatch):
+    from types import SimpleNamespace
+
+    from confidence_override import ConsentedConfidence
+
+    observed = datetime.now(timezone.utc)
+    raw = SimpleNamespace(
+        state="RED", derived_at=observed, evidence_digests=("a" * 64,)
+    )
+    first_bid = Decimal("0.00005025")
+    ask = Decimal("0.00012000")
+    initial = ConsentedConfidence(
+        raw, lambda: True, (first_bid, (first_bid + ask) / Decimal(2), ask)
+    )
+    lower_bid = Decimal("0.00004000")
+    changed = ConsentedConfidence(
+        raw, lambda: True, (lower_bid, (lower_bid + ask) / Decimal(2), ask)
+    )
+    reads = []
+
+    def fresh_view():
+        reads.append(1)
+        return initial if len(reads) <= 3 else changed
+
+    scoped = ConsentedConfidence(
+        raw,
+        lambda: True,
+        (first_bid, (first_bid + ask) / Decimal(2), ask),
+        current_view=fresh_view,
+    )
+    monkeypatch.setattr(offer_manager.cfg, "TIER_ENABLED", False)
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375"))
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015"))
+    monkeypatch.setattr(
+        offer_manager.OfferManager,
+        "create_offer_with_retry",
+        lambda *_args, **_kwargs: pytest.fail("wallet dispatch reached"),
+    )
+    monkeypatch.setattr(
+        database,
+        "claim_offer_book_improvement",
+        lambda **_kwargs: pytest.fail("improvement claim reached"),
+    )
+    offer_manager.OfferManager().create_ladder(
+        mid_price=Decimal("0.000075"),
+        side="buy",
+        num_offers=1,
+        total_slots=24,
+        trade_size_xch=Decimal("0.1"),
+        spread_fraction=Decimal("0.126"),
+        cat_asset_id=ASSET_ID,
+        cat_wallet_id=2,
+        market_confidence=scoped,
+        follow_run_id=RUN_ID,
+    )
+    assert len(reads) >= 4
