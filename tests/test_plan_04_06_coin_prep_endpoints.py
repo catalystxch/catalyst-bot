@@ -912,6 +912,36 @@ class TestCoinPrepStatus(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestCoinPrepVerify(_FlaskBase):
+    def test_fee_coin_with_cancellation_change_does_not_satisfy_exact_target(self):
+        exact_fee = 10_000_000_000
+        cancellation_change = exact_fee - 26_585_838
+        xch_coins = {
+            "success": True,
+            "records": [
+                {"coin": {"amount": exact_fee}},
+                {"coin": {"amount": cancellation_change}},
+            ],
+        }
+        with (
+            patch(
+                "wallet.get_spendable_coins_rpc",
+                side_effect=[xch_coins, self._EMPTY_COINS],
+            ),
+            patch("wallet.get_wallet_balance", return_value=self._ENOUGH_BALANCE),
+            patch("wallet.WALLET_ID_XCH", 1),
+        ):
+            resp = self._get(
+                "/api/coin-prep/verify?tier_enabled=true"
+                "&fees_xch=0.01&fees_xch_count=2",
+                environ_base=self._LOOPBACK,
+            )
+
+        body = resp.get_json()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(body["tiers"]["fees"]["xch_have"], 1)
+        self.assertFalse(body["all_sufficient"])
+        self.assertTrue(body["needs_coin_prep"])
+
     _EMPTY_COINS = {"success": True, "records": []}
     _ZERO_BALANCE = {
         "wallet_balance": {"confirmed_wallet_balance": 0, "spendable_balance": 0}

@@ -2522,6 +2522,10 @@ def api_coin_prep_verify(_args=None):
                     continue
                 low = int(target_mojos * (1 - tol))
                 high = int(target_mojos * (1 + tol))
+                if tier == "fees":
+                    # Protected fee approval requires the frozen denomination.
+                    # A coin reduced by a cancellation fee cannot replace it.
+                    low = high = target_mojos
                 matched_positions = [
                     idx
                     for idx, amt in enumerate(remaining)
