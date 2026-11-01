@@ -40,6 +40,21 @@ def confidence(**changes):
     )
 
 
+def test_wallet_effect_refreshes_red_book_even_after_candidate_deadline():
+    from bot_loop import BotLoop
+
+    bot = SimpleNamespace(
+        _confidence_override_consent=SimpleNamespace(revoked=False),
+        _running=True,
+        _fresh_effective_market_confidence=lambda: "fresh-red-view",
+        _effective_market_confidence=lambda: "expired-raw-view",
+    )
+    assert BotLoop._wallet_effect_market_confidence(bot) == "fresh-red-view"
+
+    bot._confidence_override_consent.revoked = True
+    assert BotLoop._wallet_effect_market_confidence(bot) == "expired-raw-view"
+
+
 def test_consent_bound_to_review_run_expiry_and_scope():
     permit = RunConsent.confirm(
         scope=SCOPE, reviewed_digest=scope_digest(SCOPE), duration_hours=48, now=NOW

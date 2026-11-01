@@ -1360,6 +1360,19 @@ class BotLoop:
                 return None
         return self._effective_market_confidence()
 
+    def _wallet_effect_market_confidence(self):
+        """Refresh an aging RED book before building a wallet-effect batch.
+
+        Checking ``_confidence_override_active`` here would skip the refresh
+        precisely when the prior snapshot's short candidate deadline expired.
+        The refreshed view still has to pass the full scoped consent checks.
+        """
+
+        consent = getattr(self, "_confidence_override_consent", None)
+        if consent is not None and not consent.revoked and self._running:
+            return self._fresh_effective_market_confidence()
+        return self._effective_market_confidence()
+
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
         """Re-sample continuity at every outer-cycle mutation phase boundary."""
 
@@ -13095,7 +13108,7 @@ class BotLoop:
                         RequoteSeverity.FULL,
                         RequoteSeverity.EMERGENCY,
                     ),
-                    market_confidence=self._effective_market_confidence(),
+                    market_confidence=self._wallet_effect_market_confidence(),
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force
@@ -14364,7 +14377,7 @@ class BotLoop:
                 price_floor=price_floor,
                 interpolate_refill_prices=side
                 not in _recovery_anchor_drift_refill_sides,
-                market_confidence=self._effective_market_confidence(),
+                market_confidence=self._wallet_effect_market_confidence(),
                 follow_run_id=follow_run_id,
             )
             _parallel_results[side] = offers or []
