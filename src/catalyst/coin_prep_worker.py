@@ -2041,6 +2041,14 @@ class CoinPrepWorker:
             for plan_amount, tier_name, _exp in plan_entries:
                 if slots_remaining.get((plan_amount, tier_name), 0) <= 0:
                     continue
+                # Approved fee targets fund later protected wallet operations.
+                # A cancellation-change coin cannot replace an exact fee coin.
+                if (
+                    tier_name == get_fee_tier_name()
+                    and getattr(self, "fee_approval_id", None)
+                    and coin_amount != plan_amount
+                ):
+                    continue
                 if tier_name != get_fee_tier_name() and coin_amount < plan_amount:
                     continue
                 if not _within_tolerance(coin_amount, plan_amount):
