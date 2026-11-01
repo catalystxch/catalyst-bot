@@ -19730,10 +19730,13 @@
             const showLiveDashboard = isRunning || isStopping || _botStarting;
             // #liveControls moved to Settings → Live sub-tab (2026-04-22),
             // so it's no longer part of the dashboard's running/idle toggle set.
-            ['heroStrip', 'marketStrip', 'dashboardActivityRow', 'dashboardAdvisorRow', 'activeFeaturesBar'].forEach((id) => {
+            ['heroStrip', 'dashboardActivityRow', 'dashboardAdvisorRow', 'activeFeaturesBar'].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) el.classList.toggle('dashboard-section-hidden', !showLiveDashboard);
             });
+            // The confidence review must remain reachable before a RED Follow
+            // run starts. Hiding it until Running makes consent impossible.
+            document.getElementById('marketStrip')?.classList.remove('dashboard-section-hidden');
 
             const guide = document.getElementById('startupGuide');
             if (guide) {
@@ -33502,6 +33505,18 @@
                 return;
             }
 
+            // RED Follow needs its scoped consent before the bot becomes
+            // Running. Otherwise Start enters an empty run and the review
+            // refuses to open while Running.
+            const confidenceState = document.getElementById('marketConfidenceState')?.textContent?.trim().toUpperCase();
+            const hasBootstrapCampaign = typeof _bootstrapActiveCampaign !== 'undefined'
+                && !!_bootstrapActiveCampaign?.campaign_id;
+            if (confidenceState === 'RED' && !hasBootstrapCampaign
+                && !options.confidenceOverride && !options.resumeExistingOffers) {
+                await reviewConfidenceOverride();
+                return;
+            }
+
             // Immediate visual feedback — disable button, show loading state + toast
             const startBtn = document.getElementById('startBtn');
             const originalText = startBtn.innerHTML;
@@ -33602,6 +33617,13 @@
                     updateStartupChecklist(bot_state);
                     updateDashboardStartupLayout(bot_state);
                     showToast('The retained Follow offers need an exact run-bound resume review before Start.', 'warning');
+                } else if (result.reason === 'CONFIDENCE_OVERRIDE_REVIEW_REQUIRED') {
+                    _botStarting = false;
+                    startBtn.innerHTML = originalText;
+                    startBtn.disabled = false;
+                    updateStartupChecklist(bot_state);
+                    updateDashboardStartupLayout(bot_state);
+                    await reviewConfidenceOverride();
                 } else if (result.reason === 'FOLLOW_LOCAL_OFFERS_UNRESOLVED') {
                     _botStarting = false;
                     startBtn.innerHTML = originalText;

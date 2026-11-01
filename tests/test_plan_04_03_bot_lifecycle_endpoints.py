@@ -911,6 +911,31 @@ class TestBotStart(_FlaskBase):
         body = resp.get_json()
         self.assertEqual(body.get("status"), "started")
 
+    def test_red_follow_start_requires_override_before_running(self):
+        bot = _make_bot(running=False, start_returns=True)
+        bot.get_state.return_value["market_confidence"] = "RED"
+        with (
+            patch.object(api_server, "bot", bot),
+            patch.object(api_server, "cfg", _fake_cfg()),
+            patch.object(
+                api_server, "_get_sage_signing_block_reason", return_value=None
+            ),
+            patch(
+                "wallet.get_wallet_sync_status",
+                return_value={"reachable": True, "sync_state": "synced"},
+            ),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value={"ready": True, "run_id": "a" * 64},
+            ),
+        ):
+            resp = self._post("/api/bot/start")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            resp.get_json().get("reason"), "CONFIDENCE_OVERRIDE_REVIEW_REQUIRED"
+        )
+        bot.start.assert_not_called()
+
     def test_two_sided_follow_start_requires_current_review(self):
         bot = _make_bot(running=False, start_returns=True)
         with (

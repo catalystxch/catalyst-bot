@@ -1255,6 +1255,30 @@ def api_bot_start():
                         "error": error,
                     }
                 ), 409
+            # Do not enter an empty Running state while RED Follow consent is
+            # absent. The native client can now present the scoped review
+            # before any trading loop starts.
+            if not (
+                type(request_payload) is dict
+                and "confidence_override" in request_payload
+            ):
+                try:
+                    confidence_state = (
+                        str((bot.get_state() or {}).get("market_confidence") or "")
+                        .strip()
+                        .upper()
+                    )
+                except Exception:
+                    confidence_state = ""
+                if confidence_state == "RED":
+                    return jsonify(
+                        {
+                            "success": False,
+                            "status": "review_required",
+                            "reason": "CONFIDENCE_OVERRIDE_REVIEW_REQUIRED",
+                            "error": "Review the scoped RED Follow override before starting",
+                        }
+                    ), 409
         # A stale flag would hide live-book recovery on restart. Fail before
         # bot.start(), since a failed cleanup after start would be too late.
         try:

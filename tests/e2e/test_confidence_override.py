@@ -26,6 +26,7 @@ def open_review(page):
         window.__starts = [];
         window.__reviewRequests = [];
         bot_state = {running:false};
+        window.__realStartBot = startBot;
         startBot = async options => window.__starts.push(options);
         window.apiFetch = async (_url, options) => {
           const requested = JSON.parse(options.body);
@@ -108,3 +109,32 @@ def test_resume_handoff_requires_fresh_override_review_instead_of_plain_start(pa
     }""")
     assert page.evaluate("window.__starts") == []
     assert page.evaluate("window.__reviews") == 1
+
+
+def test_stopped_dashboard_exposes_low_confidence_review(page):
+    open_review(page)
+    page.evaluate("""() => {
+        document.getElementById('marketConfidenceBar').classList.remove('is-loading');
+        updateDashboardStartupLayout({running:false,status:'stopped'});
+    }""")
+    expect(page.locator("#marketStrip")).to_be_visible()
+    expect(
+        page.get_by_role("button", name="Review low-confidence override")
+    ).to_be_visible()
+
+
+def test_red_start_opens_override_review_before_start_request(page):
+    open_review(page)
+    page.evaluate("""async () => {
+        window.__reviews = 0;
+        window.__startRequests = 0;
+        reviewConfidenceOverride = async () => { window.__reviews += 1; };
+        apiFetch = async () => { window.__startRequests += 1; throw Error('Unexpected start request'); };
+        getStartSafetyState = () => ({allowed:true});
+        currentCAT = {wallet_id:2,asset_id:'asset'};
+        coinPrepStatus = 'ready';
+        document.getElementById('marketConfidenceState').textContent = 'RED';
+        await window.__realStartBot();
+    }""")
+    assert page.evaluate("window.__reviews") == 1
+    assert page.evaluate("window.__startRequests") == 0
