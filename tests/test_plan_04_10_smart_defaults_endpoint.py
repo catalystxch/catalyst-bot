@@ -66,6 +66,67 @@ def _green_market_confidence(
     )
 
 
+@unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
+class TestPassiveRedSmartPlanning(unittest.TestCase):
+    def test_thin_two_sided_book_inside_hard_band_can_be_planned(self):
+        from blueprints import smart_defaults
+
+        confidence = SimpleNamespace(
+            state="RED",
+            reason_codes=(
+                "insufficient_bid_depth",
+                "insufficient_ask_depth",
+                "single_provider_dependency",
+            ),
+            observed_bid=Decimal("0.00005"),
+            observed_ask=Decimal("0.00008"),
+            evidence_digests=("a" * 64,),
+        )
+        with (
+            patch.object(
+                smart_defaults.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375")
+            ),
+            patch.object(smart_defaults.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015")),
+        ):
+            self.assertEqual(
+                smart_defaults._passive_red_planning_prices(confidence),
+                (Decimal("0.00005"), Decimal("0.000065"), Decimal("0.00008")),
+            )
+
+    def test_bad_book_and_other_red_causes_cannot_be_planned(self):
+        from blueprints import smart_defaults
+
+        confidence = SimpleNamespace(
+            state="RED",
+            reason_codes=("insufficient_bid_depth",),
+            observed_bid=Decimal("0.00005"),
+            observed_ask=Decimal("0.00008"),
+            evidence_digests=("a" * 64,),
+        )
+        with (
+            patch.object(
+                smart_defaults.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375")
+            ),
+            patch.object(smart_defaults.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015")),
+        ):
+            for reason, bid, ask in (
+                ("hard_price_move_cap", Decimal("0.00005"), Decimal("0.00008")),
+                ("insufficient_bid_depth", Decimal("0.00005"), Decimal("0.00016")),
+                ("insufficient_bid_depth", Decimal("0.00008"), Decimal("0.00005")),
+            ):
+                confidence.reason_codes = (reason,)
+                confidence.observed_bid = bid
+                confidence.observed_ask = ask
+                self.assertIsNone(
+                    smart_defaults._passive_red_planning_prices(confidence)
+                )
+            confidence.reason_codes = ("insufficient_bid_depth",)
+            confidence.observed_bid = Decimal("0.00005")
+            confidence.observed_ask = Decimal("0.00008")
+            confidence.evidence_digests = ()
+            self.assertIsNone(smart_defaults._passive_red_planning_prices(confidence))
+
+
 class _FlaskBase(unittest.TestCase):
     _LOOPBACK = {"REMOTE_ADDR": "127.0.0.1"}
 
@@ -509,6 +570,58 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
         )
         wallet_balance.assert_not_called()
         clear_cache.assert_not_called()
+
+    def test_thin_red_book_offers_explicit_passive_setup_before_wallet_read(self):
+        from blueprints import smart_defaults
+
+        confidence = SimpleNamespace(
+            state="RED",
+            data_valid=False,
+            provider_redundancy=1,
+            follow_capacity_fraction=Decimal("0"),
+            market_stage="INVALID",
+            trusted_midpoint=None,
+            trusted_bid=None,
+            trusted_ask=None,
+            observed_bid=Decimal("0.00005"),
+            observed_ask=Decimal("0.00008"),
+            reason_codes=("insufficient_bid_depth", "single_provider_dependency"),
+            evidence_digests=("a" * 64,),
+        )
+        with (
+            patch("wallet.get_wallet_balance") as wallet_balance,
+            patch.object(
+                smart_defaults.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375")
+            ),
+            patch.object(smart_defaults.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015")),
+            patch.object(
+                smart_defaults,
+                "_fetch_dexie_orderbook_standalone",
+                return_value={"provider_book": {"bids": [], "asks": []}},
+            ),
+            patch.object(
+                smart_defaults,
+                "_smart_market_own_offer_identities",
+                return_value=frozenset(),
+            ),
+            patch.object(
+                smart_defaults,
+                "_derive_smart_market_confidence",
+                return_value=confidence,
+            ),
+        ):
+            with api_server.app.test_request_context("/api/smart-defaults"):
+                response, status = smart_defaults._calculate_smart_defaults(
+                    asset_id=self._ASSET_ID,
+                    cat_wallet_id=2,
+                    cat_decimals=3,
+                    cat_ticker_id="MZ_XCH",
+                    cat_name="Monkeyzoo Token",
+                )
+
+        self.assertEqual(status, 409)
+        self.assertTrue(response.get_json()["passive_red_setup_available"])
+        wallet_balance.assert_not_called()
 
     def test_valid_but_wide_follow_book_requires_explicit_bootstrap(self):
         from blueprints import smart_defaults

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -1056,6 +1057,41 @@ def _smart_bootstrap_suggestion_reasons(
     return tuple(dict.fromkeys(reasons))
 
 
+def _passive_red_planning_prices(confidence):
+    """Allow a bounded setup preview for a thin, attributable two-sided book.
+
+    This only supplies planning prices. It does not alter persisted confidence
+    or grant permission to create offers; the live run still needs its scoped
+    RED consent and rechecks the observed book before every candidate.
+    """
+    allowed = {
+        "out_of_range_depth_excluded",
+        "insufficient_bid_depth",
+        "insufficient_ask_depth",
+        "single_provider_dependency",
+        "material_move_pending_confirmation",
+    }
+    reasons = set(confidence.reason_codes)
+    if confidence.state != "RED" or not reasons or not reasons <= allowed:
+        return None
+    bid = getattr(confidence, "observed_bid", None)
+    ask = getattr(confidence, "observed_ask", None)
+    if type(bid) is not Decimal or type(ask) is not Decimal:
+        return None
+    try:
+        low = Decimal(str(cfg.HARD_MIN_PRICE_XCH))
+        high = Decimal(str(cfg.HARD_MAX_PRICE_XCH))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not all(v.is_finite() for v in (bid, ask, low, high)):
+        return None
+    if low <= 0 or low >= high or not (low <= bid <= ask <= high):
+        return None
+    if not getattr(confidence, "evidence_digests", ()):
+        return None
+    return bid, (bid + ask) / Decimal("2"), ask
+
+
 @bp.route("/api/smart-defaults")
 def api_smart_defaults():
     """Calculate ALL smart default settings from live market data.
@@ -1299,7 +1335,10 @@ def _calculate_smart_defaults(
     )
     bootstrap_reason_codes = _smart_bootstrap_suggestion_reasons(market_confidence)
     bootstrap_suggested = bool(bootstrap_reason_codes)
-    if data_valid is not True or bootstrap_suggested:
+    passive_red_prices = _passive_red_planning_prices(market_confidence)
+    passive_red_requested = request.args.get("prepare_passive_red") == "true"
+    passive_red_planning = passive_red_requested and passive_red_prices is not None
+    if (data_valid is not True or bootstrap_suggested) and not passive_red_planning:
         reason_codes = list(market_confidence.reason_codes)
         message = (
             "Follow market is unsuitable; Bootstrap may be configured separately"
@@ -1338,9 +1377,16 @@ def _calculate_smart_defaults(
                     "reason_codes": reason_codes,
                     "bootstrap_suggested": bootstrap_suggested,
                     "bootstrap_reason_codes": list(bootstrap_reason_codes),
+                    "passive_red_setup_available": passive_red_prices is not None,
                 }
             ),
             409,
+        )
+    if passive_red_planning:
+        messages.append(
+            "Passive RED setup uses the current observed two-sided book inside "
+            "the hard price band. This does not approve a live run; the scoped "
+            "RED override and wallet-wide fee guard still apply at Start."
         )
 
     print("\n[SMART_DEFAULTS v2] === Gathering 30 days of market data ===")
@@ -1480,8 +1526,19 @@ def _calculate_smart_defaults(
     quality = analysis.get("data_quality", {})
     risk_level = health.get("risk_level", "moderate")
 
-    orderbook["best_bid"] = market_confidence.trusted_bid or Decimal("0")
-    orderbook["best_ask"] = market_confidence.trusted_ask or Decimal("0")
+    planning_confidence = (
+        replace(
+            market_confidence,
+            data_valid=True,
+            trusted_bid=passive_red_prices[0],
+            trusted_midpoint=passive_red_prices[1],
+            trusted_ask=passive_red_prices[2],
+        )
+        if passive_red_planning
+        else market_confidence
+    )
+    orderbook["best_bid"] = planning_confidence.trusted_bid or Decimal("0")
+    orderbook["best_ask"] = planning_confidence.trusted_ask or Decimal("0")
     orderbook["buy_depth_xch"] = Decimal(
         market_confidence.independent_bid_depth_mojos
     ) / Decimal("1000000000000")
@@ -1500,7 +1557,7 @@ def _calculate_smart_defaults(
         spacescan,
         trades,
         orderbook,
-        market_confidence=market_confidence,
+        market_confidence=planning_confidence,
         messages=messages,
     )
     trusted_mid_price = price_info["mid_price"]
@@ -4222,7 +4279,10 @@ def _calculate_smart_defaults(
             str(getattr(cfg, "MINIMUM_PROFIT_XCH", Decimal("0.0001")))
         ),
     )
-    if not _offer_book_policy["independent_depth_sufficient"]:
+    if (
+        not _offer_book_policy["independent_depth_sufficient"]
+        and not passive_red_planning
+    ):
         return (
             jsonify(
                 {
@@ -4320,6 +4380,7 @@ def _calculate_smart_defaults(
         "market_risk_preset": _risk_profile_name,
         "market_confidence": market_confidence.state,
         "market_data_valid": market_confidence.data_valid,
+        "passive_red_setup": passive_red_planning,
         "market_provider_redundancy": market_confidence.provider_redundancy,
         "market_follow_capacity_fraction": str(
             market_confidence.follow_capacity_fraction

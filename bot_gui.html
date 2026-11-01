@@ -20503,8 +20503,23 @@
                         ? getLiquidityMode() : 'two_sided',
                 });
                 if (sdStatus) sdStatus.textContent = 'Analysing market data + calculating capital allocation...';
-                const resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
+                let resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
                 let data = await resp.json();
+
+                if (data.passive_red_setup_available === true) {
+                    const accepted = await showStyledConfirm({
+                        icon: '⚠️',
+                        title: 'Prepare passive RED settings?',
+                        message: 'The independent offer book is thin. Smart Settings can prepare a bounded passive Follow plan from the observed bid and ask. This only fills the setup form. Starting a live run still requires your separate RED override approval and keeps the hard price, wallet, and fee limits.',
+                        confirmText: 'Prepare passive settings',
+                        cancelText: 'Keep current settings',
+                        style: 'warning',
+                    });
+                    if (!accepted) return;
+                    params.set('prepare_passive_red', 'true');
+                    resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
+                    data = await resp.json();
+                }
 
                 if (data.error) {
                     showToast('Smart Settings: ' + data.error, 'error');
@@ -20515,6 +20530,7 @@
                 // backend has produced a usable, GREEN-confidence plan. A
                 // blocked or failed plan must surface its real error instead
                 // of presenting a rewards choice that cannot be applied.
+                if (!data.passive_red_setup) {
                 try {
                     const _dbxInfo = await _fetchDbxIncentiveInfo(selectedCAT.asset_id);
                     if (_dbxInfo && _dbxInfo.pair_incentivized && _dbxInfo.max_spread_bps > 0
@@ -20544,6 +20560,7 @@
                     }
                 } catch (_dbxPromptErr) {
                     debugWarn('[SmartDefaults] DBX rewards prompt skipped:', _dbxPromptErr);
+                }
                 }
 
                 const src = data._data_sources || {};
