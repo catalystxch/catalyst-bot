@@ -11,6 +11,7 @@ Tests GET /api/smart-defaults:
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -73,6 +74,10 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
 
         confidence = SimpleNamespace(
             state="RED",
+            derived_at=datetime.now(timezone.utc),
+            manipulation_score=0,
+            pending_movement_refreshes=0,
+            provider_redundancy=1,
             reason_codes=(
                 "insufficient_bid_depth",
                 "insufficient_ask_depth",
@@ -98,6 +103,10 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
 
         confidence = SimpleNamespace(
             state="RED",
+            derived_at=datetime.now(timezone.utc),
+            manipulation_score=0,
+            pending_movement_refreshes=0,
+            provider_redundancy=1,
             reason_codes=("insufficient_bid_depth",),
             observed_bid=Decimal("0.00005"),
             observed_ask=Decimal("0.00008"),
@@ -124,6 +133,9 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
             confidence.observed_bid = Decimal("0.00005")
             confidence.observed_ask = Decimal("0.00008")
             confidence.evidence_digests = ()
+            self.assertIsNone(smart_defaults._passive_red_planning_prices(confidence))
+            confidence.evidence_digests = ("a" * 64,)
+            confidence.manipulation_score = 1
             self.assertIsNone(smart_defaults._passive_red_planning_prices(confidence))
 
 
@@ -576,6 +588,9 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
 
         confidence = SimpleNamespace(
             state="RED",
+            derived_at=datetime.now(timezone.utc),
+            manipulation_score=0,
+            pending_movement_refreshes=0,
             data_valid=False,
             provider_redundancy=1,
             follow_capacity_fraction=Decimal("0"),

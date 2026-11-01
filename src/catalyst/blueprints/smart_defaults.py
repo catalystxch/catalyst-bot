@@ -1074,6 +1074,17 @@ def _passive_red_planning_prices(confidence):
     reasons = set(confidence.reason_codes)
     if confidence.state != "RED" or not reasons or not reasons <= allowed:
         return None
+    derived_at = getattr(confidence, "derived_at", None)
+    if (
+        getattr(confidence, "manipulation_score", None) != 0
+        or getattr(confidence, "pending_movement_refreshes", None) != 0
+        or type(getattr(confidence, "provider_redundancy", None)) is not int
+        or confidence.provider_redundancy < 1
+        or type(derived_at) is not datetime
+        or derived_at.tzinfo is None
+        or not -2 <= (datetime.now(timezone.utc) - derived_at).total_seconds() <= 30
+    ):
+        return None
     bid = getattr(confidence, "observed_bid", None)
     ask = getattr(confidence, "observed_ask", None)
     if type(bid) is not Decimal or type(ask) is not Decimal:
@@ -1087,7 +1098,13 @@ def _passive_red_planning_prices(confidence):
         return None
     if low <= 0 or low >= high or not (low <= bid <= ask <= high):
         return None
-    if not getattr(confidence, "evidence_digests", ()):
+    digests = getattr(confidence, "evidence_digests", ())
+    if not digests or any(
+        type(value) is not str
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+        for value in digests
+    ):
         return None
     return bid, (bid + ask) / Decimal("2"), ask
 
