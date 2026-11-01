@@ -344,6 +344,6 @@ def test_all_production_ladder_paths_forward_current_confidence():
     manager_requote = inspect.getsource(offer_manager.OfferManager.requote_side)
 
     assert "market_confidence=self._effective_market_confidence(" in cycle
-    assert "market_confidence=self._effective_market_confidence(" in requote
-    assert "market_confidence=self._effective_market_confidence(" in create
+    assert "market_confidence=self._wallet_effect_market_confidence(" in requote
+    assert "market_confidence=self._wallet_effect_market_confidence(" in create
     assert manager_requote.count("market_confidence=market_confidence") == 2
