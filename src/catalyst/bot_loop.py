@@ -10141,6 +10141,38 @@ class BotLoop:
         """Execute one complete trading cycle."""
         if not self._runtime_recovery_cycle_boundary():
             return False
+        inflight_ladders = [
+            thread
+            for thread in getattr(self, "_ladder_threads", ())
+            if thread.is_alive()
+        ]
+        if inflight_ladders:
+            # A timed-out worker may have reached Sage but not committed its
+            # offer row yet. Wallet sync must not classify that offer as a
+            # cancelled DB zombie or start a cancellation behind the worker.
+            now = time.time()
+            ceiling = float(getattr(cfg, "LADDER_THREAD_ZOMBIE_SECS", 240) or 240)
+            stalled = [
+                thread
+                for thread in inflight_ladders
+                if float(getattr(thread, "_catalyst_start_at", 0) or 0) > 0
+                and now - thread._catalyst_start_at >= ceiling
+            ]
+            if stalled:
+                log_event(
+                    "critical",
+                    "ladder_thread_stalled_stop",
+                    "An unfinished offer creation thread exceeded its safety ceiling; stopping trading before wallet sync",
+                    data={"threads": [thread.name for thread in stalled]},
+                )
+                self.stop(wait=False)
+                return False
+            log_event(
+                "warning",
+                "ladder_inflight_cycle_deferred",
+                "Waiting for the prior ladder creation thread before wallet sync",
+            )
+            return False
         self._cycle_started_running = bool(self._running)
         self._recovery_state["cycle_probe_churn"] = False
         self._recovery_state["cycle_create_stalled"] = False
@@ -14492,47 +14524,13 @@ class BotLoop:
             # the new cycle spawns replacements — doubling offers or causing
             # MEMPOOL_CONFLICT.
             #
-            # ESCAPE HATCH: a genuinely wedged wallet RPC call used to pin
-            # the thread indefinitely, which kept this guard returning every
-            # cycle and silently left the side underquoted until the operator
-            # restarted the bot. Track each thread's start time and, once it
-            # has been alive past a hard ceiling (default 4 × the 60s join
-            # timeout = 240s), stop deferring to it. We log CRITICAL so the
-            # operator knows the old thread is a zombie, then proceed with a
-            # fresh ladder build. The daemon flag means the zombie dies when
-            # its RPC finally returns (or at process exit) — we accept the
-            # minor risk of duplicate offer creation in that window, which
-            # the trim pass + mempool-conflict detection already handle.
-            _now = time.time()
+            # The cycle boundary stops trading if a thread exceeds this
+            # ceiling. Never launch a replacement while a prior wallet call
+            # could still create an offer.
             _zombie_age_ceiling = float(
                 getattr(cfg, "LADDER_THREAD_ZOMBIE_SECS", 240) or 240
             )
-            live_now = []
-            zombies = []
-            for t in self._ladder_threads:
-                if not t.is_alive():
-                    continue
-                _start = float(getattr(t, "_catalyst_start_at", 0) or 0)
-                if _start > 0 and (_now - _start) >= _zombie_age_ceiling:
-                    zombies.append((t, _now - _start))
-                else:
-                    live_now.append(t)
-            if zombies:
-                for t, age in zombies:
-                    log_event(
-                        "critical",
-                        "ladder_thread_zombie",
-                        f"Ladder thread {t.name!r} has been alive for "
-                        f"{age:.0f}s (> {_zombie_age_ceiling:.0f}s zombie "
-                        f"ceiling). Proceeding with a fresh ladder build; "
-                        f"the stuck thread is now a daemon zombie and will "
-                        f"be released when its wallet RPC returns.",
-                        data={
-                            "thread": t.name,
-                            "age_secs": age,
-                            "ceiling_secs": _zombie_age_ceiling,
-                        },
-                    )
+            live_now = [t for t in self._ladder_threads if t.is_alive()]
             if live_now:
                 names = ", ".join(t.name for t in live_now)
                 log_event(
@@ -14544,7 +14542,7 @@ class BotLoop:
                 if work_items:
                     self._mark_recovery_create_stall()
                 return
-            self._ladder_threads = [t for t, _ in zombies]  # keep zombies referenced
+            self._ladder_threads = []
 
             threads = []
             for side, needed, spread in work_items:
@@ -14554,7 +14552,7 @@ class BotLoop:
                     name=f"create-{side}",
                     daemon=True,  # Don't block process exit
                 )
-                # Stamp start time so the zombie detector above can compute age.
+                # Stamp start time for the cycle-boundary stall check.
                 t._catalyst_start_at = time.time()
                 threads.append(t)
 
@@ -14571,8 +14569,7 @@ class BotLoop:
                         "ladder_thread_timeout",
                         f"Ladder creation thread {t.name!r} still alive after 60s timeout — "
                         f"wallet RPC may be hung; continuing main loop "
-                        f"(will be escalated to zombie at "
-                        f"{_zombie_age_ceiling:.0f}s if it stays stuck)",
+                        f"(trading stops at {_zombie_age_ceiling:.0f}s if it stays stuck)",
                     )
 
         # Process results from both sides
