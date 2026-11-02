@@ -143,6 +143,24 @@ def test_start_safety_server_denial_remains_visible_until_fresh_status(page):
     expect(page.locator("#startupReadyCtaBtn")).to_be_disabled()
 
 
+def test_unresolved_local_offer_start_denial_explains_exact_recovery(page):
+    _ready_setup(page, "allowed")
+    messages = page.evaluate(
+        """async () => {
+            window.__startMessages = [];
+            showToast = message => window.__startMessages.push(message);
+            checkForResume = async () => false;
+            apiFetch = async () => new Response(JSON.stringify({
+                success: false, reason: 'FOLLOW_LOCAL_OFFERS_UNRESOLVED',
+                error: 'Review the current Follow wallet, prepared slots and fee ceiling before starting'
+            }), {status: 409});
+            await startBot();
+            return window.__startMessages;
+        }"""
+    )
+    assert any("unresolved local offer" in message.lower() for message in messages)
+
+
 def test_start_safety_failed_poll_invalidates_previously_allowed_state(page):
     _ready_setup(page, "allowed")
     page.evaluate("""async () => {

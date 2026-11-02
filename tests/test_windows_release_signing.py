@@ -83,7 +83,7 @@ def test_signing_preflight_fails_closed_without_required_configuration():
     assert workflow["permissions"]["contents"] == "write"
     assert workflow["jobs"]["build"]["timeout-minutes"] == 360
 
-    version = named_step("Resolve release version")
+    version = named_step("Validate exact protected-main release tag")
     assert version["id"] == "release-version"
     assert "GITHUB_OUTPUT" in version["run"]
 
@@ -136,7 +136,7 @@ def test_installer_signing_uses_pinned_action_and_evidence_request_ids():
     assert upload["id"] == "upload-unsigned-installer"
     assert upload["with"] == {
         "name": "catalyst-windows-installer-${{ github.run_id }}-${{ github.run_attempt }}",
-        "path": "Catalyst-Setup-${{ github.ref_name }}.exe",
+        "path": "Catalyst-Setup-${{ inputs.tag }}.exe",
         "archive": False,
     }
 
@@ -221,3 +221,50 @@ def test_installer_pe_metadata_matches_signature_verifier_contract():
     assert "VersionInfoProductName={#MyAppName}" in installer
     assert "VersionInfoProductVersion={#MyAppVersion}" in installer
     assert "VersionInfoVersion={#MyAppVersion}" in installer
+
+
+def test_signed_publisher_cannot_replace_existing_release_channel_tag():
+    publication = named_step("Publish verified public update channel")["run"]
+    assert "gh api --paginate" in publication
+    assert "releases?per_page=100" in publication
+    assert ".permissions.push" in publication
+    assert "$releaseTag -ceq $env:RELEASE_REF" in publication
+    assert "Release channel tag already exists" in publication
+    assert "gh api --include" in publication
+    assert "releases/tags/$($env:RELEASE_REF)" in publication
+    assert "HTTP/\\S+ 404" in publication
+    assert "Unable to verify whether the release channel release exists" in publication
+    assert "git/matching-refs/tags/" in publication
+    assert "--clobber" not in publication
+
+
+def test_signed_publisher_rejects_existing_channel_before_build_or_source_upload():
+    assert step_index("Preflight immutable release channel") < step_index(
+        "Set up Python"
+    )
+    preflight = named_step("Preflight immutable release channel")["run"]
+    assert named_step("Preflight immutable release channel")["env"]["GH_TOKEN"] == (
+        "${{ secrets.CATALYST_RELEASE_CHANNEL_TOKEN }}"
+    )
+    assert "gh api --paginate" in preflight
+    assert "releases?per_page=100" in preflight
+    assert ".permissions.push" in preflight
+    assert "$releaseTag -ceq $env:RELEASE_REF" in preflight
+    assert "gh api --include" in preflight
+    assert "releases/tags/$($env:RELEASE_REF)" in preflight
+    assert "HTTP/\\S+ 404" in preflight
+    assert "Unable to verify whether the release channel release exists" in preflight
+    assert "git/matching-refs/tags/" in preflight
+    assert "Release channel tag already exists" in preflight
+
+
+def test_signed_publisher_rejects_older_version_at_preflight_and_publication():
+    preflight = named_step("Preflight immutable release channel")["run"]
+    publication = named_step("Publish verified public update channel")["run"]
+    for script in (preflight, publication):
+        assert "repos/$($env:CATALYST_RELEASE_CHANNEL_REPO)/releases/latest" in script
+        assert "$candidateVersion -le [version]$latest.tag_name.Substring(1)" in script
+        assert "Candidate is older than or equal to current stable latest" in script
+    assert publication.index("$candidateVersion -le") < publication.index(
+        "gh release create"
+    )

@@ -704,6 +704,47 @@ class TestUpsertCoin(_TempDB):
 
         self.assertEqual(count, 4)
         self.assertEqual(protected_ids.call_count, 1)
+        self.assertEqual(len(_db.get_free_coins("xch")), 4)
+
+    def test_batch_upsert_releases_writer_when_protection_snapshot_fails(self):
+        coins = [{"coin_id": "0xguard-failure", "amount_mojos": 1000}]
+        with patch.object(
+            _db,
+            "_batch_coin_terminal_mutation_protection",
+            side_effect=RuntimeError("guard unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "guard unavailable"):
+                _db.batch_upsert_coins(coins, "xch")
+        self.assertFalse(_db.get_connection().in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
+
+    def test_batch_upsert_commit_failure_is_not_reported_as_protected_coins(self):
+        real_conn = _db.get_connection()
+
+        class FailingCommit:
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("database is locked")
+
+        with patch.object(_db, "get_connection", return_value=FailingCommit()):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                _db.batch_upsert_coins(
+                    [{"coin_id": "0xcommit-failure", "amount_mojos": 1000}], "xch"
+                )
+        self.assertFalse(real_conn.in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
+
+    def test_batch_upsert_rolls_back_every_row_on_unexpected_sql_error(self):
+        coins = [
+            {"coin_id": "0xvalid-before-error", "amount_mojos": 1000},
+            {"coin_id": "0xinvalid-amount", "amount_mojos": object()},
+        ]
+        with self.assertRaises(sqlite3.ProgrammingError):
+            _db.batch_upsert_coins(coins, "xch")
+        self.assertFalse(_db.get_connection().in_transaction)
+        self.assertEqual(_db.get_free_coins("xch"), [])
 
 
 @unittest.skipIf(_SKIP is not None, f"database unavailable: {_SKIP}")

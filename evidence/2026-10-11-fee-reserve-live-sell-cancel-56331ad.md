@@ -1,0 +1,13 @@
+# TEST 7 sell-only cancellation and fee-reserve recovery
+
+Source and package: `56331ad0bd9bbf6f73e50495aecd5642009fff46`, clean detached Windows EXE SHA-256 `881936A1ABBCF03F60FD0840DD9D1B99B0614A8DEEE70CE6CC2FDB0A439FFD4F`.
+
+The earlier native Cancel All attempt failed closed with `FEE_PREP_FUNDING_INSUFFICIENT` and processed 0/3 sells. The configured fee-coin size and count were zero, but the original profile had four durable, Sage-spendable `fee_reserve` XCH coins of 1,000,000,000 mojos each. The old quick-refresh path returned before considering those purpose-bound reserves. The fix includes positive durable reserves when the configured fee tier is disabled, while retaining the configured-size filter when the tier is enabled. It does not admit ordinary XCH coins.
+
+The exact package replaced the stopped app through native shutdown with offer cancellation unchecked. It resumed as the sole `Catalyst.exe` and port 5000 owner on Sage mainnet TEST 7, fingerprint `736588221`, CAT wallet `2`, MZ asset `b8edcc6a7cf3738a3806fdbadb1bbcfc2540ec37f6732ab3a6a4bbcd2dbec105`. Before the retry, Sage and CATalyst each showed three live sells, zero buys, zero pending transactions, a stopped bot, safety allowed with an owned lease, and a cancellation approval with a 0.05 XCH cumulative cap and zero spent.
+
+After fresh operator confirmation, the native Cancel All path submitted and confirmed three sequential cancellation transactions. Its completion dialog reported **3/3 authoritatively terminal, zero failures**. Independent read-only checks found zero Sage fillable offers across the complete 4,107-record history, zero DB open MZ offers, zero unresolved cancellation cohorts, zero pending transactions, and unchanged MZ total/spendable balance of 780,212,284 atomic units. XCH total/spendable was 138,470,190,098,731 mojos. The cancellation approval and campaign both attributed 45,735,879 mojos (0.000045735879 XCH) of authoritative fee spend, with zero held.
+
+The operator then confirmed native Stop campaign. The app showed no active Bootstrap campaign; independent DB lookup also returned none. The bot remained stopped and all offers terminal. A subsequent read-only Sage check still found zero fillable offers and zero pending transactions.
+
+Verification: targeted affected suite 316 passed/15 skipped, Ruff check and format passed, full serial Windows backend 7,594 passed/267 skipped/457 subtests, and all 11 PR checks passed on the exact source. Package API, mock Sage, first-run/duplicate-owner, and persisted-profile native smoke checks passed. This evidence covers the sell-only cancel/recovery path; it does not establish full public readiness.

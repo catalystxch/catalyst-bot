@@ -322,6 +322,7 @@ def estimate_coin_prep_fee_preview(
     stage_quotes: dict | None = None,
     stage_profiles: dict | None = None,
     execution_context: dict | None = None,
+    follow_shutdown_quote: dict | None = None,
 ) -> dict:
     """Price trusted server-planned stages and persist an unapproved preview.
 
@@ -485,6 +486,40 @@ def estimate_coin_prep_fee_preview(
             if output["asset"] == "xch" and output["purpose"] == "fee_reserve"
         )
     )
+    shutdown_fee = None
+    refusal = None
+    if follow_shutdown_quote is not None:
+        from coin_prep_fee_pricing import is_current_fee_quote
+        from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
+
+        if contract["scope"]["campaign_id"] is not None:
+            raise ValueError("FOLLOW_SHUTDOWN_SCOPE_INVALID")
+        if not is_current_fee_quote(
+            follow_shutdown_quote,
+            ONE_BLOCK_COST_LIMIT,
+            contract["plan"]["target_seconds"],
+            now=_now(),
+        ):
+            available = False
+            refusal = "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE"
+        elif follow_shutdown_quote["fee_mojos"] == 0:
+            available = False
+            refusal = "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE"
+        else:
+            shutdown_fee = _exact_int(follow_shutdown_quote["fee_mojos"], 1)
+            largest_fee_coin = max(
+                (
+                    output["amount_mojos"]
+                    for output in contract["plan"]["outputs"]
+                    if output["asset"] == "xch" and output["purpose"] == "fee_reserve"
+                ),
+                default=0,
+            )
+            if available and largest_fee_coin < shutdown_fee:
+                available = False
+                refusal = "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL"
+            observations.append(_exact_int(follow_shutdown_quote["observed_at"]))
+            expiries.append(_exact_int(follow_shutdown_quote["expires_at"]))
     total = _exact_int(prep + cancel) if available else None
     # Recheck age after the last transport: a slow multistage preview must not
     # become confirmable merely because its earliest request was once fresh.
@@ -495,21 +530,45 @@ def estimate_coin_prep_fee_preview(
         available = False
         total = None
         observed, expires = now, now + 60
-    accounting = database.get_fee_scope_budget(contract["scope_sha256"])
+    accounting = database.get_fee_scope_budget(
+        contract["scope_sha256"], scope_json=contract["scope_json"]
+    )
     protected = minimum_cumulative = None
     if available:
-        protected = max(cancel, accounting["protected_cancellation_fee_mojos"])
-        # Cancellation commitments already consumed part of the lifetime total;
-        # do not double-count them as preparation or discard prior protection.
-        minimum_cumulative = _exact_int(
-            max(
-                accounting["noncancellation_committed_fee_mojos"] + prep + protected,
-                accounting["committed_fee_mojos"] + prep + cancel,
-            )
+        protected = max(
+            cancel,
+            accounting["protected_cancellation_fee_mojos"],
+            shutdown_fee or 0,
         )
+        ongoing_bootstrap = (
+            contract["scope"]["campaign_id"] is not None
+            and fee_approval_authority(request_options)["cancellation_recovery_action"]
+            is None
+        )
+        if ongoing_bootstrap:
+            # Replacement offers need the full reserve still available after
+            # all earlier fee commitments and this preparation, including fees
+            # already spent on previous protected cancellations.
+            minimum_cumulative = _exact_int(
+                accounting["committed_fee_mojos"] + prep + protected
+            )
+        else:
+            # Recovery-only and standalone consent need not replenish a reserve
+            # for new Bootstrap offers; keep prior protection without counting
+            # cancellation commitments twice.
+            minimum_cumulative = _exact_int(
+                max(
+                    accounting["noncancellation_committed_fee_mojos"]
+                    + prep
+                    + protected,
+                    accounting["committed_fee_mojos"] + prep + cancel,
+                )
+            )
     result = {
         "available": available,
-        "reason": "network_fee_estimate" if available else "FEE_ESTIMATE_UNAVAILABLE",
+        "reason": "network_fee_estimate"
+        if available
+        else (refusal or "FEE_ESTIMATE_UNAVAILABLE"),
         "scope_sha256": contract["scope_sha256"],
         "plan_sha256": contract["plan_sha256"],
         "wallet": contract["scope"],
@@ -524,6 +583,7 @@ def estimate_coin_prep_fee_preview(
         "suggested_maximum_fee_mojos": minimum_cumulative,
         "minimum_cumulative_fee_mojos": minimum_cumulative,
         "minimum_cancellation_reserve_mojos": protected,
+        "follow_shutdown_fee_mojos": shutdown_fee,
         "fee_accounting": accounting,
         "fee_coin_principal_mojos": principal,
         "fee_funding_mojos": funding,
@@ -574,6 +634,7 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
     """
     from coin_prep_fee_runtime import read_staged_prep_fee_snapshot
     from coin_prep_fee_execution import freeze_execution_context
+    from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
 
     context = read_staged_prep_fee_snapshot(request_options, quote_provider=quote_fee)
     if context["available"] is not True:
@@ -597,6 +658,14 @@ def preview_coin_prep_fees(request_options: dict) -> dict:
         fee_funding_mojos=context["funding"]["fee_funding_mojos"],
         request_options=context["request_options"],
         execution_context=freeze_execution_context(context),
+        follow_shutdown_quote=(
+            quote_fee(
+                ONE_BLOCK_COST_LIMIT,
+                target_seconds=context["recipe"]["economic_plan"]["target_seconds"],
+            )
+            if campaign is None
+            else None
+        ),
     )
     return {**result, "dispatch_authorized": False}
 
@@ -620,6 +689,8 @@ def approve_coin_prep_fees(
     if cancellation_reserve_mojos > maximum_fee_mojos:
         raise ValueError("FEE_BUDGET_INSUFFICIENT")
     preview = database.get_coin_prep_fee_preview(preview_id)
+    if "prestart_review" in json.loads(preview["quote_json"]):
+        raise ValueError("FEE_PRESTART_NATIVE_CONFIRMATION_REQUIRED")
     persisted = canonical_fee_contract(
         json.loads(preview["scope_json"]), json.loads(preview["plan_json"])
     )

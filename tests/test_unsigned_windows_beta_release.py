@@ -45,10 +45,39 @@ def test_unsigned_beta_release_is_manual_and_uses_fixed_repositories():
     )
 
 
-def test_v140_beta_tag_cannot_trigger_stable_signed_release_workflow():
-    workflow = yaml.safe_load(SIGNED_WORKFLOW.read_text(encoding="utf-8"))
-    for job in ("build", "publish-release"):
-        assert "github.ref_name != 'v1.4.0'" in workflow["jobs"][job]["if"]
+def test_signed_release_requires_manual_exact_main_tag_before_signpath():
+    text = SIGNED_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    trigger = workflow[True]  # PyYAML interprets YAML 1.1's `on` as True.
+    assert "push" not in trigger
+    assert trigger["workflow_dispatch"]["inputs"]["tag"]["required"] is True
+    assert "github.ref_name" not in text
+
+    steps = workflow["jobs"]["build"]["steps"]
+    names = [step.get("name") for step in steps]
+    assert names.index("Validate exact protected-main release tag") < names.index(
+        "Require Windows release signing configuration"
+    )
+    validation = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Validate exact protected-main release tag"
+    )
+    assert "refs/tags/$($env:RELEASE_REF)" in validation
+    assert "git merge-base --is-ancestor" in validation
+    assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in validation
+    assert "git checkout --detach" in validation
+    assert "inputs.tag" in text
+    assert "+refs/heads/main:refs/remotes/origin/main" in validation
+    signed_evidence = next(
+        step
+        for step in steps
+        if step.get("name") == "Replace and verify signed Windows installer"
+    )
+    assert (
+        signed_evidence["env"]["SOURCE_COMMIT"]
+        == "${{ steps.release-version.outputs.source_commit }}"
+    )
 
 
 def test_unsigned_bytes_are_proven_and_smoked_before_manifest_signing():

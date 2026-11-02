@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 from importlib import import_module
+import hashlib
+import json
 
 import pytest
 
@@ -59,8 +61,9 @@ def test_fresh_identity_asset_and_integer_selectable_inventory_without_effects(
     "reserved,recon,purpose",
     [(True, False, "reserve"), (False, True, "protected"), (True, True, "protected")],
 )
+@pytest.mark.parametrize("protected_prefix", ["", "0x"])
 def test_reconciliation_claim_is_not_misclassified_as_permanent_reserve(
-    live_reads, reserved, recon, purpose
+    live_reads, reserved, recon, purpose, protected_prefix
 ):
     coin_id = live_reads["xch"][0]["coin_id"]
     patch = live_reads["monkeypatch"]
@@ -71,14 +74,67 @@ def test_reconciliation_claim_is_not_misclassified_as_permanent_reserve(
     )
     patch.setattr(
         database,
-        "get_coin_reconciliation_protected_ids",
-        lambda _ids: [coin_id] if recon else [],
+        "get_coin_preparation_protected_ids",
+        lambda _ids: [protected_prefix + coin_id] if recon else [],
     )
     coin = next(
         c for c in _collect(live_reads)["snapshot"].coins if c.coin_id == coin_id
     )
     assert coin.purpose == purpose
     assert coin.protected is True
+
+
+@pytest.mark.parametrize("asset", ["xch", "cat"])
+def test_durable_claim_protection_survives_database_coin_id_prefix(live_reads, asset):
+    coin_id = live_reads[asset][0]["coin_id"]
+    canonical = "0x" + coin_id
+    cohort_json = json.dumps([canonical], separators=(",", ":"))
+    cohort_hash = hashlib.sha256(cohort_json.encode()).hexdigest()
+    empty_hash = hashlib.sha256(b"[]").hexdigest()
+    conn = database.get_connection()
+    conn.execute(
+        "INSERT INTO wallet_effect_claims (claim_token, operation_id, "
+        "operation_contract, generation, source_coin_ids_json, "
+        "source_coin_ids_sha256, fee_coin_ids_json, fee_coin_ids_sha256, "
+        "cohort_coin_ids_json, cohort_coin_ids_sha256, wallet_fingerprint_hash, "
+        "network, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "a" * 64,
+            "test-protected-cohort",
+            "EXPLICIT_COIN_COHORT_V1",
+            1,
+            cohort_json,
+            cohort_hash,
+            "[]",
+            empty_hash,
+            cohort_json,
+            cohort_hash,
+            "e" * 64,
+            "mainnet",
+            "2026-10-12T00:00:00Z",
+        ),
+    )
+    conn.commit()
+    assert canonical in database.get_coin_reconciliation_protected_ids([coin_id])
+    coin = next(
+        c for c in _collect(live_reads)["snapshot"].coins if c.coin_id == coin_id
+    )
+    assert coin.protected is True
+    assert coin.purpose == "protected"
+    assert (
+        conn.execute("SELECT COUNT(*) FROM wallet_effect_dispatches").fetchone()[0] == 0
+    )
+
+
+@pytest.mark.parametrize("protected_id", [None, True, "g" * 64, "0x38"])
+def test_malformed_reconciliation_protection_cannot_supply_inventory(
+    live_reads, protected_id
+):
+    live_reads["monkeypatch"].setattr(
+        database, "get_coin_preparation_protected_ids", lambda _ids: [protected_id]
+    )
+    with pytest.raises(ValueError, match="noncanonical coin identity"):
+        _collect(live_reads)
 
 
 @pytest.mark.parametrize(

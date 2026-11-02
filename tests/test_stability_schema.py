@@ -838,6 +838,48 @@ def test_repeated_migration_does_not_rescan_append_only_effect_history(
     )
 
 
+def test_existing_stability_watermark_allows_refresh_abort_table_install(
+    isolated_database,
+):
+    """A pre-refresh profile must be able to install the new fenced abort table."""
+
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM stability_migration_watermarks WHERE migration_key=?",
+            (database._STABILITY_BACKFILL_MIGRATION_KEY,),
+        ).fetchone()
+        conn.execute("DROP TABLE offer_refresh_aborts")
+        conn.commit()
+
+    database._migrate_stability_schema()
+
+    assert "offer_refresh_aborts" in _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
+def test_existing_stability_watermark_allows_refresh_abort_succession_install(
+    isolated_database,
+):
+    """An existing fenced profile can add immutable restart receipts."""
+
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM stability_migration_watermarks WHERE migration_key=?",
+            (database._STABILITY_BACKFILL_MIGRATION_KEY,),
+        ).fetchone()
+        conn.execute("DROP TABLE offer_refresh_abort_successions")
+        conn.commit()
+
+    database._migrate_stability_schema()
+
+    assert "offer_refresh_abort_successions" in _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
 @pytest.mark.parametrize("legacy_limit", [64, 128, 500])
 def test_migration_expands_cancel_cohort_authority_envelope_without_data_loss(
     isolated_database,

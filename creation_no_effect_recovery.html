@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CATalyst creation recovery</title>
+<style>
+body { max-width: 760px; margin: 40px auto; padding: 0 22px; font: 16px/1.5 system-ui, sans-serif; color: #eee; background: #16202a; }
+.panel { padding: 24px; border: 1px solid #51606c; border-radius: 12px; background: #202d38; }
+button { padding: 10px 16px; margin: 8px 8px 0 0; border: 0; border-radius: 6px; cursor: pointer; }
+button:disabled { opacity: .45; cursor: default; }
+#confirm { background: #e2a251; color: #171717; }
+#review { background: #aacddd; color: #171717; }
+code, pre { overflow-wrap: anywhere; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="panel">
+<h1>Review unresolved offer creation</h1>
+<p>Trading and wallet actions remain blocked. This review can only record that one attempted creation had no wallet effect after two complete Sage checks. It will not cancel or create an offer.</p>
+<button id="review" type="button">Review Sage proof</button>
+<button id="confirm" type="button" disabled>Confirm database-only recovery</button>
+<p id="status" role="status">Waiting for review.</p>
+<pre id="scope"></pre>
+</div>
+<script>
+(() => {
+  let reviewed = null;
+  const status = document.getElementById('status');
+  const scope = document.getElementById('scope');
+  const confirm = document.getElementById('confirm');
+  const review = document.getElementById('review');
+  review.addEventListener('click', async () => {
+    reviewed = null;
+    confirm.disabled = true;
+    scope.textContent = '';
+    status.textContent = 'Checking Sage and the complete offer history…';
+    try {
+      const response = await window.pywebview.api.preview_no_effect_creation();
+      if (response?.success !== true || !response.review?.proof_digest) throw new Error(response?.error || 'Proof unavailable');
+      reviewed = response.review;
+      scope.textContent = `Operation: ${reviewed.operation_id}\nLatch generation: ${reviewed.latch_generation}\nWallet binding: ${reviewed.wallet_fingerprint_hash}\nNetwork: ${reviewed.network}\nSelected coin: ${reviewed.selected_coin_id}\nComplete Sage offers: ${reviewed.sage_stable?.[8] ?? 'unavailable'}\nProof: ${reviewed.proof_digest}\nExpires: ${new Date(reviewed.expires_at_epoch * 1000).toLocaleString()}`;
+      status.textContent = 'Review the exact scope, then confirm the local recovery.';
+      confirm.disabled = false;
+    } catch (error) {
+      status.textContent = `Recovery remains blocked: ${String(error?.message || error)}`;
+    }
+  });
+  confirm.addEventListener('click', async () => {
+    if (!reviewed) return;
+    const exact = reviewed;
+    reviewed = null;
+    confirm.disabled = true;
+    status.textContent = 'Rechecking the proof…';
+    try {
+      const response = await window.pywebview.api.commit_no_effect_creation({reviewed: exact});
+      if (response?.success !== true || response.applied !== true) throw new Error(response?.error || 'Recovery was not applied');
+      status.textContent = 'The exact no-effect operation was recorded. Close and relaunch CATalyst to continue. No offer was cancelled or created.';
+    } catch (error) {
+      status.textContent = `Recovery remains blocked: ${String(error?.message || error)}`;
+    }
+  });
+})();
+</script>
+</body>
+</html>

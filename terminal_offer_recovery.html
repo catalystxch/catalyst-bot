@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CATalyst | Verify Terminal Offers</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #101723; color: #f2f5fa; }
+    main { max-width: 980px; margin: 2.5rem auto; padding: 0 1.25rem; }
+    h1 { font-size: 1.8rem; }
+    p { line-height: 1.5; }
+    .notice { padding: 1rem; border: 1px solid #e7b44d; border-radius: .6rem; background: #332817; }
+    dl { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: .7rem; }
+    dt { color: #a9bacd; }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    button { padding: .7rem 1rem; margin: .5rem .5rem .5rem 0; background: #385d8a; border: 0; border-radius: .4rem; color: white; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+    th, td { padding: .55rem; border-bottom: 1px solid #344154; text-align: left; overflow-wrap: anywhere; }
+    th { color: #a9bacd; }
+    code { overflow-wrap: anywhere; }
+    @media (max-width: 640px) { dl { grid-template-columns: 1fr; gap: .2rem; } dd { margin-bottom: .7rem; } table { font-size: .78rem; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Verify Terminal Offers</h1>
+    <p class="notice">Trading stays stopped. This screen verifies an elapsed campaign's exact Sage offer outcomes and reconciles local database records only. It sends no wallet transaction and does not start the bot or campaign.</p>
+    <button type="button" id="refresh">Preview exact offers</button>
+    <button type="button" id="commit" disabled>Confirm database-only reconciliation</button>
+    <p id="status" role="status" aria-live="polite">Reading fenced campaign scope…</p>
+    <dl>
+      <dt>Campaign</dt><dd id="campaign">—</dd>
+      <dt>Revision</dt><dd id="revision">—</dd>
+      <dt>Wallet</dt><dd id="wallet">—</dd>
+      <dt>Network</dt><dd id="network">—</dd>
+      <dt>Asset</dt><dd id="asset">—</dd>
+      <dt>Latch generation</dt><dd id="latch">—</dd>
+      <dt>Pending transactions</dt><dd id="pending">—</dd>
+      <dt>Sage live offers</dt><dd id="live">—</dd>
+      <dt>Proof digest</dt><dd id="digest">—</dd>
+    </dl>
+    <h2>Reviewed exact outcomes</h2>
+    <table>
+      <thead><tr><th>Side / tier</th><th>Trade ID</th><th>Outcome</th><th>State</th></tr></thead>
+      <tbody id="outcomes"></tbody>
+    </table>
+    <p id="result" role="status" aria-live="polite"></p>
+  </main>
+  <script>
+    const fields = Object.fromEntries(
+      ['campaign', 'revision', 'wallet', 'network', 'asset', 'latch', 'pending', 'live', 'digest']
+        .map(id => [id, document.getElementById(id)])
+    );
+    const refresh = document.getElementById('refresh');
+    const commit = document.getElementById('commit');
+    const status = document.getElementById('status');
+    const result = document.getElementById('result');
+    const outcomes = document.getElementById('outcomes');
+    let scope = null;
+    let reviewed = null;
+
+    async function readJson(path, options) {
+      const response = await fetch(path, {
+        credentials: 'same-origin', cache: 'no-store',
+        headers: {Accept: 'application/json', ...(options?.headers || {})},
+        ...options
+      });
+      const data = await response.json();
+      if (!response.ok || data?.success !== true) throw new Error(data?.error || 'Exact proof unavailable');
+      return data;
+    }
+
+    function showProof(proof) {
+      fields.campaign.textContent = String(proof.campaign_id);
+      fields.revision.textContent = String(proof.revision);
+      fields.wallet.textContent = String(proof.wallet_fingerprint_hash);
+      fields.network.textContent = String(proof.network);
+      fields.asset.textContent = String(proof.asset_id);
+      fields.latch.textContent = String(proof.latch_generation);
+      fields.pending.textContent = String(proof.sage_pending_transactions);
+      fields.live.textContent = String(proof.sage_live_offers);
+      fields.digest.textContent = String(proof.proof_digest);
+      outcomes.replaceChildren();
+      for (const offer of proof.offers) {
+        const row = document.createElement('tr');
+        for (const value of [
+          `${offer.side} / ${offer.tier}`,
+          offer.trade_id,
+          offer.classification,
+          offer.already_terminal ? 'Already terminal' : 'Needs local proof commit'
+        ]) {
+          const cell = document.createElement('td');
+          cell.textContent = String(value);
+          row.append(cell);
+        }
+        outcomes.append(row);
+      }
+    }
+
+    async function preview() {
+      reviewed = null;
+      commit.disabled = true;
+      refresh.disabled = true;
+      result.textContent = '';
+      status.textContent = 'Checking Sage identity, full offer book, pending transactions and exact outcomes…';
+      try {
+        scope = await readJson('/api/bootstrap/terminal_recovery_scope');
+        const params = new URLSearchParams({campaign_id: scope.campaign_id, revision: String(scope.revision)});
+        const proof = await readJson(`/api/bootstrap/preview_terminal?${params}`);
+        if (!Array.isArray(proof.offers) || proof.offers.length === 0
+            || proof.offers.length < scope.blocking_count
+            || proof.latch_generation !== scope.latch_generation
+            || proof.sage_live_offers !== 0 || proof.sage_pending_transactions !== 0
+            || proof.offers.some(offer => !['FILLED_PROVEN', 'EXPIRED_PROVEN'].includes(offer.classification))) {
+          throw new Error('The complete fenced offer cohort could not be reviewed.');
+        }
+        reviewed = {...proof};
+        delete reviewed.success;
+        showProof(reviewed);
+        status.textContent = `Reviewed ${reviewed.offers.length} exact offers. Trading stays stopped.`;
+        commit.disabled = false;
+      } catch (error) {
+        status.textContent = `Proof refused: ${error.message}. Obtain a fresh preview after the cause is resolved.`;
+      } finally {
+        refresh.disabled = false;
+      }
+    }
+
+    async function apply() {
+      if (!reviewed || commit.disabled) return;
+      const lines = reviewed.offers.map(offer => `${offer.side.toUpperCase()} ${offer.trade_id}: ${offer.classification}`);
+      const approved = window.confirm(
+        `Campaign ${reviewed.campaign_id}, revision ${reviewed.revision}\n` +
+        `Wallet ${reviewed.wallet_fingerprint_hash}, ${reviewed.network}\n` +
+        `Asset ${reviewed.asset_id}\nLatch generation ${reviewed.latch_generation}\n\n` +
+        `${lines.join('\n')}\n\n` +
+        'Confirm database-only proof reconciliation? Trading stays stopped. No wallet transaction will be sent.'
+      );
+      if (!approved) return;
+      const exact = reviewed;
+      reviewed = null;
+      commit.disabled = true;
+      refresh.disabled = true;
+      status.textContent = 'Rechecking the entire Sage proof before local commit…';
+      try {
+        const applied = await readJson('/api/bootstrap/commit_terminal', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reviewed: exact})
+        });
+        const summary = `${applied.filled} filled, ${applied.expired} expired, ${applied.already_terminal} already terminal; ` +
+          `${applied.pending_hooks} pending hooks; ${applied.remaining_blockers} remaining blockers; ` +
+          `${applied.unresolved_journals} unresolved journals. Trading stays stopped.`;
+        result.textContent = summary;
+        status.textContent = applied.partial_commit
+          ? 'Partial commit: obtain a fresh preview before retrying. The safety fence remains in place.'
+          : 'Local proof reconciliation completed. Restart only after reviewing the full end state.';
+      } catch (error) {
+        status.textContent = `Commit refused or interrupted: ${error.message}. A partial commit may have occurred; obtain a fresh preview before retrying.`;
+      } finally {
+        refresh.disabled = false;
+      }
+    }
+
+    refresh.addEventListener('click', preview);
+    commit.addEventListener('click', apply);
+    preview();
+  </script>
+</body>
+</html>

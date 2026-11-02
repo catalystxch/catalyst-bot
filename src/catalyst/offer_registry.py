@@ -312,6 +312,40 @@ class MutationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class RefreshAbortAuthority:
+    """Typed pointer to a database-verified, still-fenced abort record.
+
+    This value alone never authorizes persistence. The reconciliation database
+    transaction must check the referenced abort and latch again.
+    """
+
+    abort_id: str
+    parent_intent_id: str
+    child_intent_id: str
+    wallet_fingerprint_hash: str
+    network: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "abort_id", _hex_identity(self.abort_id, "abort_id"))
+        object.__setattr__(
+            self,
+            "parent_intent_id",
+            _required_text(self.parent_intent_id, "parent_intent_id"),
+        )
+        object.__setattr__(
+            self,
+            "child_intent_id",
+            _required_text(self.child_intent_id, "child_intent_id"),
+        )
+        object.__setattr__(
+            self,
+            "wallet_fingerprint_hash",
+            _hex_identity(self.wallet_fingerprint_hash, "wallet_fingerprint_hash"),
+        )
+        object.__setattr__(self, "network", _required_text(self.network, "network"))
+
+
+@dataclass(frozen=True, slots=True)
 class OfferEvidence:
     """Exact evidence for reconciliation or a terminal classification."""
 
@@ -1227,6 +1261,7 @@ def authorize_transition(
     network: Any,
     *,
     evidence: Any = None,
+    refresh_abort: Any = None,
 ) -> AuthorizationDecision:
     """Authorize a registry transition, including proof-bearing reconciliation."""
 
@@ -1248,6 +1283,26 @@ def authorize_transition(
     binding = _binding_decision(record, wallet_fingerprint_hash, network)
     if binding is not None:
         return binding
+    if refresh_abort is not None:
+        exact_child = _records_by_intent(snapshot, record.child_intent_id)
+        if (
+            type(refresh_abort) is not RefreshAbortAuthority
+            or destination is not RegistryState.TERMINAL
+            or type(evidence) is not OfferEvidence
+            or evidence.terminal_outcome is not TerminalOutcome.CANCELLED
+            or refresh_abort.parent_intent_id != record.intent_id
+            or refresh_abort.child_intent_id != record.child_intent_id
+            or refresh_abort.wallet_fingerprint_hash != record.wallet_fingerprint_hash
+            or refresh_abort.network != record.network
+            or len(exact_child) != 1
+            or exact_child[0].state is not RegistryState.CREATED
+        ):
+            return _decision(
+                False,
+                AuthorizationCode.INVALID_INPUT,
+                "fenced refresh abort does not name this proven cancellation",
+                record,
+            )
     blocker = _registry_blocker_decision(snapshot, record, exclude_target=True)
     if blocker is not None:
         return blocker
@@ -1322,10 +1377,14 @@ def authorize_transition(
         terminal_denial = _terminal_evidence_decision(record, evidence)
         if terminal_denial is not None:
             return terminal_denial
-        if evidence.terminal_outcome in {
-            TerminalOutcome.CANCELLED,
-            TerminalOutcome.EXPIRED,
-        }:
+        if (
+            evidence.terminal_outcome
+            in {
+                TerminalOutcome.CANCELLED,
+                TerminalOutcome.EXPIRED,
+            }
+            and refresh_abort is None
+        ):
             child_visibility = _replacement_child_visibility_decision(snapshot, record)
             if child_visibility is not None:
                 return child_visibility
@@ -1345,6 +1404,7 @@ __all__ = [
     "OfferReference",
     "RegistrySnapshot",
     "RegistryState",
+    "RefreshAbortAuthority",
     "TerminalOutcome",
     "authorize_mutation",
     "authorize_transition",

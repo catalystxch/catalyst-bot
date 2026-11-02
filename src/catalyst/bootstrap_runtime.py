@@ -531,7 +531,12 @@ def derive_bootstrap_runtime(
         expected_revision=campaign_record.get("revision"),
         now=now,
     )
-    plan = derive_bootstrap_plan(campaign, decision, balances)
+    plan = derive_bootstrap_plan(
+        campaign,
+        decision,
+        balances,
+        cat_decimals=balances.get("cat_decimals", 3),
+    )
     if authority.get("allowed") is not True or transition["allow_create"] is not True:
         plan = {**plan, "authorized": False}
     return {

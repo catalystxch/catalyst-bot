@@ -72,6 +72,20 @@ def test_second_schema_initialization_is_idempotent(isolated_db):
     assert database.get_bootstrap_campaign(campaign_id) is not None
 
 
+def test_existing_campaign_schema_gains_independent_state_revision(isolated_db):
+    campaign_id = database.create_bootstrap_campaign(make_campaign().to_record())
+    database.get_connection().execute(
+        "ALTER TABLE bootstrap_campaigns DROP COLUMN state_revision"
+    )
+    database.close_connection()
+
+    database._migrate_stability_schema()
+
+    restored = database.get_bootstrap_campaign(campaign_id)
+    assert restored["revision"] == 0
+    assert restored["state_revision"] == 0
+
+
 def test_v13_stability_watermark_allows_first_bootstrap_schema_install(isolated_db):
     """A pre-Bootstrap profile must not treat new v1.4 tables as corruption."""
 
@@ -179,14 +193,16 @@ def test_restart_preserves_stage_cooldown_fee_and_loss_state(isolated_db):
     assert restored["marked_inventory_loss_xch"] == "0.003"
 
 
-def test_state_update_compare_and_set_rejects_stale_revision(isolated_db):
+def test_evidence_update_retains_offer_revision_and_rejects_stale_state_cas(
+    isolated_db,
+):
     campaign_id = database.create_bootstrap_campaign(make_campaign().to_record())
     state = {
         "stage": "bootstrap",
         "deployment_fraction": "0.1",
         "current_anchor_price": "0.01",
         "stable_since": None,
-        "confirmed_fills": 0,
+        "confirmed_fills": 1,
         "settlement_clusters": 0,
         "independent_depth_sides": [],
         "suspected_linked_activity": False,
@@ -202,8 +218,12 @@ def test_state_update_compare_and_set_rejects_stale_revision(isolated_db):
             expected_revision=0,
             record=state,
         )
-        == 1
+        == 0
     )
+    refreshed = database.get_bootstrap_campaign(campaign_id)
+    assert refreshed["revision"] == 0
+    assert refreshed["state_revision"] == 1
+    assert refreshed["confirmed_fills"] == 1
 
     with pytest.raises(RuntimeError, match="compare-and-set"):
         database.update_bootstrap_campaign_state(
@@ -211,6 +231,62 @@ def test_state_update_compare_and_set_rejects_stale_revision(isolated_db):
             expected_revision=0,
             record=state,
         )
+
+
+def test_evidence_only_update_keeps_live_offer_authority_until_plan_changes(
+    isolated_db,
+):
+    from bootstrap_runtime import superseded_bootstrap_trade_ids
+
+    campaign_id = database.create_bootstrap_campaign(make_campaign().to_record())
+    campaign = database.get_bootstrap_campaign(campaign_id)
+    trade_id = "ab" * 32
+    intents = [
+        {
+            "sage_trade_id": trade_id,
+            "purpose": f"bootstrap:{campaign_id}:revision:0",
+            "lifecycle_state": "created",
+        }
+    ]
+    state = {key: campaign[key] for key in database._BOOTSTRAP_STATE_FIELDS}
+    state["independent_depth_sides"] = ["buy", "sell"]
+    state["updated_at"] = NOW + timedelta(seconds=1)
+
+    assert (
+        database.update_bootstrap_campaign_state(
+            campaign_id, expected_revision=0, expected_state_revision=0, record=state
+        )
+        == 0
+    )
+    assert (
+        superseded_bootstrap_trade_ids(
+            intents, campaign_id=campaign_id, revision=0, live_trade_ids={trade_id}
+        )
+        == ()
+    )
+
+    state["current_anchor_price"] = "0.011"
+    state["updated_at"] = NOW + timedelta(seconds=2)
+    assert (
+        database.update_bootstrap_campaign_state(
+            campaign_id, expected_revision=0, expected_state_revision=1, record=state
+        )
+        == 1
+    )
+    assert superseded_bootstrap_trade_ids(
+        intents, campaign_id=campaign_id, revision=1, live_trade_ids={trade_id}
+    ) == (trade_id,)
+
+    state["adverse_fill_times"] = [
+        {"side": "buy", "occurred_at": NOW + timedelta(seconds=3)}
+    ]
+    state["updated_at"] = NOW + timedelta(seconds=3)
+    assert (
+        database.update_bootstrap_campaign_state(
+            campaign_id, expected_revision=1, expected_state_revision=2, record=state
+        )
+        == 2
+    )
 
 
 def test_campaign_event_append_is_idempotent_and_ordered(isolated_db):

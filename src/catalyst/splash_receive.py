@@ -53,6 +53,7 @@ def normalize_offer_summary(view_result: Any) -> Dict[str, Dict[str, Any]]:
         offer_obj = view_result.get("offer")
         if isinstance(offer_obj, dict):
             payloads.append(offer_obj.get("summary"))
+            payloads.append(offer_obj)
         payloads.append(view_result)
 
     for payload in payloads:

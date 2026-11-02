@@ -35,7 +35,7 @@ _SUGGESTED_FEE_CACHE_TTL_SECS = 30
 
 # Coinset fee estimate cache (separate TTL — less aggressive than coin queries)
 _COINSET_FEE_CACHE: Dict[tuple[int, int], tuple[float, Dict]] = {}
-_COINSET_FEE_CACHE_TTL_SECS = 60
+_COINSET_FEE_CACHE_TTL_SECS = 20
 
 
 def _decimal_or_zero(value) -> Decimal:
@@ -71,12 +71,18 @@ def get_wallet_fee_environment() -> Dict:
     wallet_type = str(getattr(cfg, "WALLET_TYPE", "sage") or "sage").strip().lower()
     has_full_node_rpc = _get_full_node_cert_paths() is not None
     if wallet_type == "sage" and not has_full_node_rpc:
+        cloud_enabled = bool(getattr(cfg, "COINSET_ENABLED", True))
         return {
             "wallet_type": wallet_type,
             "has_full_node_rpc": False,
             "supports_auto_estimate": False,
+            "supports_cloud_estimate": cloud_enabled,
             "reason": "sage_no_full_node_rpc",
-            "message": "Sage has no local full-node fee estimator in this setup, so auto falls back to the manual fee.",
+            "message": (
+                "Sage has no local full-node fee estimator; Coinset may provide a network fee estimate."
+                if cloud_enabled
+                else "Sage has no local full-node fee estimator in this setup, so auto falls back to the manual fee."
+            ),
         }
     if has_full_node_rpc:
         return {
@@ -163,7 +169,7 @@ def _full_node_rpc(endpoint: str, payload: dict, timeout: int = 5) -> Optional[D
 
 
 def _coinset_fee_estimate(
-    target_seconds: int, cost: int, *, diagnostics=None
+    target_seconds: int, cost: int, *, diagnostics=None, force_refresh=False
 ) -> Optional[Dict]:
     """Query Coinset cloud API for a fee estimate.
 
@@ -195,7 +201,11 @@ def _coinset_fee_estimate(
     cache_key = (target_seconds, cost)
     now = time.time()
     cached = _COINSET_FEE_CACHE.get(cache_key)
-    if cached and 0 <= (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS:
+    if (
+        not force_refresh
+        and cached
+        and 0 <= (now - cached[0]) < _COINSET_FEE_CACHE_TTL_SECS
+    ):
         return dict(cached[1])
 
     try:
@@ -273,7 +283,9 @@ def _coinset_fee_estimate(
         return unavailable("fee_provider_unavailable")
 
 
-def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) -> Dict:
+def get_suggested_transaction_fee(
+    target_seconds: int = None, cost: int = None, *, force_refresh=False
+) -> Dict:
     target = int(
         target_seconds
         if target_seconds is not None
@@ -288,7 +300,11 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
     now = time.time()
 
     cached = _SUGGESTED_FEE_CACHE.get(cache_key)
-    if cached and 0 <= (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS:
+    if (
+        not force_refresh
+        and cached
+        and 0 <= (now - cached[0]) < _SUGGESTED_FEE_CACHE_TTL_SECS
+    ):
         return dict(cached[1])
 
     env = get_wallet_fee_environment()
@@ -337,7 +353,9 @@ def get_suggested_transaction_fee(target_seconds: int = None, cost: int = None) 
             ),
         }
     )
-    coinset_result = _coinset_fee_estimate(target, cost_val, diagnostics=failures)
+    coinset_result = _coinset_fee_estimate(
+        target, cost_val, diagnostics=failures, force_refresh=force_refresh
+    )
     if coinset_result:
         _SUGGESTED_FEE_CACHE[cache_key] = (now, coinset_result)
         return dict(coinset_result)
@@ -391,7 +409,9 @@ def fee_pool_configured() -> bool:
 
 
 def fee_pool_enabled() -> bool:
-    return get_effective_transaction_fee_mojos() > 0 and fee_pool_configured()
+    # A zero manual fee does not make network-priced offer cancellations free.
+    # Preserve dedicated fee collateral whenever the user configured it.
+    return fee_pool_configured()
 
 
 def get_fee_tier_name() -> str:

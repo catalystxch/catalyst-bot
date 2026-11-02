@@ -162,6 +162,33 @@ def _mutation_guard(operation: str):
     return decorate
 
 
+def _proof_recovery_guard(operation: str):
+    """Allow a database-only proof recovery while the mutation latch is up."""
+
+    def decorate(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            api = _bridge_runtime_api(self)
+            api._ensure_mutation_runtime()
+            runtime = api.mutation_gate.current_runtime()
+            if runtime is None or (
+                runtime.status().to_dict().get("lease", {}).get("owned_by_this_run")
+                is not True
+            ):
+                return {
+                    "success": False,
+                    "error": "recovery_authority_unavailable",
+                    "operation": operation,
+                }
+            return func(self, *args, **kwargs)
+
+        wrapper._mutation_operation = operation
+        _mutation_guarded_functions.add(wrapper)
+        return wrapper
+
+    return decorate
+
+
 class AppBridge:
     """
     JS bridge — exposes bot functionality to the PyWebView frontend.
@@ -283,15 +310,28 @@ class AppBridge:
 
     @_safe
     @_mutation_guard("app_bridge:start_bot")
-    def start_bot(self, _body=None):
+    def start_bot(self, body=None):
         """Start the bot loop. Maps to POST /api/bot/start.
         Delegates fully to api_server.api_bot_start() which runs all pre-start
         validation (CAT_ASSET_ID, wallet sync, spread sanity, etc.).
         """
         import api_server
 
+        payload = (
+            {"resume_existing_offers": True}
+            if type(body) is dict and body.get("resume_existing_offers") is True
+            else {}
+        )
+        if type(body) is dict:
+            for key in (
+                "review_confidence_override",
+                "duration_hours",
+                "confidence_override",
+            ):
+                if key in body:
+                    payload[key] = body[key]
         with api_server.app.test_request_context(
-            "/api/bot/start", method="POST", content_type="application/json", data="{}"
+            "/api/bot/start", method="POST", json=payload
         ):
             resp = api_server.api_bot_start()
         return _unwrap_flask_response(resp)
@@ -555,6 +595,140 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
+    @_mutation_guard("app_bridge:reconcile_expired_bootstrap_offers")
+    def reconcile_expired_bootstrap_offers(self, body=None):
+        """Prove exact natural expiry without a Sage wallet effect."""
+        import api_server
+
+        body_json = json.dumps(body or {})
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_expired",
+            method="POST",
+            content_type="application/json",
+            data=body_json,
+        ):
+            resp = api_server.api_bootstrap_reconcile_expired()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def preview_completed_bootstrap_offers(self, body=None):
+        """Review exact completed offers without changing campaign state."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/preview_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_preview_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def preview_terminal_offers(self, body=None):
+        """Read exact mixed terminal proof through the native bridge."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"campaign_id", "revision"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        proof = mixed_terminal_recovery.preview_terminal_offers(
+            body["campaign_id"], body["revision"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **proof}
+
+    @_safe
+    def preview_external_cancellation(self):
+        """Read exact Sage-only cancellation proof for a native review."""
+
+        import external_cancel_recovery
+
+        return {
+            "success": True,
+            "review": external_cancel_recovery.preview_external_cancellation(),
+        }
+
+    @_safe
+    def preview_no_effect_creation(self):
+        """Read a complete Sage no-effect creation proof for native review."""
+        import creation_no_effect_recovery
+
+        return {
+            "success": True,
+            "review": creation_no_effect_recovery.preview_no_effect_creation(),
+        }
+
+    @_safe
+    @_proof_recovery_guard("app_bridge:commit_no_effect_creation")
+    def commit_no_effect_creation(self, body=None):
+        """Apply only a freshly reverified local no-effect transition."""
+        import creation_no_effect_recovery
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = creation_no_effect_recovery.commit_no_effect_creation(body["reviewed"])
+        return {"success": True, **result}
+
+    @_safe
+    @_mutation_guard("app_bridge:commit_external_cancellation")
+    def commit_external_cancellation(self, body=None):
+        """Apply a single reviewed local settlement without a wallet effect."""
+
+        import external_cancel_recovery
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = external_cancel_recovery.commit_external_cancellation(body["reviewed"])
+        return {"success": True, **result}
+
+    @_safe
+    def commit_terminal_offers(self, body=None):
+        """Apply a freshly reverified, database-only terminal cohort."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = mixed_terminal_recovery.commit_terminal_offers(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **result}
+
+    @_safe
+    def drain_deferred_terminal_hooks(self, body=None):
+        """Deliver reviewed fill hooks only after normal authority returns."""
+        import mixed_terminal_recovery
+        import mutation_gate
+
+        if type(body) is not dict or set(body) != {"reviewed"}:
+            return {"success": False, "error": "invalid_exact_scope"}
+        if type(body["reviewed"]) is not dict:
+            return {"success": False, "error": "invalid_exact_scope"}
+        result = mixed_terminal_recovery.drain_deferred_terminal_hooks(
+            body["reviewed"], mutation_gate.current_runtime()
+        )
+        return {"success": True, **result}
+
+    @_safe
+    @_mutation_guard("app_bridge:reconcile_completed_bootstrap_offers")
+    def reconcile_completed_bootstrap_offers(self, body=None):
+        """Commit exact Task 9 fill proofs without a Sage wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/bootstrap/reconcile_completed",
+            method="POST",
+            json=body or {},
+        ):
+            resp = api_server.api_bootstrap_reconcile_completed()
+        return _unwrap_flask_response(resp)
+
+    @_safe
     @_mutation_guard("app_bridge:renew_bootstrap_campaign")
     def renew_bootstrap_campaign(self, body=None):
         """Create a freshly reviewed successor to a stopped campaign."""
@@ -669,11 +843,11 @@ class AppBridge:
         return _unwrap_flask_response(resp)
 
     @_safe
-    @_mutation_guard("app_bridge:cancel_all_offers")
     def cancel_all_offers(self, body=None):
-        """Cancel all offers. Maps to POST /api/offers/cancel_all."""
+        """Use the route's gate so blocked proof-only recovery remains reachable."""
         import api_server
 
+        api_server._ensure_mutation_runtime()
         with api_server.app.test_request_context(
             "/api/offers/cancel_all",
             method="POST",
@@ -690,6 +864,71 @@ class AppBridge:
 
         with api_server.app.test_request_context("/api/offers/cancel_all/status"):
             resp = api_server.api_cancel_all_status()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def get_refresh_abort_preview(self):
+        """Read exact fenced recovery scope for the native operator view."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/offers/refresh_abort/preview"):
+            resp = api_server.api_refresh_abort_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def begin_refresh_abort(self, body=None):
+        """Reach the exact proof-only abort route while the safety latch holds."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/begin",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_begin()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def cancel_next_refresh_abort_offer(self, body=None):
+        """Use the route's exact fence, Task 8 journal, fee and Sage checks."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/cancel_next",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_cancel_next()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def reconcile_refresh_abort_target(self, body=None):
+        """Check one exact target through the normal authoritative proof path."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/reconcile_target",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_reconcile_target()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    def complete_refresh_abort(self, body=None):
+        """Close only a proven empty exact abort without a wallet effect."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/offers/refresh_abort/complete",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            resp = api_server.api_refresh_abort_complete()
         return _unwrap_flask_response(resp)
 
     @_safe
@@ -929,6 +1168,258 @@ class AppBridge:
         ):
             resp = api_server.api_coin_prep_fee_preview()
         return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:prepare_prestart_follow_fee_ceiling_review")
+    def prepare_prestart_follow_fee_ceiling_review(self, body=None):
+        """Freeze a completed Coin Prep scope's initial Follow cap for native review."""
+        import re
+        from prestart_follow_fee_ceiling import preview_prestart_follow_fee_ceiling
+
+        if (
+            type(body) is not dict
+            or set(body) != {"approval_id", "proposed_maximum_fee_mojos"}
+            or type(body["approval_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
+            or type(body["proposed_maximum_fee_mojos"]) is not int
+        ):
+            return {"success": False, "reason": "FEE_PRESTART_REVIEW_INPUT_INVALID"}
+        try:
+            review = preview_prestart_follow_fee_ceiling(
+                body["approval_id"], body["proposed_maximum_fee_mojos"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FEE_APPROVAL_STALE",
+                "FEE_APPROVAL_REQUIRED",
+                "FEE_SESSION_INCOMPLETE",
+                "FEE_PRESTART_STANDALONE_REQUIRED",
+                "FEE_PRESTART_CEILING_MUST_INCREASE",
+                "FEE_PRESTART_INITIAL_CEILING_REQUIRED",
+                "FEE_PRESTART_TARGETS_CHANGED",
+                "FEE_PRESTART_FUNDING_INSUFFICIENT",
+                "FEE_PRESTART_RUN_EXISTS",
+                "FEE_WALLET_CONTEXT_CHANGED",
+                "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            }:
+                reason = "FEE_PRESTART_REVIEW_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**review, "success": True, "dispatch_authorized": False}
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_prestart_follow_fee_ceiling_review")
+    def confirm_prestart_follow_fee_ceiling_review(self, body=None):
+        """Consume one explicit native review; no worker, wallet effect or run."""
+        import re
+        from prestart_follow_fee_ceiling import confirm_prestart_follow_fee_ceiling
+
+        if (
+            type(body) is not dict
+            or set(body) != {"preview_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("preview_id", "review_sha256")
+            )
+        ):
+            return {"success": False, "reason": "FEE_PRESTART_CONFIRMATION_REQUIRED"}
+        try:
+            confirmed = confirm_prestart_follow_fee_ceiling(
+                body["preview_id"], body["review_sha256"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FEE_APPROVAL_STALE",
+                "FEE_PREVIEW_STALE",
+                "FEE_PRESTART_REVIEW_USED",
+                "FEE_PRESTART_REVIEW_CHANGED",
+                "FEE_PRESTART_REVIEW_REQUIRED",
+                "FEE_PRESTART_ACCOUNTING_CHANGED",
+                "FEE_PRESTART_FUNDING_INSUFFICIENT",
+                "FEE_PRESTART_INITIAL_CEILING_REQUIRED",
+                "FEE_PRESTART_TARGETS_CHANGED",
+                "FEE_PRESTART_RUN_EXISTS",
+                "FEE_SESSION_INCOMPLETE",
+                "FEE_WALLET_CONTEXT_CHANGED",
+                "FEE_WALLET_IDENTITY_UNAVAILABLE",
+            }:
+                reason = "FEE_PRESTART_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**confirmed, "success": True, "dispatch_authorized": False}
+
+    @_safe
+    @_mutation_guard("app_bridge:preview_follow_principal")
+    def preview_follow_principal(self, body=None):
+        """Read-only Follow principal proposal via the shared HTTP handler."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/follow/principal-preview",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_follow_principal_preview()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:prepare_follow_run_review")
+    def prepare_follow_run_review(self, body=None):
+        """Freeze review terms for a later native final confirmation."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/follow/run-review",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body),
+        ):
+            resp = api_server.api_follow_run_review()
+        return _unwrap_flask_response(resp)
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_follow_run_review")
+    def confirm_follow_run_review(self, body=None):
+        """Consume a reviewed financial run from an explicit native click.
+
+        This records authority but never starts the bot or sends a wallet
+        effect. The browser-mode HTTP surface has no equivalent endpoint.
+        """
+        import re
+
+        from follow_principal import confirm_follow_run_review
+
+        if (
+            type(body) is not dict
+            or set(body) != {"review_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_REVIEW_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            result = confirm_follow_run_review(body["review_id"], body["review_sha256"])
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_REVIEW_REQUIRED",
+                "FOLLOW_REVIEW_USED",
+                "FOLLOW_REVIEW_EXPIRED",
+                "FOLLOW_REVIEW_CHANGED",
+                "FOLLOW_BOT_MUST_BE_STOPPED",
+                "FOLLOW_CANCELLATION_IN_PROGRESS",
+                "FOLLOW_FEE_APPROVAL_STALE",
+                "FOLLOW_RUN_OVERLAP",
+                "FOLLOW_SHUTDOWN_RESERVE_UNFUNDED",
+            }:
+                reason = "FOLLOW_REVIEW_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**result, "success": True, "dispatch_authorized": False}
+
+    @_safe
+    @_mutation_guard("app_bridge:prepare_follow_fee_ceiling_review")
+    def prepare_follow_fee_ceiling_review(self, body=None):
+        """Freeze the current run's proposed fee ceiling for native review."""
+        import time
+
+        from coin_prep_fee_runtime import _configuration
+        from follow_principal import prepare_follow_fee_ceiling_review
+        import database
+
+        if (
+            type(body) is not dict
+            or set(body) != {"proposed_maximum_fee_mojos"}
+            or type(body["proposed_maximum_fee_mojos"]) is not int
+            or not 0 < body["proposed_maximum_fee_mojos"] <= 2**63 - 1
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_REVISION_INVALID",
+                "dispatch_authorized": False,
+            }
+        try:
+            asset_id = _configuration()["CAT_ASSET_ID"]
+            marker = database.get_unexpired_follow_run_marker(
+                asset_id=asset_id, now_epoch=int(time.time())
+            )
+            if marker is None:
+                raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+            result = prepare_follow_fee_ceiling_review(
+                marker["run_id"],
+                proposed_maximum_fee_mojos=body["proposed_maximum_fee_mojos"],
+            )
+            identity = database.get_follow_run_identity(result["run_id"])
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_FEE_REVISION_INVALID",
+                "FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED",
+                "FOLLOW_FEE_REVISION_UNFUNDED",
+                "FOLLOW_FEE_REVISION_CHANGED",
+                "FOLLOW_FEE_REVISION_WALLET_CHANGED",
+                "FOLLOW_FEE_REVISION_FUNDING_UNAVAILABLE",
+            }:
+                reason = "FOLLOW_FEE_REVISION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {
+            **result,
+            "identity": identity,
+            "run_stopped": marker["stopped"],
+            "success": True,
+            "dispatch_authorized": False,
+        }
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_follow_fee_ceiling_review")
+    def confirm_follow_fee_ceiling_review(self, body=None):
+        """Record only the exact accepted native in-run fee review."""
+        import re
+
+        from follow_principal import confirm_follow_fee_ceiling_review
+
+        if (
+            type(body) is not dict
+            or set(body) != {"review_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_REVISION_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            result = confirm_follow_fee_ceiling_review(
+                body["review_id"], body["review_sha256"]
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_FEE_REVISION_REVIEW_REQUIRED",
+                "FOLLOW_FEE_REVISION_REVIEW_USED",
+                "FOLLOW_FEE_REVISION_REVIEW_CHANGED",
+                "FOLLOW_FEE_REVISION_REVIEW_EXPIRED",
+                "FOLLOW_FEE_REVISION_WALLET_CHANGED",
+                "FOLLOW_FEE_REVISION_CHANGED",
+                "FOLLOW_FEE_REVISION_UNFUNDED",
+            }:
+                reason = "FOLLOW_FEE_REVISION_CONFIRMATION_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
@@ -1428,6 +1919,29 @@ class AppBridge:
         if type(result) is not dict:
             raise RuntimeError("malformed safety status response")
         return result
+
+    @_safe
+    def get_cancel_latch_review(self):
+        """Read the exact cancellation proof shown by the native review."""
+        import api_server
+
+        with api_server.app.test_request_context("/api/safety/cancel-latch-review"):
+            return _unwrap_flask_response(api_server.api_safety_cancel_latch_review())
+
+    @_safe
+    def confirm_cancel_latch_review(self, body=None):
+        """Reprove and release only the reviewed exact latch generation."""
+        import api_server
+
+        with api_server.app.test_request_context(
+            "/api/safety/confirm-cancel-latch-review",
+            method="POST",
+            content_type="application/json",
+            data=json.dumps(body or {}),
+        ):
+            return _unwrap_flask_response(
+                api_server.api_safety_confirm_cancel_latch_review()
+            )
 
     @_safe
     def get_fingerprints(self):
@@ -1943,9 +2457,20 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "fresh_start",
     "live_config",
     "preview_coin_prep_fees",
+    "prepare_prestart_follow_fee_ceiling_review",
+    "confirm_prestart_follow_fee_ceiling_review",
+    "preview_follow_principal",
+    "prepare_follow_run_review",
+    "confirm_follow_run_review",
+    "prepare_follow_fee_ceiling_review",
+    "confirm_follow_fee_ceiling_review",
+    "commit_external_cancellation",
+    "commit_no_effect_creation",
     "purge_fills",
     "refresh_cat",
     "renew_bootstrap_campaign",
+    "reconcile_expired_bootstrap_offers",
+    "reconcile_completed_bootstrap_offers",
     "reload_config",
     "repost_dexie",
     "reset_coin_prep",
@@ -1968,6 +2493,13 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "stop_bootstrap_campaign",
 }
 _APP_BRIDGE_CONTROL_METHODS = {
+    "confirm_cancel_latch_review",
+    "begin_refresh_abort",
+    "commit_terminal_offers",
+    "drain_deferred_terminal_hooks",
+    "cancel_next_refresh_abort_offer",
+    "reconcile_refresh_abort_target",
+    "complete_refresh_abort",
     "browse_sage_cert",
     "close_window",
     "confirm_close_window",
@@ -1984,6 +2516,7 @@ _APP_BRIDGE_CONTROL_METHODS = {
     "toggle_console",
 }
 _APP_BRIDGE_READ_ONLY_METHODS = {
+    "get_cancel_latch_review",
     "check_resume",
     "check_splash_setup",
     "check_update",
@@ -1994,6 +2527,7 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "get_bootstrap_partial_offer_capability",
     "get_bootstrap_status",
     "get_cancel_all_status",
+    "get_refresh_abort_preview",
     "get_cats",
     "get_coin_prep_status",
     "get_coins",
@@ -2043,6 +2577,10 @@ _APP_BRIDGE_READ_ONLY_METHODS = {
     "export_bootstrap_manifest",
     "export_bootstrap_participation",
     "preview_bootstrap_campaign",
+    "preview_completed_bootstrap_offers",
+    "preview_terminal_offers",
+    "preview_external_cancellation",
+    "preview_no_effect_creation",
     "refresh_balances",
     "run_doctor",
     "validate_config",
@@ -2055,6 +2593,10 @@ _APP_BRIDGE_ACCESS_SETS = (
     ("read_only", _APP_BRIDGE_READ_ONLY_METHODS),
     ("control", _APP_BRIDGE_CONTROL_METHODS),
 )
+# Cancel All must reach its own route while an old submitted cancellation is
+# fenced: that route only checks proof in the blocked branch, and enters the
+# mutation gate itself before any new wallet cancellation in the allowed branch.
+_APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS = {"cancel_all_offers"}
 _classified_bridge_methods: set[str] = set()
 _bridge_access_by_function: dict[object, str] = {}
 for _access, _names in _APP_BRIDGE_ACCESS_SETS:
@@ -2065,7 +2607,11 @@ for _access, _names in _APP_BRIDGE_ACCESS_SETS:
         _method = vars(AppBridge).get(_name)
         if not callable(_method):
             raise RuntimeError(f"AppBridge classified callable is missing: {_name}")
-        if _access == "mutation" and _method not in _mutation_guarded_functions:
+        if (
+            _access == "mutation"
+            and _method not in _mutation_guarded_functions
+            and _name not in _APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS
+        ):
             raise RuntimeError(
                 f"AppBridge mutation callable lacks mutation guard: {_name}"
             )

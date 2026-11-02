@@ -449,6 +449,31 @@ def _log_in_fingerprint(fingerprint: str) -> bool:
     if wallet_type == "sage":
         # Acquire lock — only one thread can login at a time
         with _login_lock:
+            # A fresh CATalyst process can attach to a Sage session that is
+            # already logged in to the exact selected key. Sage may close a
+            # redundant login request, so confirm the live key and wallet
+            # service before deciding that another login is needed.
+            active_fp = _get_live_sage_fingerprint()
+            if active_fp == str(fingerprint):
+                try:
+                    from wallet import get_wallet_sync_status
+
+                    wallet_sync = get_wallet_sync_status() or {}
+                except Exception:
+                    wallet_sync = {}
+                if wallet_sync.get("reachable") is True and (
+                    wallet_sync.get("synced") is True
+                    or wallet_sync.get("syncing") is True
+                ):
+                    with _phase_lock:
+                        _sage_startup_phase = "ready"
+                    log_event(
+                        "success",
+                        "sage_startup",
+                        f"Reused active Sage fingerprint {fingerprint}",
+                    )
+                    return True
+
             # Double-check after acquiring lock — another thread may have
             # completed login while we were waiting for the lock
             if _sage_startup_phase == "ready":
@@ -1425,8 +1450,8 @@ def get_startup_status() -> Dict:
             except Exception:
                 pass
         elif sp == "error":
-            phase = "starting"
-            message = "Sage startup encountered an error — retrying..."
+            phase = "error"
+            message = "Sage startup failed"
         else:
             phase = "starting"
             message = f"Sage startup: {sp}"

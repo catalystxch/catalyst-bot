@@ -312,6 +312,11 @@ def test_bot_start_reloads_deferred_setup_config_before_validation():
 
     with (
         api_mutations_permitted(api_server),
+        # Test deferred Setup reload after the independent native review gate.
+        patch(
+            "blueprints.bot._reviewed_follow_start_readiness",
+            return_value={"ready": True},
+        ),
         patch.object(api_server, "bot", fake_bot),
         patch.object(api_server, "cfg", fake_cfg),
         patch(

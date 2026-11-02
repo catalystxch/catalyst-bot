@@ -113,6 +113,9 @@ class MarketConfidenceResult:
     evidence_digests: tuple[str, ...]
     derived_thresholds: Mapping[str, int | str]
 
+    observed_bid: Decimal | None = None
+    observed_ask: Decimal | None = None
+
     def to_snapshot(
         self,
         *,
@@ -620,6 +623,8 @@ class MarketConfidenceEngine:
             source_health=dict(sorted(source_health.items())),
             evidence_digests=tuple(dict.fromkeys(evidence_digests)),
             derived_thresholds=self.derived_thresholds,
+            observed_bid=best_bid,
+            observed_ask=best_ask,
         )
 
     def _source_conflict(self, midpoints: Mapping[str, Decimal]) -> bool:

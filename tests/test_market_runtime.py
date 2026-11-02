@@ -1075,6 +1075,39 @@ def test_bot_refreshes_aging_confidence_before_mutation(monkeypatch):
     assert refreshed == [True]
 
 
+def test_bot_rechecks_expired_confidence_before_mutation(monkeypatch):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._market_runtime_required = True
+    loop._market_degraded_decision = SimpleNamespace(can_create=True, can_requote=True)
+    loop._market_confidence_result = SimpleNamespace(
+        state="GREEN", derived_at=datetime.now(timezone.utc) - timedelta(seconds=31)
+    )
+    loop._market_confidence_valid_until = datetime.now(timezone.utc) - timedelta(
+        seconds=1
+    )
+    monkeypatch.setattr(loop, "_runtime_recovery_cycle_boundary", lambda: True)
+    loop._runtime_recovery_monotonic = lambda: 1
+    loop._runtime_recovery_wall_clock = lambda: NOW
+    loop._runtime_recovery_gap_seconds = 10
+    loop._runtime_recovery_skew_seconds = 2
+    refreshed = []
+
+    def refresh():
+        refreshed.append(True)
+        loop._market_confidence_result = SimpleNamespace(
+            state="GREEN", derived_at=datetime.now(timezone.utc)
+        )
+        loop._market_confidence_valid_until = datetime.now(timezone.utc) + timedelta(
+            seconds=30
+        )
+
+    loop._refresh_offer_book_market = refresh
+    assert loop._enter_runtime_effect_phase("create") is True
+    assert refreshed == [True]
+
+
 def test_active_cycle_wait_refreshes_market_evidence_every_five_seconds(monkeypatch):
     import bot_loop
 
@@ -1299,6 +1332,73 @@ def test_market_withdrawal_preserves_current_bootstrap_campaign_offers(monkeypat
 
     assert result == 1
     assert loop._market_withdrawal_attempted_trade_ids == {"follow-buy"}
+
+
+def test_market_withdrawal_preserves_known_bootstrap_offers_when_wallet_unavailable(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatched = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: dispatched.extend(ids) or {}
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": True,
+        "reason": "bootstrap_wallet_identity_unavailable",
+        "campaign": {"campaign_id": "campaign-1", "revision": 4},
+    }
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda phase: True)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "sage_trade_id": "bootstrap-sell",
+                "purpose": "bootstrap:campaign-1:revision:4",
+            },
+            {"sage_trade_id": "follow-buy", "purpose": "ladder"},
+        ],
+    )
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "bootstrap-sell", "tier": "inner"},
+            {"trade_id": "follow-buy", "tier": "inner"},
+        ],
+        raising=False,
+    )
+
+    loop._apply_market_withdrawal(
+        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_DEGRADED_ALL")
+    )
+
+    assert dispatched == ["follow-buy"]
+
+
+def test_bootstrap_campaign_context_retains_known_campaign_when_wallet_unavailable(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    campaign = {"campaign_id": "campaign-1", "revision": 4}
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", ASSET_ID)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "list_active_bootstrap_campaigns_for_asset",
+        lambda asset_id: [campaign],
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: {"success": False})
+
+    context = bot_loop.BotLoop.__new__(bot_loop.BotLoop)._bootstrap_campaign_context()
+
+    assert context["active"] is True
+    assert context["blocked"] is True
+    assert context["campaign"] == campaign
 
 
 def test_market_withdrawal_uses_sage_native_bulk_cancel_capacity(monkeypatch):

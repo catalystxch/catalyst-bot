@@ -32,6 +32,82 @@ def test_terminal_stop_proof_reads_only_core_bot_state():
     assert loop.is_stopped() is False
 
 
+def test_stop_records_reviewed_follow_run_before_reporting_stopped(monkeypatch):
+    import database
+
+    loop, states, _events = _loop_with_unstoppable_splash(monkeypatch)
+    loop.splash_node.is_running = lambda: False
+    loop.splash_node._running = False
+    loop._reviewed_follow_run_id = "a" * 64
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "stop_follow_run_authority",
+        lambda **kwargs: calls.append(kwargs) or {"run_id": kwargs["run_id"]},
+    )
+
+    assert loop.stop(wait=True) is True
+    assert calls and all(call["run_id"] == "a" * 64 for call in calls)
+    assert states[-1]["status"] == "stopped"
+
+
+def test_stop_does_not_report_stopped_when_follow_stop_record_fails(monkeypatch):
+    import database
+
+    loop, states, _events = _loop_with_unstoppable_splash(monkeypatch)
+    loop.splash_node.is_running = lambda: False
+    loop.splash_node._running = False
+    loop._reviewed_follow_run_id = "a" * 64
+    monkeypatch.setattr(
+        database,
+        "stop_follow_run_authority",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("database unavailable")),
+    )
+
+    assert loop.stop(wait=True) is False
+    assert states[-1]["status"] == "stopping"
+    assert not any(state.get("status") == "stopped" for state in states)
+
+
+def test_stop_retries_transient_follow_stop_record_failure(monkeypatch):
+    import database
+
+    loop, states, _events = _loop_with_unstoppable_splash(monkeypatch)
+    loop.splash_node.is_running = lambda: False
+    loop.splash_node._running = False
+    loop._reviewed_follow_run_id = "a" * 64
+    attempts = []
+
+    def record(**kwargs):
+        attempts.append(kwargs["run_id"])
+        if len(attempts) == 1:
+            raise ValueError("busy")
+        return {"run_id": kwargs["run_id"]}
+
+    monkeypatch.setattr(database, "stop_follow_run_authority", record)
+    assert loop.stop(wait=True) is True
+    assert attempts == ["a" * 64, "a" * 64]
+    assert states[-1]["status"] == "stopped"
+
+
+def test_async_finalizer_refuses_stopped_without_follow_stop_record(monkeypatch):
+    import database
+
+    loop, states, _events = _loop_with_unstoppable_splash(monkeypatch)
+    loop._running = False
+    loop.splash_node.is_running = lambda: False
+    loop.splash_node._running = False
+    loop._reviewed_follow_run_id = "a" * 64
+    monkeypatch.setattr(
+        database,
+        "stop_follow_run_authority",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("unavailable")),
+    )
+    loop._finalize_stop()
+    assert states[-1]["status"] == "stopping"
+    assert not any(state.get("status") == "stopped" for state in states)
+
+
 def test_async_stop_finalizer_does_not_publish_stopped_while_cycle_is_alive(
     monkeypatch,
 ):
