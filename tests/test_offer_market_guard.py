@@ -362,27 +362,36 @@ def test_red_ladder_prices_and_assesses_slot_with_one_candidate_view(monkeypatch
         return original_assess(**kwargs)
 
     monkeypatch.setattr(offer_manager, "_current_candidate_confidence", changing_view)
-    monkeypatch.setattr(offer_manager, "assess_passive_red_candidate", record_assessment)
+    monkeypatch.setattr(
+        offer_manager, "assess_passive_red_candidate", record_assessment
+    )
     manager = offer_manager.OfferManager()
     with (
-        patch.object(offer_manager.cfg, "MINIMUM_PROFIT_XCH", Decimal("1"), create=True),
+        patch.object(
+            offer_manager.cfg, "MINIMUM_PROFIT_XCH", Decimal("1"), create=True
+        ),
         patch.object(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.09")),
         patch.object(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.11")),
-        patch.object(offer_manager, "get_effective_transaction_fee_mojos", return_value=1),
+        patch.object(
+            offer_manager, "get_effective_transaction_fee_mojos", return_value=1
+        ),
         patch.object(
             offer_manager,
             "get_exact_spendable_coins_rpc",
             side_effect=AssertionError("unprofitable offer reached coin selection"),
         ),
     ):
-        assert manager.create_ladder(
-            mid_price=Decimal("0.101"),
-            side="buy",
-            num_offers=1,
-            trade_size_xch=Decimal("0.01"),
-            coin_ids_enabled=True,
-            market_confidence=scoped,
-        ) == []
+        assert (
+            manager.create_ladder(
+                mid_price=Decimal("0.101"),
+                side="buy",
+                num_offers=1,
+                trade_size_xch=Decimal("0.01"),
+                coin_ids_enabled=True,
+                market_confidence=scoped,
+            )
+            == []
+        )
 
     assert len(views) == 1
     assert len(assessed) == 1
