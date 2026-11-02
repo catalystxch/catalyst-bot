@@ -4887,12 +4887,19 @@ class OfferManager:
                 price_cap=price_cap,
                 price_floor=price_floor,
             )
+            # Price and assess this slot against one book view. The final
+            # wallet-effect guard below still obtains fresh evidence.
+            candidate_confidence = (
+                _current_candidate_confidence(market_confidence)
+                if price is not None and market_confidence is not None
+                else None
+            )
             if price is not None and market_confidence is not None:
                 price = passive_red_ladder_price(
                     price=price,
                     inner_price=grid_inner_price,
                     side=side,
-                    confidence=_current_candidate_confidence(market_confidence),
+                    confidence=candidate_confidence,
                     hard_min_price=cfg.HARD_MIN_PRICE_XCH,
                     hard_max_price=cfg.HARD_MAX_PRICE_XCH,
                 )
@@ -4997,7 +5004,6 @@ class OfferManager:
             market_guard = None
             purpose = "normal_lifecycle"
             if market_confidence is not None:
-                candidate_confidence = _current_candidate_confidence(market_confidence)
                 market_guard = assess_passive_red_candidate(
                     side=side,
                     candidate_price=price,

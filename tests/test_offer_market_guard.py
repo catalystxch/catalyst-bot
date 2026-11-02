@@ -335,6 +335,61 @@ def test_unprofitable_ladder_is_rejected_before_coin_inventory_rpc():
     assert created == []
 
 
+def test_red_ladder_prices_and_assesses_slot_with_one_candidate_view(monkeypatch):
+    from confidence_override import ConsentedConfidence
+
+    raw = _confidence(
+        state="RED",
+        data_valid=False,
+        derived_at=datetime.now(timezone.utc),
+    )
+    scoped = ConsentedConfidence(
+        raw,
+        lambda: True,
+        (Decimal("0.099"), Decimal("0.101"), Decimal("0.103")),
+    )
+    views = []
+    assessed = []
+
+    def changing_view(confidence):
+        views.append(confidence)
+        return scoped if len(views) == 1 else raw
+
+    original_assess = offer_manager.assess_passive_red_candidate
+
+    def record_assessment(**kwargs):
+        assessed.append((kwargs["confidence"], kwargs["candidate_price"]))
+        return original_assess(**kwargs)
+
+    monkeypatch.setattr(offer_manager, "_current_candidate_confidence", changing_view)
+    monkeypatch.setattr(offer_manager, "assess_passive_red_candidate", record_assessment)
+    manager = offer_manager.OfferManager()
+    with (
+        patch.object(offer_manager.cfg, "MINIMUM_PROFIT_XCH", Decimal("1"), create=True),
+        patch.object(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.09")),
+        patch.object(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.11")),
+        patch.object(offer_manager, "get_effective_transaction_fee_mojos", return_value=1),
+        patch.object(
+            offer_manager,
+            "get_exact_spendable_coins_rpc",
+            side_effect=AssertionError("unprofitable offer reached coin selection"),
+        ),
+    ):
+        assert manager.create_ladder(
+            mid_price=Decimal("0.101"),
+            side="buy",
+            num_offers=1,
+            trade_size_xch=Decimal("0.01"),
+            coin_ids_enabled=True,
+            market_confidence=scoped,
+        ) == []
+
+    assert len(views) == 1
+    assert len(assessed) == 1
+    assert assessed[0][0] is scoped
+    assert assessed[0][1] <= scoped.trusted_bid
+
+
 def test_all_production_ladder_paths_forward_current_confidence():
     import bot_loop
 
