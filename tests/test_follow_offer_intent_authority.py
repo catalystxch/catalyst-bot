@@ -283,7 +283,10 @@ def test_consented_red_follow_ladder_dispatches_only_passive_quotes(monkeypatch)
     assert all(ask <= price <= Decimal("0.00015") for price in sell_prices)
 
 
-def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(monkeypatch):
+@pytest.mark.parametrize("bid_drop_read", [3, 4])
+def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(
+    monkeypatch, bid_drop_read
+):
     from types import SimpleNamespace
 
     from confidence_override import ConsentedConfidence
@@ -305,7 +308,9 @@ def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(monkeypatch)
 
     def fresh_view():
         reads.append(1)
-        return initial if len(reads) <= 3 else changed
+        # One view serves slot pricing and its first assessment. Recheck
+        # before dispatch and again at the wallet-effect boundary.
+        return initial if len(reads) < bid_drop_read else changed
 
     scoped = ConsentedConfidence(
         raw,
@@ -316,10 +321,17 @@ def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(monkeypatch)
     monkeypatch.setattr(offer_manager.cfg, "TIER_ENABLED", False)
     monkeypatch.setattr(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375"))
     monkeypatch.setattr(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015"))
+
+    def intercept_wallet_dispatch(_manager, *_args, **kwargs):
+        if bid_drop_read == 3:
+            pytest.fail("wallet dispatch reached")
+        assert kwargs["market_authorizer"]() is False
+        return {"success": False, "error": "market_data_invalid"}
+
     monkeypatch.setattr(
         offer_manager.OfferManager,
         "create_offer_with_retry",
-        lambda *_args, **_kwargs: pytest.fail("wallet dispatch reached"),
+        intercept_wallet_dispatch,
     )
     monkeypatch.setattr(
         database,
@@ -338,4 +350,4 @@ def test_red_quote_is_rejected_when_fresh_bid_falls_before_dispatch(monkeypatch)
         market_confidence=scoped,
         follow_run_id=RUN_ID,
     )
-    assert len(reads) >= 4
+    assert len(reads) >= bid_drop_read
