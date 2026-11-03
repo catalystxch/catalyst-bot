@@ -8222,6 +8222,9 @@ def _migrate_stability_schema() -> None:
                 "offer_refresh_aborts",
                 "offer_refresh_published_cleanups",
                 "offer_refresh_abort_successions",
+                # New fee-mode marker on profiles whose original stability
+                # backfill completed before this table existed.
+                "unbounded_fee_approvals",
                 "follow_run_reapprovals",
                 "runtime_recovery_epochs",
                 "runtime_recovery_takeovers",

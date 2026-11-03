@@ -70,7 +70,7 @@
 
 ## Task 5: Build and live acceptance
 
-Clean Windows build from the final formatted feature worktree passed on 2026-11-03. Staged `dist/Catalyst/Catalyst.exe` is 11,708,731 bytes, SHA-256 `09A1CAA091DB20B73821C6472B45DBF6184DA8A5A4E2084DBABEF04121103C85`. The installed executable was not replaced. Full suite: 8,440 passed, 384 skipped, 460 subtests passed; 85 focused tests passed after formatting. Ruff lint/format, `git diff --check`, and Bandit for the three new source modules passed.
+The first clean Windows candidate exposed an original-profile startup migration issue during live launch. The new `unbounded_fee_approvals` marker was incorrectly classified as a missing legacy table when the existing stability watermark was present. A regression test reproduced the failure; the migration fix and source startup against the original profile passed. A new clean build and full suite are required before live acceptance. The installed executable was not replaced. The first full suite passed 8,440 tests, skipped 384, and passed 460 subtests; 85 focused tests passed after formatting. Ruff lint/format, `git diff --check`, and Bandit for the three new source modules passed.
 
 - [ ] Run relevant tests and full suite in clean profiles, lint/format/security gates and a normal Windows build from the exact commit.
 - [ ] Verify each build file/hash and open a draft PR into `main`; keep release unpublished during acceptance.

@@ -859,6 +859,27 @@ def test_existing_stability_watermark_allows_refresh_abort_table_install(
     assert _integrity(isolated_database) == "ok"
 
 
+def test_existing_stability_watermark_allows_unbounded_fee_marker_install(
+    isolated_database,
+):
+    """An existing profile can add the new immutable fee-mode marker."""
+
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM stability_migration_watermarks WHERE migration_key=?",
+            (database._STABILITY_BACKFILL_MIGRATION_KEY,),
+        ).fetchone()
+        conn.execute("DROP TABLE unbounded_fee_approvals")
+        conn.commit()
+
+    database._migrate_stability_schema()
+
+    assert "unbounded_fee_approvals" in _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
 def test_existing_stability_watermark_allows_refresh_abort_succession_install(
     isolated_database,
 ):
