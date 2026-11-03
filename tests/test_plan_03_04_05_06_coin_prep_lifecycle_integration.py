@@ -261,6 +261,7 @@ class _TempDB(unittest.TestCase):
         full_reset=False,
         *,
         reset_offer_history=False,
+        reset_counters=False,
         wallet_offer_snapshot=None,
         legacy_recovery=None,
     ):
@@ -311,6 +312,7 @@ class _TempDB(unittest.TestCase):
                 json={
                     "full_reset": full_reset,
                     "reset_offer_history": reset_offer_history,
+                    "reset_counters": reset_counters,
                     "fee_approval_id": "a" * 64,
                 },
                 headers={"X-Bot-Local-Token": self.token},
@@ -707,6 +709,22 @@ class TestCoinPrepFullCycle(_TempDB):
             "retry coin prep without clearing protected history", data["message"]
         )
         self.assertFalse(api_server._coin_prep_state.get("running"))
+
+    def test_runtime_counter_reset_preserves_position_during_reprep(self):
+        """Re-prep counter cleanup must not erase accumulated trading exposure."""
+        from types import SimpleNamespace
+
+        bot = self._make_bot()
+        risk = SimpleNamespace(net_position_cat=Decimal("123"))
+        risk.reset_position = lambda: setattr(risk, "net_position_cat", Decimal("0"))
+        bot.risk_manager = risk
+        bot._watchdog_violation_streaks = {"old": 3}
+        self._seed_fill()
+        response = self._trigger(bot_mock=bot, reset_counters=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(risk.net_position_cat, Decimal("123"))
+        self.assertEqual(bot._watchdog_violation_streaks, {})
+        self.assertEqual(self._fill_count(), 1)
 
     def test_offer_history_reset_does_not_auto_resume_after_cancellation(self):
         """Cancelling creates proof history, so that requested reset must stay manual."""

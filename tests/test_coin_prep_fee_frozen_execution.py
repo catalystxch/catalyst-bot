@@ -16,7 +16,7 @@ from sage_offer_wire import encode_wallet_puzzle_hash
 
 
 @pytest.fixture
-def approved(tmp_path, monkeypatch):
+def approved(tmp_path, monkeypatch, request):
     # conftest restores project modules between files; this fixture is reused
     # by other files, so never retain a previous file's database/clock binding.
     global database, api_server
@@ -27,6 +27,15 @@ def approved(tmp_path, monkeypatch):
     utils.economic_reads(state, monkeypatch)
     runtime = import_module("coin_prep_fee_runtime")
     service = import_module("coin_prep_fee_approval")
+    if getattr(request, "param", None) == "bounded":
+        # Exercise historical bounded Follow approvals without changing the
+        # standard new-preview mode used by the rest of this fixture's users.
+        original_estimate = service.estimate_coin_prep_fee_preview
+
+        def bounded_estimate(*args, **kwargs):
+            return original_estimate(*args, **{**kwargs, "unbounded_fee_mode": False})
+
+        monkeypatch.setattr(service, "estimate_coin_prep_fee_preview", bounded_estimate)
     pricing = import_module("coin_prep_fee_pricing")
     tx_fees = import_module("tx_fees")
     monkeypatch.setattr(runtime, "cfg", state["config"])
@@ -164,6 +173,7 @@ def test_expired_guidance_does_not_erase_frozen_consent_or_existing_holds(approv
     database.init_database()
     result = _read(approved)
     assert result["approval"]["held_fee_mojos"] == 10
+    assert result["approval"]["unbounded"] is True
     assert result["approval"]["remaining_fee_mojos"] == 70
     assert result["approval"]["remaining_preparation_fee_mojos"] == 30
     assert result["recipe"]["targets"][-1].amount_mojos == 11_000

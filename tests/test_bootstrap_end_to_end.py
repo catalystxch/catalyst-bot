@@ -377,8 +377,8 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     assert args == {
         "xch_target": 9,
         "cat_target": 3,
-        "buy_tier_sizes": "inner=0.03333333333333333333333333333,mid=0.03333333333333333333333333333,outer=0.03333333333333333333333333334,fees=0.001",
-        "cat_tier_sizes": "inner=33.33333333333333333333333333,mid=33.33333333333333333333333333,outer=33.33333333333333333333333334",
+        "buy_tier_sizes": "inner=0.033333333334,mid=0.033333333333,outer=0.033333333333,fees=0.001",
+        "cat_tier_sizes": "inner=33.334,mid=33.333,outer=33.333",
         "tier_counts_xch": "inner=1,mid=1,outer=1,fees=6",
         "tier_counts_cat": "inner=1,mid=1,outer=1",
         "prep_headroom_pct": "0",
@@ -391,13 +391,13 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
     prepared_xch = {
         tier: precision_worker._apply_prep_headroom_xch(amount)
         for tier, amount in {
-            "inner": Decimal("0.03333333333333333333333333333"),
-            "mid": Decimal("0.03333333333333333333333333333"),
-            "outer": Decimal("0.03333333333333333333333333334"),
+            "inner": Decimal("0.033333333334"),
+            "mid": Decimal("0.033333333333"),
+            "outer": Decimal("0.033333333333"),
         }.items()
     }
     assert prepared_xch == {
-        "inner": Decimal("0.033333333333"),
+        "inner": Decimal("0.033333333334"),
         "mid": Decimal("0.033333333333"),
         "outer": Decimal("0.033333333333"),
     }
@@ -405,9 +405,9 @@ def test_bootstrap_coin_prep_uses_exact_campaign_outputs_including_single_coins(
         int(prepared_xch[tier] * Decimal("1000000000000"))
         >= int(live_size * Decimal("1000000000000"))
         for tier, live_size in {
-            "inner": Decimal("0.03333333333333333333333333333"),
-            "mid": Decimal("0.03333333333333333333333333333"),
-            "outer": Decimal("0.03333333333333333333333333334"),
+            "inner": Decimal("0.033333333334"),
+            "mid": Decimal("0.033333333333"),
+            "outer": Decimal("0.033333333333"),
         }.items()
     )
 
@@ -603,13 +603,18 @@ def test_bootstrap_coin_prep_reduces_only_the_filled_campaign_side_capacity(
     assert counts == {"buy": 9, "sell": 10}
 
 
+@pytest.mark.parametrize("effective_fee_mojos", [0, 10_000_000])
 def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
-    bootstrap_app, monkeypatch
+    bootstrap_app, monkeypatch, effective_fee_mojos
 ):
     from blueprints import coin_prep
     import tx_fees
     import wallet
 
+    monkeypatch.setattr(coin_prep.cfg, "FEE_PREP_COUNT", 50, raising=False)
+    monkeypatch.setattr(
+        coin_prep.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.001"), raising=False
+    )
     _bootstrap, client, _identity, _clock = bootstrap_app
     preview = client.post("/api/bootstrap/preview", json=_request()).get_json()
     started = client.post(
@@ -643,7 +648,7 @@ def test_active_bootstrap_coin_prep_uses_bounded_replacement_wave_counts(
         },
     )
     monkeypatch.setattr(
-        tx_fees, "get_effective_transaction_fee_mojos", lambda: 10_000_000
+        tx_fees, "get_effective_transaction_fee_mojos", lambda: effective_fee_mojos
     )
     monkeypatch.setattr(coin_prep, "get_fills", lambda **_kwargs: [])
     monkeypatch.setattr(coin_prep, "get_offer_intents_for_registry", lambda: [])
@@ -1352,6 +1357,16 @@ def test_live_bot_executes_active_bootstrap_and_queues_publication(
     )
     loop._emit_coin_update = lambda reason: created_call.setdefault("emit", reason)
 
+    # This isolated publication test stubs creation itself. Model the explicit
+    # fee-consent precondition; readiness failures have independent coverage.
+    import bootstrap_fee_authority
+
+    monkeypatch.setattr(
+        bootstrap_fee_authority,
+        "cancellation_fee_readiness",
+        lambda campaign: {"ready": True, "approval_id": "b" * 64},
+    )
+
     result = loop._route_bootstrap_creation_if_active(
         current_buy_ids=set(), current_sell_ids=set()
     )
@@ -1898,6 +1913,77 @@ def test_superseded_revision_trade_ids_are_fenced_before_replacement():
         revision=2,
         live_trade_ids=live,
     ) == ("01" * 32, "02" * 32)
+
+
+@pytest.mark.parametrize("intent_revision, transition", [(1, False), (2, True)])
+def test_live_bootstrap_refreshes_fee_reserve_before_cancel(
+    monkeypatch, intent_revision, transition
+):
+    """A prior cancel can spend the in-memory fee coin before later cleanup."""
+    import tx_fees
+    import wallet
+
+    trade_id = "01" * 32
+    campaign = {
+        "campaign_id": "ab" * 32,
+        "revision": 2,
+        "fee_spent_xch": "0",
+    }
+    order = []
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_balance",
+        lambda _wallet_id: {
+            "success": True,
+            "wallet_balance": {"confirmed_wallet_balance": 1_000_000_000_000},
+        },
+    )
+    monkeypatch.setattr(tx_fees, "get_effective_transaction_fee_mojos", lambda: 0)
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_offer_intents_for_registry",
+        lambda: [
+            {
+                "sage_trade_id": trade_id,
+                "purpose": f"bootstrap:{campaign['campaign_id']}:revision:{intent_revision}",
+                "lifecycle_state": "created",
+            }
+        ],
+    )
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    loop._publication_discovery_pending = 0
+    loop._market_confidence_result = None
+    loop.coin_manager = SimpleNamespace(
+        is_busy=lambda: False,
+        refresh_fee_pool_from_wallet=lambda: order.append("refresh"),
+    )
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda *_args, **_kwargs: order.append("cancel")
+    )
+    loop._bootstrap_campaign_context = lambda: {
+        "active": True,
+        "blocked": False,
+        "campaign": campaign,
+        "identity": {},
+    }
+    loop._refresh_bootstrap_campaign_evidence = lambda **_kwargs: {
+        "campaign": campaign,
+        "runtime": {
+            "transition": {
+                "cancel_required": True,
+                "cancel_reason": "bootstrap_market_withdrawal",
+            }
+        }
+        if transition
+        else None,
+        "changed": False,
+    }
+
+    result = loop._route_bootstrap_creation_if_active(
+        current_buy_ids={trade_id}, current_sell_ids=set()
+    )
+    assert result == {"buy": set(), "sell": set()}
+    assert order == ["refresh", "cancel"]
 
 
 def test_live_bot_materializes_authoritative_stage_before_creating(

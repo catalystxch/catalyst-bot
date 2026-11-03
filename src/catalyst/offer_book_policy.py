@@ -141,15 +141,28 @@ def _bootstrap_decimal(
     return value
 
 
-def _split_exact(total: Decimal) -> tuple[Decimal, Decimal, Decimal]:
-    unit = total / Decimal("3")
-    return unit, unit, total - unit - unit
+def _split_exact(total: Decimal, decimals: int) -> tuple[Decimal, Decimal, Decimal]:
+    """Split a stage into three spendable atomic amounts without overrun."""
+    if type(decimals) is not int or not 0 <= decimals <= 18:
+        raise ValueError("Bootstrap asset scale is invalid")
+    if type(total) is not Decimal or not total.is_finite() or total < 0:
+        raise ValueError("Bootstrap stage amount is invalid")
+    scale = Decimal(10**decimals)
+    atoms = int(total * scale)
+    if atoms == 0:
+        return (Decimal("0"), Decimal("0"), Decimal("0"))
+    if atoms < 3:
+        raise ValueError("Bootstrap stage cannot fund three atomic offers")
+    unit, remainder = divmod(atoms, 3)
+    return tuple(Decimal(unit + (index < remainder)) / scale for index in range(3))
 
 
 def derive_bootstrap_plan(
     campaign: BootstrapCampaign,
     decision: BootstrapDecision,
     balances: dict[str, Any],
+    *,
+    cat_decimals: int = 3,
 ) -> dict[str, Any]:
     """Derive a bounded, purpose-separated three-level Bootstrap plan."""
 
@@ -159,6 +172,8 @@ def derive_bootstrap_plan(
         raise TypeError("decision must be a BootstrapDecision")
     if type(balances) is not dict:
         raise TypeError("balances must be a dict")
+    if type(cat_decimals) is not int or not 0 <= cat_decimals <= 18:
+        raise ValueError("Bootstrap CAT scale is invalid")
     if (
         decision.minimum_price != campaign.minimum_price
         or decision.maximum_price != campaign.maximum_price
@@ -177,6 +192,9 @@ def derive_bootstrap_plan(
     network_fee = _bootstrap_decimal(balances, "network_fee_xch")
     minimum_profit = _bootstrap_decimal(balances, "minimum_profit_xch")
     fee_coin_size = _bootstrap_decimal(balances, "fee_coin_size_xch")
+    fee_pool_enabled = balances.get("fee_pool_enabled", False)
+    if type(fee_pool_enabled) is not bool:
+        raise ValueError("fee_pool_enabled must be a boolean")
     expected_cancel_requotes = balances.get("expected_cancel_requotes", 0)
     if type(expected_cancel_requotes) is not int or expected_cancel_requotes < 0:
         raise ValueError("expected_cancel_requotes must be nonnegative")
@@ -278,8 +296,8 @@ def derive_bootstrap_plan(
         CampaignSide.SELL: (Decimal("1.02"), Decimal("1.05"), Decimal("1.10")),
     }
     amounts = {
-        CampaignSide.BUY: _split_exact(xch_deployment),
-        CampaignSide.SELL: _split_exact(cat_deployment),
+        CampaignSide.BUY: _split_exact(xch_deployment, 12),
+        CampaignSide.SELL: _split_exact(cat_deployment, cat_decimals),
     }
     level_names = ("near", "middle", "far")
     all_levels: list[dict[str, Any]] = []
@@ -404,7 +422,7 @@ def derive_bootstrap_plan(
                 "amount_xch": fee_coin_size,
             }
             for level in all_levels
-            if network_fee > 0
+            if network_fee > 0 or fee_pool_enabled
         ],
         "excluded_xch": {
             "campaign_undeployed_xch": campaign.xch_budget - xch_deployment,

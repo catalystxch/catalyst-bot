@@ -333,6 +333,9 @@ class Config:
         if _liquidity_mode_raw not in ("two_sided", "buy_only", "sell_only"):
             _liquidity_mode_raw = "two_sided"
         self.LIQUIDITY_MODE = _liquidity_mode_raw
+        # User's saved choice to quote passive ladders in a thin RED market.
+        # The live wallet/run authority and price evidence remain separate.
+        self.THIN_MARKET_ENABLED = _bool("THIN_MARKET_ENABLED", False)
         # Read the raw ENABLE flags, then override if LIQUIDITY_MODE pins
         # a single side. A misconfigured env (e.g. mode=buy_only with
         # ENABLE_BUY=False) always resolves in favour of LIQUIDITY_MODE
@@ -983,6 +986,7 @@ class Config:
         self.SPLASH_RECEIVE_MAX_BACKLOG = _int("SPLASH_RECEIVE_MAX_BACKLOG", 250)
         self.SPLASH_BINARY_PATH = _str("SPLASH_BINARY_PATH", "")
         self.SPLASH_P2P_PORT = _int("SPLASH_P2P_PORT", 11511)
+        self.SPLASH_KNOWN_PEER = _str("SPLASH_KNOWN_PEER", "").strip()
         self.SPLASH_AUTO_START = _bool("SPLASH_AUTO_START", True)
         self.SPLASH_TESTNET = _bool("SPLASH_TESTNET", False)
 
@@ -1061,6 +1065,7 @@ class Config:
         "ENABLE_BUY",
         "ENABLE_SELL",
         "LIQUIDITY_MODE",
+        "THIN_MARKET_ENABLED",
         "LOOP_SECONDS",
         "MIN_TRADE_XCH",
         "MAX_TRADE_XCH",

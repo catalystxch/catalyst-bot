@@ -183,6 +183,238 @@ def _append_event(operation_id: str, *, blocks: bool, suffix: str) -> None:
     )
 
 
+def test_restricted_recovery_can_own_inactive_lease_while_latch_stays_tripped(
+    isolated_gate_database,
+):
+    """An exact cleanup owner must not need to clear the durable fence."""
+
+    _path, clock = isolated_gate_database
+    prior = _gate(clock, run_id="prior")
+    assert prior.acquire()["acquired"] is True
+    operation_id = "cancel:" + "b" * 64
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[operation_id],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    assert prior.release_lease()["released"] is True
+
+    recovery = _gate(clock, run_id="restricted-recovery")
+    assert recovery.acquire()["acquired"] is True
+    status = recovery.status()
+    assert status.allowed is False
+    assert status.reason_code == "UNRESOLVED_OPERATIONS"
+    assert status.owner_is_this_run is True
+    assert database.get_runtime_safety_latch()[
+        "blocking_operation_ids_json"
+    ] == json.dumps([operation_id])
+    with pytest.raises(mutation_gate.MutationBlocked):
+        recovery.enter_mutation("wallet:create_offer")
+
+
+def test_generic_expired_lease_takeover_stays_blocked_during_refresh_abort(
+    isolated_gate_database,
+):
+    """A dead prior owner requires a scoped successor, not generic takeover."""
+
+    _path, clock = isolated_gate_database
+    prior = _gate(clock, run_id="prior", pid=111)
+    assert prior.acquire()["acquired"] is True
+    database.trip_runtime_safety_latch(
+        reason_code="REFRESH_ABORT_CLEANUP",
+        blocking_operation_ids=["refresh-abort:" + "a" * 64],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    clock.advance(31)
+    successor = _gate(
+        clock,
+        run_id="candidate-successor",
+        pid=222,
+        pid_liveness=lambda _pid, _host: False,
+    )
+
+    takeover = successor.acquire()
+
+    assert takeover["acquired"] is False
+    assert takeover["reason"] == "safety_latch_tripped"
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    assert database.get_runtime_mutation_lease()["owner_run_id"] == "prior"
+
+
+def test_refresh_abort_cleanup_enter_is_exact_and_keeps_general_gate_closed(
+    isolated_gate_database, monkeypatch
+):
+    """A retained abort blocker permits only its own reviewed cancellation."""
+
+    _path, clock = isolated_gate_database
+    gate = _gate(clock)
+    assert gate.acquire()["acquired"] is True
+    abort_id = "a" * 64
+    trade_id = "b" * 64
+    blocker = f"refresh-abort:{abort_id}"
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=WALLET_HASH,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    status = gate.status()
+    assert status.allowed is False
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+
+    def authorize(**request):
+        assert request["abort_id"] == abort_id
+        assert request["trade_id"] in {trade_id, "c" * 64}
+        return {
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "intent_id": "intent-child",
+            "blocking_operation_id": blocker,
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "latch_generation": status.latch_generation,
+            "lease_version": gate._lease_version,
+            "lease_acquired_at": gate._lease_acquired_at,
+            "observed_at": NOW.isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            ),
+            "prepared_operation_id": request.get("prepared_operation_id"),
+        }
+
+    monkeypatch.setattr(database, "authorize_refresh_abort_cleanup_target", authorize)
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_refresh_abort_cleanup(
+            abort_id=abort_id,
+            trade_id="c" * 64,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+        )
+    permit = gate.enter_refresh_abort_cleanup(
+        abort_id=abort_id,
+        trade_id=trade_id,
+        expected_latch_generation=status.latch_generation,
+        observed_trade_ids=[trade_id],
+        observed_pending_transaction_ids=[],
+        observed_at=NOW,
+    )
+    assert gate.active_mutation_count() == 1
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_refresh_abort_cleanup_permit(
+            permit,
+            abort_id=abort_id,
+            trade_id="c" * 64,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+            prepared_operation_id=f"cancel:{trade_id}",
+        )
+    checked = gate.require_refresh_abort_cleanup_permit(
+        permit,
+        abort_id=abort_id,
+        trade_id=trade_id,
+        expected_latch_generation=status.latch_generation,
+        observed_trade_ids=[trade_id],
+        observed_pending_transaction_ids=[],
+        observed_at=NOW,
+        prepared_operation_id=f"cancel:{trade_id}",
+    )
+    assert checked["trade_id"] == trade_id
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.enter_mutation("wallet:create_offer")
+    assert gate.exit_mutation(permit) is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        gate.require_refresh_abort_cleanup_permit(
+            permit,
+            abort_id=abort_id,
+            trade_id=trade_id,
+            expected_latch_generation=status.latch_generation,
+            observed_trade_ids=[trade_id],
+            observed_pending_transaction_ids=[],
+            observed_at=NOW,
+            prepared_operation_id=f"cancel:{trade_id}",
+        )
+
+
+def test_refresh_abort_wallet_permit_rechecks_exact_book_and_identity(
+    isolated_gate_database, monkeypatch
+):
+    _path, clock = isolated_gate_database
+    adapter = object()
+    gate, binding = _wallet_owner(clock, adapter, run_id="cleanup-owner")
+    assert gate.acquire()["acquired"] is True
+    monkeypatch.setattr(mutation_gate, "_runtime", gate)
+    abort_id = "a" * 64
+    trade_id = "b" * 64
+    blocker = f"refresh-abort:{abort_id}"
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=gate.wallet_fingerprint_hash,
+        network="mainnet",
+        tripped_at=NOW,
+    )
+    status = gate.status()
+    observed_at = NOW.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    def authorize(**request):
+        if request["observed_trade_ids"] != [trade_id]:
+            raise ValueError("Sage book mismatch")
+        return {
+            "abort_id": abort_id,
+            "trade_id": trade_id,
+            "blocking_operation_id": blocker,
+            "wallet_fingerprint_hash": gate.wallet_fingerprint_hash,
+            "network": "mainnet",
+            "latch_generation": status.latch_generation,
+            "lease_version": gate._lease_version,
+            "lease_acquired_at": gate._lease_acquired_at,
+            "prepared_operation_id": request.get("prepared_operation_id"),
+        }
+
+    monkeypatch.setattr(database, "authorize_refresh_abort_cleanup_target", authorize)
+    request = {
+        "abort_id": abort_id,
+        "trade_id": trade_id,
+        "expected_latch_generation": status.latch_generation,
+        "observed_trade_ids": [trade_id],
+        "observed_pending_transaction_ids": [],
+        "observed_at": observed_at,
+    }
+    permit = mutation_gate.enter_refresh_abort_cleanup_wallet_mutation(**request)
+    assert permit.mode == "refresh_abort_cleanup"
+    with pytest.raises(mutation_gate.MutationBlocked):
+        mutation_gate.enter_wallet_mutation("wallet:create_offer")
+    snapshot = _wallet_snapshot(clock, binding)
+    checked_binding, checked_adapter, decision = (
+        mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+            permit, snapshot, **request
+        )
+    )
+    assert checked_binding is binding
+    assert checked_adapter is adapter
+    assert decision["allowed"] is True
+    with pytest.raises(ValueError, match="Sage book mismatch"):
+        mutation_gate.require_fresh_refresh_abort_cleanup_wallet_continuation(
+            permit,
+            _wallet_snapshot(clock, binding),
+            **{**request, "observed_trade_ids": []},
+        )
+    assert mutation_gate.exit_wallet_mutation(permit) is True
+    with pytest.raises(mutation_gate.MutationBlocked):
+        mutation_gate.require_refresh_abort_cleanup_wallet_permit_authority(
+            permit, abort_id=abort_id, trade_id=trade_id, operation="cancel"
+        )
+
+
 def _active_delegation_row(handoff, environment, now):
     return database.get_valid_worker_delegation(
         delegation_id=handoff.delegation_id,
@@ -3182,7 +3414,8 @@ import api_server
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=15,
+        # This checks import side effects, not cold-import latency under load.
+        timeout=90,
         check=False,
     )
 
@@ -3418,7 +3651,6 @@ def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
     expected = {
         "activate_boost": "app_bridge:activate_boost",
         "begin_startup": "app_bridge:begin_startup",
-        "cancel_all_offers": "app_bridge:cancel_all_offers",
         "cancel_offer": "app_bridge:cancel_offer",
         "cleanup_orphans": "app_bridge:cleanup_orphans",
         "deactivate_boost": "app_bridge:deactivate_boost",
@@ -3430,6 +3662,9 @@ def test_app_bridge_mutation_methods_are_explicitly_guarded_and_return_dicts(
         name: getattr(getattr(app_bridge.AppBridge, name), "_mutation_operation", None)
         for name in expected
     } == expected
+    assert app_bridge._APP_BRIDGE_ROUTE_GUARDED_MUTATION_METHODS == {
+        "cancel_all_offers"
+    }
 
     calls = []
     monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
@@ -7652,6 +7887,7 @@ def test_desktop_lease_acquisition_defers_owner_services_until_port_reserved(
         "COIN_PREP_EFFECT_UNKNOWN",
         "WALLET_EFFECT_SUBMITTED_UNRECONCILED",
         "WALLET_EFFECT_UNKNOWN_UNRECONCILED",
+        "WALLET_EFFECT_CRASH_UNRESOLVED_UNRECONCILED",
     ],
 )
 def test_desktop_retries_startup_after_exact_coin_prep_recovery(
@@ -7808,6 +8044,47 @@ def test_desktop_coin_prep_recovery_recheck_remains_fail_closed(monkeypatch):
         "bootstrap_denied",
         "arbiter_release",
     ]
+
+
+def test_desktop_enters_only_exact_restricted_refresh_abort_owner(monkeypatch):
+    import api_server
+    import read_only_diagnostics
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    events = []
+    blocked = {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"}
+
+    class Arbiter:
+        acquired = True
+
+        def release(self):
+            events.append("arbiter_release")
+            return True
+
+    monkeypatch.setattr(
+        read_only_diagnostics, "acquire_startup_arbiter", lambda: Arbiter()
+    )
+    monkeypatch.setattr(
+        read_only_diagnostics, "preflight_requires_diagnostics", lambda: False
+    )
+    monkeypatch.setattr(desktop_app, "_acquire_instance_lock", lambda: True)
+    monkeypatch.setattr(database, "attempt_db_recovery", lambda: {"action": "ok"})
+    monkeypatch.setattr(
+        desktop_app, "_initialize_startup_ownership", lambda: dict(blocked)
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_refresh_abort_restricted_startup",
+        lambda auth: events.append(("restricted", auth)) or True,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "activate_wallet_setup_bootstrap",
+        lambda _auth: events.append("bootstrap"),
+    )
+
+    assert desktop_app._authorize_desktop_startup() is True
+    assert events == [("restricted", blocked), "arbiter_release"]
 
 
 def test_desktop_retires_expired_lease_only_after_dead_owner_proof(monkeypatch):
@@ -8193,10 +8470,575 @@ def test_desktop_refreshes_authorization_after_zero_count_latch_recovery(
     assert calls == ["authorize", "recover", "authorize"]
 
 
-def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
+def test_desktop_preserves_single_refresh_abort_blocker_before_legacy_recovery(
     monkeypatch,
 ):
-    """A corrected reconciler must recheck its old fail-closed conflict on restart."""
+    """Normal Task 9 would add a second blocker for an unpublished child."""
+
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    calls = []
+    blocked = {
+        "allowed": False,
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "failed_check": "unresolved_operations",
+    }
+    monkeypatch.setattr(database, "init_database", lambda: calls.append("database"))
+    monkeypatch.setattr(
+        api_server,
+        "initialize_mutation_runtime",
+        lambda: calls.append("authorize") or blocked,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "has_exact_refresh_abort_startup_candidate",
+        lambda: calls.append("candidate") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "recover_legacy_startup_reservations",
+        lambda: calls.append("legacy_recovery") or {"remaining": 1},
+    )
+
+    result = desktop_app._initialize_startup_ownership()
+
+    assert result == blocked
+    assert calls == ["database", "authorize", "candidate"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["valid", "none", "extra_latch", "extra_journal", "active_lease", "wrong_wallet"],
+)
+def test_exact_refresh_abort_startup_discovery_is_read_only_and_narrow(
+    monkeypatch, change
+):
+    import api_server
+
+    operation_id = "cancel:" + "c" * 64
+    latch = {
+        "state": "tripped",
+        "reason_code": "UNRESOLVED_OPERATIONS",
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "blocking_operation_ids_json": json.dumps([operation_id]),
+    }
+    lease = {"active": 0}
+    blockers = [{"operation_id": operation_id}]
+    if change == "extra_latch":
+        latch["blocking_operation_ids_json"] = json.dumps(
+            [operation_id, "create:other"]
+        )
+    elif change == "extra_journal":
+        blockers.append({"operation_id": "create:other"})
+    elif change == "active_lease":
+        lease["active"] = 1
+    elif change == "wrong_wallet":
+        latch["wallet_fingerprint_hash"] = OTHER_WALLET_HASH
+    monkeypatch.setattr(
+        api_server,
+        "cfg",
+        SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64),
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kwargs: (
+            [{"cancel_operation_id": operation_id}] if change != "none" else []
+        ),
+    )
+    monkeypatch.setattr(database, "list_incomplete_refresh_aborts", lambda **_kw: [])
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database, "get_unresolved_offer_operation_blockers", lambda: blockers
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is (change == "valid")
+
+
+def test_exact_refresh_abort_discovery_accepts_only_the_current_owned_lease(
+    monkeypatch,
+):
+    import api_server
+
+    operation_id = "cancel:" + "c" * 64
+    run_id = "restricted-owner"
+    monkeypatch.setattr(
+        api_server, "cfg", SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64)
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(database, "list_incomplete_refresh_aborts", lambda **_kw: [])
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kw: [{"cancel_operation_id": operation_id}],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_runtime_safety_latch",
+        lambda: {
+            "state": "tripped",
+            "reason_code": "UNRESOLVED_OPERATIONS",
+            "wallet_fingerprint_hash": WALLET_HASH,
+            "network": "mainnet",
+            "blocking_operation_ids_json": json.dumps([operation_id]),
+        },
+    )
+    lease = {
+        "active": 1,
+        "owner_run_id": run_id,
+        "owner_pid": os.getpid(),
+        "owner_host": socket.gethostname(),
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": operation_id}],
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is False
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=run_id
+        )
+        is True
+    )
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id="different-run"
+        )
+        is False
+    )
+    lease["owner_pid"] += 1
+    assert (
+        api_server.has_exact_refresh_abort_startup_candidate(
+            allow_active_owner_run_id=run_id
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("post_acquire_valid", [True, False])
+@pytest.mark.parametrize("incomplete_abort", [True, False])
+def test_restricted_startup_rechecks_owned_lease_before_serving(
+    monkeypatch, post_acquire_valid, incomplete_abort
+):
+    import api_server
+
+    events = []
+    run_id = "restricted-owner"
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=736588221,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    authority = object()
+    abort_id = "a" * 64 if incomplete_abort else None
+
+    class Runtime:
+        last_acquire_result = {"acquired": True}
+
+        def __init__(self):
+            self.run_id = run_id
+
+        def register_stop_handler(self, _handler):
+            events.append("stop_handler")
+
+        def status(self):
+            events.append("status")
+            return mutation_gate.GateStatus(
+                allowed=False,
+                reason_code=(
+                    "REFRESH_ABORT_CLEANUP"
+                    if incomplete_abort
+                    else "UNRESOLVED_OPERATIONS"
+                ),
+                source="durable_latch",
+                latch_generation=667,
+                blocking_operation_ids=("cancel:" + "c" * 64,),
+                lease_active=True,
+                owner_run_id=run_id,
+                owner_pid=os.getpid(),
+                owner_is_this_run=True,
+            )
+
+        def start_heartbeat(self):
+            events.append("heartbeat")
+            return True
+
+        def acquire_refresh_abort_successor(self, **kwargs):
+            events.append(("successor", kwargs["abort_id"]))
+            return {"acquired": True}
+
+    runtime = Runtime()
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setattr(api_server, "_mutation_runtime", None)
+    monkeypatch.setattr(api_server, "_mutation_runtime_db_path", None)
+    monkeypatch.setattr(mutation_gate, "current_runtime", lambda: None)
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", lambda: authority)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(CAT_ASSET_ID="f" * 64))
+
+    def preflight(*, allow_active_owner_run_id=None):
+        events.append(("preflight", allow_active_owner_run_id))
+        return {
+            "eligible": allow_active_owner_run_id is None or post_acquire_valid,
+            "abort_id": abort_id,
+            "wallet_snapshot": {
+                "trade_ids": [],
+                "pending_transaction_ids": [],
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }
+
+    monkeypatch.setattr(
+        api_server, "preflight_refresh_abort_restricted_startup", preflight
+    )
+
+    def initialize(**kwargs):
+        events.append(("initialize", kwargs["acquire_lease"]))
+        return runtime
+
+    monkeypatch.setattr(mutation_gate, "initialize", initialize)
+    monkeypatch.setattr(
+        mutation_gate,
+        "shutdown_runtime",
+        lambda **kwargs: (
+            events.append(("shutdown", kwargs["release_owned_lease"]))
+            or {"released": True}
+        ),
+    )
+    blocked = {
+        "allowed": False,
+        "reason_code": (
+            "REFRESH_ABORT_CLEANUP" if incomplete_abort else "UNRESOLVED_OPERATIONS"
+        ),
+    }
+    assert (
+        api_server.activate_refresh_abort_restricted_startup(blocked)
+        is post_acquire_valid
+    )
+    assert api_server._refresh_abort_recovery_active is post_acquire_valid
+    assert events[0] == ("preflight", None)
+    assert ("preflight", run_id) in events
+    assert (("successor", abort_id) in events) is incomplete_abort
+    if post_acquire_valid:
+        assert "heartbeat" in events
+        assert not any(type(item) is tuple and item[0] == "shutdown" for item in events)
+    else:
+        assert "heartbeat" not in events
+        assert ("shutdown", True) in events
+
+
+@pytest.mark.parametrize("post_ok", [True, False])
+def test_restricted_startup_owns_disposable_fenced_lease_without_trading(
+    isolated_gate_database, monkeypatch, post_ok
+):
+    import api_server
+
+    _path, _clock = isolated_gate_database
+    fingerprint = 736588221
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=fingerprint,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=(datetime.now(timezone.utc) - timedelta(seconds=1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    predecessor = mutation_gate.MutationGate(
+        run_id="disposable-prior",
+        owner_pid=os.getpid(),
+        owner_host=socket.gethostname(),
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+    )
+    assert predecessor.acquire()["acquired"] is True
+    blocker = "cancel:" + "c" * 64
+    database.trip_runtime_safety_latch(
+        reason_code="UNRESOLVED_OPERATIONS",
+        blocking_operation_ids=[blocker],
+        wallet_fingerprint_hash=wallet_hash,
+        network="mainnet",
+        tripped_at=datetime.now(timezone.utc),
+    )
+    assert predecessor.release_lease()["released"] is True
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setattr(api_server, "_mutation_runtime", None)
+    monkeypatch.setattr(api_server, "bot", None)
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(api_server, "get_wallet_adapter_authority", object)
+    monkeypatch.setattr(api_server, "cfg", SimpleNamespace(CAT_ASSET_ID="f" * 64))
+
+    def preflight(*, allow_active_owner_run_id=None):
+        if allow_active_owner_run_id is not None:
+            lease = database.get_runtime_mutation_lease()
+            assert lease["owner_run_id"] == allow_active_owner_run_id
+            assert lease["active"] == 1
+        return {
+            "eligible": allow_active_owner_run_id is None or post_ok,
+            "abort_id": None,
+        }
+
+    monkeypatch.setattr(
+        api_server, "preflight_refresh_abort_restricted_startup", preflight
+    )
+    blocked = {"allowed": False, "reason_code": "UNRESOLVED_OPERATIONS"}
+    assert api_server.activate_refresh_abort_restricted_startup(blocked) is post_ok
+    owned = database.get_runtime_mutation_lease()
+    assert owned["active"] == int(post_ok)
+    assert owned["owner_pid"] == os.getpid()
+    assert database.get_runtime_safety_latch()["state"] == "tripped"
+    if post_ok:
+        assert mutation_gate.status().allowed is False
+        with pytest.raises(mutation_gate.MutationBlocked):
+            mutation_gate.enter_mutation("wallet:create_offer")
+        mutation_gate.shutdown_runtime(release_owned_lease=True)
+    else:
+        assert mutation_gate.current_runtime() is None
+
+
+@pytest.mark.parametrize("stage", ["fenced", "parent_terminal"])
+@pytest.mark.parametrize("lease_state", ["released", "expired"])
+def test_exact_refresh_abort_startup_discovers_incomplete_abort_without_effect(
+    monkeypatch, stage, lease_state
+):
+    """Restart after abort entry must retain its fenced recovery path."""
+
+    import api_server
+
+    abort_id = "a" * 64
+    cancel_op = "cancel:" + "c" * 64
+    abort_op = f"refresh-abort:{abort_id}"
+    expected = {abort_op, cancel_op} if stage == "fenced" else {abort_op}
+    latch = {
+        "state": "tripped",
+        "reason_code": "REFRESH_ABORT_CLEANUP",
+        "generation": 10,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "blocking_operation_ids_json": json.dumps(sorted(expected)),
+    }
+    abort = {
+        "abort_id": abort_id,
+        "state": stage,
+        "cancel_operation_id": cancel_op,
+        "blocking_operation_id": abort_op,
+        "latch_generation": 10,
+        "wallet_fingerprint_hash": WALLET_HASH,
+        "network": "mainnet",
+        "asset_id": "a" * 64,
+        "owner_run_id": "run-a",
+        "lease_owner_pid": 111,
+        "lease_owner_host": "test-host",
+        "lease_acquired_at": "2026-08-15T12:00:00.000000Z",
+    }
+    lease = (
+        {"active": 0}
+        if lease_state == "released"
+        else {
+            "active": 1,
+            "expires_at": "2020-01-01T00:00:00.000000Z",
+            "owner_run_id": "run-a",
+            "owner_pid": 111,
+            "owner_host": "test-host",
+            "acquired_at": "2026-08-15T12:00:00.000000Z",
+        }
+    )
+    monkeypatch.setattr(
+        api_server,
+        "cfg",
+        SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="a" * 64),
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (WALLET_HASH, "mainnet")
+    )
+    monkeypatch.setattr(
+        database, "list_incomplete_refresh_aborts", lambda **_kw: [abort]
+    )
+    monkeypatch.setattr(
+        database, "list_fenced_refresh_abort_candidates", lambda **_kw: []
+    )
+    monkeypatch.setattr(database, "get_runtime_safety_latch", lambda: latch)
+    monkeypatch.setattr(database, "get_runtime_mutation_lease", lambda: lease)
+    monkeypatch.setattr(
+        database,
+        "get_unresolved_offer_operation_blockers",
+        lambda: [{"operation_id": cancel_op}] if stage == "fenced" else [],
+    )
+
+    assert api_server.has_exact_refresh_abort_startup_candidate() is True
+
+
+@pytest.mark.parametrize(
+    "change", ["valid", "valid_abort", "identity", "book", "pending", "candidate_gone"]
+)
+def test_refresh_abort_startup_requires_two_fresh_identity_and_sage_reads(
+    monkeypatch, change
+):
+    import api_server
+    import wallet
+
+    fingerprint = 736588221
+    wallet_hash = mutation_gate.wallet_fingerprint_hash(fingerprint)
+    bound_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    binding = mutation_gate.WalletIdentityBinding(
+        backend="sage",
+        name="TEST 7",
+        fingerprint=fingerprint,
+        network_id="mainnet",
+        kind="private",
+        has_secrets=True,
+        bound_at_utc=bound_at.isoformat().replace("+00:00", "Z"),
+        maximum_age_seconds=60,
+    )
+    observations = []
+    for index in (1, 2):
+        identity = {
+            "success": True,
+            "backend": "sage",
+            "name": "TEST 7",
+            "fingerprint": fingerprint,
+            "network_id": "mainnet",
+            "kind": "private",
+            "has_secrets": True,
+            "observed_at_utc": (bound_at + timedelta(seconds=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        observations.append(identity)
+    if change == "identity":
+        observations[1]["fingerprint"] = 123
+    snapshots = [
+        {
+            "trade_ids": ["a" * 64, "c" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": (bound_at + timedelta(seconds=3))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+        {
+            "trade_ids": ["a" * 64, "c" * 64],
+            "pending_transaction_ids": [],
+            "observed_at": (bound_at + timedelta(seconds=4))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        },
+    ]
+    if change == "book":
+        snapshots[1]["trade_ids"] = ["a" * 64]
+    if change == "pending":
+        snapshots[1]["pending_transaction_ids"] = ["d" * 64]
+    discovery_calls = []
+
+    def discover(**_kwargs):
+        discovery_calls.append(True)
+        return change != "candidate_gone" or len(discovery_calls) == 1
+
+    monkeypatch.setattr(
+        api_server, "has_exact_refresh_abort_startup_candidate", discover
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_mutation_binding", lambda: (wallet_hash, "mainnet")
+    )
+    monkeypatch.setattr(
+        api_server, "_configured_wallet_identity_binding", lambda _network: binding
+    )
+    monkeypatch.setattr(
+        api_server, "cfg", SimpleNamespace(WALLET_TYPE="sage", CAT_ASSET_ID="f" * 64)
+    )
+    monkeypatch.setattr(wallet, "get_wallet_identity", lambda: observations.pop(0))
+    monkeypatch.setattr(
+        wallet, "_read_refresh_abort_cleanup_snapshot", lambda: snapshots.pop(0)
+    )
+    monkeypatch.setattr(
+        database,
+        "list_incomplete_refresh_aborts",
+        lambda **_kw: (
+            [
+                {
+                    "abort_id": "e" * 64,
+                    "target_trade_ids_json": json.dumps(["a" * 64, "c" * 64]),
+                }
+            ]
+            if change == "valid_abort"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        database,
+        "list_fenced_refresh_abort_candidates",
+        lambda **_kw: (
+            []
+            if change == "valid_abort"
+            else [
+                {
+                    "child_trade_id": "a" * 64,
+                    "parent_trade_id": "b" * 64,
+                    "cancel_operation_id": "cancel:" + "b" * 64,
+                }
+            ]
+        ),
+    )
+
+    if change in {"valid", "valid_abort"}:
+        assert mutation_gate.validate_wallet_identity(binding, observations[0])[
+            "allowed"
+        ]
+        assert mutation_gate.validate_wallet_identity(
+            binding,
+            observations[1],
+            last_observed_at_utc=observations[0]["observed_at_utc"],
+        )["allowed"]
+
+    result = api_server.preflight_refresh_abort_restricted_startup()
+
+    assert result["eligible"] is (change in {"valid", "valid_abort"}), result
+    if change in {"valid", "valid_abort"}:
+        assert result["wallet_snapshot"]["trade_ids"] == ["a" * 64, "c" * 64]
+        assert len(discovery_calls) == 2
+    if change == "valid_abort":
+        assert result["abort_id"] == "e" * 64
+
+
+def test_desktop_retries_startup_after_legacy_binding_conflict(
+    monkeypatch,
+):
+    """Legacy binding recovery still rechecks startup authority after proof."""
     import api_server
 
     desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
@@ -8205,7 +9047,7 @@ def test_desktop_retries_startup_after_persisted_reconciliation_conflict(
         [
             {
                 "allowed": False,
-                "reason_code": "REGISTRY_BLOCKED",
+                "reason_code": "TASK8_BINDING_CONFLICT",
                 "failed_check": "unresolved_operations",
             },
             {"allowed": True, "reason_code": "", "failed_check": None},
@@ -9628,6 +10470,105 @@ def test_diagnostics_mode_exposes_only_bounded_safety_status(monkeypatch):
         "error": "diagnostics_read_only",
         "reason": "DIAGNOSTICS_READ_ONLY",
     }
+
+
+def test_restricted_refresh_abort_http_mode_denies_every_other_route(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(
+        api_server, "_refresh_abort_recovery_active", True, raising=False
+    )
+    denied = (
+        ("GET", "/api/status"),
+        ("GET", "/api/offers"),
+        ("POST", "/api/bot/start"),
+        ("POST", "/api/offers/cancel_all"),
+        ("POST", "/api/coin-prep/trigger"),
+        ("POST", "/api/bootstrap/start"),
+        ("POST", "/api/splash/node/start"),
+    )
+    for method, path in denied:
+        with api_server.app.test_request_context(
+            path, method=method, environ_base={"REMOTE_ADDR": "127.0.0.1"}
+        ):
+            response = api_server.enforce_local_runtime_guard()
+            assert response is not None, (method, path)
+            assert response[1] == 423, (method, path)
+            assert response[0].get_json()["error"] == "refresh_abort_recovery_only"
+    with api_server.app.test_request_context(
+        "/api/offers/refresh_abort/preview",
+        method="GET",
+        headers={api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN},
+        environ_base={"REMOTE_ADDR": "127.0.0.1"},
+    ):
+        assert api_server.enforce_local_runtime_guard() is None
+
+
+def test_restricted_refresh_abort_mode_serves_only_recovery_view(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    with api_server.app.test_request_context("/"):
+        response = api_server.serve_gui()
+    assert response.status_code == 401
+    with api_server.app.test_request_context(
+        "/",
+        headers={api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN},
+    ):
+        response = api_server.serve_gui()
+    assert response.status_code == 200
+    assert b"Fenced offer recovery" in response.data
+    assert b"/api/offers/refresh_abort/preview" in response.data
+    assert b"Start Bot" not in response.data
+    assert b"Cancel All" not in response.data
+
+
+def test_restricted_refresh_abort_view_requires_native_bootstrap_cookie(monkeypatch):
+    import api_server
+
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    client = api_server.app.test_client()
+    denied = client.get("/")
+    assert denied.status_code == 401
+    bootstrap = client.get("/?bootstrap=" + api_server._LOCAL_API_BOOTSTRAP_TOKEN)
+    assert bootstrap.status_code == 302
+    assert bootstrap.headers["Location"] == "/"
+    authorized = client.get("/")
+    assert authorized.status_code == 200
+    assert "no-store" in authorized.headers["Cache-Control"]
+    assert b"Fenced offer recovery" in authorized.data
+    assert b"Start Bot" not in authorized.data
+
+
+def test_restricted_refresh_abort_window_has_no_native_trading_bridge(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "app_bridge",
+        SimpleNamespace(
+            AppBridge=lambda: (_ for _ in ()).throw(
+                AssertionError("trading bridge constructed")
+            )
+        ),
+    )
+
+    assert desktop_app._create_desktop_bridge() is None
+
+
+def test_ordinary_desktop_window_retains_native_bridge(monkeypatch):
+    import api_server
+
+    desktop_app = _import_desktop_app_without_rewrapping_pytest_streams(monkeypatch)
+    sentinel = object()
+    monkeypatch.setattr(api_server, "_refresh_abort_recovery_active", False)
+    monkeypatch.setitem(
+        sys.modules, "app_bridge", SimpleNamespace(AppBridge=lambda: sentinel)
+    )
+
+    assert desktop_app._create_desktop_bridge() is sentinel
 
 
 def test_standalone_diagnostics_shutdown_has_no_shared_side_effects(monkeypatch):

@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 from market_confidence import MarketConfidenceEngine
+from thin_market_reference import select_thin_market_reference
 from providers.models import (
     Capability,
     ObservationQuality,
@@ -92,6 +93,45 @@ def _splash(*, bid="0.099", ask="0.101", amount=3_000, at=None, ids=("s-b", "s-a
         },
         at=at,
     )
+
+
+def test_thin_red_book_keeps_age_stamped_price_for_later_one_sided_book():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    first = engine.evaluate(
+        observations=(_dexie(amount=500),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    assert first.state == "RED"
+    assert first.thin_anchor_midpoint == Decimal("0.1")
+    restored = MarketConfidenceEngine(risk_preset="balanced")
+    restored.hydrate(engine.export_state())
+    later = restored.evaluate(
+        observations=(
+            _observation(
+                "dexie",
+                {
+                    "bids": [
+                        {
+                            "offer_id": "later-bid",
+                            "price": "0.09",
+                            "amount_mojos": 500,
+                        }
+                    ],
+                    "asks": [],
+                },
+                at=NOW + timedelta(hours=1),
+            ),
+        ),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(hours=1),
+    )
+    reference = select_thin_market_reference(later, now=NOW + timedelta(hours=1))
+    assert reference is not None
+    assert reference.source == "thin_anchor"
+    assert reference.midpoint == Decimal("0.1")
 
 
 @pytest.mark.parametrize(
@@ -389,6 +429,103 @@ def test_crossing_dust_cannot_move_price_or_cross_meaningful_book():
     assert result.trusted_bid == Decimal("0.099")
     assert result.trusted_ask == Decimal("0.101")
     assert "crossed_book" not in result.reason_codes
+
+
+def test_trusted_timestamp_updates_only_when_midpoint_is_accepted():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    first = engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    second = engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(seconds=20),
+    )
+
+    assert first.last_trusted_at == NOW
+    assert first.last_trusted_evidence_digests == (_dexie().payload_sha256,)
+    assert second.last_trusted_at == NOW + timedelta(seconds=20)
+
+
+def test_red_carry_forward_preserves_last_trusted_timestamp():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    accepted = engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    red = engine.evaluate(
+        observations=(_dexie(amount=100), _splash(amount=100)),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW + timedelta(hours=3),
+    )
+
+    assert accepted.last_trusted_at == NOW
+    assert red.state == "RED"
+    assert red.trusted_midpoint == accepted.trusted_midpoint
+    assert red.last_trusted_at == NOW
+    assert red.last_trusted_evidence_digests == accepted.last_trusted_evidence_digests
+
+
+def test_trusted_timestamp_round_trips_through_engine_state():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    engine.evaluate(
+        observations=(_dexie(), _splash()),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    restored = MarketConfidenceEngine(risk_preset="balanced")
+    restored.hydrate(engine.export_state())
+
+    assert restored.export_state()["last_trusted_at"] == "2026-09-10T12:00:00Z"
+    assert restored.export_state()["last_trusted_evidence_digests"] == [
+        _dexie().payload_sha256
+    ]
+
+
+def test_hydrate_rejects_invalid_trusted_timestamp():
+    state = MarketConfidenceEngine(risk_preset="balanced").export_state()
+    state.update(
+        last_trusted_midpoint="0.1",
+        last_trusted_bid="0.099",
+        last_trusted_ask="0.101",
+        last_trusted_at="2026-09-10T12:00:00",
+    )
+
+    with pytest.raises(ValueError, match="trusted price timestamp"):
+        MarketConfidenceEngine(risk_preset="balanced").hydrate(state)
+
+
+def test_legacy_trusted_price_without_timestamp_keeps_unknown_age():
+    state = MarketConfidenceEngine(risk_preset="balanced").export_state()
+    state.update(
+        last_trusted_midpoint="0.1",
+        last_trusted_bid="0.099",
+        last_trusted_ask="0.101",
+    )
+    state.pop("last_trusted_at")
+    restored = MarketConfidenceEngine(risk_preset="balanced")
+
+    restored.hydrate(state)
+
+    assert restored.export_state()["last_trusted_at"] is None
+    assert restored.export_state()["last_trusted_evidence_digests"] == []
+    result = restored.evaluate(
+        observations=(_dexie(amount=100), _splash(amount=100)),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    assert result.trusted_midpoint == Decimal("0.1")
+    assert result.last_trusted_at is None
+    assert result.last_trusted_evidence_digests == ()
 
 
 def test_one_sided_provider_does_not_supply_independent_corroboration():

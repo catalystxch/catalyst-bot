@@ -375,6 +375,7 @@ def canonical_coin_prep_contract(
     purpose: str,
     source_coin_ids: list[str],
     target_contract: dict[str, Any],
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     if type(operation_kind) is not str:
         raise TypeError("operation_kind must be an exact string")
@@ -400,6 +401,12 @@ def canonical_coin_prep_contract(
         "source_coin_ids": sources,
         "target_contract": target,
     }
+    # Attempt identity is separate from economic plan_hash. Never overwrite a
+    # terminal journal's immutable claim/evidence when retrying the same plan.
+    if attempt_id is not None:
+        if type(attempt_id) is not str or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
+            raise ValueError("coin prep attempt_id is invalid")
+        material["attempt_id"] = attempt_id
     encoded = json.dumps(
         material, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )

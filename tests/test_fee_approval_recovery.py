@@ -306,6 +306,19 @@ def test_timeout_and_restart_leave_submitted_fee_held(isolated_database, monkeyp
     assert state["held_fee_mojos"] == 10
 
 
+def test_dispatched_unknown_effect_remains_a_recovery_hold(
+    isolated_database, monkeypatch
+):
+    operation_id, claim, _, _, approval = _prepared(monkeypatch)
+    _submit(operation_id, claim, approval)
+    state = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+    assert state["unresolved_operation_count"] == 1
+    assert (
+        state["pending_operation"]["effect_state"] == "submitted_awaiting_confirmation"
+    )
+    assert state["held_fee_mojos"] == 10
+
+
 @pytest.mark.parametrize(
     "outcome,held,spent,remaining", [("CONFIRMED", 0, 10, 90), ("FAILED", 0, 0, 100)]
 )
@@ -371,6 +384,19 @@ def test_exact_journal_evidence_settles_once(
         database.record_fee_reservation_outcome(operation_id, "f" * 64)
     database.record_fee_reservation_outcome(operation_id, _evidence_id(operation))
     database.record_fee_reservation_outcome(operation_id, _evidence_id(operation))
+    # A new standalone scope must disclose settled spent/released outcomes,
+    # not just pending holds, even before its first preview is persisted.
+    previous = database.get_coin_prep_fee_approval_context(approval["approval_id"])
+    scope = {**json.loads(previous["scope_json"]), "session_id": "e" * 64}
+    contract = fee_service.canonical_fee_contract(
+        scope, json.loads(previous["plan_json"])
+    )
+    carried = database.get_fee_scope_budget(
+        contract["scope_sha256"], scope_json=contract["scope_json"]
+    )
+    assert carried["spent_fee_mojos"] == spent
+    assert carried["held_fee_mojos"] == 0
+    assert carried["protected_cancellation_fee_mojos"] == 20
     conn = database.get_connection()
     for statement in [
         "UPDATE approved_fee_outcomes SET evidence_json='{}'",

@@ -6,6 +6,24 @@ from replacement_capacity import canonical_coin_prep_contract
 import wallet
 
 
+_UNSIGNED_BUILD_FAILURES = frozenset(
+    {
+        "SAGE_CONNECTION_ERROR",
+        "SAGE_HTTP_ERROR",
+        "SAGE_RPC_ERROR",
+        "NO_SPENDABLE_COINS",
+        "UNKNOWN_UNSPENT",
+        "MEMPOOL_CONFLICT",
+        "LEASE_OWNED_BY_OTHER",
+        "MUTATION_RUNTIME_NOT_INITIALIZED",
+        "DURABLE_STATE_UNAVAILABLE",
+        "WALLET_IDENTITY_MISMATCH",
+        "WALLET_IDENTITY_BINDING_INVALID",
+        "WALLET_MUTATION_FAILED",
+    }
+)
+
+
 def batch_target_contract(
     plan: BatchPlan, address: str, cat_asset_id: str | None
 ) -> dict:
@@ -109,6 +127,17 @@ def inspect_batch_unsigned(
     if plan.fee_source_id:
         selected.append(plan.fee_source_id)
     unsigned = wallet.build_transaction_rpc(selected, batch_actions(target))
+    if type(unsigned) is dict and unsigned.get("success") is False:
+        reason = next(
+            (
+                unsigned.get(key)
+                for key in ("reason", "error_code", "error")
+                if type(unsigned.get(key)) is str
+                and unsigned[key] in _UNSIGNED_BUILD_FAILURES
+            ),
+            "UNSIGNED_EFFECT_NOT_INSPECTABLE",
+        )
+        return {"available": False, "cost": None, "reason": reason}
     validated = wallet.inspect_unsigned_transaction_effect(
         unsigned, batch_validation_contract(plan, target)
     )

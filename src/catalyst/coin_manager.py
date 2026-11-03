@@ -725,6 +725,7 @@ class FeeCoinPool:
         self._available: list = []  # [(coin_id, amount_mojos), ...]
         self._reserved: set = set()  # coin IDs handed out this cycle
         self._reservation_tickets: dict[str, int] = {}
+        self._external_recovery_ids: set[str] = set()
         self._next_reservation_ticket = 0
         self._lock = threading.Lock()
 
@@ -736,6 +737,7 @@ class FeeCoinPool:
             self._available = []
             self._reserved = set()
             self._reservation_tickets = {}
+            self._external_recovery_ids = set()
             for rec in fee_coin_records:
                 cid = _coin_id_from_record(rec)
                 if cid:
@@ -794,6 +796,30 @@ class FeeCoinPool:
             self._reservation_tickets[coin_id] = ticket
             return coin_id, amount, ticket
 
+    def reserve_external_recovery_with_ticket(
+        self, coin_id: str, amount_mojos: int
+    ) -> tuple[str, int, int] | None:
+        """Reserve one separately verified recovery input without exposing it to normal offers."""
+        if (
+            type(coin_id) is not str
+            or len(coin_id) != 64
+            or any(ch not in "0123456789abcdef" for ch in coin_id)
+            or type(amount_mojos) is not int
+            or amount_mojos <= 0
+        ):
+            return None
+        with self._lock:
+            if coin_id in self._reserved or any(
+                cid == coin_id for cid, _ in self._available
+            ):
+                return None
+            self._next_reservation_ticket += 1
+            ticket = self._next_reservation_ticket
+            self._reserved.add(coin_id)
+            self._reservation_tickets[coin_id] = ticket
+            self._external_recovery_ids.add(coin_id)
+            return coin_id, amount_mojos, ticket
+
     def release_ticket(self, coin_id: str, ticket: int) -> bool:
         """Release only the same in-memory reservation, never a newer one."""
         with self._lock:
@@ -801,6 +827,7 @@ class FeeCoinPool:
                 return False
             del self._reservation_tickets[coin_id]
             self._reserved.discard(coin_id)
+            self._external_recovery_ids.discard(coin_id)
             return True
 
     # ---- introspection ----
@@ -2272,12 +2299,12 @@ class CoinManager:
         for pending cancel transactions.
 
         Much lighter than a full update_coin_counts() — one RPC call,
-        filtered to fee-sized coins only.
+        restricted to durable fee-reserve coins. When the configured fee tier
+        is disabled, previously prepared reserves remain usable for cancelling
+        outstanding offers.
         """
         try:
             fee_size = get_fee_coin_size_mojos()
-            if fee_size <= 0:
-                return
             result = get_exact_spendable_coins_rpc(WALLET_ID_XCH)
             if not result or not result.get("success"):
                 return  # can't refresh — keep existing pool
@@ -2299,7 +2326,7 @@ class CoinManager:
             fee_records = []
             for record in records:
                 amount = int((record.get("coin") or {}).get("amount", 0))
-                if not (low <= amount <= high):
+                if amount <= 0 or (fee_size > 0 and not (low <= amount <= high)):
                     continue
                 enriched = dict(record)
                 enriched["_catalyst_policy_purpose"] = purpose_by_coin_id.get(
@@ -5414,6 +5441,12 @@ class CoinManager:
         # Don't re-scan during active topup/prep (would interfere)
         if not (self._prep_running or self._topup_running):
             self.update_coin_counts()
+            if reason == "startup":
+                # The normal tier scan can omit durable fee_reserve outputs when
+                # new fee-coin preparation is disabled. Restore the exact
+                # spendable reserves before startup market safety may need to
+                # cancel an existing offer.
+                self.refresh_fee_pool_from_wallet()
 
         # --- Coin change detection ---
         self._detect_coin_changes(reason)

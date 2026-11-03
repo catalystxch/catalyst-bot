@@ -131,6 +131,111 @@ def test_evidence_compaction_keeps_daily_non_sensitive_summary(isolated_db):
     assert "raw_evidence" not in summaries[0]
 
 
+def test_evidence_compaction_without_expired_rows_does_not_take_write_lock(isolated_db):
+    persist_provider_observation(_provider_observation(NOW))
+    statements = []
+    conn = database.get_connection()
+    conn.set_trace_callback(statements.append)
+    try:
+        result = database.compact_market_provider_evidence(
+            before=NOW - timedelta(days=30), summarized_at=NOW
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert result == {"deleted": 0, "summaries_written": 0}
+    assert not any(statement.startswith("BEGIN IMMEDIATE") for statement in statements)
+    assert len(database.get_market_provider_observations(asset_id=ASSET_ID)) == 1
+
+
+def test_evidence_compaction_bounds_expired_rows_per_write_transaction(isolated_db):
+    old = NOW - timedelta(days=31)
+    for offset in range(501):
+        persist_provider_observation(
+            _provider_observation(old + timedelta(seconds=offset))
+        )
+
+    first = database.compact_market_provider_evidence(
+        before=NOW - timedelta(days=30), summarized_at=NOW
+    )
+    assert first == {"deleted": 500, "summaries_written": 1}
+    assert (
+        len(database.get_market_provider_observations(asset_id=ASSET_ID, limit=10)) == 1
+    )
+    assert (
+        database.get_market_evidence_summaries(asset_id=ASSET_ID)[0][
+            "observation_count"
+        ]
+        == 500
+    )
+
+    second = database.compact_market_provider_evidence(
+        before=NOW - timedelta(days=30), summarized_at=NOW
+    )
+    assert second == {"deleted": 1, "summaries_written": 1}
+    assert database.get_market_provider_observations(asset_id=ASSET_ID, limit=10) == []
+    assert (
+        database.get_market_evidence_summaries(asset_id=ASSET_ID)[0][
+            "observation_count"
+        ]
+        == 501
+    )
+
+
+def test_evidence_compaction_uses_expiry_index_with_sparse_old_rows(isolated_db):
+    cutoff = NOW - timedelta(days=30)
+    persist_provider_observation(_provider_observation(cutoff - timedelta(seconds=1)))
+    for offset in range(1000):
+        persist_provider_observation(
+            _provider_observation(NOW + timedelta(seconds=offset))
+        )
+
+    conn = database.get_connection()
+    indexed_lookup = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT 1 FROM market_provider_observations WHERE observed_at < ? LIMIT 1",
+        (cutoff.isoformat(),),
+    ).fetchall()
+    indexed_batch = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT observation_id, asset_id FROM market_provider_observations "
+        "WHERE observed_at < ? LIMIT 500",
+        (cutoff.isoformat(),),
+    ).fetchall()
+    assert all(
+        "idx_market_provider_observations_time" in row["detail"]
+        for row in indexed_lookup
+    )
+    assert all(
+        "idx_market_provider_observations_time" in row["detail"]
+        for row in indexed_batch
+    )
+
+    result = database.compact_market_provider_evidence(before=cutoff, summarized_at=NOW)
+    assert result == {"deleted": 1, "summaries_written": 1}
+    assert (
+        len(database.get_market_provider_observations(asset_id=ASSET_ID, limit=2000))
+        == 1000
+    )
+
+
+def test_existing_evidence_database_gains_expiry_index(isolated_db, monkeypatch):
+    conn = database.get_connection()
+    conn.execute("DROP INDEX idx_market_provider_observations_time")
+    conn.commit()
+    database.close_connection()
+    monkeypatch.setattr(database, "_db_initialized_path", "")
+
+    database.init_database()
+
+    indexes = (
+        database.get_connection()
+        .execute("PRAGMA index_list(market_provider_observations)")
+        .fetchall()
+    )
+    assert "idx_market_provider_observations_time" in {row["name"] for row in indexes}
+
+
 def test_bot_housekeeping_compacts_provider_evidence_after_thirty_days(monkeypatch):
     from bot_loop import BotLoop
 

@@ -23,6 +23,7 @@ from offer_registry import (
     OfferReference,
     RegistrySnapshot,
     RegistryState,
+    RefreshAbortAuthority,
     TerminalOutcome,
     authorize_transition,
     offer_record_from_row,
@@ -57,7 +58,7 @@ _EXPIRED_STATUSES = frozenset({5, "expired"})
 _TERMINAL_STATUSES = _FILLED_STATUSES | _CANCELLED_STATUSES | _EXPIRED_STATUSES
 _MAX_EVIDENCE_AGE_SECONDS = 300
 _MAX_SOURCE_SKEW_SECONDS = 60
-_MAX_HISTORY_RECORDS = 4096
+_MAX_HISTORY_RECORDS = 16384
 _MAX_HISTORY_PAGE_SIZE = 4096
 _MAX_HISTORY_PAGES = 20
 _MAX_WALLET_IDS = 64
@@ -158,6 +159,8 @@ def _validate_provider_value_bounds(
     *,
     depth: int = 0,
     state: dict[str, int] | None = None,
+    max_history_list_items: int = _MAX_PROVIDER_CONTAINER_ITEMS,
+    max_text_bytes: int = _MAX_PROVIDER_TOTAL_TEXT_BYTES,
 ) -> None:
     """Preflight exact provider shapes before normalization or copying."""
 
@@ -170,14 +173,14 @@ def _validate_provider_value_bounds(
         if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
             raise _SourceLimitError("provider text exceeds source limit")
         state["text_bytes_upper"] += len(value) * 4
-        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+        if state["text_bytes_upper"] > max_text_bytes:
             raise _SourceLimitError("provider text exceeds source limit")
         return
     if type(value) is bytes:
         if len(value) > _MAX_PROVIDER_SCALAR_CHARS:
             raise _SourceLimitError("provider bytes exceed source limit")
         state["text_bytes_upper"] += len(value)
-        if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+        if state["text_bytes_upper"] > max_text_bytes:
             raise _SourceLimitError("provider bytes exceed source limit")
         return
     if type(value) is int:
@@ -195,15 +198,30 @@ def _validate_provider_value_bounds(
             if len(key) > _MAX_PROVIDER_SCALAR_CHARS:
                 raise _SourceLimitError("provider object key exceeds source limit")
             state["text_bytes_upper"] += len(key) * 4
-            if state["text_bytes_upper"] > _MAX_PROVIDER_TOTAL_TEXT_BYTES:
+            if state["text_bytes_upper"] > max_text_bytes:
                 raise _SourceLimitError("provider text exceeds source limit")
-            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+            _validate_provider_value_bounds(
+                item,
+                depth=depth + 1,
+                state=state,
+                max_history_list_items=max_history_list_items,
+                max_text_bytes=max_text_bytes,
+            )
         return
     if type(value) is list:
-        if len(value) > _MAX_PROVIDER_CONTAINER_ITEMS:
+        list_limit = (
+            max_history_list_items if depth <= 1 else _MAX_PROVIDER_CONTAINER_ITEMS
+        )
+        if len(value) > list_limit:
             raise _SourceLimitError("provider list exceeds source limit")
         for item in value:
-            _validate_provider_value_bounds(item, depth=depth + 1, state=state)
+            _validate_provider_value_bounds(
+                item,
+                depth=depth + 1,
+                state=state,
+                max_history_list_items=max_history_list_items,
+                max_text_bytes=max_text_bytes,
+            )
         return
     raise ValueError("provider value must use exact bounded JSON scalar types")
 
@@ -216,8 +234,17 @@ def _provider_value_within_bounds(value: Any) -> bool:
     return True
 
 
-def _require_provider_bounds(value: Any) -> None:
-    _validate_provider_value_bounds(value)
+def _require_provider_bounds(
+    value: Any,
+    *,
+    max_history_list_items: int = _MAX_PROVIDER_CONTAINER_ITEMS,
+    max_text_bytes: int = _MAX_PROVIDER_TOTAL_TEXT_BYTES,
+) -> None:
+    _validate_provider_value_bounds(
+        value,
+        max_history_list_items=max_history_list_items,
+        max_text_bytes=max_text_bytes,
+    )
 
 
 def _norm_id(value: Any) -> str:
@@ -844,7 +871,7 @@ def _flow(entry: Any) -> tuple[str, str, int, str, str, str] | None:
         not coin_id
         or not asset_id
         or amount is None
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
         or (raw_parent is not None and not parent_coin_id)
         or (raw_condition is not None and not spend_condition_id)
     ):
@@ -979,7 +1006,9 @@ def _fill_proof(
     ]
     if {flow[0] for flow in selected_flows} != set(intent["selected_coin_ids"]):
         return None
-    if any(flow[1] != offered_asset for flow in selected_flows):
+    if any(
+        flow[1] != offered_asset or flow[3] == "external" for flow in selected_flows
+    ):
         return None
     if sum(flow[2] for flow in selected_flows) < intent["offered_amount"]:
         return None
@@ -996,7 +1025,10 @@ def _fill_proof(
     receipts = [
         flow
         for flow in created
-        if flow and flow[1] == requested_asset and flow[2] == intent["requested_amount"]
+        if flow
+        and flow[3] in (None, "own")
+        and flow[1] == requested_asset
+        and flow[2] == intent["requested_amount"]
     ]
     if len(receipts) != 1:
         return None
@@ -1158,8 +1190,13 @@ def _cancel_proof(
     tx: dict[str, Any],
     coins: dict[str, dict[str, Any]],
     context: Any,
+    *,
+    external: bool = False,
 ) -> dict[str, Any] | None:
-    exact_context = _validated_cancel_context(context)
+    if external:
+        exact_context = context if _basic_cancel_members(context) is not None else None
+    else:
+        exact_context = _validated_cancel_context(context)
     if exact_context is None:
         return None
     members = exact_context["members"]
@@ -1248,6 +1285,8 @@ def _cancel_proof(
     spent = [_flow(entry) for entry in tx["spent"]]
     created = [_flow(entry) for entry in tx["created"]]
     if any(flow is None for flow in spent) or any(flow is None for flow in created):
+        return None
+    if any(flow[3] == "external" for flow in (*spent, *created)):
         return None
     spent_by_id = {flow[0]: flow for flow in spent if flow}
     if len(spent_by_id) != len(spent) or set(spent_by_id) != (
@@ -1500,6 +1539,7 @@ def _classify_terminal_evidence(
     *,
     cancel_context: Any = None,
     now: Any = None,
+    external_cancel: bool = False,
 ) -> dict[str, Any]:
     """Classify immutable evidence without database, wallet, or clock side effects."""
 
@@ -1645,7 +1685,57 @@ def _classify_terminal_evidence(
         else candidate_fill
     )
     cancel_candidates: list[dict[str, Any]] = []
-    if cancel_context is not None:
+    if external_cancel and status in _CANCELLED_STATUSES:
+        for row in transactions:
+            candidate = _exact_confirmed_transaction(row)
+            if candidate is None:
+                continue
+            candidate_time = _parse_utc(candidate["timestamp"])
+            if (
+                candidate_time is None
+                or candidate_time < exact_intent["offer_created_at"]
+                or candidate_time > observed_now
+            ):
+                continue
+            spent = candidate.get("spent")
+            if type(spent) is not list:
+                continue
+            selected = set(exact_intent["selected_coin_ids"])
+            spent_ids = {
+                _hex_id(flow.get("coin_id")) for flow in spent if type(flow) is dict
+            }
+            if not selected.issubset(spent_ids):
+                continue
+            auxiliary = sorted(spent_ids - selected)
+            context = {
+                "members": [
+                    {
+                        "trade_id": exact_intent["sage_trade_id"],
+                        "selected_coin_ids": list(exact_intent["selected_coin_ids"]),
+                        "request_timestamp": _canonical_utc(
+                            exact_intent["offer_created_at"]
+                        ),
+                        "transaction_timestamp": candidate["timestamp"],
+                        "transaction_id": _hex_id(candidate.get("transaction_id"))
+                        or None,
+                        "spend_identity": candidate.get("spend_identity"),
+                        "asset_id": exact_intent["asset_id"],
+                        "side": exact_intent["side"],
+                        "offered_amount_atomic": exact_intent["offered_amount_atomic"],
+                        "requested_amount_atomic": exact_intent[
+                            "requested_amount_atomic"
+                        ],
+                        "offer_text_sha256": exact_intent["offer_text_sha256"],
+                    }
+                ],
+                "auxiliary_coin_ids": auxiliary,
+            }
+            proof = _cancel_proof(
+                exact_intent, offer_rows, candidate, coins, context, external=True
+            )
+            if proof is not None:
+                cancel_candidates.append(proof)
+    elif cancel_context is not None:
         candidate_transactions = (
             [tx]
             if tx is not None
@@ -1704,8 +1794,13 @@ def _classify_terminal_evidence(
     if status in _CANCELLED_STATUSES and cancel is not None:
         return {
             "classification": CANCELLED_PROVEN,
-            "reason_code": "EXACT_CANCEL_RETURN_PROOF",
+            "reason_code": (
+                "EXACT_EXTERNAL_CANCEL_RETURN_PROOF"
+                if external_cancel
+                else "EXACT_CANCEL_RETURN_PROOF"
+            ),
             **cancel,
+            **({"origin": "external"} if external_cancel else {}),
         }
     if status in _CANCELLED_STATUSES and fill is not None:
         return _conflict()
@@ -1781,6 +1876,26 @@ def classify_terminal_evidence(
         return _unknown("EVIDENCE_SCHEMA_INVALID")
 
 
+def classify_external_cancel_evidence(
+    intent: Any, evidence: Any, *, now: Any = None
+) -> dict[str, Any]:
+    """Prove a Sage cancellation without claiming a CATalyst wallet effect.
+
+    This pure classifier does not authorize a terminal database write. The
+    external authority and fee audit have a separate transactional boundary.
+    """
+
+    try:
+        result = _classify_terminal_evidence(
+            intent, evidence, now=now, external_cancel=True
+        )
+    except BaseException:
+        return _unknown("EVIDENCE_SCHEMA_INVALID")
+    if result.get("reason_code") == "CANCEL_PROOF_INCOMPLETE":
+        return _unknown("EXTERNAL_CANCEL_PROOF_INCOMPLETE")
+    return result
+
+
 def _offer_list(
     result: Any, *, record_cap: int = _MAX_HISTORY_RECORDS
 ) -> list[dict[str, Any]] | None:
@@ -1805,7 +1920,11 @@ def _offer_list(
         return None
     if any(len(row) > _MAX_PROVIDER_RECORD_FIELDS for row in rows):
         raise _SourceLimitError("offer record fields exceed source limit")
-    _require_provider_bounds(result)
+    _require_provider_bounds(
+        result,
+        max_history_list_items=_MAX_HISTORY_RECORDS,
+        max_text_bytes=32 * 1024 * 1024,
+    )
     return rows
 
 
@@ -2138,7 +2257,7 @@ def _normalized_transaction_flow(entry: Any) -> dict[str, Any] | None:
         or not asset_present
         or not asset_id
         or not amount_text
-        or address_kind not in {None, "own", "offer"}
+        or address_kind not in {None, "own", "offer", "external"}
     ):
         return None
     normalized = {
@@ -2602,6 +2721,8 @@ def load_authoritative_evidence(
             for entry in flows:
                 flow = _flow(entry)
                 if flow:
+                    if flow[3] == "external":
+                        continue
                     if (
                         flow[0] not in required_ids
                         and len(required_ids) >= _MAX_COIN_RECORDS
@@ -2759,6 +2880,13 @@ def load_authoritative_evidence(
                 for tx in supplemental_transactions:
                     for flow_name in ("spent", "created"):
                         for flow in tx.get(flow_name) or []:
+                            # Keep invalid flows in transaction evidence so the
+                            # terminal classifier still rejects incomplete proof.
+                            # They cannot supply authoritative coin/asset hints.
+                            if type(flow) is not dict:
+                                continue
+                            if flow.get("address_kind") == "external":
+                                continue
                             coin_id = _hex_id(flow.get("coin_id"))
                             if coin_id:
                                 required_ids.add(coin_id)
@@ -3299,7 +3427,12 @@ def _post_fill_hook_callbacks(fill: dict[str, Any]) -> dict[str, Callable[..., A
     }
 
 
-def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str, str]:
+def _run_post_fill_hooks(
+    fill: dict[str, Any],
+    *,
+    completed_at: str,
+    authority_check: Callable[[], None] | None = None,
+) -> dict[str, str]:
     """Run post-commit hooks without allowing failures to undo proof."""
 
     import database
@@ -3312,6 +3445,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         database.block_offer_fill_hook_authority_loss(fill_id)
         return {name: "blocked" for name in database._AUTHORITATIVE_FILL_HOOKS}
     fill = current_fill
+    if authority_check is not None:
+        authority_check()
     try:
         callbacks = _post_fill_hook_callbacks(fill)
     except Exception:
@@ -3334,6 +3469,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
             pass
         return results
     for hook_name, callback in callbacks.items():
+        if authority_check is not None:
+            authority_check()
         try:
             claim = database.claim_offer_fill_hook(int(fill["fill_id"]), hook_name)
         except Exception:
@@ -3399,6 +3536,8 @@ def _run_post_fill_hooks(fill: dict[str, Any], *, completed_at: str) -> dict[str
         heartbeat_thread.start()
         effect_boundary = False
         try:
+            if authority_check is not None:
+                authority_check()
             acknowledgement = callback(
                 current_fill,
                 claim_token=claim_token,
@@ -4134,6 +4273,96 @@ def _derive_sage_bulk_cancel_context(
     return contexts[0] if len(contexts) == 1 else None
 
 
+def reconcile_external_cancellation(
+    intent_id: str,
+    *,
+    evidence: Any = None,
+    wallet_facade: Any = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Settle a human Sage cancellation from exact proof, without wallet effect.
+
+    Callers must establish native user review before invoking this mutation.
+    Untrusted API bodies must never supply ``evidence``; that parameter exists
+    for deterministic isolated tests only.
+    """
+
+    import database
+
+    intent = database.get_offer_intent(intent_id)
+    if intent is None:
+        raise ValueError("intent_id does not exist")
+    if evidence is None:
+        try:
+            collected = load_authoritative_evidence(intent, wallet_facade=wallet_facade)
+        except BaseException:
+            return {
+                **_unknown("EXTERNAL_CANCEL_EVIDENCE_UNAVAILABLE"),
+                "applied": False,
+            }
+        observed_at = _clock_utc()
+    else:
+        observed_at = _canonical_utc(datetime.now(timezone.utc) if now is None else now)
+        collected = evidence
+    result = classify_external_cancel_evidence(intent, collected, now=observed_at)
+    if result.get("classification") != CANCELLED_PROVEN:
+        return {**result, "applied": False}
+    destination, registry_evidence = _registry_evidence(intent, result, observed_at)
+    records = tuple(
+        offer_record_from_row(row) for row in database.get_offer_intents_for_registry()
+    )
+    decision = authorize_transition(
+        RegistrySnapshot(records),
+        OfferReference(
+            intent_id=intent["intent_id"],
+            sage_trade_id=intent["sage_trade_id"],
+            offer_text_sha256=intent["offer_text_sha256"],
+        ),
+        destination,
+        intent["wallet_fingerprint_hash"],
+        intent["network"],
+        evidence=registry_evidence,
+    )
+    if not decision.allowed:
+        return {
+            **result,
+            "applied": False,
+            "authorization_code": decision.code.value,
+        }
+    durable_proof = {"classification": result, "evidence": collected}
+    durable_json, _full_digest = canonical_evidence_and_digest(durable_proof)
+    if json.loads(durable_json).get("bounded") is True:
+        return {**_unknown("EXTERNAL_CANCEL_EVIDENCE_TOO_LARGE"), "applied": False}
+    evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
+    committed = database.commit_offer_reconciliation(
+        intent_id=intent["intent_id"],
+        operation_id=f"reconcile:{intent['intent_id']}",
+        classification=CANCELLED_PROVEN,
+        reason_code=result["reason_code"],
+        wallet_identity_json={
+            "wallet_fingerprint_hash": intent["wallet_fingerprint_hash"],
+            "network": intent["network"],
+        },
+        evidence_json=durable_json,
+        evidence_sha256=evidence_sha256,
+        transaction_id=result.get("transaction_id"),
+        spend_identity=result.get("spend_identity"),
+        block_height=result["block_height"],
+        fee_mojos=result["fee_mojos"],
+        coin_rebindings=result["coin_rebindings"],
+        reconciled_at=observed_at,
+        external_cancel=True,
+    )
+    return {
+        **result,
+        "applied": True,
+        "authorization_code": decision.code.value,
+        "evidence_sha256": evidence_sha256,
+        "event": committed["event"],
+        "idempotent": committed["idempotent"],
+    }
+
+
 def reconcile_offer(
     intent_id: str,
     *,
@@ -4141,8 +4370,14 @@ def reconcile_offer(
     cancel_context: Any = None,
     wallet_facade: Any = None,
     now: Any = None,
+    refresh_abort_id: str | None = None,
+    defer_post_fill_hooks: bool = False,
+    recovery_fence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Authorize and persist one exact reconciliation result."""
+
+    if type(defer_post_fill_hooks) is not bool:
+        raise TypeError("defer_post_fill_hooks must be an exact bool")
 
     import database
 
@@ -4173,6 +4408,25 @@ def reconcile_offer(
         cancel_context=cancel_context,
         now=observed_at,
     )
+    if recovery_fence is not None and result["classification"] not in {
+        FILLED_PROVEN,
+        EXPIRED_PROVEN,
+    }:
+        raise ValueError("mixed terminal recovery proof is not fill or expiry")
+    refresh_abort = None
+    if refresh_abort_id is not None:
+        if result["classification"] != CANCELLED_PROVEN:
+            raise ValueError("refresh abort requires exact proven parent cancellation")
+        saved_abort = database.get_refresh_abort(refresh_abort_id)
+        if saved_abort is None:
+            raise ValueError("fenced refresh abort is missing")
+        refresh_abort = RefreshAbortAuthority(
+            abort_id=saved_abort["abort_id"],
+            parent_intent_id=saved_abort["parent_intent_id"],
+            child_intent_id=saved_abort["child_intent_id"],
+            wallet_fingerprint_hash=saved_abort["wallet_fingerprint_hash"],
+            network=saved_abort["network"],
+        )
     immutable_economics = None
     if result["classification"] == FILLED_PROVEN:
         immutable_economics = database.get_offer_intent_economic_authority(
@@ -4203,9 +4457,12 @@ def reconcile_offer(
         intent["wallet_fingerprint_hash"],
         intent["network"],
         evidence=registry_evidence,
+        refresh_abort=refresh_abort,
     )
     operation_id = f"reconcile:{intent['intent_id']}"
     if not decision.allowed:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery registry authority denied")
         _trip_denial_latch(
             intent,
             operation_id,
@@ -4296,6 +4553,10 @@ def reconcile_offer(
                 raise _EvidenceEncodingError("bounded fill proof exceeds durable cap")
         evidence_sha256 = hashlib.sha256(durable_json.encode("utf-8")).hexdigest()
     except Exception:
+        if recovery_fence is not None:
+            raise ValueError("mixed terminal recovery proof encoding failed") from None
+        if refresh_abort is not None:
+            raise RuntimeError("refresh abort proof encoding failed")
         encoding_result = _unknown("EVIDENCE_ENCODING_FAILED")
         fallback_destination, fallback_evidence = _registry_evidence(
             intent, encoding_result, observed_at
@@ -4394,7 +4655,9 @@ def reconcile_offer(
                 if result["classification"] == CANCELLED_PROVEN
                 else None
             ),
+            refresh_abort_id=refresh_abort_id,
             reconciled_at=observed_at,
+            recovery_fence=recovery_fence,
         )
     except ValueError as exc:
         if result["classification"] == CANCELLED_PROVEN and "Task 8" in str(exc):
@@ -4445,8 +4708,10 @@ def reconcile_offer(
                 "authoritative fill commit lost its durable fill identity"
             )
         response["fill_id"] = int(fill_id)
-        response["post_fill_hooks"] = _run_post_fill_hooks(
-            fill, completed_at=observed_at
+        response["post_fill_hooks"] = (
+            {name: "pending" for name in database._AUTHORITATIVE_FILL_HOOKS}
+            if defer_post_fill_hooks
+            else _run_post_fill_hooks(fill, completed_at=observed_at)
         )
     return response
 

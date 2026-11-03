@@ -3,6 +3,9 @@
 import hashlib
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 import coin_prep_worker
 import database
@@ -114,6 +117,7 @@ def test_sell_only_final_sweep_preserves_owned_buy_coin_purpose(tmp_path, monkey
         buy_coin_id,
         "xch",
         buy_coin["amount"],
+        tier="inner",
         designation="tier_spare",
         assigned_tier="inner",
         purpose="replacement",
@@ -148,11 +152,62 @@ def test_sell_only_final_sweep_preserves_owned_buy_coin_purpose(tmp_path, monkey
         worker._designate_final_sweep()
         still_owned = database.get_coin_state(buy_coin_id)
         assert still_owned["status"] == "free"
+        assert still_owned["tier"] == "inner"
         assert still_owned["purpose"] == "replacement"
         assert still_owned["designation"] == "unknown"
         assert still_owned["assigned_tier"] == "none"
         assert database.get_coin_state(absent_coin_id)["status"] == "gone"
         assert database.set_coin_designation(buy_coin_id, "tier_spare", "inner")
         assert database.get_tier_spare_counts("xch")["inner"] == 1
+    finally:
+        database.close_connection()
+
+
+def test_final_sweep_bounds_registry_scans_during_large_wallet_upsert(
+    tmp_path, monkeypatch
+):
+    """A large selectable wallet must leave room for the mutation lease writer."""
+
+    database.close_connection()
+    monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "sweep.db"))
+    monkeypatch.setattr(database, "_db_initialized_path", "")
+    database.init_database()
+    monkeypatch.setattr("user_paths.data_dir", lambda: str(tmp_path))
+    coins = [
+        {
+            "coin_id": hashlib.sha256(f"sweep-coin-{index}".encode()).hexdigest(),
+            "amount": 1_000_000_000,
+        }
+        for index in range(48)
+    ]
+    worker = object.__new__(coin_prep_worker.CoinPrepWorker)
+    worker._db_ready = True
+    worker.xch_wallet_id = 1
+    worker.cat_wallet_id = 2
+    worker.tier_enabled = False
+    worker.log = lambda _message: None
+    worker._get_coins_via_rpc = lambda wallet_id, _name, selectable_only=False: (
+        coins if wallet_id == 1 else []
+    )
+    worker._partition_coins_for_designation = lambda observed, _wallet_type: (
+        {},
+        observed,
+    )
+
+    original = database._nonterminal_registry_coin_ids
+    try:
+        with patch.object(
+            database, "_nonterminal_registry_coin_ids", wraps=original
+        ) as registry_scan:
+            worker._designate_final_sweep()
+        assert registry_scan.call_count <= 10
+        assert len(database.get_free_coins("xch")) == 48
+        monkeypatch.setattr(
+            database,
+            "batch_upsert_coins",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("guard unavailable")),
+        )
+        with pytest.raises(RuntimeError, match="guard unavailable"):
+            worker._designate_final_sweep()
     finally:
         database.close_connection()

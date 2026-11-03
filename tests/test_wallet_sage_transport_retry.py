@@ -6,6 +6,31 @@ import mutation_gate
 import wallet_sage
 
 
+def test_reused_sage_connection_updates_live_socket_timeout(monkeypatch):
+    class Socket:
+        def __init__(self):
+            self.timeout = 5
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+    class Connection:
+        def __init__(self):
+            self.sock = Socket()
+            self.timeout = 5
+
+    connection = Connection()
+    monkeypatch.setattr(wallet_sage._conn_local, "conn", connection, raising=False)
+
+    assert wallet_sage._get_sage_connection(60) is connection
+    assert connection.timeout == 60
+    assert connection.sock.timeout == 60
+
+    assert wallet_sage._get_sage_connection(5) is connection
+    assert connection.timeout == 5
+    assert connection.sock.timeout == 5
+
+
 @pytest.mark.parametrize("endpoint", ["submit_transaction", "send_xch", "make_offer"])
 def test_response_loss_does_not_replay_wallet_mutation(monkeypatch, endpoint):
     sends = []

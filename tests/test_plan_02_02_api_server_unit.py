@@ -249,17 +249,24 @@ class TestBotStartEndpoint(unittest.TestCase):
         self.assertEqual(body.get("status"), "already_running")
         self.assertTrue(body.get("success"))
 
-    def test_stop_with_no_bot_returns_500(self):
-        # Both start/stop require bot to be initialised — return 500 when None
-        with patch.object(api_server, "bot", None):
+    def test_stop_with_no_bot_is_already_stopped(self):
+        # The pre-wallet desktop shell has no BotLoop to stop.
+        import database
+
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(database, "get_setting", return_value=None),
+        ):
             resp = self.client.post(
                 "/api/bot/stop",
                 headers=self.headers,
                 environ_base=self.loopback,
             )
-        self.assertEqual(resp.status_code, 500)
-        body = resp.get_json()
-        self.assertIn("error", body)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json(),
+            {"status": "stopped", "running": False, "bot_initialized": False},
+        )
 
 
 if __name__ == "__main__":
