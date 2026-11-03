@@ -224,6 +224,7 @@ _KEY_MAP = {
     "skew_intensity": "SKEW_INTENSITY",
     "max_position_xch": "MAX_POSITION_XCH",
     "liquidity_mode": "LIQUIDITY_MODE",
+    "thin_market_enabled": "THIN_MARKET_ENABLED",
     "tier_enabled": "TIER_ENABLED",
     "buy_ladder_reversed": "BUY_LADDER_REVERSED",
     "inner_size_xch": "INNER_SIZE_XCH",
@@ -390,6 +391,19 @@ def api_config_update():
     )
 
     def _write_setting(env_key, raw_value):
+        if env_key == "THIN_MARKET_ENABLED" and str(raw_value).strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }:
+            from confidence_override import record_saved_thin_market_choice
+
+            try:
+                if not record_saved_thin_market_choice():
+                    return False
+            except (ValueError, TypeError, KeyError):
+                return False
         if _defer_runtime:
             writer = getattr(cfg, "update_persisted", None)
             if writer is None:
@@ -1372,9 +1386,17 @@ def api_check_resume():
         except Exception as e:
             print(f"[RESUME] Gap closer detection error: {e}", flush=True)
 
+        from follow_restart_intent import read_follow_restart_intent
+
+        restart_intent = read_follow_restart_intent()
         return jsonify(
             {
                 "can_resume": can_resume,
+                "auto_resume_requested": bool(
+                    can_resume
+                    and restart_intent
+                    and restart_intent["identity"]["asset_id"] == asset_id
+                ),
                 "has_session": can_resume,
                 "buy_count": len(open_buy),
                 "sell_count": len(open_sell),

@@ -62,6 +62,15 @@ class TxFeesTests(unittest.TestCase):
         self.assertEqual(plan["count"], 20)
         self.assertEqual(plan["coin_size_mojos"], 100_000_000)
 
+    def test_auto_fee_pool_size_grows_with_live_network_fee(self):
+        self.cfg.TRANSACTION_FEE_MODE = "auto"
+        with patch.object(
+            self.tx_fees,
+            "get_suggested_transaction_fee",
+            return_value={"available": True, "fee_mojos": 60_000_001},
+        ):
+            self.assertEqual(self.tx_fees.get_fee_coin_size_mojos(), 1_201_000_000)
+
     def test_empty_node_estimate_falls_back_instead_of_becoming_zero(self):
         self.cfg.COINSET_ENABLED = False
         with (

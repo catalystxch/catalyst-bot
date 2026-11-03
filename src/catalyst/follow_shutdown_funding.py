@@ -1,4 +1,4 @@
-"""Read-only one-block shutdown fee envelope for a proposed Follow run.
+"""Read-only one-block shutdown fee funding screen for a proposed Follow run.
 
 This is a funding screen, not a quote for offers that do not yet exist. Sage
 must price the exact live book before cancellation; a book that cannot fit in
@@ -16,21 +16,23 @@ ONE_BLOCK_COST_LIMIT = 11_000_000_000
 
 def preview_one_block_shutdown_funding(
     *,
-    maximum_fee_mojos: int,
+    maximum_fee_mojos: int | None,
     spent_fee_mojos: int,
     held_fee_mojos: int,
     largest_fee_coin_mojos: int,
     protected_shutdown_fee_mojos: int,
     target_seconds: int,
 ) -> dict:
-    """Require both ceiling headroom and one independently spendable fee coin.
+    """Require the quoted fee reserve and one independently spendable fee coin.
 
     The full-book executable cost is unknown until offers exist. ``ready``
     certifies only this conservative one-block funding screen; callers must
-    separately prove the actual book, fee coin and cohort structure.
+    separately prove the actual book, fee coin and cohort structure. A missing
+    maximum is the explicit unbounded mode and does not consume cumulative fee
+    headroom; it still requires the current quote to fit the protected reserve
+    and one spendable fee coin.
     """
     amounts = (
-        maximum_fee_mojos,
         spent_fee_mojos,
         held_fee_mojos,
         largest_fee_coin_mojos,
@@ -38,12 +40,19 @@ def preview_one_block_shutdown_funding(
     )
     if (
         any(type(value) is not int or value < 0 for value in amounts)
-        or maximum_fee_mojos == 0
+        or (
+            maximum_fee_mojos is not None
+            and (type(maximum_fee_mojos) is not int or maximum_fee_mojos <= 0)
+        )
         or type(target_seconds) is not int
         or target_seconds < 1
     ):
         raise ValueError("FOLLOW_SHUTDOWN_FUNDING_INPUT_INVALID")
-    remaining = maximum_fee_mojos - spent_fee_mojos - held_fee_mojos
+    remaining = (
+        None
+        if maximum_fee_mojos is None
+        else maximum_fee_mojos - spent_fee_mojos - held_fee_mojos
+    )
     result = {
         "ready": False,
         "reason": "FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE",
@@ -67,7 +76,7 @@ def preview_one_block_shutdown_funding(
     result["expires_at"] = quote["expires_at"]
     if fee <= 0:
         result["reason"] = "FOLLOW_SHUTDOWN_FEE_FUNDING_REQUIRED"
-    elif fee > remaining:
+    elif remaining is not None and fee > remaining:
         result["reason"] = "FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT"
     elif fee > protected_shutdown_fee_mojos:
         result["reason"] = "FOLLOW_SHUTDOWN_RESERVE_INSUFFICIENT"

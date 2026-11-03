@@ -201,7 +201,7 @@ def test_follow_cancel_price_refuses_unresolved_run_before_unsigned_build(
     assert result["reason"] == "FOLLOW_UNRESOLVED_EFFECT"
 
 
-def test_follow_cancel_price_refuses_fee_above_remaining_run_cap(approved, monkeypatch):
+def test_follow_cancel_price_can_quote_above_recorded_estimate(approved, monkeypatch):
     run_id, identity = _run(approved)
     pricing = import_module("follow_fee_cancellation")
     monkeypatch.setattr(
@@ -234,61 +234,20 @@ def test_follow_cancel_price_refuses_fee_above_remaining_run_cap(approved, monke
         fee_coin_id="d" * 64,
         now_epoch=1002,
     )
-    assert result["available"] is False
-    assert result["reason"] == "FEE_BUDGET_EXCEEDED"
-    assert result["required_fee_mojos"] == 81
+    assert result["available"] is True
+    assert result["fee_mojos"] == 81
+    assert result["authority"]["unbounded"] is True
     assert result["dispatch_authorized"] is False
 
 
-def test_follow_cancel_price_uses_current_confirmed_ceiling(approved, monkeypatch):
+def test_unbounded_run_has_no_fee_ceiling_revision(approved):
     run_id, identity = _run(approved)
-    review = database.create_follow_fee_ceiling_review(
-        run_id=run_id,
-        identity=identity,
-        configuration_sha256="a" * 64,
-        proposed_maximum_fee_mojos=120,
-        observed_fee_principal_mojos=120,
-        now_epoch=1002,
-    )
-    database.confirm_follow_fee_ceiling_review(
-        review_id=review["review_id"],
-        review_sha256=review["review_sha256"],
-        identity=identity,
-        configuration_sha256="a" * 64,
-        observed_fee_principal_mojos=120,
-        now_epoch=1003,
-    )
-    pricing = import_module("follow_fee_cancellation")
-    monkeypatch.setattr(
-        import_module("wallet"),
-        "build_cancel_offers_batch_unsigned",
-        lambda *_args, **_kwargs: {
-            "_catalyst_validated_cancel_unsigned": True,
-            "_catalyst_exact_unsigned_cost": 123456,
-        },
-    )
-    monkeypatch.setattr(
-        pricing,
-        "quote_fee",
-        lambda cost, target_seconds: {
-            "available": True,
-            "fee_mojos": 20,
-            "source": "coinset",
-            "cost": cost,
-            "target_seconds": target_seconds,
-            "observed_at": 1004,
-            "expires_at": 1064,
-        },
-    )
-    monkeypatch.setattr(pricing, "is_current_fee_quote", lambda *_args: True)
-    result = pricing.price_follow_cancellation(
-        run_id=run_id,
-        identity=identity,
-        trade_ids=["b" * 64],
-        source_coin_ids=["c" * 64],
-        fee_coin_id="d" * 64,
-        now_epoch=1004,
-    )
-    assert result["available"] is True
-    assert result["authority"]["maximum_fee_mojos"] == 120
-    assert result["authority"]["revision"] == 1
+    with pytest.raises(ValueError, match="FOLLOW_FEE_REVISION_UNAVAILABLE"):
+        database.create_follow_fee_ceiling_review(
+            run_id=run_id,
+            identity=identity,
+            configuration_sha256="a" * 64,
+            proposed_maximum_fee_mojos=120,
+            observed_fee_principal_mojos=120,
+            now_epoch=1002,
+        )

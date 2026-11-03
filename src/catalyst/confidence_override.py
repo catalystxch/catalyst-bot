@@ -245,6 +245,151 @@ def override_price_range(confidence, *, now, valid_until, allow_thin_pending=Fal
         return None
 
 
+def saved_thin_market_price_range(confidence, *, now, valid_until):
+    """Price corridor for a saved thin-market choice, without a fixed band.
+
+    A current two-sided book supplies its own bounds. A one-sided book may
+    use an attributable accepted midpoint from the past 24 hours. This is
+    only price evidence; the live run, wallet and fee authority are separate.
+    """
+    from config import cfg
+    from thin_market_reference import select_thin_market_reference
+
+    try:
+        current = _utc(now)
+        deadline = _utc(valid_until)
+        if (
+            getattr(confidence, "state", None) != "RED"
+            or current >= deadline
+            or getattr(confidence, "pending_movement_refreshes", 0) != 0
+        ):
+            return None
+        reference = select_thin_market_reference(confidence, now=current)
+        if reference is None:
+            return None
+        if reference.source == "current_book":
+            return (
+                reference.observed_bid,
+                reference.midpoint,
+                reference.observed_ask,
+                reference.evidence_digests,
+            )
+        half_spread = Decimal(str(cfg.SPREAD_BPS)) / Decimal(20000)
+        if not half_spread.is_finite() or not Decimal(0) < half_spread < Decimal(1):
+            return None
+        midpoint = reference.midpoint
+        bid = reference.observed_bid
+        ask = reference.observed_ask
+        if (bid is not None and bid >= midpoint) or (
+            ask is not None and ask <= midpoint
+        ):
+            return None
+        lower = midpoint * (Decimal(1) - half_spread)
+        upper = midpoint * (Decimal(1) + half_spread)
+        if bid is not None:
+            lower = min(lower, bid)
+        if ask is not None:
+            upper = max(upper, ask)
+        return lower, midpoint, upper, reference.evidence_digests
+    except (AttributeError, TypeError, ValueError, ArithmeticError):
+        return None
+
+
+class SavedThinMarketConsent:
+    """Run-bound use of a saved user choice; never financial authority.
+
+    It is rebound only when a new bot run has proved a current Follow scope.
+    Scope drift revokes it for the rest of that run. The saved preference is
+    separate from this transient object and can be changed by the user.
+    """
+
+    dynamic_band = True
+
+    def __init__(self, scope):
+        self.digest = scope_digest(scope)
+        self.follow_run_id = scope.get("follow_run_id")
+        self.revoked = False
+        self._lock = threading.RLock()
+
+    def revoke(self):
+        with self._lock:
+            self.revoked = True
+
+    def active(self, *, scope, now):
+        with self._lock:
+            valid = not self.revoked and self.digest == scope_digest(scope)
+            if not valid:
+                self.revoked = True
+            return valid
+
+    def candidate_active(self, *, now):
+        with self._lock:
+            return not self.revoked
+
+    def price_evidence(self, confidence, *, now, valid_until):
+        with self._lock:
+            if self.revoked:
+                return None
+            return saved_thin_market_price_range(
+                confidence, now=now, valid_until=valid_until
+            )
+
+    def price_range(self, confidence, *, now, valid_until):
+        evidence = self.price_evidence(confidence, now=now, valid_until=valid_until)
+        return evidence[:3] if evidence is not None else None
+
+
+_THIN_CHOICE_SETTING = "thin_market_choice_v1"
+
+
+def _thin_choice_identity(identity: dict) -> dict:
+    keys = (
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "asset_id",
+        "wallet_id",
+        "xch_wallet_id",
+        "ticker",
+    )
+    if type(identity) is not dict or any(identity.get(key) is None for key in keys):
+        raise ValueError("THIN_MARKET_IDENTITY_UNAVAILABLE")
+    return {key: identity[key] for key in keys}
+
+
+def record_saved_thin_market_choice() -> bool:
+    """Bind the user's saved selection to the verified current Sage pair."""
+    import database
+    from coin_prep_fee_runtime import _configuration, _verified_identity
+
+    configuration = _configuration()
+    identity = _verified_identity(configuration)
+    full_identity = {
+        **identity,
+        "asset_id": configuration["CAT_ASSET_ID"],
+        "wallet_id": configuration["CAT_WALLET_ID"],
+        "xch_wallet_id": configuration["WALLET_ID_XCH"],
+        "ticker": configuration["CAT_TICKER_ID"],
+    }
+    payload = json.dumps(
+        _thin_choice_identity(full_identity), sort_keys=True, separators=(",", ":")
+    )
+    return database.set_setting(_THIN_CHOICE_SETTING, payload) is True
+
+
+def saved_thin_market_choice_matches(scope: dict) -> bool:
+    """A saved RED choice cannot silently migrate to another wallet or CAT."""
+    import database
+
+    try:
+        expected = _thin_choice_identity(scope["identity"])
+        raw = database.get_setting(_THIN_CHOICE_SETTING)
+        actual = json.loads(raw) if type(raw) is str else None
+        return actual == expected
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 class ConsentedConfidence:
     """Transient candidate view; raw confidence and persisted RED are untouched.
 
@@ -260,10 +405,14 @@ class ConsentedConfidence:
         *,
         candidate_authorize=None,
         current_view=None,
+        evidence_digests=None,
+        dynamic_band=False,
     ):
         self._raw, self._authorize, self._range = raw, authorize, price_range
         self._candidate_authorize = candidate_authorize or authorize
         self._current_view = current_view
+        self._evidence_digests = evidence_digests
+        self.dynamic_band = dynamic_band
 
     def dispatch_allowed(self):
         return self._authorize() is True
@@ -278,6 +427,8 @@ class ConsentedConfidence:
             return self._range[
                 {"trusted_bid": 0, "trusted_midpoint": 1, "trusted_ask": 2}[key]
             ]
+        if key == "evidence_digests" and self._evidence_digests is not None:
+            return self._evidence_digests
         return getattr(self._raw, key)
 
 
@@ -298,6 +449,7 @@ def _configuration_digest(configuration):
             "SNIPER_ENABLED",
             "SNIPER_SIZE_XCH",
             "MIN_EDGE_BPS",
+            "THIN_MARKET_ENABLED",
         )
     }
     return scope_digest(

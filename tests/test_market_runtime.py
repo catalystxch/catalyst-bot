@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import database
 import pytest
 from market_runtime import OfferBookMarketRuntime
+from thin_market_reference import select_thin_market_reference
 
 
 ASSET_ID = "b8" * 32
@@ -87,6 +88,42 @@ def test_runtime_persists_one_coherent_green_decision(isolated_db):
     assert stored["snapshot_id"] == result.snapshot_id
     providers = database.get_market_provider_observations(ASSET_ID, limit=10)
     assert {row["provider_id"] for row in providers} == {"dexie", "splash"}
+
+
+def test_one_sided_runtime_exposes_fresh_settled_trade_reference(isolated_db):
+    book = _book()
+    book["asks"] = []
+    runtime = OfferBookMarketRuntime(
+        asset_id=ASSET_ID,
+        risk_preset="balanced",
+        fetch_dexie_book=lambda _asset: book,
+        fetch_splash_offers=lambda _asset: [],
+        fetch_splash_health=lambda: {
+            "running": False,
+            "api_reachable": False,
+            "peers": 0,
+        },
+        fetch_dexie_settled_trades=lambda _asset: [
+            {
+                "trade_id": "trade-1",
+                "price": "0.00010",
+                "type": "buy",
+                "base_volume": "2",
+                "target_volume": "2",
+                "trade_timestamp": NOW.isoformat(),
+            }
+        ],
+    )
+    result = runtime.refresh(
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000_000_000_000,
+        now=NOW,
+    )
+    assert result.confidence.state == "RED"
+    reference = select_thin_market_reference(result.confidence, now=NOW)
+    assert reference is not None
+    assert reference.source == "settled_trade"
+    assert reference.midpoint == Decimal("0.00010")
 
 
 def test_runtime_allows_restricted_creation_from_one_valid_exact_provider(isolated_db):

@@ -98,6 +98,7 @@ def test_native_fee_change_confirmation_requires_exact_acceptance(monkeypatch):
     assert seen == [("c" * 64, "d" * 64)]
 
 
+@pytest.mark.parametrize("approved", ["bounded"], indirect=True)
 def test_native_fee_change_consumes_review_in_original_run_ledger(
     approved, monkeypatch
 ):
@@ -152,6 +153,7 @@ def test_native_fee_change_consumes_review_in_original_run_ledger(
     )
 
 
+@pytest.mark.parametrize("approved", ["bounded"], indirect=True)
 def test_native_stopped_run_can_review_funded_cleanup_increase(approved, monkeypatch):
     from importlib import import_module
 

@@ -85,6 +85,31 @@ def test_http_confirmation_records_consent_without_launching_prep(
     }
 
 
+def test_standard_confirmation_needs_no_cumulative_cap_input(
+    local_api, confirmation
+):
+    import database
+
+    stored = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
+    quote = json.loads(stored["quote_json"])
+    quote["approval_authority"]["unbounded_fee_mode"] = True
+    preview = database.store_coin_prep_fee_preview(
+        scope_sha256=stored["scope_sha256"],
+        plan_sha256=stored["plan_sha256"],
+        scope_json=stored["scope_json"],
+        plan_json=stored["plan_json"],
+        request_options_json=stored["request_options_json"],
+        quote_json=json.dumps(quote),
+        observed_at=stored["observed_at"],
+        expires_at=stored["expires_at"],
+    )
+    response = _http(local_api, {"preview_id": preview["preview_id"]})
+    assert response.status_code == 200
+    result = response.get_json()
+    assert result["unbounded"] is True
+    assert result["dispatch_authorized"] is False
+
+
 def test_http_and_native_duplicate_confirmations_share_one_durable_consent(
     local_api, confirmation
 ):
@@ -125,7 +150,7 @@ def test_malformed_or_client_authority_fields_are_rejected_before_wallet_reads(
 
 
 @pytest.mark.parametrize(
-    "body", [None, [], "confirmation", {}, {"preview_id": "a" * 64}]
+    "body", [None, [], "confirmation", {}]
 )
 def test_nonobject_or_incomplete_http_request_cannot_record_consent(
     local_api, confirmation, body

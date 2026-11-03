@@ -76,6 +76,28 @@ def test_follow_review_accepts_explicit_continuous_term(monkeypatch):
     assert calls[0]["duration_seconds"] is None
 
 
+def test_follow_review_accepts_standard_terms_without_cumulative_fee_cap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        follow_principal,
+        "prepare_follow_run_review",
+        lambda approval_id, **terms: (
+            calls.append((approval_id, terms)) or {"dispatch_authorized": False}
+        ),
+    )
+    _, status = _call(
+        {
+            "approval_id": "a" * 64,
+            "buy_limit": 24,
+            "sell_limit": 24,
+            "continuous": True,
+        }
+    )
+    assert status == 200
+    assert calls[0][1]["requested_fee_cap_mojos"] is None
+    assert calls[0][1]["continuous"] is True
+
+
 def test_follow_review_rejects_missing_or_coerced_terms_before_service(monkeypatch):
     monkeypatch.setattr(
         follow_principal,

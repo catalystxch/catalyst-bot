@@ -1742,6 +1742,23 @@ CREATE TABLE IF NOT EXISTS fee_approvals (
               AND cancellation_reserve_mojos<=total_fee_mojos),
     UNIQUE(scope_sha256, version)
 );
+-- New policy is an immutable property of an approval. Older rows have no
+-- marker and therefore retain their original bounded semantics.
+CREATE TABLE IF NOT EXISTS unbounded_fee_approvals (
+    approval_id TEXT PRIMARY KEY NOT NULL REFERENCES fee_approvals(approval_id)
+);
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_update
+BEFORE UPDATE ON unbounded_fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'unbounded fee approvals are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_delete
+BEFORE DELETE ON unbounded_fee_approvals BEGIN
+    SELECT RAISE(ABORT, 'unbounded fee approvals are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS unbounded_fee_approvals_no_replace
+BEFORE INSERT ON unbounded_fee_approvals
+WHEN EXISTS (SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=NEW.approval_id)
+BEGIN SELECT RAISE(ABORT, 'unbounded fee approvals are append-only'); END;
 CREATE TABLE IF NOT EXISTS approved_fee_reservations (
     operation_id TEXT PRIMARY KEY NOT NULL
         CHECK((length(operation_id)=64 AND operation_id NOT GLOB '*[^0-9a-f]*')
@@ -4652,6 +4669,7 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "unbounded_fee_approvals": {"approval_id"},
     "follow_fee_ceiling_reviews": {
         "review_id",
         "review_sha256",
@@ -22316,6 +22334,16 @@ def _fee_scope_totals(
     return totals
 
 
+def _fee_approval_is_unbounded(conn: sqlite3.Connection, approval_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _fee_wallet_campaigns(conn, scopes: List[str]) -> Dict[str, List[str]]:
     campaigns: Dict[str, List[str]] = {}
     for scope in scopes:
@@ -22363,15 +22391,22 @@ def _fee_single_scope_totals(conn: sqlite3.Connection, scope: str) -> Dict[str, 
 
 
 def _insert_fee_approval(
-    conn: sqlite3.Connection, scope: str, plan: str, total: int, reserve: int
+    conn: sqlite3.Connection,
+    scope: str,
+    plan: str,
+    total: int,
+    reserve: int,
+    *,
+    unbounded: bool = False,
 ) -> str:
     """Insert an approval inside the caller's already serialized transaction."""
     totals = _fee_scope_totals(conn, scope)
     limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
     if reserve < limits["protected_cancellation_fee_mojos"]:
         raise ValueError("FEE_CANCEL_PROTECTION_DECREASED")
-    if totals["committed_fee_mojos"] > total or (
-        totals["noncancellation_committed_fee_mojos"] > total - reserve
+    if not unbounded and (
+        totals["committed_fee_mojos"] > total
+        or (totals["noncancellation_committed_fee_mojos"] > total - reserve)
     ):
         raise ValueError("FEE_BUDGET_EXCEEDED")
     version = conn.execute(
@@ -22383,6 +22418,8 @@ def _insert_fee_approval(
         "INSERT INTO fee_approvals VALUES (?, ?, ?, ?, ?, ?)",
         (approval_id, scope, plan, version, total, reserve),
     )
+    if unbounded:
+        conn.execute("INSERT INTO unbounded_fee_approvals VALUES (?)", (approval_id,))
     return approval_id
 
 
@@ -22415,18 +22452,23 @@ def create_fee_approval(
     plan_sha256: str,
     total_fee_mojos: int,
     cancellation_reserve_mojos: int,
+    unbounded: bool = False,
 ) -> Dict[str, Any]:
     """Persist a new approval version; never discard earlier commitments."""
     scope = _fee_digest(scope_sha256)
     plan = _fee_digest(plan_sha256)
     total = _fee_amount(total_fee_mojos)
     reserve = _fee_amount(cancellation_reserve_mojos)
+    if type(unbounded) is not bool:
+        raise ValueError("unbounded fee mode must be a boolean")
     if reserve > total:
         raise ValueError("cancellation reserve exceeds total fee ceiling")
     conn = _stability_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        approval_id = _insert_fee_approval(conn, scope, plan, total, reserve)
+        approval_id = _insert_fee_approval(
+            conn, scope, plan, total, reserve, unbounded=unbounded
+        )
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -22772,6 +22814,7 @@ def approve_coin_prep_fee_preview(
     now: Optional[int] = None,
     current_fee_funding_mojos: Optional[int] = None,
     current_principal_funded: Optional[bool] = None,
+    unbounded: bool = False,
 ) -> Dict[str, Any]:
     """Atomically bind one deliberate preview confirmation to one approval.
 
@@ -22796,6 +22839,8 @@ def approve_coin_prep_fee_preview(
         and type(current_principal_funded) is not bool
     ):
         raise ValueError("principal funding must be an exact boolean")
+    if type(unbounded) is not bool:
+        raise ValueError("unbounded fee mode must be a boolean")
     if reserve > maximum:
         raise ValueError("FEE_BUDGET_INSUFFICIENT")
     conn = _stability_connection()
@@ -22821,6 +22866,14 @@ def approve_coin_prep_fee_preview(
             if (
                 prior["total_fee_mojos"] != maximum
                 or prior["cancellation_reserve_mojos"] != reserve
+                or (
+                    conn.execute(
+                        "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+                        (prior["approval_id"],),
+                    ).fetchone()
+                    is not None
+                )
+                != unbounded
             ):
                 raise ValueError("FEE_CONSENT_CONFLICT")
             approval_id = prior["approval_id"]
@@ -22843,25 +22896,31 @@ def approve_coin_prep_fee_preview(
             recovery_action = json.loads(preview["request_options_json"]).get(
                 "cancellation_recovery_action"
             )
-            if (
-                reserve < cancellation
-                or (
+            if reserve < cancellation or (
+                not unbounded
+                and (
                     maximum - reserve - totals["noncancellation_committed_fee_mojos"]
                     < prep
-                )
-                or (maximum - totals["committed_fee_mojos"] < prep + cancellation)
-                or (
-                    campaign_scoped
-                    and recovery_action is None
-                    and maximum - totals["committed_fee_mojos"] < prep + reserve
+                    or maximum - totals["committed_fee_mojos"] < prep + cancellation
+                    or (
+                        campaign_scoped
+                        and recovery_action is None
+                        and maximum - totals["committed_fee_mojos"] < prep + reserve
+                    )
                 )
             ):
                 raise ValueError("FEE_BUDGET_INSUFFICIENT")
-            if maximum - totals["committed_fee_mojos"] > min(
+            if unbounded:
+                required_funding = prep + reserve
+            else:
+                required_funding = maximum - totals["committed_fee_mojos"]
+            if required_funding > min(
                 funding, current_funding if current_funding is not None else funding
             ):
                 raise ValueError("FEE_FUNDING_INSUFFICIENT")
-            approval_id = _insert_fee_approval(conn, scope, plan, maximum, reserve)
+            approval_id = _insert_fee_approval(
+                conn, scope, plan, maximum, reserve, unbounded=unbounded
+            )
             conn.execute(
                 "INSERT INTO coin_prep_fee_consents VALUES (?, ?, ?)",
                 (preview_id, approval_id, now),
@@ -23404,7 +23463,10 @@ def create_follow_run_authority(
         if approved["version"] != latest:
             raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
         totals = _fee_scope_totals(conn, approved["scope_sha256"])
-        if totals["committed_fee_mojos"] + protected > maximum:
+        if (
+            not _fee_approval_is_unbounded(conn, approval)
+            and totals["committed_fee_mojos"] + protected > maximum
+        ):
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_UNFUNDED")
         if (
             conn.execute(
@@ -23611,6 +23673,7 @@ def get_follow_creation_authority(
         ).fetchone()
         if row is None:
             return result
+        unbounded = _fee_approval_is_unbounded(conn, row["approval_id"])
         result.update(
             {
                 "run_id": row["run_id"],
@@ -23622,6 +23685,7 @@ def get_follow_creation_authority(
                 "sell_limit": row["sell_limit"],
                 "expires_at_epoch": row["expires_at_epoch"],
                 "maximum_fee_mojos": row["maximum_fee_mojos"],
+                "unbounded": unbounded,
                 "protected_shutdown_fee_mojos": row["protected_shutdown_fee_mojos"],
                 "consent_id": row["consent_id"],
             }
@@ -23681,6 +23745,7 @@ def get_follow_creation_authority(
                             "reason_code": None,
                             "approval_id": effective["approval_id"],
                             "maximum_fee_mojos": effective["maximum_fee_mojos"],
+                            "unbounded": effective.get("unbounded") is True,
                             "protected_shutdown_fee_mojos": effective[
                                 "protected_shutdown_fee_mojos"
                             ],
@@ -23688,7 +23753,7 @@ def get_follow_creation_authority(
                     )
             elif unresolved is not None:
                 result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
-            elif (
+            elif not unbounded and (
                 totals["committed_fee_mojos"] + row["protected_shutdown_fee_mojos"]
                 > row["maximum_fee_mojos"]
             ):
@@ -23801,6 +23866,7 @@ def get_follow_cleanup_authority(
                 {
                     "spent_fee_mojos": totals["spent_fee_mojos"],
                     "held_fee_mojos": totals["held_fee_mojos"],
+                    "unbounded": _fee_approval_is_unbounded(conn, row["approval_id"]),
                     "remaining_fee_mojos": max(0, row["maximum_fee_mojos"] - committed),
                 }
             )
@@ -23814,7 +23880,9 @@ def get_follow_cleanup_authority(
             ).fetchone()
             if unresolved is not None:
                 result["reason_code"] = "FOLLOW_UNRESOLVED_EFFECT"
-            elif committed > row["maximum_fee_mojos"]:
+            elif committed > row[
+                "maximum_fee_mojos"
+            ] and not _fee_approval_is_unbounded(conn, row["approval_id"]):
                 result["reason_code"] = "FOLLOW_FEE_CAP_EXCEEDED"
             else:
                 result["ready"] = True
@@ -23995,6 +24063,8 @@ def create_follow_fee_ceiling_review(
     )
     if policy.get("ready") is not True:
         raise ValueError("FOLLOW_FEE_REVISION_AUTHORITY_REQUIRED")
+    if policy.get("unbounded") is True:
+        raise ValueError("FOLLOW_FEE_REVISION_UNAVAILABLE")
     prior_revision = policy["revision"]
     prior_maximum = policy["maximum_fee_mojos"]
     protected = policy["protected_shutdown_fee_mojos"]
@@ -24360,6 +24430,14 @@ def get_fee_approval(approval_id: str) -> Dict[str, Any]:
         if row is None:
             raise ValueError("FEE_APPROVAL_REQUIRED")
         result = dict(row)
+        unbounded = (
+            conn.execute(
+                "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            is not None
+        )
+        result["unbounded"] = unbounded
         result.update(_fee_scope_totals(conn, row["scope_sha256"]))
         limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, row["scope_sha256"]))
         maximum = min(row["total_fee_mojos"], limits["maximum_fee_mojos"])
@@ -24367,10 +24445,16 @@ def get_fee_approval(approval_id: str) -> Dict[str, Any]:
             row["cancellation_reserve_mojos"],
             limits["protected_cancellation_fee_mojos"],
         )
-        result["remaining_fee_mojos"] = maximum - result["committed_fee_mojos"]
-        result["remaining_preparation_fee_mojos"] = min(
-            result["remaining_fee_mojos"],
+        remaining = maximum - result["committed_fee_mojos"]
+        remaining_preparation = min(
+            remaining,
             maximum - protected - result["noncancellation_committed_fee_mojos"],
+        )
+        # These legacy-shaped values remain informational for older clients;
+        # unbounded callers must branch on `unbounded`, never use them to gate.
+        result["remaining_fee_mojos"] = max(0, remaining) if unbounded else remaining
+        result["remaining_preparation_fee_mojos"] = (
+            max(0, remaining_preparation) if unbounded else remaining_preparation
         )
         return result
     finally:
@@ -24472,6 +24556,7 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             conn, _fee_wallet_scopes(conn, context["scope_sha256"])
         )
         maximum = min(int(context["total_fee_mojos"]), limits["maximum_fee_mojos"])
+        unbounded = _fee_approval_is_unbounded(conn, approval_id)
         protected = max(
             int(context["cancellation_reserve_mojos"]),
             limits["protected_cancellation_fee_mojos"],
@@ -24503,11 +24588,13 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
                 "cancellation": bool(pending["cancellation"]),
                 "effect_state": effect_state,
             }
+            # An unresolved hold is still part of the durable recovery state.
+            # Unbounded fee policy removes only the cumulative arithmetic cap.
         elif session_completed:
             effect_state = "complete"
         elif stale:
             effect_state = "stale"
-        elif remaining_preparation <= 0:
+        elif remaining_preparation <= 0 and not unbounded:
             effect_state = "paused_budget"
         else:
             effect_state = "approved"
@@ -24525,10 +24612,13 @@ def get_coin_prep_fee_approval_status(approval_id: str) -> Dict[str, Any]:
             "session_completed": session_completed,
             "stale": stale,
             "total_fee_mojos": int(context["total_fee_mojos"]),
+            "unbounded": unbounded,
             "cancellation_reserve_mojos": int(context["cancellation_reserve_mojos"]),
             **totals,
-            "remaining_fee_mojos": remaining,
-            "remaining_preparation_fee_mojos": remaining_preparation,
+            "remaining_fee_mojos": max(0, remaining) if unbounded else remaining,
+            "remaining_preparation_fee_mojos": (
+                max(0, remaining_preparation) if unbounded else remaining_preparation
+            ),
             "reservation_count": len(rows),
             "unresolved_operation_count": len(unresolved),
             "confirmed_operation_count": confirmed_count,
@@ -24630,14 +24720,29 @@ def _reserve_approved_fee_locked(
         raise ValueError("FEE_APPROVAL_STALE")
     totals = _fee_scope_totals(conn, scope)
     limits = _fee_wallet_limits(conn, _fee_wallet_scopes(conn, scope))
-    maximum = min(approval["total_fee_mojos"], limits["maximum_fee_mojos"])
+    unbounded = (
+        conn.execute(
+            "SELECT 1 FROM unbounded_fee_approvals WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        is not None
+    )
+    maximum = (
+        None
+        if unbounded
+        else min(approval["total_fee_mojos"], limits["maximum_fee_mojos"])
+    )
     protection = max(
         approval["cancellation_reserve_mojos"],
         limits["protected_cancellation_fee_mojos"],
     )
-    if totals["committed_fee_mojos"] + fee > maximum or (
-        not cancellation
-        and totals["noncancellation_committed_fee_mojos"] + fee > maximum - protection
+    if not unbounded and (
+        totals["committed_fee_mojos"] + fee > maximum
+        or (
+            not cancellation
+            and totals["noncancellation_committed_fee_mojos"] + fee
+            > maximum - protection
+        )
     ):
         raise ValueError("FEE_BUDGET_EXCEEDED")
     conn.execute(
@@ -25367,7 +25472,8 @@ def reserve_follow_cancellation_fee(
         # exact journaled cleanup may then spend the same run's allowance.
         totals = _fee_scope_totals(conn, row["scope_sha256"])
         committed_after = totals["committed_fee_mojos"] + fee
-        if committed_after > effective["maximum_fee_mojos"]:
+        unbounded = _fee_approval_is_unbounded(conn, effective["approval_id"])
+        if not unbounded and committed_after > effective["maximum_fee_mojos"]:
             raise ValueError("FEE_BUDGET_EXCEEDED")
         stopped = (
             conn.execute(
@@ -25377,9 +25483,12 @@ def reserve_follow_cancellation_fee(
             is not None
         )
         cleanup_eligible = stopped or now >= row["expires_at_epoch"]
-        if (not cleanup_eligible or not shutdown_cleanup) and committed_after + row[
-            "protected_shutdown_fee_mojos"
-        ] > effective["maximum_fee_mojos"]:
+        if (
+            not unbounded
+            and (not cleanup_eligible or not shutdown_cleanup)
+            and committed_after + row["protected_shutdown_fee_mojos"]
+            > effective["maximum_fee_mojos"]
+        ):
             raise ValueError("FOLLOW_SHUTDOWN_RESERVE_PROTECTED")
         result = _reserve_approved_fee_locked(
             conn,
@@ -25528,7 +25637,9 @@ def recheck_follow_cancellation_fee_hold(
             ):
                 return False
             totals = _fee_scope_totals(conn, row["scope_sha256"])
-            if totals["committed_fee_mojos"] > effective["maximum_fee_mojos"]:
+            if totals["committed_fee_mojos"] > effective[
+                "maximum_fee_mojos"
+            ] and not _fee_approval_is_unbounded(conn, effective["approval_id"]):
                 return False
             stopped = (
                 conn.execute(

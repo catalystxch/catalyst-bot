@@ -11,6 +11,8 @@ import database
 from fee_approval_test_utils import _coin
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
+pytestmark = pytest.mark.parametrize("approved", ["bounded"], indirect=True)
+
 
 def _completed_review(state, *, maximum=5_000_000_000, fee_coin_mojos=10_000_000_000):
     global database

@@ -59,21 +59,19 @@ def test_actual_unsigned_fee_can_rise_inside_approved_preparation_allowance(
     assert utils._counts()["wallet_effect_claims"] == 0
 
 
-def test_higher_fee_cannot_consume_protected_cancellation_allowance(
+def test_higher_exact_fee_is_not_blocked_by_cumulative_allowance(
     approved, monkeypatch
 ):
     _network_quote(approved, monkeypatch, 41)
     result = _price(approved)
-    assert result["available"] is False
-    assert result["reason"] == "FEE_BUDGET_EXCEEDED"
-    assert result["required_fee_mojos"] == 41
-    assert result["approval"]["remaining_preparation_fee_mojos"] == 40
-    assert "pricing" not in result
+    assert result["available"] is True
+    assert result["pricing"]["plan"].fee_mojos == 41
+    assert result["approval"]["unbounded"] is True
     assert result["dispatch_authorized"] is False
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
-def test_existing_unknown_hold_blocks_overlapping_network_repricing(
+def test_plain_reservation_hold_requires_recovery_even_without_cumulative_cap(
     approved, monkeypatch
 ):
     account = approved["approval"]
@@ -85,20 +83,11 @@ def test_existing_unknown_hold_blocks_overlapping_network_repricing(
         fee_mojos=15,
         cancellation=False,
     )
-    service = import_module("coin_prep_fee_dispatch")
-    monkeypatch.setattr(
-        service,
-        "read_approved_prep_fee_snapshot",
-        lambda _approval_id: pytest.fail(
-            "recovery gate must run before fresh wallet inventory reads"
-        ),
-    )
     result = _price(approved)
     assert result["available"] is False
     assert result["reason"] == "FEE_EFFECT_RECOVERY_REQUIRED"
-    assert result["recovery_state"] == "held_before_submission"
+    assert result["approval"]["unbounded"] is True
     assert result["approval"]["held_fee_mojos"] == 15
-    assert result["approval"]["remaining_preparation_fee_mojos"] == 25
     assert utils._counts()["approved_fee_reservations"] == 1
 
 
@@ -347,7 +336,7 @@ def test_different_attempt_cannot_inherit_prepared_journal_fee(exact_journal):
     assert utils._counts()["approved_fee_reservations"] == 0
 
 
-def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journal):
+def test_new_plain_ledger_hold_does_not_create_a_fee_cap(exact_journal):
     account = exact_journal["approval"]
     database.reserve_approved_fee(
         approval_id=account["approval_id"],
@@ -357,9 +346,9 @@ def test_new_competing_hold_is_counted_atomically_at_final_boundary(exact_journa
         fee_mojos=25,
         cancellation=False,
     )
-    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
-        _reserve(exact_journal)
-    assert database.get_fee_approval(account["approval_id"])["held_fee_mojos"] == 25
+    _reserve(exact_journal)
+    assert database.get_fee_approval(account["approval_id"])["held_fee_mojos"] == 45
+    assert utils._counts()["approved_fee_reservations"] == 2
 
 
 def test_fee_hold_retrieval_never_authorizes_operation_replay(exact_journal):

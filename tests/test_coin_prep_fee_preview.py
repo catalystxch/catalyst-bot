@@ -189,7 +189,7 @@ def _hold(preview, approval, operation, fee, cancellation=False):
     )
 
 
-def _approve(preview, maximum=200, reserve=40):
+def _approve(preview, maximum=200, reserve=40, unbounded=False):
     return database.approve_coin_prep_fee_preview(
         preview_id=preview["preview_id"],
         scope_sha256=preview["scope_sha256"],
@@ -197,7 +197,17 @@ def _approve(preview, maximum=200, reserve=40):
         maximum_fee_mojos=maximum,
         cancellation_reserve_mojos=reserve,
         now=100,
+        unbounded=unbounded,
     )
+
+
+def test_explicit_unbounded_approval_records_exact_fees_without_cumulative_cap(context):
+    preview = _preview(context, funding=1000)
+    approval = _approve(preview, maximum=80, reserve=40, unbounded=True)
+    _hold(preview, approval, "1", 100)
+    state = database.get_fee_approval(approval["approval_id"])
+    assert state["unbounded"] is True
+    assert state["held_fee_mojos"] == 100
 
 
 @pytest.mark.parametrize("change", ["session", "pair", "campaign"])

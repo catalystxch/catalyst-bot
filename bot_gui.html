@@ -8425,7 +8425,7 @@
                 <label class="follow-review-check"><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"><span>Continue until I stop the run or its fee or safety limit is reached</span></label>
                 <div class="follow-review-grid">
                     <label class="follow-review-field"><span>Timed authority (hours)</span><input id="followRunHours" type="number" min="1" max="48" step="1" value="48" oninput="invalidateFollowRunReview()"></label>
-                    <label class="follow-review-field"><span>Cumulative fee ceiling (XCH)</span><input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="markFollowRunFeeCapEdited()"></label>
+                    <label class="follow-review-field" id="followRunFeeCapRow"><span>Cumulative fee ceiling (legacy approvals only)</span><input id="followRunFeeCapXch" type="text" inputmode="decimal" value="0.005" oninput="markFollowRunFeeCapEdited()"></label>
                 </div>
                 <p class="follow-review-note">Timed authority applies only when continuous is off. The 48-hour observation is separate from run lifetime.</p>
                 <pre id="followRunReviewText" class="follow-review-result" aria-live="polite"></pre>
@@ -8433,7 +8433,7 @@
                 <div class="follow-review-actions">
                     <button type="button" class="btn btn-secondary" onclick="closeFollowRunReview()">Back</button>
                     <button type="button" class="btn btn-secondary" id="followRunReviewPrepare" onclick="prepareFollowRunReview()">Refresh exact review</button>
-                    <button type="button" class="btn btn-secondary" id="prestartFollowFeeOpen" onclick="openPrestartFollowFeeReview()">Review fee ceiling</button>
+                    <button type="button" class="btn btn-secondary" id="prestartFollowFeeOpen" onclick="openPrestartFollowFeeReview()">Review legacy fee ceiling</button>
                     <button type="button" class="btn btn-primary" id="followRunReviewConfirm" disabled onclick="confirmFollowRunReview()">Record approval</button>
                 </div>
             </div>
@@ -11143,6 +11143,10 @@
                             </div>
                         </div>
 
+                        <label style="display:flex; align-items:center; justify-content:center; gap:8px; margin:0 0 12px; font-size:0.86em; cursor:pointer;">
+                            <input type="checkbox" id="configThinMarketEnabled" style="width:auto; margin:0;" onchange="scheduleSettingsUpdate()">
+                            Place passive ladders in thin markets, including RED ratings
+                        </label>
                         <button type="button" id="smartDefaultsBtn" class="btn btn-smart-defaults" style="padding: 10px 25px; font-size: 1em;" onclick="getSmartDefaults()" disabled>Smart Settings</button>
                         <div id="smartDefaultsDisabledHint" style="margin-top: 8px; font-size: 0.82em; color: var(--status-warning); display: flex; align-items: center; gap: 6px;">
                             <span aria-hidden="true">⚠</span>
@@ -14001,6 +14005,10 @@
                                 ? _lmNorm : 'two_sided';
                             setLiquidityMode(_lmResolved, { silent: true });
                         } catch (_) { setLiquidityMode('two_sided', { silent: true }); }
+
+                        const thinMarketChoice = g('THIN_MARKET_ENABLED');
+                        document.getElementById('configThinMarketEnabled').checked =
+                            thinMarketChoice === true || thinMarketChoice === 'true' || thinMarketChoice === '1' || thinMarketChoice === 'True';
 
                         const te = g('TIER_ENABLED');
                         const tierEnabledOn = te === true || te === 'true' || te === '1' || te === 'True';
@@ -20510,15 +20518,18 @@
                 let data = await resp.json();
 
                 if (data.passive_red_setup_available === true) {
-                    const accepted = await showStyledConfirm({
+                    let accepted = document.getElementById('configThinMarketEnabled').checked;
+                    if (!accepted) accepted = await showStyledConfirm({
                         icon: '⚠️',
-                        title: 'Prepare passive RED settings?',
-                        message: 'The independent offer book is thin. Smart Settings can prepare a bounded passive Follow plan from the observed bid and ask. This only fills the setup form. Starting a live run still requires your separate RED override approval and keeps the hard price, wallet, and fee limits.',
-                        confirmText: 'Prepare passive settings',
+                        title: 'Trade in this thin market?',
+                        message: 'The independent offer book is thin. Smart Settings can prepare passive BUY and SELL ladders from current book evidence or a recent trusted price. This choice is saved with Setup and remains active across restarts. Wallet, fee, and price evidence checks still apply.',
+                        confirmText: 'Enable thin-market ladders',
                         cancelText: 'Keep current settings',
                         style: 'warning',
                     });
                     if (!accepted) return;
+                    document.getElementById('configThinMarketEnabled').checked = true;
+                    scheduleSettingsUpdate();
                     params.set('prepare_passive_red', 'true');
                     resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
                     data = await resp.json();
@@ -21207,6 +21218,7 @@
             'configTopupPoolCat',
             'configTradeXch', 'configMaxBuy', 'configMaxSell',
             'configTierEnabled', 'configBuyLadderReversed',
+            'configThinMarketEnabled',
             'configInnerSizeXch', 'configMidSizeXch',
             'configOuterSizeXch', 'configExtremeSizeXch',
             'configBuyInnerSizeXch', 'configBuyMidSizeXch',
@@ -32402,6 +32414,34 @@
                     return false;
                 }
 
+                if (data.auto_resume_requested === true && _startupGatesComplete) {
+                    try {
+                        const resumed = await apiFetch(`${API_URL}/bot/start`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                resume_existing_offers: true,
+                                automatic_resume: true
+                            })
+                        });
+                        const outcome = await resumed.json();
+                        if (resumed.ok && outcome.success === true) {
+                            _resumeHandled = true;
+                            setResumeSessionSummary(data);
+                            syncResumePairIntoSelectors(data.active_cat);
+                            setFreshStartTemplateState(false);
+                            setSettingsReviewedState(true);
+                            setCoinPrepStatus('skipped-safe');
+                            showToast('Previous Follow ladder resumed after wallet verification.', 'success');
+                            return true;
+                        }
+                        showToast('Automatic resume needs review: ' +
+                            (outcome.reason || 'readiness unavailable'), 'warning');
+                    } catch (error) {
+                        showToast('Automatic resume could not verify the wallet.', 'warning');
+                    }
+                }
+
                 setResumeSessionSummary(data);
                 
                 // Populate the resume modal
@@ -33028,7 +33068,7 @@
             if (![buyLimit, sellLimit].every(Number.isSafeInteger)
                 || buyLimit < 1 || buyLimit > 50 || sellLimit < 1 || sellLimit > 50
                 || (!continuous && (!Number.isSafeInteger(hours) || hours < 1 || hours > 48))) {
-                output.textContent = 'Enter 1–50 offers per side, a valid timed duration if selected, and a positive fee ceiling of up to 12 decimal places.';
+                output.textContent = 'Enter 1–50 offers per side and a valid timed duration if selected.';
                 return;
             }
             _followRunReviewBusy = true;
@@ -33038,21 +33078,25 @@
                 const statusResponse = await apiFetch(`${API_URL}/coin-prep/status`);
                 const status = await statusResponse.json();
                 const approvalId = status?.follow_fee_approval_id || status?.fee_approval_id;
-                const feeCap = Number((status?.follow_fee_approval || status?.fee_approval)?.total_fee_mojos);
+                const feeApproval = status?.follow_fee_approval || status?.fee_approval || {};
+                const unboundedFees = feeApproval.unbounded === true;
+                const feeCap = Number(feeApproval.total_fee_mojos);
                 if (!statusResponse.ok || status?.success !== true
                     || !/^[0-9a-f]{64}$/.test(approvalId || '')
-                    || !Number.isSafeInteger(feeCap) || feeCap <= 0) {
+                    || (!unboundedFees && (!Number.isSafeInteger(feeCap) || feeCap <= 0))) {
                     throw new Error('A completed, current Coin Prep fee approval is required. Review Coin Prep first.');
                 }
                 const feeInput = document.getElementById('followRunFeeCapXch');
-                if (feeInput.dataset.reviewFeeEdited !== 'true') {
+                document.getElementById('followRunFeeCapRow').style.display = unboundedFees ? 'none' : '';
+                document.getElementById('prestartFollowFeeOpen').style.display = unboundedFees ? 'none' : '';
+                if (!unboundedFees && feeInput.dataset.reviewFeeEdited !== 'true') {
                     feeInput.value = coinPrepMojosToXch(feeCap);
                 }
-                const requestedFeeCap = followRunFeeCapMojos(feeInput.value);
-                if (requestedFeeCap === null) {
+                const requestedFeeCap = unboundedFees ? null : followRunFeeCapMojos(feeInput.value);
+                if (!unboundedFees && requestedFeeCap === null) {
                     throw new Error('Enter a positive exact XCH fee ceiling with up to 12 decimal places.');
                 }
-                if (feeCap !== requestedFeeCap) {
+                if (!unboundedFees && feeCap !== requestedFeeCap) {
                     throw new Error(`The approved cumulative ceiling is ${coinPrepMojosToXch(feeCap)} XCH. Adjust Follow fee to change it before reviewing this run.`);
                 }
                 const response = await apiFetch(`${API_URL}/follow/run-review`, {
@@ -33062,7 +33106,7 @@
                         buy_limit: buyLimit,
                         sell_limit: sellLimit,
                         ...(continuous ? {continuous: true} : {duration_seconds: hours * 3600}),
-                        maximum_fee_mojos: feeCap,
+                        ...(!unboundedFees ? {maximum_fee_mojos: feeCap} : {}),
                     }),
                 });
                 const review = await response.json();
@@ -33070,7 +33114,7 @@
                     || Number(document.getElementById('followRunSellLimit').value) !== sellLimit
                     || document.getElementById('followRunContinuous').checked !== continuous
                     || (!continuous && Number(document.getElementById('followRunHours').value) !== hours)
-                    || followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value) !== requestedFeeCap) {
+                    || (!unboundedFees && followRunFeeCapMojos(document.getElementById('followRunFeeCapXch').value) !== requestedFeeCap)) {
                     throw new Error('The terms changed while the wallet review was prepared. Refresh the exact review.');
                 }
                 if (!response.ok || review?.success !== true
@@ -33078,7 +33122,8 @@
                     || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')
                     || review.buy_limit !== buyLimit || review.sell_limit !== sellLimit
                     || (review.continuous === true) !== continuous
-                    || Number(review.maximum_fee_mojos) !== feeCap
+                    || (review.unbounded === true) !== unboundedFees
+                    || (!unboundedFees && Number(review.maximum_fee_mojos) !== feeCap)
                     || review.replacement_count_gate_passed !== true
                     || review.current_prep_targets_proven !== true
                     || review.buy_slots_arithmetic_fit !== buyLimit
@@ -33107,13 +33152,14 @@
                     `Maximum selectable trade XCH: ${formatFollowFeeMojos(review.maximum_trade_xch_mojos)}\n` +
                     `Maximum selectable trade token: ${review.maximum_trade_cat_atoms} atoms\n` +
                     `Protected fee principal: ${formatFollowFeeMojos(review.protected_fee_principal_mojos)}\n` +
-                    `Cumulative fee ceiling: ${formatFollowFeeMojos(review.maximum_fee_mojos)}\n` +
+                    (unboundedFees ? 'Network fees: each wallet effect is quoted and funded when needed; no cumulative ceiling\n'
+                        : `Cumulative fee ceiling: ${formatFollowFeeMojos(review.maximum_fee_mojos)}\n`) +
                     `Protected cancellation reserve: ${formatFollowFeeMojos(review.cancellation_reserve_mojos)}\n` +
                     `Largest selectable protected fee coin: ${formatFollowFeeMojos(review.largest_spendable_fee_coin_mojos)}\n` +
                     `Conservative one-block shutdown fee quote: ${formatFollowFeeMojos(review.shutdown_funding.quoted_fee_mojos)}\n` +
                     `Quote expires: ${new Date(review.shutdown_funding.expires_at * 1000).toISOString()}\n` +
                     `Funding screen passed. CATalyst rechecks the network quote when recording approval. The actual 48-offer cancellation cost and one-block fit are not yet proven; CATalyst must recheck the live book.\n` +
-                    `Authority: ${continuous ? 'continuous until stopped or fee/safety limit' : 'expires ' + new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
+                    `Authority: ${continuous ? 'continuous until stopped or a safety gate holds' : 'expires ' + new Date(review.expires_at_epoch * 1000).toISOString()}\n` +
                     `This exact review expires: ${new Date(review.review_expires_at_epoch * 1000).toISOString()}`;
                 accept.disabled = false;
                 accept.onchange = () => {
@@ -36031,6 +36077,7 @@
             'configToxicityMaxSpreadMultiplier','configToxicityThrottleSecs',
             'configInventoryEnabled','configSkewIntensity','configMaxPositionXch',
             'configTierEnabled','configBuyLadderReversed',
+            'configThinMarketEnabled',
             'configTopupPoolPct','configTopupPoolXch','configTopupPoolCat',
             'configBuyInnerSizeXch','configBuyMidSizeXch','configBuyOuterSizeXch','configBuyExtremeSizeXch',
             'configInnerSizeXch','configMidSizeXch','configOuterSizeXch','configExtremeSizeXch',
@@ -36879,6 +36926,7 @@
                 // are derived from it in config.py reload.
                 liquidity_mode: (typeof getLiquidityMode === 'function')
                     ? getLiquidityMode() : 'two_sided',
+                thin_market_enabled: !!document.getElementById('configThinMarketEnabled')?.checked,
                 // Checkbox checked ⇔ reverse-buy ON. Direct mapping (no invert)
                 // so the saved flag matches the visual tick state.
                 buy_ladder_reversed: document.getElementById('configBuyLadderReversed').checked,
@@ -38023,7 +38071,7 @@ function closeCtgErrorModal() {
             setCoinPrepFeeText('cpFeeSource',
                 `${sources.join(' + ') || 'Unavailable'} · ${age === null ? 'age unavailable' : `${age}s old`} · ${preview.target_seconds}s target${expired ? ' · expired — refresh required' : ''}`);
             if (expired) {
-                setCoinPrepFeeText('cpFeeStatus', 'The fee estimate has expired. Refresh it and review the new maximum before approving Coin Prep.');
+                setCoinPrepFeeText('cpFeeStatus', 'The fee estimate has expired. Refresh it before approving Coin Prep.');
                 setCoinPrepFeeLaunchEnabled(false);
             }
             return !expired;
@@ -38041,6 +38089,11 @@ function closeCtgErrorModal() {
                 if (error) error.textContent = 'The fee estimate has expired. Refresh it before approving Coin Prep.';
                 setCoinPrepFeeLaunchEnabled(false);
                 return null;
+            }
+            if (_coinPrepFeePreview.unbounded_fee_mode === true) {
+                if (error) error.textContent = '';
+                setCoinPrepFeeLaunchEnabled(_coinPrepFeePreview.funded === true);
+                return 'unbounded';
             }
             try {
                 const maximum = canonicalCoinPrepMojos(coinPrepXchToMojos(input.value));
@@ -38076,7 +38129,11 @@ function closeCtgErrorModal() {
             const capRow = document.getElementById('cpFeeCapRow');
             if (panel) panel.style.display = 'block';
             if (details) details.style.display = 'grid';
-            if (capRow) capRow.style.display = 'block';
+            const unboundedFees = preview.unbounded_fee_mode === true;
+            if (capRow) capRow.style.display = unboundedFees ? 'none' : 'block';
+            setCoinPrepFeeText('cpFeeDisclaimer', unboundedFees
+                ? 'Each transaction receives a fresh exact fee quote and funding check. Fee coins are principal, and paid fees are recorded separately. There is no cumulative fee ceiling for this approval.'
+                : 'A target is not a guarantee of confirmation time. Exact unsigned costs are re-priced before every transaction and CATalyst pauses if the approved cap cannot cover them.');
 
             const wallet = preview.wallet || {};
             const ticker = wallet.ticker || currentCAT?.symbol || currentCAT?.name || 'CAT';
@@ -38093,7 +38150,7 @@ function closeCtgErrorModal() {
             const cancellation = preview.minimum_cancellation_reserve_mojos ?? preview.estimated_cancellation_fee_mojos;
             setCoinPrepFeeText('cpFeeCancellation', `${coinPrepMojosToXch(cancellation)} XCH protected; current estimate ${coinPrepMojosToXch(preview.estimated_cancellation_fee_mojos)} XCH`);
             const accounting = preview.fee_accounting || {};
-            setCoinPrepFeeText('cpFeePriorAccounting', `${coinPrepMojosToXch(accounting.spent_fee_mojos ?? '0')} XCH spent · ${coinPrepMojosToXch(accounting.held_fee_mojos ?? '0')} XCH held (included in the cumulative cap)`);
+            setCoinPrepFeeText('cpFeePriorAccounting', `${coinPrepMojosToXch(accounting.spent_fee_mojos ?? '0')} XCH spent · ${coinPrepMojosToXch(accounting.held_fee_mojos ?? '0')} XCH held${unboundedFees ? '' : ' (included in the cumulative cap)'}`);
             setCoinPrepFeeText('cpFeePrincipal', `${coinPrepMojosToXch(preview.fee_coin_principal_mojos)} XCH prepared as coin principal, not spent as fees`);
             setCoinPrepFeeText('cpFeeFunding', `${coinPrepMojosToXch(preview.fee_funding_mojos)} XCH${preview.funded ? '' : ' — insufficient'}`);
 
@@ -38138,11 +38195,13 @@ function closeCtgErrorModal() {
             }
             setCoinPrepFeeText('cpFeeNetwork', networkLines.join(' · '));
             setCoinPrepFeeText('cpFeeStatus', preview.funded
-                ? 'Review the current estimate and choose the cumulative maximum network fee you approve, including prior spent/held fees and protected cancellation.'
+                ? (unboundedFees
+                    ? 'Review the current estimate and protected cancellation funding. Each later wallet effect will be quoted and checked against available fee coins.'
+                    : 'Review the current estimate and choose the cumulative maximum network fee you approve, including prior spent/held fees and protected cancellation.')
                 : 'The wallet does not have enough selectable XCH fee funding for this estimate.');
 
             const input = document.getElementById('cpFeeMaximumInput');
-            if (input) input.value = coinPrepMojosToXch(preview.suggested_maximum_fee_mojos);
+            if (input && !unboundedFees) input.value = coinPrepMojosToXch(preview.suggested_maximum_fee_mojos);
             validateCoinPrepFeeMaximum();
             _coinPrepFeeAgeTimer = setInterval(updateCoinPrepFeeFreshness, 1000);
         }
@@ -38590,8 +38649,9 @@ function closeCtgErrorModal() {
                 setCoinPrepFeeLaunchEnabled(false);
                 return;
             }
-            const maximumFeeMojos = validateCoinPrepFeeMaximum();
-            if (maximumFeeMojos === null) return;
+            const feeApprovalMode = validateCoinPrepFeeMaximum();
+            if (feeApprovalMode === null) return;
+            const unboundedFees = feeApprovalMode === 'unbounded';
             let confirmedPreview = _coinPrepFeePreview;
             const confirmedOptions = {..._coinPrepFeePreviewOptions};
             const recoveryIntent = _coinPrepFeeRecoveryIntent;
@@ -38621,7 +38681,7 @@ function closeCtgErrorModal() {
                 }
                 if (!updateCoinPrepFeeFreshness()) {
                     const input = document.getElementById('cpFeeMaximumInput');
-                    if (coinPrepXchToMojos(input.value).toString() !== maximumFeeMojos) {
+                    if (!unboundedFees && coinPrepXchToMojos(input.value).toString() !== feeApprovalMode) {
                         throw new Error('The maximum changed while reviewing history. Review it before approving Coin Prep.');
                     }
                     const previousPreview = confirmedPreview;
@@ -38643,11 +38703,11 @@ function closeCtgErrorModal() {
                         confirmedPreview = fresh;
                     } finally {
                         // Rendering a preview suggests a cap; preserve the cap actually confirmed.
-                        input.value = coinPrepMojosToXch(maximumFeeMojos);
+                        if (!unboundedFees) input.value = coinPrepMojosToXch(feeApprovalMode);
                         input.disabled = false;
                     }
                 }
-                if (validateCoinPrepFeeMaximum() !== maximumFeeMojos) {
+                if (validateCoinPrepFeeMaximum() !== feeApprovalMode) {
                     throw new Error('The fee estimate expired or the maximum changed while reviewing history. Refresh and review the estimate before approving Coin Prep.');
                 }
                 if (btn) btn.textContent = 'Recording fee approval…';
@@ -38656,9 +38716,11 @@ function closeCtgErrorModal() {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         preview_id: confirmedPreview.preview_id,
-                        maximum_fee_mojos: maximumFeeMojos,
-                        cancellation_reserve_mojos: String(confirmedPreview.minimum_cancellation_reserve_mojos
-                            ?? confirmedPreview.estimated_cancellation_fee_mojos),
+                        ...(unboundedFees ? {} : {
+                            maximum_fee_mojos: feeApprovalMode,
+                            cancellation_reserve_mojos: String(confirmedPreview.minimum_cancellation_reserve_mojos
+                                ?? confirmedPreview.estimated_cancellation_fee_mojos),
+                        }),
                     }),
                 });
                 const approval = await approvalResponse.json();
@@ -40133,7 +40195,9 @@ function finalDismiss() {
                 }
                 const hasOffers = await checkForResume();
                 if (hasOffers) {
-                    debugLog('[STARTUP] Resume modal shown after gates');
+                    debugLog(_resumeHandled
+                        ? '[STARTUP] Reviewed Follow run resumed automatically'
+                        : '[STARTUP] Resume modal shown after gates');
                     // Button stays disabled — modal blocks interaction.
                     // resumeSession() will re-enable it when done.
                     return;

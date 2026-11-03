@@ -160,7 +160,10 @@ def price_approved_cancellation(
                         required_fee_mojos=fee,
                         remaining_campaign_fee_mojos=remaining_campaign,
                     )
-            if fee > after["approval"]["remaining_fee_mojos"]:
+            if (
+                after["approval"].get("unbounded") is not True
+                and fee > after["approval"]["remaining_fee_mojos"]
+            ):
                 return _unavailable(
                     after,
                     "FEE_BUDGET_EXCEEDED",

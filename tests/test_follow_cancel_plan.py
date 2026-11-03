@@ -106,15 +106,16 @@ def test_follow_cancel_plan_keeps_exact_singleton_fee_input(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("remaining_fee", "fee_coin_count", "expected_reason"),
+    ("remaining_fee", "fee_coin_count", "unbounded", "expected_reason"),
     [
-        (100, 4, None),
-        (70, 4, "FEE_BUDGET_EXCEEDED"),
-        (100, 2, "FEE_PREP_FUNDING_INSUFFICIENT"),
+        (100, 4, False, None),
+        (70, 4, False, "FEE_BUDGET_EXCEEDED"),
+        (0, 4, True, None),
+        (100, 2, False, "FEE_PREP_FUNDING_INSUFFICIENT"),
     ],
 )
 def test_follow_full_book_preflight_prices_all_cohorts_before_effect(
-    monkeypatch, remaining_fee, fee_coin_count, expected_reason
+    monkeypatch, remaining_fee, fee_coin_count, unbounded, expected_reason
 ):
     pool = FeeCoinPool()
     pool.refresh(
@@ -138,6 +139,7 @@ def test_follow_full_book_preflight_prices_all_cohorts_before_effect(
         lambda **_kwargs: {
             "ready": True,
             "remaining_fee_mojos": remaining_fee,
+            "unbounded": unbounded,
             "revision": 0,
             "approval_id": "d" * 64,
         },

@@ -281,7 +281,7 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
             "financial_consent_id": review["review_id"],
         },
     )
-    assert bot_routes._reviewed_follow_start_readiness(
+    readiness = bot_routes._reviewed_follow_start_readiness(
         SimpleNamespace(
             LIQUIDITY_MODE="two_sided",
             MAX_ACTIVE_BUY_OFFERS=24,
@@ -289,7 +289,13 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
             CAT_ASSET_ID=proposal["identity"]["asset_id"],
         ),
         resume_existing_offers=False,
-    ) == {"ready": True, "run_id": run["run_id"]}
+    )
+    assert readiness["ready"] is True
+    assert readiness["run_id"] == run["run_id"]
+    assert readiness["scope"]["identity"] == proposal["identity"]
+    assert readiness["scope"]["configuration_sha256"] == proposal[
+        "configuration_sha256"
+    ]
     assert database.get_follow_run_review(review["review_id"])["consumed"] is True
     with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
         follow_principal.confirm_follow_run_review(

@@ -180,7 +180,10 @@ def price_approved_prep_batch(approval_id: str) -> dict:
                     "checked_at": coin_prep_fee_pricing._now(),
                 },
             )
-        if fee > context["approval"]["remaining_preparation_fee_mojos"]:
+        if (
+            context["approval"].get("unbounded") is not True
+            and fee > context["approval"]["remaining_preparation_fee_mojos"]
+        ):
             return _paused(context, "FEE_BUDGET_EXCEEDED", required_fee_mojos=fee)
         if fee > funding["fee_funding_mojos"]:
             return _paused(

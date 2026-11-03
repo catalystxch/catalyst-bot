@@ -295,6 +295,8 @@ def api_follow_run_review():
                 "continuous",
                 "maximum_fee_mojos",
             },
+            {"approval_id", "buy_limit", "sell_limit", "duration_seconds"},
+            {"approval_id", "buy_limit", "sell_limit", "continuous"},
         )
         or type(body["approval_id"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", body["approval_id"]) is None
@@ -303,9 +305,9 @@ def api_follow_run_review():
             for key in (
                 "buy_limit",
                 "sell_limit",
-                "maximum_fee_mojos",
             )
         )
+        or ("maximum_fee_mojos" in body and type(body["maximum_fee_mojos"]) is not int)
         or (
             body.get("continuous") is not True
             if "continuous" in body
@@ -316,7 +318,10 @@ def api_follow_run_review():
         )
         or not 1 <= body["buy_limit"] <= 50
         or not 1 <= body["sell_limit"] <= 50
-        or not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1
+        or (
+            "maximum_fee_mojos" in body
+            and not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1
+        )
     ):
         return jsonify(
             {
@@ -331,7 +336,7 @@ def api_follow_run_review():
             buy_limit=body["buy_limit"],
             sell_limit=body["sell_limit"],
             duration_seconds=body.get("duration_seconds"),
-            requested_fee_cap_mojos=body["maximum_fee_mojos"],
+            requested_fee_cap_mojos=body.get("maximum_fee_mojos"),
             **({"continuous": True} if body.get("continuous") is True else {}),
         )
         return jsonify(_fee_json_amounts({**result, "success": True}))
@@ -425,7 +430,11 @@ def api_coin_prep_fee_approval():
     from super_log import slog
 
     body = request.get_json(silent=True)
-    keys = {"preview_id", "maximum_fee_mojos", "cancellation_reserve_mojos"}
+    legacy_keys = {
+        "preview_id",
+        "maximum_fee_mojos",
+        "cancellation_reserve_mojos",
+    }
     invalid = {
         "success": False,
         "reason": "FEE_APPROVAL_REQUEST_INVALID",
@@ -433,13 +442,15 @@ def api_coin_prep_fee_approval():
     }
     if (
         type(body) is not dict
-        or set(body) != keys
+        or set(body) not in ({"preview_id"}, legacy_keys)
         or type(body["preview_id"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", body["preview_id"]) is None
     ):
         return jsonify(invalid), 400
     amounts = {}
     for key in ("maximum_fee_mojos", "cancellation_reserve_mojos"):
+        if key not in body:
+            continue
         value = body[key]
         # Canonical atomic strings are lossless across JavaScript's JSON
         # boundary. No float/bool/scientific/whitespace/leading-zero coercion.

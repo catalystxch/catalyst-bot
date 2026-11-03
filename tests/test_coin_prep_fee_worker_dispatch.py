@@ -183,7 +183,7 @@ def test_worker_cannot_submit_caller_fee_instead_of_fresh_exact_quote(active_wor
     assert utils._counts()["wallet_effect_claims"] == 0
 
 
-def test_worker_does_not_borrow_cancel_cover_when_network_fee_rises(
+def test_worker_rejects_fee_change_from_frozen_plan_before_dispatch(
     active_worker, monkeypatch
 ):
     def quote(cost, target_seconds):
@@ -198,7 +198,7 @@ def test_worker_does_not_borrow_cancel_cover_when_network_fee_rises(
         }
 
     monkeypatch.setattr(import_module("coin_prep_fee_pricing"), "quote_fee", quote)
-    with pytest.raises(ValueError, match="FEE_BUDGET_EXCEEDED"):
+    with pytest.raises(ValueError, match="FEE_DISPATCH_PLAN_MISMATCH"):
         _submit(active_worker)
     assert active_worker["adapter_attempts"] == []
     assert utils._counts()["wallet_effect_claims"] == 0

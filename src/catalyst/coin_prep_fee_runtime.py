@@ -654,9 +654,12 @@ def read_approved_prep_fee_snapshot(
         raise ValueError("FEE_APPROVAL_RECOVERY_ACTION_INVALID")
     raw_scope = json.loads(consent["scope_json"])
     stored_authority = json.loads(consent["quote_json"]).get("approval_authority")
-    if raw_scope.get(
-        "campaign_id"
-    ) is not None and stored_authority != fee_approval_authority(request_options):
+    legacy_authority = fee_approval_authority(request_options)
+    current_authority = {**legacy_authority, "unbounded_fee_mode": False}
+    if raw_scope.get("campaign_id") is not None and stored_authority not in (
+        legacy_authority,
+        current_authority,
+    ):
         # Campaign approvals written by the buggy pre-marker candidate cannot
         # prove whether they were ordinary prep or cancellation-only consent.
         # Require a fresh displayed approval after upgrade instead of guessing.

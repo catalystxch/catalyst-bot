@@ -1648,6 +1648,18 @@ class TestBotStart(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestBotStop(_FlaskBase):
+    def setUp(self):
+        super().setUp()
+        self._restart_clear = patch(
+            "follow_restart_intent.clear_follow_restart_intent",
+            return_value={"state": "stopped"},
+        )
+        self._restart_clear.start()
+        self.addCleanup(self._restart_clear.stop)
+        self._restart_read = patch("database.get_setting", return_value=None)
+        self._restart_read.start()
+        self.addCleanup(self._restart_read.stop)
+
     def test_requires_token(self):
         resp = self._post("/api/bot/stop", auth=False)
         self.assertEqual(resp.status_code, 401)
@@ -1666,6 +1678,18 @@ class TestBotStop(_FlaskBase):
         with patch.object(api_server, "bot", bot):
             resp = self._post("/api/bot/stop")
         self.assertEqual(resp.status_code, 200)
+
+    def test_manual_stop_clears_existing_automatic_restart_intent(self):
+        bot = _make_bot(running=True)
+        with (
+            patch.object(api_server, "bot", bot),
+            patch("database.get_setting", return_value='{"state":"running"}'),
+            patch("follow_restart_intent.clear_follow_restart_intent") as clear,
+        ):
+            resp = self._post("/api/bot/stop")
+        self.assertEqual(resp.status_code, 200)
+        clear.assert_called_once_with(reason="manual_stop")
+        bot.stop.assert_called_once()
 
     def test_stop_response_has_status_key(self):
         bot = _make_bot(running=True)

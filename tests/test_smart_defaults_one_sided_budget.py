@@ -77,7 +77,7 @@ _CONFIDENCE = SimpleNamespace(
 )
 
 
-def _recommend(mode, *, xch_mojos, cat_mojos):
+def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None):
     def balance(wallet_id):
         amount = xch_mojos if wallet_id == 1 else cat_mojos
         return {
@@ -116,7 +116,12 @@ def _recommend(mode, *, xch_mojos, cat_mojos):
             },
         ),
         patch(
-            "tx_fees.get_suggested_transaction_fee", return_value={"available": False}
+            "tx_fees.get_suggested_transaction_fee",
+            return_value=(
+                {"available": True, "fee_mojos": fee_mojos}
+                if fee_mojos is not None
+                else {"available": False}
+            ),
         ),
     ):
         with api_server.app.test_request_context("/api/smart-defaults"):
@@ -172,3 +177,40 @@ def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():
     assert _active_ladder_xch(plan, "sell") / Decimal(
         str(plan["smart_mid_price"])
     ) + Decimal(str(plan["topup_pool_cat"])) <= Decimal("1000000")
+
+
+def test_fee_inventory_can_use_more_than_three_percent_after_buy_principal_reserve():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=10_000_000_000_000,
+        cat_mojos=1_000_000_000_000_000,
+        fee_mojos=1_000_000_000,
+    )
+
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert fee_pool > Decimal("0.3")  # old 3% cap on a 10 XCH wallet
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("10"), plan["_capital_plan"]
+
+
+def test_final_fee_reconciliation_shrinks_weekly_inventory_to_safe_remainder():
+    plan = {
+        "coin_prep_headroom_pct": 0,
+        "buy_inner_size_xch": 0.005,
+        "buy_inner_tier_count": 10,
+        "buy_inner_tier_spare_count": 0,
+        "fee_coin_size_xch": 0.001,
+        "fee_prep_count": 100,
+        "topup_pool_xch": 0.02,
+        "_capital_plan": {},
+    }
+
+    smart_defaults._reconcile_smart_fee_inventory(plan, Decimal("0.1"))
+
+    assert plan["fee_prep_count"] == 30
+    assert Decimal("0.005") * plan["buy_inner_tier_count"] + Decimal(
+        str(plan["topup_pool_xch"])
+    ) + Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"] <= Decimal(
+        "0.1"
+    )

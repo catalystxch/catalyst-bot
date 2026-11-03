@@ -11,7 +11,7 @@ Tests GET /api/smart-defaults:
 import os
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -69,7 +69,7 @@ def _green_market_confidence(
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestPassiveRedSmartPlanning(unittest.TestCase):
-    def test_thin_two_sided_book_inside_hard_band_can_be_planned(self):
+    def test_thin_two_sided_book_can_be_planned_without_fixed_price_band(self):
         from blueprints import smart_defaults
 
         confidence = SimpleNamespace(
@@ -86,12 +86,11 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
             observed_bid=Decimal("0.00005"),
             observed_ask=Decimal("0.00008"),
             evidence_digests=("a" * 64,),
+            observed_book_evidence_digests=("a" * 64,),
         )
         with (
-            patch.object(
-                smart_defaults.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0000375")
-            ),
-            patch.object(smart_defaults.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00015")),
+            patch.object(smart_defaults.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.1")),
+            patch.object(smart_defaults.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.2")),
         ):
             self.assertEqual(
                 smart_defaults._passive_red_planning_prices(confidence),
@@ -111,6 +110,7 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
             observed_bid=Decimal("0.00005"),
             observed_ask=Decimal("0.00008"),
             evidence_digests=("a" * 64,),
+            observed_book_evidence_digests=("a" * 64,),
         )
         with (
             patch.object(
@@ -120,7 +120,6 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
         ):
             for reason, bid, ask in (
                 ("hard_price_move_cap", Decimal("0.00005"), Decimal("0.00008")),
-                ("insufficient_bid_depth", Decimal("0.00005"), Decimal("0.00016")),
                 ("insufficient_bid_depth", Decimal("0.00008"), Decimal("0.00005")),
             ):
                 confidence.reason_codes = (reason,)
@@ -133,10 +132,34 @@ class TestPassiveRedSmartPlanning(unittest.TestCase):
             confidence.observed_bid = Decimal("0.00005")
             confidence.observed_ask = Decimal("0.00008")
             confidence.evidence_digests = ()
+            confidence.observed_book_evidence_digests = ()
             self.assertIsNone(smart_defaults._passive_red_planning_prices(confidence))
             confidence.evidence_digests = ("a" * 64,)
+            confidence.observed_book_evidence_digests = ("a" * 64,)
             confidence.manipulation_score = 1
             self.assertIsNone(smart_defaults._passive_red_planning_prices(confidence))
+
+    def test_one_sided_book_uses_recent_proven_anchor_for_planning(self):
+        from blueprints import smart_defaults
+
+        confidence = SimpleNamespace(
+            state="RED",
+            derived_at=datetime.now(timezone.utc),
+            manipulation_score=0,
+            reason_codes=("one_sided_book", "insufficient_ask_depth"),
+            observed_bid=Decimal("0.00007"),
+            observed_ask=None,
+            trusted_midpoint=Decimal("0.00008"),
+            last_trusted_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            last_trusted_evidence_digests=("a" * 64,),
+            evidence_digests=("b" * 64,),
+            observed_book_evidence_digests=("b" * 64,),
+        )
+        with patch.object(smart_defaults.cfg, "SPREAD_BPS", Decimal("800")):
+            self.assertEqual(
+                smart_defaults._passive_red_planning_prices(confidence),
+                (Decimal("0.00007"), Decimal("0.00008"), Decimal("0.0000832")),
+            )
 
 
 class _FlaskBase(unittest.TestCase):
@@ -602,6 +625,7 @@ class TestSmartDefaultsSourceContract(unittest.TestCase):
             observed_ask=Decimal("0.00008"),
             reason_codes=("insufficient_bid_depth", "single_provider_dependency"),
             evidence_digests=("a" * 64,),
+            observed_book_evidence_digests=("a" * 64,),
         )
         with (
             patch("wallet.get_wallet_balance") as wallet_balance,

@@ -31,6 +31,7 @@ def confidence(**changes):
                 "observed_bid": Decimal("0.00005"),
                 "observed_ask": Decimal("0.00008"),
                 "evidence_digests": ("b" * 64,),
+                "observed_book_evidence_digests": ("b" * 64,),
                 "manipulation_score": 0,
                 "pending_movement_refreshes": 0,
                 "provider_redundancy": 1,
@@ -132,6 +133,97 @@ def test_expired_evidence_rejected():
     assert override_price_range(confidence(), now=NOW, valid_until=NOW) is None
 
 
+def test_saved_thin_policy_uses_current_book_without_absolute_band(monkeypatch):
+    from confidence_override import saved_thin_market_price_range
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.01"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.02"))
+    value = confidence()
+    result = saved_thin_market_price_range(
+        value, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    )
+    assert result == (
+        Decimal("0.00005"),
+        Decimal("0.000065"),
+        Decimal("0.00008"),
+        ("b" * 64,),
+    )
+
+
+def test_saved_thin_policy_uses_recent_anchor_for_one_sided_book():
+    from confidence_override import saved_thin_market_price_range
+
+    value = confidence(
+        reason_codes=("one_sided_book", "insufficient_ask_depth"),
+        observed_ask=None,
+        trusted_midpoint=Decimal("0.000065"),
+        last_trusted_at=NOW - timedelta(hours=2),
+        last_trusted_evidence_digests=("a" * 64,),
+    )
+    result = saved_thin_market_price_range(
+        value, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    )
+    assert result is not None
+    bid, midpoint, ask, digests = result
+    assert bid <= Decimal("0.00005") < midpoint < ask
+    assert digests == ("a" * 64, "b" * 64)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reason_codes": ("provider_price_conflict",)},
+        {"reason_codes": ("hard_price_move_cap",)},
+        {"reason_codes": ("material_move_pending_confirmation",)},
+        {"manipulation_score": 1},
+        {"observed_book_evidence_digests": ()},
+    ],
+)
+def test_saved_thin_policy_rejects_unsafe_current_book(changes):
+    from confidence_override import saved_thin_market_price_range
+
+    assert (
+        saved_thin_market_price_range(
+            confidence(**changes), now=NOW, valid_until=NOW + timedelta(seconds=20)
+        )
+        is None
+    )
+
+
+def test_saved_thin_consent_stays_active_until_run_scope_changes():
+    from confidence_override import SavedThinMarketConsent
+
+    permit = SavedThinMarketConsent(SCOPE)
+    assert permit.active(scope=SCOPE, now=NOW + timedelta(days=8))
+    assert not permit.active(scope=SCOPE | {"buy_limit": 25}, now=NOW)
+    assert not permit.active(scope=SCOPE, now=NOW)
+
+
+def test_saved_thin_choice_is_bound_to_wallet_and_asset(monkeypatch):
+    import json
+    import database
+    from confidence_override import saved_thin_market_choice_matches
+
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 12345,
+        "asset_id": "a" * 64,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "ticker": "MZ_XCH",
+    }
+    monkeypatch.setattr(database, "get_setting", lambda _key: json.dumps(identity))
+    assert saved_thin_market_choice_matches({"identity": identity})
+    assert not saved_thin_market_choice_matches(
+        {"identity": identity | {"wallet_fingerprint": 54321}}
+    )
+    assert not saved_thin_market_choice_matches(
+        {"identity": identity | {"asset_id": "b" * 64}}
+    )
+
+
 def test_consented_hard_move_uses_fresh_book_inside_configured_price_band(monkeypatch):
     from config import cfg
 
@@ -198,6 +290,44 @@ def test_candidate_rechecks_consent_and_preserves_profitability():
     assert raw.state == "RED" and raw.data_valid is False
 
 
+def test_saved_thin_candidate_uses_relative_book_not_old_hard_band(monkeypatch):
+    from confidence_override import ConsentedConfidence
+    from config import cfg
+    from offer_manager import assess_passive_red_candidate, passive_red_ladder_price
+
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.01"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.02"))
+    view = ConsentedConfidence(
+        confidence(),
+        lambda: True,
+        (Decimal("0.00005"), Decimal("0.000065"), Decimal("0.00008")),
+        dynamic_band=True,
+    )
+    price = Decimal("0.00004")
+    assert (
+        passive_red_ladder_price(
+            price=price,
+            inner_price=price,
+            side="buy",
+            confidence=view,
+            hard_min_price=cfg.HARD_MIN_PRICE_XCH,
+            hard_max_price=cfg.HARD_MAX_PRICE_XCH,
+        )
+        == price
+    )
+    result = assess_passive_red_candidate(
+        side="buy",
+        candidate_price=price,
+        size_xch=Decimal("1"),
+        confidence=view,
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=1,
+        minimum_profit_xch=Decimal("0"),
+        now=NOW,
+    )
+    assert result["eligible"] is True
+
+
 def runtime_loop(monkeypatch):
     import bot_loop
     from bot_loop import BotLoop
@@ -218,6 +348,77 @@ def runtime_loop(monkeypatch):
         type("Clock", (datetime,), {"now": classmethod(lambda cls, tz=None: NOW)}),
     )
     return loop
+
+
+def test_saved_thin_choice_binds_to_current_follow_run_and_anchor(monkeypatch):
+    from bot_loop import BotLoop
+    from confidence_override import ConsentedConfidence, SavedThinMarketConsent
+    from config import cfg
+
+    loop = runtime_loop(monkeypatch)
+    loop._confidence_override_consent = None
+    loop._market_confidence_result = confidence(
+        reason_codes=("one_sided_book", "insufficient_ask_depth"),
+        observed_ask=None,
+        trusted_midpoint=Decimal("0.000065"),
+        last_trusted_at=NOW - timedelta(hours=1),
+        last_trusted_evidence_digests=("a" * 64,),
+    )
+    monkeypatch.setattr(cfg, "THIN_MARKET_ENABLED", True, raising=False)
+    monkeypatch.setattr(
+        "confidence_override.saved_thin_market_choice_matches", lambda _scope: True
+    )
+    assert BotLoop._confidence_override_active(loop)
+    assert isinstance(loop._confidence_override_consent, SavedThinMarketConsent)
+    view = BotLoop._effective_market_confidence(loop)
+    assert isinstance(view, ConsentedConfidence)
+    assert view.dynamic_band is True
+    assert view.evidence_digests == ("a" * 64, "b" * 64)
+
+
+def test_saved_thin_expired_anchor_holds_existing_run_offers_only(monkeypatch):
+    import bot_loop
+    from bot_loop import BotLoop
+    from confidence_override import SavedThinMarketConsent
+    from config import cfg
+
+    loop = runtime_loop(monkeypatch)
+    monkeypatch.setattr(bot_loop, "datetime", datetime)
+    loop._confidence_override_consent = SavedThinMarketConsent(SCOPE)
+    loop._market_confidence_result = confidence(
+        reason_codes=("market_data_absent",),
+        observed_bid=None,
+        observed_ask=None,
+        trusted_midpoint=Decimal("0.000065"),
+        last_trusted_at=datetime.now(timezone.utc) - timedelta(hours=25),
+        last_trusted_evidence_digests=("a" * 64,),
+    )
+    monkeypatch.setattr(cfg, "THIN_MARKET_ENABLED", True, raising=False)
+    assert not BotLoop._confidence_override_active(loop)
+    assert BotLoop._saved_thin_stale_hold_active(loop)
+    loop._market_confidence_result.reason_codes = ("provider_price_conflict",)
+    assert not BotLoop._saved_thin_stale_hold_active(loop)
+
+
+def test_saved_thin_expired_red_anchor_keeps_existing_offers(monkeypatch):
+    import bot_loop
+    from bot_loop import BotLoop
+    from confidence_override import SavedThinMarketConsent
+    from config import cfg
+
+    loop = runtime_loop(monkeypatch)
+    monkeypatch.setattr(bot_loop, "datetime", datetime)
+    loop._confidence_override_consent = SavedThinMarketConsent(SCOPE)
+    loop._market_confidence_result = confidence(
+        reason_codes=("market_data_absent",),
+        observed_bid=None,
+        observed_ask=None,
+        thin_anchor_midpoint=Decimal("0.000065"),
+        thin_anchor_at=datetime.now(timezone.utc) - timedelta(hours=25),
+        thin_anchor_evidence_digests=("a" * 64,),
+    )
+    monkeypatch.setattr(cfg, "THIN_MARKET_ENABLED", True, raising=False)
+    assert BotLoop._saved_thin_stale_hold_active(loop)
 
 
 def test_runtime_capacity_and_withdrawal_agree(monkeypatch):

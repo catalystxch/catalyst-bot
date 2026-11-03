@@ -98,15 +98,15 @@ def test_cancellation_price_refuses_zero_fee_before_wallet_effect(
     assert calls == [0]
 
 
-def test_cancellation_price_cannot_exceed_remaining_total_budget(approved, monkeypatch):
+def test_unbounded_cancellation_can_quote_above_recorded_estimate(approved, monkeypatch):
     calls = _builder(monkeypatch, approved)
     _quote(monkeypatch, approved, 81)
 
     result = _price(approved)
 
-    assert result["available"] is False
-    assert result["reason"] == "FEE_BUDGET_EXCEEDED"
-    assert result["required_fee_mojos"] == 81
+    assert result["available"] is True
+    assert result["fee_mojos"] == 81
+    assert result["approval"]["unbounded"] is True
     assert calls == [0, 81]
 
 

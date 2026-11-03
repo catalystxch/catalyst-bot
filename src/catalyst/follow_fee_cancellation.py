@@ -34,7 +34,7 @@ def price_follow_cancellation(
     fee_coin_id: str,
     now_epoch: int,
 ) -> dict:
-    """Converge a Sage unsigned cancellation against the effective run cap."""
+    """Converge a Sage unsigned cancellation against current run fee authority."""
     trades = _canonical_ids(trade_ids)
     sources = _canonical_ids(source_coin_ids)
     fee_coins = _canonical_ids([fee_coin_id])
@@ -89,7 +89,10 @@ def price_follow_cancellation(
             )
             if after.get("ready") is not True or after != authority:
                 return _refused("FOLLOW_FEE_APPROVAL_STALE", after)
-            if fee > after["remaining_fee_mojos"]:
+            if (
+                after.get("unbounded") is not True
+                and fee > after["remaining_fee_mojos"]
+            ):
                 return _refused("FEE_BUDGET_EXCEEDED", after, required_fee_mojos=fee)
             return {
                 "available": True,

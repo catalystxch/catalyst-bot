@@ -401,7 +401,26 @@ def get_fee_coin_size_xch() -> Decimal:
 
 
 def get_fee_coin_size_mojos() -> int:
-    return xch_to_mojos(get_fee_coin_size_xch())
+    configured = xch_to_mojos(get_fee_coin_size_xch())
+    if configured <= 0:
+        return 0
+    if get_transaction_fee_mode() not in _AUTO_FEE_MODES:
+        return configured
+    try:
+        quote = get_suggested_transaction_fee()
+        fee_mojos = int(quote.get("fee_mojos", 0) or 0) if quote.get("available") else 0
+    except Exception:
+        fee_mojos = 0
+    if fee_mojos <= 0:
+        return configured
+    # Keep the configured floor, and grow the runtime target when congestion
+    # makes it too small to recycle at least ten fee operations. Rounding to
+    # 1M mojos preserves the fee-plan denomination. This is sizing guidance;
+    # it does not dispatch a transaction or mutate user configuration.
+    raw_target = max(1_000_000_000, fee_mojos * 20)
+    step = 1_000_000
+    network_target = ((raw_target + step - 1) // step) * step
+    return max(configured, network_target)
 
 
 def fee_pool_configured() -> bool:
@@ -419,13 +438,14 @@ def get_fee_tier_name() -> str:
 
 
 def get_fee_pool_plan() -> Dict:
+    coin_size_mojos = get_fee_coin_size_mojos()
     return {
         "enabled": fee_pool_enabled(),
         "configured": fee_pool_configured(),
         "tier_name": FEE_TIER_NAME,
         "count": get_fee_pool_count(),
-        "coin_size_mojos": get_fee_coin_size_mojos(),
-        "coin_size_xch": str(get_fee_coin_size_xch()),
+        "coin_size_mojos": coin_size_mojos,
+        "coin_size_xch": str(mojos_to_xch(coin_size_mojos)),
     }
 
 

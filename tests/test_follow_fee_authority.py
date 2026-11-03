@@ -54,6 +54,53 @@ def test_explicit_continuous_review_survives_finite_window(approved):
     )
 
 
+def test_unbounded_follow_authority_survives_fees_above_recorded_estimate(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    identity = {
+        key: scope[key]
+        for key in (
+            "network",
+            "wallet_type",
+            "wallet_fingerprint",
+            "wallet_id",
+            "xch_wallet_id",
+            "asset_id",
+            "ticker",
+        )
+    }
+    terms = dict(
+        approval_id=approval_id,
+        identity=identity,
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+    )
+    run = reviewed_run(**terms)
+    database.reserve_approved_fee(
+        approval_id=approval_id,
+        scope_sha256=approved["approval"]["scope_sha256"],
+        plan_sha256=approved["approval"]["plan_sha256"],
+        operation_id="f" * 64,
+        fee_mojos=81,
+        cancellation=False,
+    )
+    authority = database.get_follow_creation_authority(
+        identity=identity, configuration_sha256="a" * 64, now_epoch=1002
+    )
+    assert authority["ready"] is False
+    assert authority["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
+    assert authority["run_id"] == run["run_id"]
+    assert authority["unbounded"] is True
+
+
 def reviewed_run(**terms):
     terms.setdefault("principal_review_sha256", "d" * 64)
     review = database.create_follow_run_review(
@@ -553,6 +600,7 @@ def test_unresolved_fee_effect_temporarily_blocks_creation_without_reset(approve
     assert cleanup["ready"] is False
     assert cleanup["reason_code"] == "FOLLOW_UNRESOLVED_EFFECT"
     assert cleanup["held_fee_mojos"] == 1
+    assert cleanup["unbounded"] is True
     assert cleanup["remaining_fee_mojos"] == 79
 
 

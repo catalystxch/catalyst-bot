@@ -306,6 +306,17 @@ def test_timeout_and_restart_leave_submitted_fee_held(isolated_database, monkeyp
     assert state["held_fee_mojos"] == 10
 
 
+def test_dispatched_unknown_effect_remains_a_recovery_hold(
+    isolated_database, monkeypatch
+):
+    operation_id, claim, _, _, approval = _prepared(monkeypatch)
+    _submit(operation_id, claim, approval)
+    state = database.get_coin_prep_fee_approval_status(approval["approval_id"])
+    assert state["unresolved_operation_count"] == 1
+    assert state["pending_operation"]["effect_state"] == "submitted_awaiting_confirmation"
+    assert state["held_fee_mojos"] == 10
+
+
 @pytest.mark.parametrize(
     "outcome,held,spent,remaining", [("CONFIRMED", 0, 10, 90), ("FAILED", 0, 0, 100)]
 )

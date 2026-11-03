@@ -1097,7 +1097,13 @@ class BotLoop:
         )
 
     def _override_protected_trade_ids(self) -> set[str]:
-        if not self._confidence_override_active():
+        def protection_active():
+            return (
+                self._confidence_override_active()
+                or self._saved_thin_stale_hold_active()
+            )
+
+        if not protection_active():
             return set()
         try:
             protected = {
@@ -1107,7 +1113,54 @@ class BotLoop:
             }
         except Exception:
             return set()
-        return protected if self._confidence_override_active() else set()
+        return protected if protection_active() else set()
+
+    def _saved_thin_stale_hold_active(self) -> bool:
+        """Leave this run's existing offers open after its price anchor ages out."""
+        from confidence_override import SavedThinMarketConsent, current_scope
+
+        consent = getattr(self, "_confidence_override_consent", None)
+        if (
+            getattr(cfg, "THIN_MARKET_ENABLED", False) is not True
+            or not getattr(self, "_running", False)
+            or not isinstance(consent, SavedThinMarketConsent)
+            or consent.revoked
+        ):
+            return False
+        raw, _ = self._market_confidence_snapshot()
+        anchors = [
+            value
+            for value in (
+                getattr(raw, "last_trusted_at", None),
+                getattr(raw, "thin_anchor_at", None),
+            )
+            if type(value) is datetime and value.tzinfo is not None
+        ]
+        trusted_at = max(anchors) if anchors else None
+        reasons = getattr(raw, "reason_codes", ())
+        if (
+            type(trusted_at) is not datetime
+            or trusted_at.tzinfo is None
+            or type(reasons) is not tuple
+            or not set(reasons).issubset(
+                {
+                    "market_data_absent",
+                    "stale_provider_data",
+                    "one_sided_book",
+                    "insufficient_bid_depth",
+                    "insufficient_ask_depth",
+                    "single_provider_dependency",
+                    "out_of_range_depth_excluded",
+                }
+            )
+            or datetime.now(timezone.utc) - trusted_at.astimezone(timezone.utc)
+            <= timedelta(hours=24)
+        ):
+            return False
+        try:
+            return consent.active(scope=current_scope(), now=datetime.now(timezone.utc))
+        except Exception:
+            return False
 
     def _authorize_publication_claim(self, claim: dict) -> bool:
         """Authorize one exact durable publication at its effect boundary.
@@ -1259,13 +1312,28 @@ class BotLoop:
             return (self._market_confidence_result, self._market_confidence_valid_until)
 
     def _confidence_override_active(self) -> bool:
-        from confidence_override import current_scope
+        from confidence_override import (
+            SavedThinMarketConsent,
+            current_scope,
+            saved_thin_market_choice_matches,
+        )
 
         consent = getattr(self, "_confidence_override_consent", None)
-        if consent is None or consent.revoked or not getattr(self, "_running", False):
+        if not getattr(self, "_running", False):
+            return False
+        if consent is None and getattr(cfg, "THIN_MARKET_ENABLED", False) is not True:
+            return False
+        if consent is not None and consent.revoked:
             return False
         try:
             scope = current_scope()
+            if consent is None and getattr(cfg, "THIN_MARKET_ENABLED", False) is True:
+                if not saved_thin_market_choice_matches(scope):
+                    return False
+                consent = SavedThinMarketConsent(scope)
+                self._confidence_override_consent = consent
+            if consent is None or consent.revoked:
+                return False
             raw, deadline = self._market_confidence_snapshot()
             now = datetime.now(timezone.utc)
             if not consent.active(scope=scope, now=now):
@@ -1302,6 +1370,15 @@ class BotLoop:
         )
         if prices is None:
             return raw
+        evidence = (
+            consent.price_evidence(
+                raw, now=datetime.now(timezone.utc), valid_until=deadline
+            )
+            if getattr(consent, "dynamic_band", False)
+            else None
+        )
+        if getattr(consent, "dynamic_band", False) and evidence is None:
+            return raw
 
         def candidate_authorized():
             # Building a 48-slot batch must not repeat Sage identity and fee
@@ -1328,6 +1405,8 @@ class BotLoop:
             prices,
             candidate_authorize=candidate_authorized,
             current_view=self._fresh_effective_market_confidence,
+            evidence_digests=evidence[3] if evidence is not None else None,
+            dynamic_band=getattr(consent, "dynamic_band", False),
         )
 
     def _fresh_effective_market_confidence(self):
@@ -1369,7 +1448,10 @@ class BotLoop:
         """
 
         consent = getattr(self, "_confidence_override_consent", None)
-        if consent is not None and not consent.revoked and self._running:
+        if (
+            (consent is not None and not consent.revoked)
+            or getattr(cfg, "THIN_MARKET_ENABLED", False) is True
+        ) and self._running:
             return self._fresh_effective_market_confidence()
         return self._effective_market_confidence()
 

@@ -108,6 +108,84 @@ def _preview(*, available: bool = True) -> dict:
     }
 
 
+def test_unbounded_fee_preview_has_no_cumulative_cap_input(page):
+    _open_gui(page)
+    preview = _preview()
+    preview["unbounded_fee_mode"] = True
+    preview["suggested_maximum_fee_mojos"] = None
+    preview["minimum_cumulative_fee_mojos"] = None
+    result = page.evaluate(
+        """preview => {
+            preview.observed_at = Math.floor(Date.now() / 1000);
+            preview.expires_at = preview.observed_at + 60;
+            renderCoinPrepFeePreview(preview);
+            return {
+                capHidden: document.getElementById('cpFeeCapRow').style.display === 'none',
+                mode: validateCoinPrepFeeMaximum(),
+                text: document.getElementById('cpFeeStatus').textContent,
+            };
+        }""",
+        preview,
+    )
+    assert result["capHidden"] is True
+    assert result["mode"] == "unbounded"
+    assert "Each later wallet effect" in result["text"]
+
+
+def test_follow_run_review_omits_legacy_cap_for_unbounded_approval(page):
+    _open_gui(page)
+    result = page.evaluate(
+        """async () => {
+            IS_DESKTOP = true;
+            window.pywebview = {api: {confirm_follow_run_review: async () => ({success: true})}};
+            let requested = null;
+            window.apiFetch = async (path, options = {}) => {
+                if (String(path).endsWith('/coin-prep/status')) {
+                    return new Response(JSON.stringify({
+                        success: true, follow_fee_approval_id: 'a'.repeat(64),
+                        follow_fee_approval: {unbounded: true, total_fee_mojos: 16000000},
+                    }), {status: 200});
+                }
+                if (String(path).endsWith('/follow/run-review')) {
+                    requested = JSON.parse(options.body);
+                    return new Response(JSON.stringify({
+                        success: true, unbounded: true,
+                        review_id: 'b'.repeat(64), review_sha256: 'c'.repeat(64),
+                        buy_limit: 24, sell_limit: 24, continuous: true,
+                        maximum_fee_mojos: 16000000,
+                        replacement_count_gate_passed: true,
+                        current_prep_targets_proven: true,
+                        buy_slots_arithmetic_fit: 24, sell_slots_arithmetic_fit: 24,
+                        shutdown_funding: {
+                            ready: true, full_book_proven: false, dispatch_authorized: false,
+                            expires_at: Math.floor(Date.now() / 1000) + 60,
+                            quoted_fee_mojos: 1000,
+                        },
+                        identity: {wallet_fingerprint: 736588221, network: 'mainnet', ticker: 'MZ', asset_id: 'd'.repeat(64)},
+                        maximum_trade_xch_mojos: 1000000000,
+                        maximum_trade_cat_atoms: 1000000,
+                        protected_fee_principal_mojos: 2000000000,
+                        cancellation_reserve_mojos: 4000000,
+                        largest_spendable_fee_coin_mojos: 50000000,
+                        expires_at_epoch: Math.floor(Date.now() / 1000) + 3600,
+                        review_expires_at_epoch: Math.floor(Date.now() / 1000) + 60,
+                    }), {status: 200});
+                }
+                throw new Error(`Unexpected request ${path}`);
+            };
+            await prepareFollowRunReview();
+            return {
+                requested,
+                capHidden: document.getElementById('followRunFeeCapRow').style.display === 'none',
+                text: document.getElementById('followRunReviewText').textContent,
+            };
+        }"""
+    )
+    assert "maximum_fee_mojos" not in result["requested"]
+    assert result["capHidden"] is True
+    assert "no cumulative ceiling" in result["text"]
+
+
 def test_zero_headroom_is_preserved_in_saved_coin_prep_plan(page):
     _open_gui(page)
     result = page.evaluate(

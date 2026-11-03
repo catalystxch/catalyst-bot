@@ -433,7 +433,7 @@ def assess_passive_red_candidate(
                 "eligible": False,
                 "reason_code": "red_quote_would_improve_book",
             }
-        if (
+        if not getattr(confidence, "dynamic_band", False) and (
             candidate_price < cfg.HARD_MIN_PRICE_XCH
             or candidate_price > cfg.HARD_MAX_PRICE_XCH
         ):
@@ -480,6 +480,8 @@ def passive_red_ladder_price(
         price += max(Decimal("0"), ask - inner_price)
         if price < ask:
             return None
+    if getattr(confidence, "dynamic_band", False):
+        return price if price > 0 else None
     return price if hard_min_price <= price <= hard_max_price else None
 
 
@@ -7213,12 +7215,16 @@ class OfferManager:
             ):
                 raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
             total_fee = sum(priced["fee_mojos"] for _, _, priced in selected)
-            if total_fee > after["remaining_fee_mojos"]:
+            if (
+                after.get("unbounded") is not True
+                and total_fee > after["remaining_fee_mojos"]
+            ):
                 raise ValueError("FEE_BUDGET_EXCEEDED")
             preview = {
                 "cohorts": [cohort for cohort, _contract, _priced in selected],
                 "total_fee_mojos": total_fee,
                 "remaining_fee_mojos": after["remaining_fee_mojos"],
+                "unbounded": after.get("unbounded") is True,
                 "dispatch_authorized": False,
             }
         finally:

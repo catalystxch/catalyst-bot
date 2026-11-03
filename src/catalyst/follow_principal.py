@@ -38,7 +38,7 @@ def calculate_follow_principal(
     xch_reserve: Decimal,
     cat_reserve: Decimal,
     cat_decimals: int,
-    fee_cap_mojos: int,
+    fee_cap_mojos: int | None,
     fee_pool_principal_mojos: int,
     fee_reserve_coin_ids: set[str],
 ) -> dict:
@@ -53,8 +53,10 @@ def calculate_follow_principal(
         type(snapshot) is not CoinSnapshot
         or type(cat_decimals) is not int
         or not 0 <= cat_decimals <= 18
-        or type(fee_cap_mojos) is not int
-        or fee_cap_mojos <= 0
+        or (
+            fee_cap_mojos is not None
+            and (type(fee_cap_mojos) is not int or fee_cap_mojos <= 0)
+        )
         or type(fee_pool_principal_mojos) is not int
         or fee_pool_principal_mojos < 0
         or type(fee_reserve_coin_ids) is not set
@@ -62,7 +64,7 @@ def calculate_follow_principal(
         raise ValueError("FOLLOW_PRINCIPAL_INPUT_INVALID")
     xch_floor = _floor_atoms(xch_reserve, 12)
     cat_floor = _floor_atoms(cat_reserve, cat_decimals)
-    fee_floor = max(fee_cap_mojos, fee_pool_principal_mojos)
+    fee_floor = max(fee_cap_mojos or 0, fee_pool_principal_mojos)
     if any(
         type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
         for value in fee_reserve_coin_ids
@@ -144,7 +146,7 @@ def calculate_follow_principal(
     }
 
 
-def read_follow_principal_snapshot(*, fee_cap_mojos: int) -> dict:
+def read_follow_principal_snapshot(*, fee_cap_mojos: int | None = None) -> dict:
     """Read the verified Sage inventory and durable fee-coin designation.
 
     The result is a principal proposal for native review, never wallet-effect
@@ -158,7 +160,9 @@ def read_follow_principal_snapshot(*, fee_cap_mojos: int) -> dict:
     )
 
 
-def _principal_from_observed_snapshot(observed: dict, *, fee_cap_mojos: int) -> dict:
+def _principal_from_observed_snapshot(
+    observed: dict, *, fee_cap_mojos: int | None
+) -> dict:
     """Calculate principal from one trusted, identity-verified wallet read."""
 
     from tx_fees import get_fee_pool_plan
@@ -253,6 +257,117 @@ def prove_follow_replacement_count_capacity(
         "buy_limit": buy_limit,
         "sell_limit": sell_limit,
         "replacement_count_gate_passed": True,
+    }
+
+
+def prove_follow_restart_book(
+    *,
+    run_id: str,
+    local_offers: list,
+    sage_offers: list,
+    run_intents: list,
+    buy_limit: int,
+    sell_limit: int,
+) -> dict:
+    """Prove retained offers are exactly the active offers owned by one run.
+
+    Partial books are safe to continue because the normal ladder can refill
+    missing slots. Unknown intents, extra wallet offers, or disagreement
+    between Sage and the local registry fail closed.
+    """
+    if (
+        type(run_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", run_id) is None
+        or type(buy_limit) is not int
+        or not 1 <= buy_limit <= 50
+        or type(sell_limit) is not int
+        or not 1 <= sell_limit <= 50
+        or type(local_offers) is not list
+        or type(sage_offers) is not list
+        or type(run_intents) is not list
+    ):
+        raise ValueError("FOLLOW_RESTART_BOOK_INVALID")
+
+    def active_ids(
+        rows: list, id_field: str, *, require_side: bool
+    ) -> dict[str, str | None]:
+        result = {}
+        for row in rows:
+            if type(row) is not dict:
+                raise ValueError("FOLLOW_RESTART_BOOK_INVALID")
+            raw_status = row.get("status")
+            if raw_status in {3, 4, 5} or str(raw_status).strip().upper() in {
+                "CANCELLED",
+                "CANCELED",
+                "EXPIRED",
+                "COMPLETED",
+                "CONFIRMED",
+                "SUCCESS",
+                "TAKEN",
+                "FILLED",
+                "FAILED",
+            }:
+                continue
+            offer_id = row.get(id_field) or row.get("offer_id") or row.get("trade_id")
+            side = str(row.get("side", "")).lower()
+            if (
+                type(offer_id) is not str
+                or not offer_id
+                or (require_side and side not in {"buy", "sell"})
+            ):
+                raise ValueError("FOLLOW_RESTART_BOOK_INVALID")
+            if raw_status not in {0, 1, 2} and str(raw_status).strip().upper() not in {
+                "OPEN",
+                "PENDING",
+                "PENDING_CANCEL",
+                "MEMPOOL_OBSERVED",
+            }:
+                raise ValueError("FOLLOW_RESTART_BOOK_UNKNOWN_EFFECT")
+            if offer_id in result:
+                raise ValueError("FOLLOW_RESTART_BOOK_INVALID")
+            result[offer_id] = side if side in {"buy", "sell"} else None
+        return result
+
+    local = active_ids(local_offers, "trade_id", require_side=True)
+    sage = active_ids(sage_offers, "trade_id", require_side=False)
+    intent_ids = {}
+    for intent in run_intents:
+        if type(intent) is not dict:
+            raise ValueError("FOLLOW_RESTART_BOOK_RUN_MISMATCH")
+        owner_run_id = intent.get("run_id")
+        expected_purposes = {
+            f"follow:{run_id}:normal_lifecycle",
+            f"follow:{run_id}:book_opportunity",
+        }
+        if (
+            type(owner_run_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", owner_run_id) is None
+            or intent.get("purpose") not in expected_purposes
+        ):
+            raise ValueError("FOLLOW_RESTART_BOOK_RUN_MISMATCH")
+        if intent.get("lifecycle_state") not in {"created", "visible"}:
+            raise ValueError("FOLLOW_RESTART_BOOK_UNKNOWN_EFFECT")
+        offer_id = intent.get("sage_trade_id")
+        side = intent.get("side")
+        if (
+            type(offer_id) is not str
+            or not offer_id
+            or side not in {"buy", "sell"}
+            or offer_id in intent_ids
+        ):
+            raise ValueError("FOLLOW_RESTART_BOOK_INVALID")
+        intent_ids[offer_id] = side
+    if not local or set(local) != set(sage) or local != intent_ids:
+        raise ValueError("FOLLOW_RESTART_BOOK_MEMBERSHIP_MISMATCH")
+    buys = sum(side == "buy" for side in local.values())
+    sells = sum(side == "sell" for side in local.values())
+    if buys > buy_limit or sells > sell_limit:
+        raise ValueError("FOLLOW_RESTART_BOOK_CAPACITY_INVALID")
+    return {
+        "ready": True,
+        "buy_count": buys,
+        "sell_count": sells,
+        "dispatch_authorized": False,
     }
 
 
@@ -360,7 +475,10 @@ def preview_approved_follow_principal(
         raise ValueError("FOLLOW_FEE_APPROVAL_STALE")
     _prove_approved_coin_prep_targets(observed)
     principal = _principal_from_observed_snapshot(
-        observed, fee_cap_mojos=before["total_fee_mojos"]
+        observed,
+        fee_cap_mojos=(
+            None if before.get("unbounded") is True else before["total_fee_mojos"]
+        ),
     )
     slot_fit = {}
     shutdown_funding = {
@@ -383,7 +501,9 @@ def preview_approved_follow_principal(
             maximum_trade_cat_atoms=principal["maximum_trade_cat_atoms"],
         )
         shutdown_funding = preview_one_block_shutdown_funding(
-            maximum_fee_mojos=before["total_fee_mojos"],
+            maximum_fee_mojos=(
+                None if before.get("unbounded") is True else before["total_fee_mojos"]
+            ),
             spent_fee_mojos=before["spent_fee_mojos"],
             held_fee_mojos=before["held_fee_mojos"],
             largest_fee_coin_mojos=principal["largest_spendable_fee_coin_mojos"],
@@ -412,6 +532,7 @@ def preview_approved_follow_principal(
             if key != "dispatch_authorized"
         },
         "maximum_fee_mojos": before["total_fee_mojos"],
+        "unbounded": before.get("unbounded") is True,
         "cancellation_reserve_mojos": before["cancellation_reserve_mojos"],
         "largest_planned_fee_coin_mojos": largest_planned_fee_coin_mojos,
         "shutdown_funding": shutdown_funding,
@@ -448,7 +569,7 @@ def prepare_follow_run_review(
     buy_limit: int,
     sell_limit: int,
     duration_seconds: int | None,
-    requested_fee_cap_mojos: int,
+    requested_fee_cap_mojos: int | None = None,
     continuous: bool = False,
 ) -> dict:
     """Persist a short-lived review from server-verified principal and slots.
@@ -476,8 +597,12 @@ def prepare_follow_run_review(
                 or not 0 < duration_seconds <= 48 * 3600
             )
         )
-        or type(requested_fee_cap_mojos) is not int
-        or requested_fee_cap_mojos <= 0
+        or (
+            requested_fee_cap_mojos is not None
+            and (
+                type(requested_fee_cap_mojos) is not int or requested_fee_cap_mojos <= 0
+            )
+        )
     ):
         raise ValueError("FOLLOW_REVIEW_REQUEST_INVALID")
 
@@ -509,9 +634,12 @@ def prepare_follow_run_review(
             or proposal["shutdown_funding"].get("ready") is not True
             or proposal["shutdown_funding"].get("full_book_proven") is not False
             or proposal["shutdown_funding"].get("dispatch_authorized") is not False
-            or proposal.get("maximum_fee_mojos") != requested_fee_cap_mojos
+            or (
+                proposal.get("unbounded") is not True
+                and proposal.get("maximum_fee_mojos") != requested_fee_cap_mojos
+            )
             or type(reserve) is not int
-            or not 0 < reserve <= requested_fee_cap_mojos
+            or not 0 < reserve <= proposal["maximum_fee_mojos"]
             or type(proposal.get("maximum_trade_xch_mojos")) is not int
             or proposal["maximum_trade_xch_mojos"] <= 0
             or type(proposal.get("maximum_trade_cat_atoms")) is not int
@@ -531,6 +659,8 @@ def prepare_follow_run_review(
         return proposal
 
     proposal = _current_proposal()
+    if proposal.get("unbounded") is True:
+        requested_fee_cap_mojos = proposal["maximum_fee_mojos"]
     refreshed = _current_proposal()
 
     def _stable_view(value: dict) -> dict:
@@ -562,7 +692,9 @@ def prepare_follow_run_review(
         "expires_at_epoch": (
             CONTINUOUS_RUN_EXPIRY if continuous else started_at_epoch + duration_seconds
         ),
-        "maximum_fee_mojos": requested_fee_cap_mojos,
+        # This immutable field binds the approval record for compatibility;
+        # unbounded approvals do not use it as a cumulative stopping point.
+        "maximum_fee_mojos": proposal["maximum_fee_mojos"],
         "protected_shutdown_fee_mojos": proposal["cancellation_reserve_mojos"],
     }
     if continuous:
@@ -813,6 +945,12 @@ def prepare_follow_fee_ceiling_review(
         or proposed_maximum_fee_mojos <= 0
     ):
         raise ValueError("FOLLOW_FEE_REVISION_INVALID")
+    identity = database.get_follow_run_identity(run_id)
+    policy = database.get_effective_follow_fee_policy(
+        run_id=run_id, identity=identity, now_epoch=int(time.time())
+    )
+    if policy.get("unbounded") is True:
+        raise ValueError("FOLLOW_FEE_REVISION_UNAVAILABLE")
     observed = _current_follow_fee_funding(run_id)
     now_epoch = int(time.time())
     review = database.create_follow_fee_ceiling_review(
@@ -876,9 +1014,6 @@ def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) ->
         != "two_sided"
     ):
         return {"ready": True}
-    if resume_existing_offers:
-        # A retained offer book needs its own exact run-bound membership proof.
-        return {"ready": False, "reason": "FOLLOW_RESUME_REVIEW_REQUIRED"}
     try:
         import database
         from confidence_override import current_scope
@@ -913,6 +1048,81 @@ def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) ->
         wallet_hash = hashlib.sha256(
             f"fingerprint:{fingerprint}".encode("utf-8")
         ).hexdigest()
+        if resume_existing_offers:
+            if identity.get("network") != "mainnet":
+                return {"ready": False, "reason": "FOLLOW_RESUME_NETWORK_INVALID"}
+            from wallet import (
+                get_all_offers,
+                get_pending_transactions,
+                get_wallet_sync_status,
+            )
+
+            sync = get_wallet_sync_status()
+            if (
+                type(sync) is not dict
+                or sync.get("reachable") is not True
+                or sync.get("synced") is not True
+                or sync.get("sync_state") != "synced"
+            ):
+                return {"ready": False, "reason": "FOLLOW_RESUME_WALLET_NOT_SYNCED"}
+            pending = get_pending_transactions()
+            if type(pending) is not list or pending:
+                return {"ready": False, "reason": "FOLLOW_RESUME_PENDING_EFFECT"}
+            local_open = database.get_open_offers(cat_asset_id=asset_id)
+            all_intents = database.get_offer_intents_for_registry()
+            if type(local_open) is not list or type(all_intents) is not list:
+                return {"ready": False, "reason": "FOLLOW_RESUME_PROOF_UNAVAILABLE"}
+            run_intents = [
+                row
+                for row in all_intents
+                if type(row) is dict
+                and row.get("wallet_fingerprint_hash") == wallet_hash
+                and row.get("network") == identity.get("network")
+                and row.get("asset_id") == asset_id
+                and row.get("lifecycle_state") not in {"terminal", "creation_failed"}
+            ]
+            try:
+                # The facade performs a complete, stable read for active offers;
+                # completed history can grow without bound during continuous runs.
+                wallet_offers = get_all_offers(
+                    include_completed=False, start=0, end=10000
+                )
+                if type(wallet_offers) is not list:
+                    return {"ready": False, "reason": "FOLLOW_RESUME_PROOF_UNAVAILABLE"}
+                book = prove_follow_restart_book(
+                    run_id=authority["run_id"],
+                    local_offers=local_open,
+                    sage_offers=wallet_offers,
+                    run_intents=run_intents,
+                    buy_limit=authority["buy_limit"],
+                    sell_limit=authority["sell_limit"],
+                )
+            except ValueError as exc:
+                reason = str(exc)
+                if not reason.startswith("FOLLOW_RESTART_BOOK_"):
+                    reason = "FOLLOW_RESUME_PROOF_UNAVAILABLE"
+                return {"ready": False, "reason": reason}
+            proposal = preview_approved_follow_principal(
+                authority["approval_id"],
+                buy_limit=authority["buy_limit"],
+                sell_limit=authority["sell_limit"],
+            )
+            if (
+                proposal.get("dispatch_authorized") is not False
+                or proposal.get("identity") != identity
+                or proposal.get("configuration_sha256")
+                != authority["configuration_sha256"]
+                or proposal.get("proposal_sha256")
+                != authority["principal_review_sha256"]
+            ):
+                return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
+            return {
+                "ready": True,
+                "run_id": authority["run_id"],
+                "resume": True,
+                "book": book,
+                "scope": scope,
+            }
         local_open = database.get_open_offers(cat_asset_id=asset_id)
         unresolved = [
             row
@@ -943,7 +1153,7 @@ def reviewed_follow_start_readiness(cfg_obj, *, resume_existing_offers: bool) ->
             or proposal.get("sell_slots_arithmetic_fit") != authority["sell_limit"]
         ):
             return {"ready": False, "reason": "FOLLOW_REVIEW_CHANGED"}
-        return {"ready": True, "run_id": authority["run_id"]}
+        return {"ready": True, "run_id": authority["run_id"], "scope": scope}
     except (ValueError, KeyError, TypeError):
         return {"ready": False, "reason": "FOLLOW_REVIEW_REQUIRED"}
     except Exception:

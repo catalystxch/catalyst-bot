@@ -82,7 +82,9 @@ def test_two_sided_follow_start_requires_native_review(monkeypatch):
 def test_two_sided_follow_start_reproves_principal_and_slots(monkeypatch):
     _ready_sources(monkeypatch)
     result = routes._reviewed_follow_start_readiness(CFG, resume_existing_offers=False)
-    assert result == {"ready": True, "run_id": AUTHORITY["run_id"]}
+    assert result["ready"] is True
+    assert result["run_id"] == AUTHORITY["run_id"]
+    assert result["scope"]["configuration_sha256"] == AUTHORITY["configuration_sha256"]
 
 
 def test_two_sided_follow_start_rejects_changed_inventory(monkeypatch):
@@ -138,7 +140,86 @@ def test_two_sided_follow_start_rejects_unresolved_intent_without_offer_row(
     ) == {"ready": False, "reason": "FOLLOW_LOCAL_OFFERS_UNRESOLVED"}
 
 
-def test_two_sided_follow_resume_needs_exact_book_review():
+def _resume_sources(
+    monkeypatch, *, sync=None, pending=None, sage=None, local=None, intents=None
+):
+    import database
+    import wallet
+
+    _ready_sources(monkeypatch)
+    wallet_hash = hashlib.sha256(b"fingerprint:123").hexdigest()
+    local = local or [{"trade_id": "buy-id", "side": "buy", "status": "open"}]
+    intents = intents or [
+        {
+            "run_id": "d" * 64,
+            "wallet_fingerprint_hash": wallet_hash,
+            "network": "mainnet",
+            "asset_id": CFG.CAT_ASSET_ID,
+            "purpose": f"follow:{AUTHORITY['run_id']}:normal_lifecycle",
+            "sage_trade_id": "buy-id",
+            "side": "buy",
+            "lifecycle_state": "visible",
+        }
+    ]
+    monkeypatch.setattr(database, "get_open_offers", lambda **_kwargs: local)
+    monkeypatch.setattr(database, "get_offer_intents_for_registry", lambda: intents)
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_sync_status",
+        lambda: (
+            sync
+            or {
+                "reachable": True,
+                "synced": True,
+                "sync_state": "synced",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        wallet, "get_pending_transactions", lambda: [] if pending is None else pending
+    )
+    monkeypatch.setattr(
+        wallet, "get_all_offers", lambda **_kwargs: sage if sage is not None else local
+    )
+
+
+def test_two_sided_follow_resume_accepts_exact_partial_run_bound_book(monkeypatch):
+    _resume_sources(monkeypatch)
+    result = routes._reviewed_follow_start_readiness(CFG, resume_existing_offers=True)
+    assert result["ready"] is True
+    assert result["run_id"] == AUTHORITY["run_id"]
+    assert result["resume"] is True
+    assert result["book"]["buy_count"] == 1
+    assert result["book"]["sell_count"] == 0
+
+
+def test_two_sided_follow_resume_requires_strict_sync_and_no_pending_effect(
+    monkeypatch,
+):
+    _resume_sources(
+        monkeypatch,
+        sync={"reachable": True, "synced": False, "sync_state": "not_synced"},
+    )
     assert routes._reviewed_follow_start_readiness(
         CFG, resume_existing_offers=True
-    ) == {"ready": False, "reason": "FOLLOW_RESUME_REVIEW_REQUIRED"}
+    ) == {
+        "ready": False,
+        "reason": "FOLLOW_RESUME_WALLET_NOT_SYNCED",
+    }
+    _resume_sources(monkeypatch, pending=[{"status": "pending"}])
+    assert routes._reviewed_follow_start_readiness(
+        CFG, resume_existing_offers=True
+    ) == {
+        "ready": False,
+        "reason": "FOLLOW_RESUME_PENDING_EFFECT",
+    }
+
+
+def test_two_sided_follow_resume_rejects_wallet_book_mismatch(monkeypatch):
+    _resume_sources(monkeypatch, sage=[])
+    assert routes._reviewed_follow_start_readiness(
+        CFG, resume_existing_offers=True
+    ) == {
+        "ready": False,
+        "reason": "FOLLOW_RESTART_BOOK_MEMBERSHIP_MISMATCH",
+    }

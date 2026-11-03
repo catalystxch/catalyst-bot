@@ -9,6 +9,8 @@ import pytest
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 from test_follow_fee_cancellation import _run
 
+pytestmark = pytest.mark.parametrize("approved", ["bounded"], indirect=True)
+
 
 def test_initial_effective_fee_policy_uses_original_run_scope(approved):
     run_id, identity = _run(approved)

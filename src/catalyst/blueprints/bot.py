@@ -783,6 +783,14 @@ def api_bot_start():
         type(request_payload) is dict
         and request_payload.get("resume_existing_offers") is True
     )
+    automatic_resume = bool(
+        type(request_payload) is dict
+        and request_payload.get("automatic_resume") is True
+    )
+    if automatic_resume and not resume_existing_offers:
+        return jsonify(
+            {"success": False, "reason": "FOLLOW_RESTART_INTENT_REQUIRED"}
+        ), 409
 
     try:
         has_pending_restart_changes = getattr(
@@ -1255,6 +1263,25 @@ def api_bot_start():
                         "error": error,
                     }
                 ), 409
+            if automatic_resume:
+                from follow_restart_intent import (
+                    read_follow_restart_intent,
+                    restart_intent_matches,
+                )
+
+                scope = follow_readiness.get("scope")
+                if not (
+                    type(scope) is dict
+                    and restart_intent_matches(
+                        read_follow_restart_intent(),
+                        run_id=follow_readiness.get("run_id"),
+                        identity=scope.get("identity"),
+                        configuration_sha256=scope.get("configuration_sha256"),
+                    )
+                ):
+                    return jsonify(
+                        {"success": False, "reason": "FOLLOW_RESTART_INTENT_MISMATCH"}
+                    ), 409
             # Do not enter an empty Running state while RED Follow consent is
             # absent. The native client can now present the scoped review
             # before any trading loop starts.
@@ -1270,7 +1297,20 @@ def api_bot_start():
                     )
                 except Exception:
                     confidence_state = ""
-                if confidence_state == "RED":
+                thin_choice_ready = False
+                if getattr(api_server.cfg, "THIN_MARKET_ENABLED", False):
+                    from confidence_override import (
+                        current_scope,
+                        saved_thin_market_choice_matches,
+                    )
+
+                    try:
+                        thin_choice_ready = saved_thin_market_choice_matches(
+                            current_scope()
+                        )
+                    except (ValueError, TypeError, KeyError):
+                        thin_choice_ready = False
+                if confidence_state == "RED" and not thin_choice_ready:
                     return jsonify(
                         {
                             "success": False,
@@ -1348,6 +1388,20 @@ def api_bot_start():
         ), 400
     server.events.emit("bot_control", {"action": "started"})
     result = {"success": True, "status": "started"}
+    if bootstrap_campaign is None:
+        from follow_restart_intent import bind_follow_restart_intent
+
+        try:
+            scope = follow_readiness.get("scope")
+            if type(scope) is not dict:
+                raise ValueError("FOLLOW_RESTART_SCOPE_UNAVAILABLE")
+            bind_follow_restart_intent(
+                run_id=follow_readiness["run_id"],
+                identity=scope["identity"],
+                configuration_sha256=scope["configuration_sha256"],
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            result["restart_warning"] = str(exc)
     if warnings:
         result["warnings"] = warnings
     return jsonify(result)
@@ -1359,6 +1413,16 @@ def api_bot_stop():
     server = _api_server()
     bot = server.bot
     slog("GUI_ACTION", ">>> BUTTON: Stop Bot")
+    import database
+    from follow_restart_intent import clear_follow_restart_intent
+
+    try:
+        if database.get_setting("follow_restart_intent_v1") is not None:
+            clear_follow_restart_intent(reason="manual_stop")
+    except Exception:
+        return jsonify(
+            {"success": False, "reason": "FOLLOW_RESTART_INTENT_PERSIST_FAILED"}
+        ), 503
     if not bot:
         # Wallet setup can display the desktop shell before a BotLoop exists.
         # In that state there is no bot work to stop. The later shutdown route

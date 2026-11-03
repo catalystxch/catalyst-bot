@@ -9,6 +9,7 @@ import pytest
 from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
 from follow_principal import (
     calculate_follow_principal,
+    prove_follow_restart_book,
     preview_approved_follow_principal,
     read_follow_principal_snapshot,
 )
@@ -17,6 +18,46 @@ from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 def _coin(asset, marker, amount, *, purpose="", protected=False):
     return SelectableCoin(asset, marker * 64, amount, purpose, True, protected)
+
+
+def test_restart_book_proof_requires_exact_run_local_and_sage_membership():
+    local = [
+        {"trade_id": "buy-1", "side": "buy", "status": "open"},
+        {"trade_id": "sell-1", "side": "sell", "status": "open"},
+    ]
+    sage = [
+        {"trade_id": "buy-1", "side": "buy", "status": "open"},
+        {"trade_id": "sell-1", "side": "sell", "status": "open"},
+    ]
+    intents = [
+        {"sage_trade_id": "buy-1", "side": "buy", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":normal_lifecycle", "lifecycle_state": "visible"},
+        {"sage_trade_id": "sell-1", "side": "sell", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":book_opportunity", "lifecycle_state": "visible"},
+    ]
+    result = prove_follow_restart_book(
+        run_id="a" * 64, local_offers=local, sage_offers=sage,
+        run_intents=intents, buy_limit=24, sell_limit=24,
+    )
+    assert result == {"ready": True, "buy_count": 1, "sell_count": 1, "dispatch_authorized": False}
+
+
+@pytest.mark.parametrize("change", ["missing_sage", "untracked", "unknown_effect", "wrong_run"])
+def test_restart_book_proof_fails_closed_on_membership_or_effect_mismatch(change):
+    local = [{"trade_id": "buy-1", "side": "buy", "status": "open"}]
+    sage = list(local)
+    intents = [{"sage_trade_id": "buy-1", "side": "buy", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":normal_lifecycle", "lifecycle_state": "visible"}]
+    if change == "missing_sage":
+        sage = []
+    elif change == "untracked":
+        sage.append({"trade_id": "extra", "side": "sell", "status": "open"})
+    elif change == "unknown_effect":
+        intents[0]["lifecycle_state"] = "creation_unknown"
+    elif change == "wrong_run":
+        intents[0]["purpose"] = "follow:" + "c" * 64 + ":normal_lifecycle"
+    with pytest.raises(ValueError):
+        prove_follow_restart_book(
+            run_id="a" * 64, local_offers=local, sage_offers=sage,
+            run_intents=intents, buy_limit=24, sell_limit=24,
+        )
 
 
 def test_max_safe_principal_preserves_fee_pool_and_configured_reserves():
@@ -46,6 +87,27 @@ def test_max_safe_principal_preserves_fee_pool_and_configured_reserves():
     assert result["protected_cat_reserve_atoms"] == 150_000
     assert result["unprotected_xch_coin_count"] == 1
     assert result["unprotected_cat_coin_count"] == 1
+
+
+def test_unbounded_fee_mode_reserves_fee_coins_without_cumulative_cap():
+    coins = CoinSnapshot(
+        (
+            _coin("xch", "a", 80_000_000_000),
+            _coin("xch", "b", 30_000_000_000, purpose="fee_reserve"),
+            _coin("cat", "c", 900_000),
+        )
+    )
+    result = calculate_follow_principal(
+        coins,
+        xch_reserve=Decimal("0"),
+        cat_reserve=Decimal("0"),
+        cat_decimals=3,
+        fee_cap_mojos=None,
+        fee_pool_principal_mojos=20_000_000_000,
+        fee_reserve_coin_ids={"b" * 64},
+    )
+    assert result["protected_fee_principal_mojos"] == 20_000_000_000
+    assert result["maximum_trade_xch_mojos"] == 80_000_000_000
 
 
 def test_principal_refuses_insufficient_xch_after_protected_fee():
