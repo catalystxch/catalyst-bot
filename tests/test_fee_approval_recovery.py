@@ -313,7 +313,9 @@ def test_dispatched_unknown_effect_remains_a_recovery_hold(
     _submit(operation_id, claim, approval)
     state = database.get_coin_prep_fee_approval_status(approval["approval_id"])
     assert state["unresolved_operation_count"] == 1
-    assert state["pending_operation"]["effect_state"] == "submitted_awaiting_confirmation"
+    assert (
+        state["pending_operation"]["effect_state"] == "submitted_awaiting_confirmation"
+    )
     assert state["held_fee_mojos"] == 10
 
 

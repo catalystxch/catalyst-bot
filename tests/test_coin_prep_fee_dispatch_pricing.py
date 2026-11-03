@@ -59,9 +59,7 @@ def test_actual_unsigned_fee_can_rise_inside_approved_preparation_allowance(
     assert utils._counts()["wallet_effect_claims"] == 0
 
 
-def test_higher_exact_fee_is_not_blocked_by_cumulative_allowance(
-    approved, monkeypatch
-):
+def test_higher_exact_fee_is_not_blocked_by_cumulative_allowance(approved, monkeypatch):
     _network_quote(approved, monkeypatch, 41)
     result = _price(approved)
     assert result["available"] is True

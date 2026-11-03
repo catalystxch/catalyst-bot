@@ -30,21 +30,52 @@ def test_restart_book_proof_requires_exact_run_local_and_sage_membership():
         {"trade_id": "sell-1", "side": "sell", "status": "open"},
     ]
     intents = [
-        {"sage_trade_id": "buy-1", "side": "buy", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":normal_lifecycle", "lifecycle_state": "visible"},
-        {"sage_trade_id": "sell-1", "side": "sell", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":book_opportunity", "lifecycle_state": "visible"},
+        {
+            "sage_trade_id": "buy-1",
+            "side": "buy",
+            "run_id": "b" * 64,
+            "purpose": "follow:" + "a" * 64 + ":normal_lifecycle",
+            "lifecycle_state": "visible",
+        },
+        {
+            "sage_trade_id": "sell-1",
+            "side": "sell",
+            "run_id": "b" * 64,
+            "purpose": "follow:" + "a" * 64 + ":book_opportunity",
+            "lifecycle_state": "visible",
+        },
     ]
     result = prove_follow_restart_book(
-        run_id="a" * 64, local_offers=local, sage_offers=sage,
-        run_intents=intents, buy_limit=24, sell_limit=24,
+        run_id="a" * 64,
+        local_offers=local,
+        sage_offers=sage,
+        run_intents=intents,
+        buy_limit=24,
+        sell_limit=24,
     )
-    assert result == {"ready": True, "buy_count": 1, "sell_count": 1, "dispatch_authorized": False}
+    assert result == {
+        "ready": True,
+        "buy_count": 1,
+        "sell_count": 1,
+        "dispatch_authorized": False,
+    }
 
 
-@pytest.mark.parametrize("change", ["missing_sage", "untracked", "unknown_effect", "wrong_run"])
+@pytest.mark.parametrize(
+    "change", ["missing_sage", "untracked", "unknown_effect", "wrong_run"]
+)
 def test_restart_book_proof_fails_closed_on_membership_or_effect_mismatch(change):
     local = [{"trade_id": "buy-1", "side": "buy", "status": "open"}]
     sage = list(local)
-    intents = [{"sage_trade_id": "buy-1", "side": "buy", "run_id": "b" * 64, "purpose": "follow:" + "a" * 64 + ":normal_lifecycle", "lifecycle_state": "visible"}]
+    intents = [
+        {
+            "sage_trade_id": "buy-1",
+            "side": "buy",
+            "run_id": "b" * 64,
+            "purpose": "follow:" + "a" * 64 + ":normal_lifecycle",
+            "lifecycle_state": "visible",
+        }
+    ]
     if change == "missing_sage":
         sage = []
     elif change == "untracked":
@@ -55,8 +86,12 @@ def test_restart_book_proof_fails_closed_on_membership_or_effect_mismatch(change
         intents[0]["purpose"] = "follow:" + "c" * 64 + ":normal_lifecycle"
     with pytest.raises(ValueError):
         prove_follow_restart_book(
-            run_id="a" * 64, local_offers=local, sage_offers=sage,
-            run_intents=intents, buy_limit=24, sell_limit=24,
+            run_id="a" * 64,
+            local_offers=local,
+            sage_offers=sage,
+            run_intents=intents,
+            buy_limit=24,
+            sell_limit=24,
         )
 
 

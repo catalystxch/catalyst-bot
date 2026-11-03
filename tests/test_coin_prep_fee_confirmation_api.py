@@ -85,9 +85,7 @@ def test_http_confirmation_records_consent_without_launching_prep(
     }
 
 
-def test_standard_confirmation_needs_no_cumulative_cap_input(
-    local_api, confirmation
-):
+def test_standard_confirmation_needs_no_cumulative_cap_input(local_api, confirmation):
     import database
 
     stored = database.get_coin_prep_fee_preview(confirmation["preview"]["preview_id"])
@@ -149,9 +147,7 @@ def test_malformed_or_client_authority_fields_are_rejected_before_wallet_reads(
     assert not any(_counts().values())
 
 
-@pytest.mark.parametrize(
-    "body", [None, [], "confirmation", {}]
-)
+@pytest.mark.parametrize("body", [None, [], "confirmation", {}])
 def test_nonobject_or_incomplete_http_request_cannot_record_consent(
     local_api, confirmation, body
 ):

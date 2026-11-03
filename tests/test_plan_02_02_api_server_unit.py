@@ -253,8 +253,9 @@ class TestBotStartEndpoint(unittest.TestCase):
         # The pre-wallet desktop shell has no BotLoop to stop.
         import database
 
-        with patch.object(api_server, "bot", None), patch.object(
-            database, "get_setting", return_value=None
+        with (
+            patch.object(api_server, "bot", None),
+            patch.object(database, "get_setting", return_value=None),
         ):
             resp = self.client.post(
                 "/api/bot/stop",

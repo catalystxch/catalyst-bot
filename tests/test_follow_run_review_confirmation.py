@@ -293,9 +293,9 @@ def test_native_confirmation_consumes_persisted_review_once(approved, monkeypatc
     assert readiness["ready"] is True
     assert readiness["run_id"] == run["run_id"]
     assert readiness["scope"]["identity"] == proposal["identity"]
-    assert readiness["scope"]["configuration_sha256"] == proposal[
-        "configuration_sha256"
-    ]
+    assert (
+        readiness["scope"]["configuration_sha256"] == proposal["configuration_sha256"]
+    )
     assert database.get_follow_run_review(review["review_id"])["consumed"] is True
     with pytest.raises(ValueError, match="FOLLOW_REVIEW_USED"):
         follow_principal.confirm_follow_run_review(

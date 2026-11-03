@@ -98,7 +98,9 @@ def test_cancellation_price_refuses_zero_fee_before_wallet_effect(
     assert calls == [0]
 
 
-def test_unbounded_cancellation_can_quote_above_recorded_estimate(approved, monkeypatch):
+def test_unbounded_cancellation_can_quote_above_recorded_estimate(
+    approved, monkeypatch
+):
     calls = _builder(monkeypatch, approved)
     _quote(monkeypatch, approved, 81)
 

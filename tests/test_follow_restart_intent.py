@@ -28,8 +28,12 @@ CONFIG = "c" * 64
 @pytest.fixture
 def saved_setting(monkeypatch):
     state = {"raw": None}
-    monkeypatch.setattr(database, "get_setting", lambda _key, default=None: state["raw"] or default)
-    monkeypatch.setattr(database, "set_setting", lambda _key, value: state.update(raw=value) or True)
+    monkeypatch.setattr(
+        database, "get_setting", lambda _key, default=None: state["raw"] or default
+    )
+    monkeypatch.setattr(
+        database, "set_setting", lambda _key, value: state.update(raw=value) or True
+    )
     return state
 
 
@@ -44,7 +48,9 @@ def test_running_intent_round_trips_exact_run_wallet_asset_and_config(saved_sett
         saved, run_id=RUN_ID, identity=IDENTITY, configuration_sha256=CONFIG
     )
     assert not restart_intent_matches(
-        saved, run_id=RUN_ID, identity={**IDENTITY, "wallet_fingerprint": 456},
+        saved,
+        run_id=RUN_ID,
+        identity={**IDENTITY, "wallet_fingerprint": 456},
         configuration_sha256=CONFIG,
     )
     assert not restart_intent_matches(
@@ -64,8 +70,13 @@ def test_manual_stop_writes_durable_opt_out(saved_setting):
 
 @pytest.mark.parametrize(
     "raw",
-    [None, "{", "{}", '{"version":1,"state":"stopped"}',
-     '{"version":1,"state":"running","run_id":"x"}'],
+    [
+        None,
+        "{",
+        "{}",
+        '{"version":1,"state":"stopped"}',
+        '{"version":1,"state":"running","run_id":"x"}',
+    ],
 )
 def test_missing_or_malformed_intent_never_resumes(saved_setting, raw):
     saved_setting["raw"] = raw
@@ -84,8 +95,10 @@ def test_missing_or_malformed_intent_never_resumes(saved_setting, raw):
 def test_binding_rejects_invalid_identity(changes):
     with pytest.raises(ValueError, match="FOLLOW_RESTART_INTENT_INVALID"):
         bind_follow_restart_intent(
-            run_id=RUN_ID, identity={**IDENTITY, **changes},
-            configuration_sha256=CONFIG, now_epoch=1234,
+            run_id=RUN_ID,
+            identity={**IDENTITY, **changes},
+            configuration_sha256=CONFIG,
+            now_epoch=1234,
         )
 
 
@@ -93,6 +106,8 @@ def test_failed_persistence_is_not_reported_as_saved(monkeypatch):
     monkeypatch.setattr(database, "set_setting", lambda *_args: False)
     with pytest.raises(ValueError, match="FOLLOW_RESTART_INTENT_PERSIST_FAILED"):
         bind_follow_restart_intent(
-            run_id=RUN_ID, identity=IDENTITY, configuration_sha256=CONFIG,
+            run_id=RUN_ID,
+            identity=IDENTITY,
+            configuration_sha256=CONFIG,
             now_epoch=1234,
         )
