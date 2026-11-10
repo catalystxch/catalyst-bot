@@ -6369,6 +6369,99 @@
         }
         .follow-review-actions .btn { min-height: 38px; }
         .follow-review-actions .btn-primary { margin-left: auto; }
+        /* Confidence override is a financial review: keep its exact consent
+           flow, while using the same structured surface as Follow reviews. */
+        .confidence-override-modal .modal-content {
+            width: min(92vw, 680px);
+            max-width: 680px;
+            max-height: min(88vh, 760px);
+            padding: 0;
+            overflow-y: auto;
+            border-color: rgba(245, 158, 11, 0.42);
+        }
+        .confidence-override-header {
+            padding: 26px 28px 18px;
+            border-bottom: 1px solid var(--border-default);
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.13), transparent 75%);
+        }
+        .confidence-override-kicker {
+            margin-bottom: 7px;
+            color: var(--warning-200);
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .confidence-override-header h2 {
+            margin: 0 0 10px;
+            color: var(--text-primary);
+            font-size: clamp(1.35rem, 3vw, 1.7rem);
+            line-height: 1.2;
+        }
+        .confidence-override-header p {
+            margin: 0 0 8px;
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            line-height: 1.55;
+        }
+        .confidence-override-header p:last-child { margin-bottom: 0; }
+        .confidence-override-body { padding: 20px 28px 24px; }
+        .confidence-override-field { display: block; }
+        .confidence-override-field span {
+            display: block;
+            margin-bottom: 7px;
+            color: var(--text-secondary);
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .confidence-override-field input {
+            box-sizing: border-box;
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border-default);
+            border-radius: 10px;
+            background: rgba(2, 6, 23, 0.45);
+            color: var(--text-primary);
+            font: 600 0.96rem var(--font-ui);
+        }
+        .confidence-override-result {
+            min-height: 52px;
+            margin: 16px 0 0;
+            padding: 12px 14px;
+            border: 1px solid var(--border-default);
+            border-radius: 11px;
+            background: rgba(2, 6, 23, 0.32);
+            color: var(--text-secondary);
+            font: 0.82rem/1.5 var(--font-mono);
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        .confidence-override-check {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            margin: 16px 0;
+            color: var(--text-primary);
+            font-size: 0.88rem;
+            line-height: 1.45;
+        }
+        .confidence-override-check input { flex: none; margin: 3px 0 0; accent-color: var(--accent-primary); }
+        .confidence-override-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
+        .confidence-override-actions .btn { min-height: 38px; }
+        .confidence-override-actions .btn-primary { margin-left: auto; }
+        :root[data-theme="light"] .confidence-override-field input,
+        :root[data-theme="light"] .confidence-override-result {
+            background: var(--bg-surface-2) !important;
+        }
+        :root[data-theme="light"] .confidence-override-kicker { color: var(--status-warning); }
+        @media (max-width: 600px) {
+            .confidence-override-header { padding: 20px 18px 15px; }
+            .confidence-override-body { padding: 17px 18px 20px; }
+            .confidence-override-actions .btn { flex: 1 1 100%; }
+            .confidence-override-actions .btn-primary { margin-left: 0; }
+        }
         @media (max-width: 600px) {
             .follow-review-header { padding: 20px 18px 15px; }
             .follow-review-body { padding: 17px 18px 20px; }
@@ -8394,18 +8487,23 @@
     <script defer src="/assets/walletconnect-signing.js"></script>
 </head>
 <body>
-    <div id="confidenceOverrideModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="confidenceOverrideTitle" style="display:none">
-        <div class="modal-content" style="max-width:620px;padding:24px;overflow:auto">
-            <h2 id="confidenceOverrideTitle">Continue despite low market confidence</h2>
-            <p>Thin market depth and a large move from the last trusted price can cause poor execution or losses. This permits continuous Follow at the reviewed limits when a current bid and ask both fit inside your configured hard price range. RED warnings stay visible.</p>
-            <p>Wallet identity, coin ownership, protected fee funding, fee limits, price freshness and runtime safety still apply. Stop or a restart removes consent. Expiry or changed settings restore ordinary confidence policy.</p>
-            <label>Override duration (hours, 1–168) <input id="confidenceOverrideHours" type="number" min="1" max="168" step="1" value="72" oninput="invalidateConfidenceOverrideReview()"></label>
-            <pre id="confidenceOverrideReviewText" style="white-space:pre-wrap"></pre>
-            <label><input type="checkbox" id="confidenceOverrideAccept"> I understand and approve this specific run.</label>
-            <div style="margin-top:16px">
-                <button type="button" onclick="closeConfidenceOverrideReview()">Back</button>
-                <button type="button" onclick="reviewConfidenceOverride()">Refresh exact review</button>
-                <button type="button" id="confidenceOverrideConfirm" disabled onclick="confirmConfidenceOverrideStart()">Start Follow with override</button>
+    <div id="confidenceOverrideModal" class="modal confidence-override-modal" role="dialog" aria-modal="true" aria-labelledby="confidenceOverrideTitle" style="display:none">
+        <div class="modal-content">
+            <div class="confidence-override-header">
+                <div class="confidence-override-kicker">Financial review · Confidence override</div>
+                <h2 id="confidenceOverrideTitle">Continue despite low market confidence</h2>
+                <p>Thin market depth and a large move from the last trusted price can cause poor execution or losses. This permits continuous Follow at the reviewed limits when a current bid and ask both fit inside your configured hard price range. RED warnings stay visible.</p>
+                <p>Wallet identity, coin ownership, protected fee funding, fee limits, price freshness and runtime safety still apply. Stop or a restart removes consent. Expiry or changed settings restore ordinary confidence policy.</p>
+            </div>
+            <div class="confidence-override-body">
+                <label class="confidence-override-field"><span>Override duration (hours, 1–168)</span><input id="confidenceOverrideHours" type="number" min="1" max="168" step="1" value="72" oninput="invalidateConfidenceOverrideReview()"></label>
+                <pre id="confidenceOverrideReviewText" class="confidence-override-result" aria-live="polite"></pre>
+                <label class="confidence-override-check"><input type="checkbox" id="confidenceOverrideAccept"><span>I understand and approve this specific run.</span></label>
+                <div class="confidence-override-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeConfidenceOverrideReview()">Back</button>
+                    <button type="button" class="btn btn-secondary" onclick="reviewConfidenceOverride()">Refresh exact review</button>
+                    <button type="button" class="btn btn-primary" id="confidenceOverrideConfirm" disabled onclick="confirmConfidenceOverrideStart()">Start Follow with override</button>
+                </div>
             </div>
         </div>
     </div>
