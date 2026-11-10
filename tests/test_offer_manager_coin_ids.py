@@ -631,10 +631,14 @@ class OfferManagerCoinIdTests(unittest.TestCase):
                 outcome["error"] = exc
 
         with (
-            patch.object(offer_manager.OfferManager, "create_offer_with_retry", new=create_offer),
+            patch.object(
+                offer_manager.OfferManager, "create_offer_with_retry", new=create_offer
+            ),
             patch.object(offer_manager, "add_offer", side_effect=add_offer_early),
             patch.object(offer_manager, "log_event"),
-            patch.object(offer_manager, "update_offer_bech32", side_effect=cache_offer_early),
+            patch.object(
+                offer_manager, "update_offer_bech32", side_effect=cache_offer_early
+            ),
             patch("builtins.print"),
             patch("database.lock_coin"),
         ):

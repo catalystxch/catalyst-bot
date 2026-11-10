@@ -5720,7 +5720,6 @@ class OfferManager:
             self._recently_created[trade_id] = time.time()
             created.append(offer_detail)
 
-
         spec_by_index = {spec["i"]: spec for spec in offer_specs}
         with ThreadPoolExecutor(max_workers=max_parallel) as executor:
             futures = [executor.submit(_create_one, spec) for spec in offer_specs]
