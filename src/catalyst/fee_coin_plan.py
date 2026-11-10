@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 _MOJOS_PER_XCH = 1_000_000_000_000
 _MIN_FEE_COIN_MOJOS = _MOJOS_PER_XCH // 1_000
 _FEE_COIN_SIZE_STEP_MOJOS = 1_000_000
-_MAX_FEE_OPERATIONS_PER_COIN = 10
+_MAX_FEE_OPERATIONS_PER_COIN = 20
 _FEE_COIN_FEE_MULTIPLIER = 20
 _DAYS_PER_WEEK = 7
 
@@ -43,7 +43,8 @@ def plan_weekly_fee_coins(
     The model assumes at least two network-fee operations per active offer
     slot per day, plus two operations per slot for startup and shutdown. Recent
     observed activity can raise the daily rate. One fee coin is modeled to
-    serve at most ten fee operations.
+    serve at most twenty operations, with half its face value retained as a
+    fee-spike buffer at the current estimate.
     """
     if (
         type(estimated_fee_mojos) is not int
@@ -69,11 +70,6 @@ def plan_weekly_fee_coins(
         )
         daily_operations = max(baseline_operations_per_day, observed_daily)
 
-    modeled_operation_count = daily_operations * _DAYS_PER_WEEK + 2 * slots
-    target_fee_coin_count = _ceil_div(
-        modeled_operation_count, _MAX_FEE_OPERATIONS_PER_COIN
-    )
-
     raw_size = max(
         _MIN_FEE_COIN_MOJOS,
         estimated_fee_mojos * _FEE_COIN_FEE_MULTIPLIER,
@@ -82,6 +78,12 @@ def plan_weekly_fee_coins(
     fee_coin_size_mojos = (
         _ceil_div(raw_size, _FEE_COIN_SIZE_STEP_MOJOS) * _FEE_COIN_SIZE_STEP_MOJOS
     )
+    operations_per_coin = min(
+        _MAX_FEE_OPERATIONS_PER_COIN,
+        max(1, fee_coin_size_mojos // (estimated_fee_mojos * 2)),
+    )
+    modeled_operation_count = daily_operations * _DAYS_PER_WEEK + 2 * slots
+    target_fee_coin_count = _ceil_div(modeled_operation_count, operations_per_coin)
     target_principal = target_fee_coin_count * fee_coin_size_mojos
     fee_coin_count = min(
         target_fee_coin_count,
@@ -96,5 +98,6 @@ def plan_weekly_fee_coins(
         "fee_coin_principal_mojos": principal,
         "target_fee_coin_principal_mojos": target_principal,
         "modeled_operation_count": modeled_operation_count,
+        "modeled_operations_per_coin": operations_per_coin,
         "underfunded": fee_coin_count < target_fee_coin_count,
     }
