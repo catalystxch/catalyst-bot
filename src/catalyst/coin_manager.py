@@ -1661,8 +1661,9 @@ def get_tier_sizes_mojos_from_cfg(
         max_sell_offers = int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0)
         if max_sell_offers <= 0:
             max_sell_offers = sum(sell_tier_counts.values())
+        # Match the per-side half spread used to create live offers.
         spread_fraction = Decimal(str(getattr(cfg, "SPREAD_BPS", 0) or 0)) / Decimal(
-            "10000"
+            "20000"
         )
         min_edge_bps = Decimal(str(getattr(cfg, "MIN_EDGE_BPS", 0) or 0))
         ladder_summary = summarize_sell_ladder_cat(

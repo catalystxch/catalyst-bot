@@ -3348,7 +3348,8 @@ class CoinPrepWorker:
                 )
                 if max_sell_offers <= 0:
                     max_sell_offers = sum(sell_tier_counts.values())
-            spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("10000")
+            # SPREAD_BPS covers both sides; sell slot distances use half.
+            spread_fraction = _env_decimal("SPREAD_BPS", "0") / Decimal("20000")
             min_edge_bps = _env_decimal("MIN_EDGE_BPS", "0")
             from coin_prep_economics import prepared_cat_sizes
 
@@ -3359,7 +3360,7 @@ class CoinPrepWorker:
                 cat_decimals=self.cat_decimals,
                 sell_counts=sell_tier_counts,
                 max_offers=max_sell_offers,
-                spread_bps=spread_fraction * Decimal("10000"),
+                spread_bps=spread_fraction * Decimal("20000"),
                 min_edge_bps=min_edge_bps,
             )
             self.log(
@@ -9945,7 +9946,6 @@ class CoinPrepWorker:
                     or (
                         operation.get("outcome") == "PREPARED"
                         and operation.get("effect_dispatch_token") is None
-                        and operation.get("constructed_outputs_json") is None
                     )
                 )
                 and type(pending) is list

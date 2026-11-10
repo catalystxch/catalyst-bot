@@ -142,9 +142,10 @@ def prepared_cat_sizes(
         tier: _integer(count, 0, MAX_PLAN_OUTPUTS)
         for tier, count in sell_counts.items()
     }
+    # SPREAD_BPS is the total bid/ask spread; Follow places each side at half.
     summary = summarize_sell_ladder_cat(
         mid_price=price,
-        spread_fraction=_decimal(spread_bps) / Decimal("10000"),
+        spread_fraction=_decimal(spread_bps) / Decimal("20000"),
         max_offers=max_offers,
         tier_counts=counts,
         tier_sizes_xch=sizes,

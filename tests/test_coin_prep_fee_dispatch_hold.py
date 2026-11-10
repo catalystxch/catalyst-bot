@@ -233,6 +233,64 @@ def test_exact_hold_counts_fee_without_granting_external_dispatch(prepared):
     )
 
 
+def test_zero_floor_top_up_reserve_source_can_fund_prep(prepared):
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE coins SET designation='reserve', purpose='top_up' WHERE coin_id=?",
+        (database.norm_coin_id("1" * 64),),
+    )
+    conn.commit()
+    assert _hold(prepared)["fee_mojos"] == 10
+
+
+@pytest.mark.parametrize("asset", ["cat", "xch"])
+def test_fee_or_fixed_reserve_cannot_fund_prep(prepared, asset):
+    coin_id = "1" * 64 if asset == "cat" else "2" * 64
+    conn = database.get_connection()
+    conn.execute(
+        "UPDATE coins SET designation='reserve', purpose=? WHERE coin_id=?",
+        (
+            "replacement" if asset == "cat" else "top_up",
+            database.norm_coin_id(coin_id),
+        ),
+    )
+    conn.commit()
+    with pytest.raises(ValueError, match="FEE_EFFECT_NOT_DISPATCHABLE"):
+        _hold(prepared)
+
+
+def test_bound_unsigned_outputs_can_be_released_with_exact_no_effect_view(prepared):
+    """No dispatch and fresh selectable inputs prove a bound unsigned batch inert."""
+    operation = prepared["operation"]
+    identity = json.loads(
+        database.get_connection()
+        .execute(
+            "SELECT wallet_identity_json FROM coin_prep_operations WHERE operation_id=?",
+            (operation["operation_id"],),
+        )
+        .fetchone()[0]
+    )
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:00.000000Z",
+        "expires_at": "2026-08-21T12:00:15.000000Z",
+        "selectable_coin_ids": ["1" * 64, "2" * 64],
+        "pending_transaction_ids": [],
+    }
+    assert database.recover_coin_prep_predispatch_no_effect(
+        operation["operation_id"], view
+    )
+    assert not database.wallet_effect_claim_is_current(
+        prepared["claim"]["claim_token"],
+        prepared["claim"]["generation"],
+        operation_id=operation["operation_id"],
+        source_coin_ids=["1" * 64],
+        fee_coin_ids=["2" * 64],
+    )
+
+
 def test_generic_ledger_approval_cannot_replace_deliberate_preview_consent(prepared):
     approval = database.create_fee_approval(
         scope_sha256=prepared["contract"]["scope_sha256"],

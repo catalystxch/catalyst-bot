@@ -184,9 +184,10 @@ def prepared_sell_ladder_cat_total(
     if max_offers <= 0:
         return 0
 
+    # SPREAD_BPS describes both sides; each sell slot uses half the spread.
     summary = summarize_sell_ladder_cat(
         mid_price=mid_price,
-        spread_fraction=_decimal(spread_bps) / Decimal("10000"),
+        spread_fraction=_decimal(spread_bps) / Decimal("20000"),
         max_offers=max_offers,
         tier_counts=counts,
         tier_sizes_xch=tier_sizes_xch,

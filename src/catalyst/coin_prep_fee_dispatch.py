@@ -42,17 +42,48 @@ def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim
         for coin_id in json.loads(claim[key])
     }
     original = {coin.coin_id: coin for coin in saved_snapshot.coins}
+    reserve_floors = context["recipe"]["economic_plan"]["reserve_floors_mojos"]
     reserves = {
         row["coin_id"].removeprefix("0x")
         for asset in ("xch", "cat")
         for row in database.get_reserve_coins(asset)
     }
-    if own_ids & reserves or any(
-        coin_id not in original
-        or original[coin_id].protected
-        or not original[coin_id].selectable
+    prior_invalid = [
+        coin_id
         for coin_id in own_ids
-    ):
+        if coin_id not in original
+        or not original[coin_id].selectable
+        or (
+            original[coin_id].protected
+            and not (
+                original[coin_id].purpose == "reserve"
+                and reserve_floors[original[coin_id].asset] == 0
+            )
+        )
+    ]
+    if own_ids & reserves or prior_invalid:
+        invalid_kinds = {
+            "missing": sum(coin_id not in original for coin_id in prior_invalid),
+            "protected": sum(
+                coin_id in original and original[coin_id].protected
+                for coin_id in prior_invalid
+            ),
+            "nonselectable": sum(
+                coin_id in original and not original[coin_id].selectable
+                for coin_id in prior_invalid
+            ),
+            "fee_source": sum(coin_id in fee_ids for coin_id in prior_invalid),
+        }
+        slog(
+            "coin_prep",
+            "Direct batch preclaim inventory changed",
+            {
+                "reserve_overlap_count": len(own_ids & reserves),
+                "invalid_source_count": len(prior_invalid),
+                "invalid_kinds": invalid_kinds,
+            },
+            level="warning",
+        )
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     fresh = {}
     for coin in context["snapshot"].coins:
@@ -64,6 +95,29 @@ def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim
                 coin = replace(coin, protected=before.protected, purpose=before.purpose)
         fresh[coin.coin_id] = coin
     if fresh != original:
+        old_ids, new_ids = set(original), set(fresh)
+        changed = [coin_id for coin_id in old_ids & new_ids if original[coin_id] != fresh[coin_id]]
+        changed_fields = sorted(
+            {
+                field
+                for coin_id in changed
+                for field in vars(original[coin_id])
+                if getattr(original[coin_id], field) != getattr(fresh[coin_id], field)
+            }
+        )
+        slog(
+            "coin_prep",
+            "Direct batch inventory changed before dispatch",
+            {
+                "missing_count": len(old_ids - new_ids),
+                "added_count": len(new_ids - old_ids),
+                "changed_count": len(changed),
+                "changed_fields": changed_fields,
+                "own_missing_count": len(own_ids - new_ids),
+                "own_changed_count": len(own_ids & set(changed)),
+            },
+            level="warning",
+        )
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
 
 

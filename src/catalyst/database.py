@@ -2951,7 +2951,6 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                      AND (prep.outcome='PREPARED' OR
                           json_extract(prep.outcome_evidence_json,
                                        '$.dispatch_outcome')='PREPARED')
-                     AND prep.constructed_outputs_json IS NULL
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
                           WHERE hold.operation_id=prep.operation_id)
@@ -5832,7 +5831,6 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                      AND (prep.outcome='PREPARED' OR
                           json_extract(prep.outcome_evidence_json,
                                        '$.dispatch_outcome')='PREPARED')
-                     AND prep.constructed_outputs_json IS NULL
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
                           WHERE hold.operation_id=prep.operation_id)
@@ -12373,7 +12371,8 @@ def recover_coin_prep_predispatch_no_effect(
                 or json.loads(prep["outcome_evidence_json"])["dispatch_outcome"]
                 == "PREPARED"
             )
-            and prep["constructed_outputs_json"] is None
+            # An unsigned output binding is persisted before the final fee
+            # hold. With no dispatch row or fee hold, it is still pre-effect.
             and prep["resolved_claim"] is None
             and prep["dispatched_claim"] is None
             and prep["fee_hold"] is None
@@ -24801,6 +24800,26 @@ def get_coin_prep_fee_dispatch_claim(
         conn.close()
 
 
+def _prep_claim_has_ineligible_reserve(conn, claim, approved_plan):
+    """Keep fixed reserves protected while allowing zero-floor top-up change."""
+
+    floors = approved_plan.get("reserve_floors_mojos", {})
+    source_ids = set(json.loads(claim["source_coin_ids_json"]))
+    rows = conn.execute(
+        "SELECT coin.coin_id, coin.wallet_type, coin.purpose "
+        "FROM wallet_effect_claim_coins AS effect_coin "
+        "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
+        "WHERE effect_coin.claim_token=? AND coin.designation='reserve'",
+        (claim["claim_token"],),
+    )
+    return any(
+        row["coin_id"] not in source_ids
+        or row["purpose"] != "top_up"
+        or floors.get(row["wallet_type"]) != 0
+        for row in rows
+    )
+
+
 def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, context):
     """Recheck held prep consent/quote/cohort after acquiring the dispatch lock.
 
@@ -24884,13 +24903,9 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
     ).fetchone()
     if (
         claim is None
-        or conn.execute(
-            "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
-            "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
-            "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
-            (claim_token,),
-        ).fetchone()
-        is not None
+        or _prep_claim_has_ineligible_reserve(
+            conn, claim, json.loads(consent["plan_json"])
+        )
     ):
         raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
     contract = json.loads(operation["target_contract_json"])
@@ -24999,14 +25014,8 @@ def reserve_coin_prep_fee_for_dispatch(
         # Reserve designations may change after service inventory checks. Do
         # not use availability-filtered get_reserve_coins here: own claimed
         # roots are intentionally unavailable to unrelated planners.
-        if (
-            conn.execute(
-                "SELECT 1 FROM wallet_effect_claim_coins AS effect_coin "
-                "JOIN coins AS coin ON coin.coin_id=effect_coin.coin_id "
-                "WHERE effect_coin.claim_token=? AND coin.designation='reserve' LIMIT 1",
-                (claim["claim_token"],),
-            ).fetchone()
-            is not None
+        if _prep_claim_has_ineligible_reserve(
+            conn, claim, json.loads(consent["plan_json"])
         ):
             raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
         target = json.loads(operation["target_contract_json"])

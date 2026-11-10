@@ -2,11 +2,52 @@
 
 from importlib import import_module
 from datetime import datetime, timedelta, timezone
+import json
 import time
 from types import SimpleNamespace
 import sqlite3
 
 import pytest
+
+
+def test_zero_floor_organic_reserve_can_fund_approved_prep(monkeypatch):
+    """A claimed top-up leftover stays eligible after exact fee pricing."""
+    import coin_prep_fee_dispatch as dispatch
+    from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
+
+    cat_id, fee_id = "1" * 64, "2" * 64
+    before = CoinSnapshot(
+        (
+            SelectableCoin("cat", cat_id, 100, "reserve", True, True),
+            SelectableCoin("xch", fee_id, 50),
+        )
+    )
+    claimed = CoinSnapshot(
+        (
+            SelectableCoin("cat", cat_id, 100, "protected", True, True),
+            SelectableCoin("xch", fee_id, 50, "protected", True, True),
+        )
+    )
+    monkeypatch.setattr(
+        dispatch.database, "wallet_effect_claim_is_current", lambda *a, **kw: True
+    )
+    monkeypatch.setattr(dispatch.database, "get_reserve_coins", lambda _asset: [])
+    claim = {
+        "claim_token": "claim",
+        "generation": 1,
+        "source_coin_ids_json": json.dumps([cat_id]),
+        "fee_coin_ids_json": json.dumps([fee_id]),
+    }
+    plan = SimpleNamespace(source_coin_ids=(cat_id,), fee_source_id=fee_id)
+    context = {
+        "snapshot": claimed,
+        "recipe": {"economic_plan": {"reserve_floors_mojos": {"cat": 0, "xch": 0}}},
+    }
+    dispatch._verify_current_inventory(context, before, plan, "operation", claim)
+
+    context["recipe"]["economic_plan"]["reserve_floors_mojos"]["cat"] = 1
+    with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
+        dispatch._verify_current_inventory(context, before, plan, "operation", claim)
 
 import database
 import fee_approval_test_utils as utils
