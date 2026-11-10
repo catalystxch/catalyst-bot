@@ -13,7 +13,7 @@ import hashlib
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 
 from flask import Blueprint, jsonify, request
 
@@ -2708,6 +2708,7 @@ def _calculate_smart_defaults(
                 int(
                     (_xch_units_avail / _CP_HEADROOM_MULT - _BUY_SPARE_OVERHEAD)
                     / max(1e-9, _BUY_TIER_FACTOR)
+                    + 1e-9
                 ),
             )
             _n_buy = max(1, min(_target_n, _n_buy))
@@ -2729,6 +2730,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + 1e-9
                     ),
                 )
         elif _avail_cat <= 0:
@@ -2743,7 +2745,14 @@ def _calculate_smart_defaults(
             _n_final = max(1, min(_n_buy, _n_sell)) if _n_sell > 0 else max(1, _n_buy)
 
         # Recalculate base size with agreed n (uses the binding constraint).
-        _base_size = max(_MIN_OFFER_XCH, round(_solve_base(_n_final), 4))
+        _base_size = max(
+            _MIN_OFFER_XCH,
+            float(
+                Decimal(str(_solve_base(_n_final))).quantize(
+                    Decimal("0.0001"), rounding=ROUND_DOWN
+                )
+            ),
+        )
 
         # Re-check CAT capacity against the definitive final base_size.
         if (
@@ -2762,6 +2771,7 @@ def _calculate_smart_defaults(
                     int(
                         (_cat_units_avail / _CP_HEADROOM_MULT - _SPARE_OVERHEAD)
                         / max(1e-9, _TIER_CAPITAL_FACTOR)
+                        + 1e-9
                     ),
                 )
         _n_sell_cap = _n_sell  # definitive CAT-backed sell capacity

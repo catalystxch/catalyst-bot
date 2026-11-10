@@ -77,7 +77,24 @@ _CONFIDENCE = SimpleNamespace(
 )
 
 
-def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None, target_offers=None):
+def _recommend(
+    mode,
+    *,
+    xch_mojos,
+    cat_mojos,
+    fee_mojos=None,
+    target_offers=None,
+    fills_per_day=None,
+):
+    analysis = (
+        _ANALYSIS
+        if fills_per_day is None
+        else {
+            **_ANALYSIS,
+            "liquidity": {**_ANALYSIS["liquidity"], "fills_per_day": fills_per_day},
+        }
+    )
+
     def balance(wallet_id):
         amount = xch_mojos if wallet_id == 1 else cat_mojos
         return {
@@ -93,7 +110,7 @@ def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None, target_offers=None
     with (
         patch("wallet.get_wallet_balance", side_effect=balance),
         patch("market_data_collector.collect_all_market_data", return_value=_MARKET),
-        patch("market_data_collector.analyze_market_data", return_value=_ANALYSIS),
+        patch("market_data_collector.analyze_market_data", return_value=analysis),
         patch.object(
             smart_defaults, "_fetch_dexie_orderbook_standalone", return_value=_BOOK
         ),
@@ -195,6 +212,27 @@ def test_requested_24_per_side_resizes_the_ladder_from_available_balances():
     assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
         str(plan["topup_pool_xch"])
     ) <= Decimal("127.908416089710")
+
+
+def test_thin_market_target_does_not_lose_a_slot_to_capacity_rounding():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+        fills_per_day=0.87,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert plan["_capital_plan"]["n_final"] == 24
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
+    assert _active_ladder_xch(plan, "sell") / Decimal(
+        str(plan["smart_mid_price"])
+    ) + Decimal(str(plan["topup_pool_cat"])) <= Decimal("1235383.474")
 
 
 def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():
