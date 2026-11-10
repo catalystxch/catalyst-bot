@@ -135,6 +135,38 @@ def test_thin_red_book_keeps_age_stamped_price_for_later_one_sided_book():
 
 
 @pytest.mark.parametrize(
+    ("elapsed", "guard_expected"),
+    [(timedelta(seconds=20), True), (timedelta(days=2), False)],
+)
+def test_thin_move_guard_expires_with_its_anchor(elapsed, guard_expected):
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    first = engine.evaluate(
+        observations=(_dexie(amount=500),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+    assert first.thin_anchor_midpoint == Decimal("0.1")
+
+    later = NOW + elapsed
+    moved = engine.evaluate(
+        observations=(_dexie(bid="0.14", ask="0.142", amount=500, at=later),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=later,
+    )
+
+    assert ("thin_move_pending_confirmation" in moved.reason_codes) is guard_expected
+    reference = select_thin_market_reference(moved, now=later)
+    if guard_expected:
+        assert reference is None
+    else:
+        assert reference is not None
+        assert reference.source == "current_book"
+        assert reference.midpoint == Decimal("0.141")
+
+
+@pytest.mark.parametrize(
     ("observations", "expected_state", "reason"),
     [
         ((_dexie(), _splash()), "GREEN", None),

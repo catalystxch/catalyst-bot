@@ -730,7 +730,13 @@ class MarketConfidenceEngine:
                 "rapid_offer_churn",
             }.intersection(reasons)
         )
-        if thin_book_safe and self._thin_anchor_midpoint is not None:
+        if (
+            thin_book_safe
+            and self._thin_anchor_midpoint is not None
+            and self._thin_anchor_at is not None
+            and self._thin_anchor_evidence_digests
+            and current_time - self._thin_anchor_at <= timedelta(hours=24)
+        ):
             thin_move = _basis_points(proposed_midpoint, self._thin_anchor_midpoint)
             trade_confirms = bool(
                 settled_trade_price is not None
