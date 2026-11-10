@@ -261,9 +261,34 @@ def test_existing_fee_outcome_guard_upgrades_without_losing_proof_gate(approved)
             "AND run.approval_id=reservation.approval_id",
         )
         assert old_follow_fragment != new_fragment
+        new_no_effect = """AND (
+                             terminal.reason_code='SAGE_RELAY_REJECTED'
+                             OR (
+                                 terminal.reason_code='FOLLOW_PREDISPATCH_NO_EFFECT'
+                                 AND json_extract(
+                                     terminal.evidence_json, '$.effect_attempted'
+                                 )=0
+                                 AND json_type(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 )='object'
+                                 AND json_extract(
+                                     terminal.evidence_json,
+                                     '$.wallet_evidence_sha256'
+                                 )=catalyst_sha256(json_extract(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 ))
+                             )
+                         )"""
+        old_no_effect = "AND terminal.reason_code='SAGE_RELAY_REJECTED'"
+        assert current.count(new_no_effect) == 1
+        old_follow = current.replace(new_fragment, old_follow_fragment)
+        old_current = current.replace(new_fragment, prior_fragment)
         for prior in (
-            current.replace(new_fragment, old_follow_fragment),
-            current.replace(new_fragment, prior_fragment),
+            old_follow,
+            old_current,
+            current.replace(new_no_effect, old_no_effect),
+            old_follow.replace(new_no_effect, old_no_effect),
+            old_current.replace(new_no_effect, old_no_effect),
         ):
             conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
             conn.execute(prior)

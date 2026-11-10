@@ -2977,6 +2977,24 @@ def get_pending_transactions() -> Optional[list]:
     return None
 
 
+def get_pending_transactions_strict() -> Optional[list]:
+    """Read the exact Sage pending list for no-effect recovery proof.
+
+    A success envelope without the native list is an incomplete read, not an
+    empty pending set.
+    """
+    result = rpc("get_pending_transactions", {}, timeout=10)
+    if type(result) is not dict or not _rpc_succeeded(result):
+        return None
+    if "transactions" in result and "pending_transactions" in result:
+        if result["transactions"] != result["pending_transactions"]:
+            return None
+    for key in ("transactions", "pending_transactions"):
+        if key in result:
+            return result[key] if type(result[key]) is list else None
+    return None
+
+
 def _are_coins_spendable_rpc(coin_ids: list) -> Optional[bool]:
     """Call Sage's exact spendability endpoint for a set of coin ids."""
     if not coin_ids:
@@ -5345,6 +5363,30 @@ def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict:
     }
 
 
+def get_recovery_active_offers_by_ids(offer_ids: tuple[str, ...]) -> dict | None:
+    """Require each native Sage offer response to prove active status."""
+    _require_exact_offer_ids(offer_ids)
+    records = []
+    for offer_id in offer_ids:
+        response = rpc("get_offer", {"offer_id": offer_id}, timeout=10)
+        if (
+            type(response) is not dict
+            or not _rpc_succeeded(response)
+            or type(response.get("offer")) is not dict
+        ):
+            return None
+        row = response["offer"]
+        if (
+            row.get("offer_id") != offer_id
+            or row.get("trade_id", offer_id) != offer_id
+            or "status" not in row
+            or type(row["status"]) is not str
+        ):
+            return None
+        records.append({"offer_id": offer_id, "status": row["status"]})
+    return {"complete": True, "requested_ids": list(offer_ids), "offers": records}
+
+
 def get_authoritative_offer_absence_by_ids(offer_ids: tuple[str, ...]) -> dict:
     """Prove exact Sage DB absence only from its offer-specific 404 response.
 
@@ -6882,6 +6924,57 @@ def get_coins_by_ids(
         if asset_id is not None:
             coin_map[cid]["asset_id"] = asset_id
     return coin_map
+
+
+def get_recovery_coins_by_ids(coin_ids: list[str]) -> dict | None:
+    """Require explicit unspent and offer-lock fields from the native RPC."""
+    if (
+        type(coin_ids) is not list
+        or not 1 <= len(coin_ids) <= _MAX_GET_COINS_BY_IDS
+        or any(
+            type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in coin_ids
+        )
+        or len(set(coin_ids)) != len(coin_ids)
+    ):
+        return None
+    response = rpc("get_coins_by_ids", {"coin_ids": coin_ids}, timeout=15)
+    if (
+        type(response) is not dict
+        or not _rpc_succeeded(response)
+        or type(response.get("coins")) is not list
+        or len(response["coins"]) != len(coin_ids)
+    ):
+        return None
+    result = {}
+    for row in response["coins"]:
+        if (
+            type(row) is not dict
+            or "coin_id" not in row
+            or "spent_height" not in row
+            or "offer_id" not in row
+            or type(row["coin_id"]) is not str
+        ):
+            return None
+        normalized = row["coin_id"].lower().removeprefix("0x")
+        if normalized not in coin_ids or normalized in result:
+            return None
+        if row["spent_height"] is not None and (
+            type(row["spent_height"]) is not int or row["spent_height"] < 0
+        ):
+            return None
+        if row["offer_id"] is not None and type(row["offer_id"]) is not str:
+            return None
+        result[normalized] = {
+            "coin_id": normalized,
+            "offer_id": row["offer_id"],
+            "spent_height": row["spent_height"],
+        }
+    return (
+        {"0x" + coin_id: result[coin_id] for coin_id in coin_ids}
+        if len(result) == len(coin_ids)
+        else None
+    )
 
 
 def are_coins_spendable(coin_ids: list) -> Optional[bool]:

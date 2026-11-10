@@ -280,6 +280,12 @@ def get_coins_by_ids(
     return result if type(result) is dict else None
 
 
+def get_recovery_coins_by_ids(coin_ids: list[str]) -> dict | None:
+    """Read native Sage coin fields without losing missing-field evidence."""
+    callback = getattr(_wallet_adapter, "get_recovery_coins_by_ids", None)
+    return callback(coin_ids) if callable(callback) else None
+
+
 def get_coins_by_ids_with_asset_hints(
     coin_ids: list, *, authoritative_asset_hints: dict
 ) -> dict | None:
@@ -1227,6 +1233,14 @@ def get_wallet_identity() -> dict:
     return result
 
 
+def get_wallet_identity_for_recovery() -> dict:
+    """Read the selected adapter identity while a durable latch fences effects."""
+    try:
+        return _identity_from_adapter(_wallet_adapter)
+    except Exception:
+        return {"success": False}
+
+
 def preflight_wallet_identity() -> dict:
     """Read-only UX preflight; the mutation-bound read remains authoritative."""
 
@@ -1443,6 +1457,24 @@ def get_pending_transactions():
 
     callback = getattr(_wallet_adapter, "get_pending_transactions", None)
     return callback() if callable(callback) else None
+
+
+def get_pending_transactions_strict() -> list | None:
+    """Return only a native, complete pending list for recovery proof."""
+    callback = getattr(_wallet_adapter, "get_pending_transactions_strict", None)
+    return callback() if callable(callback) else None
+
+
+def get_authoritative_offers_by_ids(offer_ids: tuple[str, ...]) -> dict | None:
+    """Read exact Sage offer rows through the selected read-only adapter."""
+    callback = getattr(_wallet_adapter, "get_authoritative_offers_by_ids", None)
+    return callback(offer_ids) if callable(callback) else None
+
+
+def get_recovery_active_offers_by_ids(offer_ids: tuple[str, ...]) -> dict | None:
+    """Read exact active offer identities from native Sage responses."""
+    callback = getattr(_wallet_adapter, "get_recovery_active_offers_by_ids", None)
+    return callback(offer_ids) if callable(callback) else None
 
 
 def _read_refresh_abort_cleanup_snapshot() -> dict:

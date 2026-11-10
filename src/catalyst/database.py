@@ -1979,7 +1979,24 @@ AND NOT EXISTS (
                      OR (
                          terminal.phase='RECONCILED'
                          AND terminal.outcome='CANCEL_FAILED'
-                         AND terminal.reason_code='SAGE_RELAY_REJECTED'
+                         AND (
+                             terminal.reason_code='SAGE_RELAY_REJECTED'
+                             OR (
+                                 terminal.reason_code='FOLLOW_PREDISPATCH_NO_EFFECT'
+                                 AND json_extract(
+                                     terminal.evidence_json, '$.effect_attempted'
+                                 )=0
+                                 AND json_type(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 )='object'
+                                 AND json_extract(
+                                     terminal.evidence_json,
+                                     '$.wallet_evidence_sha256'
+                                 )=catalyst_sha256(json_extract(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 ))
+                             )
+                         )
                          AND terminal.blocks_mutation=0
                      )
                  )
@@ -7782,6 +7799,30 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
           'coin_prep_cancellation_fee_outcome'"""
     if expected_sql.count(follow_guard_sql) != 1:
         raise RuntimeError("follow fee outcome guard definition is unavailable")
+    new_no_effect_sql = """AND (
+                             terminal.reason_code='SAGE_RELAY_REJECTED'
+                             OR (
+                                 terminal.reason_code='FOLLOW_PREDISPATCH_NO_EFFECT'
+                                 AND json_extract(
+                                     terminal.evidence_json, '$.effect_attempted'
+                                 )=0
+                                 AND json_type(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 )='object'
+                                 AND json_extract(
+                                     terminal.evidence_json,
+                                     '$.wallet_evidence_sha256'
+                                 )=catalyst_sha256(json_extract(
+                                     terminal.evidence_json, '$.wallet_evidence'
+                                 ))
+                             )
+                         )"""
+    prior_no_effect_sql = "AND terminal.reason_code='SAGE_RELAY_REJECTED'"
+    if expected_sql.count(new_no_effect_sql) != 1:
+        raise RuntimeError("pre-dispatch fee outcome guard definition is unavailable")
+    prior_no_effect_guard_sql = expected_sql.replace(
+        new_no_effect_sql, prior_no_effect_sql
+    )
     prior_follow_guard_sql = follow_guard_sql.replace(
         """AND (
                         run.approval_id=reservation.approval_id
@@ -7846,6 +7887,13 @@ def _upgrade_fee_outcome_journal_guard(conn: sqlite3.Connection) -> None:
         _normalized_schema_sql(legacy_sql),
         _normalized_schema_sql(prior_follow_sql),
         _normalized_schema_sql(prior_current_sql),
+        _normalized_schema_sql(prior_no_effect_guard_sql),
+        _normalized_schema_sql(
+            prior_follow_sql.replace(new_no_effect_sql, prior_no_effect_sql)
+        ),
+        _normalized_schema_sql(
+            prior_current_sql.replace(new_no_effect_sql, prior_no_effect_sql)
+        ),
     }:
         raise RuntimeError("fee outcome journal guard has unknown schema")
     conn.execute("DROP TRIGGER approved_fee_outcomes_journal_guard")
@@ -22191,7 +22239,11 @@ def _fee_scope_legacy_cancellation_holds(
             rejected = (
                 terminal["phase"] == "RECONCILED"
                 and terminal["outcome"] == "CANCEL_FAILED"
-                and terminal["reason_code"] == "SAGE_RELAY_REJECTED"
+                and terminal["reason_code"]
+                in {
+                    "SAGE_RELAY_REJECTED",
+                    "FOLLOW_PREDISPATCH_NO_EFFECT",
+                }
                 and terminal["blocks_mutation"] == 0
             )
             confirmed = (
@@ -25731,11 +25783,13 @@ def recheck_follow_cancellation_fee_hold(
                 ):
                     return False
             cleanup_eligible = stopped or now >= row["expires_at_epoch"]
-            if (not cleanup_eligible or not shutdown_cleanup) and totals[
-                "committed_fee_mojos"
-            ] + effective["protected_shutdown_fee_mojos"] > effective[
-                "maximum_fee_mojos"
-            ]:
+            if (
+                not _fee_approval_is_unbounded(conn, effective["approval_id"])
+                and (not cleanup_eligible or not shutdown_cleanup)
+                and totals["committed_fee_mojos"]
+                + effective["protected_shutdown_fee_mojos"]
+                > effective["maximum_fee_mojos"]
+            ):
                 return False
             fee_coin = conn.execute(
                 "SELECT designation FROM coins WHERE coin_id=?", (fee_coin_id,)
@@ -27527,7 +27581,26 @@ def get_unresolved_offer_cancel_cohort_manifests() -> List[Dict[str, Any]]:
                 (member["operation_id"], member["attempt"]),
             ).fetchone()
             if finalized is None:
-                has_unresolved = True
+                recovered = conn.execute(
+                    "SELECT * FROM offer_operation_journal "
+                    "WHERE operation_id=? AND attempt=? AND phase='RECONCILED'",
+                    (member["operation_id"], member["attempt"]),
+                ).fetchone()
+                if recovered is None:
+                    has_unresolved = True
+                else:
+                    recovery = validate_offer_operation_event(dict(recovered))
+                    recovery_evidence = json.loads(recovery["evidence_json"])
+                    if (
+                        recovery["outcome"] != "CANCEL_FAILED"
+                        or recovery["reason_code"] != "FOLLOW_PREDISPATCH_NO_EFFECT"
+                        or recovery["blocks_mutation"] != 0
+                        or recovery["transaction_id"] is not None
+                        or recovery_evidence.get("cohort_id") != manifest["cohort_id"]
+                        or recovery_evidence.get("trade_id") != member["trade_id"]
+                        or recovery_evidence.get("wallet_evidence_sha256") is None
+                    ):
+                        raise ValueError("durable pre-dispatch recovery is invalid")
             else:
                 final_event = validate_offer_operation_event(dict(finalized))
                 if (
@@ -28404,6 +28477,318 @@ def reconcile_rejected_offer_cancel_cohort(
         )
         conn.commit()
         return {"manifest": manifest, "events": events}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def reconcile_follow_predispatch_cancel_cohort(
+    *,
+    run_id: str,
+    manifest_json: Any,
+    expected_latch_generation: int,
+    wallet_fingerprint_hash: str,
+    network: str,
+    wallet_evidence: Dict[str, Any],
+    reconciled_at: Any = None,
+) -> Dict[str, Any]:
+    """Release one claimed Follow cohort fenced before its wallet call.
+
+    The exact latch reason is written only after the fee recheck rejects and
+    before ``wallet.cancel_offers_batch``. The caller must additionally supply
+    fresh, complete Sage no-effect reads for every claimed coin and offer.
+    """
+
+    from cancel_outcomes import CANCEL_FAILED, cancellation_result
+
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    run = _fee_digest(run_id)
+    if (
+        type(expected_latch_generation) is not int
+        or expected_latch_generation < 1
+        or type(wallet_evidence) is not dict
+        or set(wallet_evidence)
+        != {
+            "source_coins",
+            "fee_coin",
+            "offers",
+            "pending_transactions",
+            "observed_at_epoch",
+        }
+        or wallet_evidence["pending_transactions"] != []
+        or type(wallet_evidence["observed_at_epoch"]) is not int
+        or not int(time.time()) - 15
+        <= wallet_evidence["observed_at_epoch"]
+        <= int(time.time())
+        or type(wallet_evidence["source_coins"]) is not list
+        or type(wallet_evidence["offers"]) is not list
+        or type(wallet_evidence["fee_coin"]) is not dict
+    ):
+        raise ValueError("Follow pre-dispatch no-effect evidence is incomplete")
+    safe_wallet_hash = _required_stability_text(
+        wallet_fingerprint_hash, "wallet_fingerprint_hash"
+    )
+    safe_network = _required_stability_text(network, "network")
+    when = _stability_timestamp_or_now(reconciled_at, "reconciled_at")
+    no_effect = cancellation_result(
+        CANCEL_FAILED,
+        method="follow_predispatch_no_effect",
+        raw_response={"reason_code": "FOLLOW_PREDISPATCH_NO_EFFECT"},
+        error="CANCEL_REJECTED",
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        latch_row = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if latch_row is None:
+            raise ValueError("Follow pre-dispatch latch is missing")
+        latch = dict(latch_row)
+        operation_ids = [member["operation_id"] for member in manifest["members"]]
+        if (
+            latch["state"] != "tripped"
+            or latch["reason_code"] != "UNRESOLVED_OPERATIONS"
+            or latch["reason"]
+            != "Follow cancellation fee hold changed after effect claim"
+            or latch["generation"] != expected_latch_generation
+            or latch["wallet_fingerprint_hash"] != safe_wallet_hash
+            or latch["network"] != safe_network
+            or json.loads(latch["blocking_operation_ids_json"]) != sorted(operation_ids)
+        ):
+            raise ValueError("Follow pre-dispatch latch does not match cohort")
+        durable = conn.execute(
+            "SELECT * FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (manifest["cohort_id"],),
+        ).fetchone()
+        if (
+            durable is None
+            or _validated_offer_cancel_cohort_manifest_row(dict(durable)) != manifest
+        ):
+            raise ValueError("Follow pre-dispatch manifest is not durable")
+        fee_operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+        hold = conn.execute(
+            "SELECT reservation.*, outcome.state AS accounting_outcome "
+            "FROM approved_fee_reservations AS reservation "
+            "LEFT JOIN approved_fee_outcomes AS outcome USING(operation_id) "
+            "WHERE reservation.operation_id=?",
+            (fee_operation_id,),
+        ).fetchone()
+        if (
+            hold is None
+            or hold["cancellation"] != 1
+            or hold["accounting_outcome"] is not None
+        ):
+            raise ValueError("Follow pre-dispatch fee hold is missing")
+        run_row = conn.execute(
+            "SELECT approval_id FROM follow_run_authorities WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        stopped = conn.execute(
+            "SELECT 1 FROM follow_run_stops WHERE run_id=?",
+            (run,),
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT active,expires_at FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if stopped is None or lease is None or lease["active"] != 0:
+            raise ValueError("Follow pre-dispatch recovery requires a stopped runtime")
+        if run_row is None or (
+            hold["approval_id"] != run_row["approval_id"]
+            and conn.execute(
+                "SELECT 1 FROM follow_fee_ceiling_revisions "
+                "WHERE run_id=? AND approval_id=?",
+                (run, hold["approval_id"]),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("Follow pre-dispatch fee hold has wrong run")
+        prepared_rows = []
+        source_ids = []
+        for member in manifest["members"]:
+            prepared_row = conn.execute(
+                "SELECT * FROM offer_operation_journal WHERE event_id=?",
+                (member["prepared_event_id"],),
+            ).fetchone()
+            claim = conn.execute(
+                "SELECT * FROM offer_cancel_effect_claims "
+                "WHERE operation_id=? AND attempt=?",
+                (member["operation_id"], member["attempt"]),
+            ).fetchone()
+            later = conn.execute(
+                "SELECT 1 FROM offer_operation_journal "
+                "WHERE operation_id=? AND sequence>(SELECT sequence FROM "
+                "offer_operation_journal WHERE event_id=?)",
+                (member["operation_id"], member["prepared_event_id"]),
+            ).fetchone()
+            creation = conn.execute(
+                "SELECT purpose,sage_trade_id,lifecycle_state FROM offer_intents "
+                "WHERE intent_id=?",
+                (member["intent_id"],),
+            ).fetchone()
+            if (
+                prepared_row is None
+                or claim is None
+                or later is not None
+                or creation is None
+            ):
+                raise ValueError("Follow pre-dispatch member proof is incomplete")
+            prepared = validate_offer_operation_event(dict(prepared_row))
+            validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+            evidence = json.loads(prepared["evidence_json"])
+            effect = evidence.get("wallet_effect") or {}
+            batch = effect.get("batch") or {}
+            if (
+                creation["purpose"]
+                not in {
+                    f"follow:{run}:normal_lifecycle",
+                    f"follow:{run}:book_opportunity",
+                }
+                or creation["sage_trade_id"] != member["trade_id"]
+                or creation["lifecycle_state"] not in {"created", "cancel_requested"}
+                or claim["prepared_event_id"] != prepared["event_id"]
+                or batch.get("protocol") != "sage_native_cancel_offers_zero_plus_fee_v1"
+                or batch.get("trade_ids")
+                != [item["trade_id"] for item in manifest["members"]]
+            ):
+                raise ValueError("Follow pre-dispatch member binding differs")
+            prepared_rows.append((member, prepared, evidence))
+            if not source_ids:
+                source_ids = batch.get("source_coin_ids") or []
+                fee_coin_id = batch.get("fee_coin_id")
+            elif source_ids != batch.get("source_coin_ids") or fee_coin_id != batch.get(
+                "fee_coin_id"
+            ):
+                raise ValueError("Follow pre-dispatch wallet effect differs")
+        if (
+            len(source_ids) != len(manifest["members"])
+            or type(fee_coin_id) is not str
+            or type(wallet_evidence["source_coins"]) is not list
+            or len(wallet_evidence["source_coins"]) != len(source_ids)
+            or len(wallet_evidence["offers"]) != len(source_ids)
+        ):
+            raise ValueError("Follow pre-dispatch source set differs")
+        for index, (coin_id, member) in enumerate(zip(source_ids, manifest["members"])):
+            coin = wallet_evidence["source_coins"][index]
+            offer = wallet_evidence["offers"][index]
+            if (
+                type(coin) is not dict
+                or set(coin) != {"coin_id", "offer_id", "spent_height"}
+                or norm_coin_id(coin["coin_id"]) != norm_coin_id(coin_id)
+                or str(coin["offer_id"]).lower().removeprefix("0x")
+                != member["trade_id"]
+                or coin["spent_height"] is not None
+                or type(offer) is not dict
+                or set(offer) != {"offer_id", "status"}
+                or offer["offer_id"] != member["trade_id"]
+                or offer["status"] != "active"
+            ):
+                raise ValueError("Follow pre-dispatch source is not still active")
+        fee_coin = wallet_evidence["fee_coin"]
+        if (
+            set(fee_coin) != {"coin_id", "offer_id", "spent_height"}
+            or norm_coin_id(fee_coin["coin_id"]) != norm_coin_id(fee_coin_id)
+            or fee_coin["offer_id"] not in {None, ""}
+            or fee_coin["spent_height"] is not None
+        ):
+            raise ValueError("Follow pre-dispatch fee input may have changed")
+
+        proof_digest = hashlib.sha256(
+            _canonical_json_text(
+                wallet_evidence, "wallet_evidence", expected_type=dict
+            ).encode("utf-8")
+        ).hexdigest()
+        events = []
+        terminal_members = []
+        for member, prepared, evidence in prepared_rows:
+            member_evidence = {
+                "trade_id": member["trade_id"],
+                "attempt": member["attempt"],
+                "cohort_id": manifest["cohort_id"],
+                "member_id": member["member_id"],
+                "effect_attempted": False,
+                "cancel_result": no_effect,
+                "wallet_evidence": wallet_evidence,
+                "wallet_evidence_sha256": proof_digest,
+            }
+            journal = _journal_values(
+                event_id=f"{member['operation_id']}:attempt:{member['attempt']}:reconciled",
+                operation_id=member["operation_id"],
+                intent_id=member["intent_id"],
+                operation_type="CANCEL",
+                attempt=member["attempt"],
+                phase="RECONCILED",
+                outcome=CANCEL_FAILED,
+                request_timestamp=when,
+                wallet_identity_json=json.loads(prepared["wallet_identity_json"]),
+                transaction_id=None,
+                spend_identity=None,
+                evidence_json=member_evidence,
+                evidence_sha256=None,
+                reason_code="FOLLOW_PREDISPATCH_NO_EFFECT",
+                blocks_mutation=False,
+                created_at=when,
+            )
+            event = _insert_offer_operation_event(conn, journal)
+            events.append(event)
+            terminal_members.append(
+                {
+                    "operation_id": member["operation_id"],
+                    "attempt": member["attempt"],
+                    "event_id": event["event_id"],
+                    "phase": event["phase"],
+                    "outcome": event["outcome"],
+                    "reason_code": event["reason_code"],
+                    "evidence_sha256": event["evidence_sha256"],
+                }
+            )
+            prior_state = evidence.get("prior_lifecycle_state") or "open"
+            conn.execute(
+                "UPDATE offers SET lifecycle_state=? WHERE trade_id=? AND status='open'",
+                (prior_state, member["trade_id"]),
+            )
+        outcome_evidence = {
+            "schema_version": 1,
+            "kind": "follow_cancellation_fee_outcome",
+            "state": "RELEASED_NO_EFFECT",
+            "operation_id": fee_operation_id,
+            "cohort_id": manifest["cohort_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "fee_mojos": int(hold["fee_mojos"]),
+            "members": terminal_members,
+            "follow_run_id": run,
+        }
+        outcome_text = _canonical_json_text(
+            outcome_evidence, "follow_no_effect_outcome", expected_type=dict
+        )
+        conn.execute(
+            "INSERT INTO approved_fee_outcomes VALUES (?, ?, ?, ?)",
+            (
+                fee_operation_id,
+                "RELEASED_NO_EFFECT",
+                hashlib.sha256(outcome_text.encode("utf-8")).hexdigest(),
+                outcome_text,
+            ),
+        )
+        _reconciliation_latch_update(
+            conn,
+            operation_id=operation_ids[0],
+            additionally_resolved=operation_ids[1:],
+            wallet_fingerprint_hash=safe_wallet_hash,
+            network=safe_network,
+            reason_code="FOLLOW_PREDISPATCH_NO_EFFECT",
+            reason="Exact Sage cohort remained active after pre-dispatch fee rejection",
+            reconciled_at=when,
+            blocking=False,
+        )
+        conn.commit()
+        return {
+            "manifest": manifest,
+            "events": events,
+            "fee_outcome": "RELEASED_NO_EFFECT",
+        }
     except Exception:
         conn.rollback()
         raise
@@ -32973,6 +33358,7 @@ def get_offer_intent(intent_id: str) -> Optional[Dict[str, Any]]:
 
 
 _OFFER_DISCOVERY_PROVIDERS = ("dexie", "splash")
+_OFFER_PREPUBLICATION_TIMEOUT_SECONDS = 600
 
 
 def _offer_discovery_identity(value: Any, label: str) -> str:
@@ -32989,7 +33375,7 @@ def _offer_discovery_identity(value: Any, label: str) -> str:
 def ensure_offer_publication_discoveries(
     intent_id: str, *, deadline_seconds: int = 90
 ) -> List[Dict[str, Any]]:
-    """Create and return the durable per-provider discovery obligations."""
+    """Arm discovery after publication, with a bounded prepublication wait."""
 
     safe_intent_id = _required_stability_text(intent_id, "intent_id")
     if type(deadline_seconds) is not int or deadline_seconds <= 0:
@@ -33014,8 +33400,54 @@ def ensure_offer_publication_discoveries(
         confirmed_dt = _parse_iso_timestamp(
             confirmed_at, "confirmed_at", require_timezone=True
         )
+        prepublication_deadline = confirmed_dt + timedelta(
+            seconds=max(deadline_seconds, _OFFER_PREPUBLICATION_TIMEOUT_SECONDS)
+        )
+        first_success = None
+        for publication in conn.execute(
+            "SELECT publisher,network,offer_fingerprint,attempt_count,"
+            "claim_generation,row_version,dispatch_started_at,request_sha256,"
+            "acknowledgement_json,acknowledgement_sha256,succeeded_at,terminal_at "
+            "FROM publication_outbox WHERE intent_id=? AND state='succeeded'",
+            (safe_intent_id,),
+        ):
+            row = dict(publication)
+            acknowledgement = row["acknowledgement_json"]
+            if (
+                row["publisher"] not in _OFFER_DISCOVERY_PROVIDERS
+                or row["network"] != intent["network"]
+                or row["offer_fingerprint"] != identity
+                or type(row["attempt_count"]) is not int
+                or row["attempt_count"] < 1
+                or type(row["claim_generation"]) is not int
+                or row["claim_generation"] < 1
+                or type(row["row_version"]) is not int
+                or row["row_version"] < 1
+                or row["dispatch_started_at"] is None
+                or type(row["request_sha256"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", row["request_sha256"]) is None
+                or type(acknowledgement) is not str
+                or type(row["acknowledgement_sha256"]) is not str
+                or hashlib.sha256(acknowledgement.encode("utf-8")).hexdigest()
+                != row["acknowledgement_sha256"]
+                or row["succeeded_at"] != row["terminal_at"]
+            ):
+                continue
+            try:
+                succeeded = _parse_iso_timestamp(
+                    row["succeeded_at"], "succeeded_at", require_timezone=True
+                )
+            except (TypeError, ValueError):
+                continue
+            if succeeded < confirmed_dt or succeeded > prepublication_deadline:
+                continue
+            if first_success is None or succeeded < first_success:
+                first_success = succeeded
         deadline_at = _stability_timestamp(
-            confirmed_dt + timedelta(seconds=deadline_seconds), "discovery deadline"
+            (first_success + timedelta(seconds=deadline_seconds))
+            if first_success is not None
+            else prepublication_deadline,
+            "discovery deadline",
         )
         updated_at = _stability_wall_clock()
         for provider in _OFFER_DISCOVERY_PROVIDERS:
@@ -33035,6 +33467,23 @@ def ensure_offer_publication_discoveries(
         ).fetchall()
         if len(rows) != len(_OFFER_DISCOVERY_PROVIDERS):
             raise RuntimeError("offer discovery obligations are incomplete")
+        # Acknowledgement can arrive after obligations are first inserted.
+        # Reanchor only pending/exact obligations. An already expired row is
+        # terminal and must never be revived by a late provider response.
+        if not any(row["state"] == "deadline_expired" for row in rows):
+            if any(row["deadline_at"] != deadline_at for row in rows):
+                conn.execute(
+                    "UPDATE offer_publication_discoveries "
+                    "SET deadline_at=?, updated_at=? WHERE intent_id=?",
+                    (deadline_at, updated_at, safe_intent_id),
+                )
+                rows = conn.execute(
+                    "SELECT * FROM offer_publication_discoveries "
+                    "WHERE intent_id=? ORDER BY provider",
+                    (safe_intent_id,),
+                ).fetchall()
+        else:
+            deadline_at = rows[0]["deadline_at"]
         for row in rows:
             current = dict(row)
             if (

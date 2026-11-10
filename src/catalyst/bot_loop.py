@@ -1907,20 +1907,32 @@ class BotLoop:
 
         if cancel_trade_ids and self._enter_runtime_effect_phase("cancel"):
             unique_trade_ids = sorted(set(cancel_trade_ids))
-            self.offer_manager.cancel_offers(
+            outcomes = self.offer_manager.cancel_offers(
                 unique_trade_ids,
                 reason="PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
                 force_storm=True,
             )
-            result["cancel_requested"] = len(unique_trade_ids)
+            outcome_counts: Dict[str, int] = {}
+            for trade_id in unique_trade_ids:
+                row = (outcomes or {}).get(trade_id)
+                outcome = (
+                    str(row.get("outcome") or "").strip() if type(row) is dict else ""
+                ) or "MISSING_RESULT"
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            result["cancel_requested"] = sum(
+                outcome_counts.get(outcome, 0)
+                for outcome in {"CANCEL_CONFIRMED", "CANCEL_SUBMITTED_UNCONFIRMED"}
+            )
+            result["pending"] += len(unique_trade_ids) - result["cancel_requested"]
             log_event(
                 "warning",
                 "offer_publication_discovery_expired",
-                f"Sage cancellation submitted for {len(unique_trade_ids)} "
-                "offer(s) not rediscovered within 90 seconds",
+                f"Sage cancellation attempted for {len(unique_trade_ids)} "
+                "offer(s) after the publication discovery deadline",
                 data={
                     "reason_code": "PUBLICATION_DISCOVERY_DEADLINE_EXCEEDED",
                     "trade_ids": unique_trade_ids,
+                    "outcome_counts": outcome_counts,
                 },
             )
         else:
