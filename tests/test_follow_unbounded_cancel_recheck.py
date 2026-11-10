@@ -215,6 +215,62 @@ def test_claimed_predispatch_retry_refuses_changed_wallet_proof(approved, monkey
     assert projection.result["outcome"] == "CANCEL_UNKNOWN"
 
 
+def test_claimed_predispatch_recovery_allows_exact_second_attempt(approved):
+    database, run_id, manifest, identity, latch, proof = _claimed_predispatch_cohort(
+        approved
+    )
+    database.reconcile_follow_predispatch_cancel_cohort(
+        run_id=run_id,
+        manifest_json=manifest,
+        expected_latch_generation=latch["generation"],
+        wallet_fingerprint_hash="f" * 64,
+        network=identity["network"],
+        wallet_evidence=proof,
+    )
+    next_members = [
+        {
+            "trade_id": member["trade_id"],
+            "operation_id": member["operation_id"],
+            "intent_id": member["intent_id"],
+            "attempt": 2,
+            "prepared_event_id": f"{member['operation_id']}:attempt:2:prepared",
+        }
+        for member in manifest["members"]
+    ]
+    retry_manifest = database.canonical_offer_cancel_cohort_manifest(next_members)
+    requests = []
+    for member in retry_manifest["members"]:
+        original = database.get_offer_operation_events(member["operation_id"])[0]
+        evidence = json.loads(original["evidence_json"])
+        evidence.update(
+            attempt=2,
+            cohort_id=retry_manifest["cohort_id"],
+            member_id=member["member_id"],
+        )
+        requests.append(
+            {
+                "operation_id": member["operation_id"],
+                "event_id": member["prepared_event_id"],
+                "trade_id": member["trade_id"],
+                "intent_id": member["intent_id"],
+                "attempt": 2,
+                "wallet_identity_json": json.loads(original["wallet_identity_json"]),
+                "evidence_json": evidence,
+            }
+        )
+    result = database.prepare_offer_cancel_cohort(
+        manifest_json=retry_manifest, member_requests_json=requests
+    )
+    assert len(result["events"]) == 2
+    for member in retry_manifest["members"]:
+        events = database.get_offer_operation_events(member["operation_id"])
+        assert [(e["attempt"], e["phase"]) for e in events] == [
+            (1, "PREPARED"),
+            (1, "RECONCILED"),
+            (2, "PREPARED"),
+        ]
+
+
 @pytest.mark.parametrize("damage", ["pending", "spent", "offer"])
 def test_claimed_predispatch_recovery_refuses_ambiguous_wallet_proof(approved, damage):
     database, run_id, manifest, identity, latch, proof = _claimed_predispatch_cohort(

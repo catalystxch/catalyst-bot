@@ -27076,6 +27076,100 @@ def _replacement_claim_failed_without_effect(
     )
 
 
+def _released_follow_predispatch_retry_proven(
+    conn: sqlite3.Connection, prepared: Dict[str, Any], recovered: Dict[str, Any]
+) -> bool:
+    """Require the exact committed no-effect cohort before attempt N+1."""
+
+    from cancel_outcomes import CANCEL_FAILED, cancellation_result
+
+    try:
+        if (
+            recovered["event_id"]
+            != f"{prepared['operation_id']}:attempt:{prepared['attempt']}:reconciled"
+            or recovered["operation_id"] != prepared["operation_id"]
+            or recovered["intent_id"] != prepared["intent_id"]
+            or recovered["attempt"] != prepared["attempt"]
+            or recovered["phase"] != "RECONCILED"
+            or recovered["outcome"] != CANCEL_FAILED
+            or recovered["reason_code"] != "FOLLOW_PREDISPATCH_NO_EFFECT"
+            or recovered["blocks_mutation"] != 0
+            or recovered["transaction_id"] is not None
+            or recovered["spend_identity"] is not None
+            or recovered["wallet_identity_json"] != prepared["wallet_identity_json"]
+        ):
+            return False
+        proof = json.loads(recovered["evidence_json"])
+        prepared_proof = json.loads(prepared["evidence_json"])
+        if type(proof) is not dict or type(prepared_proof) is not dict:
+            return False
+        wallet_proof = proof.get("wallet_evidence")
+        expected_result = cancellation_result(
+            CANCEL_FAILED,
+            method="follow_predispatch_no_effect",
+            raw_response={"reason_code": "FOLLOW_PREDISPATCH_NO_EFFECT"},
+            error="CANCEL_REJECTED",
+        )
+        if (
+            set(proof)
+            != {
+                "trade_id",
+                "attempt",
+                "cohort_id",
+                "member_id",
+                "effect_attempted",
+                "cancel_result",
+                "wallet_evidence",
+                "wallet_evidence_sha256",
+            }
+            or proof["trade_id"] != prepared_proof.get("trade_id")
+            or proof["attempt"] != prepared["attempt"]
+            or proof["cohort_id"] != prepared_proof.get("cohort_id")
+            or proof["member_id"] != prepared_proof.get("member_id")
+            or proof["effect_attempted"] is not False
+            or proof["cancel_result"] != expected_result
+            or type(wallet_proof) is not dict
+            or hashlib.sha256(
+                _canonical_json_text(
+                    wallet_proof, "wallet_evidence", expected_type=dict
+                ).encode("utf-8")
+            ).hexdigest()
+            != proof["wallet_evidence_sha256"]
+        ):
+            return False
+        manifest_row = conn.execute(
+            "SELECT * FROM offer_cancel_cohort_manifests WHERE cohort_id=?",
+            (proof["cohort_id"],),
+        ).fetchone()
+        if manifest_row is None:
+            return False
+        manifest = _validated_offer_cancel_cohort_manifest_row(dict(manifest_row))
+        validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+        creation = conn.execute(
+            "SELECT purpose FROM offer_intents WHERE intent_id=?",
+            (prepared["intent_id"],),
+        ).fetchone()
+        purpose = creation["purpose"] if creation else None
+        parts = purpose.split(":") if type(purpose) is str else []
+        if (
+            len(parts) != 3
+            or parts[0] != "follow"
+            or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+        ):
+            return False
+        fee_proof = get_released_follow_predispatch_cancel_fee_outcome(
+            run_id=parts[1], manifest_json=manifest, connection=conn
+        )
+        return any(
+            member["operation_id"] == prepared["operation_id"]
+            and member["event_id"] == recovered["event_id"]
+            and member["evidence_sha256"] == recovered["evidence_sha256"]
+            for member in fee_proof["members"]
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def _prepare_offer_cancel_in_transaction(
     conn: sqlite3.Connection,
     *,
@@ -27159,8 +27253,19 @@ def _prepare_offer_cancel_in_transaction(
                     or prepared_prior["phase"] != "PREPARED"
                     or prepared_prior["outcome"] != "PREPARED"
                     or finalized_prior["attempt"] != prior_attempt
-                    or finalized_prior["phase"] != "FINALIZED"
                 ):
+                    raise ValueError(
+                        "cancellation attempt must follow exact prior failed"
+                    )
+                if finalized_prior["phase"] == "RECONCILED":
+                    if not _released_follow_predispatch_retry_proven(
+                        conn, prepared_prior, finalized_prior
+                    ):
+                        raise ValueError(
+                            "cancellation attempt must follow exact prior failed"
+                        )
+                    continue
+                if finalized_prior["phase"] != "FINALIZED":
                     raise ValueError(
                         "cancellation attempt must follow exact prior failed"
                     )
@@ -28797,14 +28902,14 @@ def reconcile_follow_predispatch_cancel_cohort(
 
 
 def get_released_follow_predispatch_cancel_fee_outcome(
-    *, run_id: str, manifest_json: Any
+    *, run_id: str, manifest_json: Any, connection: Optional[sqlite3.Connection] = None
 ) -> Dict[str, Any]:
     """Read exact atomic fee-release evidence for a no-effect Follow cohort."""
 
     run = _fee_digest(run_id)
     manifest = validate_offer_cancel_cohort_manifest(manifest_json)
     operation_id = _follow_cancellation_fee_operation_id(run, manifest)
-    conn = get_connection()
+    conn = connection if connection is not None else get_connection()
     row = conn.execute(
         "SELECT outcome.state,outcome.evidence_id,outcome.evidence_json,"
         "reservation.fee_mojos,reservation.cancellation "
