@@ -85,6 +85,7 @@ def _recommend(
     fee_mojos=None,
     target_offers=None,
     fills_per_day=None,
+    shutdown_fee_mojos=None,
 ):
     analysis = (
         _ANALYSIS
@@ -134,8 +135,10 @@ def _recommend(
         ),
         patch(
             "tx_fees.get_suggested_transaction_fee",
-            return_value=(
-                {"available": True, "fee_mojos": fee_mojos}
+            side_effect=lambda *, target_seconds, cost: (
+                {"available": True, "fee_mojos": shutdown_fee_mojos}
+                if cost == 11_000_000_000 and shutdown_fee_mojos is not None
+                else {"available": True, "fee_mojos": fee_mojos}
                 if fee_mojos is not None
                 else {"available": False}
             ),
@@ -233,6 +236,23 @@ def test_thin_market_target_does_not_lose_a_slot_to_capacity_rounding():
     assert _active_ladder_xch(plan, "sell") / Decimal(
         str(plan["smart_mid_price"])
     ) + Decimal(str(plan["topup_pool_cat"])) <= Decimal("1235383.474")
+
+
+def test_smart_fee_coin_covers_full_book_shutdown_quote():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+        fills_per_day=0.87,
+        fee_mojos=13_079_100,
+        shutdown_fee_mojos=2_326_137_840,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert Decimal(str(plan["fee_coin_size_xch"])) >= Decimal("0.004652275680")
+    assert Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"] <= 1
 
 
 def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():

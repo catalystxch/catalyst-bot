@@ -2249,6 +2249,19 @@ def _calculate_smart_defaults(
         _fee_est_60 = get_suggested_transaction_fee(
             target_seconds=_fee_spike_secs, cost=35_000_000
         )
+        # Follow must be able to cancel its whole book when stopped. That
+        # shutdown can cost far more than an ordinary CAT spend, so size each
+        # prepared fee coin to cover a fresh one-block cancellation quote.
+        from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
+
+        _shutdown_fee_est = get_suggested_transaction_fee(
+            target_seconds=300, cost=ONE_BLOCK_COST_LIMIT
+        )
+        _shutdown_fee_xch = (
+            max(0, int(_shutdown_fee_est.get("fee_mojos", 0) or 0)) / 1e12
+            if _shutdown_fee_est.get("available")
+            else 0.0
+        )
         if _fee_est.get("available"):
             _fee_mojos = int(_fee_est.get("fee_mojos", 0) or 0)
             _fee_mojos_60 = int(_fee_est_60.get("fee_mojos", 0) or 0)
@@ -2266,7 +2279,7 @@ def _calculate_smart_defaults(
             _peak_fee_xch = _peak_fee_mojos / 1e12
             # Fee coin must be at least 20x the peak fee so it can recycle ~10 times
             # before a top-up is needed. Hard minimum 0.001 XCH.
-            _fee_coin_raw = max(0.001, _peak_fee_xch * 20)
+            _fee_coin_raw = max(0.001, _peak_fee_xch * 20, _shutdown_fee_xch * 2)
             # Round up to 3 significant figures for cleanliness
             import math as _math
 
@@ -2359,6 +2372,7 @@ def _calculate_smart_defaults(
     _fee_plan = plan_weekly_fee_coins(
         estimated_fee_mojos=max(1, int(_peak_fee_mojos)),
         active_offer_target_count=_active_offer_target_count,
+        minimum_coin_size_mojos=int(Decimal(str(_fee_coin_size)) * Decimal(10**12)),
         allocatable_xch_mojos=max(
             0,
             int(Decimal(str(_fee_allocatable_xch)) * Decimal(10**12)),

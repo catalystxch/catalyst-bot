@@ -42,6 +42,18 @@ def test_fee_coin_size_rounds_up_to_clean_million_mojo_step():
     assert result["fee_coin_size_mojos"] == 1_201_000_000
 
 
+def test_shutdown_sized_minimum_coin_still_respects_wallet_allocation():
+    result = plan_weekly_fee_coins(
+        estimated_fee_mojos=13_079_100,
+        active_offer_target_count=48,
+        allocatable_xch_mojos=1_000_000_000_000,
+        minimum_coin_size_mojos=4_660_000_000,
+    )
+
+    assert result["fee_coin_size_mojos"] == 4_660_000_000
+    assert result["fee_coin_principal_mojos"] <= 1_000_000_000_000
+
+
 def test_wallet_allocation_caps_count_without_overcommitting_principal():
     result = plan_weekly_fee_coins(
         estimated_fee_mojos=1_000_000,

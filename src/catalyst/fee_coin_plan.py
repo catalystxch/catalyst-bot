@@ -36,6 +36,7 @@ def plan_weekly_fee_coins(
     active_offer_target_count: int,
     recent_fee_operations_per_day=None,
     allocatable_xch_mojos: int = 0,
+    minimum_coin_size_mojos: int = 0,
 ) -> dict:
     """Plan fee-coin principal for seven days without exceeding allocation.
 
@@ -51,6 +52,8 @@ def plan_weekly_fee_coins(
         or active_offer_target_count <= 0
         or type(allocatable_xch_mojos) is not int
         or allocatable_xch_mojos < 0
+        or type(minimum_coin_size_mojos) is not int
+        or minimum_coin_size_mojos < 0
     ):
         raise ValueError("fee estimate, offer count, or allocation is invalid")
 
@@ -74,6 +77,7 @@ def plan_weekly_fee_coins(
     raw_size = max(
         _MIN_FEE_COIN_MOJOS,
         estimated_fee_mojos * _FEE_COIN_FEE_MULTIPLIER,
+        minimum_coin_size_mojos,
     )
     fee_coin_size_mojos = (
         _ceil_div(raw_size, _FEE_COIN_SIZE_STEP_MOJOS) * _FEE_COIN_SIZE_STEP_MOJOS
