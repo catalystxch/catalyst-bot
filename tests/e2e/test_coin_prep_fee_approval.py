@@ -347,9 +347,12 @@ def test_open_coin_prep_modal_automatically_refreshes_near_expiry_read_only(page
             .filter(call => call.path.endsWith('/coin-prep/fee-preview'))
             .map(call => call.path)"""
     ) == ["/api/coin-prep/fee-preview"]
-    assert page.evaluate(
-        "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
-    ) is False
+    assert (
+        page.evaluate(
+            "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+        )
+        is False
+    )
 
     # A visible but closed confirmation view must not start another preview.
     page.evaluate(
@@ -359,12 +362,18 @@ def test_open_coin_prep_modal_automatically_refreshes_near_expiry_read_only(page
         }"""
     )
     page.clock.fast_forward(20_000)
-    assert page.evaluate(
-        "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
-    ) == 1
-    assert page.evaluate(
-        "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
-    ) is False
+    assert (
+        page.evaluate(
+            "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
+        )
+        == 1
+    )
+    assert (
+        page.evaluate(
+            "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+        )
+        is False
+    )
 
 
 def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
