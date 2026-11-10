@@ -528,6 +528,36 @@ def test_legacy_trusted_price_without_timestamp_keeps_unknown_age():
     assert result.last_trusted_evidence_digests == ()
 
 
+@pytest.mark.parametrize("trusted_at", [None, NOW - timedelta(days=2)])
+def test_expired_trusted_price_does_not_block_fresh_thin_book(trusted_at):
+    state = MarketConfidenceEngine(risk_preset="balanced").export_state()
+    state.update(
+        last_trusted_midpoint="0.1",
+        last_trusted_bid="0.099",
+        last_trusted_ask="0.101",
+        last_trusted_at=(
+            trusted_at.isoformat().replace("+00:00", "Z") if trusted_at else None
+        ),
+        last_trusted_evidence_digests=(["a" * 64] if trusted_at else []),
+    )
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    engine.hydrate(state)
+
+    result = engine.evaluate(
+        observations=(_dexie(bid="0.14", ask="0.142", amount=500),),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=1_000,
+        now=NOW,
+    )
+
+    assert result.state == "RED"
+    assert "hard_price_move_cap" not in result.reason_codes
+    reference = select_thin_market_reference(result, now=NOW)
+    assert reference is not None
+    assert reference.source == "current_book"
+    assert reference.midpoint == Decimal("0.141")
+
+
 def test_one_sided_provider_does_not_supply_independent_corroboration():
     one_sided_splash = _observation(
         "splash",

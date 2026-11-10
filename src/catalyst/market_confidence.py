@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
@@ -571,7 +571,13 @@ class MarketConfidenceEngine:
             and not source_conflict
             and manipulation_score < int(self._thresholds["manipulation_red"])
         )
-        if proposed_midpoint is not None and self._last_trusted_midpoint is not None:
+        if (
+            proposed_midpoint is not None
+            and self._last_trusted_midpoint is not None
+            and self._last_trusted_at is not None
+            and self._last_trusted_evidence_digests
+            and current_time - self._last_trusted_at <= timedelta(hours=24)
+        ):
             move_bps = _basis_points(proposed_midpoint, self._last_trusted_midpoint)
             hard_cap = move_bps > Decimal(self._thresholds["hard_move_cap_bps"])
             if hard_cap:
