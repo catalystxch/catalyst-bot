@@ -20513,6 +20513,15 @@
                     liquidity_mode: (typeof getLiquidityMode === 'function')
                         ? getLiquidityMode() : 'two_sided',
                 });
+                const buyTarget = Number(document.getElementById('configMaxBuy')?.value);
+                const sellTarget = Number(document.getElementById('configMaxSell')?.value);
+                const mode = params.get('liquidity_mode');
+                const requestedTarget = mode === 'buy_only' ? buyTarget
+                    : mode === 'sell_only' ? sellTarget
+                    : buyTarget === sellTarget ? buyTarget : 0;
+                if (Number.isInteger(requestedTarget) && requestedTarget >= 1 && requestedTarget <= 50) {
+                    params.set('target_offers_per_side', String(requestedTarget));
+                }
                 if (sdStatus) sdStatus.textContent = 'Analysing market data + calculating capital allocation...';
                 let resp = await apiFetch(`${API_URL}/smart-defaults?${params}`);
                 let data = await resp.json();

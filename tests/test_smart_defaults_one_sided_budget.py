@@ -77,7 +77,7 @@ _CONFIDENCE = SimpleNamespace(
 )
 
 
-def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None):
+def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None, target_offers=None):
     def balance(wallet_id):
         amount = xch_mojos if wallet_id == 1 else cat_mojos
         return {
@@ -135,6 +135,7 @@ def _recommend(mode, *, xch_mojos, cat_mojos, fee_mojos=None):
                 cat_decimals=3,
                 cat_ticker_id="TST_XCH",
                 cat_name="TestCAT",
+                target_offers_per_side=target_offers,
             )
     assert response.status_code == 200
     return response.get_json()
@@ -164,6 +165,36 @@ def test_buy_only_tiny_cat_balance_does_not_zero_xch_ladder():
     assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
         str(plan["topup_pool_xch"])
     ) <= Decimal("10")
+
+
+def test_requested_24_per_side_resizes_the_ladder_from_available_balances():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=127_908_416_089_710,
+        cat_mojos=1_235_383_474,
+        target_offers=24,
+    )
+
+    assert plan["max_active_buy"] == 24
+    assert plan["max_active_sell"] == 24
+    assert (
+        sum(
+            plan[f"buy_{tier}_tier_count"]
+            for tier in ("inner", "mid", "outer", "extreme")
+        )
+        == 24
+    )
+    assert (
+        sum(
+            plan[f"sell_{tier}_tier_count"]
+            for tier in ("inner", "mid", "outer", "extreme")
+        )
+        == 24
+    )
+    fee_pool = Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"]
+    assert _active_ladder_xch(plan, "buy") + fee_pool + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
 
 
 def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():

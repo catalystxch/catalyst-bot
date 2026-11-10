@@ -1211,6 +1211,11 @@ def api_smart_defaults():
         cat_name = (request.args.get("cat_name", "") or "").strip()
         cat_wallet_id = _positive_int_or_none(request.args.get("cat_wallet_id"))
         cat_decimals = _nonnegative_int_or_none(request.args.get("cat_decimals"))
+        target_offers_per_side = _positive_int_or_none(
+            request.args.get("target_offers_per_side")
+        )
+        if target_offers_per_side is not None and target_offers_per_side > 50:
+            target_offers_per_side = None
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
@@ -1220,6 +1225,7 @@ def api_smart_defaults():
             asset_id=asset_id or None,
             cat_wallet_id=cat_wallet_id,
             cat_decimals=cat_decimals,
+            target_offers_per_side=target_offers_per_side,
             cat_ticker_id=cat_ticker_id or None,
             cat_name=cat_name or None,
         )
@@ -1245,6 +1251,7 @@ def _calculate_smart_defaults(
     cat_decimals=None,
     cat_ticker_id=None,
     cat_name=None,
+    target_offers_per_side=None,
 ):
     """Smart Defaults v2 — data-driven settings from 30 days of market data.
 
@@ -2480,6 +2487,8 @@ def _calculate_smart_defaults(
     # (uses 2.5 as an approximate capital factor before tier selection)
     _max_possible_n = max(2, int(_trading_xch / (_MIN_OFFER_XCH * 2.5)))
     _target_n = min(_market_n, _max_possible_n)
+    if type(target_offers_per_side) is int and 1 <= target_offers_per_side <= 50:
+        _target_n = min(_target_n, target_offers_per_side)
 
     # AMM pool-impact caps are retired; the market-confidence layer scales
     # independent order-book depth to configured offer size.
@@ -2791,7 +2800,7 @@ def _calculate_smart_defaults(
         # config value so coin prep, spares, and active-offer limits are aligned.
         # capital_mult already shrank _trading_xch → smaller per-offer sizes.
         # Combining both: conservative = fewer AND smaller offers.
-        if _rp["max_offers_mult"] != 1.0:
+        if _rp["max_offers_mult"] != 1.0 and target_offers_per_side is None:
             _adj_n = max(1, round(_n_final * _rp["max_offers_mult"]))
             _smart_max_buy = _adj_n
             _smart_max_sell = _adj_n
