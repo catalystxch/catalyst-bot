@@ -14187,7 +14187,7 @@
                             const spc = parseInt(g('SNIPER_PREP_COUNT') || 0); if (spc >= 0) document.getElementById('configSniperPrepCount').value = spc;
                             const srp = parseFloat(g('SNIPER_REARM_PRICE_MOVE_BPS') || 0); if (srp >= 0) document.getElementById('configSniperRearmPriceMovePct').value = (srp / 100).toFixed(1);
                             const srg = parseFloat(g('SNIPER_REARM_GAP_MOVE_BPS') || 0); if (srg >= 0) document.getElementById('configSniperRearmGapMovePct').value = (srg / 100).toFixed(1);
-                            const tfm = g('TRANSACTION_FEE_MODE'); if (tfm) document.getElementById('configTransactionFeeMode').value = 'manual';
+                            const tfm = g('TRANSACTION_FEE_MODE'); if (tfm) document.getElementById('configTransactionFeeMode').value = tfm;
                             const tfx = g('TRANSACTION_FEE_XCH'); if (tfx !== null && tfx !== undefined) document.getElementById('configTransactionFeeXch').value = tfx;
                             document.getElementById('configTransactionFeeEnabled').checked = (parseFloat(tfx || 0) > 0);
                             const tfsecs = parseInt(g('TRANSACTION_FEE_TARGET_SECS') || 0); if (tfsecs >= 0) document.getElementById('configTransactionFeeTargetSecs').value = tfsecs;
@@ -14214,6 +14214,29 @@
 
                         // A1: snapshot for unsaved-changes tracking
                         snapshotSettings();
+                        // Preserve exact loaded values where UI presentation
+                        // is lossy or the legacy tier keys have side semantics.
+                        // This keeps a no-edit Save & Continue from changing
+                        // execution settings and invalidating fee approval.
+                        window._settingsRoundTrip = {
+                            raw: {
+                                inner_size_xch: g('INNER_SIZE_XCH'),
+                                mid_size_xch: g('MID_SIZE_XCH'),
+                                outer_size_xch: g('OUTER_SIZE_XCH'),
+                                extreme_size_xch: g('EXTREME_SIZE_XCH'),
+                                min_edge_bps: g('MIN_EDGE_BPS'),
+                                transaction_fee_mode: g('TRANSACTION_FEE_MODE'),
+                            },
+                            displayed: {
+                                inner_size_xch: document.getElementById('configInnerSizeXch')?.value,
+                                mid_size_xch: document.getElementById('configMidSizeXch')?.value,
+                                outer_size_xch: document.getElementById('configOuterSizeXch')?.value,
+                                extreme_size_xch: document.getElementById('configExtremeSizeXch')?.value,
+                                min_edge_bps: document.getElementById('configMinEdgeBps')?.value,
+                                transaction_fee_enabled: document.getElementById('configTransactionFeeEnabled')?.checked,
+                                transaction_fee_xch: document.getElementById('configTransactionFeeXch')?.value,
+                            },
+                        };
                         attachUnsavedListeners();
                         clearInlineValidation();
                     } catch (e) { debugWarn('[settings] Config load failed:', e); }
@@ -37008,7 +37031,7 @@
                 sniper_prep_count: parseInt(document.getElementById('configSniperPrepCount').value) || 0,
                 sniper_rearm_price_move_bps: Math.round((parseFloat(document.getElementById('configSniperRearmPriceMovePct').value) || 0) * 100),
                 sniper_rearm_gap_move_bps: Math.round((parseFloat(document.getElementById('configSniperRearmGapMovePct').value) || 0) * 100),
-                transaction_fee_mode: 'manual',
+                transaction_fee_mode: document.getElementById('configTransactionFeeMode')?.value || 'manual',
                 transaction_fee_xch: document.getElementById('configTransactionFeeEnabled').checked
                     ? (parseFloat(document.getElementById('configTransactionFeeXch').value) || 0)
                     : 0,
@@ -37020,6 +37043,27 @@
                 enable_runtime_coin_health: document.getElementById('configRuntimeCoinHealth').checked,
                 sage_set_change_address: document.getElementById('configSageChangeAddress').checked,
             };
+            const _roundTrip = window._settingsRoundTrip;
+            if (_roundTrip?.raw && _roundTrip?.displayed) {
+                for (const key of ['inner_size_xch', 'mid_size_xch', 'outer_size_xch', 'extreme_size_xch']) {
+                    const inputId = 'config' + key.split('_').map(part => part[0].toUpperCase() + part.slice(1)).join('');
+                    const field = document.getElementById(inputId);
+                    const rawValue = _roundTrip.raw[key];
+                    if (field && field.value === _roundTrip.displayed[key] && rawValue != null && rawValue !== '') {
+                        config[key] = Number(rawValue);
+                    }
+                }
+                const edgeField = document.getElementById('configMinEdgeBps');
+                if (edgeField && edgeField.value === _roundTrip.displayed.min_edge_bps
+                        && _roundTrip.raw.min_edge_bps != null) {
+                    config.min_edge_bps = Number(_roundTrip.raw.min_edge_bps);
+                }
+                if (_roundTrip.raw.transaction_fee_mode
+                        && document.getElementById('configTransactionFeeEnabled')?.checked === _roundTrip.displayed.transaction_fee_enabled
+                        && document.getElementById('configTransactionFeeXch')?.value === _roundTrip.displayed.transaction_fee_xch) {
+                    config.transaction_fee_mode = _roundTrip.raw.transaction_fee_mode;
+                }
+            }
             config = normalizeConfigForLiquidityMode(config);
             omitInactiveBlankSettings(config);
 
