@@ -300,6 +300,73 @@ def test_fee_preview_age_advances_and_expired_quote_cannot_be_approved(page):
     assert result["maximum"] is None
 
 
+def test_open_coin_prep_modal_automatically_refreshes_near_expiry_read_only(page):
+    page.clock.install(time="2027-01-15T08:00:00Z")
+    _open_gui(page)
+    preview = _preview()
+    result = page.evaluate(
+        """preview => {
+            const now = Math.floor(Date.now() / 1000);
+            window.__feeCalls = [];
+            window.apiFetch = async (path, options = {}) => {
+                const requestedPath = String(path);
+                window.__feeCalls.push({path: requestedPath, options});
+                if (!requestedPath.endsWith('/coin-prep/fee-preview')) {
+                    return new Response('{}', {status: 200});
+                }
+                const refreshed = structuredClone(preview);
+                refreshed.preview_id = 'e'.repeat(64);
+                refreshed.suggested_maximum_fee_mojos = '18000000';
+                refreshed.observed_at = Math.floor(Date.now() / 1000);
+                refreshed.expires_at = refreshed.observed_at + 60;
+                return new Response(JSON.stringify(refreshed), {status: 200});
+            };
+
+            const overlay = document.getElementById('coinPrepConfirmOverlay');
+            overlay.classList.add('active');
+            showCoinPrepView('confirm');
+            preview.observed_at = now;
+            preview.expires_at = now + 20;
+            renderCoinPrepFeePreview(preview);
+            document.getElementById('cpFeeMaximumInput').value = '0.000020';
+            validateCoinPrepFeeMaximum();
+            return true;
+        }""",
+        preview,
+    )
+    assert result is True
+    page.clock.fast_forward(6_000)
+    preview_calls = page.evaluate(
+        "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
+    )
+    assert preview_calls == 1, page.evaluate("window.__feeCalls")
+    expect(page.locator("#cpConfirmBtn")).to_be_enabled()
+    expect(page.locator("#cpFeeMaximumInput")).to_have_value("0.000020")
+    assert page.evaluate(
+        """window.__feeCalls
+            .filter(call => call.path.endsWith('/coin-prep/fee-preview'))
+            .map(call => call.path)"""
+    ) == ["/api/coin-prep/fee-preview"]
+    assert page.evaluate(
+        "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+    ) is False
+
+    # A visible but closed confirmation view must not start another preview.
+    page.evaluate(
+        """() => {
+            document.getElementById('coinPrepConfirmOverlay').classList.remove('active');
+            _coinPrepFeePreview.expires_at = Math.floor(Date.now() / 1000) + 10;
+        }"""
+    )
+    page.clock.fast_forward(20_000)
+    assert page.evaluate(
+        "window.__feeCalls.filter(call => call.path.endsWith('/coin-prep/fee-preview')).length"
+    ) == 1
+    assert page.evaluate(
+        "window.__feeCalls.some(call => /trigger|fee-approval|wallet/i.test(call.path))"
+    ) is False
+
+
 def test_fee_preview_is_read_only_and_renders_lossless_operator_evidence(page):
     _open_gui(page)
     preview = _preview()

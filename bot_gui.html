@@ -37865,6 +37865,8 @@ function closeCtgErrorModal() {
         let _coinPrepFeeRequestSequence = 0;
         let _coinPrepConfirmReadyText = 'Yes, Prepare Coins';
         let _coinPrepFeeAgeTimer = null;
+        const COIN_PREP_FEE_AUTO_REFRESH_WINDOW_SECONDS = 15;
+        let _coinPrepFeeAutoRefreshBusy = false;
         let _coinPrepRecoveryStatus = null;
         let _coinPrepFeeReviewContract = null;
         let _coinPrepRecoveryReviewBusy = false;
@@ -38211,6 +38213,16 @@ function closeCtgErrorModal() {
             const age = Number.isFinite(observedAt) && observedAt > 0
                 ? Math.max(0, Math.trunc(now - observedAt)) : null;
             const expired = !Number.isFinite(expiresAt) || expiresAt <= 0 || now >= expiresAt;
+            const modal = document.getElementById('coinPrepConfirmOverlay');
+            const confirmView = document.getElementById('coinPrepConfirmView');
+            const confirmOpen = modal?.classList.contains('active')
+                && confirmView && confirmView.style.display !== 'none';
+            if (!expired && confirmOpen && expiresAt - now <= COIN_PREP_FEE_AUTO_REFRESH_WINDOW_SECONDS
+                    && !_coinPrepFeeAutoRefreshBusy && !_coinPrepFeeConfirmBusy) {
+                _coinPrepFeeAutoRefreshBusy = true;
+                void refreshCoinPrepFeePreview(_coinPrepFeePreviewOptions, true)
+                    .finally(() => { _coinPrepFeeAutoRefreshBusy = false; });
+            }
             const sources = [];
             for (const stage of preview.stages || []) {
                 const raw = String(stage?.quote?.source || '').toLowerCase();
@@ -38385,8 +38397,10 @@ function closeCtgErrorModal() {
             setCoinPrepFeeLaunchEnabled(false);
         }
 
-        async function refreshCoinPrepFeePreview(options = null) {
+        async function refreshCoinPrepFeePreview(options = null, preserveMaximum = false) {
             const requestOptions = options || _coinPrepFeePreviewOptions || buildCoinPrepFeePreviewOptions();
+            const maximumInput = document.getElementById('cpFeeMaximumInput');
+            const maximumBeforeRefresh = preserveMaximum && maximumInput ? maximumInput.value : null;
             _coinPrepFeePreviewOptions = { ...requestOptions };
             _coinPrepFeePreview = null;
             if (_coinPrepFeeAgeTimer !== null) clearInterval(_coinPrepFeeAgeTimer);
@@ -38422,6 +38436,10 @@ function closeCtgErrorModal() {
                     return false;
                 }
                 renderCoinPrepFeePreview(data);
+                if (preserveMaximum && maximumInput && maximumBeforeRefresh !== null) {
+                    maximumInput.value = maximumBeforeRefresh;
+                    validateCoinPrepFeeMaximum();
+                }
                 return true;
             } catch (error) {
                 if (requestSequence === _coinPrepFeeRequestSequence) {
