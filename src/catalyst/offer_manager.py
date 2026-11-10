@@ -7623,6 +7623,107 @@ class OfferManager:
             wallet.close_offer_cancel_continuation(continuation)
 
     @staticmethod
+    def _follow_predispatch_no_effect_result(
+        intent: _CanonicalOfferCancelIntent, prepared: dict, recovered: dict
+    ) -> dict:
+        """Validate the exact atomic no-effect recovery before permitting retry."""
+
+        attempt = prepared["attempt"]
+        prepared_proof = json.loads(prepared["evidence_json"])
+        proof = json.loads(recovered["evidence_json"])
+        if type(prepared_proof) is not dict or type(proof) is not dict:
+            raise ValueError("Follow no-effect cancellation proof is malformed")
+        cohort_id = prepared_proof.get("cohort_id")
+        member_id = prepared_proof.get("member_id")
+        manifest = database.get_offer_cancel_cohort_manifest(cohort_id)
+        if manifest is None:
+            raise ValueError("Follow no-effect cohort manifest is missing")
+        database.validate_offer_cancel_cohort_prepared_event(prepared, manifest)
+        matching = [
+            member
+            for member in manifest["members"]
+            if member["operation_id"] == intent.operation_id
+            and member["attempt"] == attempt
+            and member["trade_id"] == intent.trade_id
+        ]
+        expected = cancellation_result(
+            CANCEL_FAILED,
+            method="follow_predispatch_no_effect",
+            raw_response={"reason_code": "FOLLOW_PREDISPATCH_NO_EFFECT"},
+            error="CANCEL_REJECTED",
+        )
+        wallet_proof = proof.get("wallet_evidence") if type(proof) is dict else None
+        if (
+            len(matching) != 1
+            or matching[0]["member_id"] != member_id
+            or prepared["phase"] != "PREPARED"
+            or recovered["event_id"]
+            != f"{intent.operation_id}:attempt:{attempt}:reconciled"
+            or recovered["operation_id"] != intent.operation_id
+            or recovered["intent_id"] != intent.intent_id
+            or recovered["operation_type"] != "CANCEL"
+            or recovered["attempt"] != attempt
+            or recovered["phase"] != "RECONCILED"
+            or recovered["outcome"] != CANCEL_FAILED
+            or recovered["reason_code"] != "FOLLOW_PREDISPATCH_NO_EFFECT"
+            or recovered["blocks_mutation"] != 0
+            or recovered["transaction_id"] is not None
+            or recovered["spend_identity"] is not None
+            or recovered["request_timestamp"] != recovered["created_at"]
+            or recovered["wallet_identity_json"] != prepared["wallet_identity_json"]
+            or type(proof) is not dict
+            or set(proof)
+            != {
+                "trade_id",
+                "attempt",
+                "cohort_id",
+                "member_id",
+                "effect_attempted",
+                "cancel_result",
+                "wallet_evidence",
+                "wallet_evidence_sha256",
+            }
+            or proof["trade_id"] != intent.trade_id
+            or proof["attempt"] != attempt
+            or proof["cohort_id"] != cohort_id
+            or proof["member_id"] != member_id
+            or proof["effect_attempted"] is not False
+            or proof["cancel_result"] != expected
+            or type(wallet_proof) is not dict
+            or hashlib.sha256(
+                json.dumps(
+                    wallet_proof,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            != proof["wallet_evidence_sha256"]
+        ):
+            raise ValueError("Follow no-effect cancellation proof is not exact")
+        creation = database.get_offer_intent(intent.intent_id)
+        purpose = creation.get("purpose") if type(creation) is dict else None
+        if (
+            type(purpose) is not str
+            or not purpose.startswith("follow:")
+            or purpose.split(":")[-1] not in {"normal_lifecycle", "book_opportunity"}
+        ):
+            raise ValueError("Follow no-effect retry has no run authority")
+        run_id = purpose.split(":")[1]
+        fee_proof = database.get_released_follow_predispatch_cancel_fee_outcome(
+            run_id=run_id, manifest_json=manifest
+        )
+        if not any(
+            item["operation_id"] == intent.operation_id
+            and item["event_id"] == recovered["event_id"]
+            and item["evidence_sha256"] == recovered["evidence_sha256"]
+            for item in fee_proof["members"]
+        ):
+            raise ValueError("Follow no-effect fee release is not exact")
+        return expected
+
+    @staticmethod
     def _read_existing_cancel_result(
         intent: _CanonicalOfferCancelIntent,
     ) -> _OfferCancelResultProjection:
@@ -7659,14 +7760,18 @@ class OfferManager:
                     or prior_prepared["phase"] != "PREPARED"
                     or prior_prepared["outcome"] != "PREPARED"
                     or prior_finalized["attempt"] != prior_attempt
-                    or prior_finalized["phase"] != "FINALIZED"
                 ):
                     raise ValueError(
                         "cancellation attempts are not contiguous failures"
                     )
                 if len(prior_group) == 2:
-                    if (
-                        prior_finalized["outcome"] != CANCEL_FAILED
+                    if prior_finalized["phase"] == "RECONCILED":
+                        OfferManager._follow_predispatch_no_effect_result(
+                            intent, prior_prepared, prior_finalized
+                        )
+                    elif (
+                        prior_finalized["phase"] != "FINALIZED"
+                        or prior_finalized["outcome"] != CANCEL_FAILED
                         or prior_finalized["blocks_mutation"] != 0
                     ):
                         raise ValueError(
@@ -7675,7 +7780,8 @@ class OfferManager:
                 else:
                     reconciled = prior_group[2]
                     if (
-                        prior_finalized["outcome"]
+                        prior_finalized["phase"] != "FINALIZED"
+                        or prior_finalized["outcome"]
                         not in {CANCEL_SUBMITTED_UNCONFIRMED, CANCEL_UNKNOWN}
                         or prior_finalized["blocks_mutation"] != 1
                         or reconciled["phase"] != "RECONCILED"
@@ -7879,6 +7985,26 @@ class OfferManager:
                     latch_binding=(wallet_hash, network),
                     authoritative=False,
                 )
+            # A stopped-run recovery can prove that a claimed Follow cohort
+            # never reached Sage. It writes a RECONCILED no-effect failure
+            # directly after PREPARED, rather than a normal FINALIZED result.
+            # Recognize that exact durable shape so Cancel All can advance to
+            # the next attempt instead of replaying CANCEL_UNKNOWN forever.
+            recovered = events[1] if len(events) == 2 else None
+            if (
+                recovered is not None
+                and recovered["phase"] == "RECONCILED"
+                and recovered["reason_code"] == "FOLLOW_PREDISPATCH_NO_EFFECT"
+            ):
+                no_effect = OfferManager._follow_predispatch_no_effect_result(
+                    intent, prepared, recovered
+                )
+                no_effect["_catalyst_effect_attempted"] = False
+                no_effect["_catalyst_idempotent_replay"] = True
+                no_effect["_catalyst_operation_id"] = intent.operation_id
+                no_effect["_catalyst_intent_id"] = intent.intent_id
+                no_effect["_catalyst_attempt"] = latest_attempt
+                return _OfferCancelResultProjection(no_effect, None, True)
             terminal_confirmed = (
                 len(events) == 3
                 and events[2]["phase"] == "RECONCILED"

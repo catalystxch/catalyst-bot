@@ -1,6 +1,8 @@
 """An unbounded Follow run keeps its exact cancellation hold at dispatch."""
 
+import hashlib
 from importlib import import_module
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +103,11 @@ def test_claimed_predispatch_recovery_releases_exact_follow_cohort(approved):
         wallet_evidence=proof,
     )
     assert result["fee_outcome"] == "RELEASED_NO_EFFECT"
+    fee_outcome = database.get_released_follow_predispatch_cancel_fee_outcome(
+        run_id=run_id, manifest_json=manifest
+    )
+    assert fee_outcome["state"] == "RELEASED_NO_EFFECT"
+    assert len(fee_outcome["members"]) == 2
     assert database.get_runtime_safety_latch()["state"] == "resolved"
     assert database.get_unresolved_offer_operation_blockers() == []
     assert database.get_unresolved_offer_cancel_cohort_manifests() == []
@@ -110,6 +117,102 @@ def test_claimed_predispatch_recovery_releases_exact_follow_cohort(approved):
         )["ready"]
         is True
     )
+
+
+def test_claimed_predispatch_recovery_is_retryable_cancel_failure(
+    approved, monkeypatch
+):
+    database, run_id, manifest, identity, latch, proof = _claimed_predispatch_cohort(
+        approved
+    )
+    database.reconcile_follow_predispatch_cancel_cohort(
+        run_id=run_id,
+        manifest_json=manifest,
+        expected_latch_generation=latch["generation"],
+        wallet_fingerprint_hash="f" * 64,
+        network=identity["network"],
+        wallet_evidence=proof,
+    )
+    offer_manager = import_module("offer_manager")
+    monkeypatch.setattr(
+        offer_manager.OfferManager,
+        "_verified_continuation_journal",
+        staticmethod(
+            lambda _journal, intent, **_kwargs: (
+                {
+                    "snapshot_sha256": json.loads(
+                        database.get_offer_operation_events(intent.operation_id)[0][
+                            "evidence_json"
+                        ]
+                    )["continuation_journal_sha256"]
+                },
+                run_id,
+                "f" * 64,
+                identity["network"],
+            )
+        ),
+    )
+    manager = offer_manager.OfferManager()
+    for member in manifest["members"]:
+        intent = manager._canonical_cancel_intent(member["trade_id"])
+        result = manager._existing_cancel_result(intent)
+        assert result["outcome"] == "CANCEL_FAILED"
+        assert result["_catalyst_attempt"] == 1
+    assert database.get_runtime_safety_latch()["state"] == "resolved"
+
+
+def test_claimed_predispatch_retry_refuses_changed_wallet_proof(approved, monkeypatch):
+    database, run_id, manifest, identity, latch, proof = _claimed_predispatch_cohort(
+        approved
+    )
+    database.reconcile_follow_predispatch_cancel_cohort(
+        run_id=run_id,
+        manifest_json=manifest,
+        expected_latch_generation=latch["generation"],
+        wallet_fingerprint_hash="f" * 64,
+        network=identity["network"],
+        wallet_evidence=proof,
+    )
+    offer_manager = import_module("offer_manager")
+    member = manifest["members"][0]
+    original = database.get_offer_operation_events
+
+    def damaged_events(operation_id):
+        rows = original(operation_id)
+        if operation_id == member["operation_id"]:
+            rows[-1] = dict(rows[-1])
+            recovered = json.loads(rows[-1]["evidence_json"])
+            recovered["wallet_evidence_sha256"] = "0" * 64
+            rows[-1]["evidence_json"] = json.dumps(
+                recovered, sort_keys=True, separators=(",", ":")
+            )
+            rows[-1]["evidence_sha256"] = hashlib.sha256(
+                rows[-1]["evidence_json"].encode()
+            ).hexdigest()
+        return rows
+
+    monkeypatch.setattr(database, "get_offer_operation_events", damaged_events)
+    monkeypatch.setattr(
+        offer_manager.OfferManager,
+        "_verified_continuation_journal",
+        staticmethod(
+            lambda _journal, intent, **_kwargs: (
+                {
+                    "snapshot_sha256": json.loads(
+                        original(intent.operation_id)[0]["evidence_json"]
+                    )["continuation_journal_sha256"]
+                },
+                run_id,
+                "f" * 64,
+                identity["network"],
+            )
+        ),
+    )
+    manager = offer_manager.OfferManager()
+    intent = manager._canonical_cancel_intent(member["trade_id"])
+    projection = manager._read_existing_cancel_result(intent)
+    assert projection.authoritative is False
+    assert projection.result["outcome"] == "CANCEL_UNKNOWN"
 
 
 @pytest.mark.parametrize("damage", ["pending", "spent", "offer"])

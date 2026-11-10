@@ -28796,6 +28796,72 @@ def reconcile_follow_predispatch_cancel_cohort(
         conn.close()
 
 
+def get_released_follow_predispatch_cancel_fee_outcome(
+    *, run_id: str, manifest_json: Any
+) -> Dict[str, Any]:
+    """Read exact atomic fee-release evidence for a no-effect Follow cohort."""
+
+    run = _fee_digest(run_id)
+    manifest = validate_offer_cancel_cohort_manifest(manifest_json)
+    operation_id = _follow_cancellation_fee_operation_id(run, manifest)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT outcome.state,outcome.evidence_id,outcome.evidence_json,"
+        "reservation.fee_mojos,reservation.cancellation "
+        "FROM approved_fee_outcomes AS outcome "
+        "JOIN approved_fee_reservations AS reservation USING(operation_id) "
+        "WHERE outcome.operation_id=?",
+        (operation_id,),
+    ).fetchone()
+    if row is None or row["state"] != "RELEASED_NO_EFFECT" or row["cancellation"] != 1:
+        raise ValueError("Follow no-effect fee release is missing")
+    evidence = json.loads(row["evidence_json"])
+    if type(evidence) is not dict:
+        raise ValueError("Follow no-effect fee release is malformed")
+    canonical = _canonical_json_text(
+        evidence, "follow_no_effect_outcome", expected_type=dict
+    )
+    if (
+        hashlib.sha256(canonical.encode("utf-8")).hexdigest() != row["evidence_id"]
+        or set(evidence)
+        != {
+            "schema_version",
+            "kind",
+            "state",
+            "operation_id",
+            "cohort_id",
+            "manifest_sha256",
+            "fee_mojos",
+            "members",
+            "follow_run_id",
+        }
+        or evidence["schema_version"] != 1
+        or evidence["kind"] != "follow_cancellation_fee_outcome"
+        or evidence["state"] != "RELEASED_NO_EFFECT"
+        or evidence["operation_id"] != operation_id
+        or evidence["cohort_id"] != manifest["cohort_id"]
+        or evidence["manifest_sha256"] != manifest["manifest_sha256"]
+        or evidence["fee_mojos"] != row["fee_mojos"]
+        or evidence["follow_run_id"] != run
+        or type(evidence["members"]) is not list
+        or len(evidence["members"]) != manifest["member_count"]
+    ):
+        raise ValueError("Follow no-effect fee release is not exact")
+    expected_members = []
+    for member in manifest["members"]:
+        event = conn.execute(
+            "SELECT event_id,operation_id,attempt,phase,outcome,reason_code,"
+            "evidence_sha256 FROM offer_operation_journal WHERE event_id=?",
+            (f"{member['operation_id']}:attempt:{member['attempt']}:reconciled",),
+        ).fetchone()
+        if event is None:
+            raise ValueError("Follow no-effect member journal is missing")
+        expected_members.append(dict(event))
+    if evidence["members"] != expected_members:
+        raise ValueError("Follow no-effect fee members differ")
+    return evidence
+
+
 def _canonical_coin_prep_wallet_identity(value: Any) -> tuple[str, str, str]:
     """Return canonical Task 5 identity payload, fingerprint hash, and network."""
 
