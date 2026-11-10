@@ -65,6 +65,17 @@ def prepare_fee_inventory(snapshot, targets, reserve_floors):
     total, physical_reserve = {"xch": 0, "cat": 0}, {"xch": 0, "cat": 0}
     classified, reused = [], 0
     for coin in sorted(snapshot.coins, key=lambda coin: (coin.asset, coin.coin_id)):
+        if (
+            coin.selectable
+            and coin.protected
+            and coin.purpose == "reserve"
+            and reserve_floors[coin.asset] == 0
+        ):
+            # An organic top-up leftover from the previous prep is not an
+            # operator-set fixed reserve. With a zero reserve floor, a new
+            # prep may resize it into the new ladder and designate its own
+            # leftover. Follow keeps protecting the old coin until then.
+            coin = replace(coin, purpose="", protected=False)
         if coin.selectable and (not coin.protected or coin.purpose == "reserve"):
             total[coin.asset] += coin.amount_mojos
         if coin.selectable and coin.protected and coin.purpose == "reserve":

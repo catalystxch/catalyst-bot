@@ -166,6 +166,51 @@ def test_thin_move_guard_expires_with_its_anchor(elapsed, guard_expected):
         assert reference.midpoint == Decimal("0.141")
 
 
+def test_large_ladder_does_not_erase_meaningful_thin_book_price_edges():
+    engine = MarketConfidenceEngine(risk_preset="balanced")
+    observation = _observation(
+        "dexie",
+        {
+            "bids": [
+                {
+                    "offer_id": "bid-small",
+                    "price": "0.00005025",
+                    "amount_mojos": 100_000_000_000,
+                },
+                {
+                    "offer_id": "bid-edge",
+                    "price": "0.000045",
+                    "amount_mojos": 2_250_000_000_000,
+                },
+            ],
+            "asks": [
+                {
+                    "offer_id": "ask-edge",
+                    "price": "0.00012",
+                    "amount_mojos": 600_000_000_000,
+                },
+                {
+                    "offer_id": "ask-far",
+                    "price": "0.00017945",
+                    "amount_mojos": 5_000_000_000_000,
+                },
+            ],
+        },
+    )
+    result = engine.evaluate(
+        observations=(observation,),
+        own_offer_identities=frozenset(),
+        configured_offer_size_mojos=12_500_000_000_000,
+        now=NOW,
+    )
+
+    assert result.state == "RED"
+    assert result.observed_bid == Decimal("0.000045")
+    assert result.observed_ask == Decimal("0.00012")
+    assert result.thin_anchor_midpoint == Decimal("0.0000825")
+    assert select_thin_market_reference(result, now=NOW) is not None
+
+
 @pytest.mark.parametrize(
     ("observations", "expected_state", "reason"),
     [

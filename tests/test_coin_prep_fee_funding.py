@@ -63,6 +63,25 @@ def test_existing_physical_reserve_overlaps_the_floor_instead_of_being_charged_t
     assert reserved.purpose == "reserve"
 
 
+def test_zero_fixed_reserve_allows_old_organic_reserve_to_fund_new_prep():
+    result = _prepare(
+        [
+            _coin(1, 70, purpose="reserve", protected=True),
+            _coin(2, 30),
+            _coin(3, 20, "cat"),
+        ],
+        floors={"xch": 0, "cat": 0},
+    )
+
+    assert result["principal_funded"] is True
+    assert result["fee_funding_mojos"] == 50
+    former_reserve = next(
+        coin for coin in result["snapshot"].coins if coin.coin_id == f"{1:064x}"
+    )
+    assert former_reserve.protected is False
+    assert former_reserve.purpose == ""
+
+
 def test_reconciliation_protected_coins_cannot_fund_the_floor_or_fees():
     result = _prepare(
         [

@@ -12,6 +12,9 @@ from market_evidence import MarketConfidenceSnapshot
 from providers.models import Capability, ObservationQuality, ProviderObservation
 
 
+_MAX_PRICE_EDGE_EVIDENCE_MOJOS = 500_000_000_000  # 0.5 XCH
+
+
 _PRESETS: dict[str, dict[str, Decimal | int]] = {
     "conservative": {
         "depth_multiple": Decimal("3"),
@@ -391,6 +394,10 @@ class MarketConfidenceEngine:
                 * Decimal(self._thresholds["minimum_evidence_ratio"])
             ).to_integral_value(rounding=ROUND_CEILING)
         )
+        # Large planned tiers must still see meaningful smaller book edges in
+        # a thin market. The depth requirement below remains based on the full
+        # configured offer size, so this cannot manufacture GREEN capacity.
+        minimum_offer_amount = min(minimum_offer_amount, _MAX_PRICE_EDGE_EVIDENCE_MOJOS)
 
         reasons: list[str] = []
         source_health: dict[str, str] = {}
