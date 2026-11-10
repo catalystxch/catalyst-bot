@@ -5320,9 +5320,7 @@ class OfferManager:
             max_parallel = 1
         else:
             max_parallel = self._get_ladder_parallelism(coin_ids_enabled)
-        _results_lock = _threading.Lock()
         _used_coins_lock = _threading.Lock()
-        _results_map = {}  # {i: res}
 
         def _create_one(spec):
             """Create a single offer (runs in thread pool)."""
@@ -5511,27 +5509,12 @@ class OfferManager:
         )
         _ladder_start = time.time()
 
-        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-            futures = [executor.submit(_create_one, spec) for spec in offer_specs]
-            for f in as_completed(futures):
-                try:
-                    idx, res = f.result()
-                    with _results_lock:
-                        _results_map[idx] = res
-                except Exception as e:
-                    log_event("warning", "parallel_offer_error", f"Thread error: {e}")
-
-        _ladder_elapsed = time.time() - _ladder_start
-        log_event(
-            "info",
-            "ladder_parallel_done",
-            f"{len(offer_specs)} {side} offers fired in {_ladder_elapsed:.1f}s",
-        )
-
-        # ── Phase 4: Process results (sequential — DB writes) ─────────────
-        for spec in offer_specs:
+        def _project_result(spec, res):
+            # Publication is queued when Sage confirms the offer, but its
+            # outbox cannot dispatch until this projection caches the text.
+            # Project each completed future before a slow later wallet call
+            # consumes the offer's public discovery deadline.
             i = spec["i"]
-            res = _results_map.get(i)
             price = spec["price"]
             tier = spec["tier"]
             size_xch = spec["size_xch"]
@@ -5550,13 +5533,13 @@ class OfferManager:
                 if _fail_level != "debug":
                     print(f"  ❌ {fail_msg}", flush=True)
                 log_event(_fail_level, "offer_create_failed", fail_msg)
-                continue
+                return
 
             trade_record = res.get("trade_record") or {}
             trade_id = res.get("trade_id") or trade_record.get("trade_id") or ""
 
             if not trade_id:
-                continue
+                return
 
             parent_intent_id = (
                 refresh_parent_ids.get(int(slot))
@@ -5575,7 +5558,7 @@ class OfferManager:
                         "refresh_child_identity_missing",
                         "Confirmed refresh child did not return its durable intent ID",
                     )
-                    continue
+                    return
                 try:
                     database.bind_refresh_lineage(parent_intent_id, child_intent_id)
                 except Exception as exc:
@@ -5590,7 +5573,7 @@ class OfferManager:
                         "refresh_lineage_bind_failed",
                         f"Held parent cancellation after child creation: {exc}",
                     )
-                    continue
+                    return
 
             locked_coin_id = res.get("locked_coin_id")
             verified_locked_coin_ids = []
@@ -5692,14 +5675,15 @@ class OfferManager:
                     self.cancel_offers([trade_id], reason="db_insert_failed")
                 except Exception:
                     pass
-                continue
+                return
 
             lock_targets = verified_locked_coin_ids or (
                 [locked_coin_id] if locked_coin_id else []
             )
             for coin_id in lock_targets:
-                used_coin_ids.add(coin_id)
-                self._cycle_used_coin_ids.add(coin_id)
+                with _used_coins_lock:
+                    used_coin_ids.add(coin_id)
+                    self._cycle_used_coin_ids.add(coin_id)
                 try:
                     lock_coin(coin_id, trade_id)
                 except Exception as e:
@@ -5736,6 +5720,27 @@ class OfferManager:
             self._recently_created[trade_id] = time.time()
             created.append(offer_detail)
 
+
+        spec_by_index = {spec["i"]: spec for spec in offer_specs}
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = [executor.submit(_create_one, spec) for spec in offer_specs]
+            for f in as_completed(futures):
+                try:
+                    idx, res = f.result()
+                except Exception as e:
+                    log_event("warning", "parallel_offer_error", f"Thread error: {e}")
+                    continue
+                _project_result(spec_by_index[idx], res)
+
+        _ladder_elapsed = time.time() - _ladder_start
+        log_event(
+            "info",
+            "ladder_parallel_done",
+            f"{len(offer_specs)} {side} offers fired in {_ladder_elapsed:.1f}s",
+        )
+
+        order_by_slot = {spec["slot"]: spec["i"] for spec in offer_specs}
+        created.sort(key=lambda offer: order_by_slot[offer["slot"]])
         return created
 
     def _estimate_ladder_worst_case_xch(

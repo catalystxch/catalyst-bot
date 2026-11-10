@@ -1,5 +1,6 @@
 import itertools
 import sys
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -587,6 +588,68 @@ class OfferManagerCoinIdTests(unittest.TestCase):
 
         self.assertCountEqual(seen, preselected)
         self.assertEqual([offer["coin_id"] for offer in created], preselected)
+
+    def test_create_ladder_projects_completed_offer_while_next_wallet_call_waits(self):
+        manager = offer_manager.OfferManager()
+        second_started = threading.Event()
+        release_second = threading.Event()
+        first_projected = threading.Event()
+        outcome = {}
+        calls = itertools.count(1)
+
+        def create_offer(_self, _offer_dict, **_kwargs):
+            index = next(calls)
+            if index == 2:
+                second_started.set()
+                if not release_second.wait(10):
+                    raise AssertionError("second wallet call was never released")
+            return {
+                "success": True,
+                "trade_id": f"trade-{index}",
+                "trade_record": {"trade_id": f"trade-{index}"},
+                "locked_coin_id": f"coin-{index}",
+                "offer": f"offer1{index}",
+            }
+
+        def add_offer_early(**kwargs):
+            return True
+
+        def cache_offer_early(trade_id, _offer_text):
+            if trade_id == "trade-1":
+                first_projected.set()
+
+        def run_ladder():
+            try:
+                outcome["created"] = manager.create_ladder(
+                    mid_price=Decimal("0.001"),
+                    side="buy",
+                    num_offers=2,
+                    total_slots=2,
+                    coin_ids_enabled=False,
+                )
+            except Exception as exc:
+                outcome["error"] = exc
+
+        with (
+            patch.object(offer_manager.OfferManager, "create_offer_with_retry", new=create_offer),
+            patch.object(offer_manager, "add_offer", side_effect=add_offer_early),
+            patch.object(offer_manager, "log_event"),
+            patch.object(offer_manager, "update_offer_bech32", side_effect=cache_offer_early),
+            patch("builtins.print"),
+            patch("database.lock_coin"),
+        ):
+            worker = threading.Thread(target=run_ladder, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(second_started.wait(5))
+                self.assertTrue(first_projected.wait(2))
+            finally:
+                release_second.set()
+                worker.join(10)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertEqual(len(outcome["created"]), 2)
 
     def test_create_ladder_caches_offer_bech32_for_splash_repost(self):
         manager = offer_manager.OfferManager()
