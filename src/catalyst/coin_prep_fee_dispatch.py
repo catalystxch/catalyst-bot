@@ -96,7 +96,11 @@ def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim
         fresh[coin.coin_id] = coin
     if fresh != original:
         old_ids, new_ids = set(original), set(fresh)
-        changed = [coin_id for coin_id in old_ids & new_ids if original[coin_id] != fresh[coin_id]]
+        changed = [
+            coin_id
+            for coin_id in old_ids & new_ids
+            if original[coin_id] != fresh[coin_id]
+        ]
         changed_fields = sorted(
             {
                 field

@@ -49,6 +49,7 @@ def test_zero_floor_organic_reserve_can_fund_approved_prep(monkeypatch):
     with pytest.raises(ValueError, match="FEE_WALLET_CONTEXT_CHANGED"):
         dispatch._verify_current_inventory(context, before, plan, "operation", claim)
 
+
 import database
 import fee_approval_test_utils as utils
 import mutation_gate

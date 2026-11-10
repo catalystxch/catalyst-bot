@@ -24901,11 +24901,8 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
         "AND resolution.claim_token IS NULL AND dispatch.claim_token IS NULL",
         (claim_token, generation, operation_id),
     ).fetchone()
-    if (
-        claim is None
-        or _prep_claim_has_ineligible_reserve(
-            conn, claim, json.loads(consent["plan_json"])
-        )
+    if claim is None or _prep_claim_has_ineligible_reserve(
+        conn, claim, json.loads(consent["plan_json"])
     ):
         raise ValueError("FEE_EFFECT_NOT_DISPATCHABLE")
     contract = json.loads(operation["target_contract_json"])
