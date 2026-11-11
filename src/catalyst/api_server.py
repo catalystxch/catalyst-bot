@@ -4764,6 +4764,18 @@ def _coin_prep_rbf_owned_review_snapshot() -> dict | None:
     }
 
 
+def _coin_prep_rbf_dispatched_attempt(operation_id: str) -> dict | None:
+    """Find the one recorded submission before offering another preview."""
+    matches = [
+        attempt
+        for attempt in database.get_recoverable_coin_prep_rbf_attempts()
+        if attempt["operation_id"] == operation_id
+    ]
+    if len(matches) > 1:
+        raise ValueError("multiple unresolved RBF submissions")
+    return matches[0] if matches else None
+
+
 def activate_no_effect_creation_restricted_startup(authorization: Any) -> bool:
     """Open only an exact, database-only creation review under a fenced lease."""
 
@@ -5367,7 +5379,22 @@ def serve_gui():
             return Response(
                 "Recovery authority unavailable", status=423, mimetype="text/plain"
             )
-        from coin_prep_recovery_review import render_recovery_review
+        from coin_prep_recovery_review import (
+            render_recovery_result,
+            render_recovery_review,
+        )
+
+        dispatched = _coin_prep_rbf_dispatched_attempt(snapshot["operation_id"])
+        if dispatched is not None:
+            return Response(
+                render_recovery_result(
+                    attempt_id=dispatched["attempt_id"],
+                    fee_mojos=dispatched["fee_mojos"],
+                    attempted=True,
+                ),
+                mimetype="text/html",
+                headers={"Cache-Control": "no-store"},
+            )
 
         return Response(render_recovery_review(snapshot), mimetype="text/html")
     if _refresh_abort_recovery_active:
@@ -5417,6 +5444,27 @@ def api_coin_prep_recovery_preview():
         return jsonify(
             {"success": False, "reason": "COIN_PREP_RECOVERY_AUTHORITY_UNAVAILABLE"}
         ), 423
+    dispatched = _coin_prep_rbf_dispatched_attempt(snapshot["operation_id"])
+    if dispatched is not None:
+        if request.is_json:
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "RBF_REPLACEMENT_ALREADY_DISPATCHED",
+                    "retry_allowed": False,
+                }
+            ), 409
+        from coin_prep_recovery_review import render_recovery_result
+
+        return Response(
+            render_recovery_result(
+                attempt_id=dispatched["attempt_id"],
+                fee_mojos=dispatched["fee_mojos"],
+                attempted=True,
+            ),
+            mimetype="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
     body = (
         request.get_json(silent=True)
         if request.is_json

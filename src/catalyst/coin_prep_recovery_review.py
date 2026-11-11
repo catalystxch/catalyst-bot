@@ -220,10 +220,10 @@ def render_recovery_result(
             "confirmed on chain. Do not submit another replacement."
         )
     elif attempted:
-        title = "Submission outcome is uncertain"
+        title = "Replacement submission recorded"
         message = (
-            "Trading remains paused. The request may have reached Sage. "
-            "CATalyst will verify the chain before any further action. "
+            "Trading remains paused while CATalyst verifies which transaction "
+            "confirmed on chain. The request may have reached Sage. "
             "Do not submit another replacement."
         )
     else:

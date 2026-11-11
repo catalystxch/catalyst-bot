@@ -242,11 +242,55 @@ def test_recovery_bootstrap_binds_cookie_before_reading_private_scope(monkeypatc
     assert "Set-Cookie" in response.headers
 
 
+def test_dispatched_recovery_shows_status_without_new_preview(monkeypatch):
+    import api_server
+    import wallet
+
+    operation_id = "coin-prep:" + "a" * 64
+    snapshot = {"operation_id": operation_id}
+    dispatched = {
+        "operation_id": operation_id,
+        "attempt_id": "b" * 64,
+        "fee_mojos": 209_458_761,
+    }
+    monkeypatch.setattr(api_server, "_coin_prep_rbf_recovery_active", True)
+    monkeypatch.setattr(api_server, "_has_valid_local_token", lambda: True)
+    monkeypatch.setattr(
+        api_server, "_coin_prep_rbf_owned_review_snapshot", lambda: snapshot
+    )
+    monkeypatch.setattr(
+        api_server.database,
+        "get_recoverable_coin_prep_rbf_attempts",
+        lambda: [dispatched],
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_pending_transactions_strict",
+        lambda: pytest.fail("a dispatched review must not build another preview"),
+    )
+
+    with api_server.app.test_request_context("/"):
+        home = api_server.serve_gui()
+    assert home.status_code == 200
+    assert b"Replacement submission recorded" in home.data
+    assert b"Build unsigned replacement preview" not in home.data
+
+    with api_server.app.test_request_context(
+        "/api/safety/coin-prep-recovery-preview", method="POST", data={}
+    ):
+        preview = api_server.api_coin_prep_recovery_preview()
+    assert preview.status_code == 200
+    assert b"Do not submit another replacement" in preview.data
+
+
 def test_preview_uses_only_server_selected_pending_transaction(monkeypatch):
     import api_server
     import wallet
     import coin_prep_rbf_review_service
 
+    monkeypatch.setattr(
+        api_server.database, "get_recoverable_coin_prep_rbf_attempts", lambda: []
+    )
     snapshot = {
         "operation_id": "coin-prep:" + "a" * 64,
         "original_input_coin_ids": ["b" * 64],
