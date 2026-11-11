@@ -886,6 +886,51 @@ def test_pending_financial_effect_temporarily_blocks_matching_risk_consent(monke
     assert loop._confidence_override_active()
 
 
+def test_pending_financial_effect_keeps_existing_follow_offer_protected(monkeypatch):
+    import bot_loop
+    from confidence_override import SavedThinMarketConsent
+
+    loop = runtime_loop(monkeypatch)
+    loop._confidence_override_consent = SavedThinMarketConsent(SCOPE)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", SCOPE["asset_id"])
+    intent = dict(
+        purpose="follow:" + "f" * 64 + ":normal_lifecycle",
+        asset_id=SCOPE["asset_id"],
+        terminal_at=None,
+        lifecycle_state="visible",
+        sage_trade_id="1" * 64,
+    )
+    monkeypatch.setattr(
+        bot_loop.database, "get_offer_intents_for_registry", lambda: [intent]
+    )
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_unexpired_follow_run_marker",
+        lambda **_: {"run_id": "f" * 64, "stopped": False},
+    )
+
+    def pending():
+        raise ValueError("CONFIDENCE_OVERRIDE_OPERATION_PENDING")
+
+    monkeypatch.setattr("confidence_override.current_scope", pending)
+    assert loop._override_protected_trade_ids() == {"1" * 64}
+    assert not loop._confidence_override_active()
+
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_unexpired_follow_run_marker",
+        lambda **_: {"run_id": "e" * 64, "stopped": False},
+    )
+    assert loop._override_protected_trade_ids() == set()
+    monkeypatch.setattr(
+        bot_loop.database,
+        "get_unexpired_follow_run_marker",
+        lambda **_: {"run_id": "f" * 64, "stopped": False},
+    )
+    loop._market_confidence_result.reason_codes = ("provider_price_conflict",)
+    assert loop._override_protected_trade_ids() == set()
+
+
 @pytest.mark.parametrize(
     "suffix,expected",
     [

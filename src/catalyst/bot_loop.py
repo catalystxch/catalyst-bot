@@ -1101,6 +1101,7 @@ class BotLoop:
             return (
                 self._confidence_override_active()
                 or self._saved_thin_stale_hold_active()
+                or self._pending_override_existing_offer_hold()
             )
 
         if not protection_active():
@@ -1114,6 +1115,58 @@ class BotLoop:
         except Exception:
             return set()
         return protected if protection_active() else set()
+
+    def _pending_override_existing_offer_hold(self) -> bool:
+        """Keep this run's offers while its own fee effect is unresolved.
+
+        Pending accounting blocks new creations. It does not invalidate the
+        reviewed risk choice or make an existing passive offer unsafe.
+        """
+        from confidence_override import (
+            RunConsent,
+            SavedThinMarketConsent,
+            current_scope,
+        )
+
+        consent = getattr(self, "_confidence_override_consent", None)
+        if (
+            not getattr(self, "_running", False)
+            or not isinstance(consent, (RunConsent, SavedThinMarketConsent))
+            or consent.revoked
+            or type(consent.follow_run_id) is not str
+            or len(consent.follow_run_id) != 64
+        ):
+            return False
+        try:
+            current_scope()
+        except ValueError as exc:
+            if str(exc) != "CONFIDENCE_OVERRIDE_OPERATION_PENDING":
+                return False
+        except Exception:
+            return False
+        else:
+            return False
+
+        now = datetime.now(timezone.utc)
+        raw, deadline = self._market_confidence_snapshot()
+        if (
+            getattr(raw, "state", None) != "RED"
+            or not consent.candidate_active(now=now)
+            or consent.price_range(raw, now=now, valid_until=deadline) is None
+        ):
+            return False
+        try:
+            marker = database.get_unexpired_follow_run_marker(
+                asset_id=str(getattr(cfg, "CAT_ASSET_ID", "") or ""),
+                now_epoch=int(now.timestamp()),
+            )
+        except Exception:
+            return False
+        return bool(
+            type(marker) is dict
+            and marker.get("run_id") == consent.follow_run_id
+            and marker.get("stopped") is False
+        )
 
     def _saved_thin_stale_hold_active(self) -> bool:
         """Leave this run's existing offers open after its price anchor ages out."""
