@@ -530,6 +530,7 @@ def current_scope():
         )
         or authority["buy_limit"] != configuration["MAX_ACTIVE_BUY_OFFERS"]
         or authority["sell_limit"] != configuration["MAX_ACTIVE_SELL_OFFERS"]
+        or type(authority.get("unbounded", False)) is not bool
         or not 0 < authority["maximum_fee_mojos"] <= 2**63 - 1
         or not 0
         <= authority["protected_shutdown_fee_mojos"]
@@ -570,7 +571,14 @@ def current_scope():
             for side in ("BUY", "SELL")
         },
         "default_trade_xch": str(configuration["DEFAULT_TRADE_XCH"]),
-        "fee_cap_mojos": str(authority["maximum_fee_mojos"]),
+        # The ledger retains a bookkeeping amount for unbounded approval, but
+        # that amount is not an enforceable cumulative fee ceiling.
+        "fee_unbounded": authority.get("unbounded") is True,
+        "fee_cap_mojos": (
+            None
+            if authority.get("unbounded") is True
+            else str(authority["maximum_fee_mojos"])
+        ),
         "protected_cancel_mojos": str(authority["protected_shutdown_fee_mojos"]),
     }
 

@@ -33117,7 +33117,7 @@
 ` +
                     `Up to ${scope.buy_limit} BUY and ${scope.sell_limit} SELL offers
 ` +
-                    `Approved Follow run fee ceiling: ${scope.fee_cap_mojos} mojos
+                    `${scope.fee_unbounded ? 'Approved Follow run fees: no cumulative ceiling' : `Approved Follow run fee ceiling: ${scope.fee_cap_mojos} mojos`}
 ` +
                     `Protected cancellation reserve: ${scope.protected_cancel_mojos} mojos
 ` +

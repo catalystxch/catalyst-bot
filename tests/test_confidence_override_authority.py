@@ -102,6 +102,17 @@ def test_scope_requires_real_follow_authority_and_records_audit_only(
     assert saved["restorable"] is False and saved["scope"] == scope
 
 
+def test_scope_labels_unbounded_follow_fees_without_inventing_a_ceiling(
+    approved, monkeypatch
+):
+    complete(approved, monkeypatch)
+    install_reader(monkeypatch, {"unbounded": True})
+    scope = policy.current_scope()
+    assert scope["fee_unbounded"] is True
+    assert scope["fee_cap_mojos"] is None
+    assert scope["protected_cancel_mojos"] == "123456789"
+
+
 def test_scope_accepts_only_actual_durable_follow_run(approved, monkeypatch):
     complete(approved, monkeypatch)
     from coin_prep_fee_runtime import _configuration, _verified_identity
