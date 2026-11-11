@@ -11867,13 +11867,13 @@
                         <input type="hidden" id="configTransactionFeeTargetSecs" value="300">
                         <div class="form-group" style="margin-bottom: 8px;">
                             <label style="display: flex; align-items: center; gap: 10px;">
-                                <input type="checkbox" id="configTransactionFeeEnabled" style="width: auto; margin: 0;" onchange="updateFeeSettingsUi(); updateCoinPrepPreview();">
-                                <span>Manual Transaction Fee <span class="cc-help">?<span class="cc-tooltip">Manual fee for wallet transactions outside the approved Coin Prep workflow. Coin Prep and its protected cancellations use fresh cost-based estimates within a separately approved budget; this switch cannot disable that approval or make prep free. Offer creation itself stays fee-free.</span></span></span>
+                                <input type="checkbox" id="configTransactionFeeEnabled" style="width: auto; margin: 0;" onchange="updateFeeSettingsUi(true); updateCoinPrepPreview();">
+                                <span><span id="configTransactionFeeLabel">Manual Transaction Fee</span> <span class="cc-help">?<span class="cc-tooltip">Fee for wallet transactions outside the approved Coin Prep workflow. Smart Settings can select automatic network estimates with the shown amount as a fallback. Coin Prep and its protected cancellations use fresh cost-based estimates within a separately approved budget. Offer creation itself stays fee-free.</span></span></span>
                             </label>
                         </div>
                         <div id="transactionFeeManualWrap" style="display: none;">
                             <div class="form-group" style="margin-bottom: 10px;">
-                                <label style="font-size: 0.85em;">Manual Fee Amount (XCH) <span class="cc-help">?<span class="cc-tooltip">Applies only to transactions using manual fee settings, not the Coin Prep estimate or approved spending ceiling.</span></span></label>
+                                <label style="font-size: 0.85em;"><span id="configTransactionFeeAmountLabel">Manual Fee Amount (XCH)</span> <span class="cc-help">?<span class="cc-tooltip">In automatic mode, this amount is the fallback if a network estimate is unavailable. It does not change the Coin Prep estimate or approved spending ceiling.</span></span></label>
                                 <input type="number" id="configTransactionFeeXch" value="0" step="any" min="0" oninput="updateFeeSettingsUi();">
                             </div>
                         </div>
@@ -14287,7 +14287,7 @@
                             const srg = parseFloat(g('SNIPER_REARM_GAP_MOVE_BPS') || 0); if (srg >= 0) document.getElementById('configSniperRearmGapMovePct').value = (srg / 100).toFixed(1);
                             const tfm = g('TRANSACTION_FEE_MODE'); if (tfm) document.getElementById('configTransactionFeeMode').value = tfm;
                             const tfx = g('TRANSACTION_FEE_XCH'); if (tfx !== null && tfx !== undefined) document.getElementById('configTransactionFeeXch').value = tfx;
-                            document.getElementById('configTransactionFeeEnabled').checked = (parseFloat(tfx || 0) > 0);
+                            document.getElementById('configTransactionFeeEnabled').checked = tfm === 'auto' || (parseFloat(tfx || 0) > 0);
                             const tfsecs = parseInt(g('TRANSACTION_FEE_TARGET_SECS') || 0); if (tfsecs >= 0) document.getElementById('configTransactionFeeTargetSecs').value = tfsecs;
                             const fpc = parseInt(g('FEE_PREP_COUNT') || 0); if (fpc >= 0) document.getElementById('configFeePrepCount').value = fpc;
                             const fcs = g('FEE_COIN_SIZE_XCH'); if (fcs !== null && fcs !== undefined) document.getElementById('configFeeCoinSizeXch').value = fcs;
@@ -20510,6 +20510,20 @@
         // =================================================================
         let SMART_DEFAULTS_IN_FLIGHT = false;
 
+        function applySmartFeeRecommendation(data) {
+            if (!data || typeof data !== 'object') return;
+            const modeField = document.getElementById('configTransactionFeeMode');
+            const amountField = document.getElementById('configTransactionFeeXch');
+            const enabledField = document.getElementById('configTransactionFeeEnabled');
+            const mode = data.transaction_fee_mode;
+            if (mode === 'auto' || mode === 'manual') modeField.value = mode;
+            if (data.transaction_fee_xch !== undefined) amountField.value = data.transaction_fee_xch;
+            if (mode === 'auto' || data.transaction_fee_xch !== undefined) {
+                enabledField.checked = mode === 'auto' || (parseFloat(amountField.value) || 0) > 0;
+            }
+            updateFeeSettingsUi();
+        }
+
         async function _fetchDbxIncentiveInfo(assetId) {
             // Lightweight call to /api/dbx/info — returns just the per-pair
             // incentive blob from dexie_incentives' 5-min cache, no
@@ -20843,9 +20857,7 @@
                 if (data.sniper_prep_count !== undefined) document.getElementById('configSniperPrepCount').value = data.sniper_prep_count;
                 if (data.sniper_rearm_price_move_bps !== undefined) document.getElementById('configSniperRearmPriceMovePct').value = (parseFloat(data.sniper_rearm_price_move_bps) / 100).toFixed(1);
                 if (data.sniper_rearm_gap_move_bps !== undefined) document.getElementById('configSniperRearmGapMovePct').value = (parseFloat(data.sniper_rearm_gap_move_bps) / 100).toFixed(1);
-                if (data.transaction_fee_mode !== undefined) document.getElementById('configTransactionFeeMode').value = 'manual';
-                if (data.transaction_fee_xch !== undefined) document.getElementById('configTransactionFeeXch').value = data.transaction_fee_xch;
-                if (data.transaction_fee_xch !== undefined) document.getElementById('configTransactionFeeEnabled').checked = (parseFloat(data.transaction_fee_xch) || 0) > 0;
+                applySmartFeeRecommendation(data);
                 if (data.transaction_fee_target_secs !== undefined) document.getElementById('configTransactionFeeTargetSecs').value = data.transaction_fee_target_secs;
                 if (data.fee_prep_count !== undefined) document.getElementById('configFeePrepCount').value = data.fee_prep_count;
                 if (data.fee_coin_size_xch !== undefined) document.getElementById('configFeeCoinSizeXch').value = data.fee_coin_size_xch;
@@ -20853,7 +20865,6 @@
                 if (data.enable_coin_prep !== undefined) { document.getElementById('configCoinPrepEnabled').checked = data.enable_coin_prep; document.getElementById('coinPrepDisableWarning').style.display = data.enable_coin_prep ? 'none' : 'block'; }
                 if (data.enable_runtime_coin_health !== undefined) { document.getElementById('configRuntimeCoinHealth').checked = data.enable_runtime_coin_health; document.getElementById('runtimeCoinWarning').style.display = data.enable_runtime_coin_health ? 'none' : 'block'; }
                 if (data.sage_set_change_address !== undefined) document.getElementById('configSageChangeAddress').checked = data.sage_set_change_address;
-                if (typeof updateFeeSettingsUi === 'function') updateFeeSettingsUi();
                 if (typeof refreshFeeStatusPreview === 'function') refreshFeeStatusPreview();
 
                 // Coin Prep Multiplier — market-derived overall spare budget.
@@ -21846,7 +21857,7 @@
             const effectiveFeeXch = enabled ? manualFeeXch : 0;
             return {
                 transactionFeeEnabled: enabled,
-                transactionFeeMode: 'manual',
+                transactionFeeMode: document.getElementById('configTransactionFeeMode')?.value || 'manual',
                 transactionFeeXch: manualFeeXch,
                 feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
@@ -21859,10 +21870,10 @@
             const manualFeeXch = parseFloat(config.transaction_fee_xch) || 0;
             const feeCount = parseInt(config.fee_prep_count) || 0;
             const feeCoinSizeXch = parseFloat(config.fee_coin_size_xch) || 0;
-            const enabled = manualFeeXch > 0;
+            const enabled = config.transaction_fee_mode === 'auto' || manualFeeXch > 0;
             return {
                 transactionFeeEnabled: enabled,
-                transactionFeeMode: 'manual',
+                transactionFeeMode: config.transaction_fee_mode || 'manual',
                 transactionFeeXch: manualFeeXch,
                 feePoolEnabled: feeCount > 0 && feeCoinSizeXch > 0,
                 feeCoinSize: feeCoinSizeXch,
@@ -21876,9 +21887,11 @@
             if (!hint) return;
 
             const opts = getFeeOptionsFromInputs();
-            const manualText = opts.transactionFeeEnabled && opts.effectiveFeeXch > 0
-                ? `Manual transaction fee: <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong>, only for transactions using manual fee settings.`
-                : 'Manual transaction fees are <strong>OFF</strong>; this does not make Coin Prep free.';
+            const manualText = opts.transactionFeeMode === 'auto'
+                ? `Automatic network fee is on. Configured fallback: <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong>. A zero estimate with no positive fallback pauses automatic top-up before wallet submission.`
+                : opts.transactionFeeEnabled && opts.effectiveFeeXch > 0
+                    ? `Manual transaction fee: <strong>${formatTransactionFeeXch(opts.effectiveFeeXch)} XCH</strong>, only for transactions using manual fee settings.`
+                    : 'Manual transaction fees are <strong>OFF</strong>; this does not make Coin Prep free.';
             const poolText = opts.feePoolEnabled
                 ? `Configured fee-coin pool: ${opts.feeCount} x ${formatTransactionFeeXch(opts.feeCoinSize)} XCH, retained in the wallet, not fees already spent. The Coin Prep review shows the actual required outputs.`
                 : 'No dedicated fee-coin pool is enabled by these settings.';
@@ -21891,11 +21904,16 @@
             `;
         }
 
-        function updateFeeSettingsUi() {
+        function updateFeeSettingsUi(manualToggle = false) {
             const enabled = !!document.getElementById('configTransactionFeeEnabled')?.checked;
             const manualWrap = document.getElementById('transactionFeeManualWrap');
             const feeMode = document.getElementById('configTransactionFeeMode');
-            if (feeMode) feeMode.value = 'manual';
+            if (feeMode && manualToggle) feeMode.value = 'manual';
+            const auto = feeMode?.value === 'auto';
+            const label = document.getElementById('configTransactionFeeLabel');
+            if (label) label.textContent = auto ? 'Automatic Network Fee' : 'Manual Transaction Fee';
+            const amountLabel = document.getElementById('configTransactionFeeAmountLabel');
+            if (amountLabel) amountLabel.textContent = auto ? 'Fallback Fee Amount (XCH)' : 'Manual Fee Amount (XCH)';
             if (manualWrap) manualWrap.style.display = enabled ? 'block' : 'none';
             renderFeeStatusHint();
         }
@@ -37155,11 +37173,6 @@
                 if (edgeField && edgeField.value === _roundTrip.displayed.min_edge_bps
                         && _roundTrip.raw.min_edge_bps != null) {
                     config.min_edge_bps = Number(_roundTrip.raw.min_edge_bps);
-                }
-                if (_roundTrip.raw.transaction_fee_mode
-                        && document.getElementById('configTransactionFeeEnabled')?.checked === _roundTrip.displayed.transaction_fee_enabled
-                        && document.getElementById('configTransactionFeeXch')?.value === _roundTrip.displayed.transaction_fee_xch) {
-                    config.transaction_fee_mode = _roundTrip.raw.transaction_fee_mode;
                 }
             }
             config = normalizeConfigForLiquidityMode(config);

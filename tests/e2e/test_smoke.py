@@ -2091,6 +2091,47 @@ def test_smart_settings_snapshot_ignores_equivalent_number_formatting(page):
     expect(page.locator("#smartSettingsStaleBanner")).to_be_hidden()
 
 
+def test_smart_settings_keeps_automatic_network_fee_mode(page):
+    """The Smart Settings fee recommendation must survive the UI refresh."""
+    gui = Path(__file__).resolve().parents[2] / "bot_gui.html"
+    page.goto(gui.as_uri(), wait_until="domcontentloaded")
+
+    result = page.evaluate(
+        """() => {
+            window._settingsRoundTrip = {
+                raw: { transaction_fee_mode: 'manual' },
+                displayed: { transaction_fee_enabled: false, transaction_fee_xch: '0' },
+            };
+            applySmartFeeRecommendation({
+                transaction_fee_mode: 'auto',
+                transaction_fee_xch: '0.0000130791',
+            });
+            updateFeeSettingsUi();
+            const automatic = {
+                mode: document.getElementById('configTransactionFeeMode').value,
+                enabled: document.getElementById('configTransactionFeeEnabled').checked,
+                amount: document.getElementById('configTransactionFeeXch').value,
+                label: document.getElementById('configTransactionFeeLabel').textContent,
+                feeOptionsMode: getFeeOptionsFromInputs().transactionFeeMode,
+            };
+            updateFeeSettingsUi(true);
+            return {
+                automatic,
+                explicitManualMode: document.getElementById('configTransactionFeeMode').value,
+            };
+        }"""
+    )
+
+    assert result["automatic"] == {
+        "mode": "auto",
+        "enabled": True,
+        "amount": "0.0000130791",
+        "label": "Automatic Network Fee",
+        "feeOptionsMode": "auto",
+    }
+    assert result["explicitManualMode"] == "manual"
+
+
 def test_blank_spread_cannot_submit_partial_settings_save(page):
     """A blank Smart Settings spread must stop before the bulk config write."""
     gui = Path(__file__).resolve().parents[2] / "bot_gui.html"

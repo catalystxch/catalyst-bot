@@ -460,6 +460,7 @@ def consume_fast_reconcile() -> bool:
 from tx_fees import (
     fee_pool_enabled,
     get_effective_transaction_fee_mojos,
+    get_transaction_fee_mode,
     get_fee_coin_size_mojos,
     get_fee_coin_size_xch,
     get_fee_pool_count,
@@ -2462,7 +2463,11 @@ class CoinManager:
         return bool(getattr(cfg, "ENABLE_COIN_PREP", False)) and fee_pool_enabled()
 
     def _tx_fee_mojos(self) -> int:
-        return get_effective_transaction_fee_mojos()
+        fee_mojos = get_effective_transaction_fee_mojos()
+        if get_transaction_fee_mode() in {"auto", "node", "suggested"}:
+            if fee_mojos <= 0:
+                raise ValueError("AUTO_TRANSACTION_FEE_UNAVAILABLE")
+        return fee_mojos
 
     def _wallet_rpc_failed(self, rpc_result) -> bool:
         return (
