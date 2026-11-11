@@ -71,6 +71,18 @@ def _smart_tibet_shock_trigger_pct(min_edge_bps) -> float:
     return float(trigger.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def _smart_price_rails_for_book(min_mid, max_mid, best_bid, best_ask):
+    """Keep generated price rails outside both sides of a usable book."""
+    low = Decimal(str(min_mid))
+    high = Decimal(str(max_mid))
+    bid = Decimal(str(best_bid or 0))
+    ask = Decimal(str(best_ask or 0))
+    if bid > 0 and ask > bid:
+        low = min(low, bid * Decimal("0.85"))
+        high = max(high, ask * Decimal("1.15"))
+    return float(low), float(high)
+
+
 def _positive_int_or_none(value):
     try:
         parsed = int(value)
@@ -2093,6 +2105,12 @@ def _calculate_smart_defaults(
             max_mid = min_max_mid
         if min_mid > live_price * 0.85:
             min_mid = live_price * 0.85
+
+    # Follow authority checks the observed bid and ask, not only the midpoint.
+    # In a thin book the ask can sit above a rail derived from the midpoint.
+    min_mid, max_mid = _smart_price_rails_for_book(
+        min_mid, max_mid, orderbook.get("best_bid"), orderbook.get("best_ask")
+    )
 
     # ═══ COMPETITOR AWARENESS ═══
     competitor_enabled = True
