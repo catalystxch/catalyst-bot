@@ -10566,9 +10566,9 @@ class CoinPrepWorker:
                 if xch_prepared_ok and cat_prepared_ok:
                     self.log(
                         "Existing selectable tier coins already satisfy the current "
-                        "prep target; skipping full consolidation and split."
+                        "tier target; checking the approved fee plan for remaining "
+                        "reserve or top-up outputs."
                     )
-                    return self._complete_existing_tier_preparation()
 
             self._xch_plan_already_satisfied = xch_prepared_ok
             self._cat_plan_already_satisfied = cat_prepared_ok
