@@ -243,7 +243,7 @@ class TestResumePath(_TempDB):
 
 @unittest.skipIf(_SKIP is not None, f"modules unavailable: {_SKIP}")
 class TestFreshStartPath(_TempDB):
-    """fresh-start must clear session data from DB and set the flag."""
+    """fresh-start opens a new session while preserving durable history."""
 
     def _fresh_start(self):
         return self.client.post(
@@ -256,13 +256,20 @@ class TestFreshStartPath(_TempDB):
         resp = self._fresh_start()
         self.assertTrue(resp.get_json().get("success"))
 
+    def test_fresh_start_requires_open_offers_to_be_cancelled(self):
+        with patch("blueprints.session.get_open_offers", return_value=[{"trade_id": "live"}]):
+            resp = self._fresh_start()
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json().get("reason"), "OPEN_OFFERS_REQUIRE_CANCELLATION")
+        self.assertFalse(api_server._fresh_start_is_set())
+
     def test_fresh_start_preserves_authoritative_fills(self):
-        """Task 9 fill history makes the broad fresh reset fail closed."""
+        """Historical fills remain available to position and proof checks."""
         self._seed_fill()
         self.assertEqual(self._fill_count(), 1)
         resp = self._fresh_start()
-        self.assertEqual(resp.status_code, 409)
-        self.assertFalse(resp.get_json().get("success"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json().get("success"))
         self.assertEqual(self._fill_count(), 1)
 
     def test_fresh_start_sets_flag(self):
@@ -285,11 +292,11 @@ class TestFreshStartPath(_TempDB):
         self.assertFalse(resp.get_json().get("can_resume"))
 
     def test_response_reports_no_authoritative_fills_cleared(self):
-        """A refused reset reports that no authoritative fills were deleted."""
+        """A fresh session reports that no authoritative fills were deleted."""
         self._seed_fill()
         resp = self._fresh_start()
         body = resp.get_json()
-        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.status_code, 200)
         self.assertEqual(body.get("fills_cleared"), 0)
         self.assertEqual(self._fill_count(), 1)
 

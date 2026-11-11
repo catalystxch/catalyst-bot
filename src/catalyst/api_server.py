@@ -6747,13 +6747,13 @@ def _reset_fresh_run_session(
 
     Two request modes are retained for client compatibility:
 
-    * ``preserve_history=False`` (default / legacy / "Start Fresh"):
+    * ``preserve_history=False`` (legacy reset):
         Requests the broad legacy reset. The database guard refuses the
         operation without mutation whenever authoritative fills, protected
         offers, intents, or reservations exist; proof and fill history are
         never deleted. Empty legacy state remains reset-compatible.
 
-    * ``preserve_history=True`` (coin-prep re-run):
+    * ``preserve_history=True`` (fresh session or coin-prep re-run):
         Keeps the fills / round-trips tables and the position baseline.
         Coin prep can still request coin and offer cleanup, but the same
         authority guard preserves every protected row and lock. This is the
@@ -6829,7 +6829,7 @@ def _reset_fresh_run_session(
     if reason:
         if preserve_history:
             details = (
-                f"Coin-prep re-run at {reset_at}: preserved fills / round-trips / "
+                f"Session transition at {reset_at}: preserved fills / round-trips / "
                 f"position baseline, cleared {summary['coins_cleared']} coin rows"
             )
             if cancel_open_offers:

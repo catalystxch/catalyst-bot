@@ -144,3 +144,21 @@ def test_follow_review_exposes_bounded_shutdown_funding_reason(monkeypatch):
     assert status == 409
     assert result["reason"] == "FOLLOW_SHUTDOWN_FEE_COIN_TOO_SMALL"
     assert result["dispatch_authorized"] is False
+
+
+def test_follow_review_exposes_stale_coin_prep_fee_approval(monkeypatch):
+    def reject(*_a, **_kw):
+        raise ValueError("FEE_APPROVAL_STALE")
+
+    monkeypatch.setattr(follow_principal, "prepare_follow_run_review", reject)
+    result, status = _call(
+        {
+            "approval_id": "a" * 64,
+            "buy_limit": 24,
+            "sell_limit": 24,
+            "continuous": True,
+        }
+    )
+    assert status == 409
+    assert result["reason"] == "FEE_APPROVAL_STALE"
+    assert result["dispatch_authorized"] is False

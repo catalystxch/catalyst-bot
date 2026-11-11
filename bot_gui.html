@@ -33282,6 +33282,8 @@
                     || !Number.isSafeInteger(review.shutdown_funding?.expires_at)
                     || Date.now() >= review.shutdown_funding.expires_at * 1000) {
                     const fundingMessages = {
+                        FEE_APPROVAL_STALE: 'Coin Prep was approved under earlier fee settings. Review and approve Coin Prep again under the current automatic-fee setting.',
+                        FOLLOW_FEE_APPROVAL_STALE: 'The Follow fee approval is stale. Review and approve Coin Prep again under the current settings.',
                         FOLLOW_SHUTDOWN_FEE_ESTIMATE_UNAVAILABLE: 'A fresh network shutdown-fee quote is unavailable. Refresh the review when fee guidance returns.',
                         FOLLOW_SHUTDOWN_FEE_FUNDING_REQUIRED: 'The shutdown-fee quote is zero. A positive protected fee is required.',
                         FOLLOW_SHUTDOWN_FEE_CAP_INSUFFICIENT: 'The remaining cumulative fee ceiling is below the conservative shutdown quote. Review the fee approval.',

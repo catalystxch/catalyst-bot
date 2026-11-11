@@ -346,6 +346,7 @@ def api_follow_run_review():
             "FOLLOW_REVIEW_PROPOSAL_INVALID",
             "FOLLOW_REVIEW_PROPOSAL_CHANGED",
             "FOLLOW_FEE_APPROVAL_STALE",
+            "FEE_APPROVAL_STALE",
             "FOLLOW_FEE_APPROVAL_REQUIRED",
             "FOLLOW_FEE_APPROVAL_MISMATCH",
             "FOLLOW_SLOT_INVENTORY_SHORT",

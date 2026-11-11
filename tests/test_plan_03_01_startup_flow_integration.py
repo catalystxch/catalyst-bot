@@ -269,15 +269,14 @@ class TestStartupPhase2SessionMode(_TempDB):
     def test_fresh_start_returns_success(self):
         self.assertTrue(self._fresh_start().get_json().get("success"))
 
-    def test_fresh_start_refuses_to_clear_authoritative_fills(self):
-        """Fresh-start cannot erase durable fill authority."""
+    def test_fresh_start_preserves_fills_and_opens_new_session(self):
+        """Historical fills must not trap a wallet in the resume path."""
         self._seed_fill()
         response = self._fresh_start()
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(
-            response.get_json().get("error"), "authoritative_state_conflict"
-        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json().get("success"))
         self.assertEqual(self._fill_count(), 1)
+        self.assertTrue(api_server._fresh_start_is_set())
 
     def test_fresh_start_sets_session_flag(self):
         """After fresh-start, the flag prevents re-showing the resume modal."""
