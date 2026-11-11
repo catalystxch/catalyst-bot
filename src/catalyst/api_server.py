@@ -1401,6 +1401,21 @@ def _request_origin_matches_app() -> bool:
     raw_origin = request.headers.get("Origin", "")
     if not raw_origin:
         return True
+    if str(raw_origin).strip().lower() == "null":
+        # WebView2 sends Origin: null for a form submitted from its local
+        # recovery document, even while reporting Sec-Fetch-Site: same-origin.
+        # Keep this exception to the fenced recovery form and its local token.
+        return (
+            _coin_prep_rbf_recovery_active
+            and request.path
+            in {
+                "/api/safety/coin-prep-recovery-preview",
+                "/api/safety/coin-prep-recovery-submit",
+            }
+            and request.headers.get("Sec-Fetch-Site", "").strip().lower()
+            == "same-origin"
+            and _has_valid_local_token()
+        )
     try:
         parsed = urlparse(str(raw_origin).strip())
     except Exception:

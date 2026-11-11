@@ -139,6 +139,39 @@ class TestApiLocalGuard(unittest.TestCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(resp.get_json()["error"], "origin_not_allowed")
 
+    def test_recovery_webview_null_origin_requires_same_origin_and_token(self):
+        path = "/api/safety/coin-prep-recovery-preview"
+        with patch.object(api_server, "_coin_prep_rbf_recovery_active", True):
+            for fetch_site, token, expected in (
+                ("same-origin", api_server._LOCAL_API_TOKEN, True),
+                ("cross-site", api_server._LOCAL_API_TOKEN, False),
+                ("same-origin", "wrong", False),
+            ):
+                with self.subTest(fetch_site=fetch_site, expected=expected):
+                    with api_server.app.test_request_context(
+                        path,
+                        method="POST",
+                        headers={
+                            "Origin": "null",
+                            "Sec-Fetch-Site": fetch_site,
+                            api_server._LOCAL_API_TOKEN_HEADER: token,
+                        },
+                    ):
+                        self.assertEqual(
+                            api_server._request_origin_matches_app(), expected
+                        )
+
+        with api_server.app.test_request_context(
+            "/api/bot/start",
+            method="POST",
+            headers={
+                "Origin": "null",
+                "Sec-Fetch-Site": "same-origin",
+                api_server._LOCAL_API_TOKEN_HEADER: api_server._LOCAL_API_TOKEN,
+            },
+        ):
+            self.assertFalse(api_server._request_origin_matches_app())
+
     def test_console_route_returns_404_when_console_removed(self):
         resp = self.client.get("/console", environ_base=self.loopback)
         self.assertEqual(resp.status_code, 404)
