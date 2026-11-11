@@ -63,9 +63,7 @@ def owned_coin_prep_latch(tmp_path, monkeypatch):
         assert gate.acquire()["acquired"] is True
         database.trip_runtime_safety_latch(
             reason_code="COIN_PREP_RECOVERY_REQUIRED",
-            blocking_operation_ids=sorted(
-                [OPERATION, f"wallet-effect:{CLAIM}"]
-            ),
+            blocking_operation_ids=sorted([OPERATION, f"wallet-effect:{CLAIM}"]),
             wallet_fingerprint_hash=gate.wallet_fingerprint_hash,
             network="mainnet",
             tripped_at=NOW,
@@ -182,9 +180,7 @@ def test_rbf_permit_refuses_other_attempt_or_latch_generation(
             )
 
 
-def test_rbf_permit_is_revoked_when_latch_changes(
-    owned_coin_prep_latch, monkeypatch
-):
+def test_rbf_permit_is_revoked_when_latch_changes(owned_coin_prep_latch, monkeypatch):
     owned = owned_coin_prep_latch
     gate, binding, _adapter, generation = owned
     monkeypatch.setattr(

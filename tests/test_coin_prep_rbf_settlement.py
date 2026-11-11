@@ -23,18 +23,18 @@ FEE = 15_654_431
 
 
 def _utc(offset=0):
-    return (datetime.now(timezone.utc) + timedelta(seconds=offset)).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    return (
+        (datetime.now(timezone.utc) + timedelta(seconds=offset))
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _outputs(change_id, change_amount):
     return [
-        {"coin_id": coin_id, "amount_mojos": FEE_COIN_AMOUNT,
-         "purpose": "fee_reserve"}
+        {"coin_id": coin_id, "amount_mojos": FEE_COIN_AMOUNT, "purpose": "fee_reserve"}
         for coin_id in SHARED
-    ] + [{"coin_id": change_id, "amount_mojos": change_amount,
-          "purpose": "top_up"}]
+    ] + [{"coin_id": change_id, "amount_mojos": change_amount, "purpose": "top_up"}]
 
 
 def _facts(winner):
@@ -58,11 +58,15 @@ def _facts(winner):
         "source_coin_id": SOURCE,
         "source_spent_height": 100,
         "coins": [
-            {"coin_id": item["coin_id"], "amount_mojos": item["amount_mojos"],
-             "confirmed_height": (
-                 100 if item["coin_id"] in {output["coin_id"] for output in winning}
-                 else None
-             )}
+            {
+                "coin_id": item["coin_id"],
+                "amount_mojos": item["amount_mojos"],
+                "confirmed_height": (
+                    100
+                    if item["coin_id"] in {output["coin_id"] for output in winning}
+                    else None
+                ),
+            }
             for item in [*original, successor[-1]]
         ],
     }
@@ -86,9 +90,10 @@ def _facts(winner):
 def test_only_height_proven_winner_settles(winner):
     operation, attempt, evidence = _facts(winner)
     expected_tx = ORIGINAL_TX if winner == "ORIGINAL" else SUCCESSOR_TX
-    assert database._verify_coin_prep_rbf_winner(
-        operation, attempt, evidence
-    ) == (winner, expected_tx)
+    assert database._verify_coin_prep_rbf_winner(operation, attempt, evidence) == (
+        winner,
+        expected_tx,
+    )
 
 
 def test_ambiguous_two_changes_confirmed_is_rejected():
@@ -122,29 +127,56 @@ def test_resolution_commits_operation_attempt_coins_and_latch_together(
     conn.row_factory = __import__("sqlite3").Row
     conn.executescript(database.SCHEMA_SQL + database.STABILITY_SCHEMA_SQL)
     for column in (
-        "designation TEXT", "assigned_tier TEXT",
+        "designation TEXT",
+        "assigned_tier TEXT",
     ):
         conn.execute(f"ALTER TABLE coins ADD COLUMN {column}")
     database._validate_stability_schema(conn)
     operation_id = "coin-prep:" + "5" * 64
     claim = "6" * 64
     identity = {
-        "backend": "sage", "name": "wallet", "fingerprint": 736588221,
-        "network_id": "mainnet", "kind": "bls", "has_secrets": True,
-        "bound_at_utc": _utc(-10), "maximum_age_seconds": 300,
+        "backend": "sage",
+        "name": "wallet",
+        "fingerprint": 736588221,
+        "network_id": "mainnet",
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": _utc(-10),
+        "maximum_age_seconds": 300,
     }
     identity_json = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-    target = {"wallet_type": "xch", "outputs": [
-        {"output_index": index, "amount_mojos": FEE_COIN_AMOUNT,
-         "purpose": "fee_reserve"} for index in range(4)
-    ] + [{"output_index": 4, "amount_mojos": CHANGE, "purpose": "top_up"}]}
+    target = {
+        "wallet_type": "xch",
+        "outputs": [
+            {
+                "output_index": index,
+                "amount_mojos": FEE_COIN_AMOUNT,
+                "purpose": "fee_reserve",
+            }
+            for index in range(4)
+        ]
+        + [{"output_index": 4, "amount_mojos": CHANGE, "purpose": "top_up"}],
+    }
     op_fields = (
-        operation_id, "split", "fee_reserve", json.dumps([SOURCE]),
-        json.dumps(target), identity_json, "{}", claim, 1,
-        "SUBMITTED_UNKNOWN", json.dumps({
-            "reason_code": "SUBMITTED_UNKNOWN", "effect_claim_token": claim,
-            "effect_claim_generation": 1, "dispatch_outcome": "SUBMITTED",
-        }), _utc(-5),
+        operation_id,
+        "split",
+        "fee_reserve",
+        json.dumps([SOURCE]),
+        json.dumps(target),
+        identity_json,
+        "{}",
+        claim,
+        1,
+        "SUBMITTED_UNKNOWN",
+        json.dumps(
+            {
+                "reason_code": "SUBMITTED_UNKNOWN",
+                "effect_claim_token": claim,
+                "effect_claim_generation": 1,
+                "dispatch_outcome": "SUBMITTED",
+            }
+        ),
+        _utc(-5),
     )
     conn.execute(
         "INSERT INTO coin_prep_operations (operation_id,operation_kind,purpose,"
@@ -158,8 +190,12 @@ def test_resolution_commits_operation_attempt_coins_and_latch_together(
         "reason_code='COIN_PREP_RECOVERY_REQUIRED',"
         "blocking_operation_ids_json=?,wallet_fingerprint_hash=?,network='mainnet' "
         "WHERE singleton_id=1",
-        (json.dumps(sorted([operation_id, f"wallet-effect:{claim}"])),
-         __import__("mutation_gate").wallet_fingerprint_hash(identity["fingerprint"])),
+        (
+            json.dumps(sorted([operation_id, f"wallet-effect:{claim}"])),
+            __import__("mutation_gate").wallet_fingerprint_hash(
+                identity["fingerprint"]
+            ),
+        ),
     )
     original = _outputs(OLD_CHANGE, CHANGE)
     successor = _outputs(NEW_CHANGE, CHANGE - FEE)
@@ -169,14 +205,26 @@ def test_resolution_commits_operation_attempt_coins_and_latch_together(
         "original_outputs_json,successor_outputs_json,wallet_identity_sha256,"
         "latch_generation,reviewed_at,review_expires_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (ATTEMPT, operation_id, ORIGINAL_TX, "7" * 64, "8" * 64, FEE,
-         json.dumps(original), json.dumps(successor), "9" * 64, 1,
-         _utc(-3), _utc(60)),
+        (
+            ATTEMPT,
+            operation_id,
+            ORIGINAL_TX,
+            "7" * 64,
+            "8" * 64,
+            FEE,
+            json.dumps(original),
+            json.dumps(successor),
+            "9" * 64,
+            1,
+            _utc(-3),
+            _utc(60),
+        ),
     )
     conn.execute(
         "INSERT INTO coin_prep_rbf_dispatches "
         "(attempt_id,operation_id,lease_version,owner_run_id,started_at) "
-        "VALUES (?,?,?,?,?)", (ATTEMPT, operation_id, 1, "run", _utc(-2)),
+        "VALUES (?,?,?,?,?)",
+        (ATTEMPT, operation_id, 1, "run", _utc(-2)),
     )
     conn.commit()
     conn.close()
@@ -184,27 +232,38 @@ def test_resolution_commits_operation_attempt_coins_and_latch_together(
     _, _, proof = _facts(winner)
     expected = original if winner == "ORIGINAL" else successor
     authoritative = {
-        "fresh": True, "complete": True, "wallet_identity": identity,
-        "observed_at": _utc(0), "expires_at": _utc(300),
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": _utc(0),
+        "expires_at": _utc(300),
         "coins": expected,
     }
     # Use one timestamp for the exact expiry relationship.
     authoritative["expires_at"] = (
-        datetime.fromisoformat(authoritative["observed_at"].replace("Z", "+00:00"))
-        + timedelta(seconds=300)
-    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        (
+            datetime.fromisoformat(authoritative["observed_at"].replace("Z", "+00:00"))
+            + timedelta(seconds=300)
+        )
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
     ambiguous = json.loads(json.dumps(proof["rbf_chain_view"]))
     ambiguous["coins"][-2]["confirmed_height"] = 100
     ambiguous["coins"][-1]["confirmed_height"] = 100
     with pytest.raises(ValueError, match="winner is not proven"):
         database.resolve_coin_prep_rbf_attempt(
-            ATTEMPT, winner=winner,
+            ATTEMPT,
+            winner=winner,
             winner_transaction_id=proof["winner_transaction_id"],
-            chain_view=ambiguous, authoritative_view=authoritative,
+            chain_view=ambiguous,
+            authoritative_view=authoritative,
         )
     with pytest.raises(ValueError, match="joint no-effect proof"):
         database.record_coin_prep_operation_outcome(
-            operation_id, outcome="FAILED", evidence_json={
+            operation_id,
+            outcome="FAILED",
+            evidence_json={
                 "reason_code": "NO_EFFECT_GUESSED",
                 "effect_claim_token": claim,
                 "effect_claim_generation": 1,
@@ -214,21 +273,31 @@ def test_resolution_commits_operation_attempt_coins_and_latch_together(
         )
     still = database._stability_read_only_connection()
     try:
-        assert still.execute(
-            "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
-            (operation_id,),
-        ).fetchone()["outcome"] == "SUBMITTED_UNKNOWN"
-        assert still.execute(
-            "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
-        ).fetchone()["state"] == "tripped"
-        assert still.execute(
-            "SELECT 1 FROM coin_prep_rbf_resolutions WHERE attempt_id=?",
-            (ATTEMPT,),
-        ).fetchone() is None
+        assert (
+            still.execute(
+                "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()["outcome"]
+            == "SUBMITTED_UNKNOWN"
+        )
+        assert (
+            still.execute(
+                "SELECT state FROM runtime_safety_latch WHERE singleton_id=1"
+            ).fetchone()["state"]
+            == "tripped"
+        )
+        assert (
+            still.execute(
+                "SELECT 1 FROM coin_prep_rbf_resolutions WHERE attempt_id=?",
+                (ATTEMPT,),
+            ).fetchone()
+            is None
+        )
     finally:
         still.close()
     result = database.resolve_coin_prep_rbf_attempt(
-        ATTEMPT, winner=winner,
+        ATTEMPT,
+        winner=winner,
         winner_transaction_id=proof["winner_transaction_id"],
         chain_view=proof["rbf_chain_view"],
         authoritative_view=authoritative,
@@ -265,9 +334,14 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
     op_id = "coin-prep:" + "5" * 64
     claim = "6" * 64
     identity = {
-        "backend": "sage", "name": "wallet", "fingerprint": 736588221,
-        "network_id": "mainnet", "kind": "bls", "has_secrets": True,
-        "bound_at_utc": _utc(-10), "maximum_age_seconds": 300,
+        "backend": "sage",
+        "name": "wallet",
+        "fingerprint": 736588221,
+        "network_id": "mainnet",
+        "kind": "bls",
+        "has_secrets": True,
+        "bound_at_utc": _utc(-10),
+        "maximum_age_seconds": 300,
     }
     wallet_hash = __import__("mutation_gate").wallet_fingerprint_hash(
         identity["fingerprint"]
@@ -277,13 +351,34 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
         "source_coin_ids_json,target_contract_json,wallet_identity_json,"
         "prepared_evidence_json,effect_claim_token,effect_claim_generation,"
         "outcome,prepared_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (op_id, "split", "fee_reserve", json.dumps([SOURCE]),
-         json.dumps({"wallet_type": "xch", "outputs": [
-             {"output_index": index, "amount_mojos": FEE_COIN_AMOUNT,
-              "purpose": "fee_reserve"} for index in range(4)
-         ] + [{"output_index": 4, "amount_mojos": CHANGE,
-               "purpose": "top_up"}]}),
-         json.dumps(identity), "{}", claim, 1, "SUBMITTED_UNKNOWN", _utc(-100)),
+        (
+            op_id,
+            "split",
+            "fee_reserve",
+            json.dumps([SOURCE]),
+            json.dumps(
+                {
+                    "wallet_type": "xch",
+                    "outputs": [
+                        {
+                            "output_index": index,
+                            "amount_mojos": FEE_COIN_AMOUNT,
+                            "purpose": "fee_reserve",
+                        }
+                        for index in range(4)
+                    ]
+                    + [
+                        {"output_index": 4, "amount_mojos": CHANGE, "purpose": "top_up"}
+                    ],
+                }
+            ),
+            json.dumps(identity),
+            "{}",
+            claim,
+            1,
+            "SUBMITTED_UNKNOWN",
+            _utc(-100),
+        ),
     )
     conn.execute(
         "UPDATE runtime_safety_latch SET generation=1,state='tripped',"
@@ -337,61 +432,88 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
         v2_target["contract_version"] = 2
         v2_conn.execute(
             "UPDATE coin_prep_operations SET target_contract_json=? "
-            "WHERE operation_id=?", (json.dumps(v2_target), op_id),
+            "WHERE operation_id=?",
+            (json.dumps(v2_target), op_id),
         )
         v2_conn.commit()
         with pytest.raises(ValueError, match="exact XCH fee split"):
             database.prepare_coin_prep_rbf_attempt(
-                operation_id=op_id, original_transaction_id=ORIGINAL_TX,
-                unsigned_sha256="7" * 64, review_sha256="8" * 64,
+                operation_id=op_id,
+                original_transaction_id=ORIGINAL_TX,
+                unsigned_sha256="7" * 64,
+                review_sha256="8" * 64,
                 fee_mojos=FEE,
                 original_outputs=_outputs(OLD_CHANGE, CHANGE),
                 successor_outputs=_outputs(NEW_CHANGE, CHANGE - FEE),
-                latch_generation=1, reviewed_at=_utc(-1),
+                latch_generation=1,
+                reviewed_at=_utc(-1),
                 review_expires_at=_utc(60),
             )
         v2_conn.execute(
             "UPDATE coin_prep_operations SET target_contract_json=? "
-            "WHERE operation_id=?", (old_target, op_id),
+            "WHERE operation_id=?",
+            (old_target, op_id),
         )
         v2_conn.commit()
     finally:
         v2_conn.close()
     first = database.prepare_coin_prep_rbf_attempt(
-        operation_id=op_id, original_transaction_id=ORIGINAL_TX,
-        unsigned_sha256="7" * 64, review_sha256="8" * 64, fee_mojos=FEE,
+        operation_id=op_id,
+        original_transaction_id=ORIGINAL_TX,
+        unsigned_sha256="7" * 64,
+        review_sha256="8" * 64,
+        fee_mojos=FEE,
         original_outputs=_outputs(OLD_CHANGE, CHANGE),
         successor_outputs=_outputs(NEW_CHANGE, CHANGE - FEE),
-        latch_generation=1, reviewed_at=_utc(-1), review_expires_at=_utc(60),
+        latch_generation=1,
+        reviewed_at=_utc(-1),
+        review_expires_at=_utc(60),
     )["attempt"]
     second = database.prepare_coin_prep_rbf_attempt(
-        operation_id=op_id, original_transaction_id=ORIGINAL_TX,
-        unsigned_sha256="9" * 64, review_sha256="a" * 64, fee_mojos=FEE,
+        operation_id=op_id,
+        original_transaction_id=ORIGINAL_TX,
+        unsigned_sha256="9" * 64,
+        review_sha256="a" * 64,
+        fee_mojos=FEE,
         original_outputs=_outputs(OLD_CHANGE, CHANGE),
         successor_outputs=_outputs(NEW_CHANGE, CHANGE - FEE),
-        latch_generation=1, reviewed_at=_utc(-1), review_expires_at=_utc(60),
+        latch_generation=1,
+        reviewed_at=_utc(-1),
+        review_expires_at=_utc(60),
     )["attempt"]
     assert first["attempt_id"] != second["attempt_id"]
     expired = database.prepare_coin_prep_rbf_attempt(
-        operation_id=op_id, original_transaction_id=ORIGINAL_TX,
-        unsigned_sha256="c" * 64, review_sha256="d" * 64, fee_mojos=FEE,
+        operation_id=op_id,
+        original_transaction_id=ORIGINAL_TX,
+        unsigned_sha256="c" * 64,
+        review_sha256="d" * 64,
+        fee_mojos=FEE,
         original_outputs=_outputs(OLD_CHANGE, CHANGE),
         successor_outputs=_outputs(NEW_CHANGE, CHANGE - FEE),
-        latch_generation=1, reviewed_at=_utc(-100), review_expires_at=_utc(-50),
+        latch_generation=1,
+        reviewed_at=_utc(-100),
+        review_expires_at=_utc(-50),
     )["attempt"]
     with pytest.raises(ValueError, match="time is not current"):
         database.record_coin_prep_rbf_dispatch_start(
-            expired["attempt_id"], owner_run_id="successor", lease_version=2,
+            expired["attempt_id"],
+            owner_run_id="successor",
+            lease_version=2,
             started_at=_utc(-60),
         )
     with pytest.raises(ValueError, match="review has changed"):
         database.record_coin_prep_rbf_dispatch_start(
-            expired["attempt_id"], owner_run_id="successor", lease_version=2,
+            expired["attempt_id"],
+            owner_run_id="successor",
+            lease_version=2,
         )
     pre = database.authorize_coin_prep_rbf_rescue_target(
-        attempt_id=first["attempt_id"], operation_id=op_id,
-        expected_latch_generation=1, unsigned_sha256="7" * 64,
-        owner_run_id="successor", lease_version=2,
+        attempt_id=first["attempt_id"],
+        operation_id=op_id,
+        expected_latch_generation=1,
+        unsigned_sha256="7" * 64,
+        owner_run_id="successor",
+        lease_version=2,
     )
     assert pre["dispatch_started"] is False
     database.record_coin_prep_rbf_sign_start(
@@ -412,13 +534,15 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
     try:
         inactive.execute(
             "UPDATE runtime_mutation_lease SET active=0, released_at=? "
-            "WHERE singleton_id=1", (_utc(0),),
+            "WHERE singleton_id=1",
+            (_utc(0),),
         )
         inactive.commit()
     finally:
         inactive.close()
     database.record_coin_prep_rbf_sign_no_submit(
-        second["attempt_id"], receipt={
+        second["attempt_id"],
+        receipt={
             "attempt_id": second["attempt_id"],
             "reason_code": "CRASH_BEFORE_SUBMIT_MARKER",
             "submit_rpc_attempted": False,
@@ -447,7 +571,8 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
     )
     with pytest.raises(ValueError, match="submit-start marker already exists"):
         database.record_coin_prep_rbf_sign_no_submit(
-            first["attempt_id"], receipt={
+            first["attempt_id"],
+            receipt={
                 "attempt_id": first["attempt_id"],
                 "reason_code": "PRE_SUBMIT_EXCEPTION",
                 "submit_rpc_attempted": False,
@@ -455,16 +580,23 @@ def test_successor_adoption_requires_dead_expired_exact_owner(tmp_path, monkeypa
             },
         )
     post = database.authorize_coin_prep_rbf_rescue_target(
-        attempt_id=first["attempt_id"], operation_id=op_id,
-        expected_latch_generation=1, unsigned_sha256="7" * 64,
-        owner_run_id="successor", lease_version=2, allow_dispatched=True,
+        attempt_id=first["attempt_id"],
+        operation_id=op_id,
+        expected_latch_generation=1,
+        unsigned_sha256="7" * 64,
+        owner_run_id="successor",
+        lease_version=2,
+        allow_dispatched=True,
     )
     assert post["dispatch_started"] is True
     with pytest.raises(ValueError, match="already dispatched"):
         database.authorize_coin_prep_rbf_rescue_target(
-            attempt_id=first["attempt_id"], operation_id=op_id,
-            expected_latch_generation=1, unsigned_sha256="7" * 64,
-            owner_run_id="successor", lease_version=2,
+            attempt_id=first["attempt_id"],
+            operation_id=op_id,
+            expected_latch_generation=1,
+            unsigned_sha256="7" * 64,
+            owner_run_id="successor",
+            lease_version=2,
         )
     with pytest.raises(ValueError, match="one-shot"):
         database.record_coin_prep_rbf_dispatch_start(

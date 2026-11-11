@@ -59,13 +59,15 @@ def test_rbf_signs_then_submits_only_same_coin_spends(monkeypatch):
             }
             return {
                 "spend_bundle": {
-                    "coin_spends": [{
-                        **_spend(),
-                        "coin": {
-                            **_spend()["coin"],
-                            "parent_coin_info": "0x" + "11" * 32,
-                        },
-                    }],
+                    "coin_spends": [
+                        {
+                            **_spend(),
+                            "coin": {
+                                **_spend()["coin"],
+                                "parent_coin_info": "0x" + "11" * 32,
+                            },
+                        }
+                    ],
                     "aggregated_signature": "00" * 96,
                 }
             }
@@ -80,7 +82,8 @@ def test_rbf_signs_then_submits_only_same_coin_spends(monkeypatch):
     assert result["success"] is True
     assert result["transaction_id"] == TX_ID
     assert [endpoint for endpoint, _ in calls] == [
-        "sign_coin_spends", "submit_transaction"
+        "sign_coin_spends",
+        "submit_transaction",
     ]
     assert checks == ["coin_prep_rbf_rescue:sign", "coin_prep_rbf_rescue:submit"]
 

@@ -16,8 +16,11 @@ DIGEST = "d" * 64
 
 def _fixture(monkeypatch, *, digest=DIGEST):
     outputs = [
-        {"coin_id": f"{index:064x}", "amount_mojos": index + 1,
-         "purpose": "fee_reserve" if index < 4 else "top_up"}
+        {
+            "coin_id": f"{index:064x}",
+            "amount_mojos": index + 1,
+            "purpose": "fee_reserve" if index < 4 else "top_up",
+        }
         for index in range(5)
     ]
     attempt = {
@@ -100,9 +103,16 @@ def test_one_shot_marker_precedes_sage_sign_and_uncertain_result_stays_attempted
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_identity_from_adapter", lambda _adapter: {})
     monkeypatch.setattr(
-        wallet, "get_pending_transactions_strict",
-        lambda: [{"transaction_id": ORIGINAL, "fee": 0,
-                  "spent": [{"coin_id": "1" * 64}], "created": []}],
+        wallet,
+        "get_pending_transactions_strict",
+        lambda: [
+            {
+                "transaction_id": ORIGINAL,
+                "fee": 0,
+                "spent": [{"coin_id": "1" * 64}],
+                "created": [],
+            }
+        ],
     )
     monkeypatch.setattr(
         wallet.mutation_gate,
@@ -153,18 +163,27 @@ def test_sign_refusal_records_no_submit_and_does_not_burn_submit_marker(monkeypa
     events = []
     adapter = SimpleNamespace(
         submit_reviewed_coin_prep_rbf_rpc=lambda _unsigned, **_kwargs: {
-            "success": False, "reason": "RBF_SIGN_RESPONSE_INVALID"
+            "success": False,
+            "reason": "RBF_SIGN_RESPONSE_INVALID",
         }
     )
     monkeypatch.setattr(wallet, "_wallet_adapter", adapter)
     monkeypatch.setattr(wallet, "_identity_from_adapter", lambda _adapter: {})
     monkeypatch.setattr(
-        wallet, "get_pending_transactions_strict",
-        lambda: [{"transaction_id": ORIGINAL, "fee": 0,
-                  "spent": [{"coin_id": "1" * 64}], "created": []}],
+        wallet,
+        "get_pending_transactions_strict",
+        lambda: [
+            {
+                "transaction_id": ORIGINAL,
+                "fee": 0,
+                "spent": [{"coin_id": "1" * 64}],
+                "created": [],
+            }
+        ],
     )
     monkeypatch.setattr(
-        wallet.mutation_gate, "enter_coin_prep_rbf_rescue_wallet_mutation",
+        wallet.mutation_gate,
+        "enter_coin_prep_rbf_rescue_wallet_mutation",
         lambda **_kwargs: object(),
     )
     monkeypatch.setattr(
@@ -173,16 +192,19 @@ def test_sign_refusal_records_no_submit_and_does_not_burn_submit_marker(monkeypa
         lambda *_args, **_kwargs: (SimpleNamespace(backend="sage"), adapter, {}),
     )
     monkeypatch.setattr(
-        wallet.mutation_gate, "wallet_mutation_permit_journal_authority",
+        wallet.mutation_gate,
+        "wallet_mutation_permit_journal_authority",
         lambda *_args: {"owner_run_id": "run", "lease_version": 1},
     )
     monkeypatch.setattr(wallet.mutation_gate, "exit_wallet_mutation", lambda _p: None)
     monkeypatch.setattr(
-        database, "record_coin_prep_rbf_sign_start",
+        database,
+        "record_coin_prep_rbf_sign_start",
         lambda *_a, **_k: events.append("sign_intent"),
     )
     monkeypatch.setattr(
-        database, "record_coin_prep_rbf_submit_start",
+        database,
+        "record_coin_prep_rbf_submit_start",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("submit marker")),
     )
 

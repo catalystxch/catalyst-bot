@@ -4789,29 +4789,51 @@ END;
 
 _STABILITY_REQUIRED_COLUMNS = {
     "coin_prep_rbf_attempts": {
-        "attempt_id", "operation_id", "original_transaction_id",
-        "unsigned_sha256", "review_sha256", "fee_mojos",
-        "original_outputs_json", "successor_outputs_json",
-        "wallet_identity_sha256", "latch_generation", "reviewed_at",
+        "attempt_id",
+        "operation_id",
+        "original_transaction_id",
+        "unsigned_sha256",
+        "review_sha256",
+        "fee_mojos",
+        "original_outputs_json",
+        "successor_outputs_json",
+        "wallet_identity_sha256",
+        "latch_generation",
+        "reviewed_at",
         "review_expires_at",
     },
     "coin_prep_rbf_dispatches": {
-        "attempt_id", "operation_id", "lease_version", "owner_run_id",
+        "attempt_id",
+        "operation_id",
+        "lease_version",
+        "owner_run_id",
         "started_at",
     },
     "coin_prep_rbf_sign_intents": {
-        "attempt_id", "operation_id", "lease_version", "owner_run_id",
+        "attempt_id",
+        "operation_id",
+        "lease_version",
+        "owner_run_id",
         "started_at",
     },
     "coin_prep_rbf_sign_owners": {
-        "attempt_id", "owner_pid", "owner_host", "lease_acquired_at",
+        "attempt_id",
+        "owner_pid",
+        "owner_host",
+        "lease_acquired_at",
     },
     "coin_prep_rbf_sign_no_submit": {
-        "attempt_id", "receipt_json", "receipt_sha256", "recorded_at",
+        "attempt_id",
+        "receipt_json",
+        "receipt_sha256",
+        "recorded_at",
     },
     "coin_prep_rbf_resolutions": {
-        "attempt_id", "winner", "winner_transaction_id",
-        "outcome_evidence_sha256", "resolved_at",
+        "attempt_id",
+        "winner",
+        "winner_transaction_id",
+        "outcome_evidence_sha256",
+        "resolved_at",
     },
     "unbounded_fee_approvals": {"approval_id"},
     "follow_fee_ceiling_reviews": {
@@ -29479,7 +29501,8 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
 
 
 def _verify_coin_prep_rbf_winner(
-    operation: Dict[str, Any], attempt: Dict[str, Any],
+    operation: Dict[str, Any],
+    attempt: Dict[str, Any],
     evidence: Dict[str, Any],
 ) -> tuple[str, str]:
     """Require a complete height-addressed view of both output candidates."""
@@ -29501,10 +29524,19 @@ def _verify_coin_prep_rbf_winner(
     if len(source_ids) != 1:
         raise ValueError("RBF source cohort is not exact")
     chain = evidence.get("rbf_chain_view")
-    if type(chain) is not dict or set(chain) != {
-        "complete", "network", "observed_at", "source_coin_id",
-        "source_spent_height", "coins"
-    } or chain["complete"] is not True:
+    if (
+        type(chain) is not dict
+        or set(chain)
+        != {
+            "complete",
+            "network",
+            "observed_at",
+            "source_coin_id",
+            "source_spent_height",
+            "coins",
+        }
+        or chain["complete"] is not True
+    ):
         raise ValueError("RBF chain view is not complete")
     identity = json.loads(operation["wallet_identity_json"])
     observed_at = _parse_iso_timestamp(
@@ -29513,10 +29545,9 @@ def _verify_coin_prep_rbf_winner(
     now = _parse_iso_timestamp(
         _stability_wall_clock(), "RBF current time", require_timezone=True
     )
-    if (
-        chain["network"] != identity["network_id"]
-        or not timedelta(seconds=-5) <= now - observed_at <= timedelta(seconds=30)
-    ):
+    if chain["network"] != identity["network_id"] or not timedelta(
+        seconds=-5
+    ) <= now - observed_at <= timedelta(seconds=30):
         raise ValueError("RBF chain view is stale or from another network")
     source = _reconciliation_coin_identity(chain["source_coin_id"], "RBF source")[0]
     height = _exact_integer(
@@ -29538,13 +29569,18 @@ def _verify_coin_prep_rbf_winner(
     observed = {}
     for item in records:
         if type(item) is not dict or set(item) != {
-            "coin_id", "amount_mojos", "confirmed_height"
+            "coin_id",
+            "amount_mojos",
+            "confirmed_height",
         }:
             raise ValueError("RBF chain output record is malformed")
         coin_id = _reconciliation_coin_identity(item["coin_id"], "RBF output")[0]
         if coin_id in observed or coin_id not in by_id:
             raise ValueError("RBF chain output set differs")
-        if _exact_integer(item["amount_mojos"], "RBF output amount", minimum=1) != by_id[coin_id]:
+        if (
+            _exact_integer(item["amount_mojos"], "RBF output amount", minimum=1)
+            != by_id[coin_id]
+        ):
             raise ValueError("RBF chain output amount differs")
         confirmed = item["confirmed_height"]
         if confirmed is not None:
@@ -29563,13 +29599,15 @@ def _verify_coin_prep_rbf_winner(
     ):
         raise ValueError("RBF winner is not proven by the source spend height")
     supplied = sorted(
-        (_reconciliation_coin_identity(item["coin_id"], "RBF expected output")[0],
-         item["amount_mojos"], item["purpose"])
+        (
+            _reconciliation_coin_identity(item["coin_id"], "RBF expected output")[0],
+            item["amount_mojos"],
+            item["purpose"],
+        )
         for item in evidence["expected_outputs"]
     )
     expected = sorted(
-        (item["coin_id"], item["amount_mojos"], item["purpose"])
-        for item in winning
+        (item["coin_id"], item["amount_mojos"], item["purpose"]) for item in winning
     )
     if supplied != expected:
         raise ValueError("RBF post-view outputs differ from winner contract")
@@ -30208,10 +30246,7 @@ def record_coin_prep_operation_outcome(
                     (output["amount_mojos"], output["purpose"])
                     for output in evidence_payload["expected_outputs"]
                 )
-                if (
-                    rbf_resolution is not None
-                    and rbf_resolution[0] == "SUCCESSOR"
-                ):
+                if rbf_resolution is not None and rbf_resolution[0] == "SUCCESSOR":
                     pass  # The sealed successor and chain view were checked above.
                 elif confirmed_outputs != target_outputs and not (
                     _legacy_sage_even_split_confirmation_matches(
@@ -30377,8 +30412,10 @@ def record_coin_prep_operation_outcome(
                 "(attempt_id,winner,winner_transaction_id,"
                 "outcome_evidence_sha256,resolved_at) VALUES (?,?,?,?,?)",
                 (
-                    rbf_attempt["attempt_id"], rbf_resolution[0],
-                    rbf_resolution[1], hashlib.sha256(evidence.encode()).hexdigest(),
+                    rbf_attempt["attempt_id"],
+                    rbf_resolution[0],
+                    rbf_resolution[1],
+                    hashlib.sha256(evidence.encode()).hexdigest(),
                     when,
                 ),
             )
@@ -30497,7 +30534,9 @@ def _coin_prep_rbf_outputs(value: Any, label: str) -> tuple[list[dict], str]:
     ids = set()
     for output in value:
         if type(output) is not dict or set(output) != {
-            "coin_id", "amount_mojos", "purpose"
+            "coin_id",
+            "amount_mojos",
+            "purpose",
         }:
             raise ValueError(f"{label} output shape is invalid")
         coin_id = _reconciliation_coin_identity(output["coin_id"], label)[0]
@@ -30508,8 +30547,7 @@ def _coin_prep_rbf_outputs(value: Any, label: str) -> tuple[list[dict], str]:
         purpose = output["purpose"]
         if purpose not in {"fee_reserve", "top_up"}:
             raise ValueError(f"{label} purpose is invalid")
-        result.append({"coin_id": coin_id, "amount_mojos": amount,
-                       "purpose": purpose})
+        result.append({"coin_id": coin_id, "amount_mojos": amount, "purpose": purpose})
     result.sort(key=lambda item: item["coin_id"])
     return result, _canonical_json_text(result, label, expected_type=list)
 
@@ -30585,18 +30623,24 @@ def prepare_coin_prep_rbf_attempt(
             or fence["network"] != identity["network_id"]
         ):
             raise ValueError("RBF attempt does not match exact recovery authority")
-        if conn.execute(
-            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
-            (safe_operation,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (safe_operation,),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("RBF original operation already has a dispatch")
-        if conn.execute(
-            "SELECT 1 FROM coin_prep_rbf_sign_intents AS sign "
-            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
-            "ON receipt.attempt_id=sign.attempt_id "
-            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
-            (safe_operation,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_sign_intents AS sign "
+                "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+                "ON receipt.attempt_id=sign.attempt_id "
+                "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+                (safe_operation,),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("RBF prior sign phase is unresolved")
         target = json.loads(op["target_contract_json"])
         if (
@@ -30606,28 +30650,42 @@ def prepare_coin_prep_rbf_attempt(
         ):
             raise ValueError("RBF target is not the exact XCH fee split")
         expected_old = sorted(
-            (item["amount_mojos"], item["purpose"])
-            for item in target["outputs"]
+            (item["amount_mojos"], item["purpose"]) for item in target["outputs"]
         )
-        if sorted((item["amount_mojos"], item["purpose"]) for item in original) != expected_old:
-            raise ValueError("RBF original outputs differ from prep contract")
-        old_fees = sorted(item["amount_mojos"] for item in original
-                          if item["purpose"] == "fee_reserve")
-        new_fees = sorted(item["amount_mojos"] for item in successor
-                          if item["purpose"] == "fee_reserve")
-        old_change = [item["amount_mojos"] for item in original
-                      if item["purpose"] == "top_up"]
-        new_change = [item["amount_mojos"] for item in successor
-                      if item["purpose"] == "top_up"]
         if (
-            len(old_fees) != 4 or old_fees != new_fees
-            or len(old_change) != 1 or len(new_change) != 1
+            sorted((item["amount_mojos"], item["purpose"]) for item in original)
+            != expected_old
+        ):
+            raise ValueError("RBF original outputs differ from prep contract")
+        old_fees = sorted(
+            item["amount_mojos"]
+            for item in original
+            if item["purpose"] == "fee_reserve"
+        )
+        new_fees = sorted(
+            item["amount_mojos"]
+            for item in successor
+            if item["purpose"] == "fee_reserve"
+        )
+        old_change = [
+            item["amount_mojos"] for item in original if item["purpose"] == "top_up"
+        ]
+        new_change = [
+            item["amount_mojos"] for item in successor if item["purpose"] == "top_up"
+        ]
+        if (
+            len(old_fees) != 4
+            or old_fees != new_fees
+            or len(old_change) != 1
+            or len(new_change) != 1
             or old_change[0] - new_change[0] != fee
             or {item["coin_id"] for item in original}
             == {item["coin_id"] for item in successor}
         ):
             raise ValueError("RBF successor is not a fee-only replacement")
-        identity_digest = hashlib.sha256(op["wallet_identity_json"].encode()).hexdigest()
+        identity_digest = hashlib.sha256(
+            op["wallet_identity_json"].encode()
+        ).hexdigest()
         immutable = {
             "operation_id": safe_operation,
             "original_transaction_id": old_tx,
@@ -30656,7 +30714,9 @@ def prepare_coin_prep_rbf_attempt(
         conn.execute(
             "INSERT INTO coin_prep_rbf_attempts (attempt_id,"
             + ",".join(immutable)
-            + ") VALUES (" + ",".join("?" for _ in range(len(immutable) + 1)) + ")",
+            + ") VALUES ("
+            + ",".join("?" for _ in range(len(immutable) + 1))
+            + ")",
             (attempt_id, *immutable.values()),
         )
         row = conn.execute(
@@ -30700,7 +30760,8 @@ def record_coin_prep_rbf_sign_start(
         operation = conn.execute(
             "SELECT outcome,effect_claim_token,wallet_identity_json "
             "FROM coin_prep_operations "
-            "WHERE operation_id=?", (candidate["operation_id"],)
+            "WHERE operation_id=?",
+            (candidate["operation_id"],),
         ).fetchone()
         if lease is None or latch is None or operation is None:
             raise ValueError("RBF sign authority is incomplete")
@@ -30717,28 +30778,36 @@ def record_coin_prep_rbf_sign_start(
             or lease["expires_at"] is None
             or _parse_iso_timestamp(
                 lease["expires_at"], "RBF sign lease expiry", require_timezone=True
-            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
             or latch["state"] != "tripped"
             or latch["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
             or latch["generation"] != candidate["latch_generation"]
-            or json.loads(latch["blocking_operation_ids_json"]) != sorted([
-                candidate["operation_id"],
-                f"wallet-effect:{operation['effect_claim_token']}",
-            ])
+            or json.loads(latch["blocking_operation_ids_json"])
+            != sorted(
+                [
+                    candidate["operation_id"],
+                    f"wallet-effect:{operation['effect_claim_token']}",
+                ]
+            )
             or operation["outcome"] != "SUBMITTED_UNKNOWN"
-            or hashlib.sha256(
-                operation["wallet_identity_json"].encode()
-            ).hexdigest() != candidate["wallet_identity_sha256"]
+            or hashlib.sha256(operation["wallet_identity_json"].encode()).hexdigest()
+            != candidate["wallet_identity_sha256"]
             or _parse_iso_timestamp(
-                candidate["review_expires_at"], "RBF sign review expiry",
+                candidate["review_expires_at"],
+                "RBF sign review expiry",
                 require_timezone=True,
-            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
         ):
             raise ValueError("RBF sign lease, latch or review has changed")
-        if conn.execute(
-            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
-            (candidate["operation_id"],),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (candidate["operation_id"],),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("RBF submit already started")
         active = conn.execute(
             "SELECT sign.attempt_id FROM coin_prep_rbf_sign_intents AS sign "
@@ -30749,10 +30818,13 @@ def record_coin_prep_rbf_sign_start(
         ).fetchone()
         if active is not None:
             raise ValueError("RBF prior sign intent remains unresolved")
-        if conn.execute(
-            "SELECT 1 FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
-            (attempt_id,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("RBF sign attempt is already spent")
         conn.execute(
             "INSERT INTO coin_prep_rbf_sign_intents "
@@ -30764,8 +30836,7 @@ def record_coin_prep_rbf_sign_start(
             "INSERT INTO coin_prep_rbf_sign_owners "
             "(attempt_id,owner_pid,owner_host,lease_acquired_at) "
             "VALUES (?,?,?,?)",
-            (attempt_id, lease["owner_pid"], lease["owner_host"],
-             lease["acquired_at"]),
+            (attempt_id, lease["owner_pid"], lease["owner_host"], lease["acquired_at"]),
         )
         conn.commit()
         return {"attempt_id": attempt_id, "sign_started": True}
@@ -30776,10 +30847,15 @@ def record_coin_prep_rbf_sign_start(
         conn.close()
 
 
-_RBF_SIGN_NO_SUBMIT_REASONS = frozenset({
-    "SIGN_REFUSED", "SIGNED_BYTES_INVALID", "PRE_SUBMIT_EXCEPTION",
-    "SIGN_ABORTED_BEFORE_SUBMIT", "CRASH_BEFORE_SUBMIT_MARKER",
-})
+_RBF_SIGN_NO_SUBMIT_REASONS = frozenset(
+    {
+        "SIGN_REFUSED",
+        "SIGNED_BYTES_INVALID",
+        "PRE_SUBMIT_EXCEPTION",
+        "SIGN_ABORTED_BEFORE_SUBMIT",
+        "CRASH_BEFORE_SUBMIT_MARKER",
+    }
+)
 
 
 def get_recoverable_coin_prep_rbf_sign_intents() -> list[Dict[str, Any]]:
@@ -30818,9 +30894,8 @@ def record_coin_prep_rbf_sign_no_submit(
     attempt_id = _fee_digest(attempt_id)
     if (
         type(receipt) is not dict
-        or set(receipt) != {
-            "attempt_id", "reason_code", "submit_rpc_attempted", "evidence_sha256"
-        }
+        or set(receipt)
+        != {"attempt_id", "reason_code", "submit_rpc_attempted", "evidence_sha256"}
         or receipt["attempt_id"] != attempt_id
         or receipt["reason_code"] not in _RBF_SIGN_NO_SUBMIT_REASONS
         or receipt["submit_rpc_attempted"] is not False
@@ -30829,9 +30904,7 @@ def record_coin_prep_rbf_sign_no_submit(
     _fee_digest(receipt["evidence_sha256"])
     if type(prior_owner_liveness_proven_dead) is not bool:
         raise ValueError("RBF owner liveness proof is malformed")
-    encoded = _canonical_json_text(
-        receipt, "RBF no-submit receipt", expected_type=dict
-    )
+    encoded = _canonical_json_text(receipt, "RBF no-submit receipt", expected_type=dict)
     digest = hashlib.sha256(encoded.encode()).hexdigest()
     conn = _stability_connection()
     try:
@@ -30842,10 +30915,13 @@ def record_coin_prep_rbf_sign_no_submit(
         ).fetchone()
         if sign is None:
             raise ValueError("RBF sign intent is absent")
-        if conn.execute(
-            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
-            (sign["operation_id"],),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+                (sign["operation_id"],),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("RBF submit-start marker already exists")
         existing = conn.execute(
             "SELECT * FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
@@ -30870,9 +30946,11 @@ def record_coin_prep_rbf_sign_no_submit(
                     and (
                         lease["expires_at"] is None
                         or _parse_iso_timestamp(
-                            lease["expires_at"], "RBF prior lease expiry",
+                            lease["expires_at"],
+                            "RBF prior lease expiry",
                             require_timezone=True,
-                        ) > _parse_iso_timestamp(
+                        )
+                        > _parse_iso_timestamp(
                             now, "RBF current time", require_timezone=True
                         )
                     )
@@ -30896,7 +30974,10 @@ def record_coin_prep_rbf_sign_no_submit(
 
 
 def record_coin_prep_rbf_submit_start(
-    attempt_id: str, *, owner_run_id: str, lease_version: int,
+    attempt_id: str,
+    *,
+    owner_run_id: str,
+    lease_version: int,
     started_at: Any = None,
 ) -> Dict[str, Any]:
     """Commit the one-shot boundary before the first Sage submit RPC.
@@ -30910,10 +30991,14 @@ def record_coin_prep_rbf_submit_start(
     when = _stability_wall_clock()
     if started_at is not None:
         supplied = _stability_timestamp(started_at, "RBF dispatch start")
-        drift = abs((
-            _parse_iso_timestamp(supplied, "RBF supplied time", require_timezone=True)
-            - _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
-        ).total_seconds())
+        drift = abs(
+            (
+                _parse_iso_timestamp(
+                    supplied, "RBF supplied time", require_timezone=True
+                )
+                - _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+            ).total_seconds()
+        )
         if drift > 5:
             raise ValueError("RBF dispatch time is not current")
     conn = _stability_connection()
@@ -30948,19 +31033,23 @@ def record_coin_prep_rbf_submit_start(
             or owned["expires_at"] is None
             or _parse_iso_timestamp(
                 owned["expires_at"], "RBF lease expiry", require_timezone=True
-            ) <= _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
             or fence["state"] != "tripped"
             or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
             or fence["generation"] != candidate["latch_generation"]
             or _parse_iso_timestamp(
-                candidate["review_expires_at"], "RBF review expiry",
+                candidate["review_expires_at"],
+                "RBF review expiry",
                 require_timezone=True,
-            ) <= _parse_iso_timestamp(when, "RBF dispatch time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(when, "RBF dispatch time", require_timezone=True)
         ):
             raise ValueError("RBF dispatch lease, latch or review has changed")
         operation = conn.execute(
             "SELECT outcome,effect_claim_token FROM coin_prep_operations "
-            "WHERE operation_id=?", (candidate["operation_id"],)
+            "WHERE operation_id=?",
+            (candidate["operation_id"],),
         ).fetchone()
         if operation is None or operation["outcome"] != "SUBMITTED_UNKNOWN":
             raise ValueError("RBF original operation is no longer pending")
@@ -30968,14 +31057,17 @@ def record_coin_prep_rbf_submit_start(
             "SELECT wallet_identity_json FROM coin_prep_operations WHERE operation_id=?",
             (candidate["operation_id"],),
         ).fetchone()
-        if hashlib.sha256(identity_row["wallet_identity_json"].encode()).hexdigest() != (
-            candidate["wallet_identity_sha256"]
+        if (
+            hashlib.sha256(identity_row["wallet_identity_json"].encode()).hexdigest()
+            != (candidate["wallet_identity_sha256"])
         ):
             raise ValueError("RBF dispatch wallet identity changed")
-        if json.loads(fence["blocking_operation_ids_json"]) != sorted([
-            candidate["operation_id"],
-            f"wallet-effect:{operation['effect_claim_token']}",
-        ]):
+        if json.loads(fence["blocking_operation_ids_json"]) != sorted(
+            [
+                candidate["operation_id"],
+                f"wallet-effect:{operation['effect_claim_token']}",
+            ]
+        ):
             raise ValueError("RBF dispatch blocker set changed")
         sign_intent = conn.execute(
             "SELECT * FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
@@ -31104,11 +31196,14 @@ def authorize_coin_prep_rbf_rescue_target(
             or owned["expires_at"] is None
             or _parse_iso_timestamp(
                 owned["expires_at"], "RBF lease expiry", require_timezone=True
-            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
             or _parse_iso_timestamp(
-                candidate["review_expires_at"], "RBF review expiry",
+                candidate["review_expires_at"],
+                "RBF review expiry",
                 require_timezone=True,
-            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            )
+            <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
         ):
             raise ValueError("RBF rescue authority changed")
         if allow_dispatched:
@@ -31121,9 +31216,8 @@ def authorize_coin_prep_rbf_rescue_target(
                 raise ValueError("RBF one-shot dispatch marker is absent or changed")
         elif marker is not None:
             raise ValueError("RBF rescue already dispatched")
-        elif (
-            sign_receipt is not None
-            or (active_sign is not None and active_sign["attempt_id"] != attempt_id)
+        elif sign_receipt is not None or (
+            active_sign is not None and active_sign["attempt_id"] != attempt_id
         ):
             raise ValueError("RBF sign phase belongs to another active attempt")
         return {
@@ -31223,10 +31317,9 @@ def adopt_coin_prep_rbf_successor(
         expiry_dt = _parse_iso_timestamp(
             expiry, "RBF successor expiry", require_timezone=True
         )
-        if (
-            not timedelta(seconds=-5) <= now_dt - observed_dt <= timedelta(seconds=30)
-            or not now_dt < expiry_dt <= now_dt + timedelta(seconds=120)
-        ):
+        if not timedelta(seconds=-5) <= now_dt - observed_dt <= timedelta(
+            seconds=30
+        ) or not now_dt < expiry_dt <= now_dt + timedelta(seconds=120):
             raise ValueError("RBF adoption observation or lease expiry is stale")
         op = conn.execute(
             "SELECT * FROM coin_prep_operations WHERE operation_id=?",
@@ -31271,9 +31364,11 @@ def adopt_coin_prep_rbf_successor(
                 not prior_owner_liveness_proven_dead
                 or prior["expires_at"] is None
                 or _parse_iso_timestamp(
-                    prior["expires_at"], "RBF prior lease expiry",
+                    prior["expires_at"],
+                    "RBF prior lease expiry",
                     require_timezone=True,
-                ) > now_dt
+                )
+                > now_dt
                 or prior["released_at"] is not None
                 or prior["wallet_fingerprint_hash"] != wallet_hash
                 or prior["network"] != identity["network_id"]
@@ -31304,8 +31399,17 @@ def adopt_coin_prep_rbf_successor(
             "expires_at=?,released_at=NULL,updated_at=? WHERE singleton_id=1 "
             "AND lease_version=? AND active=?",
             (
-                owner, pid, host, wallet_hash, identity["network_id"], now, now,
-                expiry, now, version, prior["active"],
+                owner,
+                pid,
+                host,
+                wallet_hash,
+                identity["network_id"],
+                now,
+                now,
+                expiry,
+                now,
+                version,
+                prior["active"],
             ),
         )
         if changed.rowcount != 1:
@@ -31369,13 +31473,20 @@ def resolve_coin_prep_rbf_attempt(
     outputs = json.loads(
         attempt[
             "original_outputs_json"
-            if winner == "ORIGINAL" else "successor_outputs_json"
+            if winner == "ORIGINAL"
+            else "successor_outputs_json"
         ]
     )
-    if type(authoritative_view) is dict and type(authoritative_view.get("coins")) is list:
+    if (
+        type(authoritative_view) is dict
+        and type(authoritative_view.get("coins")) is list
+    ):
         observed_by_id = {
-            _reconciliation_coin_identity(row.get("coin_id"), "RBF observed output")[0]: row
-            for row in authoritative_view["coins"] if type(row) is dict
+            _reconciliation_coin_identity(row.get("coin_id"), "RBF observed output")[
+                0
+            ]: row
+            for row in authoritative_view["coins"]
+            if type(row) is dict
         }
         for output in outputs:
             observed = observed_by_id.get(output["coin_id"])

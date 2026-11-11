@@ -3471,7 +3471,10 @@ def _rbf_coin_spend_bytes(raw_spends: Any) -> Optional[list[bytes]]:
         from chia_rs import CoinSpend
 
         def prefixed(value: Any) -> str:
-            if type(value) is not str or re.fullmatch(r"(?:0x)?[0-9a-fA-F]*", value) is None:
+            if (
+                type(value) is not str
+                or re.fullmatch(r"(?:0x)?[0-9a-fA-F]*", value) is None
+            ):
                 raise ValueError("invalid coin spend bytes")
             return value if value.startswith("0x") else f"0x{value}"
 
@@ -3578,12 +3581,14 @@ def submit_reviewed_coin_prep_rbf_rpc(
         submitted.get("success") is False
         or submitted.get("error")
         or submitted.get("reason")
-        or str(submitted.get("status") or "").lower()
-        in {"failed", "error", "rejected"}
+        or str(submitted.get("status") or "").lower() in {"failed", "error", "rejected"}
     ):
         return refuse("RBF_SUBMIT_REJECTED", attempted=True)
     reported_id = _response_transaction_id(submitted)
-    if reported_id is not None and reported_id.lower().removeprefix("0x") != transaction_id:
+    if (
+        reported_id is not None
+        and reported_id.lower().removeprefix("0x") != transaction_id
+    ):
         return refuse("RBF_SUBMIT_ID_MISMATCH", attempted=True)
     return {
         "success": True,

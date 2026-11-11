@@ -29,12 +29,11 @@ def _output(index, amount, purpose, *, successor=False):
 def _priced(*, expires=None):
     observed = int(time.time())
     expires = observed + 60 if expires is None else expires
-    original = [
-        _output(index, RESERVE, "fee_reserve") for index in range(4)
-    ] + [_output(4, OLD_CHANGE, "top_up")]
+    original = [_output(index, RESERVE, "fee_reserve") for index in range(4)] + [
+        _output(4, OLD_CHANGE, "top_up")
+    ]
     successor = [
-        _output(index, RESERVE, "fee_reserve", successor=True)
-        for index in range(4)
+        _output(index, RESERVE, "fee_reserve", successor=True) for index in range(4)
     ] + [_output(4, OLD_CHANGE - FEE, "top_up", successor=True)]
     return {
         "available": True,
@@ -72,16 +71,13 @@ def _install(monkeypatch, priced):
     monkeypatch.setattr(
         service,
         "price_pending_coin_prep_replacement",
-        lambda operation, tx: (
-            calls.append(("price", operation, tx)) or priced
-        ),
+        lambda operation, tx: calls.append(("price", operation, tx)) or priced,
     )
     monkeypatch.setattr(
         service,
         "get_coin_prep_rbf_preview_authority",
         lambda operation: (
-            calls.append(("authority", operation))
-            or {"latch": {"generation": 7}}
+            calls.append(("authority", operation)) or {"latch": {"generation": 7}}
         ),
     )
 
@@ -117,9 +113,10 @@ def test_review_seals_exact_fee_outputs_and_quote_expiry_without_unsigned(monkey
     assert review["unsigned_sha256"] == DIGEST
     assert "coin_spends" not in json.dumps(result)
     assert "must not reach review" not in json.dumps(result)
-    assert result["review_sha256"] == hashlib.sha256(
-        service._canonical_json(review).encode()
-    ).hexdigest()
+    assert (
+        result["review_sha256"]
+        == hashlib.sha256(service._canonical_json(review).encode()).hexdigest()
+    )
     assert calls[0] == ("price", OPERATION, TX)
     assert calls[-1][0] == "prepare"
     recorded = calls[-1][1]

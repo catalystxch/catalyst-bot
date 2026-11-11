@@ -9,6 +9,7 @@ def render_recovery_review(snapshot: dict) -> str:
     Admission, exact-operation binding and lease checks belong to the caller.
     The caller alone decides whether the reviewed submission action is enabled.
     """
+
     def text(key):
         value = snapshot.get(key)
         return escape(str(value)) if value is not None else "Unavailable"
@@ -17,8 +18,11 @@ def render_recovery_review(snapshot: dict) -> str:
         value = snapshot.get(key)
         if type(value) is int and value >= 0:
             digits = str(value)
-        elif type(value) is str and value.isascii() and value.isdigit() and (
-            value == "0" or not value.startswith("0")
+        elif (
+            type(value) is str
+            and value.isascii()
+            and value.isdigit()
+            and (value == "0" or not value.startswith("0"))
         ):
             digits = value
         else:
@@ -40,46 +44,72 @@ def render_recovery_review(snapshot: dict) -> str:
         ("Review digest", text("review_digest")),
         ("Replacement attempt", text("attempt_id")),
     )
+
     def rows(indices):
         return "".join(
             f"<dt>{fields[index][0]}</dt><dd>{fields[index][1]}</dd>"
             for index in indices
         )
+
     inputs = snapshot.get("original_input_coin_ids")
-    input_rows = "".join(
-        "<li>" + escape(value) + "</li>"
-        for value in inputs if type(value) is str
-    ) if type(inputs) is list else "<li>Unavailable</li>"
+    input_rows = (
+        "".join(
+            "<li>" + escape(value) + "</li>" for value in inputs if type(value) is str
+        )
+        if type(inputs) is list
+        else "<li>Unavailable</li>"
+    )
     outputs = snapshot.get("outputs")
-    output_rows = "".join(
-        "<li><strong>" + escape({"fee_reserve": "Fee reserve", "top_up": "Wallet change"}.get(
-            row.get("purpose"), "Output")) + "</strong><br>"
-        + escape(str(row.get("coin_id", row.get("puzzle_hash", "Unavailable"))))
-        + " — " + escape(str(row.get("amount_mojos", "Unavailable")))
-        + " mojos</li>"
-        for row in outputs if type(row) is dict
-    ) if type(outputs) is list else "<li>Unavailable</li>"
+    output_rows = (
+        "".join(
+            "<li><strong>"
+            + escape(
+                {"fee_reserve": "Fee reserve", "top_up": "Wallet change"}.get(
+                    row.get("purpose"), "Output"
+                )
+            )
+            + "</strong><br>"
+            + escape(str(row.get("coin_id", row.get("puzzle_hash", "Unavailable"))))
+            + " — "
+            + escape(str(row.get("amount_mojos", "Unavailable")))
+            + " mojos</li>"
+            for row in outputs
+            if type(row) is dict
+        )
+        if type(outputs) is list
+        else "<li>Unavailable</li>"
+    )
     consent = ""
     if snapshot.get("preview_available") is True:
-        disabled = "" if (snapshot.get("submission_available") is True
-                           and snapshot.get("replacement_dispatched") is not True) else " disabled"
+        disabled = (
+            ""
+            if (
+                snapshot.get("submission_available") is True
+                and snapshot.get("replacement_dispatched") is not True
+            )
+            else " disabled"
+        )
         consent = (
             '<form class="consent card" method="post" action="/api/safety/coin-prep-recovery-submit">'
-            '<h2>Approve this exact replacement</h2>'
+            "<h2>Approve this exact replacement</h2>"
             '<input type="hidden" name="attempt_id" value="' + text("attempt_id") + '">'
-            '<input type="hidden" name="review_digest" value="' + text("review_digest") + '">'
+            '<input type="hidden" name="review_digest" value="'
+            + text("review_digest")
+            + '">'
             '<label><input type="checkbox" name="confirmed" value="on" required> '
-            'I approve the replacement fee of ' + amount("fee_mojos")
-            + ' for the exact transaction and outputs shown above.</label>'
-            '<button type="submit"' + disabled + '>Submit this replacement</button>'
-            '</form>'
+            "I approve the replacement fee of "
+            + amount("fee_mojos")
+            + " for the exact transaction and outputs shown above.</label>"
+            '<button type="submit"' + disabled + ">Submit this replacement</button>"
+            "</form>"
         )
     footer = (
         "Trading stays blocked until independent chain confirmation."
-        if snapshot.get("submission_available") is True else
-        "Submission is not available in this review. No wallet action can be initiated from this page."
+        if snapshot.get("submission_available") is True
+        else "Submission is not available in this review. No wallet action can be initiated from this page."
     )
-    return """<!doctype html><html lang="en"><head><meta charset="utf-8">
+    return (
+        """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Coin Prep recovery review · CATalyst</title>
 <style>
@@ -147,17 +177,33 @@ the pending operation is independently reconciled.</p></div></aside>
 <button type="submit">Build unsigned replacement preview</button></form>
 <div class="grid"><section class="card" aria-labelledby="original-heading">
 <div class="card-header"><h2 id="original-heading">Original transaction</h2><span class="tag">Pending</span></div>
-<dl>""" + rows((1, 2, 4)) + """</dl></section>
+<dl>"""
+        + rows((1, 2, 4))
+        + """</dl></section>
 <section class="card" aria-labelledby="preview-heading"><div class="card-header">
-<h2 id="preview-heading">Replacement preview</h2><span class="tag preview">Unsigned</span></div><dl>""" + rows((3, 5, 6)) + (
-        "</dl></section></div><details class=\"card details\"><summary>Inspect exact inputs and outputs</summary>"
-        "<div class=\"detail-grid\"><section><h3>Original input coins</h3><ul>" + input_rows
-        + "</ul></section><section><h3>Replacement outputs</h3><ul>" + output_rows
-        + "</ul></section></div></details><section class=\"card review-meta\">"
-        "<div class=\"card-header\"><h2>Review evidence</h2></div><dl>" + rows((0, 7, 8, 9, 10))
-        + "</dl></section>" + consent + "<footer><p>" + footer + "</p>"
-        + ("<button disabled>Submission unavailable</button>" if snapshot.get("submission_available") is not True else "")
-        + "</footer></main></body></html>"
+<h2 id="preview-heading">Replacement preview</h2><span class="tag preview">Unsigned</span></div><dl>"""
+        + rows((3, 5, 6))
+        + (
+            '</dl></section></div><details class="card details"><summary>Inspect exact inputs and outputs</summary>'
+            '<div class="detail-grid"><section><h3>Original input coins</h3><ul>'
+            + input_rows
+            + "</ul></section><section><h3>Replacement outputs</h3><ul>"
+            + output_rows
+            + '</ul></section></div></details><section class="card review-meta">'
+            '<div class="card-header"><h2>Review evidence</h2></div><dl>'
+            + rows((0, 7, 8, 9, 10))
+            + "</dl></section>"
+            + consent
+            + "<footer><p>"
+            + footer
+            + "</p>"
+            + (
+                "<button disabled>Submission unavailable</button>"
+                if snapshot.get("submission_available") is not True
+                else ""
+            )
+            + "</footer></main></body></html>"
+        )
     )
 
 
@@ -189,21 +235,21 @@ def render_recovery_result(
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<title>Coin Prep recovery · CATalyst</title><style>'
-        ':root{color-scheme:dark;font-family:Inter,Segoe UI,sans-serif}'
-        'body{margin:0;min-height:100vh;background:#0B0E14;color:#E6EDF3}'
-        'header{padding:18px 28px;border-bottom:1px solid #2b3142;background:#080B11}'
-        'main{max-width:760px;margin:64px auto;padding:28px;background:#111620;'
-        'border:1px solid #2b3142;border-radius:12px}'
-        'h1{font-size:28px;margin:0 0 12px}p{color:#8B949E;line-height:1.6}'
-        'dl{display:grid;grid-template-columns:150px 1fr;gap:12px;margin:28px 0}'
-        'dt{color:#8B949E}dd{margin:0;overflow-wrap:anywhere;font-family:monospace}'
-        'a{display:inline-block;padding:11px 16px;border-radius:7px;'
-        'background:#6366F1;color:white;text-decoration:none;font-weight:600}'
-        '@media(max-width:650px){main{margin:24px 16px}dl{display:block}dt{margin-top:12px}}'
-        '</style></head><body><header>CATalyst · Wallet recovery</header><main>'
-        '<h1>' + title + '</h1><p>' + message + '</p><dl>'
-        '<dt>Attempt</dt><dd>' + safe_attempt + '</dd>'
-        '<dt>Reviewed fee</dt><dd>' + safe_fee + ' mojos</dd></dl>'
+        "<title>Coin Prep recovery · CATalyst</title><style>"
+        ":root{color-scheme:dark;font-family:Inter,Segoe UI,sans-serif}"
+        "body{margin:0;min-height:100vh;background:#0B0E14;color:#E6EDF3}"
+        "header{padding:18px 28px;border-bottom:1px solid #2b3142;background:#080B11}"
+        "main{max-width:760px;margin:64px auto;padding:28px;background:#111620;"
+        "border:1px solid #2b3142;border-radius:12px}"
+        "h1{font-size:28px;margin:0 0 12px}p{color:#8B949E;line-height:1.6}"
+        "dl{display:grid;grid-template-columns:150px 1fr;gap:12px;margin:28px 0}"
+        "dt{color:#8B949E}dd{margin:0;overflow-wrap:anywhere;font-family:monospace}"
+        "a{display:inline-block;padding:11px 16px;border-radius:7px;"
+        "background:#6366F1;color:white;text-decoration:none;font-weight:600}"
+        "@media(max-width:650px){main{margin:24px 16px}dl{display:block}dt{margin-top:12px}}"
+        "</style></head><body><header>CATalyst · Wallet recovery</header><main>"
+        "<h1>" + title + "</h1><p>" + message + "</p><dl>"
+        "<dt>Attempt</dt><dd>" + safe_attempt + "</dd>"
+        "<dt>Reviewed fee</dt><dd>" + safe_fee + " mojos</dd></dl>"
         '<a href="/">Return to recovery</a></main></body></html>'
     )

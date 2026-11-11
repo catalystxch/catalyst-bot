@@ -29,9 +29,7 @@ def quote_required_replacement_fee(cost: int) -> dict:
         return {"available": False, "reason": "RBF_FEE_ESTIMATE_INVALID"}
     # The normalized quote omits the provider's maximum. Read the cached
     # original only if it is the exact same observation.
-    provider = get_suggested_transaction_fee(
-        cost=cost, target_seconds=target_seconds
-    )
+    provider = get_suggested_transaction_fee(cost=cost, target_seconds=target_seconds)
     same_observation = (
         provider.get("available") is True
         and provider.get("observed_at") == quote.get("observed_at")

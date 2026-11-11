@@ -1361,9 +1361,7 @@ class MutationGate:
         self._active_mutations: dict[str, str] = {}
         self._active_wallet_mutations: set[str] = set()
         self._refresh_abort_cleanup_permits: dict[str, tuple[str, str, int]] = {}
-        self._coin_prep_rbf_rescue_permits: dict[
-            str, tuple[str, str, int, str]
-        ] = {}
+        self._coin_prep_rbf_rescue_permits: dict[str, tuple[str, str, int, str]] = {}
         self._exclusive_mutation_permit: Optional[str] = None
         self._wallet_lifecycle_transitioning = False
         self._quiescing = False
@@ -2401,7 +2399,10 @@ class MutationGate:
             self._active_mutations[token] = operation
             self._active_wallet_mutations.add(token)
             self._coin_prep_rbf_rescue_permits[token] = (
-                attempt_id, operation_id, expected_latch_generation, unsigned_sha256
+                attempt_id,
+                operation_id,
+                expected_latch_generation,
+                unsigned_sha256,
             )
             return token
 
@@ -2423,7 +2424,12 @@ class MutationGate:
             self.require_active_wallet_mutation_permit(permit, operation)
             if (
                 self._coin_prep_rbf_rescue_permits.get(permit)
-                != (attempt_id, operation_id, expected_latch_generation, unsigned_sha256)
+                != (
+                    attempt_id,
+                    operation_id,
+                    expected_latch_generation,
+                    unsigned_sha256,
+                )
                 or self._quiescing
                 or self._wallet_lifecycle_transitioning
                 or self._exclusive_mutation_permit not in {None, permit}
@@ -3811,9 +3817,7 @@ def require_fresh_coin_prep_rbf_rescue_wallet_continuation(
         )
         if decision.get("allowed") is not True:
             raise MutationBlocked(decision.get("reason"), operation)
-        runtime._last_wallet_identity_observed_at_utc = str(
-            decision["observed_at_utc"]
-        )
+        runtime._last_wallet_identity_observed_at_utc = str(decision["observed_at_utc"])
     return binding, adapter, decision
 
 

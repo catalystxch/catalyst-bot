@@ -44,26 +44,32 @@ def _outputs(value: Any) -> list[dict]:
         coin_id = _hex_id(item.get("coin_id"))
         amount = item.get("amount_mojos")
         purpose = item.get("purpose")
-        if type(amount) is not int or amount <= 0 or purpose not in {
-            "fee_reserve", "top_up"
-        }:
+        if (
+            type(amount) is not int
+            or amount <= 0
+            or purpose not in {"fee_reserve", "top_up"}
+        ):
             raise ValueError("RBF review output is malformed")
-        result.append(
-            {"coin_id": coin_id, "amount_mojos": amount, "purpose": purpose}
-        )
+        result.append({"coin_id": coin_id, "amount_mojos": amount, "purpose": purpose})
     if len({item["coin_id"] for item in result}) != 5:
         raise ValueError("RBF review output IDs are duplicated")
     if sorted(item["purpose"] for item in result) != [
-        "fee_reserve", "fee_reserve", "fee_reserve", "fee_reserve", "top_up"
+        "fee_reserve",
+        "fee_reserve",
+        "fee_reserve",
+        "fee_reserve",
+        "top_up",
     ]:
         raise ValueError("RBF review output purposes are malformed")
     return sorted(result, key=lambda item: item["coin_id"])
 
 
 def _timestamp(epoch_seconds: int) -> str:
-    return datetime.fromtimestamp(epoch_seconds, timezone.utc).isoformat(
-        timespec="microseconds"
-    ).replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(epoch_seconds, timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def prepare_coin_prep_rbf_review(
@@ -85,7 +91,8 @@ def prepare_coin_prep_rbf_review(
         if type(priced) is not dict or priced.get("available") is not True:
             reason = priced.get("reason") if type(priced) is dict else None
             return refuse(
-                reason if type(reason) is str and reason
+                reason
+                if type(reason) is str and reason
                 else "RBF_REVIEW_PRICING_UNAVAILABLE"
             )
         preview = priced["preview"]
@@ -114,20 +121,20 @@ def prepare_coin_prep_rbf_review(
         original = _outputs(preview["original_outputs"])
         successor = _outputs(preview["successor_outputs"])
         old_reserves = sorted(
-            item["amount_mojos"] for item in original
+            item["amount_mojos"]
+            for item in original
             if item["purpose"] == "fee_reserve"
         )
         new_reserves = sorted(
-            item["amount_mojos"] for item in successor
+            item["amount_mojos"]
+            for item in successor
             if item["purpose"] == "fee_reserve"
         )
         old_change = next(
-            item["amount_mojos"] for item in original
-            if item["purpose"] == "top_up"
+            item["amount_mojos"] for item in original if item["purpose"] == "top_up"
         )
         new_change = next(
-            item["amount_mojos"] for item in successor
-            if item["purpose"] == "top_up"
+            item["amount_mojos"] for item in successor if item["purpose"] == "top_up"
         )
         if old_reserves != new_reserves or old_change - new_change != fee:
             return refuse("RBF_REVIEW_NOT_FEE_ONLY")

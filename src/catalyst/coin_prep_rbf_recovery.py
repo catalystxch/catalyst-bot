@@ -90,7 +90,10 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         if mutation_gate.wallet_identity_binding_payload(binding) != binding_payload:
             return None
         identity = get_wallet_identity_for_recovery()
-        if mutation_gate.validate_wallet_identity(binding, identity).get("allowed") is not True:
+        if (
+            mutation_gate.validate_wallet_identity(binding, identity).get("allowed")
+            is not True
+        ):
             return None
         sync = get_wallet_sync_status()
         if type(sync) is not dict or sync.get("synced") is not True:
@@ -119,8 +122,10 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         spent = transaction.get("spent")
         created = transaction.get("created")
         if (
-            type(spent) is not list or type(created) is not list
-            or len(spent) > 128 or len(created) > 128
+            type(spent) is not list
+            or type(created) is not list
+            or len(spent) > 128
+            or len(created) > 128
         ):
             return None
         spent_flows = [_xch_flow(item) for item in spent]
@@ -134,15 +139,18 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         ):
             return None
         external = {
-            coin_id: amount for coin_id, amount in created_flows
+            coin_id: amount
+            for coin_id, amount in created_flows
             if coin_id not in spent_ids
         }
         if source_amount < sum(external.values()):
             return None
-        original_by_id = {_id(item["coin_id"]): _amount(item["amount_mojos"])
-                          for item in original}
-        successor_by_id = {_id(item["coin_id"]): _amount(item["amount_mojos"])
-                           for item in successor}
+        original_by_id = {
+            _id(item["coin_id"]): _amount(item["amount_mojos"]) for item in original
+        }
+        successor_by_id = {
+            _id(item["coin_id"]): _amount(item["amount_mojos"]) for item in successor
+        }
         original_wins = external == original_by_id
         successor_wins = external == successor_by_id
         if original_wins == successor_wins:
@@ -174,8 +182,11 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
                 or record.get("asset_id") not in (None, "xch")
             ):
                 return None
-            observed = {"coin_id": coin_id, "amount_mojos": output["amount_mojos"],
-                        "purpose": output["purpose"]}
+            observed = {
+                "coin_id": coin_id,
+                "amount_mojos": output["amount_mojos"],
+                "purpose": output["purpose"],
+            }
             spent_height = record.get("spent_height")
             if spent_height not in (None, 0):
                 if type(spent_height) is not int or spent_height <= 0:
@@ -187,8 +198,10 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
             "+00:00", "Z"
         )
         expires_text = (
-            observed_at + timedelta(seconds=binding.maximum_age_seconds)
-        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            (observed_at + timedelta(seconds=binding.maximum_age_seconds))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
         chain_view = {
             "complete": True,
             "network": binding.network_id,
@@ -196,8 +209,11 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
             "source_coin_id": source,
             "source_spent_height": source_height,
             "coins": [
-                {"coin_id": coin_id, "amount_mojos": amount,
-                 "confirmed_height": source_height if coin_id in external else None}
+                {
+                    "coin_id": coin_id,
+                    "amount_mojos": amount,
+                    "confirmed_height": source_height if coin_id in external else None,
+                }
                 for coin_id, amount in sorted(by_id.items())
             ],
         }
