@@ -7047,6 +7047,16 @@ _EXTERNAL_CANCEL_AUDIT_POLICY_SHA256 = hashlib.sha256(
     b"external-cancel-fee-audit:v1:task9-terminal-proof-separated-from-follow-budget"
 ).hexdigest()
 _EXTERNAL_CANCEL_AUDIT_TABLES = frozenset({"offer_external_cancel_fee_audits"})
+_COIN_PREP_RBF_SCHEMA_TABLES = frozenset(
+    {
+        "coin_prep_rbf_attempts",
+        "coin_prep_rbf_sign_intents",
+        "coin_prep_rbf_sign_owners",
+        "coin_prep_rbf_sign_no_submit",
+        "coin_prep_rbf_dispatches",
+        "coin_prep_rbf_resolutions",
+    }
+)
 
 
 def _external_cancel_audit_schema_completed(conn: sqlite3.Connection) -> bool:
@@ -8437,6 +8447,7 @@ def _migrate_stability_schema() -> None:
             | _FOLLOW_SCHEMA_TABLES
             | _FOLLOW_FEE_CEILING_SCHEMA_TABLES
             | _EXTERNAL_CANCEL_AUDIT_TABLES
+            | _COIN_PREP_RBF_SCHEMA_TABLES
         )
         if backfills_completed and legacy_missing_tables:
             raise RuntimeError("stability migration watermark contradicts schema")

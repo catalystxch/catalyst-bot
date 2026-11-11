@@ -880,6 +880,28 @@ def test_existing_stability_watermark_allows_unbounded_fee_marker_install(
     assert _integrity(isolated_database) == "ok"
 
 
+def test_existing_stability_watermark_allows_coin_prep_rbf_schema_install(
+    isolated_database,
+):
+    """An existing profile can install the recovery journal after its old watermark."""
+
+    database.init_database()
+    database.close_connection()
+    with sqlite3.connect(isolated_database) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM stability_migration_watermarks WHERE migration_key=?",
+            (database._STABILITY_BACKFILL_MIGRATION_KEY,),
+        ).fetchone()
+        for table in reversed(sorted(database._COIN_PREP_RBF_SCHEMA_TABLES)):
+            conn.execute(f"DROP TABLE {table}")
+        conn.commit()
+
+    database._migrate_stability_schema()
+
+    assert database._COIN_PREP_RBF_SCHEMA_TABLES <= _table_names(isolated_database)
+    assert _integrity(isolated_database) == "ok"
+
+
 def test_existing_stability_watermark_allows_refresh_abort_succession_install(
     isolated_database,
 ):
