@@ -1146,7 +1146,11 @@ def _passive_red_planning_prices(confidence):
         return None
     from thin_market_reference import select_thin_market_reference
 
-    reference = select_thin_market_reference(confidence, now=datetime.now(timezone.utc))
+    reference = select_thin_market_reference(
+        confidence,
+        now=datetime.now(timezone.utc),
+        allow_thin_move_for_setup=True,
+    )
     if reference is None:
         return None
     if reference.source == "current_book":

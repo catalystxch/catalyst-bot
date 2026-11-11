@@ -69,6 +69,34 @@ def _green_market_confidence(
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestPassiveRedSmartPlanning(unittest.TestCase):
+    def test_current_thin_move_can_be_used_for_setup_only(self):
+        from blueprints import smart_defaults
+        from thin_market_reference import select_thin_market_reference
+
+        now = datetime.now(timezone.utc)
+        confidence = SimpleNamespace(
+            state="RED",
+            derived_at=now,
+            manipulation_score=0,
+            pending_movement_refreshes=0,
+            provider_redundancy=1,
+            reason_codes=(
+                "out_of_range_depth_excluded",
+                "insufficient_ask_depth",
+                "single_provider_dependency",
+                "thin_move_pending_confirmation",
+            ),
+            observed_bid=Decimal("0.00005025"),
+            observed_ask=Decimal("0.00017945"),
+            evidence_digests=("a" * 64,),
+            observed_book_evidence_digests=("a" * 64,),
+        )
+        self.assertIsNone(select_thin_market_reference(confidence, now=now))
+        self.assertEqual(
+            smart_defaults._passive_red_planning_prices(confidence),
+            (Decimal("0.00005025"), Decimal("0.00011485"), Decimal("0.00017945")),
+        )
+
     def test_thin_two_sided_book_can_be_planned_without_fixed_price_band(self):
         from blueprints import smart_defaults
 

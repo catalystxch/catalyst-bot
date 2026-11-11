@@ -720,13 +720,60 @@ def test_thin_depth_move_requires_distinct_persistent_fresh_observations():
     )
 
 
+def test_thin_anchor_move_can_use_reviewed_persistent_observations():
+    permit = RunConsent.confirm(
+        scope=SCOPE, reviewed_digest=scope_digest(SCOPE), duration_hours=24, now=NOW
+    )
+    raw = confidence(
+        reason_codes=(
+            "out_of_range_depth_excluded",
+            "insufficient_ask_depth",
+            "single_provider_dependency",
+            "thin_move_pending_confirmation",
+        ),
+        derived_thresholds={"persistence_refreshes": 2, "persistence_jitter_bps": 100},
+    )
+    assert override_price_range(
+        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    ) is None
+    assert permit.price_range(
+        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    ) is None
+    raw.derived_at += timedelta(seconds=5)
+    assert permit.price_range(
+        raw, now=raw.derived_at, valid_until=raw.derived_at + timedelta(seconds=20)
+    ) == (Decimal("0.00005"), Decimal("0.000065"), Decimal("0.00008"))
+
+
+def test_reviewed_override_rejects_bid_or_ask_outside_configured_range(monkeypatch):
+    from config import cfg
+
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.00004"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00007"))
+    raw = confidence(reason_codes=("insufficient_ask_depth",))
+    assert override_price_range(
+        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    ) is None
+    raw.observed_ask = Decimal("0.000065")
+    raw.observed_bid = Decimal("0.00003")
+    assert override_price_range(
+        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
+    ) is None
+
+
 @pytest.mark.parametrize(
     "reasons",
     [
         ("material_move_pending_confirmation",),
+        ("thin_move_pending_confirmation",),
         (
             "insufficient_ask_depth",
             "material_move_pending_confirmation",
+            "hard_price_move_cap",
+        ),
+        (
+            "insufficient_ask_depth",
+            "thin_move_pending_confirmation",
             "hard_price_move_cap",
         ),
         (

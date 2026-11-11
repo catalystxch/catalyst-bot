@@ -77,12 +77,13 @@ def _digests(value: Any) -> tuple[str, ...] | None:
 
 
 def select_thin_market_reference(
-    confidence: Any, *, now: datetime
+    confidence: Any, *, now: datetime, allow_thin_move_for_setup: bool = False
 ) -> ThinMarketReference | None:
     """Use a current attributable two-sided book or a <=24h trusted anchor.
 
-    A poor depth rating is allowed. Conflicting, manipulated or unconfirmed
-    movement evidence is never converted into a usable reference.
+    A poor depth rating is allowed. Conflicting or manipulated evidence is
+    rejected. The setup-only option may use a current two-sided thin move to
+    draft settings; wallet-effect callers retain the unconfirmed-move guard.
     """
     current = _utc(now)
     derived = _utc(getattr(confidence, "derived_at", None))
@@ -94,6 +95,16 @@ def select_thin_market_reference(
     reasons = getattr(confidence, "reason_codes", ())
     if type(reasons) is not tuple or any(type(reason) is not str for reason in reasons):
         return None
+    if (
+        allow_thin_move_for_setup is True
+        and "thin_move_pending_confirmation" in reasons
+        and getattr(confidence, "pending_movement_refreshes", None) == 0
+        and _price(getattr(confidence, "observed_bid", None)) is not None
+        and _price(getattr(confidence, "observed_ask", None)) is not None
+    ):
+        reasons = tuple(
+            reason for reason in reasons if reason != "thin_move_pending_confirmation"
+        )
     if _UNSAFE_REASONS.intersection(reasons) or set(reasons) - _KNOWN_SAFE_REASONS:
         return None
     if getattr(confidence, "manipulation_score", None) != 0:

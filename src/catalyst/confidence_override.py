@@ -195,10 +195,10 @@ def override_price_range(confidence, *, now, valid_until, allow_thin_pending=Fal
         if (
             allow_thin_pending is True
             and "hard_price_move_cap" not in reasons
-            and "material_move_pending_confirmation" in reasons
             and reasons & {"insufficient_bid_depth", "insufficient_ask_depth"}
         ):
-            reasons.remove("material_move_pending_confirmation")
+            reasons.discard("material_move_pending_confirmation")
+            reasons.discard("thin_move_pending_confirmation")
         if (
             not -2 <= (current - derived).total_seconds() <= 30
             or current >= deadline
@@ -226,20 +226,17 @@ def override_price_range(confidence, *, now, valid_until, allow_thin_pending=Fal
             or bid > ask
         ):
             return None
-        if "hard_price_move_cap" in reasons:
-            from config import cfg
+        from config import cfg
 
-            hard_min = Decimal(str(getattr(cfg, "HARD_MIN_PRICE_XCH", 0)))
-            hard_max = Decimal(str(getattr(cfg, "HARD_MAX_PRICE_XCH", 0)))
-            if (
-                not hard_min.is_finite()
-                or not hard_max.is_finite()
-                or hard_min <= 0
-                or hard_min >= hard_max
-                or bid < hard_min
-                or ask > hard_max
-            ):
-                return None
+        hard_min = Decimal(str(getattr(cfg, "HARD_MIN_PRICE_XCH", 0)))
+        hard_max = Decimal(str(getattr(cfg, "HARD_MAX_PRICE_XCH", 0)))
+        if not hard_min.is_finite() or not hard_max.is_finite():
+            return None
+        configured_band = hard_min > 0 and hard_max > hard_min
+        if "hard_price_move_cap" in reasons and not configured_band:
+            return None
+        if configured_band and (bid < hard_min or ask > hard_max):
+            return None
         return bid, (bid + ask) / Decimal(2), ask
     except (AttributeError, TypeError, ValueError, ArithmeticError):
         return None
