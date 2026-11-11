@@ -202,6 +202,7 @@ def _run_claimed_wallet_effect(
     fee_mojos: int = 0,
     fee_coin_ids: Optional[List[str]] = None,
     _prep_contract: Optional[dict] = None,
+    _on_prepared=None,
 ):
     """Linearize one exact durable coin claim before adapter dispatch."""
 
@@ -318,6 +319,8 @@ def _run_claimed_wallet_effect(
                 effect_claim_generation=claim["generation"],
             )
             prepared_operation = dict(prepared["operation"])
+            if _on_prepared is not None:
+                _on_prepared(prepared_operation["operation_id"])
         except Exception as exc:
             retain_wallet_effect_claim_for_reconciliation(
                 claim["claim_token"],
@@ -2180,6 +2183,7 @@ class CoinManager:
         self._prep_running: bool = False
         self._topup_running: bool = False
         self._topup_thread: Optional[threading.Thread] = None
+        self._active_runtime_topup_prep_id: Optional[str] = None
 
         # F71: Coin reservation registry (see coin_reservations.py).
         # Short-lived reservations prevent trade-create and topup-reshape
@@ -7748,6 +7752,7 @@ class CoinManager:
                 with self._lock:
                     self._topup_running = False
                     self._topup_stop_requested = False
+                    self._active_runtime_topup_prep_id = None
                     if self._topup_thread is threading.current_thread():
                         self._topup_thread = None
             except Exception as _flag_err:
@@ -9608,6 +9613,22 @@ class CoinManager:
                         data={"coin_id": output["coin_id"][:18]},
                     )
                     return False
+            pending_status = mutation_gate.read_only_status()
+            release_args = None
+            if (
+                getattr(self, "_active_runtime_topup_prep_id", None)
+                == operation["operation_id"]
+                and pending_status.reason_code == "COIN_PREP_EFFECT_UNKNOWN"
+                and set(pending_status.blocking_operation_ids)
+                == {
+                    operation["operation_id"],
+                    f"wallet-effect:{operation['effect_claim_token']}",
+                }
+            ):
+                release_args = (
+                    pending_status.latch_generation,
+                    list(pending_status.blocking_operation_ids),
+                )
             record_coin_prep_operation_outcome(
                 operation["operation_id"],
                 outcome="CONFIRMED",
@@ -9621,6 +9642,16 @@ class CoinManager:
                     "expected_wallet_identity": expected_identity,
                 },
             )
+            if release_args is not None:
+                released = mutation_gate.release_resolved(*release_args)
+                if released.get("released") is not True:
+                    log_event(
+                        "warning",
+                        "runtime_topup_gate_release_pending",
+                        "Confirmed top-up could not release its exact mutation fence",
+                        data={"reason": released.get("reason")},
+                    )
+                    return False
             return True
         except Exception as exc:
             log_event(
@@ -9945,6 +9976,9 @@ class CoinManager:
                 fee_mojos=fee_mojos,
                 fee_coin_ids=fee_coin_ids,
                 _prep_contract=prep_contract,
+                _on_prepared=lambda operation_id: setattr(
+                    self, "_active_runtime_topup_prep_id", operation_id
+                ),
             )
             if effect_result is _WALLET_EFFECT_DENIED:
                 return False

@@ -6275,7 +6275,7 @@ def test_second_desktop_process_enters_alternate_port_diagnostics(monkeypatch):
     assert started == [reservation]
 
 
-def test_mutation_stop_handler_defers_only_exact_cancel_settlement(monkeypatch):
+def test_mutation_stop_handler_defers_only_exact_settlement(monkeypatch):
     import api_server
 
     stop_calls = []
@@ -6302,8 +6302,18 @@ def test_mutation_stop_handler_defers_only_exact_cancel_settlement(monkeypatch):
     assert deferred_reasons == ["UNRESOLVED_OPERATIONS"]
     assert stop_calls == []
 
+    api_server._mutation_stop_handler("COIN_PREP_EFFECT_UNKNOWN")
+    assert deferred_reasons == [
+        "UNRESOLVED_OPERATIONS",
+        "COIN_PREP_EFFECT_UNKNOWN",
+    ]
+    assert stop_calls == []
+
     api_server._mutation_stop_handler("WALLET_IDENTITY_MISMATCH")
-    assert deferred_reasons == ["UNRESOLVED_OPERATIONS"]
+    assert deferred_reasons == [
+        "UNRESOLVED_OPERATIONS",
+        "COIN_PREP_EFFECT_UNKNOWN",
+    ]
     assert stop_calls == [False]
 
 

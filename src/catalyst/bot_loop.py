@@ -10229,6 +10229,8 @@ class BotLoop:
     def can_defer_mutation_safety_stop(self, reason_code: str) -> bool:
         """Keep one exact cancel settlement worker alive behind a closed gate."""
 
+        if reason_code == "COIN_PREP_EFFECT_UNKNOWN":
+            return self._active_topup_pending_effect()
         if reason_code != "UNRESOLVED_OPERATIONS" or self._running is not True:
             return False
         getter = getattr(
@@ -10284,8 +10286,56 @@ class BotLoop:
         except Exception:
             return False
 
+    def _active_topup_pending_effect(self) -> bool:
+        """Identify only this bot's submitted split while its observer runs."""
+
+        manager = getattr(self, "coin_manager", None)
+        worker = getattr(manager, "_topup_thread", None)
+        operation_id = getattr(manager, "_active_runtime_topup_prep_id", None)
+        if (
+            self._running is not True
+            or worker is None
+            or not worker.is_alive()
+            or type(operation_id) is not str
+            or not operation_id.startswith("coin-prep:")
+            or len(operation_id) != 74
+            or any(char not in "0123456789abcdef" for char in operation_id[10:])
+        ):
+            return False
+        try:
+            status = mutation_gate.read_only_status()
+            if status.reason_code != "COIN_PREP_EFFECT_UNKNOWN":
+                return False
+            operation = database.get_coin_prep_operation_for_observation(
+                operation_id
+            )
+            token = operation.get("effect_claim_token")
+            return bool(
+                operation.get("outcome") == "SUBMITTED_UNKNOWN"
+                and operation.get("operation_kind") == "split"
+                and operation.get("purpose") in {"fee_reserve", "replacement"}
+                and operation.get("effect_adapter_operation") == operation_id
+                and type(token) is str
+                and len(token) == 64
+                and set(status.blocking_operation_ids)
+                == {operation_id, f"wallet-effect:{token}"}
+            )
+        except Exception:
+            return False
+
     def _run_one_cycle(self):
         """Execute one complete trading cycle."""
+        safety = mutation_gate.read_only_status()
+        if safety.reason_code == "COIN_PREP_EFFECT_UNKNOWN":
+            if self._active_topup_pending_effect():
+                log_event(
+                    "info",
+                    "runtime_topup_settlement_wait",
+                    "Trading cycle paused while the exact fee split is observed read-only",
+                )
+                return False
+            self.stop(wait=False)
+            return False
         if not self._runtime_recovery_cycle_boundary():
             return False
         inflight_ladders = [

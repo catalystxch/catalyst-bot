@@ -2128,12 +2128,15 @@ def _mutation_stop_handler(reason_code: str) -> None:
     try:
         if current_bot.is_running():
             defer_reader = getattr(current_bot, "can_defer_mutation_safety_stop", None)
-            if reason_code == "UNRESOLVED_OPERATIONS" and callable(defer_reader):
+            if reason_code in {
+                "UNRESOLVED_OPERATIONS",
+                "COIN_PREP_EFFECT_UNKNOWN",
+            } and callable(defer_reader):
                 try:
                     if defer_reader(reason_code) is True:
                         slog(
                             "SAFETY",
-                            "Bot cancel settlement remains read-only pending exact proof",
+                            "Bot settlement remains read-only pending exact proof",
                             {"reason_code": reason_code},
                             level="warning",
                         )

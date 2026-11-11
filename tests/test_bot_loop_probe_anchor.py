@@ -86,6 +86,7 @@ fake_database.get_active_offer_market_identities = lambda *args, **kwargs: set()
 fake_database.get_runtime_mutation_lease = lambda: {"network": "testnet11"}
 fake_database.update_offer_status = lambda *args, **kwargs: True
 fake_database.backfill_verified_fills_from_offers = lambda *args, **kwargs: 0
+fake_database.get_coin_prep_operation_for_observation = lambda operation_id: {}
 sys.modules["database"] = fake_database
 
 
@@ -582,6 +583,49 @@ class ProbeAnchorTests(unittest.TestCase):
             self.assertTrue(
                 loop.can_defer_mutation_safety_stop("UNRESOLVED_OPERATIONS")
             )
+
+    def test_submitted_runtime_topup_pauses_cycle_only_for_its_exact_worker(self):
+        loop = bot_loop.BotLoop()
+        loop._running = True
+        operation_id = "coin-prep:" + ("a" * 64)
+        token = "b" * 64
+        loop.coin_manager._active_runtime_topup_prep_id = operation_id
+        loop.coin_manager._topup_thread = types.SimpleNamespace(is_alive=lambda: True)
+        status = types.SimpleNamespace(
+            reason_code="COIN_PREP_EFFECT_UNKNOWN",
+            blocking_operation_ids=(operation_id, f"wallet-effect:{token}"),
+            latch_generation=9,
+        )
+        operation = {
+            "outcome": "SUBMITTED_UNKNOWN",
+            "operation_kind": "split",
+            "purpose": "fee_reserve",
+            "effect_adapter_operation": operation_id,
+            "effect_claim_token": token,
+        }
+        with (
+            patch.object(bot_loop.mutation_gate, "read_only_status", return_value=status),
+            patch.object(
+                bot_loop.database,
+                "get_coin_prep_operation_for_observation",
+                return_value=operation,
+            ),
+            patch.object(loop, "_runtime_recovery_cycle_boundary") as boundary,
+            patch.object(loop, "stop") as stop,
+            patch.object(bot_loop, "log_event"),
+        ):
+            self.assertTrue(
+                loop.can_defer_mutation_safety_stop("COIN_PREP_EFFECT_UNKNOWN")
+            )
+            self.assertFalse(loop._run_one_cycle())
+            boundary.assert_not_called()
+            stop.assert_not_called()
+            status.blocking_operation_ids = (operation_id, "wallet-effect:" + "c" * 64)
+            self.assertFalse(
+                loop.can_defer_mutation_safety_stop("COIN_PREP_EFFECT_UNKNOWN")
+            )
+            self.assertFalse(loop._run_one_cycle())
+            stop.assert_called_once_with(wait=False)
 
     def test_cycle_aborts_before_wallet_sync_when_stop_requested_during_price_fetch(
         self,
