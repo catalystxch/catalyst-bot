@@ -78,7 +78,11 @@ def _facts(winner):
             else "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED"
         ),
         "winner_transaction_id": (
-            ORIGINAL_TX if winner == "ORIGINAL" else SUCCESSOR_TX
+            ORIGINAL_TX
+            if winner == "ORIGINAL"
+            else database.coin_prep_rbf_winner_reference(
+                ATTEMPT, SOURCE, 100, successor
+            )
         ),
         "rbf_chain_view": chain,
         "expected_outputs": winning,
@@ -89,11 +93,18 @@ def _facts(winner):
 @pytest.mark.parametrize("winner", ["ORIGINAL", "SUCCESSOR"])
 def test_only_height_proven_winner_settles(winner):
     operation, attempt, evidence = _facts(winner)
-    expected_tx = ORIGINAL_TX if winner == "ORIGINAL" else SUCCESSOR_TX
+    expected_tx = evidence["winner_transaction_id"]
     assert database._verify_coin_prep_rbf_winner(operation, attempt, evidence) == (
         winner,
         expected_tx,
     )
+
+
+def test_successor_requires_reference_bound_to_confirmed_coin_set():
+    operation, attempt, evidence = _facts("SUCCESSOR")
+    evidence["winner_transaction_id"] = SUCCESSOR_TX
+    with pytest.raises(ValueError, match="successor confirmation reference differs"):
+        database._verify_coin_prep_rbf_winner(operation, attempt, evidence)
 
 
 def test_ambiguous_two_changes_confirmed_is_rejected():

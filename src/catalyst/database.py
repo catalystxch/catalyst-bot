@@ -29525,7 +29525,7 @@ def _verify_coin_prep_rbf_winner(
         else "SUCCESSOR"
     )
     winner_tx = _reconciliation_coin_identity(
-        evidence.get("winner_transaction_id"), "RBF winner transaction"
+        evidence.get("winner_transaction_id"), "RBF winner reference"
     )[0]
     if winner == "ORIGINAL" and winner_tx != attempt["original_transaction_id"]:
         raise ValueError("RBF original winner transaction differs")
@@ -29622,7 +29622,49 @@ def _verify_coin_prep_rbf_winner(
     )
     if supplied != expected:
         raise ValueError("RBF post-view outputs differ from winner contract")
+    if winner == "SUCCESSOR" and winner_tx != coin_prep_rbf_winner_reference(
+        attempt["attempt_id"], source, height, winning
+    ):
+        raise ValueError("RBF successor confirmation reference differs")
     return winner, winner_tx
+
+
+def coin_prep_rbf_winner_reference(
+    attempt_id: str, source_coin_id: str, spent_height: int, outputs: list[dict]
+) -> str:
+    """Name an exact confirmed successor when Sage omits spend-bundle IDs.
+
+    The legacy resolution column is named winner_transaction_id, but Sage's
+    height-addressed confirmed response has no transaction ID. This domain-
+    separated digest identifies the proven source spend and output set; it is
+    never presented as a wallet transaction ID.
+    """
+    safe_attempt = _fee_digest(attempt_id)
+    source = _reconciliation_coin_identity(source_coin_id, "RBF source")[0]
+    height = _exact_integer(spent_height, "RBF spent height", minimum=1)
+    if type(outputs) is not list or len(outputs) != 5:
+        raise ValueError("RBF winner outputs are incomplete")
+    rows = sorted(
+        (
+            _reconciliation_coin_identity(row["coin_id"], "RBF output")[0],
+            _exact_integer(row["amount_mojos"], "RBF output amount", minimum=1),
+        )
+        for row in outputs
+    )
+    if len({coin_id for coin_id, _ in rows}) != 5:
+        raise ValueError("RBF winner output IDs repeat")
+    payload = {
+        "kind": "sage-confirmed-rbf-successor-v1",
+        "attempt_id": safe_attempt,
+        "source_coin_id": source,
+        "source_spent_height": height,
+        "outputs": rows,
+    }
+    return hashlib.sha256(
+        _canonical_json_text(
+            payload, "RBF winner reference", expected_type=dict
+        ).encode()
+    ).hexdigest()
 
 
 def _legacy_sage_even_split_confirmation_matches(

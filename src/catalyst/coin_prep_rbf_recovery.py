@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import mutation_gate
 from database import (
+    coin_prep_rbf_winner_reference,
     get_recoverable_coin_prep_rbf_sign_intents,
     get_recoverable_coin_prep_rbf_attempts,
     record_coin_prep_rbf_sign_no_submit,
@@ -118,7 +119,8 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         )
         if type(transaction) is not dict:
             return None
-        tx_id = _id(transaction.get("transaction_id"))
+        raw_tx_id = transaction.get("transaction_id")
+        tx_id = _id(raw_tx_id) if raw_tx_id is not None else None
         spent = transaction.get("spent")
         created = transaction.get("created")
         if (
@@ -156,14 +158,22 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         if original_wins == successor_wins:
             return None
         winner = "ORIGINAL" if original_wins else "SUCCESSOR"
-        if winner == "ORIGINAL" and tx_id != _id(attempt["original_transaction_id"]):
+        original_id = _id(attempt["original_transaction_id"])
+        if winner == "ORIGINAL" and tx_id is not None and tx_id != original_id:
             return None
-        if winner == "SUCCESSOR" and tx_id == _id(attempt["original_transaction_id"]):
+        if winner == "SUCCESSOR" and tx_id == original_id:
             return None
         expected_fee = 0 if winner == "ORIGINAL" else _amount(attempt["fee_mojos"])
         if source_amount - sum(external.values()) != expected_fee:
             return None
         winner_outputs = original if winner == "ORIGINAL" else successor
+        winner_reference = (
+            original_id
+            if winner == "ORIGINAL"
+            else coin_prep_rbf_winner_reference(
+                attempt["attempt_id"], source, source_height, winner_outputs
+            )
+        )
         winner_ids = sorted(_id(item["coin_id"]) for item in winner_outputs)
         output_view = get_coins_by_ids(
             winner_ids,
@@ -219,7 +229,7 @@ def observe_coin_prep_rbf_winner(attempt: dict) -> dict | None:
         }
         return {
             "winner": winner,
-            "winner_transaction_id": tx_id,
+            "winner_transaction_id": winner_reference,
             "chain_view": chain_view,
             "authoritative_view": {
                 "fresh": True,

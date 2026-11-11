@@ -13,6 +13,7 @@ import coin_prep_rbf_recovery as recovery
 SOURCE = "1" * 64
 ORIGINAL_TX = "2" * 64
 SUCCESSOR_TX = "3" * 64
+ATTEMPT = "4" * 64
 FEE = 17_219_875
 FEE_AMOUNT = 20_000_000_000
 CHANGE = 1_435_390_971_590
@@ -154,7 +155,10 @@ def _outputs(change_id, change_amount):
 
 
 @pytest.mark.parametrize("winner", ["ORIGINAL", "SUCCESSOR"])
-def test_observer_requires_exact_confirmed_source_and_outputs(monkeypatch, winner):
+@pytest.mark.parametrize("confirmed_tx_id_present", [False, True])
+def test_observer_requires_exact_confirmed_source_and_outputs(
+    monkeypatch, winner, confirmed_tx_id_present
+):
     identity = {
         "backend": "sage",
         "name": "wallet",
@@ -166,6 +170,7 @@ def test_observer_requires_exact_confirmed_source_and_outputs(monkeypatch, winne
         "maximum_age_seconds": 300,
     }
     attempt = {
+        "attempt_id": ATTEMPT,
         "source_coin_ids_json": json.dumps([SOURCE]),
         "original_outputs_json": json.dumps(_outputs(OLD_CHANGE, CHANGE)),
         "successor_outputs_json": json.dumps(_outputs(NEW_CHANGE, CHANGE - FEE)),
@@ -229,7 +234,7 @@ def test_observer_requires_exact_confirmed_source_and_outputs(monkeypatch, winne
         lambda height: {
             "success": True,
             "transaction": {
-                "transaction_id": txid,
+                "transaction_id": txid if confirmed_tx_id_present else None,
                 "spent": [
                     {
                         "coin_id": SOURCE,
@@ -251,7 +256,12 @@ def test_observer_requires_exact_confirmed_source_and_outputs(monkeypatch, winne
     proof = recovery.observe_coin_prep_rbf_winner(attempt)
     assert proof is not None
     assert proof["winner"] == winner
-    assert proof["winner_transaction_id"] == txid
+    expected_reference = (
+        ORIGINAL_TX
+        if winner == "ORIGINAL"
+        else recovery.coin_prep_rbf_winner_reference(ATTEMPT, SOURCE, 100, outputs)
+    )
+    assert proof["winner_transaction_id"] == expected_reference
     assert proof["chain_view"]["source_spent_height"] == 100
     assert all(
         "spent_height" not in coin for coin in proof["authoritative_view"]["coins"]
