@@ -9668,6 +9668,104 @@ class CoinManager:
             )
             return False
 
+    def _price_sage_xch_fee_reserve_split(
+        self,
+        *,
+        pre_owned_map: Dict[str, int],
+        source_coin_id: str,
+        num_to_create: int,
+        trading_size_mojos: int,
+        address: str,
+    ) -> dict:
+        """Price and seal the exact unsigned fee-reserve split before claiming it."""
+
+        from coin_prep_fee_pricing import is_current_fee_quote
+        from fee_estimation import quote_fee
+        from wallet import build_transaction_rpc, inspect_unsigned_transaction_effect
+
+        target_seconds = int(getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300)
+        if not 1 <= target_seconds <= 86_400:
+            return {"available": False, "reason": "FEE_PRICING_CONSTRAINTS_INVALID"}
+        fee_mojos = 1  # Unsigned-only seed; the network quote sets the submitted fee.
+        for _round in range(4):
+            prep_contract = self._build_runtime_topup_prep_contract(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                fee_mojos=fee_mojos,
+                is_cat=False,
+                output_purpose="fee_reserve",
+            )
+            if prep_contract is None:
+                return {"available": False, "reason": "FEE_SOURCE_CAPACITY_UNAVAILABLE"}
+            expected_outputs = prep_contract["target_contract"]["outputs"]
+            contract = {
+                "source_asset": "xch",
+                "source_coin_ids": [source_coin_id],
+                "fee_coin_ids": [],
+                "cat_asset_id": None,
+                "fee_mojos": fee_mojos,
+                "outputs": [
+                    {
+                        "asset": "xch",
+                        "address": address,
+                        "amount_mojos": output["amount_mojos"],
+                        "purpose": output["purpose"],
+                        "ordinal": output["output_index"],
+                    }
+                    for output in expected_outputs
+                ],
+            }
+            actions = [
+                {
+                    "type": "send",
+                    "id": {"type": "xch"},
+                    "address": address,
+                    "amount": str(output["amount_mojos"]),
+                    "memos": [],
+                }
+                for output in expected_outputs
+            ]
+            actions.append({"type": "fee", "amount": str(fee_mojos)})
+            try:
+                unsigned = build_transaction_rpc([source_coin_id], actions)
+                validated = inspect_unsigned_transaction_effect(unsigned, contract)
+            except Exception:
+                return {"available": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            cost = (
+                validated.get("_catalyst_exact_unsigned_cost")
+                if type(validated) is dict
+                and validated.get("_catalyst_executable_effect_bound") is True
+                else None
+            )
+            if type(cost) is not int or cost <= 0:
+                return {"available": False, "reason": "FEE_UNSIGNED_COST_UNAVAILABLE"}
+            try:
+                quote = quote_fee(
+                    cost, target_seconds=target_seconds, force_refresh=True
+                )
+            except Exception:
+                return {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE"}
+            if not is_current_fee_quote(quote, cost, target_seconds):
+                return {"available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE"}
+            quoted_fee = quote["fee_mojos"]
+            if type(quoted_fee) is not int or quoted_fee <= 0:
+                return {
+                    "available": False,
+                    "reason": "AUTO_TRANSACTION_FEE_UNAVAILABLE",
+                }
+            if quoted_fee == fee_mojos:
+                return {
+                    "available": True,
+                    "fee_mojos": fee_mojos,
+                    "prep_contract": prep_contract,
+                    "validated_unsigned": validated,
+                    "quote": quote,
+                }
+            fee_mojos = quoted_fee
+        return {"available": False, "reason": "FEE_PRICING_NOT_CONVERGED"}
+
     def _sage_one_step_split(
         self,
         name: str,
@@ -9693,7 +9791,7 @@ class CoinManager:
         _two_step_split step 2 — poll for num_to_create new owned coins that
         match trading_size_mojos.
         """
-        from wallet import sage_topup_split
+        from wallet import sage_topup_split, submit_built_transaction_rpc
 
         tag = f"topup_{name.lower()}"
 
@@ -9902,22 +10000,44 @@ class CoinManager:
             )
             return _TOPUP_PENDING
 
-        fee_mojos = self._tx_fee_mojos()
-        prep_contract = self._build_runtime_topup_prep_contract(
-            pre_owned_map=pre_owned_map,
-            source_coin_id=source_coin_id,
-            num_to_create=num_to_create,
-            trading_size_mojos=trading_size_mojos,
-            fee_mojos=fee_mojos,
-            is_cat=is_cat,
-            output_purpose=(
-                "fee_reserve"
-                if not is_cat
-                and str(name or "").strip().lower().rsplit("-", 1)[-1]
-                == get_fee_tier_name()
-                else "replacement"
-            ),
+        output_purpose = (
+            "fee_reserve"
+            if not is_cat
+            and str(name or "").strip().lower().rsplit("-", 1)[-1]
+            == get_fee_tier_name()
+            else "replacement"
         )
+        priced_split = None
+        if output_purpose == "fee_reserve":
+            priced_split = self._price_sage_xch_fee_reserve_split(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                address=address,
+            )
+            if priced_split.get("available") is not True:
+                log_event(
+                    "warning",
+                    f"{tag}_fee_quote_unavailable",
+                    "Runtime fee-reserve split paused before wallet dispatch because "
+                    "its exact unsigned cost could not be priced",
+                    data={"reason": priced_split.get("reason")},
+                )
+                return False
+            fee_mojos = priced_split["fee_mojos"]
+            prep_contract = priced_split["prep_contract"]
+        else:
+            fee_mojos = self._tx_fee_mojos()
+            prep_contract = self._build_runtime_topup_prep_contract(
+                pre_owned_map=pre_owned_map,
+                source_coin_id=source_coin_id,
+                num_to_create=num_to_create,
+                trading_size_mojos=trading_size_mojos,
+                fee_mojos=fee_mojos,
+                is_cat=is_cat,
+                output_purpose=output_purpose,
+            )
         if prep_contract is None:
             log_event(
                 "warning",
@@ -9966,9 +10086,35 @@ class CoinManager:
                 if fee_mojos > 0 and not is_cat
                 else []
             )
-            effect_result = _run_claimed_wallet_effect(
-                "coin_manager.topup_split_sage",
-                lambda: sage_topup_split(
+            if priced_split is not None:
+                from coin_prep_fee_pricing import is_current_fee_quote
+
+                unsigned_cost = priced_split["validated_unsigned"].get(
+                    "_catalyst_exact_unsigned_cost"
+                )
+                quote = priced_split.get("quote")
+                try:
+                    quote_ready = is_current_fee_quote(
+                        quote,
+                        unsigned_cost,
+                        int(getattr(cfg, "TRANSACTION_FEE_TARGET_SECS", 300) or 300),
+                        now=int(time.time()) + 10,
+                    )
+                except Exception:
+                    quote_ready = False
+                if not quote_ready:
+                    log_event(
+                        "warning",
+                        f"{tag}_fee_quote_expired",
+                        "Runtime fee-reserve split paused before wallet claim because "
+                        "its cost-specific network quote is stale",
+                    )
+                    return False
+                effect_callback = lambda: submit_built_transaction_rpc(
+                    priced_split["validated_unsigned"]
+                )
+            else:
+                effect_callback = lambda: sage_topup_split(
                     source_coin_id=source_coin_id,
                     num_coins=num_to_create,
                     trading_size_mojos=trading_size_mojos,
@@ -9976,7 +10122,10 @@ class CoinManager:
                     fee_mojos=fee_mojos,
                     is_cat=is_cat,
                     fee_coin_id=fee_coin_id,
-                ),
+                )
+            effect_result = _run_claimed_wallet_effect(
+                "coin_manager.topup_split_sage",
+                effect_callback,
                 source_coin_ids=[source_coin_id],
                 fee_mojos=fee_mojos,
                 fee_coin_ids=fee_coin_ids,
