@@ -9480,6 +9480,7 @@
                         <div class="v4-toolbar-left">
                         <button class="btn btn-start btn-primary" id="startBtn" onclick="startBot({ resumeExistingOffers: hasResumedLiveBook() })" aria-describedby="startupStepStartDetail" disabled>▶ Start</button>
                         <button type="button" class="btn" onclick="openFollowRunReview()">Review Follow run</button>
+                        <button type="button" class="btn" onclick="openCoinPrepFeeReviewForReadyWallet()">Review Coin Prep fees</button>
                         <button type="button" class="btn" onclick="openFollowFeeCeilingReview()">Adjust Follow fee</button>
                         <button class="btn btn-stop btn-danger" id="stopBtn" onclick="stopBot()" disabled>⏹ Stop</button>
                         <div class="v4-toolbar-sep"></div>
@@ -38463,6 +38464,22 @@ function closeCtgErrorModal() {
                 return false;
             } finally {
                 if (requestSequence === _coinPrepFeeRequestSequence && refresh) refresh.disabled = false;
+            }
+        }
+
+        async function openCoinPrepFeeReviewForReadyWallet() {
+            try {
+                const response = await apiFetch(`${API_URL}/config`, {cache: 'no-store'});
+                const saved = await response.json();
+                if (!response.ok || !saved || typeof saved !== 'object') {
+                    throw new Error('Saved settings are unavailable.');
+                }
+                const config = Object.fromEntries(Object.entries(saved)
+                    .map(([key, value]) => [key.toLowerCase(), value]));
+                showCoinPrepConfirm(config, 'recommended',
+                    'Review the current Coin Prep plan and fees. Confirming may create or replace wallet coins, even if prepared sizes already exist.');
+            } catch (error) {
+                showToast('Coin Prep fee review could not open: ' + formatError(error), 'error');
             }
         }
 
