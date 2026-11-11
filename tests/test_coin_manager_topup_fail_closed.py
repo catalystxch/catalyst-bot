@@ -249,7 +249,10 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         with (
             patch.object(coin_manager, "get_transaction_fee_mode", return_value="auto"),
             patch("tx_fees.get_transaction_fee_mode", return_value="auto"),
-            patch("tx_fees.get_suggested_transaction_fee", return_value={"available": False}),
+            patch(
+                "tx_fees.get_suggested_transaction_fee",
+                return_value={"available": False},
+            ),
             patch("tx_fees.get_manual_transaction_fee_mojos", return_value=0),
         ):
             with self.assertRaisesRegex(ValueError, "AUTO_TRANSACTION_FEE_UNAVAILABLE"):
@@ -257,7 +260,9 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         with (
             patch.object(coin_manager, "get_transaction_fee_mode", return_value="auto"),
             patch.object(
-                coin_manager, "get_effective_transaction_fee_mojos", return_value=13_079_100
+                coin_manager,
+                "get_effective_transaction_fee_mojos",
+                return_value=13_079_100,
             ),
         ):
             self.assertEqual(manager._tx_fee_mojos(), 13_079_100)
@@ -272,7 +277,9 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         ):
             self.assertEqual(manager._tx_fee_mojos(), 6_778_914)
         with (
-            patch.object(coin_manager, "get_transaction_fee_mode", return_value="manual"),
+            patch.object(
+                coin_manager, "get_transaction_fee_mode", return_value="manual"
+            ),
             patch.object(
                 coin_manager, "get_effective_transaction_fee_mojos", return_value=0
             ),

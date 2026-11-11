@@ -604,7 +604,9 @@ class ProbeAnchorTests(unittest.TestCase):
             "effect_claim_token": token,
         }
         with (
-            patch.object(bot_loop.mutation_gate, "read_only_status", return_value=status),
+            patch.object(
+                bot_loop.mutation_gate, "read_only_status", return_value=status
+            ),
             patch.object(
                 bot_loop.database,
                 "get_coin_prep_operation_for_observation",

@@ -10306,9 +10306,7 @@ class BotLoop:
             status = mutation_gate.read_only_status()
             if status.reason_code != "COIN_PREP_EFFECT_UNKNOWN":
                 return False
-            operation = database.get_coin_prep_operation_for_observation(
-                operation_id
-            )
+            operation = database.get_coin_prep_operation_for_observation(operation_id)
             token = operation.get("effect_claim_token")
             return bool(
                 operation.get("outcome") == "SUBMITTED_UNKNOWN"

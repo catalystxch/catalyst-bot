@@ -516,8 +516,9 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
     monkeypatch.setattr(
         mutation_gate,
         "release_resolved",
-        lambda generation, ids: released.append((generation, ids))
-        or {"released": True},
+        lambda generation, ids: (
+            released.append((generation, ids)) or {"released": True}
+        ),
     )
     assert manager._confirm_runtime_topup_prep(
         receipt, owned_map={"0x" + TARGET: 100, "0x" + CHANGE: 400}
@@ -525,7 +526,10 @@ def test_runtime_topup_confirmation_records_exact_new_outputs(monkeypatch):
     assert released == [
         (
             17,
-            [operation["operation_id"], "wallet-effect:" + operation["effect_claim_token"]],
+            [
+                operation["operation_id"],
+                "wallet-effect:" + operation["effect_claim_token"],
+            ],
         )
     ]
     monkeypatch.setattr(
