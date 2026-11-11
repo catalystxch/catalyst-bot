@@ -1361,6 +1361,9 @@ class MutationGate:
         self._active_mutations: dict[str, str] = {}
         self._active_wallet_mutations: set[str] = set()
         self._refresh_abort_cleanup_permits: dict[str, tuple[str, str, int]] = {}
+        self._coin_prep_rbf_rescue_permits: dict[
+            str, tuple[str, str, int, str]
+        ] = {}
         self._exclusive_mutation_permit: Optional[str] = None
         self._wallet_lifecycle_transitioning = False
         self._quiescing = False
@@ -1681,6 +1684,93 @@ class MutationGate:
                     "reason": "refresh_abort_adopted",
                     "lease": lease,
                     "abort": adopted["abort"],
+                }
+                if result["acquired"] and _as_utc(lease["expires_at"]) <= self._now():
+                    self._set_local_block("LEASE_EXPIRED")
+                    result["acquired"] = False
+                    result["reason"] = "lease_expired"
+                if result["acquired"]:
+                    self._lease_version = int(lease["lease_version"])
+                    self._lease_acquired_at = str(lease["acquired_at"])
+                    self._read_only = False
+                    if not _rotate_owner_identity_authority(self):
+                        self._set_local_block("WALLET_IDENTITY_BINDING_INVALID")
+                    self.status()
+                self.last_acquire_result = _lease_public_result(result)
+                return self.last_acquire_result
+            except Exception:
+                result = {"acquired": False, "reason": "durable_state_unavailable"}
+                self.last_acquire_result = result
+                return result
+
+    @_stop_callback_boundary
+    def acquire_coin_prep_rbf_successor(
+        self, *, operation_id: str, expected_latch_generation: int
+    ) -> dict[str, Any]:
+        """Adopt only the exact fenced fee-prep recovery, never trading authority."""
+
+        with self._lock:
+            if self._active_wallet_mutations or self._wallet_lifecycle_transitioning:
+                return {"acquired": False, "reason": "active_wallet_mutations"}
+            try:
+                authorization = self._authorization_snapshot()
+                current = authorization.get("lease")
+                latch = authorization.get("latch")
+                if type(current) is not dict or type(latch) is not dict:
+                    raise ValueError("coin-prep RBF successor authority unavailable")
+                if (
+                    latch.get("state") != "tripped"
+                    or latch.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"
+                    or latch.get("generation") != expected_latch_generation
+                    or latch.get("wallet_fingerprint_hash")
+                    != self.wallet_fingerprint_hash
+                    or latch.get("network") != self.network
+                ):
+                    return {"acquired": False, "reason": "recovery_latch_mismatch"}
+                now = self._now()
+                prior_dead = False
+                if bool(current.get("active")):
+                    if current.get("owner_run_id") == self.run_id:
+                        return {"acquired": False, "reason": "already_owned"}
+                    if _as_utc(current.get("expires_at")) > now:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_coin_prep_owner_active",
+                        }
+                    prior_dead = (
+                        self._pid_liveness(
+                            int(current.get("owner_pid") or 0),
+                            str(current.get("owner_host") or ""),
+                        )
+                        is False
+                    )
+                    if not prior_dead:
+                        return {
+                            "acquired": False,
+                            "reason": "prior_owner_liveness_unproven",
+                        }
+                adopted = database.adopt_coin_prep_rbf_successor(
+                    operation_id=operation_id,
+                    expected_latch_generation=expected_latch_generation,
+                    expected_lease_version=int(current["lease_version"]),
+                    expected_prior_owner_run_id=current.get("owner_run_id"),
+                    expected_prior_owner_pid=current.get("owner_pid"),
+                    expected_prior_owner_host=current.get("owner_host"),
+                    expected_prior_acquired_at=current.get("acquired_at"),
+                    expected_prior_expires_at=current.get("expires_at"),
+                    expected_prior_released_at=current.get("released_at"),
+                    successor_owner_run_id=self.run_id,
+                    successor_owner_pid=self.owner_pid,
+                    successor_owner_host=self.owner_host,
+                    lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                    prior_owner_liveness_proven_dead=prior_dead,
+                    observed_at=now,
+                )
+                lease = adopted["lease"]
+                result = {
+                    "acquired": adopted.get("adopted") is True,
+                    "reason": "coin_prep_rbf_adopted",
+                    "lease": lease,
                 }
                 if result["acquired"] and _as_utc(lease["expires_at"]) <= self._now():
                     self._set_local_block("LEASE_EXPIRED")
@@ -2257,6 +2347,122 @@ class MutationGate:
             return token
 
     @_stop_callback_boundary
+    def enter_coin_prep_rbf_rescue(
+        self,
+        *,
+        attempt_id: str,
+        operation_id: str,
+        expected_latch_generation: int,
+        unsigned_sha256: str,
+    ) -> str:
+        """Enter one reviewed coin-prep replacement while trading stays fenced."""
+
+        operation = "wallet:submit_coin_prep_rbf_rescue"
+        with self._lock:
+            if (
+                self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit is not None
+                or self._coin_prep_rbf_rescue_permits
+            ):
+                raise MutationBlocked("MUTATION_SHUTTING_DOWN", operation)
+            status = self.status()
+            if (
+                status.source != "durable_latch"
+                or status.reason_code != "COIN_PREP_RECOVERY_REQUIRED"
+                or self._local_reason_code != "COIN_PREP_RECOVERY_REQUIRED"
+                or status.latch_generation != expected_latch_generation
+                or not status.owner_is_this_run
+                or self._lease_version is None
+            ):
+                raise MutationBlocked(status.reason_code, operation)
+            proof = database.authorize_coin_prep_rbf_rescue_target(
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                expected_latch_generation=expected_latch_generation,
+                unsigned_sha256=unsigned_sha256,
+                owner_run_id=self.run_id,
+                lease_version=self._lease_version,
+                allow_dispatched=False,
+            )
+            if (
+                type(proof) is not dict
+                or proof.get("attempt_id") != attempt_id
+                or proof.get("operation_id") != operation_id
+                or proof.get("unsigned_sha256") != unsigned_sha256
+                or proof.get("wallet_fingerprint_hash") != self.wallet_fingerprint_hash
+                or proof.get("network") != self.network
+                or proof.get("latch_generation") != expected_latch_generation
+                or proof.get("lease_version") != self._lease_version
+                or proof.get("lease_acquired_at") != self._lease_acquired_at
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            token = str(uuid.uuid4())
+            self._active_mutations[token] = operation
+            self._active_wallet_mutations.add(token)
+            self._coin_prep_rbf_rescue_permits[token] = (
+                attempt_id, operation_id, expected_latch_generation, unsigned_sha256
+            )
+            return token
+
+    @_stop_callback_boundary
+    def require_coin_prep_rbf_rescue_permit(
+        self,
+        permit: str,
+        *,
+        attempt_id: str,
+        operation_id: str,
+        expected_latch_generation: int,
+        unsigned_sha256: str,
+        allow_dispatched: bool = False,
+    ) -> dict[str, Any]:
+        """Reprove the exact one-shot attempt before a Sage effect step."""
+
+        operation = "wallet:submit_coin_prep_rbf_rescue"
+        with self._lock:
+            self.require_active_wallet_mutation_permit(permit, operation)
+            if (
+                self._coin_prep_rbf_rescue_permits.get(permit)
+                != (attempt_id, operation_id, expected_latch_generation, unsigned_sha256)
+                or self._quiescing
+                or self._wallet_lifecycle_transitioning
+                or self._exclusive_mutation_permit not in {None, permit}
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            status = self.status()
+            if (
+                status.source != "durable_latch"
+                or status.reason_code != "COIN_PREP_RECOVERY_REQUIRED"
+                or self._local_reason_code != "COIN_PREP_RECOVERY_REQUIRED"
+                or status.latch_generation != expected_latch_generation
+                or not status.owner_is_this_run
+                or self._lease_version is None
+            ):
+                raise MutationBlocked(status.reason_code, operation)
+            proof = database.authorize_coin_prep_rbf_rescue_target(
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                expected_latch_generation=expected_latch_generation,
+                unsigned_sha256=unsigned_sha256,
+                owner_run_id=self.run_id,
+                lease_version=self._lease_version,
+                allow_dispatched=allow_dispatched,
+            )
+            if (
+                type(proof) is not dict
+                or proof.get("attempt_id") != attempt_id
+                or proof.get("operation_id") != operation_id
+                or proof.get("unsigned_sha256") != unsigned_sha256
+                or proof.get("wallet_fingerprint_hash") != self.wallet_fingerprint_hash
+                or proof.get("network") != self.network
+                or proof.get("latch_generation") != expected_latch_generation
+                or proof.get("lease_version") != self._lease_version
+                or proof.get("lease_acquired_at") != self._lease_acquired_at
+            ):
+                raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+            return proof
+
+    @_stop_callback_boundary
     def require_refresh_abort_cleanup_permit(
         self,
         permit: str,
@@ -2374,6 +2580,7 @@ class MutationGate:
         with self._mutation_condition:
             self._active_wallet_mutations.discard(permit)
             self._refresh_abort_cleanup_permits.pop(permit, None)
+            self._coin_prep_rbf_rescue_permits.pop(permit, None)
             removed = self._active_mutations.pop(permit, None) is not None
             if removed:
                 if self._exclusive_mutation_permit == permit:
@@ -3180,6 +3387,10 @@ class WalletMutationPermit:
     refresh_abort_id: Optional[str] = None
     refresh_trade_id: Optional[str] = None
     refresh_latch_generation: Optional[int] = None
+    coin_prep_rbf_attempt_id: Optional[str] = None
+    coin_prep_rbf_operation_id: Optional[str] = None
+    coin_prep_rbf_latch_generation: Optional[int] = None
+    coin_prep_rbf_unsigned_sha256: Optional[str] = None
 
 
 def install_worker_authority_environment(
@@ -3474,6 +3685,138 @@ def enter_refresh_abort_cleanup_wallet_mutation(
         )
 
 
+def enter_coin_prep_rbf_rescue_wallet_mutation(
+    *,
+    attempt_id: str,
+    operation_id: str,
+    expected_latch_generation: int,
+    unsigned_sha256: str,
+) -> WalletMutationPermit:
+    """Acquire only the exact reviewed fee-prep replacement effect."""
+
+    operation = "wallet:submit_coin_prep_rbf_rescue"
+    with _runtime_lock:
+        runtime = _runtime
+        if runtime is None:
+            raise MutationBlocked("MUTATION_RUNTIME_NOT_INITIALIZED", operation)
+        binding = runtime.require_wallet_identity_authority(operation)
+        authority = _registered_owner_identity_authority(runtime)
+        if (
+            type(authority) is not _OwnerIdentityAuthority
+            or authority.binding is not binding
+            or authority.wallet_adapter_authority is None
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+        token = runtime.enter_coin_prep_rbf_rescue(
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            expected_latch_generation=expected_latch_generation,
+            unsigned_sha256=unsigned_sha256,
+        )
+        return WalletMutationPermit(
+            mode="coin_prep_rbf_rescue",
+            permit=token,
+            runtime_authority=runtime,
+            authority_generation=authority,
+            wallet_identity_binding=binding,
+            wallet_adapter_authority=authority.wallet_adapter_authority,
+            coin_prep_rbf_attempt_id=attempt_id,
+            coin_prep_rbf_operation_id=operation_id,
+            coin_prep_rbf_latch_generation=expected_latch_generation,
+            coin_prep_rbf_unsigned_sha256=unsigned_sha256,
+        )
+
+
+def require_coin_prep_rbf_rescue_wallet_permit_authority(
+    permit: Any,
+    *,
+    attempt_id: str,
+    operation_id: str,
+    unsigned_sha256: str,
+    operation: str,
+) -> tuple[WalletIdentityBinding, Any]:
+    """Verify the held owner generation without opening generic mutation."""
+
+    if (
+        type(permit) is not WalletMutationPermit
+        or permit.mode != "coin_prep_rbf_rescue"
+        or permit.coin_prep_rbf_attempt_id != attempt_id
+        or permit.coin_prep_rbf_operation_id != operation_id
+        or permit.coin_prep_rbf_unsigned_sha256 != unsigned_sha256
+        or type(permit.coin_prep_rbf_latch_generation) is not int
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime = permit.runtime_authority
+    authority = permit.authority_generation
+    if (
+        type(runtime) is not MutationGate
+        or type(authority) is not _OwnerIdentityAuthority
+        or current_runtime() is not runtime
+        or _registered_owner_identity_authority(runtime) is not authority
+        or authority.binding is not permit.wallet_identity_binding
+        or authority.wallet_adapter_authority is not permit.wallet_adapter_authority
+    ):
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime.require_active_wallet_mutation_permit(permit.permit, operation)
+    with runtime._lock:
+        if runtime._coin_prep_rbf_rescue_permits.get(permit.permit) != (
+            attempt_id,
+            operation_id,
+            permit.coin_prep_rbf_latch_generation,
+            unsigned_sha256,
+        ):
+            raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime.require_wallet_identity_authority(operation)
+    runtime.require_wallet_adapter_authority(permit.wallet_adapter_authority, operation)
+    return permit.wallet_identity_binding, permit.wallet_adapter_authority
+
+
+def require_fresh_coin_prep_rbf_rescue_wallet_continuation(
+    permit: Any,
+    snapshot: Any,
+    *,
+    attempt_id: str,
+    operation_id: str,
+    expected_latch_generation: int,
+    unsigned_sha256: str,
+    allow_dispatched: bool = False,
+) -> tuple[WalletIdentityBinding, Any, dict[str, Any]]:
+    """Recheck attempt, lease, latch, and uncached wallet identity."""
+
+    operation = "wallet:submit_coin_prep_rbf_rescue"
+    binding, adapter = require_coin_prep_rbf_rescue_wallet_permit_authority(
+        permit,
+        attempt_id=attempt_id,
+        operation_id=operation_id,
+        unsigned_sha256=unsigned_sha256,
+        operation=operation,
+    )
+    if expected_latch_generation != permit.coin_prep_rbf_latch_generation:
+        raise MutationBlocked("WALLET_IDENTITY_BINDING_INVALID", operation)
+    runtime = permit.runtime_authority
+    with runtime._lock:
+        runtime.require_coin_prep_rbf_rescue_permit(
+            permit.permit,
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            expected_latch_generation=expected_latch_generation,
+            unsigned_sha256=unsigned_sha256,
+            allow_dispatched=allow_dispatched,
+        )
+        decision = validate_wallet_identity(
+            binding,
+            snapshot,
+            now=runtime._now(),
+            last_observed_at_utc=runtime._last_wallet_identity_observed_at_utc,
+        )
+        if decision.get("allowed") is not True:
+            raise MutationBlocked(decision.get("reason"), operation)
+        runtime._last_wallet_identity_observed_at_utc = str(
+            decision["observed_at_utc"]
+        )
+    return binding, adapter, decision
+
+
 def require_refresh_abort_cleanup_wallet_permit_authority(
     permit: Any, *, abort_id: str, trade_id: str, operation: str
 ) -> tuple[WalletIdentityBinding, Any]:
@@ -3649,10 +3992,18 @@ def wallet_mutation_permit_journal_authority(
             trade_id=permit.refresh_trade_id,
             operation=operation,
         )
+    elif type(permit) is WalletMutationPermit and permit.mode == "coin_prep_rbf_rescue":
+        binding, _adapter = require_coin_prep_rbf_rescue_wallet_permit_authority(
+            permit,
+            attempt_id=permit.coin_prep_rbf_attempt_id,
+            operation_id=permit.coin_prep_rbf_operation_id,
+            unsigned_sha256=permit.coin_prep_rbf_unsigned_sha256,
+            operation=operation,
+        )
     else:
         binding, _adapter = require_wallet_mutation_permit_authority(permit, operation)
     binding_digest = wallet_identity_binding_digest(binding)
-    if permit.mode in {"runtime", "refresh_abort_cleanup"}:
+    if permit.mode in {"runtime", "refresh_abort_cleanup", "coin_prep_rbf_rescue"}:
         runtime = permit.runtime_authority
         authority = permit.authority_generation
         with runtime._lock:
@@ -3880,7 +4231,7 @@ def exit_wallet_mutation(permit: Any) -> bool:
             _worker_active_wallet_mutations.pop(permit.permit, None)
             return True
     if (
-        permit.mode not in {"runtime", "refresh_abort_cleanup"}
+        permit.mode not in {"runtime", "refresh_abort_cleanup", "coin_prep_rbf_rescue"}
         or permit.permit is None
         or type(permit.runtime_authority) is not MutationGate
     ):
@@ -4139,6 +4490,7 @@ __all__ = [
     "acquire_exclusive_mutation",
     "enter_mutation",
     "enter_wallet_mutation",
+    "enter_coin_prep_rbf_rescue_wallet_mutation",
     "exit_mutation",
     "exit_wallet_mutation",
     "install_worker_authority_environment",
@@ -4150,6 +4502,8 @@ __all__ = [
     "require_allowed",
     "require_fresh_wallet_operation_continuation",
     "require_fresh_wallet_identity",
+    "require_fresh_coin_prep_rbf_rescue_wallet_continuation",
+    "require_coin_prep_rbf_rescue_wallet_permit_authority",
     "require_wallet_mutation_permit_authority",
     "require_wallet_operation_continuation",
     "require_worker_allowed_from_environment",

@@ -958,6 +958,7 @@ def _start_owned_runtime_services() -> None:
         or api_server._registry_terminal_recovery_active
         or api_server._cancel_latch_review_recovery_active
         or api_server._no_effect_creation_recovery_active
+        or api_server._coin_prep_rbf_recovery_active
     ):
         return
     authorization = api_server.initialize_mutation_runtime()
@@ -988,6 +989,7 @@ def start_flask_server(reservation):
         and not api_server._registry_terminal_recovery_active
         and not api_server._cancel_latch_review_recovery_active
         and not api_server._no_effect_creation_recovery_active
+        and not api_server._coin_prep_rbf_recovery_active
     ):
         api_server.create_bot()
 
@@ -1035,6 +1037,9 @@ def _create_desktop_bridge():
     """The fenced recovery window never receives the trading native API."""
 
     import api_server
+
+    if api_server._coin_prep_rbf_recovery_active:
+        return None
 
     if api_server._no_effect_creation_recovery_active:
         from app_bridge import AppBridge
@@ -2089,6 +2094,11 @@ def _authorize_desktop_startup() -> bool:
         try:
             import api_server
 
+            if (
+                authorization.get("reason_code") == "COIN_PREP_RECOVERY_REQUIRED"
+                and api_server.activate_coin_prep_rbf_restricted_startup(authorization)
+            ):
+                return True
             if authorization.get("reason_code") in {
                 "UNRESOLVED_OPERATIONS",
                 "REFRESH_ABORT_CLEANUP",

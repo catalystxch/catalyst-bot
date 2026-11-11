@@ -3111,6 +3111,53 @@ def build_transaction_rpc(
     return result
 
 
+def build_coin_prep_rbf_preview_rpc(
+    source_coin_id: str,
+    outputs: list,
+    fee_mojos: int,
+    *,
+    _identity_recheck=None,
+) -> Optional[Dict]:
+    """Build only a five-output XCH fee-prep replacement, never submit it.
+
+    The wallet facade derives these arguments from the exact recovery journal
+    and pending Sage transaction. This adapter entry point does not accept
+    arbitrary Sage actions or an ``auto_submit`` switch.
+    """
+    if (
+        type(source_coin_id) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", source_coin_id) is None
+        or type(outputs) is not list
+        or len(outputs) != 5
+        or type(fee_mojos) is not int
+        or fee_mojos < 10_000_000
+    ):
+        return None
+    actions = []
+    for output in outputs:
+        if (
+            type(output) is not dict
+            or output.get("asset") != "xch"
+            or type(output.get("address")) is not str
+            or type(output.get("amount_mojos")) is not int
+            or output["amount_mojos"] <= 0
+        ):
+            return None
+        actions.append(
+            {
+                "type": "send",
+                "id": {"type": "xch"},
+                "address": output["address"],
+                "amount": str(output["amount_mojos"]),
+                "memos": [],
+            }
+        )
+    actions.append({"type": "fee", "amount": str(fee_mojos)})
+    return build_transaction_rpc(
+        [source_coin_id], actions, _identity_recheck=_identity_recheck
+    )
+
+
 def _unsigned_effect_refusal(reason: str) -> Dict:
     return {"success": False, "reason": reason}
 
@@ -3413,6 +3460,138 @@ def submit_built_transaction_rpc(
         "create_transaction",
         _identity_recheck=_identity_recheck,
     )
+
+
+def _rbf_coin_spend_bytes(raw_spends: Any) -> Optional[list[bytes]]:
+    """Canonicalize Sage coin spends for exact signed/unsigned comparison."""
+
+    if type(raw_spends) is not list or not raw_spends:
+        return None
+    try:
+        from chia_rs import CoinSpend
+
+        def prefixed(value: Any) -> str:
+            if type(value) is not str or re.fullmatch(r"(?:0x)?[0-9a-fA-F]*", value) is None:
+                raise ValueError("invalid coin spend bytes")
+            return value if value.startswith("0x") else f"0x{value}"
+
+        result = []
+        for raw in raw_spends:
+            if type(raw) is not dict or type(raw.get("coin")) is not dict:
+                return None
+            spend = dict(raw)
+            coin = dict(spend["coin"])
+            coin["parent_coin_info"] = prefixed(coin.get("parent_coin_info"))
+            coin["puzzle_hash"] = prefixed(coin.get("puzzle_hash"))
+            spend["coin"] = coin
+            spend["puzzle_reveal"] = prefixed(spend.get("puzzle_reveal"))
+            spend["solution"] = prefixed(spend.get("solution"))
+            result.append(bytes(CoinSpend.from_json_dict(spend)))
+        return result if len(result) == len(set(result)) else None
+    except Exception:
+        return None
+
+
+def submit_reviewed_coin_prep_rbf_rpc(
+    validated_unsigned: Dict, *, _identity_recheck=None
+) -> Dict:
+    """Sign and submit only the exact previously inspected RBF coin spends."""
+
+    context = "coin_prep_rbf_rescue"
+
+    def refuse(reason: str, *, attempted: bool = False) -> Dict:
+        return {
+            "success": False,
+            "reason": reason,
+            "_catalyst_effect_attempted": attempted,
+        }
+
+    if type(validated_unsigned) is not dict:
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    try:
+        digest = hashlib.sha256(
+            _json.dumps(
+                {
+                    "summary": validated_unsigned["summary"],
+                    "coin_spends": validated_unsigned["coin_spends"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError):
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    if (
+        validated_unsigned.get("_catalyst_validated_unsigned") is not True
+        or validated_unsigned.get("_catalyst_executable_effect_bound") is not True
+        or digest != validated_unsigned.get("_catalyst_unsigned_digest")
+    ):
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    unsigned_spends = validated_unsigned["coin_spends"]
+    unsigned_bytes = _rbf_coin_spend_bytes(unsigned_spends)
+    if unsigned_bytes is None:
+        return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+    if _identity_recheck is not None:
+        _identity_recheck(f"{context}:sign")
+    try:
+        signed = _sage_post(
+            "sign_coin_spends",
+            {"coin_spends": unsigned_spends, "auto_submit": False, "partial": False},
+            timeout=30,
+            _identity_recheck=_identity_recheck,
+        )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception:
+        return refuse("RBF_SIGN_UNCERTAIN", attempted=True)
+    if (
+        type(signed) is not dict
+        or signed.get("success") is False
+        or signed.get("error")
+        or type(signed.get("spend_bundle")) is not dict
+    ):
+        return refuse("RBF_SIGN_RESPONSE_INVALID", attempted=True)
+    spend_bundle = signed["spend_bundle"]
+    signed_bytes = _rbf_coin_spend_bytes(spend_bundle.get("coin_spends"))
+    if signed_bytes is None or Counter(signed_bytes) != Counter(unsigned_bytes):
+        return refuse("RBF_SIGNED_SPENDS_MISMATCH", attempted=True)
+    transaction_id = _spend_bundle_transaction_id(spend_bundle)
+    if transaction_id is None:
+        return refuse("RBF_SIGNED_BUNDLE_INVALID", attempted=True)
+    if _identity_recheck is not None:
+        _identity_recheck(f"{context}:submit")
+    try:
+        submitted = _sage_post(
+            "submit_transaction",
+            {"spend_bundle": spend_bundle},
+            timeout=30,
+            retry_transport_error=False,
+            _identity_recheck=_identity_recheck,
+        )
+    except mutation_gate.MutationBlocked:
+        raise
+    except Exception:
+        return refuse("RBF_SUBMIT_UNCERTAIN", attempted=True)
+    if type(submitted) is not dict:
+        return refuse("RBF_SUBMIT_UNCERTAIN", attempted=True)
+    if (
+        submitted.get("success") is False
+        or submitted.get("error")
+        or submitted.get("reason")
+        or str(submitted.get("status") or "").lower()
+        in {"failed", "error", "rejected"}
+    ):
+        return refuse("RBF_SUBMIT_REJECTED", attempted=True)
+    reported_id = _response_transaction_id(submitted)
+    if reported_id is not None and reported_id.lower().removeprefix("0x") != transaction_id:
+        return refuse("RBF_SUBMIT_ID_MISMATCH", attempted=True)
+    return {
+        "success": True,
+        "submitted": True,
+        "transaction_id": transaction_id,
+        "submit_response": submitted,
+        "_catalyst_effect_attempted": True,
+    }
 
 
 def create_transaction_rpc(

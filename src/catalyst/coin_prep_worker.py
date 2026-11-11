@@ -9757,9 +9757,29 @@ class CoinPrepWorker:
         except Exception as exc:
             self.log(f"Coin prep recovery inventory unavailable: {exc}")
             return False
+        rbf_recovery = {"operation_ids": set(), "settled": set()}
+        if any(
+            row.get("purpose") == "fee_reserve"
+            and row.get("operation_kind") == "split"
+            and row.get("outcome") == "SUBMITTED_UNKNOWN"
+            for row in operations
+        ):
+            try:
+                from coin_prep_rbf_recovery import (
+                    recover_dispatched_coin_prep_rbf_attempts_read_only,
+                )
+
+                rbf_recovery = recover_dispatched_coin_prep_rbf_attempts_read_only()
+            except Exception as exc:
+                self.log(f"Coin prep RBF recovery inventory unavailable: {exc}")
+                return False
         all_confirmed = True
         for operation in operations:
             try:
+                if operation["operation_id"] in rbf_recovery["operation_ids"]:
+                    if operation["operation_id"] not in rbf_recovery["settled"]:
+                        all_confirmed = False
+                    continue
                 source_coin_ids = json.loads(operation["source_coin_ids_json"])
                 expected_identity = json.loads(operation["wallet_identity_json"])
                 observation = observer(dict(operation))
@@ -11789,7 +11809,8 @@ def recover_coin_prep_operations_at_startup() -> bool:
     worker.update_status = lambda *_args, **_kwargs: None
     legacy_recovered = _recover_legacy_sage_consolidation(worker)
     try:
-        if not get_recoverable_coin_prep_operations():
+        operations = get_recoverable_coin_prep_operations()
+        if not operations:
             return legacy_recovered
     except Exception as exc:
         slog(
@@ -11799,6 +11820,26 @@ def recover_coin_prep_operations_at_startup() -> bool:
             level="warning",
         )
         return False
+    if any(
+        row.get("purpose") == "fee_reserve"
+        and row.get("operation_kind") == "split"
+        and row.get("outcome") == "SUBMITTED_UNKNOWN"
+        for row in operations
+    ):
+        try:
+            from coin_prep_rbf_recovery import (
+                recover_crashed_coin_prep_rbf_sign_intents,
+            )
+
+            recover_crashed_coin_prep_rbf_sign_intents()
+        except Exception as exc:
+            slog(
+                "COIN_PREP",
+                "Startup RBF sign-only recovery remained unresolved",
+                {"error_type": type(exc).__name__},
+                level="warning",
+            )
+            return False
     try:
         return worker._recover_coin_prep_operations_read_only(
             worker._observe_recoverable_coin_prep_operation

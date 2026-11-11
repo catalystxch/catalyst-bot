@@ -2274,6 +2274,109 @@ CREATE TRIGGER IF NOT EXISTS follow_fee_ceiling_revisions_no_delete
 BEFORE DELETE ON follow_fee_ceiling_revisions BEGIN
     SELECT RAISE(ABORT, 'Follow fee ceiling revision is immutable');
 END;
+
+-- A fee-prep RBF rescue is a separate, one-shot wallet effect. The original
+-- prep contract remains immutable even if its replacement wins on-chain.
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_attempts (
+    attempt_id TEXT PRIMARY KEY NOT NULL CHECK(length(attempt_id)=64),
+    operation_id TEXT NOT NULL,
+    original_transaction_id TEXT NOT NULL CHECK(length(original_transaction_id)=64),
+    unsigned_sha256 TEXT NOT NULL CHECK(length(unsigned_sha256)=64),
+    review_sha256 TEXT NOT NULL CHECK(length(review_sha256)=64),
+    fee_mojos INTEGER NOT NULL CHECK(fee_mojos>=10000000),
+    original_outputs_json TEXT NOT NULL CHECK(json_valid(original_outputs_json)),
+    successor_outputs_json TEXT NOT NULL CHECK(json_valid(successor_outputs_json)),
+    wallet_identity_sha256 TEXT NOT NULL CHECK(length(wallet_identity_sha256)=64),
+    latch_generation INTEGER NOT NULL CHECK(latch_generation>=1),
+    reviewed_at TEXT NOT NULL,
+    review_expires_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_attempts_no_update
+BEFORE UPDATE ON coin_prep_rbf_attempts BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF attempt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_attempts_no_delete
+BEFORE DELETE ON coin_prep_rbf_attempts BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF attempt is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_intents (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    operation_id TEXT NOT NULL,
+    lease_version INTEGER NOT NULL CHECK(lease_version>=1),
+    owner_run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_intents_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_intents BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF sign intent is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_intents_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_intents BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF sign intent is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_owners (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_sign_intents(attempt_id),
+    owner_pid INTEGER NOT NULL CHECK(owner_pid>0),
+    owner_host TEXT NOT NULL,
+    lease_acquired_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_owners_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_owners BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF signer identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_owners_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_owners BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF signer identity is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_sign_no_submit (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_sign_intents(attempt_id),
+    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+    receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256)=64),
+    recorded_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_no_submit_no_update
+BEFORE UPDATE ON coin_prep_rbf_sign_no_submit BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF no-submit receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_sign_no_submit_no_delete
+BEFORE DELETE ON coin_prep_rbf_sign_no_submit BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF no-submit receipt is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_dispatches (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    operation_id TEXT NOT NULL UNIQUE,
+    lease_version INTEGER NOT NULL CHECK(lease_version>=1),
+    owner_run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_dispatches_no_update
+BEFORE UPDATE ON coin_prep_rbf_dispatches BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF dispatch is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_dispatches_no_delete
+BEFORE DELETE ON coin_prep_rbf_dispatches BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF dispatch is immutable');
+END;
+CREATE TABLE IF NOT EXISTS coin_prep_rbf_resolutions (
+    attempt_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES coin_prep_rbf_attempts(attempt_id),
+    winner TEXT NOT NULL CHECK(winner IN ('ORIGINAL','SUCCESSOR')),
+    winner_transaction_id TEXT NOT NULL CHECK(length(winner_transaction_id)=64),
+    outcome_evidence_sha256 TEXT NOT NULL CHECK(length(outcome_evidence_sha256)=64),
+    resolved_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_resolutions_no_update
+BEFORE UPDATE ON coin_prep_rbf_resolutions BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF resolution is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS coin_prep_rbf_resolutions_no_delete
+BEFORE DELETE ON coin_prep_rbf_resolutions BEGIN
+    SELECT RAISE(ABORT, 'coin prep RBF resolution is immutable');
+END;
 """
 
 
@@ -4685,6 +4788,31 @@ END;
 
 
 _STABILITY_REQUIRED_COLUMNS = {
+    "coin_prep_rbf_attempts": {
+        "attempt_id", "operation_id", "original_transaction_id",
+        "unsigned_sha256", "review_sha256", "fee_mojos",
+        "original_outputs_json", "successor_outputs_json",
+        "wallet_identity_sha256", "latch_generation", "reviewed_at",
+        "review_expires_at",
+    },
+    "coin_prep_rbf_dispatches": {
+        "attempt_id", "operation_id", "lease_version", "owner_run_id",
+        "started_at",
+    },
+    "coin_prep_rbf_sign_intents": {
+        "attempt_id", "operation_id", "lease_version", "owner_run_id",
+        "started_at",
+    },
+    "coin_prep_rbf_sign_owners": {
+        "attempt_id", "owner_pid", "owner_host", "lease_acquired_at",
+    },
+    "coin_prep_rbf_sign_no_submit": {
+        "attempt_id", "receipt_json", "receipt_sha256", "recorded_at",
+    },
+    "coin_prep_rbf_resolutions": {
+        "attempt_id", "winner", "winner_transaction_id",
+        "outcome_evidence_sha256", "resolved_at",
+    },
     "unbounded_fee_approvals": {"approval_id"},
     "follow_fee_ceiling_reviews": {
         "review_id",
@@ -6343,6 +6471,7 @@ def _validate_stability_schema(conn: sqlite3.Connection) -> None:
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("cancel_event_id",))
     _require_unique_key(conn, "offer_refresh_lineage_commits", ("terminal_event_id",))
     _require_unique_key(conn, "bootstrap_participation", ("campaign_id", "report_id"))
+    _require_unique_key(conn, "coin_prep_rbf_dispatches", ("operation_id",))
 
     stability_tables_by_owner = {
         _sqlite_identifier_fold(table_name): table_name
@@ -29268,6 +29397,12 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
         "SUBMITTED_UNKNOWN": common | {"dispatch_outcome"},
         "FAILED": common | {"dispatch_outcome", "effect_attempted"},
     }[outcome]
+    rbf_reason = value.get("reason_code") in {
+        "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED",
+        "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED",
+    }
+    if outcome == "CONFIRMED" and rbf_reason:
+        expected |= {"rbf_attempt_id", "rbf_chain_view", "winner_transaction_id"}
     if outcome == "FAILED" and value.get("reason_code") == (
         "AUTHORITATIVE_NO_EFFECT_CONFIRMED"
     ):
@@ -29294,7 +29429,7 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
     ):
         raise ValueError("coin prep outcome evidence values are invalid")
     if outcome == "CONFIRMED":
-        if reason != "AUTHORITATIVE_POST_VIEW_CONFIRMED":
+        if reason != "AUTHORITATIVE_POST_VIEW_CONFIRMED" and not rbf_reason:
             raise ValueError("coin prep confirmed evidence reason is invalid")
         from replacement_capacity import verify_coin_prep_post_view
 
@@ -29341,6 +29476,104 @@ def _coin_prep_outcome_evidence(outcome: str, value: Any) -> tuple[str, Dict[str
         max_bytes=65536,
     )
     return encoded, dict(value)
+
+
+def _verify_coin_prep_rbf_winner(
+    operation: Dict[str, Any], attempt: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> tuple[str, str]:
+    """Require a complete height-addressed view of both output candidates."""
+    if evidence.get("rbf_attempt_id") != attempt["attempt_id"]:
+        raise ValueError("RBF attempt does not match confirmed evidence")
+    winner = (
+        "ORIGINAL"
+        if evidence["reason_code"] == "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED"
+        else "SUCCESSOR"
+    )
+    winner_tx = _reconciliation_coin_identity(
+        evidence.get("winner_transaction_id"), "RBF winner transaction"
+    )[0]
+    if winner == "ORIGINAL" and winner_tx != attempt["original_transaction_id"]:
+        raise ValueError("RBF original winner transaction differs")
+    if winner == "SUCCESSOR" and winner_tx == attempt["original_transaction_id"]:
+        raise ValueError("RBF successor transaction is the original")
+    source_ids = json.loads(operation["source_coin_ids_json"])
+    if len(source_ids) != 1:
+        raise ValueError("RBF source cohort is not exact")
+    chain = evidence.get("rbf_chain_view")
+    if type(chain) is not dict or set(chain) != {
+        "complete", "network", "observed_at", "source_coin_id",
+        "source_spent_height", "coins"
+    } or chain["complete"] is not True:
+        raise ValueError("RBF chain view is not complete")
+    identity = json.loads(operation["wallet_identity_json"])
+    observed_at = _parse_iso_timestamp(
+        chain["observed_at"], "RBF chain observed_at", require_timezone=True
+    )
+    now = _parse_iso_timestamp(
+        _stability_wall_clock(), "RBF current time", require_timezone=True
+    )
+    if (
+        chain["network"] != identity["network_id"]
+        or not timedelta(seconds=-5) <= now - observed_at <= timedelta(seconds=30)
+    ):
+        raise ValueError("RBF chain view is stale or from another network")
+    source = _reconciliation_coin_identity(chain["source_coin_id"], "RBF source")[0]
+    height = _exact_integer(
+        chain["source_spent_height"], "RBF source spent height", minimum=1
+    )
+    if source != _reconciliation_coin_identity(source_ids[0], "RBF source")[0]:
+        raise ValueError("RBF chain source differs")
+    original = json.loads(attempt["original_outputs_json"])
+    successor = json.loads(attempt["successor_outputs_json"])
+    by_id = {}
+    for item in [*original, *successor]:
+        prior = by_id.get(item["coin_id"])
+        if prior is not None and prior != item["amount_mojos"]:
+            raise ValueError("RBF shared output amount differs")
+        by_id[item["coin_id"]] = item["amount_mojos"]
+    records = chain["coins"]
+    if type(records) is not list or len(records) != len(by_id):
+        raise ValueError("RBF chain output view is incomplete")
+    observed = {}
+    for item in records:
+        if type(item) is not dict or set(item) != {
+            "coin_id", "amount_mojos", "confirmed_height"
+        }:
+            raise ValueError("RBF chain output record is malformed")
+        coin_id = _reconciliation_coin_identity(item["coin_id"], "RBF output")[0]
+        if coin_id in observed or coin_id not in by_id:
+            raise ValueError("RBF chain output set differs")
+        if _exact_integer(item["amount_mojos"], "RBF output amount", minimum=1) != by_id[coin_id]:
+            raise ValueError("RBF chain output amount differs")
+        confirmed = item["confirmed_height"]
+        if confirmed is not None:
+            _exact_integer(confirmed, "RBF output height", minimum=1)
+        observed[coin_id] = confirmed
+    if set(observed) != set(by_id):
+        raise ValueError("RBF chain output set is incomplete")
+    winning = original if winner == "ORIGINAL" else successor
+    losing = successor if winner == "ORIGINAL" else original
+    winner_ids = {item["coin_id"] for item in winning}
+    loser_only = {item["coin_id"] for item in losing} - winner_ids
+    if (
+        any(observed[coin_id] != height for coin_id in winner_ids)
+        or any(observed[coin_id] is not None for coin_id in loser_only)
+        or not loser_only
+    ):
+        raise ValueError("RBF winner is not proven by the source spend height")
+    supplied = sorted(
+        (_reconciliation_coin_identity(item["coin_id"], "RBF expected output")[0],
+         item["amount_mojos"], item["purpose"])
+        for item in evidence["expected_outputs"]
+    )
+    expected = sorted(
+        (item["coin_id"], item["amount_mojos"], item["purpose"])
+        for item in winning
+    )
+    if supplied != expected:
+        raise ValueError("RBF post-view outputs differ from winner contract")
+    return winner, winner_tx
 
 
 def _legacy_sage_even_split_confirmation_matches(
@@ -29820,6 +30053,31 @@ def record_coin_prep_operation_outcome(
             != evidence_payload["effect_claim_generation"]
         ):
             raise ValueError("coin prep outcome evidence effect claim differs")
+        rbf_attempt = conn.execute(
+            "SELECT attempt.* FROM coin_prep_rbf_attempts AS attempt "
+            "JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.attempt_id=attempt.attempt_id "
+            "WHERE attempt.operation_id=?",
+            (safe_operation_id,),
+        ).fetchone()
+        rbf_resolution = None
+        if rbf_attempt is not None and outcome != "CONFIRMED":
+            raise ValueError(
+                "dispatched RBF attempt requires explicit joint no-effect proof"
+            )
+        if outcome == "CONFIRMED":
+            special_rbf_reason = evidence_payload.get("reason_code") in {
+                "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED",
+                "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED",
+            }
+            if rbf_attempt is not None and not special_rbf_reason:
+                raise ValueError("dispatched RBF attempt requires winner proof")
+            if special_rbf_reason:
+                if rbf_attempt is None:
+                    raise ValueError("RBF winner has no durable dispatch")
+                rbf_resolution = _verify_coin_prep_rbf_winner(
+                    current, dict(rbf_attempt), evidence_payload
+                )
         authoritative_no_effect = (
             outcome == "FAILED"
             and evidence_payload.get("reason_code")
@@ -29950,7 +30208,12 @@ def record_coin_prep_operation_outcome(
                     (output["amount_mojos"], output["purpose"])
                     for output in evidence_payload["expected_outputs"]
                 )
-                if confirmed_outputs != target_outputs and not (
+                if (
+                    rbf_resolution is not None
+                    and rbf_resolution[0] == "SUCCESSOR"
+                ):
+                    pass  # The sealed successor and chain view were checked above.
+                elif confirmed_outputs != target_outputs and not (
                     _legacy_sage_even_split_confirmation_matches(
                         current,
                         stored_target,
@@ -30108,6 +30371,17 @@ def record_coin_prep_operation_outcome(
             """,
             (outcome, evidence, when, safe_operation_id),
         )
+        if rbf_resolution is not None:
+            conn.execute(
+                "INSERT INTO coin_prep_rbf_resolutions "
+                "(attempt_id,winner,winner_transaction_id,"
+                "outcome_evidence_sha256,resolved_at) VALUES (?,?,?,?,?)",
+                (
+                    rbf_attempt["attempt_id"], rbf_resolution[0],
+                    rbf_resolution[1], hashlib.sha256(evidence.encode()).hexdigest(),
+                    when,
+                ),
+            )
         identity = json.loads(current["wallet_identity_json"])
         import mutation_gate
 
@@ -30176,6 +30450,957 @@ def get_coin_prep_operation_for_observation(operation_id: str) -> Dict[str, Any]
         return dict(row)
     finally:
         conn.close()
+
+
+def get_coin_prep_rbf_preview_authority(operation_id: str) -> Dict[str, Any]:
+    """Read the exact pending prep and safety fence in one read-only snapshot.
+
+    This grants no dispatch authority.  In particular, a preview caller must
+    never interpret this snapshot as permission to sign or submit a spend.
+    """
+    operation_id = _fee_operation_identity(operation_id)
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        operation = conn.execute(
+            "SELECT prep.*, claim.fee_coin_ids_json AS effect_fee_coin_ids_json, "
+            "dispatch.dispatch_token AS effect_dispatch_token, "
+            "dispatch.dispatched_at AS effect_dispatched_at, "
+            "dispatch.adapter_operation AS effect_adapter_operation "
+            "FROM coin_prep_operations AS prep "
+            "JOIN wallet_effect_claims AS claim "
+            "ON claim.claim_token=prep.effect_claim_token "
+            "AND claim.generation=prep.effect_claim_generation "
+            "AND claim.operation_id=prep.operation_id "
+            "JOIN wallet_effect_dispatches AS dispatch "
+            "ON dispatch.claim_token=claim.claim_token "
+            "AND dispatch.generation=claim.generation "
+            "WHERE prep.operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        conn.rollback()
+        if operation is None or latch is None:
+            raise ValueError("COIN_PREP_RBF_PREVIEW_AUTHORITY_UNAVAILABLE")
+        return {"operation": dict(operation), "latch": dict(latch)}
+    finally:
+        conn.close()
+
+
+def _coin_prep_rbf_outputs(value: Any, label: str) -> tuple[list[dict], str]:
+    """Canonical final additions; internal ephemeral coins are not outputs."""
+    if type(value) is not list or len(value) != 5:
+        raise ValueError(f"{label} must contain five exact outputs")
+    result = []
+    ids = set()
+    for output in value:
+        if type(output) is not dict or set(output) != {
+            "coin_id", "amount_mojos", "purpose"
+        }:
+            raise ValueError(f"{label} output shape is invalid")
+        coin_id = _reconciliation_coin_identity(output["coin_id"], label)[0]
+        if coin_id in ids:
+            raise ValueError(f"{label} output coin is duplicated")
+        ids.add(coin_id)
+        amount = _exact_integer(output["amount_mojos"], label, minimum=1)
+        purpose = output["purpose"]
+        if purpose not in {"fee_reserve", "top_up"}:
+            raise ValueError(f"{label} purpose is invalid")
+        result.append({"coin_id": coin_id, "amount_mojos": amount,
+                       "purpose": purpose})
+    result.sort(key=lambda item: item["coin_id"])
+    return result, _canonical_json_text(result, label, expected_type=list)
+
+
+def prepare_coin_prep_rbf_attempt(
+    *,
+    operation_id: str,
+    original_transaction_id: str,
+    unsigned_sha256: str,
+    review_sha256: str,
+    fee_mojos: int,
+    original_outputs: list[dict],
+    successor_outputs: list[dict],
+    latch_generation: int,
+    reviewed_at: Any,
+    review_expires_at: Any,
+) -> Dict[str, Any]:
+    """Seal one reviewed replacement candidate without dispatching it.
+
+    The caller must have obtained the original and successor output IDs from
+    authoritative pending and inspected unsigned views. This DB boundary
+    rechecks the durable original contract and latch before storing them.
+    """
+    safe_operation = _fee_operation_identity(operation_id)
+    old_tx = _reconciliation_coin_identity(
+        original_transaction_id, "original transaction id"
+    )[0]
+    unsigned_digest = _fee_digest(unsigned_sha256)
+    review_digest = _fee_digest(review_sha256)
+    fee = _exact_integer(fee_mojos, "RBF fee", minimum=10_000_000)
+    generation = _exact_integer(latch_generation, "RBF latch generation", minimum=1)
+    original, original_json = _coin_prep_rbf_outputs(
+        original_outputs, "original RBF outputs"
+    )
+    successor, successor_json = _coin_prep_rbf_outputs(
+        successor_outputs, "successor RBF outputs"
+    )
+    reviewed = _stability_timestamp(reviewed_at, "RBF reviewed_at")
+    expires = _stability_timestamp(review_expires_at, "RBF review_expires_at")
+    if _parse_iso_timestamp(expires, "RBF expiry", require_timezone=True) <= (
+        _parse_iso_timestamp(reviewed, "RBF review", require_timezone=True)
+    ):
+        raise ValueError("RBF review expiry must follow review")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (safe_operation,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        if operation is None or latch is None:
+            raise ValueError("RBF original operation or latch is absent")
+        op = dict(operation)
+        fence = dict(latch)
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        if (
+            op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or len(json.loads(op["source_coin_ids_json"])) != 1
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != generation
+            or json.loads(fence["blocking_operation_ids_json"])
+            != sorted([safe_operation, f"wallet-effect:{op['effect_claim_token']}"])
+            or fence["wallet_fingerprint_hash"]
+            != mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+            or fence["network"] != identity["network_id"]
+        ):
+            raise ValueError("RBF attempt does not match exact recovery authority")
+        if conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+            (safe_operation,),
+        ).fetchone() is not None:
+            raise ValueError("RBF original operation already has a dispatch")
+        if conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+            (safe_operation,),
+        ).fetchone() is not None:
+            raise ValueError("RBF prior sign phase is unresolved")
+        target = json.loads(op["target_contract_json"])
+        if (
+            target.get("contract_version") is not None
+            or target.get("wallet_type") != "xch"
+            or len(target.get("outputs", [])) != 5
+        ):
+            raise ValueError("RBF target is not the exact XCH fee split")
+        expected_old = sorted(
+            (item["amount_mojos"], item["purpose"])
+            for item in target["outputs"]
+        )
+        if sorted((item["amount_mojos"], item["purpose"]) for item in original) != expected_old:
+            raise ValueError("RBF original outputs differ from prep contract")
+        old_fees = sorted(item["amount_mojos"] for item in original
+                          if item["purpose"] == "fee_reserve")
+        new_fees = sorted(item["amount_mojos"] for item in successor
+                          if item["purpose"] == "fee_reserve")
+        old_change = [item["amount_mojos"] for item in original
+                      if item["purpose"] == "top_up"]
+        new_change = [item["amount_mojos"] for item in successor
+                      if item["purpose"] == "top_up"]
+        if (
+            len(old_fees) != 4 or old_fees != new_fees
+            or len(old_change) != 1 or len(new_change) != 1
+            or old_change[0] - new_change[0] != fee
+            or {item["coin_id"] for item in original}
+            == {item["coin_id"] for item in successor}
+        ):
+            raise ValueError("RBF successor is not a fee-only replacement")
+        identity_digest = hashlib.sha256(op["wallet_identity_json"].encode()).hexdigest()
+        immutable = {
+            "operation_id": safe_operation,
+            "original_transaction_id": old_tx,
+            "unsigned_sha256": unsigned_digest,
+            "review_sha256": review_digest,
+            "fee_mojos": fee,
+            "original_outputs_json": original_json,
+            "successor_outputs_json": successor_json,
+            "wallet_identity_sha256": identity_digest,
+            "latch_generation": generation,
+            "reviewed_at": reviewed,
+            "review_expires_at": expires,
+        }
+        attempt_id = hashlib.sha256(
+            _canonical_json_text(immutable, "RBF attempt", expected_type=dict).encode()
+        ).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if dict(existing) != {"attempt_id": attempt_id, **immutable}:
+                raise ValueError("RBF attempt identity collision")
+            conn.commit()
+            return {"attempt": dict(existing), "idempotent": True}
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_attempts (attempt_id,"
+            + ",".join(immutable)
+            + ") VALUES (" + ",".join("?" for _ in range(len(immutable) + 1)) + ")",
+            (attempt_id, *immutable.values()),
+        )
+        row = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone()
+        conn.commit()
+        return {"attempt": dict(row), "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_sign_start(
+    attempt_id: str, *, owner_run_id: str, lease_version: int
+) -> Dict[str, Any]:
+    """Commit a local-sign intent, never permission to submit to peers."""
+    attempt_id = _fee_digest(attempt_id)
+    owner = _required_stability_text(owner_run_id, "RBF sign owner")
+    version = _exact_integer(lease_version, "RBF sign lease version", minimum=1)
+    candidate = get_coin_prep_rbf_attempt_for_submit(attempt_id)
+    authorize_coin_prep_rbf_rescue_target(
+        attempt_id=attempt_id,
+        operation_id=candidate["operation_id"],
+        expected_latch_generation=candidate["latch_generation"],
+        unsigned_sha256=candidate["unsigned_sha256"],
+        owner_run_id=owner,
+        lease_version=version,
+    )
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _stability_wall_clock()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        operation = conn.execute(
+            "SELECT outcome,effect_claim_token,wallet_identity_json "
+            "FROM coin_prep_operations "
+            "WHERE operation_id=?", (candidate["operation_id"],)
+        ).fetchone()
+        if lease is None or latch is None or operation is None:
+            raise ValueError("RBF sign authority is incomplete")
+        if (
+            lease["active"] != 1
+            or lease["owner_run_id"] != owner
+            or lease["lease_version"] != version
+            or type(lease["owner_pid"]) is not int
+            or lease["owner_pid"] <= 0
+            or not lease["owner_host"]
+            or not lease["acquired_at"]
+            or lease["wallet_fingerprint_hash"] != latch["wallet_fingerprint_hash"]
+            or lease["network"] != latch["network"]
+            or lease["expires_at"] is None
+            or _parse_iso_timestamp(
+                lease["expires_at"], "RBF sign lease expiry", require_timezone=True
+            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or latch["generation"] != candidate["latch_generation"]
+            or json.loads(latch["blocking_operation_ids_json"]) != sorted([
+                candidate["operation_id"],
+                f"wallet-effect:{operation['effect_claim_token']}",
+            ])
+            or operation["outcome"] != "SUBMITTED_UNKNOWN"
+            or hashlib.sha256(
+                operation["wallet_identity_json"].encode()
+            ).hexdigest() != candidate["wallet_identity_sha256"]
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"], "RBF sign review expiry",
+                require_timezone=True,
+            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        ):
+            raise ValueError("RBF sign lease, latch or review has changed")
+        if conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+            (candidate["operation_id"],),
+        ).fetchone() is not None:
+            raise ValueError("RBF submit already started")
+        active = conn.execute(
+            "SELECT sign.attempt_id FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("RBF prior sign intent remains unresolved")
+        if conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone() is not None:
+            raise ValueError("RBF sign attempt is already spent")
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_intents "
+            "(attempt_id,operation_id,lease_version,owner_run_id,started_at) "
+            "VALUES (?,?,?,?,?)",
+            (attempt_id, candidate["operation_id"], version, owner, now),
+        )
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_owners "
+            "(attempt_id,owner_pid,owner_host,lease_acquired_at) "
+            "VALUES (?,?,?,?)",
+            (attempt_id, lease["owner_pid"], lease["owner_host"],
+             lease["acquired_at"]),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "sign_started": True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_RBF_SIGN_NO_SUBMIT_REASONS = frozenset({
+    "SIGN_REFUSED", "SIGNED_BYTES_INVALID", "PRE_SUBMIT_EXCEPTION",
+    "SIGN_ABORTED_BEFORE_SUBMIT", "CRASH_BEFORE_SUBMIT_MARKER",
+})
+
+
+def get_recoverable_coin_prep_rbf_sign_intents() -> list[Dict[str, Any]]:
+    """Inventory sign intents for which CATalyst never started an RPC submit."""
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT sign.*,owner.owner_pid,owner.owner_host,"
+            "owner.lease_acquired_at "
+            "FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_owners AS owner "
+            "ON owner.attempt_id=sign.attempt_id "
+            "JOIN coin_prep_operations AS prep "
+            "ON prep.operation_id=sign.operation_id "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "LEFT JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.operation_id=sign.operation_id "
+            "WHERE receipt.attempt_id IS NULL "
+            "AND dispatch.operation_id IS NULL "
+            "AND prep.outcome='SUBMITTED_UNKNOWN' "
+            "ORDER BY sign.started_at,sign.attempt_id LIMIT 128"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_sign_no_submit(
+    attempt_id: str,
+    *,
+    receipt: dict,
+    prior_owner_liveness_proven_dead: bool = False,
+) -> Dict[str, Any]:
+    """Close a sign-only attempt only while no submit-start marker exists."""
+    attempt_id = _fee_digest(attempt_id)
+    if (
+        type(receipt) is not dict
+        or set(receipt) != {
+            "attempt_id", "reason_code", "submit_rpc_attempted", "evidence_sha256"
+        }
+        or receipt["attempt_id"] != attempt_id
+        or receipt["reason_code"] not in _RBF_SIGN_NO_SUBMIT_REASONS
+        or receipt["submit_rpc_attempted"] is not False
+    ):
+        raise ValueError("RBF no-submit receipt is malformed")
+    _fee_digest(receipt["evidence_sha256"])
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise ValueError("RBF owner liveness proof is malformed")
+    encoded = _canonical_json_text(
+        receipt, "RBF no-submit receipt", expected_type=dict
+    )
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        sign = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if sign is None:
+            raise ValueError("RBF sign intent is absent")
+        if conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+            (sign["operation_id"],),
+        ).fetchone() is not None:
+            raise ValueError("RBF submit-start marker already exists")
+        existing = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["receipt_sha256"] != digest:
+                raise ValueError("RBF no-submit receipt replay differs")
+            conn.commit()
+            return {"attempt_id": attempt_id, "idempotent": True}
+        if receipt["reason_code"] == "CRASH_BEFORE_SUBMIT_MARKER":
+            lease = conn.execute(
+                "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+            ).fetchone()
+            now = _stability_wall_clock()
+            if (
+                not prior_owner_liveness_proven_dead
+                or lease is None
+                or (
+                    lease["active"] == 1
+                    and lease["owner_run_id"] == sign["owner_run_id"]
+                    and (
+                        lease["expires_at"] is None
+                        or _parse_iso_timestamp(
+                            lease["expires_at"], "RBF prior lease expiry",
+                            require_timezone=True,
+                        ) > _parse_iso_timestamp(
+                            now, "RBF current time", require_timezone=True
+                        )
+                    )
+                )
+            ):
+                raise ValueError("RBF crashed signer is not proven stopped")
+        when = _stability_wall_clock()
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_sign_no_submit "
+            "(attempt_id,receipt_json,receipt_sha256,recorded_at) "
+            "VALUES (?,?,?,?)",
+            (attempt_id, encoded, digest, when),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "idempotent": False}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_submit_start(
+    attempt_id: str, *, owner_run_id: str, lease_version: int,
+    started_at: Any = None,
+) -> Dict[str, Any]:
+    """Commit the one-shot boundary before the first Sage submit RPC.
+
+    A replay, including after an uncertain timeout or crash, is rejected. The
+    future caller must treat the committed row as possibly submitted.
+    """
+    attempt_id = _fee_digest(attempt_id)
+    owner = _required_stability_text(owner_run_id, "RBF owner_run_id")
+    version = _exact_integer(lease_version, "RBF lease version", minimum=1)
+    when = _stability_wall_clock()
+    if started_at is not None:
+        supplied = _stability_timestamp(started_at, "RBF dispatch start")
+        drift = abs((
+            _parse_iso_timestamp(supplied, "RBF supplied time", require_timezone=True)
+            - _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+        ).total_seconds())
+        if drift > 5:
+            raise ValueError("RBF dispatch time is not current")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        existing = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_dispatches WHERE operation_id=("
+            "SELECT operation_id FROM coin_prep_rbf_attempts WHERE attempt_id=?)",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None or lease is None or latch is None or existing is not None:
+            raise ValueError("RBF one-shot dispatch authority unavailable")
+        candidate = dict(attempt)
+        fence = dict(latch)
+        owned = dict(lease)
+        if (
+            owned["active"] != 1
+            or owned["owner_run_id"] != owner
+            or owned["lease_version"] != version
+            or owned["wallet_fingerprint_hash"] != fence["wallet_fingerprint_hash"]
+            or owned["network"] != fence["network"]
+            or owned["expires_at"] is None
+            or _parse_iso_timestamp(
+                owned["expires_at"], "RBF lease expiry", require_timezone=True
+            ) <= _parse_iso_timestamp(when, "RBF current time", require_timezone=True)
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != candidate["latch_generation"]
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"], "RBF review expiry",
+                require_timezone=True,
+            ) <= _parse_iso_timestamp(when, "RBF dispatch time", require_timezone=True)
+        ):
+            raise ValueError("RBF dispatch lease, latch or review has changed")
+        operation = conn.execute(
+            "SELECT outcome,effect_claim_token FROM coin_prep_operations "
+            "WHERE operation_id=?", (candidate["operation_id"],)
+        ).fetchone()
+        if operation is None or operation["outcome"] != "SUBMITTED_UNKNOWN":
+            raise ValueError("RBF original operation is no longer pending")
+        identity_row = conn.execute(
+            "SELECT wallet_identity_json FROM coin_prep_operations WHERE operation_id=?",
+            (candidate["operation_id"],),
+        ).fetchone()
+        if hashlib.sha256(identity_row["wallet_identity_json"].encode()).hexdigest() != (
+            candidate["wallet_identity_sha256"]
+        ):
+            raise ValueError("RBF dispatch wallet identity changed")
+        if json.loads(fence["blocking_operation_ids_json"]) != sorted([
+            candidate["operation_id"],
+            f"wallet-effect:{operation['effect_claim_token']}",
+        ]):
+            raise ValueError("RBF dispatch blocker set changed")
+        sign_intent = conn.execute(
+            "SELECT * FROM coin_prep_rbf_sign_intents WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        no_submit = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            sign_intent is None
+            or sign_intent["operation_id"] != candidate["operation_id"]
+            or sign_intent["owner_run_id"] != owner
+            or sign_intent["lease_version"] != version
+            or no_submit is not None
+        ):
+            raise ValueError("RBF sign phase has no active exact successor")
+        conn.execute(
+            "INSERT INTO coin_prep_rbf_dispatches "
+            "(attempt_id,operation_id,lease_version,owner_run_id,started_at) "
+            "VALUES (?,?,?,?,?)",
+            (attempt_id, candidate["operation_id"], version, owner, when),
+        )
+        conn.commit()
+        return {"attempt_id": attempt_id, "started": True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def record_coin_prep_rbf_dispatch_start(*args, **kwargs) -> Dict[str, Any]:
+    """Compatibility name: this marker is solely the submit-start boundary."""
+    return record_coin_prep_rbf_submit_start(*args, **kwargs)
+
+
+def authorize_coin_prep_rbf_rescue_target(
+    *,
+    attempt_id: str,
+    operation_id: str,
+    expected_latch_generation: int,
+    unsigned_sha256: str,
+    owner_run_id: str,
+    lease_version: int,
+    allow_dispatched: bool = False,
+) -> Dict[str, Any]:
+    """Read exact one-shot rescue authority without changing the database."""
+    attempt_id = _fee_digest(attempt_id)
+    operation_id = _fee_operation_identity(operation_id)
+    digest = _fee_digest(unsigned_sha256)
+    generation = _exact_integer(
+        expected_latch_generation, "RBF latch generation", minimum=1
+    )
+    owner = _required_stability_text(owner_run_id, "RBF owner")
+    version = _exact_integer(lease_version, "RBF lease version", minimum=1)
+    if type(allow_dispatched) is not bool:
+        raise ValueError("RBF dispatch state request is invalid")
+    conn = _stability_read_only_connection()
+    try:
+        conn.execute("BEGIN")
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        dispatch = conn.execute(
+            "SELECT * FROM coin_prep_rbf_dispatches WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        active_sign = conn.execute(
+            "SELECT sign.attempt_id FROM coin_prep_rbf_sign_intents AS sign "
+            "LEFT JOIN coin_prep_rbf_sign_no_submit AS receipt "
+            "ON receipt.attempt_id=sign.attempt_id "
+            "WHERE sign.operation_id=? AND receipt.attempt_id IS NULL LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        sign_receipt = conn.execute(
+            "SELECT 1 FROM coin_prep_rbf_sign_no_submit WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        conn.rollback()
+        if any(row is None for row in (attempt, operation, latch, lease)):
+            raise ValueError("RBF rescue authority is incomplete")
+        candidate = dict(attempt)
+        op = dict(operation)
+        fence = dict(latch)
+        owned = dict(lease)
+        marker = dict(dispatch) if dispatch is not None else None
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        now = _stability_wall_clock()
+        if (
+            candidate["operation_id"] != operation_id
+            or candidate["unsigned_sha256"] != digest
+            or candidate["latch_generation"] != generation
+            or candidate["wallet_identity_sha256"]
+            != hashlib.sha256(op["wallet_identity_json"].encode()).hexdigest()
+            or op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or fence["state"] != "tripped"
+            or fence["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or fence["generation"] != generation
+            or fence["wallet_fingerprint_hash"]
+            != mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+            or fence["network"] != identity["network_id"]
+            or json.loads(fence["blocking_operation_ids_json"])
+            != sorted([operation_id, f"wallet-effect:{op['effect_claim_token']}"])
+            or owned["active"] != 1
+            or owned["owner_run_id"] != owner
+            or owned["lease_version"] != version
+            or owned["wallet_fingerprint_hash"] != fence["wallet_fingerprint_hash"]
+            or owned["network"] != fence["network"]
+            or owned["acquired_at"] is None
+            or owned["expires_at"] is None
+            or _parse_iso_timestamp(
+                owned["expires_at"], "RBF lease expiry", require_timezone=True
+            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+            or _parse_iso_timestamp(
+                candidate["review_expires_at"], "RBF review expiry",
+                require_timezone=True,
+            ) <= _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        ):
+            raise ValueError("RBF rescue authority changed")
+        if allow_dispatched:
+            if (
+                marker is None
+                or marker["attempt_id"] != attempt_id
+                or marker["owner_run_id"] != owner
+                or marker["lease_version"] != version
+            ):
+                raise ValueError("RBF one-shot dispatch marker is absent or changed")
+        elif marker is not None:
+            raise ValueError("RBF rescue already dispatched")
+        elif (
+            sign_receipt is not None
+            or (active_sign is not None and active_sign["attempt_id"] != attempt_id)
+        ):
+            raise ValueError("RBF sign phase belongs to another active attempt")
+        return {
+            "attempt_id": attempt_id,
+            "operation_id": operation_id,
+            "unsigned_sha256": digest,
+            "wallet_fingerprint_hash": fence["wallet_fingerprint_hash"],
+            "network": fence["network"],
+            "latch_generation": generation,
+            "lease_version": version,
+            "lease_acquired_at": owned["acquired_at"],
+            "review_expires_at": candidate["review_expires_at"],
+            "dispatch_started": marker is not None,
+            "sign_started": active_sign is not None,
+        }
+    finally:
+        conn.close()
+
+
+def get_coin_prep_rbf_attempt_for_submit(attempt_id: str) -> Dict[str, Any]:
+    """Read immutable review fields; this alone grants no submit authority."""
+    attempt_id = _fee_digest(attempt_id)
+    conn = _stability_read_only_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("RBF attempt is absent")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def get_recoverable_coin_prep_rbf_attempts() -> list[Dict[str, Any]]:
+    """Read dispatched, unresolved RBF effects for observation only."""
+    conn = _stability_read_only_connection()
+    try:
+        rows = conn.execute(
+            "SELECT attempt.*,prep.source_coin_ids_json,prep.wallet_identity_json "
+            "FROM coin_prep_rbf_attempts AS attempt "
+            "JOIN coin_prep_rbf_dispatches AS dispatch "
+            "ON dispatch.attempt_id=attempt.attempt_id "
+            "JOIN coin_prep_operations AS prep "
+            "ON prep.operation_id=attempt.operation_id "
+            "LEFT JOIN coin_prep_rbf_resolutions AS resolution "
+            "ON resolution.attempt_id=attempt.attempt_id "
+            "WHERE resolution.attempt_id IS NULL "
+            "AND prep.outcome='SUBMITTED_UNKNOWN' "
+            "ORDER BY dispatch.started_at,attempt.attempt_id LIMIT 128"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def adopt_coin_prep_rbf_successor(
+    *,
+    operation_id: str,
+    expected_latch_generation: int,
+    expected_lease_version: int,
+    expected_prior_owner_run_id: Any,
+    expected_prior_owner_pid: Any,
+    expected_prior_owner_host: Any,
+    expected_prior_acquired_at: Any,
+    expected_prior_expires_at: Any,
+    expected_prior_released_at: Any,
+    successor_owner_run_id: str,
+    successor_owner_pid: int,
+    successor_owner_host: str,
+    lease_expires_at: Any,
+    prior_owner_liveness_proven_dead: bool,
+    observed_at: Any,
+) -> Dict[str, Any]:
+    """CAS-adopt only the exact stuck fee-prep latch for restricted recovery."""
+    operation_id = _fee_operation_identity(operation_id)
+    generation = _exact_integer(
+        expected_latch_generation, "RBF latch generation", minimum=1
+    )
+    version = _exact_integer(expected_lease_version, "RBF prior lease version")
+    owner = _required_stability_text(successor_owner_run_id, "RBF successor owner")
+    pid = _exact_integer(successor_owner_pid, "RBF successor PID", minimum=1)
+    host = _required_stability_text(successor_owner_host, "RBF successor host")
+    expiry = _stability_timestamp(lease_expires_at, "RBF successor lease expiry")
+    observed = _stability_timestamp(observed_at, "RBF adoption observation")
+    if type(prior_owner_liveness_proven_dead) is not bool:
+        raise ValueError("RBF prior owner liveness proof must be exact")
+    conn = _stability_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = _stability_wall_clock()
+        now_dt = _parse_iso_timestamp(now, "RBF current time", require_timezone=True)
+        observed_dt = _parse_iso_timestamp(
+            observed, "RBF observation", require_timezone=True
+        )
+        expiry_dt = _parse_iso_timestamp(
+            expiry, "RBF successor expiry", require_timezone=True
+        )
+        if (
+            not timedelta(seconds=-5) <= now_dt - observed_dt <= timedelta(seconds=30)
+            or not now_dt < expiry_dt <= now_dt + timedelta(seconds=120)
+        ):
+            raise ValueError("RBF adoption observation or lease expiry is stale")
+        op = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        latch = conn.execute(
+            "SELECT * FROM runtime_safety_latch WHERE singleton_id=1"
+        ).fetchone()
+        prior = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        if op is None or latch is None or prior is None:
+            raise ValueError("RBF adoption authority is incomplete")
+        op, latch, prior = dict(op), dict(latch), dict(prior)
+        identity = json.loads(op["wallet_identity_json"])
+        import mutation_gate
+
+        wallet_hash = mutation_gate.wallet_fingerprint_hash(identity["fingerprint"])
+        blockers = sorted([operation_id, f"wallet-effect:{op['effect_claim_token']}"])
+        if (
+            op["outcome"] != "SUBMITTED_UNKNOWN"
+            or op["operation_kind"] != "split"
+            or op["purpose"] != "fee_reserve"
+            or latch["state"] != "tripped"
+            or latch["reason_code"] != "COIN_PREP_RECOVERY_REQUIRED"
+            or latch["generation"] != generation
+            or json.loads(latch["blocking_operation_ids_json"]) != blockers
+            or latch["wallet_fingerprint_hash"] != wallet_hash
+            or latch["network"] != identity["network_id"]
+            or prior["lease_version"] != version
+            or prior["owner_run_id"] != expected_prior_owner_run_id
+            or prior["owner_pid"] != expected_prior_owner_pid
+            or prior["owner_host"] != expected_prior_owner_host
+            or prior["acquired_at"] != expected_prior_acquired_at
+            or prior["expires_at"] != expected_prior_expires_at
+            or prior["released_at"] != expected_prior_released_at
+            or prior["owner_run_id"] == owner
+        ):
+            raise ValueError("RBF adoption snapshot changed")
+        if prior["active"] == 1:
+            if (
+                not prior_owner_liveness_proven_dead
+                or prior["expires_at"] is None
+                or _parse_iso_timestamp(
+                    prior["expires_at"], "RBF prior lease expiry",
+                    require_timezone=True,
+                ) > now_dt
+                or prior["released_at"] is not None
+                or prior["wallet_fingerprint_hash"] != wallet_hash
+                or prior["network"] != identity["network_id"]
+            ):
+                raise ValueError("RBF prior active owner is not proven dead")
+        elif prior["active"] == 0:
+            if prior["expires_at"] is not None:
+                raise ValueError("RBF prior lease is not cleanly inactive")
+        else:
+            raise ValueError("RBF prior lease state is invalid")
+        unresolved_offer = conn.execute(
+            "SELECT 1 FROM offer_operation_journal AS journal JOIN ("
+            "SELECT operation_id,MAX(sequence) AS sequence FROM offer_operation_journal "
+            "GROUP BY operation_id) AS latest ON latest.operation_id=journal.operation_id "
+            "AND latest.sequence=journal.sequence WHERE journal.blocks_mutation=1 LIMIT 1"
+        ).fetchone()
+        other_prep = conn.execute(
+            "SELECT 1 FROM coin_prep_operations WHERE operation_id<>? "
+            "AND outcome IN ('PREPARED','SUBMITTED_UNKNOWN') LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if unresolved_offer is not None or other_prep is not None:
+            raise ValueError("unrelated recovery blocker remains")
+        changed = conn.execute(
+            "UPDATE runtime_mutation_lease SET lease_version=lease_version+1,"
+            "active=1,owner_run_id=?,owner_pid=?,owner_host=?,"
+            "wallet_fingerprint_hash=?,network=?,acquired_at=?,heartbeat_at=?,"
+            "expires_at=?,released_at=NULL,updated_at=? WHERE singleton_id=1 "
+            "AND lease_version=? AND active=?",
+            (
+                owner, pid, host, wallet_hash, identity["network_id"], now, now,
+                expiry, now, version, prior["active"],
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("RBF successor lease compare-and-set failed")
+        if prior["owner_run_id"]:
+            conn.execute(
+                "UPDATE runtime_worker_delegations SET state='revoked',"
+                "revoked_at=?,updated_at=? WHERE parent_run_id=? AND state='active'",
+                (now, now, prior["owner_run_id"]),
+            )
+        if expiry <= _stability_wall_clock():
+            raise ValueError("RBF successor lease expired during adoption")
+        successor = conn.execute(
+            "SELECT * FROM runtime_mutation_lease WHERE singleton_id=1"
+        ).fetchone()
+        conn.commit()
+        return {"adopted": True, "lease": dict(successor)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolve_coin_prep_rbf_attempt(
+    attempt_id: str,
+    *,
+    winner: str,
+    winner_transaction_id: str,
+    chain_view: dict,
+    authoritative_view: dict,
+) -> Dict[str, Any]:
+    """Settle a dispatched attempt from one complete confirmed winner view.
+
+    This merely consumes observations supplied by the read-only recovery
+    worker. It never calls Sage and never interprets a preview as chain proof.
+    The terminal operation, coin rows, attempt resolution and latch update
+    commit in ``record_coin_prep_operation_outcome``'s one transaction.
+    """
+    attempt_id = _fee_digest(attempt_id)
+    if winner not in {"ORIGINAL", "SUCCESSOR"}:
+        raise ValueError("RBF winner must be exact")
+    conn = _stability_read_only_connection()
+    try:
+        attempt = conn.execute(
+            "SELECT * FROM coin_prep_rbf_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if attempt is None:
+            raise ValueError("RBF attempt is absent")
+        attempt = dict(attempt)
+        operation = conn.execute(
+            "SELECT * FROM coin_prep_operations WHERE operation_id=?",
+            (attempt["operation_id"],),
+        ).fetchone()
+        if operation is None:
+            raise ValueError("RBF original operation is absent")
+        operation = dict(operation)
+    finally:
+        conn.close()
+    outputs = json.loads(
+        attempt[
+            "original_outputs_json"
+            if winner == "ORIGINAL" else "successor_outputs_json"
+        ]
+    )
+    if type(authoritative_view) is dict and type(authoritative_view.get("coins")) is list:
+        observed_by_id = {
+            _reconciliation_coin_identity(row.get("coin_id"), "RBF observed output")[0]: row
+            for row in authoritative_view["coins"] if type(row) is dict
+        }
+        for output in outputs:
+            observed = observed_by_id.get(output["coin_id"])
+            if observed is not None and observed.get("spent_height") is not None:
+                output["spent_height"] = observed["spent_height"]
+    return record_coin_prep_operation_outcome(
+        operation["operation_id"],
+        outcome="CONFIRMED",
+        evidence_json={
+            "reason_code": (
+                "AUTHORITATIVE_RBF_ORIGINAL_CONFIRMED"
+                if winner == "ORIGINAL"
+                else "AUTHORITATIVE_RBF_REPLACEMENT_CONFIRMED"
+            ),
+            "effect_claim_token": operation["effect_claim_token"],
+            "effect_claim_generation": operation["effect_claim_generation"],
+            "source_coin_ids": json.loads(operation["source_coin_ids_json"]),
+            "expected_outputs": outputs,
+            "authoritative_view": authoritative_view,
+            "expected_wallet_identity": json.loads(operation["wallet_identity_json"]),
+            "rbf_attempt_id": attempt_id,
+            "rbf_chain_view": chain_view,
+            "winner_transaction_id": winner_transaction_id,
+        },
+    )
 
 
 def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, Any]]:

@@ -21,6 +21,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -1916,6 +1917,517 @@ def build_transaction_rpc(selected_coin_ids: list, actions: list):
         return _blocked_mutation(exc.reason_code)
     except Exception:
         return _blocked_mutation("WALLET_MUTATION_FAILED")
+
+
+def preview_coin_prep_rbf_unsigned(
+    operation_id: str, original_transaction_id: str, fee_mojos: int
+) -> dict:
+    """Inspect one fee-only replacement while the exact prep latch is closed.
+
+    This is intentionally separate from the normal unsigned builder: callers
+    cannot supply coins, addresses or actions. Sage's v0.13.1
+    ``create_transaction(auto_submit=false)`` only constructs an unsigned
+    transaction. No signing or submission capability is exposed here.
+    """
+    from database import get_coin_prep_rbf_preview_authority
+
+    def refuse(reason: str) -> dict:
+        return {"success": False, "reason": reason}
+
+    def hex_id(value) -> str:
+        if type(value) is not str:
+            raise ValueError("invalid coin identity")
+        canonical = value.lower().removeprefix("0x")
+        if re.fullmatch(r"[0-9a-f]{64}", canonical) is None:
+            raise ValueError("invalid coin identity")
+        return canonical
+
+    def mojos(value) -> int:
+        if type(value) is int and value >= 0:
+            return value
+        if type(value) is str and value.isascii() and value.isdigit():
+            return int(value)
+        raise ValueError("invalid exact amount")
+
+    def xch_record(value) -> tuple[str, str, int]:
+        if type(value) is not dict:
+            raise ValueError("not a native XCH record")
+        asset = value.get("asset")
+        if asset is not None and (
+            type(asset) is not dict
+            or asset.get("asset_id") is not None
+            or asset.get("ticker") != "XCH"
+            or asset.get("kind") != "token"
+        ):
+            raise ValueError("not a native XCH record")
+        address = value.get("address")
+        if type(address) is not str or not address:
+            raise ValueError("missing pending address")
+        return hex_id(value.get("coin_id")), address, mojos(value.get("amount"))
+
+    if WALLET_TYPE != "sage" or not callable(
+        getattr(_wallet_adapter, "build_coin_prep_rbf_preview_rpc", None)
+    ):
+        return refuse("WALLET_BACKEND_UNSUPPORTED")
+    if type(fee_mojos) is not int or fee_mojos < 10_000_000:
+        return refuse("RBF_FEE_BELOW_MINIMUM")
+    try:
+        requested_tx = hex_id(original_transaction_id)
+        authority = get_coin_prep_rbf_preview_authority(operation_id)
+        operation = authority["operation"]
+        latch = authority["latch"]
+        identity_payload = json.loads(operation["wallet_identity_json"])
+        binding = mutation_gate.WalletIdentityBinding(**identity_payload)
+        if mutation_gate.wallet_identity_binding_payload(binding) != identity_payload:
+            return refuse("WALLET_IDENTITY_BINDING_INVALID")
+        source_ids = [hex_id(value) for value in json.loads(operation["source_coin_ids_json"])]
+        fee_ids = json.loads(operation["effect_fee_coin_ids_json"])
+        target = json.loads(operation["target_contract_json"])
+        blockers = json.loads(latch["blocking_operation_ids_json"])
+        expected_blockers = sorted(
+            [operation_id, f"wallet-effect:{operation['effect_claim_token']}"]
+        )
+        if (
+            operation.get("outcome") != "SUBMITTED_UNKNOWN"
+            or operation.get("operation_kind") != "split"
+            or operation.get("purpose") != "fee_reserve"
+            or operation.get("effect_adapter_operation") != operation_id
+            or type(source_ids) is not list
+            or len(source_ids) != 1
+            or fee_ids != []
+            or target.get("wallet_type") != "xch"
+            or target.get("contract_version") is not None
+            or latch.get("state") != "tripped"
+            or latch.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"
+            or blockers != expected_blockers
+            or latch.get("wallet_fingerprint_hash")
+            != mutation_gate.wallet_fingerprint_hash(binding.fingerprint)
+            or latch.get("network") != binding.network_id
+        ):
+            return refuse("COIN_PREP_RBF_PREVIEW_AUTHORITY_MISMATCH")
+        version_reader = getattr(_wallet_adapter, "get_sage_version", None)
+        if not callable(version_reader) or version_reader() != "0.13.1":
+            return refuse("SAGE_RBF_PREVIEW_VERSION_UNSUPPORTED")
+
+        def recheck(step: str) -> None:
+            fresh = get_coin_prep_rbf_preview_authority(operation_id)
+            if fresh != authority:
+                raise ValueError("COIN_PREP_RBF_PREVIEW_AUTHORITY_CHANGED")
+            if version_reader() != "0.13.1":
+                raise ValueError("SAGE_RBF_PREVIEW_VERSION_CHANGED")
+            decision = mutation_gate.validate_wallet_identity(
+                binding, _identity_from_adapter(_wallet_adapter)
+            )
+            if decision.get("allowed") is not True:
+                raise ValueError(str(decision.get("reason")))
+
+        recheck("before_pending")
+        pending = get_pending_transactions_strict()
+        if type(pending) is not list:
+            return refuse("SAGE_PENDING_VIEW_UNAVAILABLE")
+        matches = [
+            row for row in pending
+            if type(row) is dict
+            and type(row.get("transaction_id")) is str
+            and hex_id(row["transaction_id"]) == requested_tx
+        ]
+        if len(matches) != 1:
+            return refuse("ORIGINAL_PENDING_TRANSACTION_NOT_UNIQUE")
+        source_pending = [
+            row for row in pending
+            if type(row) is dict
+            and type(row.get("spent")) is list
+            and any(
+                type(spend) is dict
+                and hex_id(spend.get("coin_id")) == source_ids[0]
+                for spend in row["spent"]
+            )
+        ]
+        if source_pending != matches:
+            return refuse("ORIGINAL_PENDING_SOURCE_NOT_UNIQUE")
+        old = matches[0]
+        if mojos(old.get("fee")) != 0:
+            return refuse("ORIGINAL_PENDING_FEE_MISMATCH")
+        spent = [xch_record(row) for row in old["spent"]]
+        created = [xch_record(row) for row in old["created"]]
+        spent_ids = [row[0] for row in spent]
+        created_ids = [row[0] for row in created]
+        if (
+            len(spent_ids) != len(set(spent_ids))
+            or len(created_ids) != len(set(created_ids))
+            or spent_ids.count(source_ids[0]) != 1
+        ):
+            return refuse("ORIGINAL_PENDING_INPUT_MISMATCH")
+        ephemeral = set(spent_ids) - set(source_ids)
+        if ephemeral != set(created_ids) & set(spent_ids):
+            return refuse("ORIGINAL_PENDING_INPUT_MISMATCH")
+        external = [row for row in created if row[0] not in ephemeral]
+        old_outputs = target.get("outputs")
+        if (
+            type(old_outputs) is not list
+            or len(old_outputs) != 5
+            or len(external) != 5
+            or sorted(row[2] for row in external)
+            != sorted(mojos(row["amount_mojos"]) for row in old_outputs)
+            or any(
+                type(row) is not dict or row.get("output_index") != index
+                for index, row in enumerate(old_outputs)
+            )
+            or any(row.get("purpose") != "fee_reserve" for row in old_outputs[:4])
+            or old_outputs[4].get("purpose") != "top_up"
+        ):
+            return refuse("ORIGINAL_PENDING_OUTPUT_MISMATCH")
+        source_amount = next(row[2] for row in spent if row[0] == source_ids[0])
+        reserve_amounts = [mojos(row["amount_mojos"]) for row in old_outputs[:4]]
+        old_change = mojos(old_outputs[4]["amount_mojos"])
+        if source_amount != sum(reserve_amounts) + old_change:
+            return refuse("ORIGINAL_PENDING_VALUE_MISMATCH")
+        reserve_rows = [row for row in external if row[2] in reserve_amounts]
+        change_rows = [row for row in external if row[2] == old_change]
+        if (
+            len(reserve_rows) != 4
+            or len(change_rows) != 1
+            or len({row[1] for row in reserve_rows}) != 1
+            or old_change in reserve_amounts
+        ):
+            return refuse("ORIGINAL_PENDING_OUTPUT_MISMATCH")
+        new_change = old_change - fee_mojos
+        if new_change <= 0:
+            return refuse("RBF_SOURCE_CAPACITY_UNAVAILABLE")
+        address = reserve_rows[0][1]
+        outputs = [
+            {
+                "asset": "xch", "address": address,
+                "amount_mojos": amount, "purpose": "fee_reserve",
+                "ordinal": index,
+            }
+            for index, amount in enumerate(reserve_amounts)
+        ]
+        outputs.append(
+            {"asset": "xch", "address": change_rows[0][1],
+             "amount_mojos": new_change, "purpose": "top_up", "ordinal": 4}
+        )
+        recheck("before_unsigned_build")
+        unsigned = _wallet_adapter.build_coin_prep_rbf_preview_rpc(
+            source_ids[0], outputs, fee_mojos, _identity_recheck=recheck
+        )
+        recheck("after_unsigned_build")
+        inspected = _wallet_adapter.inspect_unsigned_transaction_effect(
+            unsigned,
+            {
+                "source_asset": "xch", "source_coin_ids": source_ids,
+                "fee_coin_ids": [], "cat_asset_id": None,
+                "fee_mojos": fee_mojos, "outputs": outputs,
+            },
+        )
+        if (
+            type(inspected) is not dict
+            or inspected.get("_catalyst_executable_effect_bound") is not True
+        ):
+            return refuse("RBF_UNSIGNED_EFFECT_UNVERIFIED")
+        preview_inputs = {
+            hex_id(item["coin_id"])
+            for item in inspected["summary"]["inputs"]
+        }
+        if not set(spent_ids).issubset(preview_inputs):
+            return refuse("RBF_ORIGINAL_INPUT_SUPERSET_MISMATCH")
+        # The unsigned build can take long enough for the original transaction
+        # to confirm or disappear. A preview must describe the same live
+        # pending effect observed before the Sage call, not a stale candidate.
+        pending_after = get_pending_transactions_strict()
+        if type(pending_after) is not list:
+            return refuse("SAGE_PENDING_VIEW_UNAVAILABLE")
+        matching_after = [
+            row for row in pending_after
+            if type(row) is dict
+            and hex_id(row.get("transaction_id")) == requested_tx
+        ]
+        if len(matching_after) != 1:
+            return refuse("ORIGINAL_PENDING_CHANGED_DURING_PREVIEW")
+        after = matching_after[0]
+        if (
+            mojos(after.get("fee")) != 0
+            or sorted(xch_record(row) for row in after["spent"]) != sorted(spent)
+            or sorted(xch_record(row) for row in after["created"]) != sorted(created)
+        ):
+            return refuse("ORIGINAL_PENDING_CHANGED_DURING_PREVIEW")
+        source_after = [
+            row for row in pending_after
+            if type(row) is dict
+            and type(row.get("spent")) is list
+            and any(
+                type(spend) is dict
+                and hex_id(spend.get("coin_id")) == source_ids[0]
+                for spend in row["spent"]
+            )
+        ]
+        if source_after != matching_after:
+            return refuse("ORIGINAL_PENDING_CHANGED_DURING_PREVIEW")
+        recheck("after_pending_recheck")
+        original_outputs = [
+            {
+                "coin_id": coin_id,
+                "amount_mojos": amount,
+                "purpose": "top_up" if amount == old_change else "fee_reserve",
+            }
+            for coin_id, _address, amount in external
+        ]
+        successor_outputs = [
+            {
+                "coin_id": hex_id(row["coin_id"]),
+                "amount_mojos": mojos(row["amount_mojos"]),
+                "purpose": row["purpose"],
+            }
+            for row in inspected["constructed_outputs"]
+        ]
+        return {
+            "success": True,
+            "operation_id": operation_id,
+            "original_transaction_id": requested_tx,
+            "provenance": "unique_exact_pending_effect_association",
+            "fee_mojos": fee_mojos,
+            "original_input_coin_ids": sorted(spent_ids),
+            "original_outputs": original_outputs,
+            "successor_outputs": successor_outputs,
+            "new_change_mojos": new_change,
+            "unsigned": inspected,
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return refuse("COIN_PREP_RBF_PREVIEW_UNAVAILABLE")
+    except Exception:
+        return refuse("COIN_PREP_RBF_PREVIEW_UNAVAILABLE")
+
+
+def submit_reviewed_coin_prep_rbf(attempt_id: str) -> dict:
+    """Submit exactly one durably reviewed fee-prep replacement.
+
+    No coins, actions, fee or unsigned spends are accepted from the caller.
+    The original transaction and sealed replacement are rebuilt and checked
+    before a sign-only intent and the one-shot submit marker are committed.
+    An uncertain outcome keeps the startup latch closed.
+    """
+    from coin_prep_rbf_pricing import quote_required_replacement_fee
+    from database import (
+        get_coin_prep_rbf_attempt_for_submit,
+        get_coin_prep_rbf_preview_authority,
+        record_coin_prep_rbf_sign_no_submit,
+        record_coin_prep_rbf_sign_start,
+        record_coin_prep_rbf_submit_start,
+    )
+
+    operation = "wallet:submit_coin_prep_rbf_rescue"
+    permit = None
+    sign_started = False
+    submit_started = False
+    sign_no_submit_reason = "PRE_SUBMIT_EXCEPTION"
+    try:
+        if WALLET_TYPE != "sage" or not callable(
+            getattr(_wallet_adapter, "submit_reviewed_coin_prep_rbf_rpc", None)
+        ):
+            return _blocked_mutation("WALLET_BACKEND_UNSUPPORTED")
+        attempt = get_coin_prep_rbf_attempt_for_submit(attempt_id)
+        operation_id = attempt["operation_id"]
+        source_authority = get_coin_prep_rbf_preview_authority(operation_id)
+        source_ids = json.loads(
+            source_authority["operation"]["source_coin_ids_json"]
+        )
+        if type(source_ids) is not list or len(source_ids) != 1:
+            return _blocked_mutation("COIN_PREP_RBF_ATTEMPT_INVALID")
+        source_id = source_ids[0].lower().removeprefix("0x")
+        digest = attempt["unsigned_sha256"]
+        generation = attempt["latch_generation"]
+        original_tx = attempt["original_transaction_id"]
+        fee = attempt["fee_mojos"]
+        if (
+            type(operation_id) is not str
+            or type(digest) is not str
+            or type(generation) is not int
+            or type(fee) is not int
+            or fee < 10_000_000
+        ):
+            return _blocked_mutation("COIN_PREP_RBF_ATTEMPT_INVALID")
+        preview = preview_coin_prep_rbf_unsigned(operation_id, original_tx, fee)
+        if preview.get("success") is not True:
+            return _blocked_mutation(
+                preview.get("reason") or "COIN_PREP_RBF_PREVIEW_UNAVAILABLE"
+            )
+        unsigned = preview["unsigned"]
+        if (
+            unsigned.get("_catalyst_executable_effect_bound") is not True
+            or unsigned.get("_catalyst_unsigned_digest") != digest
+        ):
+            return _blocked_mutation("COIN_PREP_RBF_UNSIGNED_SEAL_CHANGED")
+        constructed = sorted(
+            (
+                item["coin_id"].lower().removeprefix("0x"),
+                item["amount_mojos"],
+                item["purpose"],
+            )
+            for item in unsigned["constructed_outputs"]
+        )
+        reviewed = sorted(
+            (item["coin_id"], item["amount_mojos"], item["purpose"])
+            for item in json.loads(attempt["successor_outputs_json"])
+        )
+        if constructed != reviewed:
+            return _blocked_mutation("COIN_PREP_RBF_OUTPUTS_CHANGED")
+        cost = unsigned.get("_catalyst_exact_unsigned_cost")
+        guidance = quote_required_replacement_fee(cost)
+        if (
+            guidance.get("available") is not True
+            or fee < guidance["minimum_fee_mojos"]
+        ):
+            return _blocked_mutation("COIN_PREP_RBF_FEE_REVIEW_STALE")
+
+        permit = mutation_gate.enter_coin_prep_rbf_rescue_wallet_mutation(
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            expected_latch_generation=generation,
+            unsigned_sha256=digest,
+        )
+        original_pending_fingerprint = None
+
+        def recheck(step: str) -> None:
+            nonlocal original_pending_fingerprint
+            with _wallet_identity_observation_lock:
+                binding, adapter, _decision = (
+                    mutation_gate.require_fresh_coin_prep_rbf_rescue_wallet_continuation(
+                        permit,
+                        _identity_from_adapter(_wallet_adapter),
+                        attempt_id=attempt_id,
+                        operation_id=operation_id,
+                        expected_latch_generation=generation,
+                        unsigned_sha256=digest,
+                        allow_dispatched=False,
+                    )
+                )
+                if binding.backend != WALLET_TYPE or adapter is not _wallet_adapter:
+                    raise mutation_gate.MutationBlocked(
+                        "WALLET_IDENTITY_BINDING_INVALID", operation
+                    )
+            # A confirmed or replaced original must stop the pending
+            # replacement before Sage receives another wallet effect.
+            pending = get_pending_transactions_strict()
+            if type(pending) is not list:
+                raise mutation_gate.MutationBlocked(
+                    "SAGE_PENDING_VIEW_UNAVAILABLE", operation
+                )
+            exact = [
+                row for row in pending
+                if type(row) is dict
+                and str(row.get("transaction_id") or "").lower().removeprefix("0x")
+                == original_tx
+            ]
+            if len(exact) != 1:
+                raise mutation_gate.MutationBlocked(
+                    "ORIGINAL_PENDING_CHANGED_DURING_RESCUE", operation
+                )
+            source_pending = [
+                row for row in pending
+                if type(row) is dict
+                and type(row.get("spent")) is list
+                and any(
+                    type(spend) is dict
+                    and str(spend.get("coin_id") or "").lower().removeprefix("0x")
+                    == source_id
+                    for spend in row["spent"]
+                )
+            ]
+            if source_pending != exact:
+                raise mutation_gate.MutationBlocked(
+                    "ORIGINAL_PENDING_SOURCE_NOT_UNIQUE", operation
+                )
+            current_fingerprint = json.dumps(
+                {
+                    "fee": exact[0].get("fee"),
+                    "spent": exact[0].get("spent"),
+                    "created": exact[0].get("created"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if original_pending_fingerprint is None:
+                original_pending_fingerprint = current_fingerprint
+            elif current_fingerprint != original_pending_fingerprint:
+                raise mutation_gate.MutationBlocked(
+                    "ORIGINAL_PENDING_CHANGED_DURING_RESCUE", operation
+                )
+
+        recheck("before_sign_intent")
+        authority = mutation_gate.wallet_mutation_permit_journal_authority(
+            permit, operation
+        )
+        record_coin_prep_rbf_sign_start(
+            attempt_id,
+            owner_run_id=authority["owner_run_id"],
+            lease_version=authority["lease_version"],
+        )
+        sign_started = True
+
+        def adapter_recheck(step: str) -> None:
+            nonlocal submit_started
+            recheck(step)
+            if step == "rpc:submit_transaction:send":
+                fresh_guidance = quote_required_replacement_fee(cost)
+                if (
+                    fresh_guidance.get("available") is not True
+                    or fee < fresh_guidance["minimum_fee_mojos"]
+                ):
+                    raise mutation_gate.MutationBlocked(
+                        "COIN_PREP_RBF_FEE_REVIEW_STALE", operation
+                    )
+                record_coin_prep_rbf_submit_start(
+                    attempt_id,
+                    owner_run_id=authority["owner_run_id"],
+                    lease_version=authority["lease_version"],
+                )
+                submit_started = True
+
+        result = _wallet_adapter.submit_reviewed_coin_prep_rbf_rpc(
+            unsigned, _identity_recheck=adapter_recheck
+        )
+        if type(result) is not dict:
+            result = _blocked_mutation("COIN_PREP_RBF_SUBMISSION_UNKNOWN")
+        result = dict(result)
+        if not submit_started:
+            sign_no_submit_reason = (
+                "SIGNED_BYTES_INVALID"
+                if result.get("reason") == "RBF_SIGNED_SPENDS_MISMATCH"
+                else "SIGN_REFUSED"
+            )
+        result["_catalyst_effect_attempted"] = submit_started
+        return result
+    except mutation_gate.MutationBlocked as exc:
+        result = _blocked_mutation(exc.reason_code)
+    except Exception:
+        result = _blocked_mutation("COIN_PREP_RBF_SUBMISSION_UNKNOWN")
+    finally:
+        if sign_started and not submit_started:
+            try:
+                receipt_body = {
+                    "attempt_id": attempt_id,
+                    "reason_code": sign_no_submit_reason,
+                    "submit_rpc_attempted": False,
+                    "evidence_sha256": hashlib.sha256(
+                        json.dumps(
+                            {"attempt_id": attempt_id, "unsigned_sha256": digest,
+                             "reason_code": sign_no_submit_reason},
+                            sort_keys=True, separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                }
+                record_coin_prep_rbf_sign_no_submit(
+                    attempt_id, receipt=receipt_body
+                )
+            except Exception:
+                pass
+        if permit is not None:
+            try:
+                mutation_gate.exit_wallet_mutation(permit)
+            except BaseException:
+                pass
+    result["_catalyst_effect_attempted"] = submit_started
+    return result
 
 
 def build_cancel_offers_batch_unsigned(

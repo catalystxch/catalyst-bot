@@ -233,6 +233,7 @@ _PRIVATE_READ_ROUTES = frozenset(
         "/api/wallets/detect",
         "/api/cats",
         "/api/coin-prep/status",
+        "/api/safety/coin-prep-recovery-scope",
         "/api/coins",
         "/api/coin-prep/verify",
         "/api/bootstrap/status",
@@ -368,6 +369,7 @@ _MUTATING_API_ENDPOINTS = {
 }
 
 _READ_ONLY_WRITE_API_ENDPOINTS = {
+    "api_coin_prep_recovery_preview",
     # WalletConnect signs only canonical Bootstrap messages. The browser
     # namespace deliberately contains no offer, spend, send, or cancel method.
     "api_bootstrap_manifest_sign_begin",
@@ -393,6 +395,9 @@ _READ_ONLY_WRITE_API_ENDPOINTS = {
 }
 
 _CONTROL_WRITE_API_ENDPOINTS = {
+    # This route obtains its own attempt-bound recovery wallet permit. The
+    # ordinary trading mutation gate remains closed under the prep latch.
+    "api_coin_prep_recovery_submit",
     "api_safety_release_resolved",
     "api_safety_confirm_cancel_latch_review",
     "api_safety_check_submitted_cancellations",
@@ -424,6 +429,8 @@ _refresh_abort_recovery_active = False
 _registry_terminal_recovery_active = False
 _cancel_latch_review_recovery_active = False
 _no_effect_creation_recovery_active = False
+_coin_prep_rbf_recovery_active = False
+_coin_prep_rbf_recovery_scope = None
 _wallet_setup_bootstrap_active = False
 _wallet_setup_bootstrap_fingerprint: Optional[str] = None
 _LEGACY_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 3
@@ -4582,6 +4589,137 @@ def activate_cancel_latch_review_restricted_startup(authorization: Any) -> bool:
                 _mutation_runtime_db_path = None
 
 
+def _exact_coin_prep_rbf_startup_candidate() -> dict | None:
+    """Read one exact fee-split latch; no lease acquisition or wallet calls."""
+    try:
+        if str(getattr(cfg, "WALLET_TYPE", "")).strip().lower() != "sage":
+            return None
+        wallet_hash, network = _configured_mutation_binding()
+        latch = database.get_runtime_safety_latch()
+        if (
+            type(latch) is not dict
+            or latch.get("state") != "tripped"
+            or latch.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"
+            or latch.get("wallet_fingerprint_hash") != wallet_hash
+            or latch.get("network") != network
+            or type(latch.get("generation")) is not int
+        ):
+            return None
+        blockers = json.loads(latch["blocking_operation_ids_json"])
+        if type(blockers) is not list or len(blockers) != 2:
+            return None
+        operations = [value for value in blockers if type(value) is str
+                      and not value.startswith("wallet-effect:")]
+        if len(operations) != 1:
+            return None
+        authority = database.get_coin_prep_rbf_preview_authority(operations[0])
+        operation = authority["operation"]
+        if authority["latch"] != latch:
+            return None
+        identity = json.loads(operation["wallet_identity_json"])
+        source_ids = json.loads(operation["source_coin_ids_json"])
+        target = json.loads(operation["target_contract_json"])
+        if (
+            operation.get("operation_id") != operations[0]
+            or operation.get("outcome") != "SUBMITTED_UNKNOWN"
+            or operation.get("operation_kind") != "split"
+            or operation.get("purpose") != "fee_reserve"
+            or operation.get("effect_adapter_operation") != operations[0]
+            or not operation.get("effect_dispatch_token")
+            or json.loads(operation["effect_fee_coin_ids_json"]) != []
+            or blockers != sorted([operations[0], f"wallet-effect:{operation['effect_claim_token']}"])
+            or mutation_gate.wallet_fingerprint_hash(identity["fingerprint"]) != wallet_hash
+            or identity["network_id"] != network
+            or type(source_ids) is not list or len(source_ids) != 1
+            or re.fullmatch(r"[0-9a-f]{64}", source_ids[0]) is None
+            or target.get("wallet_type") != "xch"
+            or target.get("contract_version") is not None
+            or len(target.get("outputs", [])) != 5
+        ):
+            return None
+        return authority
+    except Exception:
+        return None
+
+
+def activate_coin_prep_rbf_restricted_startup(authorization: Any) -> bool:
+    """Adopt an exact pending fee split for review only, never normal trading."""
+    global _mutation_runtime, _mutation_runtime_db_path, _stability_startup_status
+    global _coin_prep_rbf_recovery_active, _coin_prep_rbf_recovery_scope
+    if (type(authorization) is not dict or authorization.get("allowed") is not False
+            or authorization.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"):
+        return False
+    with _mutation_runtime_init_lock:
+        candidate = _exact_coin_prep_rbf_startup_candidate()
+        if (_coin_prep_rbf_recovery_active or bot is not None
+                or mutation_gate.current_runtime() is not None or candidate is None):
+            return False
+        runtime = None
+        acquired = False
+        activated = False
+        try:
+            wallet_hash, network = _configured_mutation_binding()
+            binding = _configured_wallet_identity_binding(network)
+            if type(binding) is not mutation_gate.WalletIdentityBinding:
+                return False
+            runtime = mutation_gate.initialize(
+                wallet_fingerprint_hash=wallet_hash, network=network,
+                wallet_identity_binding=binding,
+                wallet_adapter_authority=get_wallet_adapter_authority(),
+                acquire_lease=False, start_heartbeat=False,
+            )
+            result = runtime.acquire_coin_prep_rbf_successor(
+                operation_id=candidate["operation"]["operation_id"],
+                expected_latch_generation=candidate["latch"]["generation"],
+            )
+            acquired = result.get("acquired") is True
+            status = runtime.read_only_status().to_dict()
+            if (not acquired or status.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"
+                    or (status.get("lease") or {}).get("owned_by_this_run") is not True
+                    or _exact_coin_prep_rbf_startup_candidate() != candidate):
+                return False
+            runtime.register_stop_handler(_mutation_stop_handler)
+            if runtime.start_heartbeat() is not True:
+                return False
+            _mutation_runtime = runtime
+            _mutation_runtime_db_path = os.path.normcase(os.path.abspath(database.DB_PATH))
+            _stability_startup_status = _redacted_startup_status(status)
+            _coin_prep_rbf_recovery_scope = candidate
+            _coin_prep_rbf_recovery_active = True
+            activated = True
+            return True
+        except Exception:
+            return False
+        finally:
+            if not activated:
+                _coin_prep_rbf_recovery_active = False
+                _coin_prep_rbf_recovery_scope = None
+                if runtime is not None:
+                    mutation_gate.shutdown_runtime(release_owned_lease=acquired)
+                _mutation_runtime = None
+                _mutation_runtime_db_path = None
+
+
+def _coin_prep_rbf_owned_review_snapshot() -> dict | None:
+    """Revalidate owner and immutable scope before serving any private review."""
+    runtime = mutation_gate.current_runtime()
+    if not _coin_prep_rbf_recovery_active or runtime is None or runtime is not _mutation_runtime:
+        return None
+    status = runtime.read_only_status().to_dict()
+    candidate = _exact_coin_prep_rbf_startup_candidate()
+    if (status.get("reason_code") != "COIN_PREP_RECOVERY_REQUIRED"
+            or (status.get("lease") or {}).get("owned_by_this_run") is not True
+            or candidate is None or candidate != _coin_prep_rbf_recovery_scope):
+        return None
+    operation = candidate["operation"]
+    return {
+        "operation_id": operation["operation_id"],
+        "original_input_coin_ids": json.loads(operation["source_coin_ids_json"]),
+        "preview_available": False,
+        "dispatch_authorized": False,
+    }
+
+
 def activate_no_effect_creation_restricted_startup(authorization: Any) -> bool:
     """Open only an exact, database-only creation review under a fenced lease."""
 
@@ -5064,6 +5202,15 @@ def enforce_local_runtime_guard():
     }:
         return jsonify({"success": False, "error": "creation_recovery_only"}), 423
 
+    if _coin_prep_rbf_recovery_active and (request.method, path) not in {
+        ("GET", "/"),
+        ("GET", "/api/safety/status"),
+        ("GET", "/api/safety/coin-prep-recovery-scope"),
+        ("POST", "/api/safety/coin-prep-recovery-preview"),
+        ("POST", "/api/safety/coin-prep-recovery-submit"),
+    }:
+        return jsonify({"success": False, "error": "coin_prep_recovery_only"}), 423
+
     if path == "/api/events" and not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
 
@@ -5160,7 +5307,7 @@ def release_local_runtime_guard(_error=None):
 
 @app.route("/")
 def serve_gui():
-    """Serve the bot GUI HTML file."""
+    """Serve the bot GUI HTML file or the exact owner-only recovery review."""
     bootstrap = request.args.get("bootstrap", "")
     if bootstrap and secrets.compare_digest(bootstrap, _LOCAL_API_BOOTSTRAP_TOKEN):
         response = Response(status=302)
@@ -5168,6 +5315,14 @@ def serve_gui():
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
         return _bind_local_browser_cookie(response)
+    if _coin_prep_rbf_recovery_active:
+        if not _has_valid_local_token():
+            return Response("Unauthorized", status=401, mimetype="text/plain")
+        snapshot = _coin_prep_rbf_owned_review_snapshot()
+        if snapshot is None:
+            return Response("Recovery authority unavailable", status=423, mimetype="text/plain")
+        from coin_prep_recovery_review import render_recovery_review
+        return Response(render_recovery_review(snapshot), mimetype="text/html")
     if _refresh_abort_recovery_active:
         if not _has_valid_local_token():
             return Response("Unauthorized", status=401, mimetype="text/plain")
@@ -5195,6 +5350,148 @@ def serve_gui():
     if not _has_valid_local_token():
         return Response("Unauthorized", status=401, mimetype="text/plain")
     return _serve_bootstrapped_html("bot_gui.html")
+
+
+@app.route("/api/safety/coin-prep-recovery-scope")
+def api_coin_prep_recovery_scope():
+    snapshot = _coin_prep_rbf_owned_review_snapshot()
+    if snapshot is None:
+        return jsonify({"success": False, "reason": "COIN_PREP_RECOVERY_AUTHORITY_UNAVAILABLE"}), 423
+    return jsonify({"success": True, "scope": snapshot})
+
+
+@app.route("/api/safety/coin-prep-recovery-preview", methods=["POST"])
+def api_coin_prep_recovery_preview():
+    """Build a server-selected unsigned review; no client wallet actions accepted."""
+    snapshot = _coin_prep_rbf_owned_review_snapshot()
+    if snapshot is None:
+        return jsonify({"success": False, "reason": "COIN_PREP_RECOVERY_AUTHORITY_UNAVAILABLE"}), 423
+    body = request.get_json(silent=True) if request.is_json else (
+        {} if not request.get_data() else None
+    )
+    if type(body) is not dict or body:
+        return jsonify({"success": False, "reason": "RBF_PREVIEW_BODY_INVALID"}), 400
+    try:
+        from wallet import get_pending_transactions_strict
+        from coin_prep_rbf_review_service import prepare_coin_prep_rbf_review
+
+        pending = get_pending_transactions_strict()
+        source = snapshot["original_input_coin_ids"][0]
+        if type(pending) is not list:
+            raise ValueError("pending view unavailable")
+        matches = [row for row in pending if type(row) is dict
+                   and type(row.get("spent")) is list
+                   and any(type(coin) is dict and type(coin.get("coin_id")) is str
+                           and coin["coin_id"].lower().removeprefix("0x") == source
+                           for coin in row["spent"])]
+        if len(matches) != 1:
+            raise ValueError("original pending transaction is ambiguous")
+        tx = matches[0].get("transaction_id")
+        if type(tx) is not str:
+            raise ValueError("original transaction ID unavailable")
+        tx = tx.lower().removeprefix("0x")
+        if re.fullmatch(r"[0-9a-f]{64}", tx) is None:
+            raise ValueError("original transaction ID invalid")
+        if _coin_prep_rbf_owned_review_snapshot() != snapshot:
+            raise ValueError("recovery scope changed")
+        result = prepare_coin_prep_rbf_review(snapshot["operation_id"], tx)
+        if result.get("available") is not True:
+            return jsonify({"success": False, "reason": result.get("reason", "RBF_REVIEW_UNAVAILABLE")}), 409
+        if _coin_prep_rbf_owned_review_snapshot() != snapshot:
+            raise ValueError("recovery scope changed")
+        review = result["review"]
+        original = review["original_outputs"]
+        successor = review["successor_outputs"]
+        snapshot.update({
+            "original_transaction_id": review["original_transaction_id"],
+            "original_fee_mojos": "0",
+            "fee_mojos": str(review["fee_mojos"]),
+            "original_change_mojos": str(next(row["amount_mojos"] for row in original if row["purpose"] == "top_up")),
+            "new_change_mojos": str(next(row["amount_mojos"] for row in successor if row["purpose"] == "top_up")),
+            "cost": str(review["cost"]),
+            "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(review["quote"]["observed_at"])),
+            "expires_at": review["review_expires_at"],
+            "review_digest": result["review_sha256"],
+            "attempt_id": result["attempt_id"],
+            "outputs": [{"coin_id": row["coin_id"], "amount_mojos": str(row["amount_mojos"]),
+                         "purpose": row["purpose"]} for row in successor],
+            "preview_available": True,
+        })
+        try:
+            owned_runtime = mutation_gate.current_runtime()
+            database.authorize_coin_prep_rbf_rescue_target(
+                attempt_id=result["attempt_id"],
+                operation_id=snapshot["operation_id"],
+                expected_latch_generation=review["latch_generation"],
+                unsigned_sha256=review["unsigned_sha256"],
+                owner_run_id=owned_runtime.run_id,
+                lease_version=owned_runtime._lease_version,
+            )
+            snapshot["submission_available"] = True
+        except Exception:
+            snapshot["submission_available"] = False
+        if request.is_json:
+            return jsonify({"success": True, "scope": snapshot, "dispatch_authorized": False})
+        from coin_prep_recovery_review import render_recovery_review
+        return Response(render_recovery_review(snapshot), mimetype="text/html")
+    except Exception:
+        return jsonify({"success": False, "reason": "RBF_REVIEW_UNAVAILABLE", "dispatch_authorized": False}), 409
+
+
+@app.route("/api/safety/coin-prep-recovery-submit", methods=["POST"])
+def api_coin_prep_recovery_submit():
+    """Accept one explicit reviewed fee-replacement click under exact authority."""
+    scope = _coin_prep_rbf_owned_review_snapshot()
+    if scope is None:
+        return jsonify({"success": False, "reason": "COIN_PREP_RECOVERY_AUTHORITY_UNAVAILABLE"}), 423
+    if request.is_json or request.mimetype != "application/x-www-form-urlencoded":
+        return jsonify({"success": False, "reason": "RBF_SUBMIT_FORM_INVALID"}), 400
+    form = request.form
+    if (
+        set(form.keys()) != {"attempt_id", "review_digest", "confirmed"}
+        or any(len(form.getlist(key)) != 1 for key in form.keys())
+        or form.get("confirmed") != "on"
+    ):
+        return jsonify({"success": False, "reason": "RBF_SUBMIT_CONSENT_INVALID"}), 400
+    attempt_id = form.get("attempt_id", "")
+    review_digest = form.get("review_digest", "")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", attempt_id) is None
+        or re.fullmatch(r"[0-9a-f]{64}", review_digest) is None
+    ):
+        return jsonify({"success": False, "reason": "RBF_SUBMIT_REVIEW_INVALID"}), 400
+    try:
+        attempt = database.get_coin_prep_rbf_attempt_for_submit(attempt_id)
+        if (
+            attempt["operation_id"] != scope["operation_id"]
+            or not secrets.compare_digest(attempt["review_sha256"], review_digest)
+            or _coin_prep_rbf_owned_review_snapshot() != scope
+        ):
+            return jsonify({"success": False, "reason": "RBF_SUBMIT_REVIEW_CHANGED"}), 409
+        from wallet import submit_reviewed_coin_prep_rbf
+
+        result = submit_reviewed_coin_prep_rbf(attempt_id)
+        attempted = result.get("_catalyst_effect_attempted") is True
+        from coin_prep_recovery_review import render_recovery_result
+
+        return Response(
+            render_recovery_result(
+                attempt_id=attempt_id,
+                fee_mojos=attempt["fee_mojos"],
+                attempted=attempted,
+                accepted=result.get("success") is True,
+            ),
+            status=202 if attempted else 409,
+            mimetype="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+    except Exception:
+        return jsonify({
+            "success": False,
+            "reason": "RBF_SUBMISSION_UNCERTAIN",
+            "trading_blocked": True,
+            "retry_allowed": False,
+        }), 409
 
 
 @app.route("/api/safety/status")
