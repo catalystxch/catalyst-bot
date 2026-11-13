@@ -1811,6 +1811,87 @@ class AppBridge:
         return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
+    @_mutation_guard("app_bridge:prepare_follow_run_fee_cap_grant")
+    def prepare_follow_run_fee_cap_grant(self, body=None):
+        """Freeze an above-cap network recommendation for native review."""
+        from follow_run_fee_cap_grant import prepare_follow_run_fee_cap_grant
+
+        if type(body) is not dict or body:
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_CAP_GRANT_INVALID",
+                "dispatch_authorized": False,
+            }
+        try:
+            return prepare_follow_run_fee_cap_grant()
+        except (TypeError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            allowed = {
+                "FOLLOW_FEE_CAP_GRANT_INVALID",
+                "FOLLOW_FEE_CAP_GRANT_NOT_REQUIRED",
+                "FOLLOW_FEE_CAP_GRANT_AUTHORITY_REQUIRED",
+                "FOLLOW_FEE_CAP_GRANT_AUTHORITY_CHANGED",
+                "FOLLOW_FEE_CAP_GRANT_RECOMMENDATION_UNAVAILABLE",
+                "FOLLOW_FEE_CAP_GRANT_PERSIST_FAILED",
+            }
+            return {
+                "success": False,
+                "reason": reason
+                if reason in allowed
+                else "FOLLOW_FEE_CAP_GRANT_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_follow_run_fee_cap_grant")
+    def confirm_follow_run_fee_cap_grant(self, body=None):
+        """Persist an exact accepted cap grant without changing run policy."""
+        import re
+
+        from follow_run_fee_cap_grant import confirm_follow_run_fee_cap_grant
+
+        if (
+            type(body) is not dict
+            or set(body) != {"review_id", "review_sha256", "accepted"}
+            or body["accepted"] is not True
+            or any(
+                type(body[key]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_FEE_CAP_GRANT_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            return confirm_follow_run_fee_cap_grant(
+                review_id=body["review_id"],
+                review_sha256=body["review_sha256"],
+                accepted=True,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            allowed = {
+                "FOLLOW_FEE_CAP_GRANT_CONFIRMATION_REQUIRED",
+                "FOLLOW_FEE_CAP_GRANT_AUTHORITY_REQUIRED",
+                "FOLLOW_FEE_CAP_GRANT_AUTHORITY_CHANGED",
+                "FOLLOW_FEE_CAP_GRANT_REVIEW_REQUIRED",
+                "FOLLOW_FEE_CAP_GRANT_REVIEW_CHANGED",
+                "FOLLOW_FEE_CAP_GRANT_REVIEW_EXPIRED",
+                "FOLLOW_FEE_CAP_GRANT_RECOMMENDATION_UNAVAILABLE",
+                "FOLLOW_FEE_CAP_GRANT_PERSIST_FAILED",
+            }
+            return {
+                "success": False,
+                "reason": reason
+                if reason in allowed
+                else "FOLLOW_FEE_CAP_GRANT_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+
+    @_safe
     @_mutation_guard("app_bridge:approve_coin_prep_fees")
     def approve_coin_prep_fees(self, body=None):
         """Record consent through the shared HTTP handler, without prep launch."""
@@ -2856,6 +2937,8 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "confirm_single_approval_follow_run_review",
     "prepare_follow_fee_ceiling_review",
     "confirm_follow_fee_ceiling_review",
+    "prepare_follow_run_fee_cap_grant",
+    "confirm_follow_run_fee_cap_grant",
     "commit_external_cancellation",
     "commit_no_effect_creation",
     "purge_fills",
