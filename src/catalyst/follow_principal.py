@@ -383,6 +383,25 @@ def prove_follow_restart_book(
     }
 
 
+def _follow_principal_stage_reprovable(state: dict) -> bool:
+    """Permit the bot's second read after the route binds the same run to start."""
+    if type(state) is not dict:
+        return False
+    if state.get("state") == "ready":
+        return True
+    if state.get("state") != "start_pending":
+        return False
+    run_id = state.get("run_id")
+    return (
+        type(run_id) is str
+        and re.fullmatch(r"[0-9a-f]{64}", run_id) is not None
+        and type(state.get("funded_buy_limit")) is int
+        and type(state.get("funded_sell_limit")) is int
+        and state["funded_buy_limit"] > 0
+        and state["funded_sell_limit"] > 0
+    )
+
+
 def preview_approved_follow_principal(
     approval_id: str, *, buy_limit: int | None = None, sell_limit: int | None = None
 ) -> dict:
@@ -467,7 +486,7 @@ def preview_approved_follow_principal(
             type(state) is not dict
             or type(policy) is not FollowRunPolicy
             or state.get("session_id") != partial_session_id
-            or state.get("state") != "ready"
+            or not _follow_principal_stage_reprovable(state)
             or state.get("fee_approval_id") != approval_id
             or state.get("fee_approval_session_id") != scope.get("session_id")
             or state.get("policy_digest") != policy.digest

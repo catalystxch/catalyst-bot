@@ -8,12 +8,32 @@ import pytest
 
 from coin_prep_batch_plan import CoinSnapshot, SelectableCoin
 from follow_principal import (
+    _follow_principal_stage_reprovable,
     calculate_follow_principal,
     prove_follow_restart_book,
     preview_approved_follow_principal,
     read_follow_principal_snapshot,
 )
 from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
+
+
+def test_follow_principal_reproves_bound_start_pending_run():
+    bound = {
+        "state": "start_pending",
+        "run_id": "a" * 64,
+        "funded_buy_limit": 24,
+        "funded_sell_limit": 24,
+    }
+    assert _follow_principal_stage_reprovable(bound) is True
+    assert _follow_principal_stage_reprovable({**bound, "state": "ready"}) is True
+    for change in (
+        {"state": "running"},
+        {"state": "recoverable_error"},
+        {"run_id": None},
+        {"funded_buy_limit": None},
+        {"funded_sell_limit": 0},
+    ):
+        assert _follow_principal_stage_reprovable({**bound, **change}) is False
 
 
 def _coin(asset, marker, amount, *, purpose="", protected=False):
