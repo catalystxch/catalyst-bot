@@ -39,3 +39,51 @@ def test_single_approval_is_only_offered_for_fresh_smart_settings():
     assert "runButton.style.display = 'none'" in dirty_check
     assert "runButton.style.display = 'inline-flex'" in dirty_check
     assert "saveSettingsAndReviewSingleRun()" in html
+
+
+def test_approved_run_resumes_from_read_only_status_without_duplicate_pollers():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    recovery = html.split("async function recoverSingleApprovalRunOnStartup()", 1)[1].split(
+        "let _followRunReview", 1
+    )[0]
+    polling = html.split("async function advanceSingleApprovalRun(sessionId)", 1)[1].split(
+        "async function recoverSingleApprovalRunOnStartup()", 1
+    )[0]
+
+    assert "get_single_approval_follow_run_status" in recovery
+    assert "['prep_pending', 'preparing', 'ready', 'start_pending']" in recovery
+    assert "runState === 'recoverable_error'" in recovery
+    assert "_singleApprovalRunPollingPromise" in polling
+    assert "_singleApprovalRunPollSession === sessionId" in polling
+    assert "setTimeout(resolve, 7000)" in polling
+    assert "attempt < 120" not in polling
+
+
+def test_smart_settings_retains_manual_targets_and_discloses_sizing_estimate():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    smart_settings = html.split("async function getSmartDefaults()", 1)[1].split(
+        "// ── \"Settings changed since Smart Settings\" tracker", 1
+    )[0]
+
+    assert "const _smartRequestedBuy" in smart_settings
+    assert "const _smartRequestedSell" in smart_settings
+    assert "Math.max(...selectedTargets)" in smart_settings
+    assert "if (!_preserveBuyTarget && data.max_active_buy !== undefined)" in smart_settings
+    assert "if (!_preserveSellTarget && data.max_active_sell !== undefined)" in smart_settings
+    assert "Requested targets retained" in smart_settings
+
+
+def test_single_review_collects_save_warnings_and_keeps_blockers():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    save_config = html.split("async function saveConfig()", 1)[1].split(
+        "function closeCtgErrorModal()", 1
+    )[0]
+    review = html.split("async function prepareSingleApprovalRunReview()", 1)[1].split(
+        "async function confirmSingleApprovalRunReview()", 1
+    )[0]
+
+    assert "_singleApprovalRunWarnings.push(lowSpreadWarning)" in save_config
+    assert "_singleApprovalRunWarnings.push(..._riskWarnings)" in save_config
+    assert "_singleApprovalRunWarnings.push(...validationWarnings" in save_config
+    assert "if (_riskBlockers.length > 0)" in save_config
+    assert "Save warnings:" in review

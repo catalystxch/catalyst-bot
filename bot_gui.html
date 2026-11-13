@@ -8516,6 +8516,8 @@
                 <p>One approval covers preparation, start, and management of this ladder. Review every limit, market warning, and fee maximum.</p>
             </div>
             <div class="follow-review-body">
+                <div id="singleApprovalRunProgress" role="status" aria-live="polite" style="display:none; white-space:pre-wrap; overflow-wrap:anywhere; padding:12px; border:1px solid var(--status-warning); border-radius:8px; color:var(--status-warning);"></div>
+                <div id="singleApprovalRunReviewBody">
                 <div class="follow-review-grid">
                     <label class="follow-review-field"><span>BUY target</span><input id="singleRunBuyTarget" type="number" min="1" step="1" value="24" oninput="invalidateSingleApprovalRunReview()"></label>
                     <label class="follow-review-field"><span>SELL target</span><input id="singleRunSellTarget" type="number" min="1" step="1" value="24" oninput="invalidateSingleApprovalRunReview()"></label>
@@ -8532,6 +8534,7 @@
                     <button type="button" class="btn btn-secondary" onclick="closeSingleApprovalRunReview()">Back</button>
                     <button type="button" class="btn btn-secondary" id="singleApprovalRunPrepare" onclick="prepareSingleApprovalRunReview()">Refresh exact review</button>
                     <button type="button" class="btn btn-primary" id="singleApprovalRunConfirm" disabled onclick="confirmSingleApprovalRunReview()">Approve, prepare &amp; start</button>
+                </div>
                 </div>
             </div>
         </div>
@@ -20590,6 +20593,14 @@
                 return;
             }
 
+            // Snapshot current per-side targets before the asynchronous plan.
+            // Smart Settings may suggest counts, but must not replace an
+            // explicit target entered by the user.
+            const _smartRequestedBuy = Number(document.getElementById('configMaxBuy')?.value);
+            const _smartRequestedSell = Number(document.getElementById('configMaxSell')?.value);
+            const _smartHadBuyTarget = Number.isSafeInteger(_smartRequestedBuy) && _smartRequestedBuy > 0;
+            const _smartHadSellTarget = Number.isSafeInteger(_smartRequestedSell) && _smartRequestedSell > 0;
+
             // Require a trading pair to be selected first
             const settingsCatSel = document.getElementById('configCatSelector');
             const hasSettingsSelection = settingsCatSel && settingsCatSel.value && !settingsCatSel.options[settingsCatSel.selectedIndex]?.disabled;
@@ -20679,12 +20690,19 @@
                     liquidity_mode: (typeof getLiquidityMode === 'function')
                         ? getLiquidityMode() : 'two_sided',
                 });
-                const buyTarget = Number(document.getElementById('configMaxBuy')?.value);
-                const sellTarget = Number(document.getElementById('configMaxSell')?.value);
+                const buyTarget = _smartRequestedBuy;
+                const sellTarget = _smartRequestedSell;
                 const mode = params.get('liquidity_mode');
-                const requestedTarget = mode === 'buy_only' ? buyTarget
-                    : mode === 'sell_only' ? sellTarget
-                    : buyTarget === sellTarget ? buyTarget : 0;
+                const selectedTargets = [
+                    mode !== 'sell_only' && _smartHadBuyTarget ? buyTarget : 0,
+                    mode !== 'buy_only' && _smartHadSellTarget ? sellTarget : 0,
+                ].filter(value => value > 0);
+                // The sizing endpoint accepts one count. For different
+                // per-side targets, size conservatively for the larger side;
+                // the requested values are restored independently below.
+                const requestedTarget = mode === 'buy_only' && _smartHadBuyTarget ? buyTarget
+                    : mode === 'sell_only' && _smartHadSellTarget ? sellTarget
+                    : selectedTargets.length ? Math.max(...selectedTargets) : 0;
                 if (Number.isSafeInteger(requestedTarget) && requestedTarget >= 1) {
                     params.set('target_offers_per_side', String(requestedTarget));
                 }
@@ -20988,8 +21006,16 @@
                     };
                 }
                 // Offer counts from capital sizing
-                if (data.max_active_buy !== undefined) document.getElementById('configMaxBuy').value = data.max_active_buy || '';
-                if (data.max_active_sell !== undefined) document.getElementById('configMaxSell').value = data.max_active_sell || '';
+                const _currentBuyTarget = Number(document.getElementById('configMaxBuy')?.value);
+                const _currentSellTarget = Number(document.getElementById('configMaxSell')?.value);
+                const _preserveBuyTarget = Number.isSafeInteger(_currentBuyTarget) && _currentBuyTarget > 0;
+                const _preserveSellTarget = Number.isSafeInteger(_currentSellTarget) && _currentSellTarget > 0;
+                if (!_preserveBuyTarget && data.max_active_buy !== undefined) {
+                    document.getElementById('configMaxBuy').value = data.max_active_buy || '';
+                }
+                if (!_preserveSellTarget && data.max_active_sell !== undefined) {
+                    document.getElementById('configMaxSell').value = data.max_active_sell || '';
+                }
                 // Per-tier counts (market-adaptive distribution).
                 // Sell row first — Smart Settings sizes by SIZE column, which
                 // matches the sell ladder directly (no reversal).
@@ -21309,11 +21335,14 @@
                     const profileBadge = `<span style="background:${profileColour}22;color:${profileColour};border:1px solid ${profileColour}55;border-radius:4px;padding:1px 7px;font-size:0.82em;font-weight:600;">${profileLabel}</span>`;
 
                     resultTitle.textContent = `\u2713 Smart Settings applied · ${qualityScore}% ${qualityLabel} · ${appliedProfile}`;
+                    const requestedBuyForSummary = Number(document.getElementById('configMaxBuy')?.value) || Number(data.max_active_buy) || 0;
+                    const requestedSellForSummary = Number(document.getElementById('configMaxSell')?.value) || Number(data.max_active_sell) || 0;
                     resultBody.textContent = [
                         `Market: ${priceStr}; ${regime}; ${mktActivity}; ${riskLabel || 'unknown'} risk`,
                         cp.available_xch > 0
-                            ? `Capital: ${(cp.total_xch || cp.available_xch).toFixed(3)} XCH total; ${cp.n_final || 0} offers/side`
+                            ? `Capital: ${(cp.total_xch || cp.available_xch).toFixed(3)} XCH total; current sizing estimate ${cp.n_final || 0} offers/side`
                             : 'Capital: insufficient after reserve',
+                        `Requested targets retained: ${requestedBuyForSummary} BUY / ${requestedSellForSummary} SELL. Smart Settings estimates capacity from this balance; coin preparation and runtime funding may support fewer slots.`,
                         spreadBps > 0
                             ? `Spread: ${spreadPct}; requote ${requotePct}`
                             : 'Spread: unavailable',
@@ -33214,10 +33243,14 @@
         }
 
         let _singleApprovalRunRequestedAfterSave = false;
+        let _singleApprovalRunWarnings = [];
         let _singleApprovalRunReview = null;
         let _singleApprovalRunPolicy = null;
         let _singleApprovalRunDefaults = null;
         let _singleApprovalRunBusy = false;
+        let _singleApprovalRunRecoveryStarted = false;
+        let _singleApprovalRunPollSession = null;
+        let _singleApprovalRunPollingPromise = null;
 
         function singleRunXchToMojos(value) {
             const raw = String(value || '').trim();
@@ -33247,7 +33280,13 @@
         function saveSettingsAndReviewSingleRun() {
             if (document.getElementById('saveConfigBtn')?.disabled) return;
             _singleApprovalRunRequestedAfterSave = true;
+            _singleApprovalRunWarnings = [];
             handleSaveClick();
+        }
+
+        function clearSingleApprovalRunSaveIntent() {
+            _singleApprovalRunRequestedAfterSave = false;
+            _singleApprovalRunWarnings = [];
         }
 
         function invalidateSingleApprovalRunReview() {
@@ -33270,6 +33309,19 @@
             if (confirm) confirm.disabled = true;
         }
 
+        function showSingleApprovalRunProgress(message, warning = false) {
+            const modal = document.getElementById('singleApprovalRunReviewModal');
+            const editor = document.getElementById('singleApprovalRunReviewBody');
+            const progress = document.getElementById('singleApprovalRunProgress');
+            if (modal) modal.style.display = 'flex';
+            if (editor) editor.style.display = 'none';
+            if (progress) {
+                progress.style.display = 'block';
+                progress.style.color = warning ? 'var(--status-warning)' : 'var(--text-primary)';
+                progress.textContent = String(message || 'Approved run setup is in progress.');
+            }
+        }
+
         async function openSingleApprovalRunReview() {
             const api = window.pywebview?.api;
             if (!IS_DESKTOP || !api?.get_single_approval_follow_run_defaults
@@ -33280,6 +33332,8 @@
             }
             const modal = document.getElementById('singleApprovalRunReviewModal');
             modal.style.display = 'flex';
+            document.getElementById('singleApprovalRunReviewBody').style.display = '';
+            document.getElementById('singleApprovalRunProgress').style.display = 'none';
             invalidateSingleApprovalRunReview();
             document.getElementById('singleApprovalRunReviewText').textContent = 'Loading exact wallet, reserve, fee-pool, and market details…';
             try {
@@ -33362,6 +33416,7 @@
                     `Trading principal / maximum trade ${formatFollowFeeMojos(p.maximum_trade_xch_mojos)} / ${p.maximum_trade_cat_atoms} CAT atoms`,
                     `Market confidence ${review.market_confidence_state || 'unknown'}${red.length ? ` · RED reasons: ${red.join(', ')}` : ''}`,
                     `Price evidence ${priceInfo.source || smartPrices.source || 'source unavailable'}${(priceInfo.observed_at || smartPrices.observed_at) ? ` · observed ${priceInfo.observed_at || smartPrices.observed_at}` : ' · source time unavailable — verify anchor freshness'}${(priceInfo.stale || smartPrices.stale) ? ' · STALE' : ''}${(priceInfo.inferred || smartPrices.inferred) ? ' · INFERRED' : ''}`,
+                    ...(_singleApprovalRunWarnings.length ? [`Save warnings: ${_singleApprovalRunWarnings.join(' · ')}`] : []),
                     'One approval covers preparation and automatic start. Fees above this maximum and prices outside this range require a new decision.',
                 ].join('\n');
                 accept.disabled = false;
@@ -33392,6 +33447,7 @@
                 });
                 if (result?.success !== true || !result.session_id) throw new Error(result?.reason || 'Run approval was not recorded.');
                 accept.disabled = true;
+                showSingleApprovalRunProgress('Run approved. Starting automatic coin preparation…');
                 await advanceSingleApprovalRun(result.session_id);
             } catch (error) {
                 output.textContent = error?.message || 'Could not record and start the approved run.';
@@ -33400,34 +33456,105 @@
 
         async function advanceSingleApprovalRun(sessionId) {
             const advance = window.pywebview?.api?.advance_single_approval_follow_run;
-            const output = document.getElementById('singleApprovalRunReviewText');
-            if (!advance) {
-                showToast('Run approved. The native app must be updated to advance preparation and start.', 'error');
+            if (!/^[0-9a-f]{64}$/.test(String(sessionId || ''))) {
+                showSingleApprovalRunProgress('Approved run status is invalid. Automatic advancement is paused.', true);
                 return;
             }
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await advance({session_id: sessionId});
-                if (state?.success !== true) {
-                    output.textContent = `Run approved, but automatic preparation needs attention: ${state?.reason || 'unknown error'}`;
-                    return;
-                }
-                const label = state.message || `Run setup: ${state.state || 'working'}`;
-                output.textContent = `${label}${state.progress ? `\n${state.progress}` : ''}`;
-                if (state.action_needed) { showToast(label, 'warning'); return; }
-                if (['running', 'complete'].includes(String(state.state || '').toLowerCase())) {
-                    showToast(label, 'success');
-                    closeSingleApprovalRunReview();
-                    return;
-                }
-                if (['failed', 'blocked'].includes(String(state.state || '').toLowerCase())) {
-                    showToast(label, 'error');
-                    return;
-                }
-                await new Promise(resolve => setTimeout(resolve, 1200));
+            if (!advance) {
+                showSingleApprovalRunProgress('Run approval is recorded, but this native app cannot advance preparation. Update the app to continue.', true);
+                return;
             }
-            output.textContent = 'Run setup is still progressing. This review remains open; use the dashboard for current preparation and live counts.';
-            showToast('Run setup is still progressing.', 'warning');
+            if (_singleApprovalRunPollingPromise) {
+                return _singleApprovalRunPollSession === sessionId
+                    ? _singleApprovalRunPollingPromise
+                    : undefined;
+            }
+            _singleApprovalRunPollSession = sessionId;
+            _singleApprovalRunPollingPromise = (async () => {
+                while (_singleApprovalRunPollSession === sessionId) {
+                    let state;
+                    try {
+                        state = await advance({session_id: sessionId});
+                    } catch (error) {
+                        showSingleApprovalRunProgress(
+                            `Could not refresh approved run status (${error?.message || 'native bridge unavailable'}). Retrying in 7 seconds.`,
+                            true,
+                        );
+                        await new Promise(resolve => setTimeout(resolve, 7000));
+                        continue;
+                    }
+                    if (state?.success !== true || state?.action_needed === true) {
+                        const reason = state?.reason || 'automatic advancement was not confirmed';
+                        showSingleApprovalRunProgress(
+                            `Run setup needs attention. State: ${state?.state || 'unknown'}\nReason: ${reason}`,
+                            true,
+                        );
+                        showToast('Approved run setup needs attention.', 'warning');
+                        return;
+                    }
+                    const label = state.message || `Run setup: ${state.state || 'working'}`;
+                    showSingleApprovalRunProgress(`${label}\nState: ${state.state || 'unknown'}`);
+                    if (['running', 'complete'].includes(String(state.state || '').toLowerCase())) {
+                        showToast(label, 'success');
+                        closeSingleApprovalRunReview();
+                        return;
+                    }
+                    if (['failed', 'blocked', 'stopped', 'recoverable_error'].includes(String(state.state || '').toLowerCase())) {
+                        showSingleApprovalRunProgress(`Run setup needs attention. State: ${state.state}`, true);
+                        showToast('Approved run setup needs attention.', 'warning');
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 7000));
+                }
+            })();
+            try {
+                return await _singleApprovalRunPollingPromise;
+            } finally {
+                _singleApprovalRunPollingPromise = null;
+                _singleApprovalRunPollSession = null;
+            }
         }
+
+        async function recoverSingleApprovalRunOnStartup() {
+            if (_singleApprovalRunRecoveryStarted) return;
+            const getStatus = window.pywebview?.api?.get_single_approval_follow_run_status;
+            if (!IS_DESKTOP || !getStatus) return;
+            _singleApprovalRunRecoveryStarted = true;
+            try {
+                const status = await getStatus();
+                if (status?.success !== true) {
+                    showSingleApprovalRunProgress(
+                        `Could not read approved run status. Reason: ${status?.reason || 'status unavailable'}`,
+                        true,
+                    );
+                    return;
+                }
+                const runState = String(status.state || 'none').toLowerCase();
+                if (['prep_pending', 'preparing', 'ready', 'start_pending'].includes(runState)) {
+                    if (!/^[0-9a-f]{64}$/.test(String(status.session_id || ''))) {
+                        showSingleApprovalRunProgress('An approved setup session has an invalid identifier. Automatic advancement is paused.', true);
+                        return;
+                    }
+                    showSingleApprovalRunProgress(`Resuming the approved run after app restart.\nState: ${runState}`);
+                    await advanceSingleApprovalRun(status.session_id);
+                    return;
+                }
+                if (runState === 'recoverable_error') {
+                    showSingleApprovalRunProgress(
+                        `Approved run needs recovery review.\nState: ${runState}\nReason: ${status.recoverable_reason || 'recovery required'}`,
+                        true,
+                    );
+                }
+            } catch (error) {
+                showSingleApprovalRunProgress(
+                    `Could not read approved run status. Reason: ${error?.message || 'native bridge unavailable'}`,
+                    true,
+                );
+            }
+        }
+
+        window.addEventListener('pywebviewready', () => { void recoverSingleApprovalRunOnStartup(); }, {once: true});
+        if (window.pywebview?.api) setTimeout(() => { void recoverSingleApprovalRunOnStartup(); }, 0);
 
         let _followRunReview = null;
         let _followRunReviewBusy = false;
@@ -36988,7 +37115,7 @@
             // the current inputs so a Save click cannot outrun the debounce.
             updateCoinPrepPreview();
             if (!validateSettingsForm()) {
-                _singleApprovalRunRequestedAfterSave = false;
+                clearSingleApprovalRunSaveIntent();
                 // Build list of what's missing
                 const missing = [];
                 const hasPair = currentCAT && currentCAT.name && currentCAT.asset_id;
@@ -37092,6 +37219,7 @@
             const spreadInput = document.getElementById('configSpreadBps');
             const spreadValue = Number(spreadInput?.value);
             if (!Number.isFinite(spreadValue) || spreadValue <= 0) {
+                clearSingleApprovalRunSaveIntent();
                 showToast('Spread must be a positive percentage before saving settings.', 'error');
                 if (spreadInput) spreadInput.style.borderColor = 'var(--status-danger)';
                 setSaveConfigButtonState(false);
@@ -37100,17 +37228,22 @@
             // Client-side spread warning (value is now in %)
             const spreadPct = spreadValue;
             if (spreadPct > 0 && spreadPct < 2) {
-                const proceed = await showStyledConfirm({
-                    icon: '📉',
-                    title: 'Low Spread Warning',
-                    message: 'A spread below 2% is risky. You may lose money on trades due to fees and slippage.',
-                    confirmText: 'Save Anyway',
-                    cancelText: 'Go Back',
-                    style: 'warning'
-                });
-                if (!proceed) {
-                    setSaveConfigButtonState(false);
-                    return;
+                const lowSpreadWarning = 'A spread below 2% is risky. Fees and slippage can exceed the spread.';
+                if (_singleApprovalRunRequestedAfterSave) {
+                    _singleApprovalRunWarnings.push(lowSpreadWarning);
+                } else {
+                    const proceed = await showStyledConfirm({
+                        icon: '📉',
+                        title: 'Low Spread Warning',
+                        message: lowSpreadWarning,
+                        confirmText: 'Save Anyway',
+                        cancelText: 'Go Back',
+                        style: 'warning'
+                    });
+                    if (!proceed) {
+                        setSaveConfigButtonState(false);
+                        return;
+                    }
                 }
             }
 
@@ -37230,6 +37363,7 @@
 
             // Show critical blockers first — these MUST be fixed
             if (_riskBlockers.length > 0) {
+                clearSingleApprovalRunSaveIntent();
                 const _blockerText = _riskBlockers.map(m => '• ' + m).join('\n\n');
                 await showStyledConfirm({
                     icon: '⛔',
@@ -37247,20 +37381,24 @@
 
             // Show non-blocking warnings — user can save anyway if they understand
             if (_riskWarnings.length > 0) {
-                const _warnText = _riskWarnings.map(m => '• ' + m).join('\n\n');
-                const _proceed = await showStyledConfirm({
-                    icon: '⚠️',
-                    title: 'Risky settings detected',
-                    message: 'These settings will work but carry risk:' +
-                             '\n\n' + _warnText +
-                             '\n\nSave anyway?',
-                    confirmText: 'Save Anyway',
-                    cancelText: 'Go Back',
-                    style: 'warning'
-                });
-                if (!_proceed) {
-                    setSaveConfigButtonState(false);
-                    return;
+                if (_singleApprovalRunRequestedAfterSave) {
+                    _singleApprovalRunWarnings.push(..._riskWarnings);
+                } else {
+                    const _warnText = _riskWarnings.map(m => '• ' + m).join('\n\n');
+                    const _proceed = await showStyledConfirm({
+                        icon: '⚠️',
+                        title: 'Risky settings detected',
+                        message: 'These settings will work but carry risk:' +
+                                 '\n\n' + _warnText +
+                                 '\n\nSave anyway?',
+                        confirmText: 'Save Anyway',
+                        cancelText: 'Go Back',
+                        style: 'warning'
+                    });
+                    if (!_proceed) {
+                        setSaveConfigButtonState(false);
+                        return;
+                    }
                 }
             }
             
@@ -37469,6 +37607,7 @@
                 value == null || (typeof value === 'number' && !Number.isFinite(value))
             );
             if (invalidConfigField) {
+                clearSingleApprovalRunSaveIntent();
                 showToast(`Cannot save: ${invalidConfigField[0].replaceAll('_', ' ')} is blank or invalid.`, 'error');
                 setSaveConfigButtonState(false);
                 return;
@@ -37528,6 +37667,7 @@
                             ? 'Your session has expired. Please reload CATalyst and try again.'
                             : 'Settings validation failed. Reload CATalyst and try again.'
                     );
+                    clearSingleApprovalRunSaveIntent();
                     if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                     showToast(validationFailure, 'error');
                     setSaveConfigButtonState(false);
@@ -37535,6 +37675,7 @@
                 }
 
                 if (!validation.valid) {
+                    clearSingleApprovalRunSaveIntent();
                     // Show first error message
                     const errorMsg = validationErrors[0]?.message || validationErrors[0] || 'Invalid settings';
                     if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
@@ -37557,21 +37698,26 @@
                         .map(w => w.message || w)
                         .map(msg => `• ${String(msg)}`)
                         .join('\n');
-                    const proceed = await showStyledConfirm({
-                        icon: '⚠️',
-                        title: 'Review Settings Warning',
-                        message: `${warnItems}\n\nSave these settings anyway and continue to the next step?`,
-                        confirmText: 'Continue',
-                        cancelText: 'Back to Settings',
-                        style: 'warning'
-                    });
-                    if (!proceed) {
-                        setSaveConfigButtonState(false);
-                        return;
-                    }
-                    if (shouldPreopenCoinPrepLoading) {
-                        showCoinPrepConfirmLoading(config);
-                        preopenedCoinPrepLoading = true;
+                    if (_singleApprovalRunRequestedAfterSave) {
+                        _singleApprovalRunWarnings.push(...validationWarnings
+                            .map(w => String(w.message || w)));
+                    } else {
+                        const proceed = await showStyledConfirm({
+                            icon: '⚠️',
+                            title: 'Review Settings Warning',
+                            message: `${warnItems}\n\nSave these settings anyway and continue to the next step?`,
+                            confirmText: 'Continue',
+                            cancelText: 'Back to Settings',
+                            style: 'warning'
+                        });
+                        if (!proceed) {
+                            setSaveConfigButtonState(false);
+                            return;
+                        }
+                        if (shouldPreopenCoinPrepLoading) {
+                            showCoinPrepConfirmLoading(config);
+                            preopenedCoinPrepLoading = true;
+                        }
                     }
                 }
                 
@@ -37645,6 +37791,7 @@
                             await openSingleApprovalRunReview();
                             return;
                         }
+                        _singleApprovalRunWarnings = [];
                     }
 
                     // If the bot already has active offers, skip coin prep entirely.
@@ -37673,13 +37820,13 @@
                     // Smart coin prep check runs in background and updates the modal
                     checkIfCoinPrepNeeded(config);
                 } else {
-                    _singleApprovalRunRequestedAfterSave = false;
+                    clearSingleApprovalRunSaveIntent();
                     if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                     showToast('Failed to save: ' + formatError(result), 'error');
                     setSaveConfigButtonState(false);
                 }
             } catch (error) {
-                _singleApprovalRunRequestedAfterSave = false;
+                clearSingleApprovalRunSaveIntent();
                 if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                 showToast('Failed to save config: ' + formatError(error), 'error');
                 setSaveConfigButtonState(false);
