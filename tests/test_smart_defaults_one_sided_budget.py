@@ -279,6 +279,25 @@ def test_smart_fee_coin_covers_full_book_shutdown_quote():
     assert Decimal(str(plan["fee_coin_size_xch"])) * plan["fee_prep_count"] <= 1
 
 
+def test_smart_settings_keeps_existing_one_xch_fee_pool_when_it_fits():
+    with (
+        patch.object(smart_defaults.cfg, "FEE_COIN_SIZE_XCH", Decimal("0.02")),
+        patch.object(smart_defaults.cfg, "FEE_PREP_COUNT", 50),
+    ):
+        plan = _recommend(
+            "two_sided",
+            xch_mojos=127_908_416_089_710,
+            cat_mojos=1_235_383_474,
+            target_offers=24,
+            fee_mojos=7_473_753,
+        )
+    assert plan["fee_coin_size_xch"] == 0.02
+    assert plan["fee_prep_count"] == 50
+    assert _active_ladder_xch(plan, "buy") + Decimal("1") + Decimal(
+        str(plan["topup_pool_xch"])
+    ) <= Decimal("127.908416089710")
+
+
 def test_sell_only_tiny_fee_funded_xch_balance_does_not_shrink_cat_ladder():
     plan = _recommend("sell_only", xch_mojos=200_000_000_000, cat_mojos=1_000_000_000)
     assert plan["max_active_sell"] >= 20

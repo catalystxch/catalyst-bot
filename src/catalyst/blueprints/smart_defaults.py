@@ -2400,6 +2400,20 @@ def _calculate_smart_defaults(
     )
     _fee_coin_size = _fee_plan["fee_coin_size_mojos"] / 1e12
     _fee_prep_count = _fee_plan["fee_coin_count"]
+    # Smart Settings may recommend a smaller weekly pool, but an existing
+    # operator-selected fee inventory remains the floor when it fits after
+    # reserves. This also makes the subsequent ladder sizing account for it.
+    _configured_fee_size = Decimal(str(getattr(cfg, "FEE_COIN_SIZE_XCH", 0) or 0))
+    _configured_fee_count = max(0, int(getattr(cfg, "FEE_PREP_COUNT", 0) or 0))
+    _configured_fee_principal = _configured_fee_size * _configured_fee_count
+    _recommended_fee_principal = Decimal(str(_fee_coin_size)) * _fee_prep_count
+    if (
+        _configured_fee_size > 0
+        and _configured_fee_principal > _recommended_fee_principal
+        and _configured_fee_principal <= Decimal(str(_fee_allocatable_xch))
+    ):
+        _fee_coin_size = float(_configured_fee_size)
+        _fee_prep_count = _configured_fee_count
     _fee_pool_xch = _fee_coin_size * _fee_prep_count
     _fee_pool_target = _fee_plan["target_fee_coin_principal_mojos"] / 1e12
     _fee_pool_pct = _fee_pool_xch / _avail_xch if _avail_xch > 0 else 0.0
