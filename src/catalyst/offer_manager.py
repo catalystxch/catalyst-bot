@@ -275,7 +275,10 @@ def require_active_follow_intent_authority(
 
 
 def require_follow_policy_price(
-    *, run_id: str, asset_id: str, candidate_price: Decimal,
+    *,
+    run_id: str,
+    asset_id: str,
+    candidate_price: Decimal,
     return_policy_digest: bool = False,
 ) -> bool | str | None:
     """Require each Follow quote to stay inside the active reviewed range."""

@@ -31837,8 +31837,11 @@ def _guard_follow_intent_principal(conn, immutable, policy_digest):
         f"AND lifecycle_state NOT IN ({placeholders})",
         (
             immutable["wallet_fingerprint_hash"],
-            immutable["network"], immutable["asset_id"],
-            immutable["side"], immutable["intent_id"], *terminal,
+            immutable["network"],
+            immutable["asset_id"],
+            immutable["side"],
+            immutable["intent_id"],
+            *terminal,
         ),
     ).fetchall()
     committed = sum(
