@@ -33,8 +33,7 @@ def verified_prep_fee_cap(
     policy,
     coordinator_state,
     current_configuration_sha256,
-    wallet_identity,
-    approval,
+    approved_snapshot,
     requested_approval_id,
     run_session_id,
 ) -> int:
@@ -47,8 +46,10 @@ def verified_prep_fee_cap(
     valid = (
         isinstance(policy, FollowRunPolicy)
         and type(coordinator_state) is dict
-        and type(wallet_identity) is dict
-        and type(approval) is dict
+        and type(approved_snapshot) is dict
+        and type(approved_snapshot.get("identity")) is dict
+        and type(approved_snapshot.get("scope")) is dict
+        and type(approved_snapshot.get("approval")) is dict
         and _digest(current_configuration_sha256)
         and _digest(run_session_id)
         and _digest(requested_approval_id)
@@ -57,8 +58,9 @@ def verified_prep_fee_cap(
         raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_REQUIRED")
 
     coordinator = coordinator_state
-    approval_id = approval.get("approval_id")
-    prep_session_id = approval.get("session_id")
+    approval_id = approved_snapshot["approval"].get("approval_id")
+    prep_session_id = approved_snapshot["scope"].get("session_id")
+    wallet_identity = approved_snapshot["identity"]
     fingerprint = wallet_identity.get("wallet_fingerprint")
     network = wallet_identity.get("network")
     asset_id = wallet_identity.get("asset_id")

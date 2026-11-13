@@ -45,15 +45,17 @@ def _binding():
             "fee_approval_session_id": prep_session_id,
         },
         "current_configuration_sha256": configuration_sha256,
-        "wallet_identity": {
-            "wallet_fingerprint": 12345,
-            "network": "mainnet",
-            "asset_id": "a" * 64,
-        },
-        "approval": {
-            "approval_id": approval_id,
-            "session_id": prep_session_id,
-            "total_fee_mojos": 1000,
+        "approved_snapshot": {
+            "identity": {
+                "wallet_fingerprint": 12345,
+                "network": "mainnet",
+                "asset_id": "a" * 64,
+            },
+            "scope": {"session_id": prep_session_id},
+            "approval": {
+                "approval_id": approval_id,
+                "total_fee_mojos": 1000,
+            },
         },
         "requested_approval_id": approval_id,
         "run_session_id": session_id,
@@ -70,7 +72,7 @@ def test_returns_per_transaction_policy_max_only_for_exact_pre_run_binding():
         ("current_configuration_sha256", "5" * 64),
         ("run_session_id", "6" * 64),
         ("requested_approval_id", "7" * 64),
-        ("wallet_identity", {"wallet_fingerprint": "other"}),
+        ("approved_snapshot", {"identity": {"wallet_fingerprint": "other"}}),
     ],
 )
 def test_rejects_mismatched_binding(field, value):
@@ -83,6 +85,13 @@ def test_rejects_mismatched_binding(field, value):
 def test_rejects_legacy_approval_without_run_binding():
     binding = _binding()
     binding["coordinator_state"].pop("fee_approval_id")
+    with pytest.raises(ValueError, match="FOLLOW_RUN_PREP_FEE_BINDING_REQUIRED"):
+        verified_prep_fee_cap(**binding)
+
+
+def test_rejects_prep_approval_from_another_session():
+    binding = _binding()
+    binding["approved_snapshot"]["scope"]["session_id"] = "9" * 64
     with pytest.raises(ValueError, match="FOLLOW_RUN_PREP_FEE_BINDING_REQUIRED"):
         verified_prep_fee_cap(**binding)
 
