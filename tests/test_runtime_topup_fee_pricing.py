@@ -18,6 +18,7 @@ def _manager():
 
 def test_fee_reserve_quotes_executable_cost_and_seals_exact_outputs(monkeypatch):
     manager = _manager()
+    monkeypatch.setattr(manager, "_verified_topup_follow_fee_cap", lambda: None)
     built = []
     inspected = []
     quoted_costs = []
@@ -76,7 +77,7 @@ def test_fee_reserve_quotes_executable_cost_and_seals_exact_outputs(monkeypatch)
         address=ADDRESS,
     )
 
-    assert priced["available"] is True
+    assert priced["available"] is True, priced
     assert priced["fee_mojos"] == 12
     assert priced["validated_unsigned"]["sealed_fee"] == 12
     assert [actions[-1]["amount"] for actions in built] == ["1", "12"]
