@@ -350,6 +350,38 @@ def test_executable_cost_and_frozen_plan_connect_to_exact_journal_hold(exact_jou
     )
 
 
+def test_follow_fee_cap_holds_executed_fee_below_network_recommendation(
+    exact_journal, monkeypatch
+):
+    service = import_module("coin_prep_fee_dispatch")
+    monkeypatch.setattr(service, "_follow_prep_fee_cap", lambda *_args: 20)
+    priced = exact_journal["priced"]
+    priced["follow_fee_cap_mojos"] = 20
+    priced["pricing"]["quote"]["fee_mojos"] = 30
+
+    result = _reserve(exact_journal)
+
+    assert priced["pricing"]["quote"]["fee_mojos"] == 30
+    assert result["fee_mojos"] == 20
+    assert utils._counts()["approved_fee_reservations"] == 1
+
+
+def test_dispatch_hold_rejects_executed_fee_above_network_recommendation(
+    exact_journal,
+):
+    approval = exact_journal["approval"]
+    with pytest.raises(ValueError, match="FEE_QUOTE_INVALID"):
+        database.reserve_coin_prep_fee_for_dispatch(
+            approval_id=approval["approval_id"],
+            scope_sha256=approval["scope_sha256"],
+            plan_sha256=approval["plan_sha256"],
+            operation_id=exact_journal["operation_id"],
+            final_quote=exact_journal["priced"]["pricing"]["quote"],
+            executed_fee_mojos=30,
+        )
+    assert utils._counts()["approved_fee_reservations"] == 0
+
+
 def test_expired_quote_cannot_hold_fee_after_operation_was_prepared(exact_journal):
     exact_journal["now"] = 1060
     with pytest.raises(ValueError, match="FEE_ESTIMATE_UNAVAILABLE"):

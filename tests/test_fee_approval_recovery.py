@@ -211,6 +211,7 @@ def _prepared(monkeypatch):
         plan_sha256=fee_contract["plan_sha256"],
         operation_id=operation_id,
         final_quote=quote,
+        executed_fee_mojos=quote["fee_mojos"],
     )
     approval = {**approval, "dispatch_quote": quote}
     return operation_id, claim, identity, constructed, approval

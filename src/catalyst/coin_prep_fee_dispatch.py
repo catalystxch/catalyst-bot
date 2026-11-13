@@ -452,6 +452,7 @@ def reserve_approved_prep_dispatch(
         plan_sha256=final["approval"]["plan_sha256"],
         operation_id=operation_id,
         final_quote=quote,
+        executed_fee_mojos=plan.fee_mojos,
     )
     return {**hold, "validated_unsigned": validated, "dispatch_authorized": False}
 

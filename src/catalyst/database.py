@@ -25307,6 +25307,7 @@ def reserve_coin_prep_fee_for_dispatch(
     plan_sha256: str,
     operation_id: str,
     final_quote: Dict[str, Any],
+    executed_fee_mojos: int,
 ) -> Dict[str, Any]:
     """Hold a final prep fee against consent and its undispatched exact journal.
 
@@ -25318,6 +25319,8 @@ def reserve_coin_prep_fee_for_dispatch(
     claim and constructed additions must already be journaled. Recovery reads
     existing holds separately: even a matching reservation cannot be replayed.
     This prep-only boundary never borrows the protected cancellation allowance.
+    The network quote is a recommendation; the exact journaled effect may pay
+    less when a signed Follow per-transaction maximum applies.
     """
     approval_id = _fee_digest(approval_id)
     scope = _fee_digest(scope_sha256)
@@ -25326,7 +25329,8 @@ def reserve_coin_prep_fee_for_dispatch(
     if type(final_quote) is not dict or final_quote.get("available") is not True:
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     try:
-        fee = _fee_amount(final_quote.get("fee_mojos"))
+        recommended_fee = _fee_amount(final_quote.get("fee_mojos"))
+        fee = _fee_amount(executed_fee_mojos)
         cost = _fee_amount(final_quote.get("cost"))
         target_seconds = _fee_amount(final_quote.get("target_seconds"))
         observed_at = _fee_amount(final_quote.get("observed_at"))
@@ -25335,6 +25339,7 @@ def reserve_coin_prep_fee_for_dispatch(
         raise ValueError("FEE_QUOTE_INVALID") from exc
     if (
         cost == 0
+        or fee > recommended_fee
         or final_quote.get("source") not in ("coinset", "full_node_rpc")
         or expires_at != observed_at + 60
     ):
