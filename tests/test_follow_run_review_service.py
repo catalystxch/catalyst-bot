@@ -21,6 +21,8 @@ def _proposal():
         "replacement_count_gate_passed": True,
         "buy_slots_arithmetic_fit": 24,
         "sell_slots_arithmetic_fit": 24,
+        "funded_buy_limit": 24,
+        "funded_sell_limit": 24,
         "slot_assignment_sha256": "d" * 64,
         "current_prep_targets_proven": True,
         "maximum_trade_xch_mojos": 123_000_000_000_000,
