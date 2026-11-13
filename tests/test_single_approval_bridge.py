@@ -37,6 +37,7 @@ def policy_terms(**changes):
 def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
     import app_bridge
     import follow_run_defaults
+    import follow_run_coordinator
 
     monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
         "buy_target": 24,
@@ -87,6 +88,36 @@ def test_native_review_rejects_client_inflated_principal(bridge_world):
     assert result["reason"] == "FOLLOW_RUN_REVIEW_FUNDING_CHANGED"
 
 
+def test_new_policy_cannot_replace_active_session_before_recording(bridge_world, monkeypatch):
+    import follow_run_coordinator
+
+    bridge, _observed, _hash, database = bridge_world
+    terms = policy_terms()
+    review = bridge.prepare_single_approval_follow_run_review({"policy": terms})
+    monkeypatch.setattr(
+        follow_run_coordinator.FollowRunCoordinator,
+        "get_state",
+        lambda self: {
+            "state": "running",
+            "policy_digest": "0" * 64,
+            "configuration_sha256": CONFIGURATION_SHA256,
+        },
+    )
+    monkeypatch.setattr(
+        database,
+        "record_active_follow_run_policy",
+        lambda _policy: pytest.fail("must not replace running policy"),
+    )
+    result = bridge.confirm_single_approval_follow_run_review({
+        "review_id": review["review_id"],
+        "review_sha256": review["review_sha256"],
+        "accepted": True,
+        "policy": terms,
+    })
+    assert result["success"] is False
+    assert result["reason"] == "FOLLOW_RUN_AUTHORITY_CHANGED"
+
+
 @pytest.fixture
 def bridge_world(monkeypatch):
     import app_bridge
@@ -94,6 +125,7 @@ def bridge_world(monkeypatch):
     import confidence_override
     import database
     import follow_run_defaults
+    import follow_run_coordinator
     import tx_fees
 
     configuration = {
@@ -117,6 +149,7 @@ def bridge_world(monkeypatch):
 
     monkeypatch.setattr(coin_prep_fee_runtime, "_configuration", lambda: configuration)
     monkeypatch.setattr(coin_prep_fee_runtime, "_verified_identity", verified_identity)
+    monkeypatch.setattr(follow_run_coordinator.FollowRunCoordinator, "get_state", lambda self: None)
     monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
         **{key: value for key, value in policy_terms().items() if key in {
             "fee_coin_principal_mojos", "xch_reserve_mojos",

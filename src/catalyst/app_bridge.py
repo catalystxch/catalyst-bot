@@ -1661,6 +1661,19 @@ class AppBridge:
                 _server_follow_review_context()
             )
             current_policy = _follow_policy_from_client_terms(body["policy"], identity)
+            from follow_run_coordinator import FollowRunCoordinator
+
+            existing_setup = FollowRunCoordinator().get_state()
+            if (
+                existing_setup is not None
+                and existing_setup["state"] != "stopped"
+                and (
+                    existing_setup["policy_digest"] != current_policy.digest
+                    or existing_setup["configuration_sha256"]
+                    != configuration_sha256
+                )
+            ):
+                raise ValueError("FOLLOW_RUN_AUTHORITY_CHANGED")
             result = confirm_follow_run_policy_review(
                 review_id=body["review_id"],
                 review_sha256=body["review_sha256"],
@@ -1671,8 +1684,6 @@ class AppBridge:
                 current_red_reasons=red_reasons,
             )
             if result.get("success") is True:
-                from follow_run_coordinator import FollowRunCoordinator
-
                 coordinator_state = FollowRunCoordinator().begin_run(
                     policy_digest=result["policy_digest"],
                     configuration_sha256=configuration_sha256,
