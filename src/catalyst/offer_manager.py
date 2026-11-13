@@ -446,7 +446,12 @@ def assess_offer_book_candidate(
     if not (bid > 0 and bid <= midpoint <= ask):
         return {"eligible": False, "reason_code": "trusted_range_invalid"}
     digests = tuple(field("evidence_digests") or ())
-    if not digests or any(
+    approved_anchor_only = (
+        getattr(confidence, "approved_anchor_only", False) is True
+        and type(getattr(confidence, "policy_digest", None)) is str
+        and re.fullmatch(r"[0-9a-f]{64}", confidence.policy_digest) is not None
+    )
+    if (not digests and not approved_anchor_only) or any(
         type(value) is not str
         or len(value) != 64
         or value.lower() != value
@@ -470,9 +475,11 @@ def assess_offer_book_candidate(
     gross = edge_per_cat * cat_amount
     required = network_fee_xch * Decimal(1 + expected_cancel_requotes)
     required += minimum_profit_xch
-    evidence_digest = hashlib.sha256(
-        "|".join(sorted(digests)).encode("ascii")
-    ).hexdigest()
+    evidence_digest = (
+        hashlib.sha256("|".join(sorted(digests)).encode("ascii")).hexdigest()
+        if digests
+        else None
+    )
     return {
         "eligible": offer_is_profitable(
             expected_gross_xch=gross,
@@ -487,6 +494,9 @@ def assess_offer_book_candidate(
         "required_xch": required,
         "improves_book": improves_book,
         "evidence_digest": evidence_digest,
+        "evidence_source": (
+            "approved_follow_policy_anchor" if approved_anchor_only else "market"
+        ),
     }
 
 

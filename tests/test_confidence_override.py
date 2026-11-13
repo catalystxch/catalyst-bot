@@ -56,6 +56,146 @@ def test_wallet_effect_refreshes_red_book_even_after_candidate_deadline():
     assert BotLoop._wallet_effect_market_confidence(bot) == "expired-raw-view"
 
 
+@pytest.mark.parametrize("coordinator_state", ["start_pending", "running"])
+def test_coordinator_approved_red_policy_builds_passive_anchor_candidate(
+    monkeypatch, coordinator_state
+):
+    import confidence_override
+    import database
+    import bot_loop
+    from bot_loop import BotLoop
+    from follow_run_coordinator import FollowRunCoordinator
+    from follow_run_policy import FollowRunPolicy
+    from offer_manager import assess_passive_red_candidate
+    from config import cfg
+
+    run_id = "c" * 64
+    configuration_sha256 = "d" * 64
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 12345,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": "a" * 64,
+    }
+    policy = FollowRunPolicy(
+        wallet_fingerprint="12345",
+        network="mainnet",
+        asset_id="a" * 64,
+        buy_target=24,
+        sell_target=24,
+        price_anchor=Decimal("0.001"),
+        price_min=Decimal("0.0008"),
+        price_max=Decimal("0.0012"),
+        maximum_fee_mojos_per_tx=100_000_000,
+        fee_coin_principal_mojos=0,
+        xch_reserve_mojos=0,
+        cat_reserve_atoms=0,
+        maximum_trade_xch_mojos=1_000_000_000_000,
+        maximum_trade_cat_atoms=1_000_000_000,
+    )
+    monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.0001"))
+    monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.01"))
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": run_id, "stopped": False},
+    )
+    monkeypatch.setattr(database, "get_follow_run_identity", lambda _run: identity)
+    monkeypatch.setattr(
+        FollowRunCoordinator,
+        "read_state",
+        lambda _self: {
+            "state": coordinator_state,
+            "run_id": run_id,
+            "policy_digest": policy.digest,
+            "configuration_sha256": configuration_sha256,
+        },
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "current_scope",
+        lambda: {
+            "follow_run_id": run_id,
+            "identity": identity,
+            "configuration_sha256": configuration_sha256,
+        },
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "current_configuration_digest",
+        lambda: configuration_sha256,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        bot_loop,
+        "log_event",
+        lambda level, event_type, message, data=None: warnings.append(
+            (level, event_type, message, data)
+        ),
+    )
+
+    bot = BotLoop.__new__(BotLoop)
+    snapshots = [(None, None)]
+    state = {}
+    bot._market_confidence_snapshot = lambda: snapshots[0]
+    bot._set_state = lambda **updates: state.update(updates)
+    bot._confidence_override_active = lambda: False
+    bot._running = True
+    bot._enter_runtime_effect_phase = lambda _phase: True
+    view = BotLoop._effective_market_confidence(bot)
+
+    assert view is not None
+    assert view.state == "RED"
+    assert view.approved_anchor_only is True
+    assert any(event[1] == "follow_approved_anchor_only" for event in warnings)
+    assert state["approved_follow_anchor_warning"] is True
+    assert state["approved_follow_anchor_price"] == str(policy.price_anchor)
+    assert view.trusted_midpoint == policy.price_anchor
+    assert view.data_valid is True
+    result = assess_passive_red_candidate(
+        side="buy",
+        candidate_price=Decimal("0.0009"),
+        size_xch=Decimal("0.1"),
+        confidence=view,
+        network_fee_xch=Decimal("0"),
+        expected_cancel_requotes=0,
+        minimum_profit_xch=Decimal("0"),
+        now=datetime.now(timezone.utc),
+    )
+    assert result["eligible"] is True, result
+    assert result["improves_book"] is False
+
+    live_confidence = SimpleNamespace(
+        state="RED",
+        data_valid=True,
+        trusted_bid=Decimal("0.00095"),
+        trusted_midpoint=Decimal("0.001"),
+        trusted_ask=Decimal("0.00105"),
+        derived_at=datetime.now(timezone.utc),
+        evidence_digests=("e" * 64,),
+        reason_codes=("insufficient_bid_depth",),
+    )
+    snapshots[0] = (live_confidence, datetime.now(timezone.utc) + timedelta(seconds=20))
+    live_view = BotLoop._effective_market_confidence(bot)
+    assert live_view.approved_anchor_only is False
+    assert state["approved_follow_anchor_warning"] is False
+    assert state["approved_follow_anchor_warning_message"] == ""
+    bot._market_runtime_required = True
+    bot._cycle_started_running = True
+    bot._runtime_recovery_monotonic = 1.0
+    bot._runtime_recovery_wall_clock = 1.0
+    bot._runtime_recovery_gap_seconds = 0.0
+    bot._runtime_recovery_skew_seconds = 0.0
+    bot._runtime_recovery_cycle_boundary = lambda: True
+    bot._market_degraded_decision = SimpleNamespace(can_create=False)
+    assert BotLoop._enter_runtime_effect_phase(bot, "create") is True
+
+
 def test_consent_bound_to_review_run_expiry_and_scope():
     permit = RunConsent.confirm(
         scope=SCOPE, reviewed_digest=scope_digest(SCOPE), duration_hours=48, now=NOW

@@ -1407,6 +1407,191 @@ class BotLoop:
             consent.revoke()
             return False
 
+    def _coordinator_follow_policy_context(self):
+        """Return only a current wallet, run, and policy bound by the coordinator."""
+        try:
+            import database
+            from confidence_override import current_configuration_digest
+            from follow_run_coordinator import FollowRunCoordinator
+            from offer_manager import require_follow_policy_price
+
+            coordinator_reader = FollowRunCoordinator()
+            state_reader = getattr(coordinator_reader, "read_state", None)
+            state = (
+                state_reader() if callable(state_reader) else coordinator_reader.get_state()
+            )
+            if (
+                type(state) is not dict
+                or state.get("state") not in {"start_pending", "running"}
+                or type(state.get("run_id")) is not str
+            ):
+                return None
+            policy = database.get_active_follow_run_policy()
+            if (
+                policy is None
+                or policy.digest != state.get("policy_digest")
+                or state.get("configuration_sha256")
+                != current_configuration_digest()
+            ):
+                return None
+            require_follow_policy_price(
+                run_id=state["run_id"],
+                asset_id=policy.asset_id,
+                candidate_price=policy.price_anchor,
+            )
+            return state, policy
+        except Exception:
+            return None
+
+    def _warn_approved_follow_anchor(self, policy) -> None:
+        now = time.time()
+        previous = float(getattr(self, "_last_follow_anchor_warning_at", 0) or 0)
+        if now - previous < 1800:
+            return
+        self._last_follow_anchor_warning_at = now
+        log_event(
+            "warning",
+            "follow_approved_anchor_only",
+            "Live market price evidence is unavailable; the approved Follow anchor remains in use",
+            data={
+                "asset_id": policy.asset_id,
+                "price_anchor": str(policy.price_anchor),
+                "price_min": str(policy.price_min),
+                "price_max": str(policy.price_max),
+            },
+        )
+
+    def _set_approved_follow_anchor_warning(self, policy=None) -> None:
+        setter = getattr(self, "_set_state", None)
+        if not callable(setter):
+            return
+        active = policy is not None
+        setter(
+            approved_follow_anchor_warning=active,
+            approved_follow_anchor_warning_message=(
+                "Live market price evidence is unavailable; the approved Follow anchor remains in use"
+                if active
+                else ""
+            ),
+            approved_follow_anchor_price=(str(policy.price_anchor) if active else ""),
+            approved_follow_anchor_min=(str(policy.price_min) if active else ""),
+            approved_follow_anchor_max=(str(policy.price_max) if active else ""),
+        )
+
+    def _coordinator_approved_follow_confidence(self, raw, valid_until=None):
+        from confidence_override import ApprovedFollowConfidence
+
+        if raw is not None and getattr(raw, "state", None) != "RED":
+            self._set_approved_follow_anchor_warning()
+            return raw
+        context = self._coordinator_follow_policy_context()
+        if context is None:
+            self._set_approved_follow_anchor_warning()
+            return raw
+        state, policy = context
+        def proof_current():
+            return self._coordinator_follow_policy_context() is not None
+
+        def policy_state_current():
+            try:
+                import database
+                from confidence_override import current_configuration_digest
+                from follow_run_coordinator import FollowRunCoordinator
+
+                reader = FollowRunCoordinator()
+                read_state = getattr(reader, "read_state", None)
+                current_state = read_state() if callable(read_state) else reader.get_state()
+                current_policy = database.get_active_follow_run_policy()
+                return bool(
+                    getattr(self, "_running", False)
+                    and type(current_state) is dict
+                    and current_state.get("state") in {"start_pending", "running"}
+                    and current_state.get("run_id") == state.get("run_id")
+                    and current_state.get("policy_digest") == policy.digest
+                    and current_state.get("configuration_sha256")
+                    == current_configuration_digest()
+                    and current_policy is not None
+                    and current_policy.digest == policy.digest
+                )
+            except Exception:
+                return False
+
+        def build_view(value, deadline, now):
+            bid = getattr(value, "trusted_bid", None)
+            midpoint = getattr(value, "trusted_midpoint", None)
+            ask = getattr(value, "trusted_ask", None)
+            derived_at = getattr(value, "derived_at", None)
+            digests = tuple(getattr(value, "evidence_digests", ()) or ())
+            live = bool(
+                value is not None
+                and getattr(value, "data_valid", False) is True
+                and all(
+                    type(price) is Decimal and price.is_finite() and price > 0
+                    for price in (bid, midpoint, ask)
+                )
+                and bid <= midpoint <= ask
+                and type(derived_at) is datetime
+                and derived_at.tzinfo is not None
+                and type(deadline) is datetime
+                and deadline.tzinfo is not None
+                and now < deadline.astimezone(timezone.utc)
+                and (now - derived_at.astimezone(timezone.utc)).total_seconds() <= 20
+                and bool(digests)
+                and all(
+                    type(digest) is str
+                    and len(digest) == 64
+                    and all(character in "0123456789abcdef" for character in digest)
+                    for digest in digests
+                )
+            )
+            anchor_only = not live
+            if anchor_only:
+                from types import SimpleNamespace
+
+                reason_codes = tuple(getattr(value, "reason_codes", ()) or ())
+                raw_view = SimpleNamespace(
+                    state="RED",
+                    reason_codes=reason_codes or ("market_data_absent",),
+                    derived_at=now,
+                )
+                price_range = (policy.price_anchor,) * 3
+                evidence_digests = ()
+                self._set_approved_follow_anchor_warning(policy)
+                self._warn_approved_follow_anchor(policy)
+            else:
+                raw_view = value
+                price_range = (bid, midpoint, ask)
+                evidence_digests = digests
+                self._set_approved_follow_anchor_warning()
+
+            def current_view():
+                if not policy_state_current():
+                    return None
+                current_raw, current_deadline = self._market_confidence_snapshot()
+                if current_raw is not None and getattr(current_raw, "state", None) != "RED":
+                    return None
+                return build_view(
+                    current_raw,
+                    current_deadline,
+                    datetime.now(timezone.utc),
+                )
+
+            return ApprovedFollowConfidence(
+                raw_view,
+                price_range=price_range,
+                policy_digest=policy.digest,
+                authorize=lambda: (
+                    self._enter_runtime_effect_phase("create") and proof_current()
+                ),
+                candidate_authorize=lambda: policy_state_current(),
+                current_view=current_view,
+                evidence_digests=evidence_digests,
+                anchor_only=anchor_only,
+                derived_at=now,
+            )
+
+        return build_view(raw, valid_until, datetime.now(timezone.utc))
+
     def _effective_market_confidence(self, confidence=None, valid_until=None):
         from confidence_override import ConsentedConfidence
 
@@ -1414,7 +1599,7 @@ class BotLoop:
         if confidence is not None:
             raw, deadline = confidence, valid_until
         if raw is None or not self._confidence_override_active():
-            return raw
+            return self._coordinator_approved_follow_confidence(raw, deadline)
         consent = self._confidence_override_consent
         prices = consent.price_range(
             raw,
@@ -1422,7 +1607,7 @@ class BotLoop:
             valid_until=deadline,
         )
         if prices is None:
-            return raw
+            return self._coordinator_approved_follow_confidence(raw, deadline)
         evidence = (
             consent.price_evidence(
                 raw, now=datetime.now(timezone.utc), valid_until=deadline
@@ -1505,7 +1690,14 @@ class BotLoop:
             (consent is not None and not consent.revoked)
             or getattr(cfg, "THIN_MARKET_ENABLED", False) is True
         ) and self._running:
-            return self._fresh_effective_market_confidence()
+            fresh = self._fresh_effective_market_confidence()
+            if fresh is None or (
+                getattr(fresh, "state", None) == "RED"
+                and getattr(fresh, "data_valid", None) is False
+            ):
+                raw, deadline = self._market_confidence_snapshot()
+                return self._coordinator_approved_follow_confidence(raw, deadline)
+            return fresh
         return self._effective_market_confidence()
 
     def _enter_runtime_effect_phase(self, phase_name: str) -> bool:
@@ -1529,6 +1721,10 @@ class BotLoop:
         if not bool(getattr(self, "_market_runtime_required", False)):
             return True
         if phase_name in {"cancel", "trim", "coin_prep"}:
+            return True
+        if phase_name in {"create", "requote"} and (
+            self._coordinator_follow_policy_context() is not None
+        ):
             return True
         decision = getattr(self, "_market_degraded_decision", None)
         if decision is None:
@@ -10557,20 +10753,28 @@ class BotLoop:
             self._enforce_market_refresh_failure(
                 now=datetime.now(timezone.utc), error=market_error
             )
-        trusted_midpoint = (
+        effective_market_confidence = (
             self._effective_market_confidence(
                 market_result.confidence, getattr(market_result, "valid_until", None)
-            ).trusted_midpoint
+            )
             if market_result
-            else None
+            else self._coordinator_approved_follow_confidence(None)
         )
+        trusted_midpoint = getattr(effective_market_confidence, "trusted_midpoint", None)
+        anchor_only = getattr(
+            effective_market_confidence, "approved_anchor_only", False
+        ) is True
         price_data = (
             {
                 "mid_price": str(trusted_midpoint),
                 "dexie_price": str(trusted_midpoint),
                 "tibet_price": "",
                 "arb_gap_bps": "0",
-                "source": "attributable_offer_book",
+                "source": (
+                    "approved_follow_run_anchor"
+                    if anchor_only
+                    else "attributable_offer_book"
+                ),
             }
             if trusted_midpoint is not None
             else None
@@ -10622,6 +10826,19 @@ class BotLoop:
                         },
                     )
                     self._bootstrap_anchor_price_logged = True
+
+        if price_data is None:
+            follow_context = self._coordinator_follow_policy_context()
+            if follow_context is not None:
+                _follow_state, follow_policy = follow_context
+                price_data = {
+                    "mid_price": str(follow_policy.price_anchor),
+                    "dexie_price": "",
+                    "tibet_price": "",
+                    "arb_gap_bps": "0",
+                    "source": "approved_follow_run_anchor",
+                }
+                self._warn_approved_follow_anchor(follow_policy)
 
         if price_data is None:
             try:

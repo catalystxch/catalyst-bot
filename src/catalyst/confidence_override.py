@@ -429,6 +429,35 @@ class ConsentedConfidence:
         return getattr(self._raw, key)
 
 
+class ApprovedFollowConfidence(ConsentedConfidence):
+    """RED candidate view backed by a coordinator-bound Follow policy."""
+
+    def __init__(
+        self,
+        raw,
+        *,
+        price_range,
+        policy_digest: str,
+        authorize,
+        candidate_authorize,
+        current_view,
+        evidence_digests=(),
+        anchor_only: bool,
+        derived_at: datetime,
+    ):
+        super().__init__(
+            raw,
+            authorize,
+            price_range,
+            candidate_authorize=candidate_authorize,
+            current_view=current_view,
+            evidence_digests=evidence_digests,
+        )
+        self.policy_digest = policy_digest
+        self.approved_anchor_only = anchor_only
+        self.derived_at = derived_at
+
+
 def _configuration_digest(configuration):
     from config import cfg
     from coin_prep_fee_execution import encode_execution_configuration
