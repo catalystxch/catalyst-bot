@@ -15,6 +15,52 @@ from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
 import wallet
 
 
+def _verified_active_transaction_fee_cap(*, run_id: str, identity: dict) -> int | None:
+    """Return the cap only when the active coordinator proves this exact run.
+
+    Stopped-run recovery deliberately has no coordinator binding and therefore
+    keeps its separate durable fee authority. This helper never infers a cap
+    from that cumulative recovery authority.
+    """
+    try:
+        from follow_run_coordinator import FollowRunCoordinator
+
+        coordinator = FollowRunCoordinator().read_state()
+        policy = database.get_active_follow_run_policy()
+        from confidence_override import current_configuration_digest, current_scope
+
+        config_digest = current_configuration_digest()
+        scope = current_scope()
+    except Exception as exc:
+        raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_UNAVAILABLE") from exc
+    if coordinator is None:
+        return None
+    if (
+        type(coordinator) is dict
+        and coordinator.get("state") == "stopped"
+        and coordinator.get("run_id") == run_id
+        and policy is None
+    ):
+        return None
+    if (
+        type(coordinator) is not dict
+        or coordinator.get("state") != "running"
+        or coordinator.get("run_id") != run_id
+        or policy is None
+        or coordinator.get("policy_digest") != policy.digest
+        or coordinator.get("configuration_sha256") != config_digest
+        or type(scope) is not dict
+        or scope.get("follow_run_id") != run_id
+        or scope.get("configuration_sha256") != config_digest
+        or scope.get("identity") != identity
+        or identity.get("network") != policy.network
+        or identity.get("asset_id") != policy.asset_id
+        or str(identity.get("wallet_fingerprint")) != policy.wallet_fingerprint
+    ):
+        raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_MISMATCH")
+    return policy.maximum_fee_mojos_per_tx
+
+
 def _refused(reason: str, authority: dict, **details) -> dict:
     return {
         "available": False,
@@ -52,6 +98,13 @@ def price_follow_cancellation(
     if type(target_seconds) is not int or target_seconds < 1:
         return _refused("FOLLOW_FEE_APPROVAL_MISMATCH", authority)
 
+    try:
+        transaction_fee_cap = _verified_active_transaction_fee_cap(
+            run_id=run_id, identity=identity
+        )
+    except ValueError as exc:
+        return _refused(str(exc), authority)
+
     fee = 0
     for _round in range(4):
         built = wallet.build_cancel_offers_batch_unsigned(
@@ -81,7 +134,12 @@ def price_follow_cancellation(
         if not is_current_fee_quote(quote, cost, target_seconds):
             return _refused("FEE_ESTIMATE_UNAVAILABLE", authority)
         quoted_fee = quote["fee_mojos"]
-        if quoted_fee == fee:
+        selected_fee = (
+            min(quoted_fee, transaction_fee_cap)
+            if transaction_fee_cap is not None
+            else quoted_fee
+        )
+        if selected_fee == fee:
             if fee == 0:
                 return _refused("FEE_CANCELLATION_FUNDING_REQUIRED", authority)
             after = database.get_effective_follow_fee_policy(
@@ -102,10 +160,20 @@ def price_follow_cancellation(
                 "source_coin_ids": sources,
                 "fee_coin_id": fee_coins[0],
                 "fee_mojos": fee,
+                "fee_cap_mojos": transaction_fee_cap,
+                "fee_cap_warning": (
+                    {
+                        "reason": "FEE_CAP_BELOW_RECOMMENDATION",
+                        "recommended_fee_mojos": quoted_fee,
+                        "approved_maximum_fee_mojos": transaction_fee_cap,
+                    }
+                    if transaction_fee_cap is not None and quoted_fee > transaction_fee_cap
+                    else None
+                ),
                 "cost": cost,
                 "quote": quote,
                 "validated_unsigned": built,
                 "dispatch_authorized": False,
             }
-        fee = quoted_fee
+        fee = selected_fee
     return _refused("FEE_PRICING_NOT_CONVERGED", authority)

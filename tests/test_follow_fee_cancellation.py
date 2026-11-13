@@ -10,9 +10,13 @@ from test_coin_prep_fee_frozen_execution import approved  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
-def current_database_module():
+def current_database_module(monkeypatch):
     global database
     database = import_module("database")
+    pricing = import_module("follow_fee_cancellation")
+    monkeypatch.setattr(
+        pricing, "_verified_active_transaction_fee_cap", lambda **_kwargs: None
+    )
 
 
 def _run(approved):
@@ -238,6 +242,73 @@ def test_follow_cancel_price_can_quote_above_recorded_estimate(approved, monkeyp
     assert result["fee_mojos"] == 81
     assert result["authority"]["unbounded"] is True
     assert result["dispatch_authorized"] is False
+
+
+def test_follow_cancel_price_clamps_to_verified_active_per_transaction_cap(
+    approved, monkeypatch
+):
+    run_id, identity = _run(approved)
+    pricing = import_module("follow_fee_cancellation")
+    wallet = import_module("wallet")
+    calls = []
+    monkeypatch.setattr(
+        pricing,
+        "_verified_active_transaction_fee_cap",
+        lambda **_kwargs: 50,
+    )
+    monkeypatch.setattr(
+        wallet,
+        "build_cancel_offers_batch_unsigned",
+        lambda _trades, *, fee_mojos, **_kwargs: calls.append(fee_mojos)
+        or {
+            "_catalyst_validated_cancel_unsigned": True,
+            "_catalyst_exact_unsigned_cost": 123456,
+        },
+    )
+    monkeypatch.setattr(
+        pricing,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "fee_mojos": 81,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "observed_at": 1002,
+            "expires_at": 1062,
+        },
+    )
+    monkeypatch.setattr(pricing, "is_current_fee_quote", lambda *_args: True)
+    result = pricing.price_follow_cancellation(
+        run_id=run_id,
+        identity=identity,
+        trade_ids=["b" * 64],
+        source_coin_ids=["c" * 64],
+        fee_coin_id="d" * 64,
+        now_epoch=1002,
+    )
+    assert result["available"] is True
+    assert result["fee_mojos"] == 50
+    assert result["fee_cap_warning"] == {
+        "reason": "FEE_CAP_BELOW_RECOMMENDATION",
+        "recommended_fee_mojos": 81,
+        "approved_maximum_fee_mojos": 50,
+    }
+    assert calls == [0, 50]
+
+
+def test_stopped_run_does_not_apply_active_coordinator_fee_cap(monkeypatch):
+    pricing = import_module("follow_fee_cancellation")
+    coordinator = import_module("follow_run_coordinator")
+    monkeypatch.setattr(
+        coordinator.FollowRunCoordinator,
+        "read_state",
+        lambda _self: {"state": "stopped", "run_id": "a" * 64},
+    )
+    monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: None)
+    assert pricing._verified_active_transaction_fee_cap(
+        run_id="a" * 64, identity={}
+    ) is None
 
 
 def test_unbounded_run_has_no_fee_ceiling_revision(approved):

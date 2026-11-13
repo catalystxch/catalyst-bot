@@ -7197,6 +7197,13 @@ class OfferManager:
                 raise ValueError(
                     str(priced.get("reason") or "FEE_ESTIMATE_UNAVAILABLE")
                 )
+            if priced.get("fee_cap_warning"):
+                log_event(
+                    "warning",
+                    "follow_cancel_fee_cap_below_recommendation",
+                    "Follow cancellation is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
+                    data=priced["fee_cap_warning"],
+                )
             fee = priced.get("fee_mojos")
             if type(fee) is not int or fee <= 0 or fee > fee_coin_amount:
                 raise ValueError("FEE_PREP_FUNDING_INSUFFICIENT")

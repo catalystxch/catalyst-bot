@@ -1443,6 +1443,41 @@ class BotLoop:
         except Exception:
             return None
 
+    def _follow_topup_fee_binding(self):
+        """Capture the exact coordinator scope for a background coin top-up."""
+        context = self._coordinator_follow_policy_context()
+        if context is None:
+            return None
+        state, policy = context
+        try:
+            import database
+            from confidence_override import current_configuration_digest
+
+            identity = database.get_follow_run_identity(state["run_id"])
+            digest = current_configuration_digest()
+            if state.get("configuration_sha256") != digest:
+                return None
+            return {
+                "run_id": state["run_id"],
+                "policy_digest": policy.digest,
+                "configuration_sha256": digest,
+                "identity": identity,
+            }
+        except Exception:
+            return None
+
+    def _start_coin_topup(
+        self, active_buy_count=0, active_sell_count=0, *, is_drip=None
+    ):
+        """Start top-up with a Follow binding when the coordinator proves one."""
+        binding = self._follow_topup_fee_binding()
+        kwargs = {"is_drip": is_drip}
+        if binding is not None:
+            kwargs["follow_fee_binding"] = binding
+        return self.coin_manager.start_topup(
+            active_buy_count, active_sell_count, **kwargs
+        )
+
     def _warn_approved_follow_anchor(self, policy) -> None:
         now = time.time()
         previous = float(getattr(self, "_last_follow_anchor_warning_at", 0) or 0)
@@ -6244,9 +6279,7 @@ class BotLoop:
                 _active_sell = sum(1 for o in _open if o.get("side") == "sell")
                 if not self._enter_runtime_effect_phase("coin_prep"):
                     return
-                if self.coin_manager.start_topup(
-                    _active_buy, _active_sell, is_drip=True
-                ):
+                if self._start_coin_topup(_active_buy, _active_sell, is_drip=True):
                     self._last_tier_drift_topup_time = _now
                     topup_note = "Live topup has been queued to reshape the coin pools."
                     log_event(
@@ -15449,7 +15482,7 @@ class BotLoop:
                 )
                 if not self._enter_runtime_effect_phase("coin_prep"):
                     return False
-                self.coin_manager.start_topup(
+                self._start_coin_topup(
                     active_buy_count, active_sell_count, is_drip=False
                 )
             elif self.coin_manager.needs_topup(active_buy_count, active_sell_count):
@@ -15461,7 +15494,7 @@ class BotLoop:
                 )
                 if not self._enter_runtime_effect_phase("coin_prep"):
                     return False
-                self.coin_manager.start_topup(active_buy_count, active_sell_count)
+                self._start_coin_topup(active_buy_count, active_sell_count)
             else:
                 log_event(
                     "debug",
@@ -15676,7 +15709,7 @@ class BotLoop:
             )
             if not self._enter_runtime_effect_phase("coin_prep"):
                 return False
-            self.coin_manager.start_topup(
+            self._start_coin_topup(
                 active_buy_count, active_sell_count, is_drip=False
             )
             return
@@ -15710,7 +15743,7 @@ class BotLoop:
             )
             if not self._enter_runtime_effect_phase("coin_prep"):
                 return False
-            self.coin_manager.start_topup(active_buy_count, active_sell_count)
+            self._start_coin_topup(active_buy_count, active_sell_count)
             return
 
         # Tier 3: Runtime health check — every 5 loops, independent check
@@ -15722,7 +15755,7 @@ class BotLoop:
             )
             if not self._enter_runtime_effect_phase("coin_prep"):
                 return False
-            self.coin_manager.start_topup(
+            self._start_coin_topup(
                 active_buy_count, active_sell_count, is_drip=False
             )
             return

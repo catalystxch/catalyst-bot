@@ -2184,6 +2184,7 @@ class CoinManager:
         self._prep_running: bool = False
         self._topup_running: bool = False
         self._topup_thread: Optional[threading.Thread] = None
+        self._topup_follow_fee_binding: Optional[dict] = None
         self._active_runtime_topup_prep_id: Optional[str] = None
 
         # F71: Coin reservation registry (see coin_reservations.py).
@@ -2467,7 +2468,69 @@ class CoinManager:
         if get_transaction_fee_mode() in {"auto", "node", "suggested"}:
             if fee_mojos <= 0:
                 raise ValueError("AUTO_TRANSACTION_FEE_UNAVAILABLE")
+        cap = self._verified_topup_follow_fee_cap()
+        if cap is not None and fee_mojos > cap:
+            log_event(
+                "warning",
+                "follow_topup_fee_cap_below_recommendation",
+                "Runtime coin top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
+                data={
+                    "recommended_fee_mojos": fee_mojos,
+                    "approved_maximum_fee_mojos": cap,
+                },
+            )
+            fee_mojos = cap
         return fee_mojos
+
+    def _verified_topup_follow_fee_cap(self) -> Optional[int]:
+        """Verify a supplied top-up binding against the current coordinator state."""
+        try:
+            from follow_run_coordinator import FollowRunCoordinator
+
+            reader = FollowRunCoordinator()
+            state_reader = getattr(reader, "read_state", None)
+            state = state_reader() if callable(state_reader) else reader.get_state()
+        except Exception as exc:
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_UNAVAILABLE") from exc
+        if state is None or (type(state) is dict and state.get("state") == "stopped"):
+            return None
+        if type(state) is not dict or state.get("state") not in {"start_pending", "running"}:
+            return None
+
+        binding = getattr(self, "_topup_follow_fee_binding", None)
+        if type(binding) is not dict:
+            raise ValueError("FOLLOW_TOPUP_FEE_BINDING_REQUIRED")
+        try:
+            import database
+            from confidence_override import current_configuration_digest, current_scope
+
+            policy = database.get_active_follow_run_policy()
+            config_digest = current_configuration_digest()
+            scope = current_scope()
+            identity = database.get_follow_run_identity(state.get("run_id"))
+        except Exception as exc:
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_UNAVAILABLE") from exc
+        if (
+            policy is None
+            or state.get("run_id") != binding.get("run_id")
+            or state.get("policy_digest") != binding.get("policy_digest")
+            or policy.digest != binding.get("policy_digest")
+            or state.get("configuration_sha256") != binding.get("configuration_sha256")
+            or state.get("configuration_sha256") != config_digest
+            or binding.get("identity") != identity
+            or type(scope) is not dict
+            or scope.get("follow_run_id") != state.get("run_id")
+            or scope.get("configuration_sha256") != config_digest
+            or scope.get("identity") != identity
+            or identity.get("network") != policy.network
+            or identity.get("asset_id") != policy.asset_id
+            or str(identity.get("wallet_fingerprint")) != policy.wallet_fingerprint
+        ):
+            raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_MISMATCH")
+        cap = policy.maximum_fee_mojos_per_tx
+        if type(cap) is not int or cap <= 0:
+            raise ValueError("FOLLOW_TOPUP_FEE_CAP_INVALID")
+        return cap
 
     def _wallet_rpc_failed(self, rpc_result) -> bool:
         return (
@@ -6311,6 +6374,7 @@ class CoinManager:
         active_buy_count: int = 0,
         active_sell_count: int = 0,
         is_drip: Optional[bool] = None,
+        follow_fee_binding: Optional[dict] = None,
     ) -> bool:
         """Start a live coin top-up in a background thread.
 
@@ -6343,7 +6407,7 @@ class CoinManager:
 
         self._topup_thread = threading.Thread(
             target=self._topup_worker,
-            args=(active_buy_count, active_sell_count),
+            args=(active_buy_count, active_sell_count, follow_fee_binding),
             daemon=True,
             name="coin-topup",
         )
@@ -6511,7 +6575,9 @@ class CoinManager:
             )
         return deficits
 
-    def _topup_worker(self, active_buy: int, active_sell: int):
+    def _topup_worker(
+        self, active_buy: int, active_sell: int, follow_fee_binding: Optional[dict] = None
+    ):
         """Smart topup worker — classifies coins and decides strategy.
 
         Decision tree:
@@ -6520,6 +6586,7 @@ class CoinManager:
           3. Nothing available → back off
         """
         try:
+            self._topup_follow_fee_binding = follow_fee_binding
             self._topup_abort_logged = False
             if self._topup_should_stop():
                 log_event(
@@ -7758,6 +7825,7 @@ class CoinManager:
                     self._topup_running = False
                     self._topup_stop_requested = False
                     self._active_runtime_topup_prep_id = None
+                    self._topup_follow_fee_binding = None
                     if self._topup_thread is threading.current_thread():
                         self._topup_thread = None
             except Exception as _flag_err:
@@ -9755,15 +9823,36 @@ class CoinManager:
                     "available": False,
                     "reason": "AUTO_TRANSACTION_FEE_UNAVAILABLE",
                 }
-            if quoted_fee == fee_mojos:
+            try:
+                fee_cap = self._verified_topup_follow_fee_cap()
+            except ValueError as exc:
+                return {"available": False, "reason": str(exc)}
+            selected_fee = (
+                min(quoted_fee, fee_cap) if fee_cap is not None else quoted_fee
+            )
+            if selected_fee == fee_mojos:
+                if fee_cap is not None and quoted_fee > fee_cap:
+                    log_event(
+                        "warning",
+                        "follow_topup_fee_cap_below_recommendation",
+                        "Runtime fee-reserve top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
+                        data={
+                            "recommended_fee_mojos": quoted_fee,
+                            "approved_maximum_fee_mojos": fee_cap,
+                        },
+                    )
                 return {
                     "available": True,
                     "fee_mojos": fee_mojos,
+                    "fee_cap_mojos": fee_cap,
+                    "fee_cap_warning": (
+                        quoted_fee > fee_cap if fee_cap is not None else False
+                    ),
                     "prep_contract": prep_contract,
                     "validated_unsigned": validated,
                     "quote": quote,
                 }
-            fee_mojos = quoted_fee
+            fee_mojos = selected_fee
         return {"available": False, "reason": "FEE_PRICING_NOT_CONVERGED"}
 
     def _sage_one_step_split(
