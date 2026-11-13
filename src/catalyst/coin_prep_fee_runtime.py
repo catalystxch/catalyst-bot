@@ -581,10 +581,32 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
     else:
         if "bootstrap_campaign_id" in options:
             raise ValueError("FEE_PREP_CAMPAIGN_UNAVAILABLE")
+        session_id = options.get("follow_run_session_id")
+        active_policy = None
+        planning_price = api_server._get_readonly_mid_price_str()
+        if session_id is not None:
+            from confidence_override import current_configuration_digest
+            from follow_funded_targets import validate_follow_prep_authority
+            from follow_run_coordinator import FollowRunCoordinator
+
+            coordinator = FollowRunCoordinator().get_state()
+            active_policy = database.get_active_follow_run_policy()
+            validate_follow_prep_authority(
+                session_id=session_id,
+                coordinator_state=coordinator,
+                policy=active_policy,
+                configuration=config,
+                configuration_sha256=current_configuration_digest(),
+                identity=identity,
+            )
+            # Thin markets can have no independently trusted live mid at this
+            # instant. The user explicitly reviewed this session's anchor and
+            # range; use that signed anchor to size the frozen prep outputs.
+            planning_price = str(active_policy.price_anchor)
         recipe = build_standard_prep_economics(
             configuration=config,
             fee_pool=fee_pool,
-            live_price=api_server._get_readonly_mid_price_str(),
+            live_price=planning_price,
             coin_multiplier=options["coin_multiplier"],
             target_seconds=options["target_seconds"],
         )
@@ -592,27 +614,10 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
         # currently fundable prefixes. The signed policy continues to carry
         # the requested targets; this exact recipe carries the initial funded
         # outputs. All evidence is re-read here on preview/approval refresh.
-        session_id = options.get("follow_run_session_id")
         if session_id is not None:
-            from confidence_override import current_configuration_digest
-            from follow_funded_targets import (
-                plan_partial_follow_prep_recipe,
-                validate_follow_prep_authority,
-            )
+            from follow_funded_targets import plan_partial_follow_prep_recipe
             from follow_principal import _principal_from_observed_snapshot
-            from follow_run_coordinator import FollowRunCoordinator
 
-            coordinator = FollowRunCoordinator().get_state()
-            active_policy = database.get_active_follow_run_policy()
-            config_sha256 = current_configuration_digest()
-            validate_follow_prep_authority(
-                session_id=session_id,
-                coordinator_state=coordinator,
-                policy=active_policy,
-                configuration=config,
-                configuration_sha256=config_sha256,
-                identity=identity,
-            )
             principal = _principal_from_observed_snapshot(context, fee_cap_mojos=None)
             recipe = plan_partial_follow_prep_recipe(
                 recipe,

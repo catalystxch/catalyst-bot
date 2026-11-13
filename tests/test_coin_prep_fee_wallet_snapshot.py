@@ -4,6 +4,7 @@ from decimal import Decimal
 from importlib import import_module
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -404,6 +405,48 @@ def test_no_market_price_cannot_be_disguised_as_a_valid_runtime_plan(economic_re
     economic_reads["live_price"] = None
     with pytest.raises(ValueError, match="FEE_PREP_PRICE_UNAVAILABLE"):
         _economic_collect(economic_reads)
+
+
+def test_approved_follow_anchor_sizes_prep_when_thin_book_has_no_live_mid(
+    economic_reads, monkeypatch
+):
+    """A signed Follow anchor can size prep while a thin book lacks a live mid."""
+    import confidence_override
+    import follow_funded_targets
+    import follow_principal
+    from follow_run_coordinator import FollowRunCoordinator
+
+    session_id = "b" * 64
+    economic_reads["live_price"] = None
+    monkeypatch.setattr(FollowRunCoordinator, "get_state", lambda _self: {})
+    monkeypatch.setattr(
+        database,
+        "get_active_follow_run_policy",
+        lambda: SimpleNamespace(price_anchor=Decimal("0.01")),
+    )
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "c" * 64
+    )
+    monkeypatch.setattr(
+        follow_funded_targets, "validate_follow_prep_authority", lambda **_kw: None
+    )
+    monkeypatch.setattr(
+        follow_principal,
+        "_principal_from_observed_snapshot",
+        lambda *_args, **_kw: {
+            "maximum_trade_xch_mojos": 1_000_000_000_000,
+            "maximum_trade_cat_atoms": 1_000_000,
+        },
+    )
+    monkeypatch.setattr(
+        follow_funded_targets,
+        "plan_partial_follow_prep_recipe",
+        lambda recipe, **_kw: recipe,
+    )
+
+    result = _economic_collect(economic_reads, {"follow_run_session_id": session_id})
+    assert result["recipe"]["targets"]
+    assert result["request_options"]["follow_run_session_id"] == session_id
 
 
 @pytest.mark.parametrize(
