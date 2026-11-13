@@ -267,7 +267,9 @@ def test_follow_requote_cold_start_propagates_run_to_creation_boundary(monkeypat
     calls = []
     manager = offer_manager.OfferManager()
     monkeypatch.setattr(offer_manager, "get_open_offers", lambda **_kwargs: [])
-    monkeypatch.setattr(manager, "_advance_pending_refresh_lineage", lambda *_args: None)
+    monkeypatch.setattr(
+        manager, "_advance_pending_refresh_lineage", lambda *_args: None
+    )
     monkeypatch.setattr(
         manager,
         "create_ladder",

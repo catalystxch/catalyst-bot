@@ -14,7 +14,11 @@ def test_transient_windows_env_replace_is_retried():
         if len(attempts) < 3:
             raise PermissionError(13, "sharing violation")
 
-    with patch.object(config.os, "name", "nt"), patch.object(config, "set_key", side_effect=write), patch.object(config.time, "sleep"):
+    with (
+        patch.object(config.os, "name", "nt"),
+        patch.object(config, "set_key", side_effect=write),
+        patch.object(config.time, "sleep"),
+    ):
         config._set_key_with_windows_retry("config.env", "MAX_POSITION_XCH", "73.7")
 
     assert len(attempts) == 3

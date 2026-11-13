@@ -96,6 +96,7 @@ def test_explicit_confirm_persists_exact_reviewed_policy(monkeypatch):
     assert result["policy_digest"] == policy.digest
     assert saved == [policy]
 
+
 def test_reject_does_not_persist(monkeypatch):
     monkeypatch.setattr(
         database,
@@ -194,7 +195,9 @@ def test_expired_review_does_not_persist(monkeypatch):
 
 def test_review_digest_mismatch_and_replay_are_rejected(monkeypatch):
     saved = []
-    monkeypatch.setattr(database, "record_active_follow_run_policy", lambda p: saved.append(p) or True)
+    monkeypatch.setattr(
+        database, "record_active_follow_run_policy", lambda p: saved.append(p) or True
+    )
     policy = make_policy()
     review = prepare_follow_run_policy_review(
         policy,
@@ -242,7 +245,9 @@ def test_review_digest_mismatch_and_replay_are_rejected(monkeypatch):
 
 
 def test_persistence_failure_does_not_report_approval(monkeypatch):
-    monkeypatch.setattr(database, "record_active_follow_run_policy", lambda _policy: False)
+    monkeypatch.setattr(
+        database, "record_active_follow_run_policy", lambda _policy: False
+    )
     policy = make_policy()
     review = prepare_follow_run_policy_review(
         policy,

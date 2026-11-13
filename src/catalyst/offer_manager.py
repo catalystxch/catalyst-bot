@@ -314,10 +314,8 @@ def require_follow_policy_price(
     if (
         type(scope) is not dict
         or coordinator.get("policy_digest") != getattr(policy, "digest", None)
-        or coordinator.get("configuration_sha256")
-        != current_digest
-        or coordinator.get("configuration_sha256")
-        != scope.get("configuration_sha256")
+        or coordinator.get("configuration_sha256") != current_digest
+        or coordinator.get("configuration_sha256") != scope.get("configuration_sha256")
         or scope.get("follow_run_id") != run_id
         or scope.get("identity") != identity
         or type(marker) is not dict
@@ -360,8 +358,10 @@ def _follow_candidate_price(offer_dict: dict, side: str) -> Decimal:
     cat_scale = 10 ** int(getattr(cfg, "CAT_DECIMALS", 3))
     if xch_mojos <= 0 or cat_atoms <= 0 or cat_scale <= 0:
         raise ValueError("FOLLOW_RUN_OFFER_AMOUNTS_INVALID")
-    return Decimal(xch_mojos) * Decimal(cat_scale) / (
-        Decimal(1_000_000_000_000) * Decimal(cat_atoms)
+    return (
+        Decimal(xch_mojos)
+        * Decimal(cat_scale)
+        / (Decimal(1_000_000_000_000) * Decimal(cat_atoms))
     )
 
 

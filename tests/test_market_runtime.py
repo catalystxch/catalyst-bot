@@ -1592,9 +1592,12 @@ def test_red_market_withdrawal_is_suppressed_only_for_proven_active_follow_run(
     )
     loop._override_protected_trade_ids = lambda: set()
 
-    assert loop._apply_market_withdrawal(
-        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_RED")
-    ) == 0
+    assert (
+        loop._apply_market_withdrawal(
+            SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_RED")
+        )
+        == 0
+    )
     assert dispatched == []
 
 
@@ -1616,9 +1619,7 @@ def test_follow_red_suppression_requires_live_offer_inside_approved_range(
     )
     monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
 
-    assert loop._active_follow_red_withdrawal_protected(
-        [{"price_xch": "1.2"}]
-    ) is False
+    assert loop._active_follow_red_withdrawal_protected([{"price_xch": "1.2"}]) is False
 
 
 def test_follow_red_withdrawal_proof_fails_closed_on_wallet_fingerprint_mismatch(
@@ -1674,9 +1675,7 @@ def test_follow_red_withdrawal_proof_fails_closed_on_wallet_fingerprint_mismatch
         },
     )
 
-    assert loop._active_follow_red_withdrawal_protected(
-        [{"price_xch": "1"}]
-    ) is False
+    assert loop._active_follow_red_withdrawal_protected([{"price_xch": "1"}]) is False
 
 
 def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission(

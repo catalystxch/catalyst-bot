@@ -161,8 +161,7 @@ def price_next_prep_batch(
             }
         fee = (
             maximum_fee_mojos
-            if maximum_fee_mojos is not None
-            and quote["fee_mojos"] > maximum_fee_mojos
+            if maximum_fee_mojos is not None and quote["fee_mojos"] > maximum_fee_mojos
             else quote["fee_mojos"]
         )
     return _unavailable("FEE_PRICING_NOT_CONVERGED")

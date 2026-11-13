@@ -8090,9 +8090,9 @@ def _upgrade_follow_run_approval_reuse(conn: sqlite3.Connection) -> None:
         "approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
         1,
     )
-    legacy_50 = canonical.replace(
-        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
-    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    legacy_50 = canonical.replace("buy_limit>0", "buy_limit BETWEEN 1 AND 50").replace(
+        "sell_limit>0", "sell_limit BETWEEN 1 AND 50"
+    )
     legacy_unique_50 = legacy.replace(
         "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
     ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
@@ -8159,9 +8159,9 @@ def _upgrade_follow_run_review_slot_limit(conn: sqlite3.Connection) -> None:
     installed = str(row[0])
     if _normalized_schema_sql(installed) == _normalized_schema_sql(canonical):
         return
-    legacy = canonical.replace(
-        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
-    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    legacy = canonical.replace("buy_limit>0", "buy_limit BETWEEN 1 AND 50").replace(
+        "sell_limit>0", "sell_limit BETWEEN 1 AND 50"
+    )
     if _normalized_schema_sql(installed) != _normalized_schema_sql(legacy):
         raise RuntimeError("Follow run review has unknown schema")
     conn.execute("PRAGMA foreign_keys=OFF")

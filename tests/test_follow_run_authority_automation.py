@@ -52,11 +52,33 @@ def test_fresh_proposal_accepts_exact_policy_principal_and_fee_cap():
 @pytest.mark.parametrize(
     ("policy_changes", "proposal_changes", "reason"),
     [
-        ({}, {"maximum_trade_xch_mojos": 501}, "FOLLOW_TRADING_PRINCIPAL_EXCEEDS_APPROVAL"),
-        ({}, {"maximum_trade_cat_atoms": 601}, "FOLLOW_TRADING_PRINCIPAL_EXCEEDS_APPROVAL"),
-        ({}, {"shutdown_funding": {"ready": True, "quoted_fee_mojos": 0}}, "FOLLOW_SHUTDOWN_FUNDING_REQUIRED"),
+        (
+            {},
+            {"maximum_trade_xch_mojos": 501},
+            "FOLLOW_TRADING_PRINCIPAL_EXCEEDS_APPROVAL",
+        ),
+        (
+            {},
+            {"maximum_trade_cat_atoms": 601},
+            "FOLLOW_TRADING_PRINCIPAL_EXCEEDS_APPROVAL",
+        ),
+        (
+            {},
+            {"shutdown_funding": {"ready": True, "quoted_fee_mojos": 0}},
+            "FOLLOW_SHUTDOWN_FUNDING_REQUIRED",
+        ),
         ({}, {"buy_slots_arithmetic_fit": 1}, "FOLLOW_SLOT_INVENTORY_SHORT"),
-        ({}, {"identity": {"network": "mainnet", "wallet_fingerprint": 123, "asset_id": "b" * 64}}, "FOLLOW_RUN_AUTHORITY_CHANGED"),
+        (
+            {},
+            {
+                "identity": {
+                    "network": "mainnet",
+                    "wallet_fingerprint": 123,
+                    "asset_id": "b" * 64,
+                }
+            },
+            "FOLLOW_RUN_AUTHORITY_CHANGED",
+        ),
     ],
 )
 def test_fresh_proposal_rejects_policy_or_proof_expansion(

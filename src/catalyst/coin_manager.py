@@ -2494,7 +2494,10 @@ class CoinManager:
             raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_UNAVAILABLE") from exc
         if state is None or (type(state) is dict and state.get("state") == "stopped"):
             return None
-        if type(state) is not dict or state.get("state") not in {"start_pending", "running"}:
+        if type(state) is not dict or state.get("state") not in {
+            "start_pending",
+            "running",
+        }:
             return None
 
         binding = getattr(self, "_topup_follow_fee_binding", None)
@@ -6576,7 +6579,10 @@ class CoinManager:
         return deficits
 
     def _topup_worker(
-        self, active_buy: int, active_sell: int, follow_fee_binding: Optional[dict] = None
+        self,
+        active_buy: int,
+        active_sell: int,
+        follow_fee_binding: Optional[dict] = None,
     ):
         """Smart topup worker — classifies coins and decides strategy.
 

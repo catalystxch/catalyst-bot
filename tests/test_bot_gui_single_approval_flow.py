@@ -53,12 +53,12 @@ def test_single_approval_is_only_offered_for_fresh_smart_settings():
 
 def test_approved_run_resumes_from_read_only_status_without_duplicate_pollers():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
-    recovery = html.split("async function recoverSingleApprovalRunOnStartup()", 1)[1].split(
-        "let _followRunReview", 1
-    )[0]
-    polling = html.split("async function advanceSingleApprovalRun(sessionId)", 1)[1].split(
-        "async function recoverSingleApprovalRunOnStartup()", 1
-    )[0]
+    recovery = html.split("async function recoverSingleApprovalRunOnStartup()", 1)[
+        1
+    ].split("let _followRunReview", 1)[0]
+    polling = html.split("async function advanceSingleApprovalRun(sessionId)", 1)[
+        1
+    ].split("async function recoverSingleApprovalRunOnStartup()", 1)[0]
 
     assert "get_single_approval_follow_run_status" in recovery
     assert "['prep_pending', 'preparing', 'ready', 'start_pending']" in recovery
@@ -72,14 +72,20 @@ def test_approved_run_resumes_from_read_only_status_without_duplicate_pollers():
 def test_smart_settings_retains_manual_targets_and_discloses_sizing_estimate():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
     smart_settings = html.split("async function getSmartDefaults()", 1)[1].split(
-        "// ── \"Settings changed since Smart Settings\" tracker", 1
+        '// ── "Settings changed since Smart Settings" tracker', 1
     )[0]
 
     assert "const _smartRequestedBuy" in smart_settings
     assert "const _smartRequestedSell" in smart_settings
     assert "Math.max(...selectedTargets)" in smart_settings
-    assert "if (!_preserveBuyTarget && data.max_active_buy !== undefined)" in smart_settings
-    assert "if (!_preserveSellTarget && data.max_active_sell !== undefined)" in smart_settings
+    assert (
+        "if (!_preserveBuyTarget && data.max_active_buy !== undefined)"
+        in smart_settings
+    )
+    assert (
+        "if (!_preserveSellTarget && data.max_active_sell !== undefined)"
+        in smart_settings
+    )
     assert "Requested targets retained" in smart_settings
 
 

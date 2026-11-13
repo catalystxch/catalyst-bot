@@ -80,6 +80,7 @@ def saved_state(monkeypatch):
             "sell_limit": 100,
         },
     )
+
     def clear_policy():
         active["policy"] = None
         return True
@@ -188,17 +189,18 @@ def test_prep_reconciliation_and_start_transitions_are_idempotent(saved_state):
         now_epoch=102,
     )
     assert ready["state"] == "ready"
-    authority = service.bind_authority(
-        **key, run_id=AUTHORITY_RUN_ID, now_epoch=103
-    )
+    authority = service.bind_authority(**key, run_id=AUTHORITY_RUN_ID, now_epoch=103)
     assert authority["run_id"] == AUTHORITY_RUN_ID
-    assert service.reconcile_prep(
-        **key,
-        effect_status="confirmed",
-        prep_complete=True,
-        fee_status="within_cap",
-        now_epoch=104,
-    )["run_id"] == AUTHORITY_RUN_ID
+    assert (
+        service.reconcile_prep(
+            **key,
+            effect_status="confirmed",
+            prep_complete=True,
+            fee_status="within_cap",
+            now_epoch=104,
+        )["run_id"]
+        == AUTHORITY_RUN_ID
+    )
     assert service.read_state()["run_id"] == AUTHORITY_RUN_ID
     pending = service.mark_start_pending(**key, now_epoch=105)
     assert service.mark_start_pending(**key, now_epoch=106) == pending
@@ -362,7 +364,9 @@ def test_start_and_running_require_live_unstopped_authority(monkeypatch, saved_s
     assert service.read_state()["state"] == "ready"
 
 
-def test_stop_clears_approval_and_prevents_reusing_old_session(monkeypatch, saved_state):
+def test_stop_clears_approval_and_prevents_reusing_old_session(
+    monkeypatch, saved_state
+):
     service = coordinator()
     run = service.begin_run(
         policy_digest=POLICY_DIGEST,
@@ -459,9 +463,7 @@ def test_prep_approval_binding_is_idempotent_and_cannot_be_replaced(
         },
     )
     with pytest.raises(ValueError, match="FOLLOW_RUN_PREP_FEE_APPROVAL_CHANGED"):
-        service.bind_prep_approval(
-            **binding(run), approval_id="7" * 64, now_epoch=103
-        )
+        service.bind_prep_approval(**binding(run), approval_id="7" * 64, now_epoch=103)
     assert service.read_state()["fee_approval_id"] == PREP_APPROVAL_ID
 
 
@@ -490,7 +492,9 @@ def test_prep_approval_binding_rejects_wrong_identity_or_config(
             **binding(run), approval_id=PREP_APPROVAL_ID, now_epoch=101
         )
 
-    monkeypatch.setattr(confidence_override, "current_configuration_digest", lambda: "c" * 64)
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "c" * 64
+    )
     with pytest.raises(ValueError, match="FOLLOW_RUN_AUTHORITY_CHANGED"):
         service.bind_prep_approval(
             **binding(run), approval_id=PREP_APPROVAL_ID, now_epoch=102
@@ -537,4 +541,3 @@ def test_partial_fee_binding_record_fails_closed(saved_state):
 
     with pytest.raises(ValueError, match="FOLLOW_RUN_COORDINATOR_STATE_INVALID"):
         service.read_state()
-

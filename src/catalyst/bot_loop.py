@@ -1418,7 +1418,9 @@ class BotLoop:
             coordinator_reader = FollowRunCoordinator()
             state_reader = getattr(coordinator_reader, "read_state", None)
             state = (
-                state_reader() if callable(state_reader) else coordinator_reader.get_state()
+                state_reader()
+                if callable(state_reader)
+                else coordinator_reader.get_state()
             )
             if (
                 type(state) is not dict
@@ -1430,8 +1432,7 @@ class BotLoop:
             if (
                 policy is None
                 or policy.digest != state.get("policy_digest")
-                or state.get("configuration_sha256")
-                != current_configuration_digest()
+                or state.get("configuration_sha256") != current_configuration_digest()
             ):
                 return None
             require_follow_policy_price(
@@ -1524,6 +1525,7 @@ class BotLoop:
             self._set_approved_follow_anchor_warning()
             return raw
         state, policy = context
+
         def proof_current():
             return self._coordinator_follow_policy_context() is not None
 
@@ -1535,7 +1537,9 @@ class BotLoop:
 
                 reader = FollowRunCoordinator()
                 read_state = getattr(reader, "read_state", None)
-                current_state = read_state() if callable(read_state) else reader.get_state()
+                current_state = (
+                    read_state() if callable(read_state) else reader.get_state()
+                )
                 current_policy = database.get_active_follow_run_policy()
                 return bool(
                     getattr(self, "_running", False)
@@ -1603,7 +1607,10 @@ class BotLoop:
                 if not policy_state_current():
                     return None
                 current_raw, current_deadline = self._market_confidence_snapshot()
-                if current_raw is not None and getattr(current_raw, "state", None) != "RED":
+                if (
+                    current_raw is not None
+                    and getattr(current_raw, "state", None) != "RED"
+                ):
                     return None
                 return build_view(
                     current_raw,
@@ -1970,7 +1977,9 @@ class BotLoop:
                 "warning",
                 "market_confidence_red_approved_follow",
                 "Market confidence is RED; the identity-matched approved Follow run remains active",
-                data={"reason_code": str(getattr(decision, "reason_code", "MARKET_RED"))},
+                data={
+                    "reason_code": str(getattr(decision, "reason_code", "MARKET_RED"))
+                },
             )
             return 0
         requested = {"mid" if tier == "middle" else tier for tier in requested}
@@ -2101,7 +2110,9 @@ class BotLoop:
             coordinator_reader = FollowRunCoordinator()
             state_reader = getattr(coordinator_reader, "read_state", None)
             coordinated = (
-                state_reader() if callable(state_reader) else coordinator_reader.get_state()
+                state_reader()
+                if callable(state_reader)
+                else coordinator_reader.get_state()
             )
             if (
                 type(coordinated) is not dict
@@ -2185,8 +2196,7 @@ class BotLoop:
                 str(observed.get("fingerprint"))
                 == str(run_identity.get("wallet_fingerprint"))
                 and network == run_identity.get("network")
-                and run_identity.get("wallet_id")
-                == getattr(cfg, "CAT_WALLET_ID", None)
+                and run_identity.get("wallet_id") == getattr(cfg, "CAT_WALLET_ID", None)
                 and run_identity.get("xch_wallet_id")
                 == getattr(cfg, "WALLET_ID_XCH", None)
             ):
@@ -10793,10 +10803,12 @@ class BotLoop:
             if market_result
             else self._coordinator_approved_follow_confidence(None)
         )
-        trusted_midpoint = getattr(effective_market_confidence, "trusted_midpoint", None)
-        anchor_only = getattr(
-            effective_market_confidence, "approved_anchor_only", False
-        ) is True
+        trusted_midpoint = getattr(
+            effective_market_confidence, "trusted_midpoint", None
+        )
+        anchor_only = (
+            getattr(effective_market_confidence, "approved_anchor_only", False) is True
+        )
         price_data = (
             {
                 "mid_price": str(trusted_midpoint),
@@ -15709,9 +15721,7 @@ class BotLoop:
             )
             if not self._enter_runtime_effect_phase("coin_prep"):
                 return False
-            self._start_coin_topup(
-                active_buy_count, active_sell_count, is_drip=False
-            )
+            self._start_coin_topup(active_buy_count, active_sell_count, is_drip=False)
             return
 
         # Tier 2: Lightweight topup — free coins running low
@@ -15755,9 +15765,7 @@ class BotLoop:
             )
             if not self._enter_runtime_effect_phase("coin_prep"):
                 return False
-            self._start_coin_topup(
-                active_buy_count, active_sell_count, is_drip=False
-            )
+            self._start_coin_topup(active_buy_count, active_sell_count, is_drip=False)
             return
 
         # Check coin prep worker status (may have finished in background)

@@ -69,7 +69,9 @@ def test_runtime_topup_fee_uses_verified_follow_per_transaction_cap(monkeypatch)
     manager = _manager(None)
     _patch_active_binding(monkeypatch, manager)
     manager_module = import_module("coin_manager")
-    monkeypatch.setattr(manager_module, "get_effective_transaction_fee_mojos", lambda: 456)
+    monkeypatch.setattr(
+        manager_module, "get_effective_transaction_fee_mojos", lambda: 456
+    )
     monkeypatch.setattr(manager_module, "get_transaction_fee_mode", lambda: "auto")
     assert manager._tx_fee_mojos() == 123
 
@@ -87,6 +89,8 @@ def test_runtime_topup_rejects_mismatched_coordinator_configuration(monkeypatch)
     _patch_active_binding(monkeypatch, manager)
     import confidence_override
 
-    monkeypatch.setattr(confidence_override, "current_configuration_digest", lambda: "e" * 64)
+    monkeypatch.setattr(
+        confidence_override, "current_configuration_digest", lambda: "e" * 64
+    )
     with pytest.raises(ValueError, match="FOLLOW_TOPUP_FEE_AUTHORITY_MISMATCH"):
         manager._verified_topup_follow_fee_cap()

@@ -69,8 +69,7 @@ def verified_prep_fee_cap(
         coordinator.get("state") not in _ACTIVE_PREP_STATES
         or coordinator.get("session_id") != run_session_id
         or coordinator.get("policy_digest") != policy.digest
-        or coordinator.get("configuration_sha256")
-        != current_configuration_sha256
+        or coordinator.get("configuration_sha256") != current_configuration_sha256
         or (run_id is not None and not _digest(run_id))
         or coordinator.get("fee_approval_id") != requested_approval_id
         or coordinator.get("fee_approval_session_id") != prep_session_id

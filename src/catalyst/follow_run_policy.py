@@ -71,7 +71,9 @@ class FollowRunPolicy:
             if type(value) is not int:
                 raise TypeError(f"{name} must be an integer")
             if value < 0 or (name == "maximum_fee_mojos_per_tx" and value == 0):
-                raise ValueError(f"{name} must be {'positive' if name == 'maximum_fee_mojos_per_tx' else 'non-negative'}")
+                raise ValueError(
+                    f"{name} must be {'positive' if name == 'maximum_fee_mojos_per_tx' else 'non-negative'}"
+                )
 
     @property
     def digest(self) -> str:

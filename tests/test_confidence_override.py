@@ -873,12 +873,14 @@ def test_thin_anchor_move_can_use_reviewed_persistent_observations():
         ),
         derived_thresholds={"persistence_refreshes": 2, "persistence_jitter_bps": 100},
     )
-    assert override_price_range(
-        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
-    ) is None
-    assert permit.price_range(
-        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
-    ) is None
+    assert (
+        override_price_range(raw, now=NOW, valid_until=NOW + timedelta(seconds=20))
+        is None
+    )
+    assert (
+        permit.price_range(raw, now=NOW, valid_until=NOW + timedelta(seconds=20))
+        is None
+    )
     raw.derived_at += timedelta(seconds=5)
     assert permit.price_range(
         raw, now=raw.derived_at, valid_until=raw.derived_at + timedelta(seconds=20)
@@ -891,14 +893,16 @@ def test_reviewed_override_rejects_bid_or_ask_outside_configured_range(monkeypat
     monkeypatch.setattr(cfg, "HARD_MIN_PRICE_XCH", Decimal("0.00004"))
     monkeypatch.setattr(cfg, "HARD_MAX_PRICE_XCH", Decimal("0.00007"))
     raw = confidence(reason_codes=("insufficient_ask_depth",))
-    assert override_price_range(
-        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
-    ) is None
+    assert (
+        override_price_range(raw, now=NOW, valid_until=NOW + timedelta(seconds=20))
+        is None
+    )
     raw.observed_ask = Decimal("0.000065")
     raw.observed_bid = Decimal("0.00003")
-    assert override_price_range(
-        raw, now=NOW, valid_until=NOW + timedelta(seconds=20)
-    ) is None
+    assert (
+        override_price_range(raw, now=NOW, valid_until=NOW + timedelta(seconds=20))
+        is None
+    )
 
 
 @pytest.mark.parametrize(

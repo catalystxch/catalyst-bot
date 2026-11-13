@@ -259,11 +259,13 @@ def test_follow_cancel_price_clamps_to_verified_active_per_transaction_cap(
     monkeypatch.setattr(
         wallet,
         "build_cancel_offers_batch_unsigned",
-        lambda _trades, *, fee_mojos, **_kwargs: calls.append(fee_mojos)
-        or {
-            "_catalyst_validated_cancel_unsigned": True,
-            "_catalyst_exact_unsigned_cost": 123456,
-        },
+        lambda _trades, *, fee_mojos, **_kwargs: (
+            calls.append(fee_mojos)
+            or {
+                "_catalyst_validated_cancel_unsigned": True,
+                "_catalyst_exact_unsigned_cost": 123456,
+            }
+        ),
     )
     monkeypatch.setattr(
         pricing,
@@ -306,9 +308,10 @@ def test_stopped_run_does_not_apply_active_coordinator_fee_cap(monkeypatch):
         lambda _self: {"state": "stopped", "run_id": "a" * 64},
     )
     monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: None)
-    assert pricing._verified_active_transaction_fee_cap(
-        run_id="a" * 64, identity={}
-    ) is None
+    assert (
+        pricing._verified_active_transaction_fee_cap(run_id="a" * 64, identity={})
+        is None
+    )
 
 
 def test_unbounded_run_has_no_fee_ceiling_revision(approved):

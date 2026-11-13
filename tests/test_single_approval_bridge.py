@@ -39,17 +39,21 @@ def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
     import follow_run_defaults
     import follow_run_coordinator
 
-    monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
-        "buy_target": 24,
-        "sell_target": 24,
-        "fee_coin_principal_mojos": "1000000000000",
-        "xch_reserve_mojos": "100000000000",
-        "cat_reserve_atoms": "1000",
-        "maximum_trade_xch_mojos": "3000000000000",
-        "maximum_trade_cat_atoms": "500000",
-        "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
-        "configuration_sha256": CONFIGURATION_SHA256,
-    })
+    monkeypatch.setattr(
+        follow_run_defaults,
+        "exact_funding_defaults",
+        lambda: {
+            "buy_target": 24,
+            "sell_target": 24,
+            "fee_coin_principal_mojos": "1000000000000",
+            "xch_reserve_mojos": "100000000000",
+            "cat_reserve_atoms": "1000",
+            "maximum_trade_xch_mojos": "3000000000000",
+            "maximum_trade_cat_atoms": "500000",
+            "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
+            "configuration_sha256": CONFIGURATION_SHA256,
+        },
+    )
     result = app_bridge.AppBridge().get_single_approval_follow_run_defaults()
     assert result["success"] is True
     assert result["policy"]["maximum_trade_xch_mojos"] == "3000000000000"
@@ -57,7 +61,9 @@ def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
     assert result["dispatch_authorized"] is False
 
 
-def test_native_status_reports_durable_setup_without_dispatch(bridge_world, monkeypatch):
+def test_native_status_reports_durable_setup_without_dispatch(
+    bridge_world, monkeypatch
+):
     import app_bridge
     import follow_run_coordinator
 
@@ -81,14 +87,16 @@ def test_native_status_reports_durable_setup_without_dispatch(bridge_world, monk
 
 def test_native_review_rejects_client_inflated_principal(bridge_world):
     bridge, _observed, _hash, _database = bridge_world
-    result = bridge.prepare_single_approval_follow_run_review({
-        "policy": policy_terms(maximum_trade_xch_mojos="999999999999999999")
-    })
+    result = bridge.prepare_single_approval_follow_run_review(
+        {"policy": policy_terms(maximum_trade_xch_mojos="999999999999999999")}
+    )
     assert result["success"] is False
     assert result["reason"] == "FOLLOW_RUN_REVIEW_FUNDING_CHANGED"
 
 
-def test_new_policy_cannot_replace_active_session_before_recording(bridge_world, monkeypatch):
+def test_new_policy_cannot_replace_active_session_before_recording(
+    bridge_world, monkeypatch
+):
     import follow_run_coordinator
 
     bridge, _observed, _hash, database = bridge_world
@@ -108,12 +116,14 @@ def test_new_policy_cannot_replace_active_session_before_recording(bridge_world,
         "record_active_follow_run_policy",
         lambda _policy: pytest.fail("must not replace running policy"),
     )
-    result = bridge.confirm_single_approval_follow_run_review({
-        "review_id": review["review_id"],
-        "review_sha256": review["review_sha256"],
-        "accepted": True,
-        "policy": terms,
-    })
+    result = bridge.confirm_single_approval_follow_run_review(
+        {
+            "review_id": review["review_id"],
+            "review_sha256": review["review_sha256"],
+            "accepted": True,
+            "policy": terms,
+        }
+    )
     assert result["success"] is False
     assert result["reason"] == "FOLLOW_RUN_AUTHORITY_CHANGED"
 
@@ -149,18 +159,31 @@ def bridge_world(monkeypatch):
 
     monkeypatch.setattr(coin_prep_fee_runtime, "_configuration", lambda: configuration)
     monkeypatch.setattr(coin_prep_fee_runtime, "_verified_identity", verified_identity)
-    monkeypatch.setattr(follow_run_coordinator.FollowRunCoordinator, "get_state", lambda self: None)
-    monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
-        **{key: value for key, value in policy_terms().items() if key in {
-            "fee_coin_principal_mojos", "xch_reserve_mojos",
-            "cat_reserve_atoms", "maximum_trade_xch_mojos",
-            "maximum_trade_cat_atoms",
-        }},
-        "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
-        "configuration_sha256": config_hash["value"],
-        "buy_target": 100,
-        "sell_target": 100,
-    })
+    monkeypatch.setattr(
+        follow_run_coordinator.FollowRunCoordinator, "get_state", lambda self: None
+    )
+    monkeypatch.setattr(
+        follow_run_defaults,
+        "exact_funding_defaults",
+        lambda: {
+            **{
+                key: value
+                for key, value in policy_terms().items()
+                if key
+                in {
+                    "fee_coin_principal_mojos",
+                    "xch_reserve_mojos",
+                    "cat_reserve_atoms",
+                    "maximum_trade_xch_mojos",
+                    "maximum_trade_cat_atoms",
+                }
+            },
+            "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
+            "configuration_sha256": config_hash["value"],
+            "buy_target": 100,
+            "sell_target": 100,
+        },
+    )
     monkeypatch.setattr(
         confidence_override,
         "current_configuration_digest",
@@ -202,7 +225,9 @@ def bridge_world(monkeypatch):
     return app_bridge.AppBridge(), observed, config_hash, database
 
 
-def test_native_preview_uses_trusted_identity_and_market_reasons(bridge_world, monkeypatch):
+def test_native_preview_uses_trusted_identity_and_market_reasons(
+    bridge_world, monkeypatch
+):
     bridge, observed, _config_hash, database = bridge_world
     monkeypatch.setattr(
         database,
@@ -263,8 +288,10 @@ def test_confirm_rederives_evidence_and_persists_only_explicit_confirmation(
     monkeypatch.setattr(
         FollowRunCoordinator,
         "begin_run",
-        lambda _self, **kwargs: started_sessions.append(kwargs)
-        or {"session_id": "d" * 64, "state": "prep_pending"},
+        lambda _self, **kwargs: (
+            started_sessions.append(kwargs)
+            or {"session_id": "d" * 64, "state": "prep_pending"}
+        ),
     )
     terms = policy_terms()
     review = bridge.prepare_single_approval_follow_run_review({"policy": terms})
@@ -317,4 +344,3 @@ def test_changed_red_snapshot_or_config_blocks_confirmation(bridge_world, monkey
     assert result["success"] is False
     assert result["reason"] == "FOLLOW_RUN_REVIEW_CHANGED"
     assert observed["identity_calls"] == 2
-

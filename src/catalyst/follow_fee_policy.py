@@ -58,7 +58,5 @@ def guard_explicit_run_fee(
     return {
         "within_cap": not exceeds_cap,
         "raise_cap_needed": exceeds_cap,
-        "reason": (
-            "FEE_CAP_BELOW_EXPLICIT_TRANSACTION_FEE" if exceeds_cap else None
-        ),
+        "reason": ("FEE_CAP_BELOW_EXPLICIT_TRANSACTION_FEE" if exceeds_cap else None),
     }

@@ -153,9 +153,7 @@ def test_legacy_slot_limit_migration_preserves_review_and_authority_rows(approve
         legacy = legacy.replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
         temporary = f"{table}_legacy_test"
         conn.execute(
-            legacy.replace(
-                f"CREATE TABLE {table} (", f"CREATE TABLE {temporary} (", 1
-            )
+            legacy.replace(f"CREATE TABLE {table} (", f"CREATE TABLE {temporary} (", 1)
         )
         conn.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
         conn.execute(f"DROP TABLE {table}")
@@ -174,11 +172,14 @@ def test_legacy_slot_limit_migration_preserves_review_and_authority_rows(approve
     assert persisted_review["buy_limit"] == persisted_review["sell_limit"] == 24
     assert persisted_run["buy_limit"] == persisted_run["sell_limit"] == 24
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert conn.execute(
-        "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN "
-        "('follow_run_reviews_no_update','follow_run_reviews_no_delete',"
-        "'follow_run_authorities_no_update','follow_run_authorities_no_delete')"
-    ).fetchone()[0] == 4
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN "
+            "('follow_run_reviews_no_update','follow_run_reviews_no_delete',"
+            "'follow_run_authorities_no_update','follow_run_authorities_no_delete')"
+        ).fetchone()[0]
+        == 4
+    )
     with pytest.raises(database.sqlite3.IntegrityError, match="immutable"):
         conn.execute(
             "UPDATE follow_run_reviews SET buy_limit=25 WHERE review_id=?",

@@ -44,7 +44,9 @@ def saved_policy_setting(monkeypatch):
     return state
 
 
-def test_active_policy_round_trips_through_canonical_durable_record(saved_policy_setting):
+def test_active_policy_round_trips_through_canonical_durable_record(
+    saved_policy_setting,
+):
     from database import (
         get_active_follow_run_policy,
         record_active_follow_run_policy,
@@ -112,4 +114,3 @@ def test_record_rejects_non_policy_and_reports_persistence_failure(monkeypatch):
     monkeypatch.setattr(database, "set_setting", lambda *_args: False)
     with pytest.raises(ValueError, match="FOLLOW_RUN_POLICY_PERSIST_FAILED"):
         record_active_follow_run_policy(make_policy())
-

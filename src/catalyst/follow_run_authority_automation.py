@@ -32,17 +32,26 @@ def _validate_policy_and_prep(session_id: str) -> tuple[dict, object, dict, dict
     coordinator = FollowRunCoordinator()
     state = coordinator.get_state()
     policy = database.get_active_follow_run_policy()
-    _require(type(state) is dict and state.get("session_id") == session_id,
-             "FOLLOW_RUN_SESSION_REQUIRED")
-    _require(state.get("state") == "ready" and state.get("unknown_effect") is False,
-             "FOLLOW_RUN_PREP_NOT_READY")
+    _require(
+        type(state) is dict and state.get("session_id") == session_id,
+        "FOLLOW_RUN_SESSION_REQUIRED",
+    )
+    _require(
+        state.get("state") == "ready" and state.get("unknown_effect") is False,
+        "FOLLOW_RUN_PREP_NOT_READY",
+    )
     _require(
         state.get("run_id") is None
-        or (type(state.get("run_id")) is str and _DIGEST.fullmatch(state["run_id"]) is not None),
+        or (
+            type(state.get("run_id")) is str
+            and _DIGEST.fullmatch(state["run_id"]) is not None
+        ),
         "FOLLOW_RUN_AUTHORITY_ALREADY_BOUND",
     )
-    _require(policy is not None and policy.digest == state.get("policy_digest"),
-             "FOLLOW_RUN_POLICY_NOT_APPROVED")
+    _require(
+        policy is not None and policy.digest == state.get("policy_digest"),
+        "FOLLOW_RUN_POLICY_NOT_APPROVED",
+    )
 
     configuration = _configuration()
     configuration_sha256 = confidence_override.current_configuration_digest()
@@ -66,7 +75,10 @@ def _validate_policy_and_prep(session_id: str) -> tuple[dict, object, dict, dict
             * Decimal(str(configuration["FEE_COIN_SIZE_XCH"]))
             * 10**12
         )
-        if any(value != value.to_integral_value() for value in (xch_reserve, cat_reserve, fee_principal)):
+        if any(
+            value != value.to_integral_value()
+            for value in (xch_reserve, cat_reserve, fee_principal)
+        ):
             raise ValueError
         reserve_match = (
             int(xch_reserve) == policy.xch_reserve_mojos
@@ -79,8 +91,10 @@ def _validate_policy_and_prep(session_id: str) -> tuple[dict, object, dict, dict
     approval_id = state.get("fee_approval_id")
     prep_session_id = state.get("fee_approval_session_id")
     _require(
-        type(approval_id) is str and _DIGEST.fullmatch(approval_id) is not None
-        and type(prep_session_id) is str and _DIGEST.fullmatch(prep_session_id) is not None,
+        type(approval_id) is str
+        and _DIGEST.fullmatch(approval_id) is not None
+        and type(prep_session_id) is str
+        and _DIGEST.fullmatch(prep_session_id) is not None,
         "FOLLOW_RUN_PREP_FEE_BINDING_INVALID",
     )
     approved = read_approved_prep_fee_snapshot(approval_id)
@@ -98,8 +112,9 @@ def _validate_policy_and_prep(session_id: str) -> tuple[dict, object, dict, dict
         requested_approval_id=approval_id,
         run_session_id=session_id,
     )
-    _require(cap == policy.maximum_fee_mojos_per_tx,
-             "FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+    _require(
+        cap == policy.maximum_fee_mojos_per_tx, "FOLLOW_RUN_PREP_FEE_BINDING_INVALID"
+    )
 
     status = database.get_coin_prep_fee_approval_status(approval_id)
     completion = database.get_coin_prep_fee_session_completion(prep_session_id)
@@ -167,9 +182,12 @@ def _validate_proposal(policy, proposal: dict) -> None:
         "FOLLOW_RUN_POLICY_INVALID",
     )
     funding = proposal.get("shutdown_funding")
-    _require(type(funding) is dict and funding.get("ready") is True,
-             funding.get("reason", "FOLLOW_SHUTDOWN_FUNDING_REQUIRED")
-             if type(funding) is dict else "FOLLOW_SHUTDOWN_FUNDING_REQUIRED")
+    _require(
+        type(funding) is dict and funding.get("ready") is True,
+        funding.get("reason", "FOLLOW_SHUTDOWN_FUNDING_REQUIRED")
+        if type(funding) is dict
+        else "FOLLOW_SHUTDOWN_FUNDING_REQUIRED",
+    )
     quoted = funding.get("quoted_fee_mojos")
     _require(type(quoted) is int and quoted > 0, "FOLLOW_SHUTDOWN_FUNDING_REQUIRED")
 
@@ -177,12 +195,15 @@ def _validate_proposal(policy, proposal: dict) -> None:
 def _validate_observed_proposal(policy, proposal, approved, configuration_sha256):
     _validate_proposal(policy, proposal)
     identity_keys = (
-        "network", "wallet_type", "wallet_fingerprint", "wallet_id",
-        "xch_wallet_id", "asset_id", "ticker",
+        "network",
+        "wallet_type",
+        "wallet_fingerprint",
+        "wallet_id",
+        "xch_wallet_id",
+        "asset_id",
+        "ticker",
     )
-    expected_identity = {
-        key: approved["identity"].get(key) for key in identity_keys
-    }
+    expected_identity = {key: approved["identity"].get(key) for key in identity_keys}
     _require(
         proposal.get("identity") == expected_identity
         and proposal.get("configuration_sha256") == configuration_sha256,
@@ -290,7 +311,8 @@ def authorize_approved_follow_run(session_id: str) -> dict:
     result = confirm_follow_run_review(review["review_id"], review["review_sha256"])
     run_id = result.get("run_id") if type(result) is dict else None
     _require(
-        type(run_id) is str and _DIGEST.fullmatch(run_id) is not None
+        type(run_id) is str
+        and _DIGEST.fullmatch(run_id) is not None
         and result.get("dispatch_authorized") is False,
         "FOLLOW_RUN_AUTHORITY_REQUIRED",
     )
@@ -300,7 +322,9 @@ def authorize_approved_follow_run(session_id: str) -> dict:
     # recommendation above the per-tx policy cap is reported for the capped
     # cancellation path, which performs its own exact quote and unsigned build.
     try:
-        after_state, after_policy, after_approved, _ = _validate_policy_and_prep(session_id)
+        after_state, after_policy, after_approved, _ = _validate_policy_and_prep(
+            session_id
+        )
         after_proposal = preview_approved_follow_principal(
             approval_id, buy_limit=policy.buy_target, sell_limit=policy.sell_target
         )
@@ -314,7 +338,9 @@ def authorize_approved_follow_run(session_id: str) -> dict:
             "FOLLOW_RUN_AUTHORITY_CHANGED",
         )
     except Exception:
-        database.stop_follow_run_authority(run_id=run_id, stopped_at_epoch=int(time.time()))
+        database.stop_follow_run_authority(
+            run_id=run_id, stopped_at_epoch=int(time.time())
+        )
         raise
 
     try:
@@ -338,8 +364,7 @@ def authorize_approved_follow_run(session_id: str) -> dict:
         raise
     # The state machine itself owns the continuous lifetime sentinel. This
     # assertion catches accidental divergence from the authority convention.
-    _require(CONTINUOUS_RUN_EXPIRY > int(time.time()),
-             "FOLLOW_RUN_AUTHORITY_INVALID")
+    _require(CONTINUOUS_RUN_EXPIRY > int(time.time()), "FOLLOW_RUN_AUTHORITY_INVALID")
     return {
         "success": True,
         "state": bound["state"],

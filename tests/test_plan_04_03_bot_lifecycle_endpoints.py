@@ -178,9 +178,7 @@ class TestBotStart(_FlaskBase):
         coordinator.mark_start_pending.side_effect = lambda **kwargs: calls.append(
             "pending"
         )
-        coordinator.mark_running.side_effect = lambda **kwargs: calls.append(
-            "running"
-        )
+        coordinator.mark_running.side_effect = lambda **kwargs: calls.append("running")
         bot.start.side_effect = lambda: calls.append("bot.start") or True
         readiness = {
             "ready": True,
@@ -204,8 +202,13 @@ class TestBotStart(_FlaskBase):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
-            patch("blueprints.bot._reviewed_follow_start_readiness", return_value=readiness),
-            patch("follow_run_coordinator.FollowRunCoordinator", return_value=coordinator),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value=readiness,
+            ),
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator", return_value=coordinator
+            ),
             patch("database.get_active_follow_run_policy", return_value=policy),
         ):
             resp = self._post("/api/bot/start")
@@ -228,7 +231,9 @@ class TestBotStart(_FlaskBase):
 
         bot = _make_bot(running=False, start_returns=False)
         policy = FollowRunPolicy(
-            wallet_fingerprint="123456789", network="mainnet", asset_id="ab" * 32,
+            wallet_fingerprint="123456789",
+            network="mainnet",
+            asset_id="ab" * 32,
             buy_target=1,
             sell_target=1,
             price_anchor=Decimal("0.01"),
@@ -243,12 +248,15 @@ class TestBotStart(_FlaskBase):
         )
         coordinator = MagicMock()
         coordinator.read_state.return_value = {
-            "session_id": "b" * 64, "run_id": "a" * 64,
-            "policy_digest": policy.digest, "configuration_sha256": "c" * 64,
+            "session_id": "b" * 64,
+            "run_id": "a" * 64,
+            "policy_digest": policy.digest,
+            "configuration_sha256": "c" * 64,
             "state": "ready",
         }
         readiness = {
-            "ready": True, "run_id": "a" * 64,
+            "ready": True,
+            "run_id": "a" * 64,
             "scope": {
                 "identity": {
                     "network": "mainnet",
@@ -268,8 +276,13 @@ class TestBotStart(_FlaskBase):
                 "wallet.get_wallet_sync_status",
                 return_value={"reachable": True, "sync_state": "synced"},
             ),
-            patch("blueprints.bot._reviewed_follow_start_readiness", return_value=readiness),
-            patch("follow_run_coordinator.FollowRunCoordinator", return_value=coordinator),
+            patch(
+                "blueprints.bot._reviewed_follow_start_readiness",
+                return_value=readiness,
+            ),
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator", return_value=coordinator
+            ),
             patch("database.get_active_follow_run_policy", return_value=policy),
         ):
             resp = self._post("/api/bot/start")

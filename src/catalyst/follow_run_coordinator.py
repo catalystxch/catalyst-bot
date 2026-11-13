@@ -74,10 +74,7 @@ class FollowRunCoordinator:
                 or type(value["version"]) is not int
                 or value["version"] != _VERSION
                 or not self._digest(value["session_id"])
-                or (
-                    value["run_id"] is not None
-                    and not self._digest(value["run_id"])
-                )
+                or (value["run_id"] is not None and not self._digest(value["run_id"]))
                 or not self._digest(value["policy_digest"])
                 or not self._digest(value["configuration_sha256"])
                 or type(value["state"]) is not str
@@ -495,7 +492,9 @@ class FollowRunCoordinator:
                 }
             )
 
-    def mark_preparing(self, *, session_id, policy_digest, configuration_sha256, now_epoch=None):
+    def mark_preparing(
+        self, *, session_id, policy_digest, configuration_sha256, now_epoch=None
+    ):
         return self._transition(
             session_id=session_id,
             policy_digest=policy_digest,
@@ -550,7 +549,12 @@ class FollowRunCoordinator:
                 policy_digest=policy_digest,
                 configuration_sha256=configuration_sha256,
                 target="awaiting_confirmation",
-                allowed_from={"prep_pending", "preparing", "awaiting_confirmation", "recoverable_error"},
+                allowed_from={
+                    "prep_pending",
+                    "preparing",
+                    "awaiting_confirmation",
+                    "recoverable_error",
+                },
                 now_epoch=now_epoch,
                 recoverable_reason=None,
                 unknown_effect=False,
@@ -574,10 +578,16 @@ class FollowRunCoordinator:
             resolve_unknown_effect=resolved_unknown,
         )
 
-    def mark_start_pending(self, *, session_id, policy_digest, configuration_sha256, now_epoch=None):
+    def mark_start_pending(
+        self, *, session_id, policy_digest, configuration_sha256, now_epoch=None
+    ):
         now = self._now(now_epoch)
         current = self.get_state()
-        if current is None or current["session_id"] != session_id or current["run_id"] is None:
+        if (
+            current is None
+            or current["session_id"] != session_id
+            or current["run_id"] is None
+        ):
             raise ValueError("FOLLOW_RUN_AUTHORITY_REQUIRED")
         self._verify_authority(
             run_id=current["run_id"],
@@ -594,10 +604,16 @@ class FollowRunCoordinator:
             now_epoch=now,
         )
 
-    def mark_running(self, *, session_id, policy_digest, configuration_sha256, now_epoch=None):
+    def mark_running(
+        self, *, session_id, policy_digest, configuration_sha256, now_epoch=None
+    ):
         now = self._now(now_epoch)
         current = self.get_state()
-        if current is None or current["session_id"] != session_id or current["run_id"] is None:
+        if (
+            current is None
+            or current["session_id"] != session_id
+            or current["run_id"] is None
+        ):
             raise ValueError("FOLLOW_RUN_AUTHORITY_REQUIRED")
         self._verify_authority(
             run_id=current["run_id"],

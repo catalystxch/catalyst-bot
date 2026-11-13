@@ -77,10 +77,7 @@ def prepare_follow_run_policy_review(
     now = int(time.time()) if now_epoch is None else now_epoch
     if type(now) is not int or now < 0:
         raise ValueError("FOLLOW_RUN_REVIEW_TIME_INVALID")
-    if (
-        type(ttl_seconds) is not int
-        or not 1 <= ttl_seconds <= _MAX_REVIEW_TTL_SECONDS
-    ):
+    if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= _MAX_REVIEW_TTL_SECONDS:
         raise ValueError("FOLLOW_RUN_REVIEW_TTL_INVALID")
     if (
         type(configuration_sha256) is not str

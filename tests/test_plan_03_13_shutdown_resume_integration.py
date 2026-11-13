@@ -198,14 +198,20 @@ class TestCheckResume(_TempDB):
             patch("wallet.preflight_wallet_identity", return_value={"success": True}),
             patch(
                 "wallet.get_wallet_sync_status",
-                return_value={"reachable": True, "synced": True, "sync_state": "synced"},
+                return_value={
+                    "reachable": True,
+                    "synced": True,
+                    "sync_state": "synced",
+                },
             ),
             patch("wallet.get_pending_transactions", return_value=[]),
             patch(
                 "follow_principal.reviewed_follow_start_readiness",
                 return_value={"ready": True, "run_id": run_id, "scope": scope},
             ),
-            patch("follow_restart_intent.read_follow_restart_intent", return_value=intent),
+            patch(
+                "follow_restart_intent.read_follow_restart_intent", return_value=intent
+            ),
         ):
             body = self._get("/api/check-resume", environ_base=_LOOPBACK).get_json()
 
@@ -308,10 +314,14 @@ class TestFreshStartPath(_TempDB):
         self.assertTrue(resp.get_json().get("success"))
 
     def test_fresh_start_requires_open_offers_to_be_cancelled(self):
-        with patch("blueprints.session.get_open_offers", return_value=[{"trade_id": "live"}]):
+        with patch(
+            "blueprints.session.get_open_offers", return_value=[{"trade_id": "live"}]
+        ):
             resp = self._fresh_start()
         self.assertEqual(resp.status_code, 409)
-        self.assertEqual(resp.get_json().get("reason"), "OPEN_OFFERS_REQUIRE_CANCELLATION")
+        self.assertEqual(
+            resp.get_json().get("reason"), "OPEN_OFFERS_REQUIRE_CANCELLATION"
+        )
         self.assertFalse(api_server._fresh_start_is_set())
 
     def test_fresh_start_preserves_authoritative_fills(self):

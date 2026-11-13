@@ -77,7 +77,9 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
                     "success": retryable,
                     "state": "prep_pending",
                     "reason": reason,
-                    "message": "Waiting for a fresh wallet and fee estimate" if retryable else "Coin preparation needs attention",
+                    "message": "Waiting for a fresh wallet and fee estimate"
+                    if retryable
+                    else "Coin preparation needs attention",
                     "action_needed": not retryable,
                 }
             approved = approve_coin_prep_fees(preview_id=preview["preview_id"])
@@ -156,7 +158,9 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
         return {
             "success": True,
             "state": state["state"],
-            "message": "Approved ladder is starting" if state["state"] == "start_pending" else "Approved ladder is running",
+            "message": "Approved ladder is starting"
+            if state["state"] == "start_pending"
+            else "Approved ladder is running",
             "action_needed": False,
         }
     if state["state"] == "ready":

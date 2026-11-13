@@ -140,7 +140,10 @@ def _server_follow_review_context():
         confidence_state = "RED"
         red_reasons = ["market_evidence_warming"]
     else:
-        if type(snapshot) is not dict or snapshot.get("asset_id") != identity["asset_id"]:
+        if (
+            type(snapshot) is not dict
+            or snapshot.get("asset_id") != identity["asset_id"]
+        ):
             raise ValueError("FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE")
         confidence_state = str(snapshot.get("state") or "RED").upper()
         reasons = snapshot.get("reason_codes") or []
@@ -173,7 +176,10 @@ def _follow_policy_from_client_terms(terms, identity):
         except Exception as exc:
             raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID") from exc
     for key in _FOLLOW_POLICY_ATOMIC_FIELDS:
-        if type(parsed[key]) is not str or re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", parsed[key]) is None:
+        if (
+            type(parsed[key]) is not str
+            or re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", parsed[key]) is None
+        ):
             raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
         parsed[key] = int(parsed[key])
     for key in ("buy_target", "sell_target"):
@@ -183,9 +189,7 @@ def _follow_policy_from_client_terms(terms, identity):
         trusted = exact_funding_defaults()
         observed_identity = {
             **trusted["wallet_identity"],
-            "wallet_fingerprint": str(
-                trusted["wallet_identity"]["wallet_fingerprint"]
-            ),
+            "wallet_fingerprint": str(trusted["wallet_identity"]["wallet_fingerprint"]),
         }
         funding_keys = (
             "fee_coin_principal_mojos",
@@ -223,7 +227,11 @@ def _follow_fee_recommendation() -> dict:
         if type(suggested) is not dict:
             raise ValueError("missing suggestion")
         fee_mojos = suggested.get("fee_mojos")
-        available = suggested.get("available") is True and type(fee_mojos) is int and fee_mojos > 0
+        available = (
+            suggested.get("available") is True
+            and type(fee_mojos) is int
+            and fee_mojos > 0
+        )
         return {
             "available": available,
             "fee_mojos": str(fee_mojos) if available else None,
@@ -1622,7 +1630,9 @@ class AppBridge:
             }
             return {
                 "success": False,
-                "reason": reason if reason in allowed else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
+                "reason": reason
+                if reason in allowed
+                else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
                 "dispatch_authorized": False,
             }
         return {
@@ -1669,8 +1679,7 @@ class AppBridge:
                 and existing_setup["state"] != "stopped"
                 and (
                     existing_setup["policy_digest"] != current_policy.digest
-                    or existing_setup["configuration_sha256"]
-                    != configuration_sha256
+                    or existing_setup["configuration_sha256"] != configuration_sha256
                 )
             ):
                 raise ValueError("FOLLOW_RUN_AUTHORITY_CHANGED")
@@ -1710,7 +1719,9 @@ class AppBridge:
             }
             return {
                 "success": False,
-                "reason": reason if reason in allowed else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
+                "reason": reason
+                if reason in allowed
+                else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
                 "dispatch_authorized": False,
             }
         return {**result, "dispatch_authorized": False}

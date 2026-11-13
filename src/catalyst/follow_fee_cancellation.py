@@ -167,7 +167,8 @@ def price_follow_cancellation(
                         "recommended_fee_mojos": quoted_fee,
                         "approved_maximum_fee_mojos": transaction_fee_cap,
                     }
-                    if transaction_fee_cap is not None and quoted_fee > transaction_fee_cap
+                    if transaction_fee_cap is not None
+                    and quoted_fee > transaction_fee_cap
                     else None
                 ),
                 "cost": cost,

@@ -23,11 +23,13 @@ def api_session_fresh_start():
     try:
         open_offers = get_open_offers()
         if open_offers:
-            return jsonify({
-                "success": False,
-                "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
-                "open_offer_count": len(open_offers),
-            }), 409
+            return jsonify(
+                {
+                    "success": False,
+                    "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+                    "open_offer_count": len(open_offers),
+                }
+            ), 409
         payload = api_server._reset_fresh_run_session(
             clear_coins=False,
             clear_price_history=False,

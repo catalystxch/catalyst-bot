@@ -60,4 +60,3 @@ def test_material_changes_name_changed_terms():
 def test_policy_rejects_invalid_terms(override):
     with pytest.raises((TypeError, ValueError)):
         policy(**override)
-

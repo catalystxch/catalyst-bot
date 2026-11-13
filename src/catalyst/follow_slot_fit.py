@@ -137,15 +137,14 @@ def prove_initial_follow_slot_fit(
     for options in coins.values():
         options.sort()
 
-    if sum(
-        len(options)
-        for (asset, _rank), options in coins.items()
-        if asset == "xch"
-    ) < buy_limit or sum(
-        len(options)
-        for (asset, _rank), options in coins.items()
-        if asset == "cat"
-    ) < sell_limit:
+    if (
+        sum(len(options) for (asset, _rank), options in coins.items() if asset == "xch")
+        < buy_limit
+        or sum(
+            len(options) for (asset, _rank), options in coins.items() if asset == "cat"
+        )
+        < sell_limit
+    ):
         raise ValueError("FOLLOW_SLOT_DENOMINATION_SHORT")
 
     required = {"xch": 0, "cat": 0}

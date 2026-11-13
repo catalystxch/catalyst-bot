@@ -1350,7 +1350,10 @@ def api_bot_start():
                     ), 409
                 if empty_auto_resume_book:
                     try:
-                        from wallet import get_pending_transactions, get_wallet_sync_status
+                        from wallet import (
+                            get_pending_transactions,
+                            get_wallet_sync_status,
+                        )
 
                         sync = get_wallet_sync_status()
                         pending = get_pending_transactions()

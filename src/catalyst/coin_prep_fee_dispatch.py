@@ -243,20 +243,17 @@ def price_approved_prep_batch(approval_id: str) -> dict:
                 )
             except Exception:
                 fresh = None
-            if (
-                not is_current_fee_quote(
-                    fresh,
-                    pricing["inspection"]["cost"],
-                    plan["target_seconds"],
-                    now=coin_prep_fee_pricing._now() + 10,
-                )
-                or (
-                    fresh["fee_mojos"] != fee
-                    and not (
-                        follow_fee_cap is not None
-                        and fee == follow_fee_cap
-                        and fresh["fee_mojos"] > follow_fee_cap
-                    )
+            if not is_current_fee_quote(
+                fresh,
+                pricing["inspection"]["cost"],
+                plan["target_seconds"],
+                now=coin_prep_fee_pricing._now() + 10,
+            ) or (
+                fresh["fee_mojos"] != fee
+                and not (
+                    follow_fee_cap is not None
+                    and fee == follow_fee_cap
+                    and fresh["fee_mojos"] > follow_fee_cap
                 )
             ):
                 return _paused(
