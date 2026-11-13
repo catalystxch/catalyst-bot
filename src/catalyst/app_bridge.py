@@ -160,6 +160,7 @@ def _follow_policy_from_client_terms(terms, identity):
     from decimal import Decimal
 
     from follow_run_policy import FollowRunPolicy
+    from follow_run_defaults import exact_funding_defaults
 
     if type(terms) is not dict or set(terms) != _FOLLOW_POLICY_CLIENT_FIELDS:
         raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
@@ -178,6 +179,29 @@ def _follow_policy_from_client_terms(terms, identity):
     for key in ("buy_target", "sell_target"):
         if type(parsed[key]) is not int:
             raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
+    try:
+        trusted = exact_funding_defaults()
+        observed_identity = {
+            **trusted["wallet_identity"],
+            "wallet_fingerprint": str(
+                trusted["wallet_identity"]["wallet_fingerprint"]
+            ),
+        }
+        funding_keys = (
+            "fee_coin_principal_mojos",
+            "xch_reserve_mojos",
+            "cat_reserve_atoms",
+            "maximum_trade_xch_mojos",
+            "maximum_trade_cat_atoms",
+        )
+        if observed_identity != identity or any(
+            parsed[key] != int(trusted[key]) for key in funding_keys
+        ):
+            raise ValueError("FOLLOW_RUN_REVIEW_FUNDING_CHANGED")
+    except ValueError as exc:
+        if str(exc) == "FOLLOW_RUN_REVIEW_FUNDING_CHANGED":
+            raise
+        raise ValueError("FOLLOW_RUN_REVIEW_FUNDING_UNAVAILABLE") from exc
     try:
         return FollowRunPolicy(
             wallet_fingerprint=str(identity["wallet_fingerprint"]),
@@ -1592,6 +1616,8 @@ class AppBridge:
                 "FOLLOW_RUN_REVIEW_CONFIGURATION_INVALID",
                 "FOLLOW_RUN_REVIEW_IDENTITY_INVALID",
                 "FOLLOW_RUN_REVIEW_IDENTITY_MISMATCH",
+                "FOLLOW_RUN_REVIEW_FUNDING_CHANGED",
+                "FOLLOW_RUN_REVIEW_FUNDING_UNAVAILABLE",
                 "FOLLOW_RUN_REVIEW_REASONS_INVALID",
             }
             return {
@@ -1664,6 +1690,8 @@ class AppBridge:
                 "FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE",
                 "FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID",
                 "FOLLOW_RUN_REVIEW_CONFIGURATION_INVALID",
+                "FOLLOW_RUN_REVIEW_FUNDING_CHANGED",
+                "FOLLOW_RUN_REVIEW_FUNDING_UNAVAILABLE",
                 "FOLLOW_RUN_POLICY_NOT_APPROVED",
                 "FOLLOW_RUN_AUTHORITY_CHANGED",
                 "FOLLOW_RUN_COORDINATOR_PERSIST_FAILED",

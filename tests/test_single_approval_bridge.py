@@ -78,12 +78,22 @@ def test_native_status_reports_durable_setup_without_dispatch(bridge_world, monk
     }
 
 
+def test_native_review_rejects_client_inflated_principal(bridge_world):
+    bridge, _observed, _hash, _database = bridge_world
+    result = bridge.prepare_single_approval_follow_run_review({
+        "policy": policy_terms(maximum_trade_xch_mojos="999999999999999999")
+    })
+    assert result["success"] is False
+    assert result["reason"] == "FOLLOW_RUN_REVIEW_FUNDING_CHANGED"
+
+
 @pytest.fixture
 def bridge_world(monkeypatch):
     import app_bridge
     import coin_prep_fee_runtime
     import confidence_override
     import database
+    import follow_run_defaults
     import tx_fees
 
     configuration = {
@@ -107,6 +117,17 @@ def bridge_world(monkeypatch):
 
     monkeypatch.setattr(coin_prep_fee_runtime, "_configuration", lambda: configuration)
     monkeypatch.setattr(coin_prep_fee_runtime, "_verified_identity", verified_identity)
+    monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
+        **{key: value for key, value in policy_terms().items() if key in {
+            "fee_coin_principal_mojos", "xch_reserve_mojos",
+            "cat_reserve_atoms", "maximum_trade_xch_mojos",
+            "maximum_trade_cat_atoms",
+        }},
+        "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
+        "configuration_sha256": config_hash["value"],
+        "buy_target": 100,
+        "sell_target": 100,
+    })
     monkeypatch.setattr(
         confidence_override,
         "current_configuration_digest",
