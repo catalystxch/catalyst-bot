@@ -33,3 +33,32 @@ def select_transaction_fee(
         "raise_cap_needed": exceeds_cap,
         "reason": "FEE_CAP_BELOW_RECOMMENDATION" if exceeds_cap else None,
     }
+
+
+def guard_explicit_run_fee(
+    *, fee_mojos: int, verified_maximum_fee_per_transaction_mojos: int
+) -> dict:
+    """Check an explicit wallet fee against a caller-verified run maximum.
+
+    The caller must obtain the maximum from a durable policy already verified
+    against the active run and exact wallet scope. This helper never infers a
+    cap from cumulative fee accounting and does not clamp an explicit fee,
+    because changing it requires rebuilding and validating the transaction.
+    """
+    if verified_maximum_fee_per_transaction_mojos is None:
+        raise ValueError("verified_fee_cap_required")
+    if (
+        type(fee_mojos) is not int
+        or not 0 <= fee_mojos <= MAX_ATOMIC_AMOUNT
+        or not _positive_mojos(verified_maximum_fee_per_transaction_mojos)
+    ):
+        raise ValueError("invalid_fee_policy_amount")
+
+    exceeds_cap = fee_mojos > verified_maximum_fee_per_transaction_mojos
+    return {
+        "within_cap": not exceeds_cap,
+        "raise_cap_needed": exceeds_cap,
+        "reason": (
+            "FEE_CAP_BELOW_EXPLICIT_TRANSACTION_FEE" if exceeds_cap else None
+        ),
+    }

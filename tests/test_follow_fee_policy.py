@@ -2,7 +2,7 @@
 
 import pytest
 
-from follow_fee_policy import select_transaction_fee
+from follow_fee_policy import guard_explicit_run_fee, select_transaction_fee
 
 
 def test_selects_fresh_recommendation_when_it_is_within_the_cap():
@@ -51,3 +51,47 @@ def test_does_not_claim_to_authorize_wallet_effects():
 
     assert "dispatch_authorized" not in decision
     assert "authorization" not in decision
+
+
+def test_explicit_fee_guard_accepts_only_fee_at_or_below_verified_cap():
+    assert guard_explicit_run_fee(
+        fee_mojos=0,
+        verified_maximum_fee_per_transaction_mojos=100,
+    ) == {
+        "within_cap": True,
+        "raise_cap_needed": False,
+        "reason": None,
+    }
+    assert guard_explicit_run_fee(
+        fee_mojos=100,
+        verified_maximum_fee_per_transaction_mojos=100,
+    ) == {
+        "within_cap": True,
+        "raise_cap_needed": False,
+        "reason": None,
+    }
+    assert guard_explicit_run_fee(
+        fee_mojos=101,
+        verified_maximum_fee_per_transaction_mojos=100,
+    ) == {
+        "within_cap": False,
+        "raise_cap_needed": True,
+        "reason": "FEE_CAP_BELOW_EXPLICIT_TRANSACTION_FEE",
+    }
+
+
+def test_explicit_fee_guard_fails_closed_when_verified_cap_is_missing():
+    with pytest.raises(ValueError, match="verified_fee_cap_required"):
+        guard_explicit_run_fee(
+            fee_mojos=1,
+            verified_maximum_fee_per_transaction_mojos=None,
+        )
+
+
+@pytest.mark.parametrize("fee", [-1, 1.0, True])
+def test_explicit_fee_guard_rejects_invalid_fee_amount(fee):
+    with pytest.raises(ValueError, match="invalid_fee_policy_amount"):
+        guard_explicit_run_fee(
+            fee_mojos=fee,
+            verified_maximum_fee_per_transaction_mojos=10,
+        )
