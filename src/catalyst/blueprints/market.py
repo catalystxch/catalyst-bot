@@ -975,7 +975,9 @@ def api_market_confidence():
     override_status = {
         "approved": consent is not None and not consent.revoked,
         "active": override_active,
-        "expires_at": consent_expiry.isoformat() if consent_expiry is not None else None,
+        "expires_at": consent_expiry.isoformat()
+        if consent_expiry is not None
+        else None,
     }
     if override_active:
         can_create = can_requote = True

@@ -5661,7 +5661,11 @@ class OfferManager:
                     _fail_level,
                     "offer_create_failed",
                     fail_msg,
-                    data={"reason_code": res.get("reason") if isinstance(res, dict) else None},
+                    data={
+                        "reason_code": res.get("reason")
+                        if isinstance(res, dict)
+                        else None
+                    },
                 )
                 return
 

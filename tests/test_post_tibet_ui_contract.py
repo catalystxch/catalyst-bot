@@ -481,9 +481,13 @@ def test_market_confidence_endpoint_fails_closed_while_evidence_is_warming(monke
 def test_market_confidence_reports_continuous_consent_without_expiry(monkeypatch):
     monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
     monkeypatch.setattr(
-        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=None)
+        market.database,
+        "get_latest_market_confidence_snapshot",
+        Mock(return_value=None),
     )
-    monkeypatch.setattr(market.database, "get_degraded_market_state", Mock(return_value=None))
+    monkeypatch.setattr(
+        market.database, "get_degraded_market_state", Mock(return_value=None)
+    )
     monkeypatch.setattr(
         market.database, "get_post_tibet_migration_report", Mock(return_value=None)
     )

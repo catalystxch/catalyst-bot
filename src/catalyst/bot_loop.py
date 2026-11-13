@@ -1726,7 +1726,9 @@ class BotLoop:
                 from confidence_override import ApprovedFollowConfidence
 
                 approved = self._coordinator_approved_follow_confidence(raw, deadline)
-                return approved if isinstance(approved, ApprovedFollowConfidence) else None
+                return (
+                    approved if isinstance(approved, ApprovedFollowConfidence) else None
+                )
         return self._effective_market_confidence()
 
     def _wallet_effect_market_confidence(self):
