@@ -10800,6 +10800,29 @@ class BotLoop:
                     data={"threads": [thread.name for thread in stalled]},
                 )
                 self.stop(wait=False)
+                try:
+                    from follow_run_coordinator import FollowRunCoordinator
+
+                    coordinator = FollowRunCoordinator()
+                    state = coordinator.read_state()
+                    if (
+                        type(state) is dict
+                        and state.get("state") != "stopped"
+                        and state.get("run_id")
+                        == getattr(self, "_reviewed_follow_run_id", None)
+                    ):
+                        coordinator.stop_run(
+                            session_id=state["session_id"],
+                            policy_digest=state["policy_digest"],
+                            configuration_sha256=state["configuration_sha256"],
+                        )
+                except Exception as exc:
+                    log_event(
+                        "error",
+                        "ladder_thread_stalled_coordinator_stop_failed",
+                        "The stalled run could not persist its coordinator stop",
+                        data={"error_type": type(exc).__name__},
+                    )
                 return False
             log_event(
                 "warning",
