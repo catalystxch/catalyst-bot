@@ -8508,6 +8508,35 @@
         </div>
     </div>
 
+    <div id="singleApprovalRunReviewModal" class="modal follow-review-modal" role="dialog" aria-modal="true" aria-labelledby="singleApprovalRunReviewTitle" style="display:none">
+        <div class="modal-content">
+            <div class="follow-review-header">
+                <div class="follow-review-kicker">Single run review</div>
+                <h2 id="singleApprovalRunReviewTitle">Review ladder and automatic preparation</h2>
+                <p>One approval covers preparation, start, and management of this ladder. Review every limit, market warning, and fee maximum.</p>
+            </div>
+            <div class="follow-review-body">
+                <div class="follow-review-grid">
+                    <label class="follow-review-field"><span>BUY target</span><input id="singleRunBuyTarget" type="number" min="1" step="1" value="24" oninput="invalidateSingleApprovalRunReview()"></label>
+                    <label class="follow-review-field"><span>SELL target</span><input id="singleRunSellTarget" type="number" min="1" step="1" value="24" oninput="invalidateSingleApprovalRunReview()"></label>
+                </div>
+                <div class="follow-review-grid">
+                    <label class="follow-review-field"><span>Anchor price (XCH/CAT)</span><input id="singleRunPriceAnchor" type="text" inputmode="decimal" oninput="invalidateSingleApprovalRunReview()"></label>
+                    <label class="follow-review-field"><span>Maximum fee per transaction (XCH)</span><input id="singleRunFeeMax" type="text" inputmode="decimal" oninput="invalidateSingleApprovalRunReview()"></label>
+                    <label class="follow-review-field"><span>Minimum price</span><input id="singleRunPriceMin" type="text" inputmode="decimal" oninput="invalidateSingleApprovalRunReview()"></label>
+                    <label class="follow-review-field"><span>Maximum price</span><input id="singleRunPriceMax" type="text" inputmode="decimal" oninput="invalidateSingleApprovalRunReview()"></label>
+                </div>
+                <pre id="singleApprovalRunReviewText" class="follow-review-result" aria-live="polite">Run Smart Settings, then refresh this review.</pre>
+                <label class="follow-review-check"><input type="checkbox" id="singleApprovalRunAccept" disabled><span>I approve these exact terms, including the displayed market confidence and RED reasons.</span></label>
+                <div class="follow-review-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeSingleApprovalRunReview()">Back</button>
+                    <button type="button" class="btn btn-secondary" id="singleApprovalRunPrepare" onclick="prepareSingleApprovalRunReview()">Refresh exact review</button>
+                    <button type="button" class="btn btn-primary" id="singleApprovalRunConfirm" disabled onclick="confirmSingleApprovalRunReview()">Approve, prepare &amp; start</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="followRunReviewModal" class="modal follow-review-modal" role="dialog" aria-modal="true" aria-labelledby="followRunReviewTitle" style="display:none">
         <div class="modal-content">
             <div class="follow-review-header">
@@ -11247,6 +11276,7 @@
                             Place passive ladders in thin markets, including RED ratings
                         </label>
                         <button type="button" id="smartDefaultsBtn" class="btn btn-smart-defaults" style="padding: 10px 25px; font-size: 1em;" onclick="getSmartDefaults()" disabled>Smart Settings</button>
+                        <button type="button" id="singleApprovalRunBtn" class="btn btn-start btn-primary" style="display:none; margin-left:8px;" onclick="saveSettingsAndReviewSingleRun()">Save &amp; review</button>
                         <div id="smartDefaultsDisabledHint" style="margin-top: 8px; font-size: 0.82em; color: var(--status-warning); display: flex; align-items: center; gap: 6px;">
                             <span aria-hidden="true">⚠</span>
                             <span>Select a trading pair above to unlock Smart Settings.</span>
@@ -20663,16 +20693,8 @@
                 let data = await resp.json();
 
                 if (data.passive_red_setup_available === true) {
-                    let accepted = document.getElementById('configThinMarketEnabled').checked;
-                    if (!accepted) accepted = await showStyledConfirm({
-                        icon: '⚠️',
-                        title: 'Trade in this thin market?',
-                        message: 'The independent offer book is thin. Smart Settings can prepare passive BUY and SELL ladders from current book evidence or a recent trusted price. This choice is saved with Setup and remains active across restarts. Wallet, fee, and price evidence checks still apply.',
-                        confirmText: 'Enable thin-market ladders',
-                        cancelText: 'Keep current settings',
-                        style: 'warning',
-                    });
-                    if (!accepted) return;
+                    // This only prepares a proposal. The single exact run
+                    // review presents RED reasons and asks for consent once.
                     document.getElementById('configThinMarketEnabled').checked = true;
                     scheduleSettingsUpdate();
                     params.set('prepare_passive_red', 'true');
@@ -21298,6 +21320,18 @@
                         _diffParts.length ? `Changed: ${_diffParts.join(' · ')}` : '',
                     ].filter(Boolean).join('\n');
                     resultBox.style.display = 'block';
+                    const smartPrice = data.smart_mid_price ?? data?._data_sources?.mid_price;
+                    window._singleApprovalSmartPriceProposal = {
+                        anchor: singleRunDecimalText(smartPrice),
+                        min: singleRunDecimalText(data.min_mid),
+                        max: singleRunDecimalText(data.max_mid),
+                        source: data?._data_sources?.mid_price_source || data?._data_sources?.price_source || data.price_source || 'Smart Settings price anchor',
+                        observed_at: data?._data_sources?.mid_price_observed_at || data?._data_sources?.observed_at || data.price_observed_at || '',
+                        stale: data?._data_sources?.mid_price_stale === true || data.price_stale === true,
+                        inferred: data?._data_sources?.mid_price_inferred === true || data.price_inferred === true,
+                    };
+                    const singleRunButton = document.getElementById('singleApprovalRunBtn');
+                    if (singleRunButton) singleRunButton.style.display = IS_DESKTOP ? 'inline-flex' : 'none';
 
                     // Show quick-rerun strip and highlight active profile button
                     const rerunStrip = document.getElementById('riskProfileRerunStrip');
@@ -21509,16 +21543,24 @@
         function checkSmartSettingsDirty() {
             if (!_smartSettingsAppliedSnapshot) {
                 setSmartSettingsBannerVisible(false);
+                const runButton = document.getElementById('singleApprovalRunBtn');
+                if (runButton) runButton.style.display = 'none';
                 return false;
             }
             const current = snapshotSmartSettingsWatched();
             for (const id of SMART_SETTINGS_WATCHED_INPUTS) {
                 if (current[id] !== _smartSettingsAppliedSnapshot[id]) {
                     setSmartSettingsBannerVisible(true);
+                    const runButton = document.getElementById('singleApprovalRunBtn');
+                    if (runButton) runButton.style.display = 'none';
                     return true;
                 }
             }
             setSmartSettingsBannerVisible(false);
+            const runButton = document.getElementById('singleApprovalRunBtn');
+            if (runButton && IS_DESKTOP && document.getElementById('smartDefaultsResult')?.style.display !== 'none') {
+                runButton.style.display = 'inline-flex';
+            }
             return false;
         }
 
@@ -21552,6 +21594,8 @@
             _smartSettingsAppliedSnapshot = null;
             _lastSmartCapitalPlan = null;
             setSmartSettingsBannerVisible(false);
+            const runButton = document.getElementById('singleApprovalRunBtn');
+            if (runButton) runButton.style.display = 'none';
         }
 
         // ── Risk Profile helpers ──────────────────────────────────────────────
@@ -33169,6 +33213,222 @@
             await startBot({ confidenceOverride: { review_id: review.review_id, accepted: true } });
         }
 
+        let _singleApprovalRunRequestedAfterSave = false;
+        let _singleApprovalRunReview = null;
+        let _singleApprovalRunPolicy = null;
+        let _singleApprovalRunDefaults = null;
+        let _singleApprovalRunBusy = false;
+
+        function singleRunXchToMojos(value) {
+            const raw = String(value || '').trim();
+            if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,12})?$/.test(raw)) return null;
+            const [whole, fraction = ''] = raw.split('.');
+            const amount = BigInt(whole) * 1000000000000n + BigInt(fraction.padEnd(12, '0'));
+            return amount > 0n && amount <= 9999999999999999999n ? amount.toString() : null;
+        }
+
+        function singleRunDecimalText(value) {
+            if (value === null || value === undefined || value === '') return '';
+            const raw = String(value).trim();
+            const match = raw.match(/^([+-]?)(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/);
+            if (!match) return '';
+            const sign = match[1] === '-' ? '-' : '';
+            const whole = match[2];
+            const fraction = match[3] || '';
+            const exponent = Number(match[4] || 0);
+            if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 100) return '';
+            const digits = whole + fraction;
+            const point = whole.length + exponent;
+            if (point <= 0) return `${sign}0.${'0'.repeat(-point)}${digits}`;
+            if (point >= digits.length) return `${sign}${digits}${'0'.repeat(point - digits.length)}`;
+            return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
+        }
+
+        function saveSettingsAndReviewSingleRun() {
+            if (document.getElementById('saveConfigBtn')?.disabled) return;
+            _singleApprovalRunRequestedAfterSave = true;
+            handleSaveClick();
+        }
+
+        function invalidateSingleApprovalRunReview() {
+            _singleApprovalRunReview = null;
+            const accept = document.getElementById('singleApprovalRunAccept');
+            const confirm = document.getElementById('singleApprovalRunConfirm');
+            if (accept) { accept.checked = false; accept.disabled = true; }
+            if (confirm) confirm.disabled = true;
+            const output = document.getElementById('singleApprovalRunReviewText');
+            if (output) output.textContent = 'Terms changed. Refresh the exact review before approving.';
+        }
+
+        function closeSingleApprovalRunReview() {
+            _singleApprovalRunReview = null;
+            const modal = document.getElementById('singleApprovalRunReviewModal');
+            if (modal) modal.style.display = 'none';
+            const accept = document.getElementById('singleApprovalRunAccept');
+            if (accept) { accept.checked = false; accept.disabled = true; }
+            const confirm = document.getElementById('singleApprovalRunConfirm');
+            if (confirm) confirm.disabled = true;
+        }
+
+        async function openSingleApprovalRunReview() {
+            const api = window.pywebview?.api;
+            if (!IS_DESKTOP || !api?.get_single_approval_follow_run_defaults
+                || !api?.prepare_single_approval_follow_run_review
+                || !api?.confirm_single_approval_follow_run_review) {
+                showToast('Single-approval ladder setup is available in the updated native desktop app.', 'warning');
+                return;
+            }
+            const modal = document.getElementById('singleApprovalRunReviewModal');
+            modal.style.display = 'flex';
+            invalidateSingleApprovalRunReview();
+            document.getElementById('singleApprovalRunReviewText').textContent = 'Loading exact wallet, reserve, fee-pool, and market details…';
+            try {
+                const defaults = await api.get_single_approval_follow_run_defaults();
+                if (defaults?.success !== true || !defaults.policy) throw new Error(defaults?.reason || 'Exact run defaults are unavailable.');
+                _singleApprovalRunDefaults = defaults;
+                _singleApprovalRunPolicy = defaults.policy;
+                document.getElementById('singleRunBuyTarget').value = String(defaults.policy.buy_target ?? 24);
+                document.getElementById('singleRunSellTarget').value = String(defaults.policy.sell_target ?? 24);
+                const smartPrices = window._singleApprovalSmartPriceProposal || {};
+                document.getElementById('singleRunPriceAnchor').value = smartPrices.anchor || singleRunDecimalText(defaults.policy.price_anchor);
+                document.getElementById('singleRunPriceMin').value = smartPrices.min || singleRunDecimalText(defaults.policy.price_min);
+                document.getElementById('singleRunPriceMax').value = smartPrices.max || singleRunDecimalText(defaults.policy.price_max);
+                document.getElementById('singleRunFeeMax').value = defaults.fee_recommendation?.available
+                    ? String(defaults.fee_recommendation.fee_xch) : '';
+                document.getElementById('singleApprovalRunReviewText').textContent =
+                    'Defaults loaded. Edit the target counts, anchor, range, and per-transaction fee maximum, then refresh the exact review.';
+            } catch (error) {
+                _singleApprovalRunPolicy = null;
+                _singleApprovalRunDefaults = null;
+                document.getElementById('singleApprovalRunReviewText').textContent = error?.message || 'Could not load exact run defaults.';
+            }
+        }
+
+        async function prepareSingleApprovalRunReview() {
+            if (_singleApprovalRunBusy || !_singleApprovalRunPolicy) return;
+            const api = window.pywebview?.api;
+            const output = document.getElementById('singleApprovalRunReviewText');
+            const accept = document.getElementById('singleApprovalRunAccept');
+            const confirm = document.getElementById('singleApprovalRunConfirm');
+            _singleApprovalRunReview = null;
+            accept.checked = false; accept.disabled = true; confirm.disabled = true;
+            const buy = Number(document.getElementById('singleRunBuyTarget').value);
+            const sell = Number(document.getElementById('singleRunSellTarget').value);
+            const anchor = document.getElementById('singleRunPriceAnchor').value.trim();
+            const priceMin = document.getElementById('singleRunPriceMin').value.trim();
+            const priceMax = document.getElementById('singleRunPriceMax').value.trim();
+            const feeMojos = singleRunXchToMojos(document.getElementById('singleRunFeeMax').value);
+            if (![buy, sell].every(Number.isSafeInteger) || buy < 1 || sell < 1
+                || ![anchor, priceMin, priceMax].every(v => /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(v))
+                || feeMojos === null) {
+                output.textContent = 'Enter positive whole offer targets, positive decimal prices, and a positive fee maximum with up to 12 decimal places.';
+                return;
+            }
+            const policy = {
+                ..._singleApprovalRunPolicy,
+                buy_target: buy,
+                sell_target: sell,
+                price_anchor: anchor,
+                price_min: priceMin,
+                price_max: priceMax,
+                maximum_fee_mojos_per_tx: feeMojos,
+            };
+            _singleApprovalRunBusy = true;
+            document.getElementById('singleApprovalRunPrepare').disabled = true;
+            output.textContent = 'Preparing exact disclosure…';
+            try {
+                const review = await api.prepare_single_approval_follow_run_review({policy});
+                if (review?.success !== true || !/^[0-9a-f]{64}$/.test(review.review_id || '')
+                    || !/^[0-9a-f]{64}$/.test(review.review_sha256 || '')) {
+                    throw new Error(review?.reason || 'The exact run review could not be prepared.');
+                }
+                _singleApprovalRunReview = {review, policy};
+                const disclosure = review.disclosure || {};
+                const id = disclosure.identity || {};
+                const red = Array.isArray(disclosure.red_reasons) ? disclosure.red_reasons : [];
+                const p = disclosure.policy || policy;
+                const fee = review.fee_recommendation || {};
+                const priceInfo = _singleApprovalRunDefaults?.price_evidence || {};
+                const smartPrices = window._singleApprovalSmartPriceProposal || {};
+                const fundable = _singleApprovalRunDefaults?.funding || {};
+                output.textContent = [
+                    `Wallet ${id.wallet_fingerprint || '—'} · ${id.network || '—'} · ${id.ticker || 'selected CAT'}`,
+                    `Asset ${id.asset_id || '—'}`,
+                    `Targets ${p.buy_target} BUY / ${p.sell_target} SELL · currently fundable ${fundable.buy_fundable ?? 'checking'} BUY / ${fundable.sell_fundable ?? 'checking'} SELL; live counts are shown on the dashboard.`,
+                    `Price ${p.price_anchor} XCH/CAT · approved range ${p.price_min}–${p.price_max}`,
+                    `Max fee per wallet transaction ${document.getElementById('singleRunFeeMax').value.trim()} XCH`,
+                    `Fee recommendation ${fee.available ? `${fee.fee_xch} XCH · ${fee.source || 'source unavailable'}` : 'currently unavailable'}`,
+                    `Fee pool principal ${formatFollowFeeMojos(p.fee_coin_principal_mojos)} · XCH reserve ${formatFollowFeeMojos(p.xch_reserve_mojos)} · CAT reserve ${p.cat_reserve_atoms} atoms`,
+                    `Trading principal / maximum trade ${formatFollowFeeMojos(p.maximum_trade_xch_mojos)} / ${p.maximum_trade_cat_atoms} CAT atoms`,
+                    `Market confidence ${review.market_confidence_state || 'unknown'}${red.length ? ` · RED reasons: ${red.join(', ')}` : ''}`,
+                    `Price evidence ${priceInfo.source || smartPrices.source || 'source unavailable'}${(priceInfo.observed_at || smartPrices.observed_at) ? ` · observed ${priceInfo.observed_at || smartPrices.observed_at}` : ' · source time unavailable — verify anchor freshness'}${(priceInfo.stale || smartPrices.stale) ? ' · STALE' : ''}${(priceInfo.inferred || smartPrices.inferred) ? ' · INFERRED' : ''}`,
+                    'One approval covers preparation and automatic start. Fees above this maximum and prices outside this range require a new decision.',
+                ].join('\n');
+                accept.disabled = false;
+                accept.onchange = () => { confirm.disabled = !accept.checked || !_singleApprovalRunReview; };
+            } catch (error) {
+                output.textContent = error?.message || 'Could not prepare the exact run review.';
+            } finally {
+                _singleApprovalRunBusy = false;
+                document.getElementById('singleApprovalRunPrepare').disabled = false;
+            }
+        }
+
+        async function confirmSingleApprovalRunReview() {
+            const current = _singleApprovalRunReview;
+            const api = window.pywebview?.api;
+            const accept = document.getElementById('singleApprovalRunAccept');
+            const confirm = document.getElementById('singleApprovalRunConfirm');
+            const output = document.getElementById('singleApprovalRunReviewText');
+            if (_singleApprovalRunBusy || !current || !accept.checked || !api?.confirm_single_approval_follow_run_review) return;
+            _singleApprovalRunBusy = true; confirm.disabled = true;
+            output.textContent = 'Recording the approved run…';
+            try {
+                const result = await api.confirm_single_approval_follow_run_review({
+                    review_id: current.review.review_id,
+                    review_sha256: current.review.review_sha256,
+                    accepted: true,
+                    policy: current.policy,
+                });
+                if (result?.success !== true || !result.session_id) throw new Error(result?.reason || 'Run approval was not recorded.');
+                accept.disabled = true;
+                await advanceSingleApprovalRun(result.session_id);
+            } catch (error) {
+                output.textContent = error?.message || 'Could not record and start the approved run.';
+            } finally { _singleApprovalRunBusy = false; }
+        }
+
+        async function advanceSingleApprovalRun(sessionId) {
+            const advance = window.pywebview?.api?.advance_single_approval_follow_run;
+            const output = document.getElementById('singleApprovalRunReviewText');
+            if (!advance) {
+                showToast('Run approved. The native app must be updated to advance preparation and start.', 'error');
+                return;
+            }
+            for (let attempt = 0; attempt < 120; attempt += 1) {
+                const state = await advance({session_id: sessionId});
+                if (state?.success !== true) {
+                    output.textContent = `Run approved, but automatic preparation needs attention: ${state?.reason || 'unknown error'}`;
+                    return;
+                }
+                const label = state.message || `Run setup: ${state.state || 'working'}`;
+                output.textContent = `${label}${state.progress ? `\n${state.progress}` : ''}`;
+                if (state.action_needed) { showToast(label, 'warning'); return; }
+                if (['running', 'complete'].includes(String(state.state || '').toLowerCase())) {
+                    showToast(label, 'success');
+                    closeSingleApprovalRunReview();
+                    return;
+                }
+                if (['failed', 'blocked'].includes(String(state.state || '').toLowerCase())) {
+                    showToast(label, 'error');
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 1200));
+            }
+            output.textContent = 'Run setup is still progressing. This review remains open; use the dashboard for current preparation and live counts.';
+            showToast('Run setup is still progressing.', 'warning');
+        }
+
         let _followRunReview = null;
         let _followRunReviewBusy = false;
 
@@ -36728,6 +36988,7 @@
             // the current inputs so a Save click cannot outrun the debounce.
             updateCoinPrepPreview();
             if (!validateSettingsForm()) {
+                _singleApprovalRunRequestedAfterSave = false;
                 // Build list of what's missing
                 const missing = [];
                 const hasPair = currentCAT && currentCAT.name && currentCAT.asset_id;
@@ -37375,6 +37636,17 @@
                     await fetchDashboard(currentCAT?.asset_id || '');
                     updateCoinPrepPreview();
 
+                    if (_singleApprovalRunRequestedAfterSave) {
+                        _singleApprovalRunRequestedAfterSave = false;
+                        if (!_wasRunning && IS_DESKTOP && window.pywebview?.api?.get_single_approval_follow_run_defaults) {
+                            if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
+                            setCoinPrepStatus('none');
+                            setSaveConfigButtonState(false);
+                            await openSingleApprovalRunReview();
+                            return;
+                        }
+                    }
+
                     // If the bot already has active offers, skip coin prep entirely.
                     // Coins are locked in those offers so the verify would see 0 free
                     // coins and incorrectly demand re-preparation.
@@ -37401,11 +37673,13 @@
                     // Smart coin prep check runs in background and updates the modal
                     checkIfCoinPrepNeeded(config);
                 } else {
+                    _singleApprovalRunRequestedAfterSave = false;
                     if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                     showToast('Failed to save: ' + formatError(result), 'error');
                     setSaveConfigButtonState(false);
                 }
             } catch (error) {
+                _singleApprovalRunRequestedAfterSave = false;
                 if (preopenedCoinPrepLoading) dismissCoinPrepConfirmLoading();
                 showToast('Failed to save config: ' + formatError(error), 'error');
                 setSaveConfigButtonState(false);
