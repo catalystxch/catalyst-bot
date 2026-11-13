@@ -75,6 +75,15 @@ def test_initial_follow_slot_fit_requires_each_tier_coin_and_trade_principal():
         prove_initial_follow_slot_fit(**terms)
 
 
+def test_legacy_full_fit_still_rejects_zero_slots():
+    from follow_slot_fit import prove_initial_follow_slot_fit
+
+    terms = _terms()
+    terms["buy_limit"] = 0
+    with pytest.raises(ValueError, match="FOLLOW_SLOT_INPUT_INVALID"):
+        prove_initial_follow_slot_fit(**terms)
+
+
 def test_full_assigned_coin_principal_must_fit_after_protected_reserves():
     from follow_slot_fit import prove_initial_follow_slot_fit
 
@@ -195,6 +204,39 @@ def test_exact_100_by_100_requires_one_fitting_coin_per_slot():
     terms["outputs"][0]["asset"] = []
     with pytest.raises(ValueError, match="FOLLOW_SLOT_PLAN_INVALID"):
         prove_initial_follow_slot_fit(**terms)
+
+
+def test_partial_initial_fit_keeps_signed_target_and_uses_target_prefix():
+    from follow_slot_fit import find_fundable_follow_slot_limits
+
+    terms = _terms()
+    terms["outputs"][2]["amount_mojos"] = 1_200
+    terms["outputs"][3]["amount_mojos"] = 1_818
+    result = find_fundable_follow_slot_limits(
+        buy_target=2,
+        sell_target=2,
+        mid_price=Decimal("1"),
+        half_spread=Decimal("0.1"),
+        min_edge_bps=Decimal("0"),
+        buy_tier_counts=terms["buy_tier_counts"],
+        sell_tier_counts=terms["sell_tier_counts"],
+        buy_tier_sizes_xch=terms["buy_tier_sizes_xch"],
+        sell_tier_sizes_xch=terms["sell_tier_sizes_xch"],
+        buy_reversed=False,
+        cat_decimals=3,
+        max_coin_size_ratio=Decimal("1.5"),
+        maximum_trade_xch_mojos=1_000_000_000_000,
+        maximum_trade_cat_atoms=1_200,
+        outputs=terms["outputs"],
+    )
+    assert result["buy_target"] == 2
+    assert result["sell_target"] == 2
+    assert result["funded_buy_limit"] == 1
+    assert result["funded_sell_limit"] == 1
+    assert result["buy_slots_arithmetic_fit"] == 1
+    assert result["sell_slots_arithmetic_fit"] == 1
+    assert result["partial_target"] is True
+    assert result["dispatch_authorized"] is False
 
 
 def test_current_slot_preview_uses_server_configuration_and_readonly_price(monkeypatch):

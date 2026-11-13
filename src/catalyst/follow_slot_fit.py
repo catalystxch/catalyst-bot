@@ -32,6 +32,8 @@ def prove_initial_follow_slot_fit(
     maximum_trade_xch_mojos: int,
     maximum_trade_cat_atoms: int,
     outputs: list[dict],
+    buy_target_limit: int | None = None,
+    sell_target_limit: int | None = None,
 ) -> dict:
     """Require one fitting approved replacement denomination per initial slot.
 
@@ -40,13 +42,24 @@ def prove_initial_follow_slot_fit(
     that each approved output still maps to one selectable wallet coin.
     """
 
+    partial_targets = buy_target_limit is not None or sell_target_limit is not None
+    if (buy_target_limit is None) != (sell_target_limit is None):
+        raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
+    buy_target = buy_limit if buy_target_limit is None else buy_target_limit
+    sell_target = sell_limit if sell_target_limit is None else sell_target_limit
     if (
         type(buy_limit) is not int
         or type(sell_limit) is not int
-        or buy_limit < 1
-        or sell_limit < 1
+        or buy_limit < (0 if partial_targets else 1)
+        or sell_limit < (0 if partial_targets else 1)
         or buy_limit > 2**63 - 1
         or sell_limit > 2**63 - 1
+        or type(buy_target) is not int
+        or type(sell_target) is not int
+        or buy_target < 1
+        or sell_target < 1
+        or buy_limit > buy_target
+        or sell_limit > sell_target
         or type(buy_reversed) is not bool
         or type(cat_decimals) is not int
         or not 0 <= cat_decimals <= 18
@@ -142,15 +155,16 @@ def prove_initial_follow_slot_fit(
         ("buy", buy_limit, buy_tier_counts, buy_tier_sizes_xch, "xch"),
         ("sell", sell_limit, sell_tier_counts, sell_tier_sizes_xch, "cat"),
     ):
-        if sum(counts.values()) != limit:
+        target = buy_target if side == "buy" else sell_target
+        if sum(counts.values()) != target:
             raise ValueError("FOLLOW_SLOT_TIER_COUNTS_INVALID")
         for slot in range(limit):
-            tier = classify_slot_tier(slot, limit, tier_counts=counts)
+            tier = classify_slot_tier(slot, target, tier_counts=counts)
             size = sizes.get(tier)
             if size is None or size <= 0:
                 raise ValueError("FOLLOW_SLOT_TIER_COUNTS_INVALID")
             price = ladder_price_for_slot(
-                slot, side, mid, spread, limit, min_edge_bps=min_edge_bps
+                slot, side, mid, spread, target, min_edge_bps=min_edge_bps
             )
             if price is None or price <= 0:
                 raise ValueError("FOLLOW_SLOT_PRICE_INVALID")
@@ -220,6 +234,106 @@ def prove_initial_follow_slot_fit(
     }
 
 
+def find_fundable_follow_slot_limits(
+    *,
+    buy_target: int,
+    sell_target: int,
+    mid_price: Decimal,
+    half_spread: Decimal,
+    min_edge_bps: Decimal,
+    buy_tier_counts: dict,
+    sell_tier_counts: dict,
+    buy_tier_sizes_xch: dict,
+    sell_tier_sizes_xch: dict,
+    buy_reversed: bool,
+    cat_decimals: int,
+    max_coin_size_ratio: Decimal,
+    maximum_trade_xch_mojos: int,
+    maximum_trade_cat_atoms: int,
+    outputs: list[dict],
+) -> dict:
+    """Find the largest independently fundable prefix on each side.
+
+    The signed targets and tier distribution stay fixed. A partial initial
+    book uses the same prefix of those target slots, so its prices and source
+    denominations remain consistent with the approved full ladder. This is
+    an initial funding proof only; later top-ups must recompute it.
+    """
+    if (
+        type(buy_target) is not int
+        or type(sell_target) is not int
+        or buy_target < 1
+        or sell_target < 1
+        or buy_target > 2**63 - 1
+        or sell_target > 2**63 - 1
+    ):
+        raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
+
+    def max_prefix(side: str) -> int:
+        low, high = 0, buy_target if side == "buy" else sell_target
+        best = 0
+        while low <= high:
+            candidate = (low + high) // 2
+            buy_limit = candidate if side == "buy" else 0
+            sell_limit = candidate if side == "sell" else 0
+            try:
+                prove_initial_follow_slot_fit(
+                    buy_limit=buy_limit,
+                    sell_limit=sell_limit,
+                    buy_target_limit=buy_target,
+                    sell_target_limit=sell_target,
+                    mid_price=mid_price,
+                    half_spread=half_spread,
+                    min_edge_bps=min_edge_bps,
+                    buy_tier_counts=buy_tier_counts,
+                    sell_tier_counts=sell_tier_counts,
+                    buy_tier_sizes_xch=buy_tier_sizes_xch,
+                    sell_tier_sizes_xch=sell_tier_sizes_xch,
+                    buy_reversed=buy_reversed,
+                    cat_decimals=cat_decimals,
+                    max_coin_size_ratio=max_coin_size_ratio,
+                    maximum_trade_xch_mojos=maximum_trade_xch_mojos,
+                    maximum_trade_cat_atoms=maximum_trade_cat_atoms,
+                    outputs=outputs,
+                )
+                best = candidate
+                low = candidate + 1
+            except ValueError:
+                high = candidate - 1
+        return best
+
+    buy_limit = max_prefix("buy")
+    sell_limit = max_prefix("sell")
+    fit = prove_initial_follow_slot_fit(
+        buy_limit=buy_limit,
+        sell_limit=sell_limit,
+        buy_target_limit=buy_target,
+        sell_target_limit=sell_target,
+        mid_price=mid_price,
+        half_spread=half_spread,
+        min_edge_bps=min_edge_bps,
+        buy_tier_counts=buy_tier_counts,
+        sell_tier_counts=sell_tier_counts,
+        buy_tier_sizes_xch=buy_tier_sizes_xch,
+        sell_tier_sizes_xch=sell_tier_sizes_xch,
+        buy_reversed=buy_reversed,
+        cat_decimals=cat_decimals,
+        max_coin_size_ratio=max_coin_size_ratio,
+        maximum_trade_xch_mojos=maximum_trade_xch_mojos,
+        maximum_trade_cat_atoms=maximum_trade_cat_atoms,
+        outputs=outputs,
+    )
+    return {
+        **fit,
+        "buy_target": buy_target,
+        "sell_target": sell_target,
+        "funded_buy_limit": buy_limit,
+        "funded_sell_limit": sell_limit,
+        "partial_target": buy_limit < buy_target or sell_limit < sell_target,
+        "dispatch_authorized": False,
+    }
+
+
 def preview_current_follow_slot_fit(
     *,
     configuration: dict,
@@ -228,6 +342,7 @@ def preview_current_follow_slot_fit(
     sell_limit: int,
     maximum_trade_xch_mojos: int,
     maximum_trade_cat_atoms: int,
+    allow_partial: bool = False,
 ) -> dict:
     """Apply current production tier sizes to a read-only executable quote.
 
@@ -269,23 +384,29 @@ def preview_current_follow_slot_fit(
         }
         for side in ("buy", "sell")
     }
-    result = prove_initial_follow_slot_fit(
-        buy_limit=buy_limit,
-        sell_limit=sell_limit,
-        mid_price=mid,
-        half_spread=spread_bps / Decimal("20000"),
-        min_edge_bps=min_edge_bps,
-        buy_tier_counts=counts["buy"],
-        sell_tier_counts=counts["sell"],
-        buy_tier_sizes_xch=get_tier_sizes_for_side("buy"),
-        sell_tier_sizes_xch=get_tier_sizes_for_side("sell"),
-        buy_reversed=configuration["BUY_LADDER_REVERSED"],
-        cat_decimals=configuration["CAT_DECIMALS"],
-        max_coin_size_ratio=ratio,
-        maximum_trade_xch_mojos=maximum_trade_xch_mojos,
-        maximum_trade_cat_atoms=maximum_trade_cat_atoms,
-        outputs=outputs,
-    )
+    fit_terms = {
+        "mid_price": mid,
+        "half_spread": spread_bps / Decimal("20000"),
+        "min_edge_bps": min_edge_bps,
+        "buy_tier_counts": counts["buy"],
+        "sell_tier_counts": counts["sell"],
+        "buy_tier_sizes_xch": get_tier_sizes_for_side("buy"),
+        "sell_tier_sizes_xch": get_tier_sizes_for_side("sell"),
+        "buy_reversed": configuration["BUY_LADDER_REVERSED"],
+        "cat_decimals": configuration["CAT_DECIMALS"],
+        "max_coin_size_ratio": ratio,
+        "maximum_trade_xch_mojos": maximum_trade_xch_mojos,
+        "maximum_trade_cat_atoms": maximum_trade_cat_atoms,
+        "outputs": outputs,
+    }
+    if allow_partial:
+        result = find_fundable_follow_slot_limits(
+            buy_target=buy_limit, sell_target=sell_limit, **fit_terms
+        )
+    else:
+        result = prove_initial_follow_slot_fit(
+            buy_limit=buy_limit, sell_limit=sell_limit, **fit_terms
+        )
     if api_server._get_readonly_mid_price_str() != first_quote:
         raise ValueError("FOLLOW_SLOT_PRICE_CHANGED")
     return {**result, "readonly_mid_price_xch": format(mid, "f")}
