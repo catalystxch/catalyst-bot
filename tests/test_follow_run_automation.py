@@ -82,3 +82,37 @@ def test_prep_status_must_match_exact_approved_id(monkeypatch):
     result = follow_run_automation.advance_approved_follow_run(state["session_id"])
     assert result["reason"] == "PREP_RESULT_UNVERIFIED"
     assert called == []
+
+
+def test_ready_run_binds_authority_then_starts_without_second_review(monkeypatch):
+    import confidence_override
+    import database
+    import follow_run_automation
+    import follow_run_authority_automation
+    import follow_run_coordinator
+
+    state = {
+        "session_id": "a" * 64,
+        "policy_digest": "b" * 64,
+        "configuration_sha256": "c" * 64,
+        "state": "ready",
+        "fee_approval_id": "d" * 64,
+    }
+    calls = []
+
+    class Coordinator:
+        def get_state(self):
+            return dict(state)
+
+    monkeypatch.setattr(follow_run_coordinator, "FollowRunCoordinator", Coordinator)
+    monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: SimpleNamespace(digest=state["policy_digest"]))
+    monkeypatch.setattr(confidence_override, "current_configuration_digest", lambda: state["configuration_sha256"])
+    monkeypatch.setattr(follow_run_authority_automation, "authorize_approved_follow_run", lambda session_id: (
+        calls.append(("authority", session_id)) or {"success": True, "state": "ready", "run_id": "e" * 64}
+    ))
+    monkeypatch.setattr(follow_run_automation, "_route_json", lambda route, path, **kwargs: (
+        calls.append(("start", path)) or {"success": True}
+    ))
+    result = follow_run_automation.advance_approved_follow_run(state["session_id"], permit=object())
+    assert result["state"] == "running"
+    assert calls == [("authority", state["session_id"]), ("start", "/api/bot/start")]

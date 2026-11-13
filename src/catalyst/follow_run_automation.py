@@ -150,11 +150,32 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
             "action_needed": False,
         }
     if state["state"] == "ready":
+        from follow_run_authority_automation import authorize_approved_follow_run
+        import api_server
+
+        authority = authorize_approved_follow_run(session_id)
+        if authority.get("success") is not True or authority.get("state") != "ready":
+            raise ValueError("FOLLOW_RUN_AUTHORITY_REQUIRED")
+        result = _route_json(
+            api_server.api_bot_start,
+            "/api/bot/start",
+            body={},
+            permit=permit,
+        )
+        if result.get("success") is not True:
+            return {
+                "success": False,
+                "state": "ready",
+                "reason": result.get("reason", "FOLLOW_RUN_START_UNAVAILABLE"),
+                "action_needed": True,
+                "fee_warning": authority.get("fee_warning"),
+            }
         return {
-            "success": False,
-            "state": "ready",
-            "reason": "FOLLOW_RUN_AUTHORITY_NOT_BOUND",
-            "action_needed": True,
+            "success": True,
+            "state": "running",
+            "message": "Approved ladder started; building the offer book",
+            "fee_warning": authority.get("fee_warning"),
+            "action_needed": False,
         }
     return {
         "success": False,
