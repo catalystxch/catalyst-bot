@@ -12649,14 +12649,11 @@ def recover_coin_prep_predispatch_no_effect(
         target_fee = target.get(
             "fee_mojos", target.get("external_fee", {}).get("fee_mojos")
         )
-        valid_fee_hold = (
-            prep["fee_hold"] is None
-            or (
-                prep["fee_hold"] == safe_operation_id
-                and prep["fee_hold_cancellation"] == 0
-                and type(target_fee) is int
-                and prep["held_fee_mojos"] == target_fee
-            )
+        valid_fee_hold = prep["fee_hold"] is None or (
+            prep["fee_hold"] == safe_operation_id
+            and prep["fee_hold_cancellation"] == 0
+            and type(target_fee) is int
+            and prep["held_fee_mojos"] == target_fee
         )
         exact = (
             decision.confirmed is True

@@ -353,18 +353,27 @@ def test_held_predispatch_batch_releases_fee_and_claim_together(prepared):
 
     assert database.recover_coin_prep_predispatch_no_effect(operation_id, view)
     conn = database.get_connection()
-    assert conn.execute(
-        "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
-        (operation_id,),
-    ).fetchone()[0] == "FAILED"
-    assert conn.execute(
-        "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
-        (claim_token,),
-    ).fetchone()[0] == "RELEASED_NO_EFFECT"
-    assert conn.execute(
-        "SELECT state FROM approved_fee_outcomes WHERE operation_id=?",
-        (operation_id,),
-    ).fetchone()[0] == "RELEASED_NO_EFFECT"
+    assert (
+        conn.execute(
+            "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()[0]
+        == "FAILED"
+    )
+    assert (
+        conn.execute(
+            "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (claim_token,),
+        ).fetchone()[0]
+        == "RELEASED_NO_EFFECT"
+    )
+    assert (
+        conn.execute(
+            "SELECT state FROM approved_fee_outcomes WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()[0]
+        == "RELEASED_NO_EFFECT"
+    )
     assert _held(prepared) == 0
 
 
@@ -389,18 +398,27 @@ def test_held_predispatch_batch_stays_fenced_without_exact_no_effect(prepared):
 
     assert not database.recover_coin_prep_predispatch_no_effect(operation_id, view)
     conn = database.get_connection()
-    assert conn.execute(
-        "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
-        (operation_id,),
-    ).fetchone()[0] == "PREPARED"
-    assert conn.execute(
-        "SELECT 1 FROM wallet_effect_claim_resolutions WHERE claim_token=?",
-        (claim_token,),
-    ).fetchone() is None
-    assert conn.execute(
-        "SELECT 1 FROM approved_fee_outcomes WHERE operation_id=?",
-        (operation_id,),
-    ).fetchone() is None
+    assert (
+        conn.execute(
+            "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()[0]
+        == "PREPARED"
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+            (claim_token,),
+        ).fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM approved_fee_outcomes WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        is None
+    )
     assert _held(prepared) == 10
 
 
