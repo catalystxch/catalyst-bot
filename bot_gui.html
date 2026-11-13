@@ -33592,6 +33592,18 @@
                     }
                     if (state?.success !== true || state?.action_needed === true) {
                         const reason = state?.reason || 'automatic advancement was not confirmed';
+                        if (reason === 'COIN_PREP_EFFECT_UNKNOWN') {
+                            const status = await window.pywebview?.api?.get_single_approval_follow_run_status?.();
+                            if (status?.success === true
+                                    && status.session_id === sessionId
+                                    && status.state === 'preparing') {
+                                showSingleApprovalRunProgress(
+                                    'Coin preparation is awaiting wallet reconciliation. Retrying the approved run automatically.\nState: preparing',
+                                );
+                                await new Promise(resolve => setTimeout(resolve, 7000));
+                                continue;
+                            }
+                        }
                         showSingleApprovalRunProgress(
                             `Run setup needs attention. State: ${state?.state || 'unknown'}\nReason: ${reason}`,
                             true,
