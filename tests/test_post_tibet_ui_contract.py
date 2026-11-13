@@ -478,6 +478,34 @@ def test_market_confidence_endpoint_fails_closed_while_evidence_is_warming(monke
     assert payload["can_increase_exposure"] is False
 
 
+def test_market_confidence_reports_continuous_consent_without_expiry(monkeypatch):
+    monkeypatch.setitem(api_server._active_cat, "asset_id", ASSET_ID)
+    monkeypatch.setattr(
+        market.database, "get_latest_market_confidence_snapshot", Mock(return_value=None)
+    )
+    monkeypatch.setattr(market.database, "get_degraded_market_state", Mock(return_value=None))
+    monkeypatch.setattr(
+        market.database, "get_post_tibet_migration_report", Mock(return_value=None)
+    )
+    monkeypatch.setattr(
+        api_server,
+        "bot",
+        SimpleNamespace(
+            _confidence_override_consent=SimpleNamespace(revoked=False),
+            _confidence_override_active=lambda: True,
+        ),
+    )
+
+    with api_server.app.test_request_context("/api/market/confidence"):
+        payload = market.api_market_confidence().get_json()
+
+    assert payload["confidence_override"] == {
+        "approved": True,
+        "active": True,
+        "expires_at": None,
+    }
+
+
 def test_dashboard_and_market_intel_render_offer_book_confidence_contract():
     html = (Path(__file__).resolve().parents[1] / "bot_gui.html").read_text(
         encoding="utf-8"

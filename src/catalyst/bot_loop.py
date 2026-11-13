@@ -1635,11 +1635,18 @@ class BotLoop:
         return build_view(raw, valid_until, datetime.now(timezone.utc))
 
     def _effective_market_confidence(self, confidence=None, valid_until=None):
-        from confidence_override import ConsentedConfidence
+        from confidence_override import ApprovedFollowConfidence, ConsentedConfidence
 
         raw, deadline = self._market_confidence_snapshot()
         if confidence is not None:
             raw, deadline = confidence, valid_until
+        # A single-approval Follow run carries its own exact, coordinator-bound
+        # RED authority. Prefer it over the older saved-choice view, whose
+        # short-lived book snapshot can expire between ladder candidates.
+        if raw is None or getattr(raw, "state", None) == "RED":
+            approved = self._coordinator_approved_follow_confidence(raw, deadline)
+            if isinstance(approved, ApprovedFollowConfidence):
+                return approved
         if raw is None or not self._confidence_override_active():
             return self._coordinator_approved_follow_confidence(raw, deadline)
         consent = self._confidence_override_consent
@@ -1701,7 +1708,7 @@ class BotLoop:
         now = datetime.now(timezone.utc)
         derived_at = getattr(raw, "derived_at", None)
         if getattr(derived_at, "tzinfo", None) is None:
-            return None
+            return self._effective_market_confidence()
         try:
             age = (now - derived_at.astimezone(timezone.utc)).total_seconds()
             remaining = (
@@ -1710,13 +1717,16 @@ class BotLoop:
                 else 0
             )
         except (TypeError, ValueError, AttributeError):
-            return None
+            return self._effective_market_confidence()
         if age >= 10 or remaining <= 10:
             try:
                 self._refresh_offer_book_market()
             except Exception as exc:
                 self._enforce_market_refresh_failure(now=now, error=exc)
-                return None
+                from confidence_override import ApprovedFollowConfidence
+
+                approved = self._coordinator_approved_follow_confidence(raw, deadline)
+                return approved if isinstance(approved, ApprovedFollowConfidence) else None
         return self._effective_market_confidence()
 
     def _wallet_effect_market_confidence(self):
@@ -15121,7 +15131,10 @@ class BotLoop:
         # discovery deadline arrives.  Stage at most ten offers per cycle and
         # divide the budget fairly between active sides; the pending-discovery
         # guard above prevents the next stage until this one is publicly proven.
-        publication_batch_limit = 10
+        # Sage can take tens of seconds per offer, and each side creates its
+        # offers serially. Keep each side to two so a healthy batch finishes
+        # before the 240-second unfinished-thread safety ceiling.
+        publication_batch_limit = 4
         requested_total = sum(max(0, int(item[1])) for item in work_items)
         if requested_total > publication_batch_limit:
             staged_counts = {side: 0 for side, _needed, _spread in work_items}

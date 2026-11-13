@@ -5657,7 +5657,12 @@ class OfferManager:
                 )
                 if _fail_level != "debug":
                     print(f"  ❌ {fail_msg}", flush=True)
-                log_event(_fail_level, "offer_create_failed", fail_msg)
+                log_event(
+                    _fail_level,
+                    "offer_create_failed",
+                    fail_msg,
+                    data={"reason_code": res.get("reason") if isinstance(res, dict) else None},
+                )
                 return
 
             trade_record = res.get("trade_record") or {}

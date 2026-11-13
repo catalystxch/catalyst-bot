@@ -170,6 +170,48 @@ def test_coordinator_approved_red_policy_builds_passive_anchor_candidate(
     assert result["eligible"] is True, result
     assert result["improves_book"] is False
 
+    # A saved thin-market choice must not replace the exact Follow approval
+    # with a snapshot-bound candidate view during this run.
+    bot._confidence_override_active = lambda: True
+    approved_again = BotLoop._effective_market_confidence(bot)
+    assert approved_again.approved_anchor_only is True
+    assert approved_again.policy_digest == policy.digest
+    assert approved_again.data_valid is True
+    assert approved_again.dispatch_allowed() is True
+
+    # If a market refresh fails, the specifically approved anchor can still
+    # supply a fresh candidate view while the coordinator remains bound.
+    bot._market_confidence_snapshot = lambda: (
+        confidence(derived_at=datetime.now(timezone.utc) - timedelta(seconds=30)),
+        datetime.now(timezone.utc) - timedelta(seconds=10),
+    )
+    bot._refresh_offer_book_market = lambda: (_ for _ in ()).throw(
+        RuntimeError("provider unavailable")
+    )
+    bot._enforce_market_refresh_failure = lambda **_kwargs: None
+    refreshed = BotLoop._fresh_effective_market_confidence(bot)
+    assert refreshed.approved_anchor_only is True
+    assert refreshed.data_valid is True
+
+    monkeypatch.setattr(
+        FollowRunCoordinator,
+        "read_state",
+        lambda _self: {"state": "stopped", "run_id": run_id},
+    )
+    assert refreshed.data_valid is False
+    assert refreshed.dispatch_allowed() is False
+    monkeypatch.setattr(
+        FollowRunCoordinator,
+        "read_state",
+        lambda _self: {
+            "state": coordinator_state,
+            "run_id": run_id,
+            "policy_digest": policy.digest,
+            "configuration_sha256": configuration_sha256,
+        },
+    )
+    bot._market_confidence_snapshot = lambda: snapshots[0]
+
     live_confidence = SimpleNamespace(
         state="RED",
         data_valid=True,
@@ -474,6 +516,7 @@ def runtime_loop(monkeypatch):
 
     loop = BotLoop.__new__(BotLoop)
     loop._running = True
+    loop._set_state = lambda **_updates: None
     monkeypatch.setattr(bot_loop.cfg, "MAX_ACTIVE_BUY_OFFERS", 24)
     monkeypatch.setattr(bot_loop.cfg, "MAX_ACTIVE_SELL_OFFERS", 24)
     loop._market_confidence_result = confidence()
