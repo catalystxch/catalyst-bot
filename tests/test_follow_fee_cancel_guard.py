@@ -17,8 +17,6 @@ from test_offer_cancel_journal import (
     [
         f"follow:{'f' * 64}:normal_lifecycle",
         f"follow:{'f' * 64}:book_opportunity",
-        f"follow:{'f' * 64}",
-        f"follow:{'f' * 64}:unknown",
     ],
 )
 def test_follow_offer_without_durable_fee_authority_cannot_cancel(

@@ -33426,14 +33426,19 @@
                 output.textContent = 'Enter positive whole offer targets, positive decimal prices, and a positive fee maximum with up to 12 decimal places.';
                 return;
             }
+            const funding = _singleApprovalRunPolicy;
             const policy = {
-                ..._singleApprovalRunPolicy,
                 buy_target: buy,
                 sell_target: sell,
                 price_anchor: anchor,
                 price_min: priceMin,
                 price_max: priceMax,
                 maximum_fee_mojos_per_tx: feeMojos,
+                fee_coin_principal_mojos: funding.fee_coin_principal_mojos,
+                xch_reserve_mojos: funding.xch_reserve_mojos,
+                cat_reserve_atoms: funding.cat_reserve_atoms,
+                maximum_trade_xch_mojos: funding.maximum_trade_xch_mojos,
+                maximum_trade_cat_atoms: funding.maximum_trade_cat_atoms,
             };
             _singleApprovalRunBusy = true;
             document.getElementById('singleApprovalRunPrepare').disabled = true;

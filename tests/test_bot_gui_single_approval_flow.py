@@ -40,6 +40,27 @@ def test_single_approval_disclosure_uses_text_nodes_and_exact_atomic_strings():
     assert "innerHTML" not in flow
 
 
+def test_single_approval_sends_only_editable_policy_and_signed_funding_terms():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    flow = html.split("async function prepareSingleApprovalRunReview()", 1)[1].split(
+        "async function confirmSingleApprovalRunReview()", 1
+    )[0]
+    policy = flow.split("const policy = {", 1)[1].split("};", 1)[0]
+
+    assert "..._singleApprovalRunPolicy" not in policy
+    assert "wallet_identity" not in policy
+    assert "configuration_sha256" not in policy
+    assert "funded_estimate" not in policy
+    for key in (
+        "fee_coin_principal_mojos",
+        "xch_reserve_mojos",
+        "cat_reserve_atoms",
+        "maximum_trade_xch_mojos",
+        "maximum_trade_cat_atoms",
+    ):
+        assert f"{key}: funding.{key}" in policy
+
+
 def test_single_approval_is_only_offered_for_fresh_smart_settings():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
     dirty_check = html.split("function checkSmartSettingsDirty()", 1)[1].split(
