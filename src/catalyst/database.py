@@ -21956,6 +21956,14 @@ def record_active_follow_run_policy(policy) -> bool:
 
 def get_active_follow_run_policy():
     """Read the active policy; malformed or unverified data fails closed."""
+    try:
+        return _decode_follow_run_policy(get_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING))
+    except Exception:
+        return None
+
+
+def _decode_follow_run_policy(raw):
+    """Validate a policy envelope without opening another connection."""
     import json
     import re
     from decimal import Decimal
@@ -21963,7 +21971,6 @@ def get_active_follow_run_policy():
     from follow_run_policy import FollowRunPolicy
 
     try:
-        raw = get_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING)
         if type(raw) is not str or not raw:
             return None
 
@@ -31788,6 +31795,64 @@ def get_recoverable_coin_prep_operations(*, limit: int = 128) -> List[Dict[str, 
     return [dict(row) for row in rows]
 
 
+def _guard_follow_intent_principal(conn, immutable, policy_digest):
+    """Reserve signed principal under the same writer lock as the intent."""
+    purpose = immutable["purpose"]
+    if not purpose.startswith("follow:"):
+        return
+    parts = purpose.split(":")
+    if (
+        len(parts) != 3
+        or re.fullmatch(r"[0-9a-f]{64}", parts[1]) is None
+        or parts[2] not in {"normal_lifecycle", "book_opportunity"}
+    ):
+        raise ValueError("FOLLOW_RUN_POLICY_PURPOSE_INVALID")
+    row = conn.execute(
+        "SELECT value FROM bot_settings WHERE key=?",
+        (_ACTIVE_FOLLOW_RUN_POLICY_SETTING,),
+    ).fetchone()
+    raw = row["value"] if row else None
+    if raw is None and policy_digest is None:
+        return  # Runs approved before signed policies retain their legacy guards.
+    policy = _decode_follow_run_policy(raw)
+    if policy is None:
+        raise ValueError("FOLLOW_RUN_POLICY_REQUIRED")
+    import mutation_gate
+
+    if (
+        policy_digest != policy.digest
+        or immutable["network"] != policy.network
+        or immutable["asset_id"] != policy.asset_id
+        or immutable["wallet_fingerprint_hash"]
+        != mutation_gate.wallet_fingerprint_hash(int(policy.wallet_fingerprint))
+    ):
+        raise ValueError("FOLLOW_RUN_POLICY_AUTHORITY_MISMATCH")
+    terminal = sorted(_TERMINAL_INTENT_RESERVATION_STATES)
+    placeholders = ",".join("?" for _ in terminal)
+    # Python integers avoid SQLite SUM's signed 64-bit overflow for atom values.
+    rows = conn.execute(
+        "SELECT offered_amount_atomic FROM offer_intents "
+        "WHERE purpose LIKE 'follow:%' AND wallet_fingerprint_hash=? "
+        "AND network=? AND asset_id=? AND side=? AND intent_id<>? "
+        f"AND lifecycle_state NOT IN ({placeholders})",
+        (
+            immutable["wallet_fingerprint_hash"],
+            immutable["network"], immutable["asset_id"],
+            immutable["side"], immutable["intent_id"], *terminal,
+        ),
+    ).fetchall()
+    committed = sum(
+        int(_atomic_amount_text(row[0], "offered_amount_atomic")) for row in rows
+    )
+    cap = (
+        policy.maximum_trade_xch_mojos
+        if immutable["side"] == "buy"
+        else policy.maximum_trade_cat_atoms
+    )
+    if committed + int(immutable["offered_amount_atomic"]) > cap:
+        raise ValueError("FOLLOW_PRINCIPAL_CAP_EXCEEDED")
+
+
 def prepare_offer_intent(
     *,
     intent_id: str,
@@ -31816,6 +31881,7 @@ def prepare_offer_intent(
     prepared_at: Any = None,
     reserve_selected_coins: bool = False,
     require_new_intent: bool = False,
+    follow_policy_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Atomically persist a creation intent and its PREPARED journal event."""
 
@@ -31984,6 +32050,7 @@ def prepare_offer_intent(
                     "selected coin has an authoritative terminal coin outcome"
                 )
         if existing is None:
+            _guard_follow_intent_principal(conn, immutable, follow_policy_digest)
             conn.execute(
                 """
                 INSERT INTO offer_intents (

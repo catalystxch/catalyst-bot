@@ -261,6 +261,12 @@ def test_follow_first_offer_guard_enforces_bound_policy_before_dispatch(
         )
         is True
     )
+    assert offer_manager.require_follow_policy_price(
+        run_id=RUN_ID,
+        asset_id=ASSET_ID,
+        candidate_price=Decimal("0.001"),
+        return_policy_digest=True,
+    ) == policy.digest
 
 
 def test_follow_requote_cold_start_propagates_run_to_creation_boundary(monkeypatch):

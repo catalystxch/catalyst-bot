@@ -275,8 +275,9 @@ def require_active_follow_intent_authority(
 
 
 def require_follow_policy_price(
-    *, run_id: str, asset_id: str, candidate_price: Decimal
-) -> bool | None:
+    *, run_id: str, asset_id: str, candidate_price: Decimal,
+    return_policy_digest: bool = False,
+) -> bool | str | None:
     """Require each Follow quote to stay inside the active reviewed range."""
     if type(candidate_price) is not Decimal or not candidate_price.is_finite():
         raise ValueError("FOLLOW_RUN_PRICE_INVALID")
@@ -340,7 +341,7 @@ def require_follow_policy_price(
         or not price_min <= candidate_price <= price_max
     ):
         raise ValueError("FOLLOW_RUN_PRICE_OUTSIDE_APPROVED_RANGE")
-    return True
+    return policy.digest if return_policy_digest else True
 
 
 def _follow_candidate_price(offer_dict: dict, side: str) -> Decimal:
@@ -3283,6 +3284,16 @@ class OfferManager:
                 "offer_size_uniqueness": intent.offer_size_uniqueness(),
                 "selected_coin_ids": [intent.selected_coin_id],
             }
+            follow_policy_digest = None
+            if intent.purpose.startswith("follow:"):
+                follow_policy_digest = require_follow_policy_price(
+                    run_id=intent.purpose.split(":", 2)[1],
+                    asset_id=intent.asset_id,
+                    candidate_price=_follow_candidate_price(
+                        intent.offer_dict(), intent.side
+                    ),
+                    return_policy_digest=True,
+                )
             self._offer_creation_crash_boundary("before_intent_commit", intent)
             try:
                 database.prepare_offer_intent(
@@ -3310,6 +3321,7 @@ class OfferManager:
                     prepared_at=prepared_at,
                     reserve_selected_coins=True,
                     require_new_intent=True,
+                    follow_policy_digest=follow_policy_digest,
                 )
             except Exception as exc:
                 message = str(exc)
