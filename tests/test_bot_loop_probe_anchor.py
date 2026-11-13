@@ -1577,8 +1577,8 @@ class ProbeAnchorTests(unittest.TestCase):
         sell_call = next(
             call for call in loop.offer_manager.create_calls if call[0] == "sell"
         )
-        self.assertEqual(buy_call[2]["num_offers"], 3)
-        self.assertEqual(sell_call[2]["num_offers"], 3)
+        self.assertEqual(buy_call[2]["num_offers"], 2)
+        self.assertEqual(sell_call[2]["num_offers"], 2)
 
     def test_create_offers_if_needed_waits_for_wallet_active_pending_cancels(self):
         loop = bot_loop.BotLoop()
@@ -1606,7 +1606,8 @@ class ProbeAnchorTests(unittest.TestCase):
         A live 45/44 DBX ladder was created in one cycle, while the durable
         publisher could acknowledge only 13-14 offers per cycle. The remaining
         49 then hit the fixed 90-second exact-discovery deadline and were safely
-        cancelled. Stage a balanced maximum of ten new offers per cycle.
+        cancelled. Stage a balanced maximum of four new offers per cycle,
+        keeping each serial Sage side below the unfinished-thread ceiling.
         """
         loop = bot_loop.BotLoop()
 
@@ -1621,7 +1622,7 @@ class ProbeAnchorTests(unittest.TestCase):
             for call in loop.offer_manager.create_calls
             for side in [call[0]]
         }
-        self.assertEqual(requested, {"buy": 5, "sell": 5})
+        self.assertEqual(requested, {"buy": 2, "sell": 2})
 
     def test_create_offers_if_needed_waits_for_exact_publication_discovery(self):
         loop = bot_loop.BotLoop()
