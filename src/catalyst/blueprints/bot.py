@@ -84,6 +84,54 @@ def _fresh_start_wallet_offer_snapshot(bot):
     return offers
 
 
+def _coordinator_start_binding(follow_readiness):
+    """Return the exact approved coordinator binding for this freshly reviewed run."""
+    if type(follow_readiness) is not dict or follow_readiness.get("ready") is not True:
+        return None
+    scope = follow_readiness.get("scope")
+    identity = scope.get("identity") if type(scope) is dict else None
+    run_id = follow_readiness.get("run_id")
+    configuration_sha256 = (
+        scope.get("configuration_sha256") if type(scope) is dict else None
+    )
+    if (
+        type(identity) is not dict
+        or type(run_id) is not str
+        or type(configuration_sha256) is not str
+    ):
+        return None
+    try:
+        import database
+        from follow_run_coordinator import FollowRunCoordinator
+
+        coordinator = FollowRunCoordinator()
+        state = coordinator.read_state()
+        policy = database.get_active_follow_run_policy()
+    except Exception:
+        return None
+    if (
+        type(state) is not dict
+        or state.get("state") not in {"ready", "start_pending"}
+        or state.get("run_id") != run_id
+        or state.get("configuration_sha256") != configuration_sha256
+        or type(state.get("session_id")) is not str
+        or policy is None
+        or state.get("policy_digest") != getattr(policy, "digest", None)
+        or str(identity.get("wallet_fingerprint"))
+        != getattr(policy, "wallet_fingerprint", None)
+        or str(identity.get("network") or "").lower()
+        != str(getattr(policy, "network", "")).lower()
+        or str(identity.get("asset_id") or "").lower().removeprefix("0x")
+        != str(getattr(policy, "asset_id", "")).lower().removeprefix("0x")
+    ):
+        return None
+    return coordinator, {
+        "session_id": state["session_id"],
+        "policy_digest": state["policy_digest"],
+        "configuration_sha256": state["configuration_sha256"],
+    }
+
+
 def _fresh_start_wallet_offer_book(bot) -> bool:
     """Require a new Sage offer read before accepting any bot-start caller."""
     return _fresh_start_wallet_offer_snapshot(bot) is not None
@@ -834,6 +882,7 @@ def api_bot_start():
     coin_prep_error = None
     coin_prep_reason = None
     tier_size_drift = []
+    coordinator_binding = None
 
     # Check CAT_ASSET_ID is configured
     if not cfg.CAT_ASSET_ID or cfg.CAT_ASSET_ID == "":
@@ -1321,6 +1370,7 @@ def api_bot_start():
                                 "reason": "FOLLOW_RESUME_WALLET_NOT_READY",
                             }
                         ), 409
+            coordinator_binding = _coordinator_start_binding(follow_readiness)
             # Do not enter an empty Running state while RED Follow consent is
             # absent. The native client can now present the scoped review
             # before any trading loop starts.
@@ -1349,7 +1399,11 @@ def api_bot_start():
                         )
                     except (ValueError, TypeError, KeyError):
                         thin_choice_ready = False
-                if confidence_state == "RED" and not thin_choice_ready:
+                if (
+                    confidence_state == "RED"
+                    and not thin_choice_ready
+                    and coordinator_binding is None
+                ):
                     return jsonify(
                         {
                             "success": False,
@@ -1400,6 +1454,19 @@ def api_bot_start():
                         "error": str(exc),
                     }
                 ), 409
+        if coordinator_binding is not None:
+            coordinator, coordinator_key = coordinator_binding
+            try:
+                coordinator.mark_start_pending(**coordinator_key)
+            except Exception as exc:
+                return jsonify(
+                    {
+                        "success": False,
+                        "status": "error",
+                        "reason": "FOLLOW_RUN_START_PENDING_FAILED",
+                        "error": str(exc)[:256],
+                    }
+                ), 409
         server._reset_runtime_session_stats()
         started = bot.start()
         if (
@@ -1408,6 +1475,19 @@ def api_bot_start():
         ):
             bot._confidence_override_pending.revoke()
             bot._confidence_override_pending = None
+        if not started and coordinator_binding is not None:
+            coordinator, coordinator_key = coordinator_binding
+            try:
+                coordinator.record_recoverable_error(
+                    **coordinator_key, reason="BOT_START_FAILED"
+                )
+            except Exception as exc:
+                slog(
+                    "SESSION",
+                    "Could not persist Follow start failure",
+                    {"error": str(exc)[:256]},
+                    level="error",
+                )
     if not started:
         state = {}
         try:
@@ -1425,6 +1505,29 @@ def api_bot_start():
                 "bot_status": state.get("status") or "blocked",
             }
         ), 400
+    if coordinator_binding is not None:
+        coordinator, coordinator_key = coordinator_binding
+        try:
+            coordinator.mark_running(**coordinator_key)
+        except Exception as exc:
+            try:
+                bot.stop(wait=False)
+            except Exception:
+                pass
+            try:
+                coordinator.record_recoverable_error(
+                    **coordinator_key, reason="COORDINATOR_START_PERSIST_FAILED"
+                )
+            except Exception:
+                pass
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "error",
+                    "reason": "FOLLOW_RUN_RUNNING_PERSIST_FAILED",
+                    "error": str(exc)[:256],
+                }
+            ), 503
     server.events.emit("bot_control", {"action": "started"})
     result = {"success": True, "status": "started"}
     if bootstrap_campaign is None:
@@ -1456,12 +1559,38 @@ def api_bot_stop():
     from follow_restart_intent import clear_follow_restart_intent
 
     try:
-        if database.get_setting("follow_restart_intent_v1") is not None:
-            clear_follow_restart_intent(reason="manual_stop")
+        from follow_run_coordinator import FollowRunCoordinator
+
+        coordinator = FollowRunCoordinator()
+        coordinator_state = coordinator.read_state()
     except Exception:
         return jsonify(
-            {"success": False, "reason": "FOLLOW_RESTART_INTENT_PERSIST_FAILED"}
+            {"success": False, "reason": "FOLLOW_RUN_COORDINATOR_READ_FAILED"}
         ), 503
+    if type(coordinator_state) is dict and coordinator_state.get("state") != "stopped":
+        coordinator_key = {
+            "session_id": coordinator_state.get("session_id"),
+            "policy_digest": coordinator_state.get("policy_digest"),
+            "configuration_sha256": coordinator_state.get("configuration_sha256"),
+        }
+        if not all(type(value) is str for value in coordinator_key.values()):
+            return jsonify(
+                {"success": False, "reason": "FOLLOW_RUN_COORDINATOR_STATE_INVALID"}
+            ), 503
+        try:
+            coordinator.stop_run(**coordinator_key)
+        except Exception:
+            return jsonify(
+                {"success": False, "reason": "FOLLOW_RUN_STOP_PERSIST_FAILED"}
+            ), 503
+    else:
+        try:
+            if database.get_setting("follow_restart_intent_v1") is not None:
+                clear_follow_restart_intent(reason="manual_stop")
+        except Exception:
+            return jsonify(
+                {"success": False, "reason": "FOLLOW_RESTART_INTENT_PERSIST_FAILED"}
+            ), 503
     if not bot:
         # Wallet setup can display the desktop shell before a BotLoop exists.
         # In that state there is no bot work to stop. The later shutdown route
