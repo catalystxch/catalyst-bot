@@ -36,6 +36,8 @@ class FollowRunPolicy:
     fee_coin_principal_mojos: int
     xch_reserve_mojos: int
     cat_reserve_atoms: int
+    maximum_trade_xch_mojos: int
+    maximum_trade_cat_atoms: int
 
     def __post_init__(self) -> None:
         for name in ("wallet_fingerprint", "network", "asset_id"):
@@ -62,6 +64,8 @@ class FollowRunPolicy:
             "fee_coin_principal_mojos",
             "xch_reserve_mojos",
             "cat_reserve_atoms",
+            "maximum_trade_xch_mojos",
+            "maximum_trade_cat_atoms",
         ):
             value = getattr(self, name)
             if type(value) is not int:

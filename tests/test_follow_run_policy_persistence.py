@@ -21,6 +21,8 @@ def make_policy(**changes):
         "fee_coin_principal_mojos": 8_000_000_000,
         "xch_reserve_mojos": 1_000_000_000,
         "cat_reserve_atoms": 25_000,
+        "maximum_trade_xch_mojos": 2_000_000_000_000,
+        "maximum_trade_cat_atoms": 1_000_000,
     }
     terms.update(changes)
     return FollowRunPolicy(**terms)
