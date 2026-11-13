@@ -199,7 +199,9 @@ def test_no_resume_startup_path_does_not_request_authoritative_fresh_reset():
     no_resume_start = resume_block.index(
         "if (!data.can_resume && data.auto_resume_requested !== true)"
     )
-    no_resume_end = resume_block.index("if (data.auto_resume_requested", no_resume_start)
+    no_resume_end = resume_block.index(
+        "if (data.auto_resume_requested", no_resume_start
+    )
     no_resume_block = resume_block[no_resume_start:no_resume_end]
 
     assert "session/fresh-start" not in no_resume_block
