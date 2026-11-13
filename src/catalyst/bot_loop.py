@@ -1733,6 +1733,15 @@ class BotLoop:
         if not requested:
             attempted_trade_ids.clear()
             return 0
+        rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
+        if self._active_follow_red_withdrawal_protected(rows):
+            log_event(
+                "warning",
+                "market_confidence_red_approved_follow",
+                "Market confidence is RED; the identity-matched approved Follow run remains active",
+                data={"reason_code": str(getattr(decision, "reason_code", "MARKET_RED"))},
+            )
+            return 0
         requested = {"mid" if tier == "middle" else tier for tier in requested}
         protected_bootstrap_trade_ids: set[str] = set()
         try:
@@ -1756,7 +1765,6 @@ class BotLoop:
             # normal RED-market withdrawal.
             protected_bootstrap_trade_ids = set()
 
-        rows = get_open_offers(cat_asset_id=getattr(cfg, "CAT_ASSET_ID", None))
         protected_follow_trade_ids = self._override_protected_trade_ids()
         trade_ids = [
             str(row.get("trade_id") or "").strip()
@@ -1843,6 +1851,145 @@ class BotLoop:
                 data=event_data,
             )
         return accepted
+
+    def _active_follow_red_withdrawal_protected(self, open_rows) -> bool:
+        """Prove a live approved Follow restart before honoring its RED choice.
+
+        This is a read-only guard. Any missing, stale, or mismatched evidence
+        falls through to the ordinary RED withdrawal path.
+        """
+        asset_id = str(getattr(cfg, "CAT_ASSET_ID", "") or "").strip().lower()
+        if len(asset_id) != 64:
+            return False
+        try:
+            policy = database.get_active_follow_run_policy()
+            if policy is None or getattr(policy, "asset_id", None) != asset_id:
+                return False
+            from follow_run_coordinator import FollowRunCoordinator
+
+            coordinator_reader = FollowRunCoordinator()
+            state_reader = getattr(coordinator_reader, "read_state", None)
+            coordinated = (
+                state_reader() if callable(state_reader) else coordinator_reader.get_state()
+            )
+            if (
+                type(coordinated) is not dict
+                or coordinated.get("state") not in {"start_pending", "running"}
+                or coordinated.get("run_id") is None
+                or coordinated.get("policy_digest") != getattr(policy, "digest", None)
+            ):
+                return False
+            from follow_restart_intent import (
+                read_follow_restart_intent,
+                restart_intent_matches,
+            )
+
+            intent = read_follow_restart_intent()
+            if type(intent) is not dict:
+                return False
+            now_epoch = int(time.time())
+            marker = database.get_unexpired_follow_run_marker(
+                asset_id=asset_id, now_epoch=now_epoch
+            )
+            if (
+                type(marker) is not dict
+                or marker.get("stopped") is not False
+                or marker.get("run_id") != intent.get("run_id")
+                or marker.get("run_id") != coordinated.get("run_id")
+            ):
+                return False
+            run_identity = database.get_follow_run_identity(marker["run_id"])
+            if (
+                type(run_identity) is not dict
+                or run_identity.get("asset_id") != asset_id
+                or run_identity.get("wallet_type") != "sage"
+                or run_identity.get("network") != getattr(policy, "network", None)
+                or str(run_identity.get("wallet_fingerprint"))
+                != str(getattr(policy, "wallet_fingerprint", None))
+            ):
+                return False
+            price_min = getattr(policy, "price_min", None)
+            price_max = getattr(policy, "price_max", None)
+            if not (
+                isinstance(price_min, Decimal)
+                and isinstance(price_max, Decimal)
+                and bool(open_rows)
+                and all(
+                    type(row) is dict
+                    and row.get("price_xch") is not None
+                    and price_min <= Decimal(str(row["price_xch"])) <= price_max
+                    for row in open_rows
+                )
+            ):
+                return False
+            from wallet import get_wallet_identity
+
+            observed = get_wallet_identity()
+            if not (
+                type(observed) is dict
+                and observed.get("success") is True
+                and str(observed.get("backend") or "").strip().lower() == "sage"
+                and observed.get("has_secrets") is True
+                and observed.get("fingerprint") is not None
+            ):
+                log_event(
+                    "warning",
+                    "market_confidence_follow_identity_unavailable",
+                    "Could not prove the approved Follow wallet identity; RED withdrawal remains enabled",
+                    data={"asset_id": asset_id},
+                )
+                return False
+            network = str((observed or {}).get("network_id") or "").strip().lower()
+            if network.startswith("testnet"):
+                network = "testnet"
+            elif network != "mainnet":
+                log_event(
+                    "warning",
+                    "market_confidence_follow_identity_unavailable",
+                    "Could not prove the approved Follow wallet identity; RED withdrawal remains enabled",
+                    data={"asset_id": asset_id},
+                )
+                return False
+            if not (
+                str(observed.get("fingerprint"))
+                == str(run_identity.get("wallet_fingerprint"))
+                and network == run_identity.get("network")
+                and run_identity.get("wallet_id")
+                == getattr(cfg, "CAT_WALLET_ID", None)
+                and run_identity.get("xch_wallet_id")
+                == getattr(cfg, "WALLET_ID_XCH", None)
+            ):
+                log_event(
+                    "warning",
+                    "market_confidence_follow_identity_unavailable",
+                    "Could not prove the approved Follow wallet identity; RED withdrawal remains enabled",
+                    data={"asset_id": asset_id},
+                )
+                return False
+            from confidence_override import current_configuration_digest
+
+            config_digest = current_configuration_digest()
+            if (
+                coordinated.get("configuration_sha256") != config_digest
+                or intent.get("configuration_sha256") != config_digest
+            ):
+                return False
+            return bool(
+                restart_intent_matches(
+                    intent,
+                    run_id=marker["run_id"],
+                    identity=run_identity,
+                    configuration_sha256=config_digest,
+                )
+            )
+        except Exception as exc:
+            log_event(
+                "warning",
+                "market_confidence_follow_identity_unavailable",
+                "Could not prove the approved Follow wallet identity; RED withdrawal remains enabled",
+                data={"asset_id": asset_id, "error_type": type(exc).__name__},
+            )
+            return False
 
     def _reconcile_offer_publication_discovery(
         self,
@@ -12037,6 +12184,7 @@ class BotLoop:
                         live_offer_ids=_live_ids,
                         force_cancel_storm=True,
                         market_confidence=self._effective_market_confidence(),
+                        follow_run_id=getattr(self, "_reviewed_follow_run_id", None),
                     )
                     # Note: do NOT add to _requoted_this_cycle until we
                     # know progress was made. Previously we stamped this
@@ -13336,6 +13484,7 @@ class BotLoop:
                         RequoteSeverity.EMERGENCY,
                     ),
                     market_confidence=self._wallet_effect_market_confidence(),
+                    follow_run_id=getattr(self, "_reviewed_follow_run_id", None),
                 )
                 # Track whether the requote actually made progress so we can
                 # decide whether to advance baselines and clear the force

@@ -1508,6 +1508,177 @@ def test_market_withdrawal_immediately_enters_durable_retry_for_unresolved_outco
     assert retries == [True]
 
 
+def test_red_market_withdrawal_is_suppressed_only_for_proven_active_follow_run(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    dispatched = []
+    loop.offer_manager = SimpleNamespace(
+        cancel_offers=lambda ids, **kwargs: (
+            dispatched.append(tuple(ids))
+            or {trade_id: {"outcome": "CANCEL_FAILED"} for trade_id in ids}
+        )
+    )
+    monkeypatch.setattr(loop, "_enter_runtime_effect_phase", lambda _phase: True)
+    monkeypatch.setattr(
+        bot_loop,
+        "get_open_offers",
+        lambda cat_asset_id=None: [
+            {"trade_id": "a" * 64, "tier": "inner", "price_xch": "1"}
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_WALLET_ID", 2, raising=False)
+    monkeypatch.setattr(bot_loop.cfg, "WALLET_ID_XCH", 1, raising=False)
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 12345,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": "b" * 64,
+    }
+    policy = SimpleNamespace(
+        network="mainnet",
+        wallet_fingerprint="12345",
+        asset_id="b" * 64,
+        digest="e" * 64,
+        price_min=Decimal("0.9"),
+        price_max=Decimal("1.1"),
+    )
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": "c" * 64, "stopped": False},
+    )
+    monkeypatch.setattr(database, "get_follow_run_identity", lambda _run: identity)
+    monkeypatch.setattr(
+        "follow_run_coordinator.FollowRunCoordinator.get_state",
+        lambda _self: {
+            "state": "running",
+            "run_id": "c" * 64,
+            "policy_digest": "e" * 64,
+            "configuration_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "follow_restart_intent.read_follow_restart_intent",
+        lambda: {
+            "run_id": "c" * 64,
+            "identity": identity,
+            "configuration_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "confidence_override.current_configuration_digest", lambda: "d" * 64
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "fingerprint": 12345,
+            "network_id": "mainnet",
+            "has_secrets": True,
+        },
+    )
+    loop._override_protected_trade_ids = lambda: set()
+
+    assert loop._apply_market_withdrawal(
+        SimpleNamespace(cancel_tiers=("inner",), reason_code="MARKET_RED")
+    ) == 0
+    assert dispatched == []
+
+
+def test_follow_red_suppression_requires_live_offer_inside_approved_range(
+    monkeypatch,
+):
+    import bot_loop
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    policy = SimpleNamespace(
+        network="mainnet",
+        wallet_fingerprint="12345",
+        asset_id="b" * 64,
+        price_min=Decimal("0.9"),
+        price_max=Decimal("1.1"),
+    )
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+
+    assert loop._active_follow_red_withdrawal_protected(
+        [{"price_xch": "1.2"}]
+    ) is False
+
+
+def test_follow_red_withdrawal_proof_fails_closed_on_wallet_fingerprint_mismatch(
+    monkeypatch,
+):
+    import bot_loop
+    import wallet
+
+    loop = bot_loop.BotLoop.__new__(bot_loop.BotLoop)
+    monkeypatch.setattr(bot_loop.cfg, "CAT_ASSET_ID", "b" * 64, raising=False)
+    monkeypatch.setattr(
+        database,
+        "get_active_follow_run_policy",
+        lambda: SimpleNamespace(
+            network="mainnet", wallet_fingerprint="12345", asset_id="b" * 64
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "follow_run_coordinator.FollowRunCoordinator.get_state",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        "follow_restart_intent.read_follow_restart_intent",
+        lambda: {"run_id": "c" * 64},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": "c" * 64, "stopped": False},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_follow_run_identity",
+        lambda _run: {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": 12345,
+            "wallet_id": 2,
+            "xch_wallet_id": 1,
+            "asset_id": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        wallet,
+        "get_wallet_identity",
+        lambda: {
+            "success": True,
+            "backend": "sage",
+            "fingerprint": 98765,
+            "network_id": "mainnet",
+            "has_secrets": True,
+        },
+    )
+
+    assert loop._active_follow_red_withdrawal_protected(
+        [{"price_xch": "1"}]
+    ) is False
+
+
 def test_market_withdrawal_reports_failed_dispatch_once_without_false_submission(
     monkeypatch,
 ):

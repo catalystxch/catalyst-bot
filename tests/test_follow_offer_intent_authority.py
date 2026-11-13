@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -182,6 +183,105 @@ def test_follow_ladder_labels_created_offer_with_exact_run(monkeypatch):
         follow_run_id=RUN_ID,
     )
     assert seen == [f"follow:{RUN_ID}:normal_lifecycle"]
+
+
+@pytest.mark.parametrize("coordinator_state", ["start_pending", "running"])
+def test_follow_first_offer_guard_enforces_bound_policy_before_dispatch(
+    monkeypatch, coordinator_state
+):
+    identity = {
+        "network": "mainnet",
+        "wallet_type": "sage",
+        "wallet_fingerprint": 12345,
+        "wallet_id": 2,
+        "xch_wallet_id": 1,
+        "asset_id": ASSET_ID,
+    }
+    policy = SimpleNamespace(
+        network="mainnet",
+        asset_id=ASSET_ID,
+        wallet_fingerprint="12345",
+        digest="d" * 64,
+        price_min=Decimal("0.000999"),
+        price_max=Decimal("0.0011"),
+    )
+    monkeypatch.setattr(offer_manager.cfg, "TIER_ENABLED", False)
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MIN_PRICE_XCH", Decimal("0.00001"))
+    monkeypatch.setattr(offer_manager.cfg, "HARD_MAX_PRICE_XCH", Decimal("0.01"))
+    monkeypatch.setattr(
+        database, "get_active_follow_run_policy", lambda: policy, raising=False
+    )
+    monkeypatch.setattr(database, "get_follow_run_identity", lambda _run: identity)
+    monkeypatch.setattr(
+        database,
+        "get_unexpired_follow_run_marker",
+        lambda **_kwargs: {"run_id": RUN_ID, "stopped": False},
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "current_scope",
+        lambda: {
+            **_scope(),
+            "identity": identity,
+            "configuration_sha256": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "follow_restart_intent.read_follow_restart_intent",
+        lambda: {
+            "run_id": RUN_ID,
+            "identity": identity,
+            "configuration_sha256": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "confidence_override.current_configuration_digest", lambda: "c" * 64
+    )
+    monkeypatch.setattr(
+        "follow_run_coordinator.FollowRunCoordinator.get_state",
+        lambda _self: {
+            "state": coordinator_state,
+            "run_id": RUN_ID,
+            "policy_digest": "d" * 64,
+            "configuration_sha256": "c" * 64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="FOLLOW_RUN_PRICE_OUTSIDE_APPROVED_RANGE"):
+        offer_manager.require_follow_policy_price(
+            run_id=RUN_ID,
+            asset_id=ASSET_ID,
+            candidate_price=Decimal("0.000998"),
+        )
+    assert (
+        offer_manager.require_follow_policy_price(
+            run_id=RUN_ID,
+            asset_id=ASSET_ID,
+            candidate_price=Decimal("0.001"),
+        )
+        is True
+    )
+
+
+def test_follow_requote_cold_start_propagates_run_to_creation_boundary(monkeypatch):
+    calls = []
+    manager = offer_manager.OfferManager()
+    monkeypatch.setattr(offer_manager, "get_open_offers", lambda **_kwargs: [])
+    monkeypatch.setattr(manager, "_advance_pending_refresh_lineage", lambda *_args: None)
+    monkeypatch.setattr(
+        manager,
+        "create_ladder",
+        lambda _price, _side, **kwargs: calls.append(kwargs) or [],
+    )
+
+    manager.requote_side(
+        "buy",
+        Decimal("0.001"),
+        follow_run_id=RUN_ID,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["follow_run_id"] == RUN_ID
 
 
 def test_follow_book_opportunity_retains_its_classification(monkeypatch):

@@ -274,6 +274,97 @@ def require_active_follow_intent_authority(
     return {"run_id": parts[1], "classification": parts[2]}
 
 
+def require_follow_policy_price(
+    *, run_id: str, asset_id: str, candidate_price: Decimal
+) -> bool | None:
+    """Require each Follow quote to stay inside the active reviewed range."""
+    if type(candidate_price) is not Decimal or not candidate_price.is_finite():
+        raise ValueError("FOLLOW_RUN_PRICE_INVALID")
+    try:
+        from follow_run_coordinator import FollowRunCoordinator
+
+        coordinator_reader = FollowRunCoordinator()
+        state_reader = getattr(coordinator_reader, "read_state", None)
+        coordinator = (
+            state_reader() if callable(state_reader) else coordinator_reader.get_state()
+        )
+        if (
+            type(coordinator) is not dict
+            or coordinator.get("state") not in {"start_pending", "running"}
+            or coordinator.get("run_id") is None
+        ):
+            return None  # legacy approved runs retain their existing guards
+        if coordinator.get("run_id") != run_id:
+            raise ValueError("FOLLOW_RUN_COORDINATOR_AUTHORITY_MISMATCH")
+        policy = database.get_active_follow_run_policy()
+        from confidence_override import current_scope
+
+        scope = current_scope()
+        from confidence_override import current_configuration_digest
+
+        current_digest = current_configuration_digest()
+        marker = database.get_unexpired_follow_run_marker(
+            asset_id=asset_id, now_epoch=int(time.time())
+        )
+        identity = database.get_follow_run_identity(run_id)
+    except Exception as exc:
+        raise ValueError("FOLLOW_RUN_POLICY_AUTHORITY_UNAVAILABLE") from exc
+    if policy is None:
+        raise ValueError("FOLLOW_RUN_POLICY_REQUIRED")
+    if (
+        type(scope) is not dict
+        or coordinator.get("policy_digest") != getattr(policy, "digest", None)
+        or coordinator.get("configuration_sha256")
+        != current_digest
+        or coordinator.get("configuration_sha256")
+        != scope.get("configuration_sha256")
+        or scope.get("follow_run_id") != run_id
+        or scope.get("identity") != identity
+        or type(marker) is not dict
+        or marker.get("run_id") != run_id
+        or marker.get("stopped") is not False
+        or type(identity) is not dict
+        or identity.get("asset_id") != asset_id
+        or identity.get("wallet_type") != "sage"
+        or identity.get("network") != getattr(policy, "network", None)
+        or identity.get("asset_id") != getattr(policy, "asset_id", None)
+        or str(identity.get("wallet_fingerprint"))
+        != str(getattr(policy, "wallet_fingerprint", None))
+    ):
+        raise ValueError("FOLLOW_RUN_POLICY_AUTHORITY_MISMATCH")
+    price_min = getattr(policy, "price_min", None)
+    price_max = getattr(policy, "price_max", None)
+    if (
+        type(price_min) is not Decimal
+        or type(price_max) is not Decimal
+        or not price_min.is_finite()
+        or not price_max.is_finite()
+        or not price_min <= candidate_price <= price_max
+    ):
+        raise ValueError("FOLLOW_RUN_PRICE_OUTSIDE_APPROVED_RANGE")
+    return True
+
+
+def _follow_candidate_price(offer_dict: dict, side: str) -> Decimal:
+    """Compute the exact wallet-amount ratio represented by one offer."""
+    xch_wallet_id = str(getattr(cfg, "WALLET_ID_XCH", 1))
+    cat_wallet_id = str(getattr(cfg, "CAT_WALLET_ID", 2))
+    if side == "buy":
+        xch_mojos = -int(offer_dict[xch_wallet_id])
+        cat_atoms = int(offer_dict[cat_wallet_id])
+    elif side == "sell":
+        xch_mojos = int(offer_dict[xch_wallet_id])
+        cat_atoms = -int(offer_dict[cat_wallet_id])
+    else:
+        raise ValueError("FOLLOW_RUN_SIDE_INVALID")
+    cat_scale = 10 ** int(getattr(cfg, "CAT_DECIMALS", 3))
+    if xch_mojos <= 0 or cat_atoms <= 0 or cat_scale <= 0:
+        raise ValueError("FOLLOW_RUN_OFFER_AMOUNTS_INVALID")
+    return Decimal(xch_mojos) * Decimal(cat_scale) / (
+        Decimal(1_000_000_000_000) * Decimal(cat_atoms)
+    )
+
+
 def _bounded_offer_max_time(offer_max_time: int, cap: int, *, now_second: int) -> int:
     """Keep a campaign offer's wallet expiry inside its approved window."""
 
@@ -3312,6 +3403,15 @@ class OfferManager:
                 offer_max_time=intent.offer_max_time,
                 side=intent.side,
             )
+            if intent.purpose.startswith("follow:"):
+                run_id = intent.purpose.split(":", 2)[1]
+                require_follow_policy_price(
+                    run_id=run_id,
+                    asset_id=intent.asset_id,
+                    candidate_price=_follow_candidate_price(
+                        intent.offer_dict(), intent.side
+                    ),
+                )
             wallet_call_started = True
             result = wallet.create_offer(
                 intent.offer_dict(),
@@ -6122,6 +6222,7 @@ class OfferManager:
         allowed_tiers: set = None,
         force_cancel_storm: bool = False,
         market_confidence: Any = None,
+        follow_run_id: Optional[str] = None,
     ) -> List[Dict]:
         """Single-pass requote: cancel old offers, then create replacements.
 
@@ -6293,6 +6394,7 @@ class OfferManager:
                 price_cap=price_cap,
                 price_floor=price_floor,
                 market_confidence=market_confidence,
+                follow_run_id=follow_run_id,
             )
             if dexie_manager and fresh:
                 for offer in fresh:
@@ -6456,6 +6558,7 @@ class OfferManager:
             price_floor=price_floor,
             refresh_parent_ids=refresh_parent_ids,
             market_confidence=market_confidence,
+            follow_run_id=follow_run_id,
         )
         if dexie_manager:
             for offer in new_offers:
