@@ -21678,6 +21678,7 @@
 
         // Track whether trading settings are impossible (blocks save)
         let tradingSettingsImpossible = false;
+        let tradingSettingsFundableEstimate = { buy: 0, sell: 0 };
 
         function getCoinPrepHeadroomPct(value, fallback = 10) {
             const parsed = parseFloat(value);
@@ -23651,6 +23652,7 @@
                 warning.textContent = 'Bootstrap campaign active: Coin Prep is bound to the exact saved campaign revision and budgets; the legacy Smart Settings coin plan is bypassed.';
             }
             tradingSettingsImpossible = false;
+            tradingSettingsFundableEstimate = { buy: 0, sell: 0 };
             return true;
         }
 
@@ -23679,6 +23681,7 @@
             const midPrice = (window._smartMidPrice > 0) ? window._smartMidPrice : _liveMid;
 
             tradingSettingsImpossible = false;
+            tradingSettingsFundableEstimate = { buy: 0, sell: 0 };
             const tradeSizeWarn = document.getElementById('tradeSizeWarning');
             const maxBuyWarn = document.getElementById('maxBuyWarning');
             const maxSellWarn = document.getElementById('maxSellWarning');
@@ -23928,8 +23931,14 @@
 
             if (coinPrepImpossible) {
                 tradingSettingsImpossible = true;
+                tradingSettingsFundableEstimate = {
+                    buy: maxBuy > 0 && _botXchForCoinPrep > 0
+                        ? Math.min(maxBuy, Math.floor(maxBuy * xchAvailable / _botXchForCoinPrep)) : 0,
+                    sell: maxSell > 0 && _botCatForCoinPrep > 0
+                        ? Math.min(maxSell, Math.floor(maxSell * catAvailable / _botCatForCoinPrep)) : 0,
+                };
                 showInputWarning(coinPrepWarn, 'critical',
-                    `? <strong>Coin prep impossible:</strong> Not enough balance to create all the coins needed.<br>${coinPrepImpossibleReasons.join('<br>')}<br><br>Reduce max offers, headroom, spare multiplier, or trade size to fit your balance.`);
+                    `? <strong>Target exceeds current funding:</strong> ${coinPrepImpossibleReasons.join('<br>')}<br><br>Requested target ${maxBuy} BUY / ${maxSell} SELL; currently fundable estimate ${tradingSettingsFundableEstimate.buy} BUY / ${tradingSettingsFundableEstimate.sell} SELL. Estimate uses current balances and may change after preparation.`);
             } else if (tradingSettingsImpossible) {
                 showInputWarning(coinPrepWarn, 'critical',
                     `? <strong>Cannot proceed:</strong> Your settings require more funds than you have. Reduce trade size, number of offers, headroom, or reserves.`);

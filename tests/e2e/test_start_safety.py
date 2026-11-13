@@ -269,6 +269,9 @@ def test_coin_prep_pool_exceeding_post_reserve_balance_blocks_save(page):
     assert result["valid"] is False
     assert result["critical"] == "true"
     assert "available after reserve" in result["warning"]
+    assert "Requested target 4 BUY / 4 SELL" in result["warning"]
+    assert "currently fundable estimate" in result["warning"]
+    assert "may change after preparation" in result["warning"]
     assert "Bot will still work" not in result["warning"]
 
 
