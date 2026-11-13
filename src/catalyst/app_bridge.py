@@ -1479,6 +1479,24 @@ class AppBridge:
         return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
+    def get_single_approval_follow_run_status(self, _body=None):
+        """Read only the durable setup stage for native UI recovery."""
+        from follow_run_coordinator import FollowRunCoordinator
+
+        try:
+            state = FollowRunCoordinator().get_state()
+        except ValueError:
+            return {"success": False, "reason": "FOLLOW_RUN_COORDINATOR_STATE_INVALID"}
+        if state is None:
+            return {"success": True, "state": "none"}
+        return {
+            "success": True,
+            "session_id": state["session_id"],
+            "state": state["state"],
+            "recoverable_reason": state["recoverable_reason"],
+        }
+
+    @_safe
     def get_single_approval_follow_run_defaults(self, _body=None):
         """Return exact wallet-backed funding terms for a single native review."""
         from follow_run_defaults import exact_funding_defaults
@@ -2851,6 +2869,7 @@ _APP_BRIDGE_CONTROL_METHODS = {
     "toggle_console",
 }
 _APP_BRIDGE_READ_ONLY_METHODS = {
+    "get_single_approval_follow_run_status",
     "get_single_approval_follow_run_defaults",
     "get_cancel_latch_review",
     "check_resume",

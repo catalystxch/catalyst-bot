@@ -56,6 +56,28 @@ def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
     assert result["dispatch_authorized"] is False
 
 
+def test_native_status_reports_durable_setup_without_dispatch(bridge_world, monkeypatch):
+    import app_bridge
+    import follow_run_coordinator
+
+    monkeypatch.setattr(
+        follow_run_coordinator.FollowRunCoordinator,
+        "get_state",
+        lambda self: {
+            "session_id": "a" * 64,
+            "state": "preparing",
+            "recoverable_reason": None,
+        },
+    )
+    result = app_bridge.AppBridge().get_single_approval_follow_run_status()
+    assert result == {
+        "success": True,
+        "session_id": "a" * 64,
+        "state": "preparing",
+        "recoverable_reason": None,
+    }
+
+
 @pytest.fixture
 def bridge_world(monkeypatch):
     import app_bridge
