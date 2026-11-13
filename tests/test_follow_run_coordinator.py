@@ -1,36 +1,68 @@
 import json
-from types import SimpleNamespace
+from decimal import Decimal
 
 import pytest
 
 import database
+from follow_run_policy import FollowRunPolicy
 from follow_run_coordinator import FollowRunCoordinator
 
 
-POLICY_DIGEST = "a" * 64
 CONFIGURATION_SHA256 = "b" * 64
 AUTHORITY_RUN_ID = "e" * 64
 IDENTITY = {
     "network": "mainnet",
     "wallet_type": "sage",
-    "wallet_fingerprint": "fingerprint-123",
+    "wallet_fingerprint": 123,
     "wallet_id": 2,
     "xch_wallet_id": 1,
     "asset_id": "a" * 64,
+    "ticker": "MZ",
 }
+
+
+def _approved_policy():
+    return FollowRunPolicy(
+        wallet_fingerprint="123",
+        network="mainnet",
+        asset_id="a" * 64,
+        buy_target=100,
+        sell_target=100,
+        price_anchor=Decimal("0.0123"),
+        price_min=Decimal("0.011"),
+        price_max=Decimal("0.013"),
+        maximum_fee_mojos_per_tx=2_000_000,
+        fee_coin_principal_mojos=8_000_000_000,
+        xch_reserve_mojos=1_000_000_000,
+        cat_reserve_atoms=25_000,
+        maximum_trade_xch_mojos=100_000_000_000,
+        maximum_trade_cat_atoms=1_000_000_000,
+    )
+
+
+POLICY_DIGEST = _approved_policy().digest
+PREP_APPROVAL_ID = "f" * 64
+PREP_SESSION_ID = "9" * 64
+
+
+def prep_snapshot(approval_id):
+    return {
+        "identity": IDENTITY,
+        "scope": {
+            **IDENTITY,
+            "campaign_id": None,
+            "session_id": PREP_SESSION_ID,
+        },
+        "approval": {"approval_id": approval_id, "unbounded": False},
+        "recovery_only": False,
+        "recovery_action": None,
+    }
 
 
 @pytest.fixture
 def saved_state(monkeypatch):
     settings = {}
-    policy = SimpleNamespace(
-        digest=POLICY_DIGEST,
-        network="mainnet",
-        wallet_fingerprint="fingerprint-123",
-        asset_id="a" * 64,
-        buy_target=100,
-        sell_target=100,
-    )
+    policy = _approved_policy()
     active = {"policy": policy}
     monkeypatch.setattr(
         database, "get_active_follow_run_policy", lambda: active["policy"]
@@ -53,6 +85,44 @@ def saved_state(monkeypatch):
         return True
 
     monkeypatch.setattr(database, "clear_active_follow_run_policy", clear_policy)
+    import coin_prep_fee_runtime
+    import confidence_override
+
+    configuration = {
+        "network": "mainnet",
+        "WALLET_TYPE": "sage",
+        "CAT_ASSET_ID": "a" * 64,
+        "CAT_WALLET_ID": 2,
+        "WALLET_ID_XCH": 1,
+        "CAT_TICKER_ID": "MZ",
+        "MAX_ACTIVE_BUY_OFFERS": 100,
+        "MAX_ACTIVE_SELL_OFFERS": 100,
+    }
+    monkeypatch.setattr(coin_prep_fee_runtime, "_configuration", lambda: configuration)
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "_verified_identity",
+        lambda _config: {
+            "network": "mainnet",
+            "wallet_type": "sage",
+            "wallet_fingerprint": 123,
+        },
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        prep_snapshot,
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "current_configuration_digest",
+        lambda: CONFIGURATION_SHA256,
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "_configuration_digest",
+        lambda _config: CONFIGURATION_SHA256,
+    )
     monkeypatch.setattr(
         database,
         "get_setting",
@@ -342,4 +412,129 @@ def test_stop_marks_existing_authority_stopped_without_offer_cancellation(
     assert stopped_authorities == [
         {"run_id": AUTHORITY_RUN_ID, "stopped_at_epoch": 103}
     ]
+
+
+def test_prep_approval_binding_persists_exact_approval_and_session(saved_state):
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+
+    bound = service.bind_prep_approval(
+        **binding(run), approval_id=PREP_APPROVAL_ID, now_epoch=101
+    )
+
+    assert bound["fee_approval_id"] == PREP_APPROVAL_ID
+    assert bound["fee_approval_session_id"] == PREP_SESSION_ID
+    assert service.read_state() == bound
+
+
+def test_prep_approval_binding_is_idempotent_and_cannot_be_replaced(
+    saved_state, monkeypatch
+):
+    import coin_prep_fee_runtime
+
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+    args = {**binding(run), "approval_id": PREP_APPROVAL_ID}
+    first = service.bind_prep_approval(**args, now_epoch=101)
+    assert service.bind_prep_approval(**args, now_epoch=102) == first
+
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        lambda approval_id: {
+            **prep_snapshot(approval_id),
+            "scope": {
+                **IDENTITY,
+                "campaign_id": None,
+                "session_id": "8" * 64,
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="FOLLOW_RUN_PREP_FEE_APPROVAL_CHANGED"):
+        service.bind_prep_approval(
+            **binding(run), approval_id="7" * 64, now_epoch=103
+        )
+    assert service.read_state()["fee_approval_id"] == PREP_APPROVAL_ID
+
+
+def test_prep_approval_binding_rejects_wrong_identity_or_config(
+    saved_state, monkeypatch
+):
+    import coin_prep_fee_runtime
+    import confidence_override
+
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+    monkeypatch.setattr(
+        coin_prep_fee_runtime,
+        "read_approved_prep_fee_snapshot",
+        lambda approval_id: {
+            **prep_snapshot(approval_id),
+            "identity": {**IDENTITY, "wallet_fingerprint": 456},
+        },
+    )
+    with pytest.raises(ValueError, match="FOLLOW_RUN_PREP_FEE_BINDING_INVALID"):
+        service.bind_prep_approval(
+            **binding(run), approval_id=PREP_APPROVAL_ID, now_epoch=101
+        )
+
+    monkeypatch.setattr(confidence_override, "current_configuration_digest", lambda: "c" * 64)
+    with pytest.raises(ValueError, match="FOLLOW_RUN_AUTHORITY_CHANGED"):
+        service.bind_prep_approval(
+            **binding(run), approval_id=PREP_APPROVAL_ID, now_epoch=102
+        )
+
+
+def test_legacy_coordinator_state_migrates_without_fee_approval(saved_state):
+    service = coordinator()
+    old = {
+        "version": 1,
+        "session_id": "d" * 64,
+        "run_id": None,
+        "policy_digest": POLICY_DIGEST,
+        "configuration_sha256": CONFIGURATION_SHA256,
+        "state": "preparing",
+        "updated_at_epoch": 100,
+        "recoverable_reason": None,
+        "unknown_effect": False,
+    }
+    saved_state[service.SETTING_KEY] = json.dumps(old)
+
+    migrated = service.read_state()
+
+    assert migrated["fee_approval_id"] is None
+    assert migrated["fee_approval_session_id"] is None
+    assert json.loads(saved_state[service.SETTING_KEY]) == migrated
+
+
+def test_partial_fee_binding_record_fails_closed(saved_state):
+    service = coordinator()
+    malformed = {
+        "version": 1,
+        "session_id": "d" * 64,
+        "run_id": None,
+        "policy_digest": POLICY_DIGEST,
+        "configuration_sha256": CONFIGURATION_SHA256,
+        "state": "preparing",
+        "updated_at_epoch": 100,
+        "recoverable_reason": None,
+        "unknown_effect": False,
+        "fee_approval_id": PREP_APPROVAL_ID,
+    }
+    saved_state[service.SETTING_KEY] = json.dumps(malformed)
+
+    with pytest.raises(ValueError, match="FOLLOW_RUN_COORDINATOR_STATE_INVALID"):
+        service.read_state()
 

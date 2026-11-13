@@ -153,11 +153,20 @@ def test_confirm_rederives_evidence_and_persists_only_explicit_confirmation(
     bridge_world, monkeypatch
 ):
     bridge, observed, _config_hash, database = bridge_world
+    from follow_run_coordinator import FollowRunCoordinator
+
     persisted = []
+    started_sessions = []
     monkeypatch.setattr(
         database,
         "record_active_follow_run_policy",
         lambda policy: persisted.append(policy) or True,
+    )
+    monkeypatch.setattr(
+        FollowRunCoordinator,
+        "begin_run",
+        lambda _self, **kwargs: started_sessions.append(kwargs)
+        or {"session_id": "d" * 64, "state": "prep_pending"},
     )
     terms = policy_terms()
     review = bridge.prepare_single_approval_follow_run_review({"policy": terms})
@@ -173,7 +182,15 @@ def test_confirm_rederives_evidence_and_persists_only_explicit_confirmation(
 
     assert result["success"] is True
     assert result["dispatch_authorized"] is False
+    assert result["session_id"] == "d" * 64
+    assert result["state"] == "prep_pending"
     assert len(persisted) == 1
+    assert started_sessions == [
+        {
+            "policy_digest": persisted[0].digest,
+            "configuration_sha256": CONFIGURATION_SHA256,
+        }
+    ]
     assert persisted[0].wallet_fingerprint == "123"
     assert observed["identity_calls"] == 2
 

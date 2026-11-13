@@ -44,20 +44,33 @@ class FollowRunCoordinator:
             return None
         try:
             value = json.loads(raw)
+            current_keys = {
+                "version",
+                "session_id",
+                "run_id",
+                "policy_digest",
+                "configuration_sha256",
+                "state",
+                "updated_at_epoch",
+                "recoverable_reason",
+                "unknown_effect",
+                "fee_approval_id",
+                "fee_approval_session_id",
+            }
+            legacy_keys = current_keys - {
+                "fee_approval_id",
+                "fee_approval_session_id",
+            }
+            migrated = type(value) is dict and set(value) == legacy_keys
+            if migrated:
+                value = {
+                    **value,
+                    "fee_approval_id": None,
+                    "fee_approval_session_id": None,
+                }
             if (
                 type(value) is not dict
-                or set(value)
-                != {
-                    "version",
-                    "session_id",
-                    "run_id",
-                    "policy_digest",
-                    "configuration_sha256",
-                    "state",
-                    "updated_at_epoch",
-                    "recoverable_reason",
-                    "unknown_effect",
-                }
+                or set(value) != current_keys
                 or type(value["version"]) is not int
                 or value["version"] != _VERSION
                 or not self._digest(value["session_id"])
@@ -83,6 +96,18 @@ class FollowRunCoordinator:
                 )
                 or type(value["unknown_effect"]) is not bool
                 or (
+                    value["fee_approval_id"] is not None
+                    and not self._digest(value["fee_approval_id"])
+                )
+                or (
+                    value["fee_approval_session_id"] is not None
+                    and not self._digest(value["fee_approval_session_id"])
+                )
+                or (
+                    (value["fee_approval_id"] is None)
+                    != (value["fee_approval_session_id"] is None)
+                )
+                or (
                     value["state"] in {"recoverable_error", "stopped"}
                     and value["recoverable_reason"] is None
                 )
@@ -99,6 +124,8 @@ class FollowRunCoordinator:
                 )
             ):
                 raise ValueError("invalid coordinator record")
+            if migrated:
+                return self._write(value)
             return value
         except Exception as exc:
             raise ValueError("FOLLOW_RUN_COORDINATOR_STATE_INVALID") from exc
@@ -161,6 +188,8 @@ class FollowRunCoordinator:
                     "updated_at_epoch": now,
                     "recoverable_reason": None,
                     "unknown_effect": False,
+                    "fee_approval_id": None,
+                    "fee_approval_session_id": None,
                 }
             )
 
@@ -294,6 +323,131 @@ class FollowRunCoordinator:
                 now_epoch=now,
             )
             return self._write({**current, "run_id": run_id, "updated_at_epoch": now})
+
+    def bind_prep_approval(
+        self,
+        *,
+        session_id: str,
+        policy_digest: str,
+        configuration_sha256: str,
+        approval_id: str,
+        now_epoch: int | None = None,
+    ) -> dict:
+        """Bind a freshly verified standalone prep fee approval to this run."""
+        if not self._digest(approval_id):
+            raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+        now = self._now(now_epoch)
+        import confidence_override
+        import database
+        import coin_prep_fee_runtime
+
+        with _LOCK:
+            current = self._bound(session_id, policy_digest, configuration_sha256)
+            if current["state"] not in {"prep_pending", "preparing"}:
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+            if current["unknown_effect"] or current["run_id"] is not None:
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+            if (
+                current["fee_approval_id"] is not None
+                and current["fee_approval_id"] != approval_id
+            ):
+                raise ValueError("FOLLOW_RUN_PREP_FEE_APPROVAL_CHANGED")
+
+            try:
+                active_policy = database.get_active_follow_run_policy()
+                configuration = coin_prep_fee_runtime._configuration()
+                current_config_sha256 = (
+                    confidence_override.current_configuration_digest()
+                )
+                if (
+                    active_policy is None
+                    or active_policy.digest != policy_digest
+                    or current_config_sha256 != configuration_sha256
+                    or confidence_override._configuration_digest(configuration)
+                    != configuration_sha256
+                    or configuration.get("MAX_ACTIVE_BUY_OFFERS")
+                    != active_policy.buy_target
+                    or configuration.get("MAX_ACTIVE_SELL_OFFERS")
+                    != active_policy.sell_target
+                ):
+                    raise ValueError("FOLLOW_RUN_AUTHORITY_CHANGED")
+                base_identity = coin_prep_fee_runtime._verified_identity(configuration)
+                expected_identity = {
+                    **base_identity,
+                    "asset_id": str(configuration.get("CAT_ASSET_ID") or "")
+                    .strip()
+                    .lower()
+                    .removeprefix("0x"),
+                    "wallet_id": configuration.get("CAT_WALLET_ID"),
+                    "xch_wallet_id": configuration.get("WALLET_ID_XCH"),
+                    "ticker": configuration.get("CAT_TICKER_ID"),
+                }
+                approved = coin_prep_fee_runtime.read_approved_prep_fee_snapshot(
+                    approval_id
+                )
+            except ValueError as exc:
+                reason = str(exc)
+                if reason == "FOLLOW_RUN_AUTHORITY_CHANGED":
+                    raise
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID") from exc
+            except Exception as exc:
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID") from exc
+
+            scope = approved.get("scope") if type(approved) is dict else None
+            identity = approved.get("identity") if type(approved) is dict else None
+            approval = approved.get("approval") if type(approved) is dict else None
+            prep_session_id = scope.get("session_id") if type(scope) is dict else None
+            scope_identity = (
+                {key: scope.get(key) for key in expected_identity}
+                if type(scope) is dict
+                else None
+            )
+            if (
+                type(expected_identity) is not dict
+                or type(expected_identity.get("wallet_fingerprint")) is not int
+                or not self._digest(expected_identity.get("asset_id"))
+                or identity != expected_identity
+                or scope_identity != expected_identity
+                or scope.get("campaign_id") is not None
+                or not self._digest(prep_session_id)
+                or type(approval) is not dict
+                or approval.get("approval_id") != approval_id
+                or type(approval.get("unbounded")) is not bool
+                or approved.get("recovery_only") is True
+                or approved.get("recovery_action") is not None
+                or expected_identity.get("network") != active_policy.network
+                or str(expected_identity.get("wallet_fingerprint"))
+                != active_policy.wallet_fingerprint
+                or expected_identity.get("asset_id") != active_policy.asset_id
+            ):
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+
+            if current["fee_approval_id"] == approval_id:
+                if current["fee_approval_session_id"] != prep_session_id:
+                    raise ValueError("FOLLOW_RUN_PREP_FEE_APPROVAL_CHANGED")
+                return current
+            candidate = {
+                **current,
+                "fee_approval_id": approval_id,
+                "fee_approval_session_id": prep_session_id,
+                "updated_at_epoch": now,
+            }
+            try:
+                from follow_prep_fee_authority import verified_prep_fee_cap
+
+                cap = verified_prep_fee_cap(
+                    policy=active_policy,
+                    coordinator_state=candidate,
+                    current_configuration_sha256=configuration_sha256,
+                    approved_snapshot=approved,
+                    requested_approval_id=approval_id,
+                    run_session_id=session_id,
+                )
+            except Exception as exc:
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID") from exc
+            if cap != active_policy.maximum_fee_mojos_per_tx:
+                raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_INVALID")
+            return self._write(candidate)
 
     def stop_run(
         self,

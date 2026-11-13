@@ -1563,6 +1563,18 @@ class AppBridge:
                 current_configuration_sha256=configuration_sha256,
                 current_red_reasons=red_reasons,
             )
+            if result.get("success") is True:
+                from follow_run_coordinator import FollowRunCoordinator
+
+                coordinator_state = FollowRunCoordinator().begin_run(
+                    policy_digest=result["policy_digest"],
+                    configuration_sha256=configuration_sha256,
+                )
+                result = {
+                    **result,
+                    "session_id": coordinator_state["session_id"],
+                    "state": coordinator_state["state"],
+                }
         except (TypeError, ValueError, KeyError) as exc:
             reason = str(exc)
             allowed = {
@@ -1571,6 +1583,10 @@ class AppBridge:
                 "FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE",
                 "FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID",
                 "FOLLOW_RUN_REVIEW_CONFIGURATION_INVALID",
+                "FOLLOW_RUN_POLICY_NOT_APPROVED",
+                "FOLLOW_RUN_AUTHORITY_CHANGED",
+                "FOLLOW_RUN_COORDINATOR_PERSIST_FAILED",
+                "FOLLOW_RUN_COORDINATOR_STATE_INVALID",
             }
             return {
                 "success": False,
