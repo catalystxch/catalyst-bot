@@ -140,3 +140,13 @@ def restart_intent_matches(
         and _valid_identity(identity)
         and _digest(configuration_sha256)
     )
+
+
+def automatic_resume_empty_book(automatic_resume: bool, snapshot: object) -> bool:
+    """Allow empty-book resume only from a complete, verified snapshot."""
+    return bool(
+        automatic_resume
+        and type(snapshot) is tuple
+        and len(snapshot) == 3
+        and all(type(rows) is list and not rows for rows in snapshot)
+    )

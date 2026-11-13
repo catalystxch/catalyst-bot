@@ -6,6 +6,7 @@ import pytest
 
 import database
 from follow_restart_intent import (
+    automatic_resume_empty_book,
     bind_follow_restart_intent,
     clear_follow_restart_intent,
     read_follow_restart_intent,
@@ -111,3 +112,19 @@ def test_failed_persistence_is_not_reported_as_saved(monkeypatch):
             configuration_sha256=CONFIG,
             now_epoch=1234,
         )
+
+
+@pytest.mark.parametrize(
+    ("automatic", "snapshot", "expected"),
+    [
+        (True, ([], [], []), True),
+        (True, ([{"trade_id": "offer"}], [], []), False),
+        (False, ([], [], []), False),
+        (True, None, False),
+        (True, ([], [], None), False),
+    ],
+)
+def test_only_verified_empty_auto_resume_book_uses_fresh_start_readiness(
+    automatic, snapshot, expected
+):
+    assert automatic_resume_empty_book(automatic, snapshot) is expected

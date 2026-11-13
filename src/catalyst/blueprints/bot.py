@@ -62,24 +62,31 @@ class _BootstrapAuthorityMismatch(Exception):
     """An active campaign belongs to a different wallet authority."""
 
 
-def _fresh_start_wallet_offer_book(bot) -> bool:
-    """Require a new Sage offer read before accepting any bot-start caller."""
+def _fresh_start_wallet_offer_snapshot(bot):
+    """Return one verified live offer snapshot, or None when unavailable."""
     manager = getattr(bot, "offer_manager", None)
     sync_with_meta = getattr(manager, "sync_from_wallet_with_meta", None)
     if not callable(sync_with_meta):
-        return False
+        return None
     try:
         offers, meta = sync_with_meta()
     except Exception:
-        return False
-    return (
+        return None
+    if not (
         type(offers) is tuple
         and len(offers) == 3
         and all(type(rows) is list for rows in offers)
         and type(meta) is dict
         and meta.get("fresh") is True
         and meta.get("using_cache") is False
-    )
+    ):
+        return None
+    return offers
+
+
+def _fresh_start_wallet_offer_book(bot) -> bool:
+    """Require a new Sage offer read before accepting any bot-start caller."""
+    return _fresh_start_wallet_offer_snapshot(bot) is not None
 
 
 def _enforce_post_tibet_start_migration(asset_id: str) -> dict[str, Any]:
@@ -1148,8 +1155,10 @@ def api_bot_start():
                 }
             ), 400
 
+    fresh_wallet_offer_snapshot = None
     if not errors:
-        if not _fresh_start_wallet_offer_book(bot):
+        fresh_wallet_offer_snapshot = _fresh_start_wallet_offer_snapshot(bot)
+        if fresh_wallet_offer_snapshot is None:
             error = "Live wallet offers could not be verified; retry bot start"
             return jsonify(
                 {
@@ -1244,8 +1253,16 @@ def api_bot_start():
                 }
             ), 409
         if bootstrap_campaign is None:
+            from follow_restart_intent import automatic_resume_empty_book
+
+            empty_auto_resume_book = automatic_resume_empty_book(
+                automatic_resume, fresh_wallet_offer_snapshot
+            )
             follow_readiness = _reviewed_follow_start_readiness(
-                cfg, resume_existing_offers=resume_existing_offers
+                cfg,
+                resume_existing_offers=(
+                    resume_existing_offers and not empty_auto_resume_book
+                ),
             )
             if follow_readiness.get("ready") is not True:
                 reason = follow_readiness.get("reason") or "FOLLOW_REVIEW_UNAVAILABLE"
@@ -1282,6 +1299,28 @@ def api_bot_start():
                     return jsonify(
                         {"success": False, "reason": "FOLLOW_RESTART_INTENT_MISMATCH"}
                     ), 409
+                if empty_auto_resume_book:
+                    try:
+                        from wallet import get_pending_transactions, get_wallet_sync_status
+
+                        sync = get_wallet_sync_status()
+                        pending = get_pending_transactions()
+                    except Exception:
+                        sync, pending = None, None
+                    if not (
+                        type(sync) is dict
+                        and sync.get("reachable") is True
+                        and sync.get("synced") is True
+                        and sync.get("sync_state") == "synced"
+                        and type(pending) is list
+                        and not pending
+                    ):
+                        return jsonify(
+                            {
+                                "success": False,
+                                "reason": "FOLLOW_RESUME_WALLET_NOT_READY",
+                            }
+                        ), 409
             # Do not enter an empty Running state while RED Follow consent is
             # absent. The native client can now present the scoped review
             # before any trading loop starts.

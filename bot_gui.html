@@ -32459,6 +32459,7 @@
         let _resumeSessionAttemptId = 0;
         let _resumeSessionNeedsVerification = false;
         let _updateAutoResumeAttempted = false;
+        let _automaticResumeRetryTimer = null;
         let _botStarting = false;  // Guards button text during startup
         let _botStartingAt = 0;    // Timestamp when _botStarting was set — safety timeout
         
@@ -32527,6 +32528,16 @@
             }
         }
 
+        function scheduleAutomaticResumeRetry() {
+            if (_automaticResumeRetryTimer !== null || _resumeHandled) return;
+            _automaticResumeRetryTimer = setTimeout(async () => {
+                _automaticResumeRetryTimer = null;
+                if (_startupGatesComplete && !_resumeHandled) {
+                    await checkForResume();
+                }
+            }, 30000);
+        }
+
         async function checkForResume() {
             if (_resumeHandled) return false;
             
@@ -32540,7 +32551,11 @@
                     return null;
                 }
                 
-                if (!data.can_resume) {
+                if (!data.can_resume && data.auto_resume_requested !== true) {
+                    if (data.automatic_resume_pending === true) {
+                        scheduleAutomaticResumeRetry();
+                        return false;
+                    }
                     // Don't touch session state when the bot is already mid-run
                     // (page refresh).  The running state is correct — no "fresh start"
                     // needed and we must not overwrite the .fresh_start_chosen flag.
@@ -32589,6 +32604,14 @@
                     } catch (error) {
                         showToast('Automatic resume could not verify the wallet.', 'warning');
                     }
+                }
+
+                if (!data.can_resume) {
+                    // An approved empty book may be resumed automatically, but
+                    // it has no live offers for the manual resume modal.
+                    showToast('Automatic restart is waiting for wallet readiness. CATalyst will retry.', 'warning');
+                    scheduleAutomaticResumeRetry();
+                    return false;
                 }
 
                 setResumeSessionSummary(data);

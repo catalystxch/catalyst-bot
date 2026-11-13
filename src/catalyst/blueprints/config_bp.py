@@ -1253,15 +1253,15 @@ def api_check_resume():
         else:
             from wallet import get_all_offers, classify_offers_from_list
 
-            offers = get_all_offers(include_completed=False, start=0, end=200)
-            if not offers:
+            offers = get_all_offers(include_completed=False, start=0, end=10000)
+            if type(offers) is not list:
                 return jsonify(
                     {
                         "can_resume": False,
                         "has_session": False,
                         "buy_count": 0,
                         "sell_count": 0,
-                        "reason": "no offers",
+                        "reason": "wallet_offer_query_not_fresh",
                     }
                 )
 
@@ -1388,17 +1388,62 @@ def api_check_resume():
         except Exception as e:
             print(f"[RESUME] Gap closer detection error: {e}", flush=True)
 
-        from follow_restart_intent import read_follow_restart_intent
+        auto_resume_requested = False
+        from follow_restart_intent import (
+            read_follow_restart_intent,
+            restart_intent_matches,
+        )
 
         restart_intent = read_follow_restart_intent()
+        automatic_resume_pending = bool(
+            type(restart_intent) is dict
+            and type(asset_id) is str
+            and restart_intent.get("identity", {}).get("asset_id") == asset_id
+        )
+        if restart_intent and type(asset_id) is str and len(asset_id) == 64:
+            try:
+                from wallet import (
+                    get_pending_transactions,
+                    get_wallet_sync_status,
+                    preflight_wallet_identity,
+                )
+                from follow_principal import reviewed_follow_start_readiness
+
+                wallet_identity = preflight_wallet_identity()
+                sync = get_wallet_sync_status()
+                pending = get_pending_transactions()
+                follow_readiness = reviewed_follow_start_readiness(
+                    cfg, resume_existing_offers=total > 0
+                )
+                scope = follow_readiness.get("scope")
+                auto_resume_requested = bool(
+                    type(wallet_identity) is dict
+                    and wallet_identity.get("success") is True
+                    and type(sync) is dict
+                    and sync.get("reachable") is True
+                    and sync.get("synced") is True
+                    and sync.get("sync_state") == "synced"
+                    and type(pending) is list
+                    and not pending
+                    and follow_readiness.get("ready") is True
+                    and type(scope) is dict
+                    and restart_intent_matches(
+                        restart_intent,
+                        run_id=follow_readiness.get("run_id"),
+                        identity=scope.get("identity"),
+                        configuration_sha256=scope.get("configuration_sha256"),
+                    )
+                    and scope["identity"].get("asset_id") == asset_id
+                )
+            except Exception:
+                # A restart hint is advisory. Missing current proof suppresses
+                # automatic resume and leaves the normal session UI available.
+                auto_resume_requested = False
         return jsonify(
             {
                 "can_resume": can_resume,
-                "auto_resume_requested": bool(
-                    can_resume
-                    and restart_intent
-                    and restart_intent["identity"]["asset_id"] == asset_id
-                ),
+                "auto_resume_requested": auto_resume_requested,
+                "automatic_resume_pending": automatic_resume_pending,
                 "has_session": can_resume,
                 "buy_count": len(open_buy),
                 "sell_count": len(open_sell),
