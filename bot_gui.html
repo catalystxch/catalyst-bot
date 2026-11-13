@@ -33392,9 +33392,10 @@
                 document.getElementById('singleRunBuyTarget').value = String(defaults.policy.buy_target ?? 24);
                 document.getElementById('singleRunSellTarget').value = String(defaults.policy.sell_target ?? 24);
                 const smartPrices = window._singleApprovalSmartPriceProposal || {};
-                document.getElementById('singleRunPriceAnchor').value = smartPrices.anchor || singleRunDecimalText(defaults.policy.price_anchor);
-                document.getElementById('singleRunPriceMin').value = smartPrices.min || singleRunDecimalText(defaults.policy.price_min);
-                document.getElementById('singleRunPriceMax').value = smartPrices.max || singleRunDecimalText(defaults.policy.price_max);
+                const previousPrices = defaults.price_evidence || {};
+                document.getElementById('singleRunPriceAnchor').value = smartPrices.anchor || previousPrices.anchor || singleRunDecimalText(defaults.policy.price_anchor);
+                document.getElementById('singleRunPriceMin').value = smartPrices.min || previousPrices.min || singleRunDecimalText(defaults.policy.price_min);
+                document.getElementById('singleRunPriceMax').value = smartPrices.max || previousPrices.max || singleRunDecimalText(defaults.policy.price_max);
                 document.getElementById('singleRunFeeMax').value = defaults.fee_recommendation?.available
                     ? String(defaults.fee_recommendation.fee_xch) : '';
                 document.getElementById('singleApprovalRunReviewText').textContent =

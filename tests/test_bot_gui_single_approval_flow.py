@@ -61,6 +61,21 @@ def test_single_approval_sends_only_editable_policy_and_signed_funding_terms():
         assert f"{key}: funding.{key}" in policy
 
 
+def test_reopened_review_labels_previous_approved_price_as_stale():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    opening = html.split("async function openSingleApprovalRunReview()", 1)[1].split(
+        "async function prepareSingleApprovalRunReview()", 1
+    )[0]
+    assert "const previousPrices = defaults.price_evidence || {}" in opening
+    for name in ("anchor", "min", "max"):
+        assert f"smartPrices.{name} || previousPrices.{name}" in opening
+    disclosure = html.split("async function prepareSingleApprovalRunReview()", 1)[
+        1
+    ].split("async function confirmSingleApprovalRunReview()", 1)[0]
+    assert "priceInfo.stale" in disclosure
+    assert "priceInfo.source" in disclosure
+
+
 def test_single_approval_is_only_offered_for_fresh_smart_settings():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
     dirty_check = html.split("function checkSmartSettingsDirty()", 1)[1].split(

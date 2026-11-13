@@ -217,6 +217,40 @@ def _follow_policy_from_client_terms(terms, identity):
         raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID") from exc
 
 
+def _previous_follow_price_evidence(identity, configuration_sha256):
+    """Offer the last approved anchor only for the same wallet and settings.
+
+    This is a labelled, stale review suggestion. It never grants run authority.
+    """
+    import database
+    from follow_run_coordinator import FollowRunCoordinator
+
+    try:
+        state = FollowRunCoordinator().get_state()
+        policy = database.get_active_follow_run_policy()
+    except ValueError:
+        return None
+    if (
+        not state
+        or policy is None
+        or state.get("policy_digest") != policy.digest
+        or state.get("configuration_sha256") != configuration_sha256
+        or policy.wallet_fingerprint != identity["wallet_fingerprint"]
+        or policy.network != identity["network"]
+        or policy.asset_id != identity["asset_id"]
+    ):
+        return None
+    return {
+        "anchor": format(policy.price_anchor, "f"),
+        "min": format(policy.price_min, "f"),
+        "max": format(policy.price_max, "f"),
+        "source": "previous approved Follow run",
+        "observed_at": "",
+        "stale": True,
+        "inferred": False,
+    }
+
+
 def _follow_fee_recommendation() -> dict:
     """Return informational quote provenance; it grants no fee authority."""
     try:
@@ -1562,6 +1596,9 @@ class AppBridge:
         return {
             "success": True,
             "policy": defaults,
+            "price_evidence": _previous_follow_price_evidence(
+                identity, configuration_sha256
+            ),
             "market_confidence_state": confidence_state,
             "red_reasons": red_reasons,
             "fee_recommendation": _follow_fee_recommendation(),

@@ -1,3 +1,4 @@
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,52 @@ def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
     assert result["policy"]["maximum_trade_xch_mojos"] == "3000000000000"
     assert result["red_reasons"] == ["THIN_BOOK", "STALE_PRICE"]
     assert result["dispatch_authorized"] is False
+
+
+def test_previous_anchor_is_suggested_only_for_same_approved_context(monkeypatch):
+    import app_bridge
+    import database
+    import follow_run_coordinator
+
+    policy = SimpleNamespace(
+        digest="d" * 64,
+        wallet_fingerprint="123",
+        network="mainnet",
+        asset_id=ASSET_ID,
+        price_anchor=Decimal("0.0123"),
+        price_min=Decimal("0.011"),
+        price_max=Decimal("0.013"),
+    )
+    monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: policy)
+    monkeypatch.setattr(
+        follow_run_coordinator.FollowRunCoordinator,
+        "get_state",
+        lambda self: {
+            "policy_digest": policy.digest,
+            "configuration_sha256": CONFIGURATION_SHA256,
+            "state": "stopped",
+        },
+    )
+
+    evidence = app_bridge._previous_follow_price_evidence(
+        IDENTITY, CONFIGURATION_SHA256
+    )
+    assert evidence == {
+        "anchor": "0.0123",
+        "min": "0.011",
+        "max": "0.013",
+        "source": "previous approved Follow run",
+        "observed_at": "",
+        "stale": True,
+        "inferred": False,
+    }
+    assert (
+        app_bridge._previous_follow_price_evidence(
+            {**IDENTITY, "asset_id": "b" * 64}, CONFIGURATION_SHA256
+        )
+        is None
+    )
+    assert app_bridge._previous_follow_price_evidence(IDENTITY, "c" * 64) is None
 
 
 def test_native_status_reports_durable_setup_without_dispatch(
