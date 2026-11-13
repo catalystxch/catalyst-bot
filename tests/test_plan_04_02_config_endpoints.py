@@ -111,6 +111,17 @@ class TestConfigGet(_FlaskBase):
 
 @unittest.skipIf(_SKIP is not None, f"api_server unavailable: {_SKIP}")
 class TestConfigPost(_FlaskBase):
+    def test_settings_validation_allows_100_offer_target_as_resource_advisory(self):
+        response = self._post_json("/api/settings/validate", {"NUM_OFFERS": 100})
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body["errors"], [])
+
+    def test_settings_validation_rejects_offer_target_beyond_signed_64_bit(self):
+        response = self._post_json("/api/settings/validate", {"NUM_OFFERS": str(2**63)})
+        body = response.get_json()
+        self.assertTrue(any("signed 64-bit" in error for error in body["errors"]))
+
     def test_post_without_token_returns_401(self):
         resp = self._post_json(
             "/api/config", {"key": "SPREAD_BPS", "value": "200"}, auth=False

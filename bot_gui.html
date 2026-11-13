@@ -8517,8 +8517,8 @@
             </div>
             <div class="follow-review-body">
                 <div class="follow-review-grid">
-                    <label class="follow-review-field"><span>BUY offers</span><input id="followRunBuyLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
-                    <label class="follow-review-field"><span>SELL offers</span><input id="followRunSellLimit" type="number" min="1" max="50" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+                    <label class="follow-review-field"><span>BUY offers</span><input id="followRunBuyLimit" type="number" min="1" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
+                    <label class="follow-review-field"><span>SELL offers</span><input id="followRunSellLimit" type="number" min="1" step="1" value="24" oninput="invalidateFollowRunReview()"></label>
                 </div>
                 <label class="follow-review-check"><input id="followRunContinuous" type="checkbox" checked onchange="invalidateFollowRunReview()"><span>Continue until I stop the run or its fee or safety limit is reached</span></label>
                 <div class="follow-review-grid">
@@ -11424,12 +11424,12 @@
                         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
                             <div class="form-group mode-hide-on-sell-only">
                                 <label>Max Buy Offers <span class="cc-help">?<span class="cc-tooltip">Maximum number of buy offers to keep open at once. Each needs its own coin.</span></span></label>
-                                <input type="number" min="1" max="50" id="configMaxBuy" value="" placeholder="e.g. 3" oninput="handleMaxOfferLimitInput()">
+                                <input type="number" min="1" id="configMaxBuy" value="" placeholder="e.g. 24" oninput="handleMaxOfferLimitInput()">
                                 <div id="maxBuyWarning" style="display: none; margin-top: 4px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em;"></div>
                             </div>
                             <div class="form-group mode-hide-on-buy-only">
                                 <label>Max Sell Offers <span class="cc-help">?<span class="cc-tooltip">Maximum number of sell offers to keep open at once. Each needs its own coin.</span></span></label>
-                                <input type="number" min="1" max="50" id="configMaxSell" value="" placeholder="e.g. 3" oninput="handleMaxOfferLimitInput()">
+                                <input type="number" min="1" id="configMaxSell" value="" placeholder="e.g. 24" oninput="handleMaxOfferLimitInput()">
                                 <div id="maxSellWarning" style="display: none; margin-top: 4px; padding: 4px 8px; border-radius: 4px; font-size: 0.82em;"></div>
                             </div>
                         </div>
@@ -20655,7 +20655,7 @@
                 const requestedTarget = mode === 'buy_only' ? buyTarget
                     : mode === 'sell_only' ? sellTarget
                     : buyTarget === sellTarget ? buyTarget : 0;
-                if (Number.isInteger(requestedTarget) && requestedTarget >= 1 && requestedTarget <= 50) {
+                if (Number.isSafeInteger(requestedTarget) && requestedTarget >= 1) {
                     params.set('target_offers_per_side', String(requestedTarget));
                 }
                 if (sdStatus) sdStatus.textContent = 'Analysing market data + calculating capital allocation...';
@@ -33215,9 +33215,9 @@
             const hours = Number(document.getElementById('followRunHours').value);
             const continuous = document.getElementById('followRunContinuous').checked;
             if (![buyLimit, sellLimit].every(Number.isSafeInteger)
-                || buyLimit < 1 || buyLimit > 50 || sellLimit < 1 || sellLimit > 50
+                || buyLimit < 1 || sellLimit < 1
                 || (!continuous && (!Number.isSafeInteger(hours) || hours < 1 || hours > 48))) {
-                output.textContent = 'Enter 1–50 offers per side and a valid timed duration if selected.';
+                output.textContent = 'Enter a positive number of offers per side and a valid timed duration if selected.';
                 return;
             }
             _followRunReviewBusy = true;

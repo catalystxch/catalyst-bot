@@ -297,6 +297,21 @@ class TestSmartDefaults(_FlaskBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(captured.get("target_offers_per_side"), 24)
 
+    def test_requested_offer_target_above_50_is_forwarded(self):
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return _fake_defaults_response(**kwargs)
+
+        with patch.object(api_server, "_calculate_smart_defaults", side_effect=capture):
+            resp = self._get(
+                "/api/smart-defaults?target_offers_per_side=100",
+                environ_base=self._LOOPBACK,
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(captured.get("target_offers_per_side"), 100)
+
     def test_exception_returns_500(self):
         with patch.object(
             api_server,

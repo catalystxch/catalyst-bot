@@ -914,6 +914,8 @@ def api_settings_validate():
             n = int(data["NUM_OFFERS"])
             if n < 1:
                 errors.append("NUM_OFFERS must be at least 1")
+            if n > 2**63 - 1:
+                errors.append("NUM_OFFERS must fit a signed 64-bit integer")
             if n > 50:
                 warnings.append("More than 50 offers per side requires many coins")
         except ValueError:

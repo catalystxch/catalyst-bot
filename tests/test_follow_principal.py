@@ -609,3 +609,13 @@ def test_follow_replacement_count_gate_refuses_a_short_24_by_24_plan():
         sell_limit=24,
         replacement_counts={"xch": 24, "cat": 24},
     ) == {"buy_limit": 24, "sell_limit": 24, "replacement_count_gate_passed": True}
+
+
+def test_follow_replacement_count_gate_accepts_funded_100_by_100_target():
+    from follow_principal import prove_follow_replacement_count_capacity
+
+    assert prove_follow_replacement_count_capacity(
+        buy_limit=100,
+        sell_limit=100,
+        replacement_counts={"xch": 100, "cat": 100},
+    ) == {"buy_limit": 100, "sell_limit": 100, "replacement_count_gate_passed": True}

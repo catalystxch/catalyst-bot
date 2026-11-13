@@ -43,8 +43,10 @@ def prove_initial_follow_slot_fit(
     if (
         type(buy_limit) is not int
         or type(sell_limit) is not int
-        or not 1 <= buy_limit <= 50
-        or not 1 <= sell_limit <= 50
+        or buy_limit < 1
+        or sell_limit < 1
+        or buy_limit > 2**63 - 1
+        or sell_limit > 2**63 - 1
         or type(buy_reversed) is not bool
         or type(cat_decimals) is not int
         or not 0 <= cat_decimals <= 18
@@ -53,7 +55,6 @@ def prove_initial_follow_slot_fit(
         or maximum_trade_xch_mojos <= 0
         or maximum_trade_cat_atoms <= 0
         or type(outputs) is not list
-        or len(outputs) > 128
     ):
         raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
     mid = _positive_decimal(mid_price)
@@ -122,6 +123,17 @@ def prove_initial_follow_slot_fit(
             coins.setdefault((asset, rank), []).append((amount, ordinal))
     for options in coins.values():
         options.sort()
+
+    if sum(
+        len(options)
+        for (asset, _rank), options in coins.items()
+        if asset == "xch"
+    ) < buy_limit or sum(
+        len(options)
+        for (asset, _rank), options in coins.items()
+        if asset == "cat"
+    ) < sell_limit:
+        raise ValueError("FOLLOW_SLOT_DENOMINATION_SHORT")
 
     required = {"xch": 0, "cat": 0}
     assigned_sources = {"xch": 0, "cat": 0}

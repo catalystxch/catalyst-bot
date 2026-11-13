@@ -54,6 +54,138 @@ def test_explicit_continuous_review_survives_finite_window(approved):
     )
 
 
+def test_100_by_100_follow_review_and_authority_are_persisted(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    terms = dict(
+        approval_id=approval_id,
+        identity={
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        },
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=100,
+        sell_limit=100,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+        continuous=True,
+    )
+    review = database.create_follow_run_review(**terms)
+    with patch.object(database.time, "time", return_value=1002):
+        run = database.create_follow_run_authority(
+            consent_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            **{key: value for key, value in terms.items() if key != "continuous"},
+        )
+    assert run["run_id"]
+    persisted = database.get_follow_run_review(review["review_id"])
+    assert persisted["buy_limit"] == persisted["sell_limit"] == 100
+
+
+def test_legacy_slot_limit_migration_preserves_review_and_authority_rows(approved):
+    approval_id = approved["approval"]["approval_id"]
+    scope = json.loads(
+        database.get_coin_prep_fee_approval_context(approval_id)["scope_json"]
+    )
+    terms = dict(
+        approval_id=approval_id,
+        identity={
+            key: scope[key]
+            for key in (
+                "network",
+                "wallet_type",
+                "wallet_fingerprint",
+                "wallet_id",
+                "xch_wallet_id",
+                "asset_id",
+                "ticker",
+            )
+        },
+        configuration_sha256="a" * 64,
+        principal_review_sha256="d" * 64,
+        buy_limit=24,
+        sell_limit=24,
+        started_at_epoch=1001,
+        expires_at_epoch=CONTINUOUS_RUN_EXPIRY,
+        maximum_fee_mojos=80,
+        protected_shutdown_fee_mojos=40,
+        continuous=True,
+    )
+    review = database.create_follow_run_review(**terms)
+    with patch.object(database.time, "time", return_value=1002):
+        run = database.create_follow_run_authority(
+            consent_id=review["review_id"],
+            review_sha256=review["review_sha256"],
+            **{key: value for key, value in terms.items() if key != "continuous"},
+        )
+
+    conn = database.get_connection()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN EXCLUSIVE")
+    dependent_triggers = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name!='follow_run_authorities' "
+        "AND sql LIKE '%follow_run_authorities%'"
+    ).fetchall()
+    for (trigger_name,) in dependent_triggers:
+        conn.execute(f'DROP TRIGGER "{trigger_name}"')
+    for table in ("follow_run_reviews", "follow_run_authorities"):
+        current = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()[0]
+        )
+        legacy = current.replace("buy_limit>0", "buy_limit BETWEEN 1 AND 50")
+        legacy = legacy.replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+        temporary = f"{table}_legacy_test"
+        conn.execute(
+            legacy.replace(
+                f"CREATE TABLE {table} (", f"CREATE TABLE {temporary} (", 1
+            )
+        )
+        conn.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+    database.close_connection()
+
+    database._migrate_stability_schema()
+    database._migrate_stability_schema()
+    conn = database.get_connection()
+    persisted_review = database.get_follow_run_review(review["review_id"])
+    persisted_run = conn.execute(
+        "SELECT * FROM follow_run_authorities WHERE run_id=?", (run["run_id"],)
+    ).fetchone()
+    assert persisted_review["buy_limit"] == persisted_review["sell_limit"] == 24
+    assert persisted_run["buy_limit"] == persisted_run["sell_limit"] == 24
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN "
+        "('follow_run_reviews_no_update','follow_run_reviews_no_delete',"
+        "'follow_run_authorities_no_update','follow_run_authorities_no_delete')"
+    ).fetchone()[0] == 4
+    with pytest.raises(database.sqlite3.IntegrityError, match="immutable"):
+        conn.execute(
+            "UPDATE follow_run_reviews SET buy_limit=25 WHERE review_id=?",
+            (review["review_id"],),
+        )
+
+
 def test_unbounded_follow_authority_survives_fees_above_recorded_estimate(approved):
     approval_id = approved["approval"]["approval_id"]
     scope = json.loads(

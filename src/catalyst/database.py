@@ -2106,8 +2106,8 @@ CREATE TABLE IF NOT EXISTS follow_run_reviews (
         CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
     principal_review_sha256 TEXT NOT NULL
         CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
-    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
-    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit>0),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit>0),
     started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
     expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
     maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
@@ -2144,8 +2144,8 @@ CREATE TABLE IF NOT EXISTS follow_run_authorities (
         CHECK(length(configuration_sha256)=64 AND configuration_sha256 NOT GLOB '*[^0-9a-f]*'),
     principal_review_sha256 TEXT NOT NULL
         CHECK(length(principal_review_sha256)=64 AND principal_review_sha256 NOT GLOB '*[^0-9a-f]*'),
-    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit BETWEEN 1 AND 50),
-    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit BETWEEN 1 AND 50),
+    buy_limit INTEGER NOT NULL CHECK(typeof(buy_limit)='integer' AND buy_limit>0),
+    sell_limit INTEGER NOT NULL CHECK(typeof(sell_limit)='integer' AND sell_limit>0),
     started_at_epoch INTEGER NOT NULL CHECK(typeof(started_at_epoch)='integer' AND started_at_epoch>=0),
     expires_at_epoch INTEGER NOT NULL CHECK(typeof(expires_at_epoch)='integer' AND expires_at_epoch>started_at_epoch),
     maximum_fee_mojos INTEGER NOT NULL CHECK(typeof(maximum_fee_mojos)='integer' AND maximum_fee_mojos>=0),
@@ -8090,7 +8090,17 @@ def _upgrade_follow_run_approval_reuse(conn: sqlite3.Connection) -> None:
         "approval_id TEXT UNIQUE NOT NULL REFERENCES coin_prep_fee_consents(approval_id)",
         1,
     )
-    if _normalized_schema_sql(installed) != _normalized_schema_sql(legacy):
+    legacy_50 = canonical.replace(
+        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
+    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    legacy_unique_50 = legacy.replace(
+        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
+    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    if _normalized_schema_sql(installed) not in {
+        _normalized_schema_sql(legacy),
+        _normalized_schema_sql(legacy_50),
+        _normalized_schema_sql(legacy_unique_50),
+    }:
         raise RuntimeError("Follow run authority has unknown schema")
     dependent = conn.execute(
         "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
@@ -8129,6 +8139,60 @@ def _upgrade_follow_run_approval_reuse(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _upgrade_follow_run_review_slot_limit(conn: sqlite3.Connection) -> None:
+    """Expand only the exact legacy Follow review count constraint."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='follow_run_reviews'"
+    ).fetchone()
+    if row is None:
+        return
+    expected_db = _sqlite_connect(":memory:")
+    try:
+        expected_db.executescript(STABILITY_SCHEMA_SQL)
+        canonical = str(
+            expected_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='follow_run_reviews'"
+            ).fetchone()[0]
+        )
+    finally:
+        expected_db.close()
+    installed = str(row[0])
+    if _normalized_schema_sql(installed) == _normalized_schema_sql(canonical):
+        return
+    legacy = canonical.replace(
+        "buy_limit>0", "buy_limit BETWEEN 1 AND 50"
+    ).replace("sell_limit>0", "sell_limit BETWEEN 1 AND 50")
+    if _normalized_schema_sql(installed) != _normalized_schema_sql(legacy):
+        raise RuntimeError("Follow run review has unknown schema")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        replacement = canonical.replace(
+            "CREATE TABLE follow_run_reviews (",
+            "CREATE TABLE follow_run_reviews_slot_v2 (",
+            1,
+        )
+        if replacement == canonical:
+            raise RuntimeError("Follow run review definition unavailable")
+        conn.execute(replacement)
+        conn.execute(
+            "INSERT INTO follow_run_reviews_slot_v2 SELECT * FROM follow_run_reviews"
+        )
+        conn.execute("DROP TABLE follow_run_reviews")
+        conn.execute(
+            "ALTER TABLE follow_run_reviews_slot_v2 RENAME TO follow_run_reviews"
+        )
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("Follow run review slot upgrade broke foreign keys")
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate_stability_schema() -> None:
     """Serialize, create and validate stability objects in one DB transaction."""
 
@@ -8141,6 +8205,7 @@ def _migrate_stability_schema() -> None:
         _upgrade_expired_subsequent_spend_outcome_schema(conn)
         _upgrade_offer_cancel_cohort_member_limit(conn)
         _upgrade_follow_run_approval_reuse(conn)
+        _upgrade_follow_run_review_slot_limit(conn)
         existing_tables = {
             str(row[0])
             for row in conn.execute(
@@ -21849,6 +21914,104 @@ def set_setting(key: str, value: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Follow run policy — one durable active set of approved material terms
+# ---------------------------------------------------------------------------
+
+
+_ACTIVE_FOLLOW_RUN_POLICY_SETTING = "active_follow_run_policy_v1"
+
+
+def record_active_follow_run_policy(policy) -> bool:
+    """Persist the validated material terms for the currently approved run."""
+    import json
+    from dataclasses import fields
+    from decimal import Decimal
+
+    from follow_run_policy import FollowRunPolicy
+
+    if not isinstance(policy, FollowRunPolicy):
+        raise ValueError("FOLLOW_RUN_POLICY_INVALID")
+
+    def serialize_term(value):
+        if isinstance(value, Decimal):
+            return "0" if value == 0 else format(value.normalize(), "f")
+        return value
+
+    terms = {
+        field.name: serialize_term(getattr(policy, field.name))
+        for field in fields(policy)
+    }
+    envelope = {
+        "version": 1,
+        "terms": terms,
+        "digest": policy.digest,
+    }
+    serialized = json.dumps(
+        envelope, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    if set_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING, serialized) is not True:
+        raise ValueError("FOLLOW_RUN_POLICY_PERSIST_FAILED")
+    return True
+
+
+def get_active_follow_run_policy():
+    """Read the active policy; malformed or unverified data fails closed."""
+    import json
+    import re
+    from decimal import Decimal
+
+    from follow_run_policy import FollowRunPolicy
+
+    try:
+        raw = get_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING)
+        if type(raw) is not str or not raw:
+            return None
+
+        def object_without_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        envelope = json.loads(
+            raw,
+            object_pairs_hook=object_without_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid JSON number")
+            ),
+        )
+        if (
+            type(envelope) is not dict
+            or set(envelope) != {"version", "terms", "digest"}
+            or type(envelope["version"]) is not int
+            or envelope["version"] != 1
+            or type(envelope["digest"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", envelope["digest"]) is None
+            or type(envelope["terms"]) is not dict
+        ):
+            return None
+        terms = dict(envelope["terms"])
+        decimal_names = {"price_anchor", "price_min", "price_max"}
+        for name in decimal_names:
+            if type(terms.get(name)) is not str:
+                return None
+            terms[name] = Decimal(terms[name])
+        policy = FollowRunPolicy(**terms)
+        if policy.digest != envelope["digest"]:
+            return None
+        return policy
+    except Exception:
+        return None
+
+
+def clear_active_follow_run_policy() -> bool:
+    """Clear the active policy using the settings store's durable write path."""
+    return set_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING, "") is True
+
+
+# ---------------------------------------------------------------------------
 # V3: Splash Incoming Offers — received from the P2P network
 # ---------------------------------------------------------------------------
 
@@ -23443,7 +23606,10 @@ def create_follow_run_review(
     encoded_identity = _follow_identity_json(identity)
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
-        any(type(v) is not int or not 1 <= v <= 50 for v in (buy_limit, sell_limit))
+        any(
+            type(v) is not int or not 1 <= v <= 2**63 - 1
+            for v in (buy_limit, sell_limit)
+        )
         or type(started_at_epoch) is not int
         or type(expires_at_epoch) is not int
         or started_at_epoch < 0
@@ -23599,7 +23765,7 @@ def create_follow_run_authority(
     identity_hash = hashlib.sha256(encoded_identity.encode("utf-8")).hexdigest()
     if (
         any(
-            type(value) is not int or not 1 <= value <= 50
+            type(value) is not int or not 1 <= value <= 2**63 - 1
             for value in (buy_limit, sell_limit)
         )
         or type(started_at_epoch) is not int

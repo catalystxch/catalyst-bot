@@ -76,6 +76,48 @@ def test_follow_review_accepts_explicit_continuous_term(monkeypatch):
     assert calls[0]["duration_seconds"] is None
 
 
+def test_follow_review_accepts_100_by_100_request(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        follow_principal,
+        "prepare_follow_run_review",
+        lambda approval_id, **terms: (
+            calls.append((approval_id, terms)) or {"dispatch_authorized": False}
+        ),
+    )
+    _, status = _call(
+        {
+            "approval_id": "a" * 64,
+            "buy_limit": 100,
+            "sell_limit": 100,
+            "continuous": True,
+        }
+    )
+    assert status == 200
+    assert calls[0][1]["buy_limit"] == 100
+    assert calls[0][1]["sell_limit"] == 100
+
+
+def test_follow_review_rejects_counts_outside_sqlite_integer_range(monkeypatch):
+    monkeypatch.setattr(
+        follow_principal,
+        "prepare_follow_run_review",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("review service reached")
+        ),
+    )
+    result, status = _call(
+        {
+            "approval_id": "a" * 64,
+            "buy_limit": 2**63,
+            "sell_limit": 100,
+            "continuous": True,
+        }
+    )
+    assert status == 400
+    assert result["reason"] == "FOLLOW_REVIEW_REQUEST_INVALID"
+
+
 def test_follow_review_accepts_standard_terms_without_cumulative_fee_cap(monkeypatch):
     calls = []
     monkeypatch.setattr(

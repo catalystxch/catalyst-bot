@@ -61,6 +61,37 @@ def test_follow_principal_preview_binds_requested_24_by_24_counts(monkeypatch):
     assert body["dispatch_authorized"] is False
 
 
+def test_follow_principal_preview_accepts_100_by_100_request(monkeypatch):
+    seen = []
+
+    def preview(approval_id, *, buy_limit=None, sell_limit=None):
+        seen.append((approval_id, buy_limit, sell_limit))
+        raise ValueError("FOLLOW_SLOT_INVENTORY_SHORT")
+
+    monkeypatch.setattr(follow_principal, "preview_approved_follow_principal", preview)
+    body, status = _call({"approval_id": "a" * 64, "buy_limit": 100, "sell_limit": 100})
+    assert seen == [("a" * 64, 100, 100)]
+    assert status == 409
+    assert body["reason"] == "FOLLOW_SLOT_INVENTORY_SHORT"
+
+
+def test_follow_principal_preview_rejects_counts_outside_sqlite_integer_range(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        follow_principal,
+        "preview_approved_follow_principal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wallet preview reached")
+        ),
+    )
+    body, status = _call(
+        {"approval_id": "a" * 64, "buy_limit": 2**63, "sell_limit": 100}
+    )
+    assert status == 400
+    assert body["reason"] == "FOLLOW_PRINCIPAL_REQUEST_INVALID"
+
+
 def test_follow_principal_preview_explains_unfitting_prepared_denomination(monkeypatch):
     monkeypatch.setattr(
         follow_principal,

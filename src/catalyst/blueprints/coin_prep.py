@@ -203,8 +203,10 @@ def api_follow_principal_preview():
             and (
                 type(body["buy_limit"]) is not int
                 or type(body["sell_limit"]) is not int
-                or not 1 <= body["buy_limit"] <= 50
-                or not 1 <= body["sell_limit"] <= 50
+                or body["buy_limit"] < 1
+                or body["sell_limit"] < 1
+                or body["buy_limit"] > 2**63 - 1
+                or body["sell_limit"] > 2**63 - 1
             )
         )
     ):
@@ -316,8 +318,10 @@ def api_follow_run_review():
                 or not 1 <= body["duration_seconds"] <= 48 * 3600
             )
         )
-        or not 1 <= body["buy_limit"] <= 50
-        or not 1 <= body["sell_limit"] <= 50
+        or body["buy_limit"] < 1
+        or body["sell_limit"] < 1
+        or body["buy_limit"] > 2**63 - 1
+        or body["sell_limit"] > 2**63 - 1
         or (
             "maximum_fee_mojos" in body
             and not 1 <= body["maximum_fee_mojos"] <= 2**53 - 1

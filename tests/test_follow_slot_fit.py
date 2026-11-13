@@ -159,6 +159,38 @@ def test_exact_24_by_24_requires_one_fitting_coin_per_slot():
     terms["outputs"].pop()
     with pytest.raises(ValueError, match="FOLLOW_SLOT_DENOMINATION_SHORT"):
         prove_initial_follow_slot_fit(**terms)
+
+
+def test_exact_100_by_100_requires_one_fitting_coin_per_slot():
+    from follow_slot_fit import prove_initial_follow_slot_fit
+
+    tiers = ("inner", "mid", "outer", "extreme")
+    terms = _terms()
+    terms.update(
+        buy_limit=100,
+        sell_limit=100,
+        buy_tier_counts={tier: 25 for tier in tiers},
+        sell_tier_counts={tier: 25 for tier in tiers},
+        buy_tier_sizes_xch={tier: Decimal("1") for tier in tiers},
+        sell_tier_sizes_xch={tier: Decimal("1") for tier in tiers},
+        maximum_trade_xch_mojos=100_000_000_000_000,
+        maximum_trade_cat_atoms=110_000,
+        outputs=[
+            {
+                "asset": asset,
+                "purpose": "replacement",
+                "tier_rank": ordinal // 25,
+                "amount_mojos": amount,
+                "ordinal": ordinal,
+            }
+            for asset, amount in (("xch", 1_000_000_000_000), ("cat", 1_100))
+            for ordinal in range(100)
+        ],
+    )
+    result = prove_initial_follow_slot_fit(**terms)
+    assert result["buy_slots_arithmetic_fit"] == 100
+    assert result["sell_slots_arithmetic_fit"] == 100
+    assert result["dispatch_authorized"] is False
     terms = _terms()
     terms["outputs"][0]["asset"] = []
     with pytest.raises(ValueError, match="FOLLOW_SLOT_PLAN_INVALID"):

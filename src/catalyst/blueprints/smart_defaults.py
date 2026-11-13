@@ -1230,8 +1230,6 @@ def api_smart_defaults():
         target_offers_per_side = _positive_int_or_none(
             request.args.get("target_offers_per_side")
         )
-        if target_offers_per_side is not None and target_offers_per_side > 50:
-            target_offers_per_side = None
         return api_server._calculate_smart_defaults(
             xch_reserve=xch_res,
             cat_reserve=cat_res,
@@ -2523,8 +2521,10 @@ def _calculate_smart_defaults(
     # (uses 2.5 as an approximate capital factor before tier selection)
     _max_possible_n = max(2, int(_trading_xch / (_MIN_OFFER_XCH * 2.5)))
     _target_n = min(_market_n, _max_possible_n)
-    if type(target_offers_per_side) is int and 1 <= target_offers_per_side <= 50:
-        _target_n = min(_target_n, target_offers_per_side)
+    if type(target_offers_per_side) is int and target_offers_per_side > 0:
+        # Market activity chooses a default. An explicit user target replaces
+        # that default while the spendable capital calculation still caps it.
+        _target_n = min(target_offers_per_side, _max_possible_n)
 
     # AMM pool-impact caps are retired; the market-confidence layer scales
     # independent order-book depth to configured offer size.

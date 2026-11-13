@@ -242,8 +242,8 @@ def prove_follow_replacement_count_capacity(
     if (
         type(buy_limit) is not int
         or type(sell_limit) is not int
-        or not 1 <= buy_limit <= 50
-        or not 1 <= sell_limit <= 50
+        or buy_limit < 1
+        or sell_limit < 1
         or type(replacement_counts) is not dict
         or set(replacement_counts) != {"xch", "cat"}
         or any(
@@ -279,9 +279,9 @@ def prove_follow_restart_book(
         type(run_id) is not str
         or re.fullmatch(r"[0-9a-f]{64}", run_id) is None
         or type(buy_limit) is not int
-        or not 1 <= buy_limit <= 50
+        or buy_limit < 1
         or type(sell_limit) is not int
-        or not 1 <= sell_limit <= 50
+        or sell_limit < 1
         or type(local_offers) is not list
         or type(sage_offers) is not list
         or type(run_intents) is not list
@@ -586,8 +586,8 @@ def prepare_follow_run_review(
         or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
         or type(buy_limit) is not int
         or type(sell_limit) is not int
-        or not 1 <= buy_limit <= 50
-        or not 1 <= sell_limit <= 50
+        or buy_limit < 1
+        or sell_limit < 1
         or type(continuous) is not bool
         or (
             (duration_seconds is not None)
@@ -765,8 +765,8 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
             or re.fullmatch(r"[0-9a-f]{64}", approval_id) is None
             or type(buy_limit) is not int
             or type(sell_limit) is not int
-            or not 1 <= buy_limit <= 50
-            or not 1 <= sell_limit <= 50
+            or buy_limit < 1
+            or sell_limit < 1
             or type(review.get("identity")) is not dict
             or type(review.get("maximum_fee_mojos")) is not int
             or type(review.get("protected_shutdown_fee_mojos")) is not int
