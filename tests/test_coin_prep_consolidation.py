@@ -1328,7 +1328,8 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker.cat_reserve = Decimal("0")
         worker.xch_reserve = Decimal("0")
         worker.coin_prep_headroom_pct = Decimal("0")
-        worker.log = lambda message: None
+        messages = []
+        worker.log = messages.append
         worker.update_status = lambda *args, **kwargs: None
         worker._set_status_coin_counts = lambda *args, **kwargs: None
         worker._log_coin_snapshot = lambda *args, **kwargs: None
@@ -1340,6 +1341,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
         worker.verify_coins = lambda: (4, 3)
         worker._merge_xch_fee_change_into_reserve = lambda: False
         worker._designate_final_sweep = lambda: None
+        worker._run_direct_batch_prep = lambda: True
         worker.fee_approval_id = "a" * 64
         worker._complete_approved_fee_session = lambda: {
             "approval_id": worker.fee_approval_id,
@@ -1377,7 +1379,7 @@ class CoinPrepConsolidationTests(unittest.TestCase):
             ),
             patch.object(self.coin_prep_worker.time, "sleep", return_value=None),
         ):
-            self.assertTrue(worker.run_full_preparation())
+            self.assertTrue(worker.run_full_preparation(), messages)
 
 
 if __name__ == "__main__":
