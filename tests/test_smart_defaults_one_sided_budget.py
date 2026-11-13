@@ -229,6 +229,18 @@ def test_requested_100_per_side_is_not_limited_by_market_default_count():
     assert plan["max_active_sell"] == 100
 
 
+def test_requested_100_per_side_can_have_a_lower_capital_sizing_estimate():
+    plan = _recommend(
+        "two_sided",
+        xch_mojos=1_000_000_000_000,
+        cat_mojos=100_000_000_000,
+        target_offers=100,
+    )
+
+    assert plan["max_active_buy"] < 100
+    assert plan["max_active_sell"] < 100
+
+
 def test_thin_market_target_does_not_lose_a_slot_to_capacity_rounding():
     plan = _recommend(
         "two_sided",
