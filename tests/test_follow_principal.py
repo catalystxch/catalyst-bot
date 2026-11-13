@@ -608,7 +608,14 @@ def test_follow_replacement_count_gate_refuses_a_short_24_by_24_plan():
         buy_limit=24,
         sell_limit=24,
         replacement_counts={"xch": 24, "cat": 24},
-    ) == {"buy_limit": 24, "sell_limit": 24, "replacement_count_gate_passed": True}
+    ) == {
+        "buy_limit": 24,
+        "sell_limit": 24,
+        "funded_buy_limit": 24,
+        "funded_sell_limit": 24,
+        "partial_target": False,
+        "replacement_count_gate_passed": True,
+    }
 
 
 def test_follow_replacement_count_gate_accepts_funded_100_by_100_target():
@@ -618,4 +625,11 @@ def test_follow_replacement_count_gate_accepts_funded_100_by_100_target():
         buy_limit=100,
         sell_limit=100,
         replacement_counts={"xch": 100, "cat": 100},
-    ) == {"buy_limit": 100, "sell_limit": 100, "replacement_count_gate_passed": True}
+    ) == {
+        "buy_limit": 100,
+        "sell_limit": 100,
+        "funded_buy_limit": 100,
+        "funded_sell_limit": 100,
+        "partial_target": False,
+        "replacement_count_gate_passed": True,
+    }

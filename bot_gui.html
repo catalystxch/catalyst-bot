@@ -23682,6 +23682,7 @@
 
             tradingSettingsImpossible = false;
             tradingSettingsFundableEstimate = { buy: 0, sell: 0 };
+            let nonTargetHardImpossible = false;
             const tradeSizeWarn = document.getElementById('tradeSizeWarning');
             const maxBuyWarn = document.getElementById('maxBuyWarning');
             const maxSellWarn = document.getElementById('maxSellWarning');
@@ -23863,6 +23864,7 @@
                     showInputWarning(tradeSizeWarn, 'critical',
                         `⛔ Trade size ${tradeSize} XCH exceeds your total balance of ${xchBalance.toFixed(4)} XCH`);
                     tradingSettingsImpossible = true;
+                    nonTargetHardImpossible = true;
                 } else if (tradeSize > xchAvailable) {
                     showInputWarning(tradeSizeWarn, 'warning',
                         `⚠️ Trade size ${tradeSize} XCH exceeds available after reserve (${xchAvailable.toFixed(4)} XCH)`);
@@ -23932,20 +23934,29 @@
             if (catUnits(_botCatForCoinPrep) > catUnits(catAvailable) && catPerCoin > 0 && maxSell > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
-                    `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${Math.floor(catAvailable).toLocaleString()} is available after reserve.`
+                    `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${catAvailable.toLocaleString(undefined, {maximumFractionDigits: catDecimals})} is available after reserve.`
                 );
             }
 
             if (coinPrepImpossible) {
-                tradingSettingsImpossible = true;
                 tradingSettingsFundableEstimate = {
                     buy: maxBuy > 0 && _botXchForCoinPrep > 0
                         ? Math.min(maxBuy, Math.floor(maxBuy * xchAvailable / _botXchForCoinPrep)) : 0,
                     sell: maxSell > 0 && _botCatForCoinPrep > 0
                         ? Math.min(maxSell, Math.floor(maxSell * catAvailable / _botCatForCoinPrep)) : 0,
                 };
-                showInputWarning(coinPrepWarn, 'critical',
-                    `? <strong>Target exceeds current funding:</strong> ${coinPrepImpossibleReasons.join('<br>')}<br><br>Requested target ${maxBuy} BUY / ${maxSell} SELL; currently fundable estimate ${tradingSettingsFundableEstimate.buy} BUY / ${tradingSettingsFundableEstimate.sell} SELL. Estimate uses current balances and may change after preparation.`);
+                const partialReviewAvailable = IS_DESKTOP &&
+                    !!window.pywebview?.api?.get_single_approval_follow_run_defaults;
+                const partialStartPossible = partialReviewAvailable &&
+                    (maxBuy === 0 || tradingSettingsFundableEstimate.buy >= 1) &&
+                    (maxSell === 0 || tradingSettingsFundableEstimate.sell >= 1);
+                tradingSettingsImpossible = nonTargetHardImpossible || !partialStartPossible;
+                if (partialStartPossible && !nonTargetHardImpossible) {
+                    if (maxBuyWarn?.dataset?.critical === 'true') maxBuyWarn.dataset.critical = 'false';
+                    if (maxSellWarn?.dataset?.critical === 'true') maxSellWarn.dataset.critical = 'false';
+                }
+                showInputWarning(coinPrepWarn, partialStartPossible && !nonTargetHardImpossible ? 'warning' : 'critical',
+                    `? <strong>Target exceeds current funding:</strong> ${coinPrepImpossibleReasons.join('<br>')}<br><br>Requested target ${maxBuy} BUY / ${maxSell} SELL; currently fundable estimate ${tradingSettingsFundableEstimate.buy} BUY / ${tradingSettingsFundableEstimate.sell} SELL. This estimate is nonbinding and may change after preparation. Exact funded counts are verified before trading${partialStartPossible ? '; the bot can grow toward the approved target as verified funds become available.' : '.'}`);
             } else if (tradingSettingsImpossible) {
                 showInputWarning(coinPrepWarn, 'critical',
                     `? <strong>Cannot proceed:</strong> Your settings require more funds than you have. Reduce trade size, number of offers, headroom, or reserves.`);
@@ -33441,11 +33452,14 @@
                 const fee = review.fee_recommendation || {};
                 const priceInfo = _singleApprovalRunDefaults?.price_evidence || {};
                 const smartPrices = window._singleApprovalSmartPriceProposal || {};
-                const fundable = _singleApprovalRunDefaults?.funding || {};
+                const fundable = _singleApprovalRunDefaults?.funded_estimate || {};
+                const fundedEstimate = fundable.available === true
+                    ? `${fundable.buy} BUY / ${fundable.sell} SELL`
+                    : 'unavailable';
                 output.textContent = [
                     `Wallet ${id.wallet_fingerprint || '—'} · ${id.network || '—'} · ${id.ticker || 'selected CAT'}`,
                     `Asset ${id.asset_id || '—'}`,
-                    `Targets ${p.buy_target} BUY / ${p.sell_target} SELL · currently fundable ${fundable.buy_fundable ?? 'checking'} BUY / ${fundable.sell_fundable ?? 'checking'} SELL; live counts are shown on the dashboard.`,
+                    `Targets ${p.buy_target} BUY / ${p.sell_target} SELL · current fundable estimate ${fundedEstimate}. This estimate is nonbinding; coin preparation verifies the actual funded counts, and the dashboard shows live offers.`,
                     `Price ${p.price_anchor} XCH/CAT · approved range ${p.price_min}–${p.price_max}`,
                     `Max fee per wallet transaction ${document.getElementById('singleRunFeeMax').value.trim()} XCH`,
                     `Fee recommendation ${fee.available ? `${fee.fee_xch} XCH · ${fee.source || 'source unavailable'}` : 'currently unavailable'}`,

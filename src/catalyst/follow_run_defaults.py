@@ -50,6 +50,47 @@ def exact_funding_defaults() -> dict:
     sell = configuration["MAX_ACTIVE_SELL_OFFERS"]
     if any(type(value) is not int or value <= 0 for value in (buy, sell)):
         raise ValueError("FOLLOW_RUN_DEFAULTS_CONFIG_INVALID")
+    funded_estimate = {
+        "available": False,
+        "buy": 0,
+        "sell": 0,
+        "kind": "nonbinding_current_inventory_estimate",
+    }
+    try:
+        from dataclasses import asdict
+        import api_server
+        from coin_prep_economics import build_standard_prep_economics
+        from follow_slot_fit import preview_current_follow_slot_fit
+        from tx_fees import get_fee_pool_plan
+
+        estimate_price = api_server._get_readonly_mid_price_str()
+        recipe = build_standard_prep_economics(
+            configuration=configuration,
+            fee_pool=get_fee_pool_plan(),
+            live_price=estimate_price,
+            coin_multiplier="1",
+            target_seconds=300,
+        )
+        fit = preview_current_follow_slot_fit(
+            configuration=configuration,
+            outputs=[asdict(target) for target in recipe["targets"]],
+            buy_limit=buy,
+            sell_limit=sell,
+            maximum_trade_xch_mojos=xch_trade,
+            maximum_trade_cat_atoms=cat_trade,
+            allow_partial=True,
+            mid_price_override=Decimal(estimate_price),
+        )
+        funded_estimate = {
+            "available": True,
+            "buy": fit["funded_buy_limit"],
+            "sell": fit["funded_sell_limit"],
+            "kind": "nonbinding_current_inventory_estimate",
+        }
+    except Exception:
+        # Defaults remain useful when pricing/configuration is temporarily
+        # unavailable; callers must render this estimate as unavailable.
+        pass
     return {
         "buy_target": buy,
         "sell_target": sell,
@@ -60,4 +101,5 @@ def exact_funding_defaults() -> dict:
         "maximum_trade_cat_atoms": str(cat_trade),
         "wallet_identity": observed["identity"],
         "configuration_sha256": before,
+        "funded_estimate": funded_estimate,
     }

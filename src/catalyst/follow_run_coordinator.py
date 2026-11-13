@@ -13,7 +13,7 @@ import threading
 import time
 
 
-_VERSION = 1
+_VERSION = 3
 _RUN_ID_RE = re.compile(r"[0-9a-f]{64}")
 _STATES = {
     "prep_pending",
@@ -56,17 +56,38 @@ class FollowRunCoordinator:
                 "unknown_effect",
                 "fee_approval_id",
                 "fee_approval_session_id",
+                "funded_buy_limit",
+                "funded_sell_limit",
+                "funded_proof_sha256",
+                "funded_refresh_proof_sha256",
             }
-            legacy_keys = current_keys - {
+            v2_keys = current_keys - {"funded_refresh_proof_sha256"}
+            v1_keys = v2_keys - {
+                "funded_buy_limit",
+                "funded_sell_limit",
+                "funded_proof_sha256",
+            }
+            legacy_keys = v1_keys - {
                 "fee_approval_id",
                 "fee_approval_session_id",
             }
-            migrated = type(value) is dict and set(value) == legacy_keys
+            migrated = (
+                type(value) is dict
+                and type(value.get("version")) is int
+                and value["version"] in {1, 2}
+                and frozenset(value)
+                in {frozenset(v2_keys), frozenset(v1_keys), frozenset(legacy_keys)}
+            )
             if migrated:
                 value = {
                     **value,
+                    "version": _VERSION,
                     "fee_approval_id": None,
                     "fee_approval_session_id": None,
+                    "funded_buy_limit": None,
+                    "funded_sell_limit": None,
+                    "funded_proof_sha256": None,
+                    "funded_refresh_proof_sha256": None,
                 }
             if (
                 type(value) is not dict
@@ -105,6 +126,39 @@ class FollowRunCoordinator:
                     != (value["fee_approval_session_id"] is None)
                 )
                 or (
+                    value["funded_buy_limit"] is not None
+                    and (
+                        type(value["funded_buy_limit"]) is not int
+                        or value["funded_buy_limit"] < 1
+                    )
+                )
+                or (
+                    value["funded_sell_limit"] is not None
+                    and (
+                        type(value["funded_sell_limit"]) is not int
+                        or value["funded_sell_limit"] < 1
+                    )
+                )
+                or (
+                    (value["funded_buy_limit"] is None)
+                    != (value["funded_sell_limit"] is None)
+                )
+                or (
+                    value["funded_proof_sha256"] is not None
+                    and not self._digest(value["funded_proof_sha256"])
+                )
+                or (
+                    value["funded_proof_sha256"] is not None
+                    and value["funded_buy_limit"] is None
+                )
+                or (
+                    value["funded_refresh_proof_sha256"] is not None
+                    and (
+                        not self._digest(value["funded_refresh_proof_sha256"])
+                        or value["funded_buy_limit"] is None
+                    )
+                )
+                or (
                     value["state"] in {"recoverable_error", "stopped"}
                     and value["recoverable_reason"] is None
                 )
@@ -122,6 +176,43 @@ class FollowRunCoordinator:
             ):
                 raise ValueError("invalid coordinator record")
             if migrated:
+                # Older single-approval runs had no partial ceiling field.
+                # Preserve their full signed target only when the persisted
+                # database authority independently proves that exact target.
+                if (
+                    value["run_id"] is not None
+                    and value["state"] in {"ready", "start_pending", "running"}
+                    and value["unknown_effect"] is False
+                ):
+                    try:
+                        import database
+
+                        policy = database.get_active_follow_run_policy()
+                        identity = database.get_follow_run_identity(value["run_id"])
+                        authority = database.get_follow_creation_authority(
+                            identity=identity,
+                            configuration_sha256=value["configuration_sha256"],
+                            now_epoch=int(time.time()),
+                        )
+                        if (
+                            policy is not None
+                            and policy.digest == value["policy_digest"]
+                            and type(authority) is dict
+                            and authority.get("ready") is True
+                            and authority.get("run_id") == value["run_id"]
+                            and authority.get("configuration_sha256")
+                            == value["configuration_sha256"]
+                            and authority.get("buy_limit") == policy.buy_target
+                            and authority.get("sell_limit") == policy.sell_target
+                            and identity.get("network") == policy.network
+                            and str(identity.get("wallet_fingerprint"))
+                            == policy.wallet_fingerprint
+                            and identity.get("asset_id") == policy.asset_id
+                        ):
+                            value["funded_buy_limit"] = policy.buy_target
+                            value["funded_sell_limit"] = policy.sell_target
+                    except Exception:
+                        pass
                 return self._write(value)
             return value
         except Exception as exc:
@@ -187,6 +278,10 @@ class FollowRunCoordinator:
                     "unknown_effect": False,
                     "fee_approval_id": None,
                     "fee_approval_session_id": None,
+                    "funded_buy_limit": None,
+                    "funded_sell_limit": None,
+                    "funded_proof_sha256": None,
+                    "funded_refresh_proof_sha256": None,
                 }
             )
 
@@ -299,16 +394,37 @@ class FollowRunCoordinator:
         run_id: str,
         policy_digest: str,
         configuration_sha256: str,
+        funded_buy_limit: int | None = None,
+        funded_sell_limit: int | None = None,
+        funded_proof_sha256: str | None = None,
         now_epoch: int | None = None,
     ) -> dict:
         """Attach the real run_id returned by the durable authority service."""
         if not self._digest(run_id):
             raise ValueError("FOLLOW_RUN_AUTHORITY_INVALID")
         now = self._now(now_epoch)
+        if (funded_buy_limit is None) != (funded_sell_limit is None):
+            raise ValueError("FOLLOW_FUNDED_TARGET_BINDING_INVALID")
+        if funded_proof_sha256 is not None and not self._digest(funded_proof_sha256):
+            raise ValueError("FOLLOW_FUNDED_TARGET_BINDING_INVALID")
+        if funded_buy_limit is not None and (
+            type(funded_buy_limit) is not int
+            or type(funded_sell_limit) is not int
+            or funded_buy_limit < 1
+            or funded_sell_limit < 1
+        ):
+            raise ValueError("FOLLOW_FUNDED_TARGET_BINDING_INVALID")
         with _LOCK:
             current = self._bound(session_id, policy_digest, configuration_sha256)
             if current["run_id"] is not None:
-                if current["run_id"] == run_id:
+                if current["run_id"] == run_id and (
+                    funded_buy_limit is None
+                    or (
+                        current.get("funded_buy_limit") == funded_buy_limit
+                        and current.get("funded_sell_limit") == funded_sell_limit
+                        and current.get("funded_proof_sha256") == funded_proof_sha256
+                    )
+                ):
                     return current
                 raise ValueError("FOLLOW_RUN_AUTHORITY_CHANGED")
             if current["state"] not in {"ready", "start_pending"}:
@@ -319,7 +435,100 @@ class FollowRunCoordinator:
                 configuration_sha256=configuration_sha256,
                 now_epoch=now,
             )
-            return self._write({**current, "run_id": run_id, "updated_at_epoch": now})
+            import database
+
+            policy = database.get_active_follow_run_policy()
+            if funded_buy_limit is None:
+                funded_buy_limit = getattr(policy, "buy_target", None)
+                funded_sell_limit = getattr(policy, "sell_target", None)
+            if (
+                type(funded_buy_limit) is not int
+                or type(funded_sell_limit) is not int
+                or not 1 <= funded_buy_limit <= getattr(policy, "buy_target", 0)
+                or not 1 <= funded_sell_limit <= getattr(policy, "sell_target", 0)
+                or (
+                    (
+                        funded_buy_limit < policy.buy_target
+                        or funded_sell_limit < policy.sell_target
+                    )
+                    and not self._digest(funded_proof_sha256)
+                )
+            ):
+                raise ValueError("FOLLOW_FUNDED_TARGET_BINDING_INVALID")
+            return self._write(
+                {
+                    **current,
+                    "run_id": run_id,
+                    "funded_buy_limit": funded_buy_limit,
+                    "funded_sell_limit": funded_sell_limit,
+                    "funded_proof_sha256": funded_proof_sha256,
+                    "funded_refresh_proof_sha256": None,
+                    "updated_at_epoch": now,
+                }
+            )
+
+    def refresh_funded_limits(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        policy_digest: str,
+        configuration_sha256: str,
+        funded_buy_limit: int,
+        funded_sell_limit: int,
+        proof_sha256: str,
+        now_epoch: int | None = None,
+    ) -> dict:
+        """Raise a running book ceiling from a fresh read-only fit proof."""
+        if (
+            not self._digest(run_id)
+            or not self._digest(proof_sha256)
+            or type(funded_buy_limit) is not int
+            or type(funded_sell_limit) is not int
+            or funded_buy_limit < 1
+            or funded_sell_limit < 1
+        ):
+            raise ValueError("FOLLOW_FUNDED_TARGET_BINDING_INVALID")
+        now = self._now(now_epoch)
+        import database
+        import confidence_override
+
+        with _LOCK:
+            current = self._bound(session_id, policy_digest, configuration_sha256)
+            if (
+                current.get("run_id") != run_id
+                or current.get("unknown_effect") is not False
+                or current.get("state") not in {"running", "start_pending"}
+                or current.get("funded_buy_limit") is None
+            ):
+                raise ValueError("FOLLOW_FUNDED_TARGET_AUTHORITY_CHANGED")
+            policy = database.get_active_follow_run_policy()
+            if (
+                policy is None
+                or policy.digest != policy_digest
+                or confidence_override.current_configuration_digest()
+                != configuration_sha256
+                or funded_buy_limit > policy.buy_target
+                or funded_sell_limit > policy.sell_target
+                or funded_buy_limit < current["funded_buy_limit"]
+                or funded_sell_limit < current["funded_sell_limit"]
+            ):
+                raise ValueError("FOLLOW_FUNDED_TARGET_AUTHORITY_CHANGED")
+            if (
+                funded_buy_limit == current["funded_buy_limit"]
+                and funded_sell_limit == current["funded_sell_limit"]
+                and current.get("funded_refresh_proof_sha256") == proof_sha256
+            ):
+                return current
+            return self._write(
+                {
+                    **current,
+                    "funded_buy_limit": funded_buy_limit,
+                    "funded_sell_limit": funded_sell_limit,
+                    "funded_refresh_proof_sha256": proof_sha256,
+                    "updated_at_epoch": now,
+                }
+            )
 
     def bind_prep_approval(
         self,

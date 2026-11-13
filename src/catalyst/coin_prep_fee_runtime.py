@@ -588,6 +588,39 @@ def read_fee_economic_snapshot(request_options: dict) -> dict:
             coin_multiplier=options["coin_multiplier"],
             target_seconds=options["target_seconds"],
         )
+        # A native-confirmed Follow session may prepare only the largest
+        # currently fundable prefixes. The signed policy continues to carry
+        # the requested targets; this exact recipe carries the initial funded
+        # outputs. All evidence is re-read here on preview/approval refresh.
+        session_id = options.get("follow_run_session_id")
+        if session_id is not None:
+            from confidence_override import current_configuration_digest
+            from follow_funded_targets import (
+                plan_partial_follow_prep_recipe,
+                validate_follow_prep_authority,
+            )
+            from follow_principal import _principal_from_observed_snapshot
+            from follow_run_coordinator import FollowRunCoordinator
+
+            coordinator = FollowRunCoordinator().get_state()
+            active_policy = database.get_active_follow_run_policy()
+            config_sha256 = current_configuration_digest()
+            validate_follow_prep_authority(
+                session_id=session_id,
+                coordinator_state=coordinator,
+                policy=active_policy,
+                configuration=config,
+                configuration_sha256=config_sha256,
+                identity=identity,
+            )
+            principal = _principal_from_observed_snapshot(context, fee_cap_mojos=None)
+            recipe = plan_partial_follow_prep_recipe(
+                recipe,
+                configuration=config,
+                policy=active_policy,
+                available_trade_xch_mojos=principal["maximum_trade_xch_mojos"],
+                available_trade_cat_atoms=principal["maximum_trade_cat_atoms"],
+            )
     if config != _configuration() or fee_pool != get_fee_pool_plan():
         raise ValueError("FEE_WALLET_CONTEXT_CHANGED")
     try:

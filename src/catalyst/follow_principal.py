@@ -231,7 +231,11 @@ def _principal_from_observed_snapshot(
 
 
 def prove_follow_replacement_count_capacity(
-    *, buy_limit: int, sell_limit: int, replacement_counts: dict
+    *,
+    buy_limit: int,
+    sell_limit: int,
+    replacement_counts: dict,
+    allow_partial: bool = False,
 ) -> dict:
     """Require one approved replacement coin per requested initial offer.
 
@@ -244,6 +248,7 @@ def prove_follow_replacement_count_capacity(
         or type(sell_limit) is not int
         or buy_limit < 1
         or sell_limit < 1
+        or type(allow_partial) is not bool
         or type(replacement_counts) is not dict
         or set(replacement_counts) != {"xch", "cat"}
         or any(
@@ -251,11 +256,18 @@ def prove_follow_replacement_count_capacity(
         )
     ):
         raise ValueError("FOLLOW_SLOT_LIMIT_INVALID")
-    if replacement_counts["xch"] < buy_limit or replacement_counts["cat"] < sell_limit:
+    funded_buy = min(buy_limit, replacement_counts["xch"])
+    funded_sell = min(sell_limit, replacement_counts["cat"])
+    if (not allow_partial and (funded_buy < buy_limit or funded_sell < sell_limit)) or (
+        allow_partial and (funded_buy < 1 or funded_sell < 1)
+    ):
         raise ValueError("FOLLOW_SLOT_INVENTORY_SHORT")
     return {
         "buy_limit": buy_limit,
         "sell_limit": sell_limit,
+        "funded_buy_limit": funded_buy,
+        "funded_sell_limit": funded_sell,
+        "partial_target": funded_buy < buy_limit or funded_sell < sell_limit,
         "replacement_count_gate_passed": True,
     }
 
@@ -420,6 +432,7 @@ def preview_approved_follow_principal(
     try:
         scope = json.loads(scope_json)
         plan = json.loads(plan_json)
+        request_options = json.loads(context.get("request_options_json", "{}"))
     except (TypeError, ValueError) as exc:
         raise ValueError("FOLLOW_FEE_SCOPE_INVALID") from exc
     identity_keys = {
@@ -438,6 +451,32 @@ def preview_approved_follow_principal(
         or re.fullmatch(r"[0-9a-f]{64}", scope["session_id"]) is None
     ):
         raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
+    partial_session_id = (
+        request_options.get("follow_run_session_id")
+        if type(request_options) is dict
+        else None
+    )
+    partial_follow = partial_session_id is not None
+    if partial_follow:
+        from follow_run_policy import FollowRunPolicy
+        from follow_run_coordinator import FollowRunCoordinator
+
+        state = FollowRunCoordinator().get_state()
+        policy = database.get_active_follow_run_policy()
+        if (
+            type(state) is not dict
+            or type(policy) is not FollowRunPolicy
+            or state.get("session_id") != partial_session_id
+            or state.get("state") != "ready"
+            or state.get("fee_approval_id") != approval_id
+            or state.get("fee_approval_session_id") != scope.get("session_id")
+            or state.get("policy_digest") != policy.digest
+            or state.get("configuration_sha256") != current_configuration_digest()
+            or state.get("unknown_effect") is not False
+            or buy_limit != policy.buy_target
+            or sell_limit != policy.sell_target
+        ):
+            raise ValueError("FOLLOW_FUNDED_TARGET_AUTHORITY_CHANGED")
     outputs = plan.get("outputs") if type(plan) is dict else None
     if type(outputs) is not list:
         raise ValueError("FOLLOW_FEE_SCOPE_INVALID")
@@ -467,6 +506,7 @@ def preview_approved_follow_principal(
             buy_limit=buy_limit,
             sell_limit=sell_limit,
             replacement_counts=replacement_counts,
+            allow_partial=partial_follow,
         )
     identity = {key: scope.get(key) for key in identity_keys}
     configuration_sha256 = current_configuration_digest()
@@ -499,6 +539,7 @@ def preview_approved_follow_principal(
             sell_limit=sell_limit,
             maximum_trade_xch_mojos=principal["maximum_trade_xch_mojos"],
             maximum_trade_cat_atoms=principal["maximum_trade_cat_atoms"],
+            allow_partial=partial_follow,
         )
         shutdown_funding = preview_one_block_shutdown_funding(
             maximum_fee_mojos=(
@@ -627,8 +668,16 @@ def prepare_follow_run_review(
             or proposal.get("buy_limit") != buy_limit
             or proposal.get("sell_limit") != sell_limit
             or proposal.get("replacement_count_gate_passed") is not True
-            or proposal.get("buy_slots_arithmetic_fit") != buy_limit
-            or proposal.get("sell_slots_arithmetic_fit") != sell_limit
+            or proposal.get("buy_slots_arithmetic_fit")
+            != proposal.get("funded_buy_limit")
+            or proposal.get("sell_slots_arithmetic_fit")
+            != proposal.get("funded_sell_limit")
+            or type(proposal.get("funded_buy_limit")) is not int
+            or type(proposal.get("funded_sell_limit")) is not int
+            or proposal["funded_buy_limit"] < 1
+            or proposal["funded_sell_limit"] < 1
+            or proposal["funded_buy_limit"] > buy_limit
+            or proposal["funded_sell_limit"] > sell_limit
             or proposal.get("current_prep_targets_proven") is not True
             or type(proposal.get("shutdown_funding")) is not dict
             or proposal["shutdown_funding"].get("ready") is not True
@@ -783,8 +832,10 @@ def confirm_follow_run_review(review_id: str, review_sha256: str) -> dict:
             or proposal["shutdown_funding"].get("ready") is not True
             or proposal["shutdown_funding"].get("full_book_proven") is not False
             or proposal["shutdown_funding"].get("dispatch_authorized") is not False
-            or proposal.get("buy_slots_arithmetic_fit") != buy_limit
-            or proposal.get("sell_slots_arithmetic_fit") != sell_limit
+            or proposal.get("buy_slots_arithmetic_fit")
+            != proposal.get("funded_buy_limit")
+            or proposal.get("sell_slots_arithmetic_fit")
+            != proposal.get("funded_sell_limit")
             or proposal.get("identity") != review["identity"]
             or proposal.get("configuration_sha256")
             != review.get("configuration_sha256")

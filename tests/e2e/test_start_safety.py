@@ -275,6 +275,49 @@ def test_coin_prep_pool_exceeding_post_reserve_balance_blocks_save(page):
     assert "Bot will still work" not in result["warning"]
 
 
+def test_desktop_review_accepts_partially_fundable_target_without_spending(page):
+    """A larger target may reach the exact review when each side can fund slots."""
+    _ready_setup(page, "allowed")
+    result = page.evaluate(
+        """() => {
+            IS_DESKTOP = true;
+            window.pywebview = {api: {get_single_approval_follow_run_defaults: async () => ({})}};
+            _pairDataReadyAssetId = currentCAT.asset_id;
+            _catSwitchTargetAssetId = '';
+            bot_state.balances = mergeVerifiedWalletBalances({
+                xch: {total: 10, confirmed: 10, spendable: 10},
+                cat: {total: 1000000, confirmed: 1000000, spendable: 1000000},
+            }, currentCAT.asset_id);
+            bot_state.pricing = {mid: 1};
+            document.getElementById('configTradeXch').value = '1';
+            document.getElementById('configMaxBuy').value = '4';
+            document.getElementById('configMaxSell').value = '4';
+            document.getElementById('configTierEnabled').checked = false;
+            document.getElementById('configCoinPrepHeadroomPct').value = '10';
+            document.getElementById('configXchReserve').value = '2';
+            document.getElementById('configCatReserve').value = '0';
+            document.getElementById('configTransactionFeeEnabled').checked = false;
+            const sniper = document.getElementById('configSniperEnabled');
+            if (sniper) sniper.checked = false;
+            updateCoinPrepPreview();
+            return {
+                impossible: tradingSettingsImpossible,
+                estimate: tradingSettingsFundableEstimate,
+                valid: validateSettingsForm(),
+                critical: document.getElementById('coinPrepWarning').dataset.critical,
+                warning: document.getElementById('coinPrepWarning').textContent,
+            };
+        }"""
+    )
+    assert result["estimate"]["buy"] >= 1
+    assert result["estimate"]["sell"] >= 1
+    assert result["impossible"] is False
+    assert result["valid"] is True
+    assert result["critical"] == "false"
+    assert "nonbinding" in result["warning"]
+    assert "verified funds become available" in result["warning"]
+
+
 def test_active_bootstrap_campaign_bypasses_legacy_reserve_warning_on_save(page):
     """A funded Bootstrap campaign must not be blocked by the obsolete Follow ladder."""
     _ready_setup(page, "allowed")

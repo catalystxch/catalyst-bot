@@ -62,7 +62,11 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
             )
 
             preview = preview_coin_prep_fees(
-                {"coin_multiplier": "1", "target_seconds": 300}
+                {
+                    "coin_multiplier": "1",
+                    "target_seconds": 300,
+                    "follow_run_session_id": session_id,
+                }
             )
             if preview.get("available") is not True:
                 reason = preview.get("reason", "FEE_PREVIEW_UNAVAILABLE")

@@ -3040,6 +3040,44 @@ class BotLoop:
         self._last_bot_health_anomaly_log = {"signature": signature, "at": now}
         return True
 
+    def _follow_funded_offer_limit(self, side: str, desired: int) -> int:
+        """Clamp an active Follow book to its durable post-prep funded proof."""
+        run_id = getattr(self, "_reviewed_follow_run_id", None)
+        if run_id is None:
+            return max(0, int(desired or 0))
+        try:
+            from follow_run_coordinator import FollowRunCoordinator
+
+            state = FollowRunCoordinator().get_state()
+            if type(state) is not dict or state.get("run_id") != run_id:
+                return 0
+            now = time.monotonic()
+            last_refresh = getattr(self, "_follow_funded_refresh_monotonic", 0.0)
+            if state.get("state") == "running" and now - last_refresh >= 60:
+                self._follow_funded_refresh_monotonic = now
+                try:
+                    from follow_funded_targets import (
+                        refresh_running_follow_funded_limits,
+                    )
+
+                    state = refresh_running_follow_funded_limits(
+                        state["session_id"], offer_manager=self.offer_manager
+                    )
+                except Exception:
+                    # Keep the last durable proof. Fresh resource evidence is
+                    # required only to raise the ceiling; unreadable inventory
+                    # never turns into additional offer capacity.
+                    pass
+            key = "funded_buy_limit" if side == "buy" else "funded_sell_limit"
+            value = state.get(key)
+            if type(value) is not int or value < 1:
+                return 0
+            return min(max(0, int(desired or 0)), value)
+        except Exception:
+            # Missing or unreadable funded proof must pause creation for this
+            # run instead of falling back to the larger configured target.
+            return 0
+
     def _get_expected_offer_targets(self, mid_price: Decimal) -> Dict[str, int]:
         """Return the intended live-book targets for the current market state."""
         targets = {"buy": 0, "sell": 0}
@@ -3050,6 +3088,7 @@ class BotLoop:
             else:
                 enabled = bool(getattr(cfg, "ENABLE_SELL", True))
                 max_offers = int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0)
+            max_offers = self._follow_funded_offer_limit(side, max_offers)
             if not enabled or max_offers <= 0:
                 continue
             try:
@@ -3158,8 +3197,12 @@ class BotLoop:
             )
         except Exception:
             targets = {
-                "buy": int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 0) or 0),
-                "sell": int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0),
+                "buy": self._follow_funded_offer_limit(
+                    "buy", int(getattr(cfg, "MAX_ACTIVE_BUY_OFFERS", 0) or 0)
+                ),
+                "sell": self._follow_funded_offer_limit(
+                    "sell", int(getattr(cfg, "MAX_ACTIVE_SELL_OFFERS", 0) or 0)
+                ),
             }
 
         deficits: Dict[str, Dict[str, int]] = {}
@@ -14562,15 +14605,18 @@ class BotLoop:
         def _skip_level(also_under_target: bool) -> str:
             return "info" if also_under_target else "debug"
 
+        creation_targets = self._get_expected_offer_targets(mid_price)
+        _buy_target_ceiling = int(creation_targets.get("buy", 0) or 0)
+        _sell_target_ceiling = int(creation_targets.get("sell", 0) or 0)
         _buy_under = (
             cfg.ENABLE_BUY
             and not skip_buy
-            and int(current_buy_count or 0) < int(cfg.MAX_ACTIVE_BUY_OFFERS)
+            and int(current_buy_count or 0) < _buy_target_ceiling
         )
         _sell_under = (
             cfg.ENABLE_SELL
             and not skip_sell
-            and int(current_sell_count or 0) < int(cfg.MAX_ACTIVE_SELL_OFFERS)
+            and int(current_sell_count or 0) < _sell_target_ceiling
         )
         _any_under = bool(_buy_under or _sell_under)
 

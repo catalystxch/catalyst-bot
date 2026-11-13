@@ -209,6 +209,145 @@ def test_prep_reconciliation_and_start_transitions_are_idempotent(saved_state):
     assert running["state"] == "running"
 
 
+def test_authority_binding_persists_partial_funded_ceiling(saved_state):
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+    service.reconcile_prep(
+        **binding(run),
+        effect_status="confirmed",
+        prep_complete=True,
+        fee_status="within_cap",
+        now_epoch=102,
+    )
+
+    bound = service.bind_authority(
+        **binding(run),
+        run_id=AUTHORITY_RUN_ID,
+        funded_buy_limit=40,
+        funded_sell_limit=30,
+        funded_proof_sha256="d" * 64,
+        now_epoch=103,
+    )
+
+    assert bound["funded_buy_limit"] == 40
+    assert bound["funded_sell_limit"] == 30
+    assert bound["funded_proof_sha256"] == "d" * 64
+    assert service.read_state() == bound
+
+
+def test_authority_binding_rejects_unproved_partial_ceiling(saved_state):
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+    service.reconcile_prep(
+        **binding(run),
+        effect_status="confirmed",
+        prep_complete=True,
+        fee_status="within_cap",
+        now_epoch=102,
+    )
+
+    with pytest.raises(ValueError, match="FOLLOW_FUNDED_TARGET_BINDING_INVALID"):
+        service.bind_authority(
+            **binding(run),
+            run_id=AUTHORITY_RUN_ID,
+            funded_buy_limit=40,
+            funded_sell_limit=30,
+            now_epoch=103,
+        )
+
+
+def test_running_ceiling_refresh_is_monotonic_and_policy_bounded(saved_state):
+    service = coordinator()
+    run = service.begin_run(
+        policy_digest=POLICY_DIGEST,
+        configuration_sha256=CONFIGURATION_SHA256,
+        now_epoch=100,
+    )
+    key = binding(run)
+    service.reconcile_prep(
+        **key,
+        effect_status="confirmed",
+        prep_complete=True,
+        fee_status="within_cap",
+        now_epoch=102,
+    )
+    service.bind_authority(
+        **key,
+        run_id=AUTHORITY_RUN_ID,
+        funded_buy_limit=40,
+        funded_sell_limit=30,
+        funded_proof_sha256="d" * 64,
+        now_epoch=103,
+    )
+    service.mark_start_pending(**key, now_epoch=104)
+    service.mark_running(**key, now_epoch=105)
+
+    extended = service.refresh_funded_limits(
+        **key,
+        run_id=AUTHORITY_RUN_ID,
+        funded_buy_limit=41,
+        funded_sell_limit=31,
+        proof_sha256="e" * 64,
+        now_epoch=106,
+    )
+    assert (extended["funded_buy_limit"], extended["funded_sell_limit"]) == (41, 31)
+    assert extended["funded_proof_sha256"] == "d" * 64
+    assert extended["funded_refresh_proof_sha256"] == "e" * 64
+
+    with pytest.raises(ValueError, match="FOLLOW_FUNDED_TARGET_AUTHORITY_CHANGED"):
+        service.refresh_funded_limits(
+            **key,
+            run_id=AUTHORITY_RUN_ID,
+            funded_buy_limit=40,
+            funded_sell_limit=31,
+            proof_sha256="f" * 64,
+            now_epoch=107,
+        )
+    with pytest.raises(ValueError, match="FOLLOW_FUNDED_TARGET_AUTHORITY_CHANGED"):
+        service.refresh_funded_limits(
+            **key,
+            run_id=AUTHORITY_RUN_ID,
+            funded_buy_limit=101,
+            funded_sell_limit=31,
+            proof_sha256="f" * 64,
+            now_epoch=107,
+        )
+
+
+def test_v1_full_target_run_migrates_only_after_authority_reproof(saved_state):
+    service = coordinator()
+    legacy = {
+        "version": 1,
+        "session_id": "c" * 64,
+        "run_id": AUTHORITY_RUN_ID,
+        "policy_digest": POLICY_DIGEST,
+        "configuration_sha256": CONFIGURATION_SHA256,
+        "state": "running",
+        "updated_at_epoch": 100,
+        "recoverable_reason": None,
+        "unknown_effect": False,
+        "fee_approval_id": PREP_APPROVAL_ID,
+        "fee_approval_session_id": PREP_SESSION_ID,
+    }
+    saved_state[service.SETTING_KEY] = json.dumps(legacy)
+
+    migrated = service.get_state()
+
+    assert migrated["version"] == 3
+    assert migrated["run_id"] == AUTHORITY_RUN_ID
+    assert migrated["funded_buy_limit"] == 100
+    assert migrated["funded_sell_limit"] == 100
+    assert migrated["funded_proof_sha256"] is None
+
+
 def test_fee_over_cap_pauses_at_awaiting_confirmation(saved_state):
     service = coordinator()
     run = service.begin_run(

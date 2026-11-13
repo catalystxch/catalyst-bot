@@ -145,6 +145,9 @@ def _validate_policy_and_prep(session_id: str) -> tuple[dict, object, dict, dict
 
 def _validate_proposal(policy, proposal: dict) -> None:
     """Ensure freshly observed principal and slots fit the signed policy."""
+    funded_buy = proposal.get("funded_buy_limit", policy.buy_target)
+    funded_sell = proposal.get("funded_sell_limit", policy.sell_target)
+    partial = funded_buy != policy.buy_target or funded_sell != policy.sell_target
     _require(
         type(proposal) is dict
         and proposal.get("dispatch_authorized") is False
@@ -158,10 +161,30 @@ def _validate_proposal(policy, proposal: dict) -> None:
         proposal.get("buy_limit") == policy.buy_target
         and proposal.get("sell_limit") == policy.sell_target
         and proposal.get("replacement_count_gate_passed") is True
-        and proposal.get("buy_slots_arithmetic_fit") == policy.buy_target
-        and proposal.get("sell_slots_arithmetic_fit") == policy.sell_target,
+        and type(funded_buy) is int
+        and type(funded_sell) is int
+        and 1 <= funded_buy <= policy.buy_target
+        and 1 <= funded_sell <= policy.sell_target
+        and proposal.get("buy_slots_arithmetic_fit") == funded_buy
+        and proposal.get("sell_slots_arithmetic_fit") == funded_sell
+        and (
+            not partial
+            or (
+                type(proposal.get("slot_assignment_sha256")) is str
+                and _DIGEST.fullmatch(proposal["slot_assignment_sha256"]) is not None
+            )
+        ),
         "FOLLOW_SLOT_INVENTORY_SHORT",
     )
+    for assignment in proposal.get("funded_output_assignments", []):
+        try:
+            price = Decimal(assignment["price_xch"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("FOLLOW_FUNDED_TARGET_PROOF_INVALID") from None
+        _require(
+            policy.price_min <= price <= policy.price_max,
+            "FOLLOW_FUNDED_TARGET_PRICE_OUTSIDE_POLICY",
+        )
     _require(
         type(proposal.get("maximum_trade_xch_mojos")) is int
         and type(proposal.get("maximum_trade_cat_atoms")) is int
@@ -211,12 +234,13 @@ def _validate_observed_proposal(policy, proposal, approved, configuration_sha256
     )
 
 
-def _fee_cap_warning(policy, proposal):
+def _fee_cap_warning(policy, proposal, *, run_id=None):
     recommended_fee = proposal["shutdown_funding"]["quoted_fee_mojos"]
     if recommended_fee <= policy.maximum_fee_mojos_per_tx:
         return None
     return {
         "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+        "run_id": run_id,
         "recommended_fee_mojos": recommended_fee,
         "maximum_fee_mojos_per_tx": policy.maximum_fee_mojos_per_tx,
         "message": "The current network recommendation is above the approved per-transaction cap; cancellations must use an exact quote at or below the cap.",
@@ -269,11 +293,22 @@ def authorize_approved_follow_run(session_id: str) -> dict:
         _validate_observed_proposal(
             policy, existing_proposal, approved, configuration_sha256
         )
+        _require(
+            current_state.get("funded_buy_limit")
+            == existing_proposal["funded_buy_limit"]
+            and current_state.get("funded_sell_limit")
+            == existing_proposal["funded_sell_limit"]
+            and current_state.get("funded_proof_sha256")
+            == existing_proposal["slot_assignment_sha256"],
+            "FOLLOW_RUN_AUTHORITY_PROOF_INVALID",
+        )
         return {
             "success": True,
             "state": current_state["state"],
             "run_id": current_state["run_id"],
-            "fee_warning": _fee_cap_warning(policy, existing_proposal),
+            "fee_warning": _fee_cap_warning(
+                policy, existing_proposal, run_id=current_state["run_id"]
+            ),
             "dispatch_authorized": False,
         }
 
@@ -349,6 +384,9 @@ def authorize_approved_follow_run(session_id: str) -> dict:
             run_id=run_id,
             policy_digest=policy.digest,
             configuration_sha256=configuration_sha256,
+            funded_buy_limit=after_proposal["funded_buy_limit"],
+            funded_sell_limit=after_proposal["funded_sell_limit"],
+            funded_proof_sha256=after_proposal["slot_assignment_sha256"],
         )
         _require(
             bound.get("run_id") == run_id and bound.get("state") == "ready",
@@ -369,6 +407,6 @@ def authorize_approved_follow_run(session_id: str) -> dict:
         "success": True,
         "state": bound["state"],
         "run_id": run_id,
-        "fee_warning": _fee_cap_warning(policy, after_proposal),
+        "fee_warning": _fee_cap_warning(policy, after_proposal, run_id=run_id),
         "dispatch_authorized": False,
     }

@@ -114,6 +114,82 @@ def test_reversed_buy_slots_use_reversed_prepared_size_tiers():
         prove_initial_follow_slot_fit(**terms)
 
 
+def test_slot_fit_can_prove_exact_vacant_slots_for_top_up(monkeypatch):
+    import api_server  # Load wallet/config modules before swapping the cfg fixture.
+    import config
+    from follow_slot_fit import preview_current_follow_slot_fit
+
+    terms = _terms()
+    cfg = SimpleNamespace(
+        ENABLE_BUY=True,
+        ENABLE_SELL=True,
+        DRY_RUN=False,
+        COIN_IDS_ENABLED=True,
+        COIN_MAX_SIZE_RATIO=1.5,
+        BUY_LADDER_REVERSED=False,
+        TIER_ENABLED=True,
+        **{
+            f"{side}_{tier.upper()}_SIZE_XCH": size
+            for side, sizes in (
+                ("BUY", terms["buy_tier_sizes_xch"]),
+                ("SELL", terms["sell_tier_sizes_xch"]),
+            )
+            for tier, size in sizes.items()
+        },
+    )
+    monkeypatch.setattr(config, "cfg", cfg)
+    configuration = {
+        "LIQUIDITY_MODE": "two_sided",
+        "TIER_ENABLED": True,
+        "MAX_ACTIVE_BUY_OFFERS": 2,
+        "MAX_ACTIVE_SELL_OFFERS": 2,
+        "SPREAD_BPS": Decimal("2000"),
+        "MIN_EDGE_BPS": Decimal("0"),
+        "CAT_DECIMALS": 3,
+        "BUY_LADDER_REVERSED": False,
+        **{
+            f"{side}_{tier.upper()}_TIER_COUNT": count
+            for side, counts in (
+                ("BUY", terms["buy_tier_counts"]),
+                ("SELL", terms["sell_tier_counts"]),
+            )
+            for tier, count in counts.items()
+        },
+    }
+
+    result = preview_current_follow_slot_fit(
+        configuration=configuration,
+        outputs=terms["outputs"],
+        buy_limit=2,
+        sell_limit=2,
+        maximum_trade_xch_mojos=terms["maximum_trade_xch_mojos"],
+        maximum_trade_cat_atoms=terms["maximum_trade_cat_atoms"],
+        allow_partial=True,
+        mid_price_override=Decimal("1"),
+        buy_slot_candidates=[1],
+        sell_slot_candidates=[0],
+    )
+
+    assert result["funded_buy_limit"] == 1
+    assert result["funded_sell_limit"] == 1
+    assert result["funded_output_assignments"] == [
+        {
+            "side": "buy",
+            "slot": 1,
+            "tier": "extreme",
+            "price_xch": "0.9",
+            "output_ordinal": 1,
+        },
+        {
+            "side": "sell",
+            "slot": 0,
+            "tier": "inner",
+            "price_xch": "1.0",
+            "output_ordinal": 0,
+        },
+    ]
+
+
 def test_slot_assignment_digest_binds_price_and_coin_size_policy():
     from follow_slot_fit import prove_initial_follow_slot_fit
 
@@ -235,6 +311,22 @@ def test_partial_initial_fit_keeps_signed_target_and_uses_target_prefix():
     assert result["funded_sell_limit"] == 1
     assert result["buy_slots_arithmetic_fit"] == 1
     assert result["sell_slots_arithmetic_fit"] == 1
+    assert result["funded_output_assignments"] == [
+        {
+            "side": "buy",
+            "slot": 0,
+            "tier": "inner",
+            "price_xch": "1.0",
+            "output_ordinal": 0,
+        },
+        {
+            "side": "sell",
+            "slot": 0,
+            "tier": "inner",
+            "price_xch": "1.0",
+            "output_ordinal": 0,
+        },
+    ]
     assert result["partial_target"] is True
     assert result["dispatch_authorized"] is False
 
@@ -292,6 +384,67 @@ def test_current_slot_preview_uses_server_configuration_and_readonly_price(monke
     )
     assert result["sell_slots_arithmetic_fit"] == 2
     assert result["readonly_mid_price_xch"] == "1"
+
+
+def test_current_slot_preview_can_bind_to_approved_policy_anchor(monkeypatch):
+    import api_server
+    import config
+    from follow_slot_fit import preview_current_follow_slot_fit
+
+    terms = _terms()
+    cfg = SimpleNamespace(
+        ENABLE_BUY=True,
+        ENABLE_SELL=True,
+        DRY_RUN=False,
+        COIN_IDS_ENABLED=True,
+        COIN_MAX_SIZE_RATIO=1.5,
+        BUY_LADDER_REVERSED=False,
+        TIER_ENABLED=True,
+        **{
+            f"{side}_{tier.upper()}_SIZE_XCH": size
+            for side, sizes in (
+                ("BUY", terms["buy_tier_sizes_xch"]),
+                ("SELL", terms["sell_tier_sizes_xch"]),
+            )
+            for tier, size in sizes.items()
+        },
+    )
+    monkeypatch.setattr(config, "cfg", cfg)
+    monkeypatch.setattr(
+        api_server,
+        "_get_readonly_mid_price_str",
+        lambda: pytest.fail("the approved anchor should be used directly"),
+    )
+    configuration = {
+        "LIQUIDITY_MODE": "two_sided",
+        "TIER_ENABLED": True,
+        "MAX_ACTIVE_BUY_OFFERS": 2,
+        "MAX_ACTIVE_SELL_OFFERS": 2,
+        "SPREAD_BPS": Decimal("2000"),
+        "MIN_EDGE_BPS": Decimal("0"),
+        "BUY_LADDER_REVERSED": False,
+        "CAT_DECIMALS": 3,
+        **{
+            f"{side}_{tier.upper()}_TIER_COUNT": count
+            for side, counts in (
+                ("BUY", terms["buy_tier_counts"]),
+                ("SELL", terms["sell_tier_counts"]),
+            )
+            for tier, count in counts.items()
+        },
+    }
+
+    result = preview_current_follow_slot_fit(
+        configuration=configuration,
+        outputs=terms["outputs"],
+        buy_limit=2,
+        sell_limit=2,
+        maximum_trade_xch_mojos=terms["maximum_trade_xch_mojos"],
+        maximum_trade_cat_atoms=terms["maximum_trade_cat_atoms"],
+        mid_price_override=Decimal("1.01"),
+    )
+
+    assert result["readonly_mid_price_xch"] == "1.01"
     configuration["MAX_ACTIVE_SELL_OFFERS"] = 3
     with pytest.raises(ValueError, match="FOLLOW_SLOT_CONFIGURATION_MISMATCH"):
         preview_current_follow_slot_fit(

@@ -34,6 +34,8 @@ def prove_initial_follow_slot_fit(
     outputs: list[dict],
     buy_target_limit: int | None = None,
     sell_target_limit: int | None = None,
+    buy_slot_indices: list[int] | None = None,
+    sell_slot_indices: list[int] | None = None,
 ) -> dict:
     """Require one fitting approved replacement denomination per initial slot.
 
@@ -68,6 +70,23 @@ def prove_initial_follow_slot_fit(
         or maximum_trade_xch_mojos <= 0
         or maximum_trade_cat_atoms <= 0
         or type(outputs) is not list
+    ):
+        raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
+    slot_indices = {
+        "buy": list(range(buy_limit)) if buy_slot_indices is None else buy_slot_indices,
+        "sell": list(range(sell_limit))
+        if sell_slot_indices is None
+        else sell_slot_indices,
+    }
+    if any(
+        type(slots) is not list
+        or len(slots) != limit
+        or len(slots) != len(set(slots))
+        or any(type(slot) is not int or not 0 <= slot < target for slot in slots)
+        for slots, limit, target in (
+            (slot_indices["buy"], buy_limit, buy_target),
+            (slot_indices["sell"], sell_limit, sell_target),
+        )
     ):
         raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
     mid = _positive_decimal(mid_price)
@@ -157,7 +176,7 @@ def prove_initial_follow_slot_fit(
         target = buy_target if side == "buy" else sell_target
         if sum(counts.values()) != target:
             raise ValueError("FOLLOW_SLOT_TIER_COUNTS_INVALID")
-        for slot in range(limit):
+        for slot in slot_indices[side]:
             tier = classify_slot_tier(slot, target, tier_counts=counts)
             size = sizes.get(tier)
             if size is None or size <= 0:
@@ -229,6 +248,16 @@ def prove_initial_follow_slot_fit(
         "assigned_xch_coin_mojos": assigned_sources["xch"],
         "assigned_cat_coin_atoms": assigned_sources["cat"],
         "slot_assignment_sha256": digest,
+        "funded_output_assignments": [
+            {
+                "side": side,
+                "slot": slot,
+                "tier": tier,
+                "price_xch": price,
+                "output_ordinal": ordinal,
+            }
+            for side, slot, tier, price, _atoms, ordinal, _coin_amount in assignments
+        ],
         "dispatch_authorized": False,
     }
 
@@ -250,6 +279,8 @@ def find_fundable_follow_slot_limits(
     maximum_trade_xch_mojos: int,
     maximum_trade_cat_atoms: int,
     outputs: list[dict],
+    buy_slot_candidates: list[int] | None = None,
+    sell_slot_candidates: list[int] | None = None,
 ) -> dict:
     """Find the largest independently fundable prefix on each side.
 
@@ -268,8 +299,29 @@ def find_fundable_follow_slot_limits(
     ):
         raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
 
+    candidates = {
+        "buy": list(range(buy_target))
+        if buy_slot_candidates is None
+        else buy_slot_candidates,
+        "sell": list(range(sell_target))
+        if sell_slot_candidates is None
+        else sell_slot_candidates,
+    }
+    if any(
+        type(slots) is not list
+        or len(slots) > target
+        or any(type(slot) is not int or not 0 <= slot < target for slot in slots)
+        or len(slots) != len(set(slots))
+        for slots, target in (
+            (candidates["buy"], buy_target),
+            (candidates["sell"], sell_target),
+        )
+    ):
+        raise ValueError("FOLLOW_SLOT_INPUT_INVALID")
+
     def max_prefix(side: str) -> int:
-        low, high = 0, buy_target if side == "buy" else sell_target
+        slots = candidates[side]
+        low, high = 0, len(slots)
         best = 0
         while low <= high:
             candidate = (low + high) // 2
@@ -294,6 +346,8 @@ def find_fundable_follow_slot_limits(
                     maximum_trade_xch_mojos=maximum_trade_xch_mojos,
                     maximum_trade_cat_atoms=maximum_trade_cat_atoms,
                     outputs=outputs,
+                    buy_slot_indices=slots[:candidate] if side == "buy" else [],
+                    sell_slot_indices=slots[:candidate] if side == "sell" else [],
                 )
                 best = candidate
                 low = candidate + 1
@@ -321,6 +375,8 @@ def find_fundable_follow_slot_limits(
         maximum_trade_xch_mojos=maximum_trade_xch_mojos,
         maximum_trade_cat_atoms=maximum_trade_cat_atoms,
         outputs=outputs,
+        buy_slot_indices=candidates["buy"][:buy_limit],
+        sell_slot_indices=candidates["sell"][:sell_limit],
     )
     return {
         **fit,
@@ -342,6 +398,9 @@ def preview_current_follow_slot_fit(
     maximum_trade_xch_mojos: int,
     maximum_trade_cat_atoms: int,
     allow_partial: bool = False,
+    mid_price_override: Decimal | None = None,
+    buy_slot_candidates: list[int] | None = None,
+    sell_slot_candidates: list[int] | None = None,
 ) -> dict:
     """Apply current production tier sizes to a read-only executable quote.
 
@@ -372,7 +431,16 @@ def preview_current_follow_slot_fit(
         spread_bps = Decimal(configuration["SPREAD_BPS"])
         min_edge_bps = Decimal(configuration["MIN_EDGE_BPS"])
         ratio = Decimal(str(cfg.COIN_MAX_SIZE_RATIO))
-        first_quote = api_server._get_readonly_mid_price_str()
+        if mid_price_override is None:
+            first_quote = api_server._get_readonly_mid_price_str()
+        else:
+            if (
+                type(mid_price_override) is not Decimal
+                or not mid_price_override.is_finite()
+                or mid_price_override <= 0
+            ):
+                raise ValueError("invalid approved anchor")
+            first_quote = format(mid_price_override, "f")
         mid = Decimal(first_quote)
     except (AttributeError, KeyError, TypeError, ValueError):
         raise ValueError("FOLLOW_SLOT_PRICE_UNAVAILABLE") from None
@@ -400,12 +468,19 @@ def preview_current_follow_slot_fit(
     }
     if allow_partial:
         result = find_fundable_follow_slot_limits(
-            buy_target=buy_limit, sell_target=sell_limit, **fit_terms
+            buy_target=buy_limit,
+            sell_target=sell_limit,
+            buy_slot_candidates=buy_slot_candidates,
+            sell_slot_candidates=sell_slot_candidates,
+            **fit_terms,
         )
     else:
         result = prove_initial_follow_slot_fit(
             buy_limit=buy_limit, sell_limit=sell_limit, **fit_terms
         )
-    if api_server._get_readonly_mid_price_str() != first_quote:
+    if (
+        mid_price_override is None
+        and api_server._get_readonly_mid_price_str() != first_quote
+    ):
         raise ValueError("FOLLOW_SLOT_PRICE_CHANGED")
     return {**result, "readonly_mid_price_xch": format(mid, "f")}
