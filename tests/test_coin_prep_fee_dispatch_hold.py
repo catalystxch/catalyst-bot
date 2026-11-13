@@ -211,6 +211,7 @@ def _hold(state, **changes):
             "observed_at": 1000,
             "expires_at": 1060,
         },
+        "executed_fee_mojos": 10,
     }
     args.update(changes)
     return reserve(**args)
@@ -231,6 +232,45 @@ def test_exact_hold_counts_fee_without_granting_external_dispatch(prepared):
         .fetchone()[0]
         == 0
     )
+
+
+def test_capped_execution_rechecks_quote_recommendation_separately(prepared):
+    quote = _hold(
+        prepared,
+        final_quote={
+            "available": True,
+            "cost": 20_000_000,
+            "target_seconds": 300,
+            "fee_mojos": 20,
+            "source": "coinset",
+            "observed_at": 1000,
+            "expires_at": 1060,
+        },
+        executed_fee_mojos=10,
+    )
+    claim = prepared["claim"]
+    dispatch = database.begin_wallet_effect_dispatch(
+        claim["claim_token"],
+        claim["generation"],
+        operation_id=prepared["operation"]["operation_id"],
+        source_coin_ids=["1" * 64],
+        fee_coin_ids=["2" * 64],
+        prep_fee_context={
+            "approval_id": prepared["approval"]["approval_id"],
+            "quote": {
+                "available": True,
+                "cost": 20_000_000,
+                "target_seconds": 300,
+                "fee_mojos": 20,
+                "source": "coinset",
+                "observed_at": 1000,
+                "expires_at": 1060,
+            },
+            "executed_fee_mojos": 10,
+        },
+    )
+    assert quote["fee_mojos"] == 10
+    assert dispatch is not None
 
 
 def test_zero_floor_top_up_reserve_source_can_fund_prep(prepared):
@@ -291,6 +331,79 @@ def test_bound_unsigned_outputs_can_be_released_with_exact_no_effect_view(prepar
     )
 
 
+def test_held_predispatch_batch_releases_fee_and_claim_together(prepared):
+    """A held fee cannot strand a batch that never crossed wallet dispatch."""
+    operation_id = prepared["operation"]["operation_id"]
+    claim_token = prepared["claim"]["claim_token"]
+    _hold(prepared)
+    identity = json.loads(
+        database.get_coin_prep_operation_for_observation(operation_id)[
+            "wallet_identity_json"
+        ]
+    )
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:00.000000Z",
+        "expires_at": "2026-08-21T12:00:15.000000Z",
+        "selectable_coin_ids": ["1" * 64, "2" * 64],
+        "pending_transaction_ids": [],
+    }
+
+    assert database.recover_coin_prep_predispatch_no_effect(operation_id, view)
+    conn = database.get_connection()
+    assert conn.execute(
+        "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()[0] == "FAILED"
+    assert conn.execute(
+        "SELECT outcome FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+        (claim_token,),
+    ).fetchone()[0] == "RELEASED_NO_EFFECT"
+    assert conn.execute(
+        "SELECT state FROM approved_fee_outcomes WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()[0] == "RELEASED_NO_EFFECT"
+    assert _held(prepared) == 0
+
+
+def test_held_predispatch_batch_stays_fenced_without_exact_no_effect(prepared):
+    operation_id = prepared["operation"]["operation_id"]
+    claim_token = prepared["claim"]["claim_token"]
+    _hold(prepared)
+    identity = json.loads(
+        database.get_coin_prep_operation_for_observation(operation_id)[
+            "wallet_identity_json"
+        ]
+    )
+    view = {
+        "fresh": True,
+        "complete": True,
+        "wallet_identity": identity,
+        "observed_at": "2026-08-21T12:00:00.000000Z",
+        "expires_at": "2026-08-21T12:00:15.000000Z",
+        "selectable_coin_ids": ["1" * 64, "2" * 64],
+        "pending_transaction_ids": ["3" * 64],
+    }
+
+    assert not database.recover_coin_prep_predispatch_no_effect(operation_id, view)
+    conn = database.get_connection()
+    assert conn.execute(
+        "SELECT outcome FROM coin_prep_operations WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone()[0] == "PREPARED"
+    assert conn.execute(
+        "SELECT 1 FROM wallet_effect_claim_resolutions WHERE claim_token=?",
+        (claim_token,),
+    ).fetchone() is None
+    assert conn.execute(
+        "SELECT 1 FROM approved_fee_outcomes WHERE operation_id=?",
+        (operation_id,),
+    ).fetchone() is None
+    assert _held(prepared) == 10
+
+
 def test_generic_ledger_approval_cannot_replace_deliberate_preview_consent(prepared):
     approval = database.create_fee_approval(
         scope_sha256=prepared["contract"]["scope_sha256"],
@@ -314,7 +427,7 @@ def test_generic_ledger_approval_cannot_replace_deliberate_preview_consent(prepa
         ({"fee_mojos": True}, "FEE_QUOTE_INVALID"),
         ({"source": "manual"}, "FEE_QUOTE_INVALID"),
         ({"target_seconds": 60}, "FEE_APPROVAL_STALE"),
-        ({"fee_mojos": 11}, "FEE_EFFECT_CONTRACT_MISMATCH"),
+        ({"fee_mojos": 9}, "FEE_QUOTE_INVALID"),
     ],
 )
 def test_invalid_stale_or_nonmatching_final_price_creates_no_hold(

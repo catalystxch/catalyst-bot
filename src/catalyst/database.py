@@ -3073,7 +3073,10 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                                        '$.dispatch_outcome')='PREPARED')
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
-                          WHERE hold.operation_id=prep.operation_id)
+                          WHERE hold.operation_id=prep.operation_id
+                            AND (hold.cancellation<>0 OR
+                                 hold.fee_mojos IS NOT json_extract(
+                                     prep.target_contract_json, '$.fee_mojos')))
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_outcomes AS fee_outcome
                           WHERE fee_outcome.operation_id=prep.operation_id)
@@ -6000,7 +6003,10 @@ WHEN catalyst_is_canonical_json(NEW.evidence_json)<>1
                                        '$.dispatch_outcome')='PREPARED')
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_reservations AS hold
-                          WHERE hold.operation_id=prep.operation_id)
+                          WHERE hold.operation_id=prep.operation_id
+                            AND (hold.cancellation<>0 OR
+                                 hold.fee_mojos IS NOT json_extract(
+                                     prep.target_contract_json, '$.fee_mojos')))
                      AND NOT EXISTS (
                          SELECT 1 FROM approved_fee_outcomes AS fee_outcome
                           WHERE fee_outcome.operation_id=prep.operation_id)
@@ -12584,6 +12590,8 @@ def recover_coin_prep_predispatch_no_effect(
                    resolution.claim_token AS resolved_claim,
                    dispatch.claim_token AS dispatched_claim,
                    hold.operation_id AS fee_hold,
+                   hold.fee_mojos AS held_fee_mojos,
+                   hold.cancellation AS fee_hold_cancellation,
                    fee_outcome.operation_id AS fee_outcome
               FROM coin_prep_operations AS prep
               JOIN wallet_effect_claims AS claim
@@ -12637,6 +12645,19 @@ def recover_coin_prep_predispatch_no_effect(
         now = _parse_iso_timestamp(
             _stability_wall_clock(), "no-effect commit", require_timezone=True
         )
+        target = json.loads(prep["target_contract_json"])
+        target_fee = target.get(
+            "fee_mojos", target.get("external_fee", {}).get("fee_mojos")
+        )
+        valid_fee_hold = (
+            prep["fee_hold"] is None
+            or (
+                prep["fee_hold"] == safe_operation_id
+                and prep["fee_hold_cancellation"] == 0
+                and type(target_fee) is int
+                and prep["held_fee_mojos"] == target_fee
+            )
+        )
         exact = (
             decision.confirmed is True
             and observed <= now < expiry
@@ -12646,11 +12667,12 @@ def recover_coin_prep_predispatch_no_effect(
                 or json.loads(prep["outcome_evidence_json"])["dispatch_outcome"]
                 == "PREPARED"
             )
-            # An unsigned output binding is persisted before the final fee
-            # hold. With no dispatch row or fee hold, it is still pre-effect.
+            # A final fee reservation is accounting, not wallet dispatch.
+            # Resolve it in this same transaction only with exact no-effect
+            # wallet evidence and a matching, non-cancellation fee contract.
             and prep["resolved_claim"] is None
             and prep["dispatched_claim"] is None
-            and prep["fee_hold"] is None
+            and valid_fee_hold
             and prep["fee_outcome"] is None
             and prep["claim_operation"] == safe_operation_id
             and json.loads(prep["claim_sources"])
@@ -12707,6 +12729,17 @@ def recover_coin_prep_predispatch_no_effect(
             "WHERE operation_id=? AND outcome IN ('PREPARED','SUBMITTED_UNKNOWN')",
             (evidence, when, safe_operation_id),
         )
+        if prep["fee_hold"] is not None:
+            conn.execute(
+                "INSERT INTO approved_fee_outcomes "
+                "(operation_id, state, evidence_id, evidence_json) "
+                "VALUES (?, 'RELEASED_NO_EFFECT', ?, ?)",
+                (
+                    safe_operation_id,
+                    hashlib.sha256(evidence.encode("utf-8")).hexdigest(),
+                    evidence,
+                ),
+            )
         _reconciliation_latch_update(
             conn,
             operation_id=safe_operation_id,
@@ -25227,7 +25260,7 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
     if type(quote) is not dict or quote.get("available") is not True:
         raise ValueError("FEE_ESTIMATE_UNAVAILABLE")
     try:
-        fee, cost, target, observed, expiry = (
+        recommended_fee, cost, target, observed, expiry = (
             _fee_amount(quote.get(key))
             for key in (
                 "fee_mojos",
@@ -25239,13 +25272,19 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
         )
     except ValueError as exc:
         raise ValueError("FEE_QUOTE_INVALID") from exc
+    try:
+        executed_fee = _fee_amount(context.get("executed_fee_mojos"))
+    except ValueError as exc:
+        raise ValueError("FEE_QUOTE_INVALID") from exc
     if (
         cost == 0
         or quote.get("source") not in ("coinset", "full_node_rpc")
         or expiry != observed + 60
-        or fee != hold["fee_mojos"]
+        or executed_fee > recommended_fee
     ):
         raise ValueError("FEE_QUOTE_INVALID")
+    if executed_fee != hold["fee_mojos"]:
+        raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
     if not observed <= int(time.time()) < expiry:
         raise ValueError("FEE_QUOTE_STALE")
     consent = conn.execute(
@@ -25295,7 +25334,7 @@ def _recheck_held_prep_fee_locked(conn, operation_id, claim_token, generation, c
     contract = json.loads(operation["target_contract_json"])
     if (
         contract.get("fee_mojos", contract.get("external_fee", {}).get("fee_mojos"))
-        != fee
+        != executed_fee
     ):
         raise ValueError("FEE_EFFECT_CONTRACT_MISMATCH")
 

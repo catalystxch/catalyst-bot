@@ -2585,6 +2585,7 @@ class CoinPrepWorker:
                 prep_fee_context={
                     "approval_id": approval_id,
                     "quote": pricing["quote"],
+                    "executed_fee_mojos": plan.fee_mojos,
                 },
             )
         except Exception:

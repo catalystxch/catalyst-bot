@@ -227,6 +227,7 @@ def _submit(operation_id, claim, approval):
         prep_fee_context={
             "approval_id": approval["approval_id"],
             "quote": approval["dispatch_quote"],
+            "executed_fee_mojos": approval["dispatch_quote"]["fee_mojos"],
         },
     )
     database.complete_wallet_effect_dispatch(dispatch, result={"success": True})
