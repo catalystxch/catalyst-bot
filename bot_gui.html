@@ -11973,7 +11973,7 @@
                         Save as preset
                         <span class="cc-help">?<span class="cc-tooltip">Tick this to also save the settings you're about to apply as a named preset, so you can recall them later from the Configuration Presets panel above. The preset is captured AFTER Save succeeds, so it reflects exactly what got applied.</span></span>
                     </label>
-                    <button type="button" class="btn btn-start btn-primary btn-save" id="saveConfigBtn" onclick="handleSaveClick()">Save &amp; Continue</button>
+                    <button type="button" class="btn btn-start btn-primary btn-save" id="saveConfigBtn" onclick="handlePrimarySettingsSave()">Save &amp; Review</button>
                 </div>
 
             </div><!-- /#v4View-settings -->
@@ -17294,7 +17294,7 @@
             // don't take effect until restart.
             const saveBtn = document.getElementById('saveConfigBtn');
             if (saveBtn) {
-                saveBtn.textContent = isRunning ? 'Save (applies on restart)' : 'Save & Continue';
+                saveBtn.textContent = isRunning ? 'Save (applies on restart)' : (IS_DESKTOP ? 'Save & Review' : 'Save & Continue');
                 saveBtn.classList.toggle('is-restart-save', isRunning);
             }
 
@@ -33291,6 +33291,14 @@
             _singleApprovalRunRequestedAfterSave = true;
             _singleApprovalRunWarnings = [];
             handleSaveClick();
+        }
+
+        function handlePrimarySettingsSave() {
+            if (IS_DESKTOP && !bot_state?.running) {
+                saveSettingsAndReviewSingleRun();
+            } else {
+                handleSaveClick();
+            }
         }
 
         function clearSingleApprovalRunSaveIntent() {

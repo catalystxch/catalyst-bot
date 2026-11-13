@@ -18,6 +18,16 @@ def test_single_approval_gui_uses_native_review_and_automatic_advance():
     assert "closeFollowRunReview();" not in confirm
 
 
+def test_primary_native_save_enters_single_review():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    assert 'id="saveConfigBtn" onclick="handlePrimarySettingsSave()"' in html
+    save = html.split("function handlePrimarySettingsSave()", 1)[1].split(
+        "function clearSingleApprovalRunSaveIntent()", 1
+    )[0]
+    assert "IS_DESKTOP && !bot_state?.running" in save
+    assert "saveSettingsAndReviewSingleRun();" in save
+
+
 def test_single_approval_disclosure_uses_text_nodes_and_exact_atomic_strings():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
     flow = html.split("async function prepareSingleApprovalRunReview()", 1)[1].split(

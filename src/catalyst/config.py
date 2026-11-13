@@ -19,9 +19,22 @@ trading-loop writes stay consistent.
 import os
 import sys
 import threading
+import time
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 from dotenv import dotenv_values, load_dotenv, set_key
+
+
+def _set_key_with_windows_retry(path: str, key: str, value: str) -> None:
+    """Retry transient Windows sharing failures during dotenv's atomic replace."""
+    for attempt in range(6):
+        try:
+            set_key(path, key, value)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 # Splash remains an optional publication path in this beta. The release fence
@@ -1490,7 +1503,7 @@ class Config:
                 }
 
                 # Write to .env file
-                set_key(_ENV_PATH, key, value)
+                _set_key_with_windows_retry(_ENV_PATH, key, value)
 
                 # Reload all settings from disk (RLock re-entry is fine)
                 self.reload()
@@ -1581,7 +1594,7 @@ class Config:
                     disk_values = {}
                 old_value = str(disk_values.get(key, getattr(self, key, "")))
 
-                set_key(_ENV_PATH, key, value)
+                _set_key_with_windows_retry(_ENV_PATH, key, value)
                 self._pending_restart_changes = True
                 self._pending_restart_keys.add(key)
 
