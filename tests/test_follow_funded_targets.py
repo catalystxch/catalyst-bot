@@ -57,8 +57,20 @@ def test_partial_prep_recipe_keeps_assigned_slots_and_fee_reserve(full_recipe):
         "funded_sell_limit": 1,
         "slot_assignment_sha256": "a" * 64,
         "funded_output_assignments": [
-            {"side": "buy", "slot": 0, "tier": "inner", "output_ordinal": 0},
-            {"side": "sell", "slot": 0, "tier": "inner", "output_ordinal": 0},
+            {
+                "side": "buy",
+                "slot": 0,
+                "tier": "inner",
+                "price_xch": "1",
+                "output_ordinal": 0,
+            },
+            {
+                "side": "sell",
+                "slot": 0,
+                "tier": "inner",
+                "price_xch": "1",
+                "output_ordinal": 0,
+            },
         ],
     }
     configuration = {
@@ -97,8 +109,20 @@ def test_partial_prep_recipe_rejects_missing_assignment(full_recipe):
         "funded_sell_limit": 1,
         "slot_assignment_sha256": "a" * 64,
         "funded_output_assignments": [
-            {"side": "buy", "slot": 0, "tier": "inner", "output_ordinal": 99},
-            {"side": "sell", "slot": 0, "tier": "inner", "output_ordinal": 0},
+            {
+                "side": "buy",
+                "slot": 0,
+                "tier": "inner",
+                "price_xch": "1",
+                "output_ordinal": 99,
+            },
+            {
+                "side": "sell",
+                "slot": 0,
+                "tier": "inner",
+                "price_xch": "1",
+                "output_ordinal": 0,
+            },
         ],
     }
     configuration = {

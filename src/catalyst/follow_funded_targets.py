@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from decimal import Decimal, InvalidOperation
 import re
 
 
@@ -484,8 +485,15 @@ def trim_follow_prep_recipe(
             "side",
             "slot",
             "tier",
+            "price_xch",
             "output_ordinal",
         }:
+            raise ValueError("FOLLOW_FUNDED_TARGET_PROOF_INVALID")
+        try:
+            price = Decimal(item["price_xch"])
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("FOLLOW_FUNDED_TARGET_PROOF_INVALID") from None
+        if type(item["price_xch"]) is not str or not price.is_finite() or price <= 0:
             raise ValueError("FOLLOW_FUNDED_TARGET_PROOF_INVALID")
         side = item["side"]
         slot = item["slot"]
