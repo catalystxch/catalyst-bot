@@ -201,6 +201,53 @@ def test_fee_induced_change_removal_is_quoted_at_its_new_actual_cost(
     assert transport["costs"][0] == transport["costs"][2]
 
 
+def test_bound_per_transaction_cap_rebuilds_at_cap_and_returns_warning(
+    monkeypatch, transport
+):
+    transport["fee"] = 200
+    service = _service()
+    monkeypatch.setattr(service, "_now", lambda: 1000)
+    monkeypatch.setattr(
+        service,
+        "quote_fee",
+        lambda cost, target_seconds: {
+            "available": True,
+            "source": "coinset",
+            "cost": cost,
+            "target_seconds": target_seconds,
+            "fee_mojos": 200,
+            "observed_at": 1000,
+            "expires_at": 1060,
+        },
+    )
+    result = service.price_next_prep_batch(
+        snapshot=SNAPSHOT,
+        targets=TARGETS,
+        reserve_floors={"xch": 0, "cat": 0},
+        receive_address=ADDRESS,
+        cat_asset_id="36" * 32,
+        maximum_fee_mojos=100,
+    )
+    assert result["available"] is True
+    assert result["plan"].fee_mojos == 100
+    assert result["quote"]["fee_mojos"] == 200
+    assert result["fee_cap_warning"] == {
+        "code": "RECOMMENDED_FEE_EXCEEDS_APPROVED_MAX",
+        "recommended_fee_mojos": 200,
+        "approved_maximum_fee_mojos": 100,
+        "planned_fee_mojos": 100,
+    }
+    assert transport["fees"] == [0, 100]
+
+
+def test_no_follow_cap_preserves_legacy_exact_quote_requirement(monkeypatch, transport):
+    transport["fee"] = 200
+    result = _price(monkeypatch, transport)
+    assert result["available"] is True
+    assert result["plan"].fee_mojos == 200
+    assert result.get("fee_cap_warning") is None
+
+
 def test_real_cat2_batch_is_repriced_with_separate_xch_fee_input(
     monkeypatch, transport
 ):

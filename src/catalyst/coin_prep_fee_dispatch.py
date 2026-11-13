@@ -26,6 +26,31 @@ def _paused(context, reason, **details):
     }
 
 
+def _follow_prep_fee_cap(approval_id, approved_snapshot=None):
+    """Return a cap only when the durable Follow session binds this approval."""
+    from follow_run_coordinator import FollowRunCoordinator
+
+    state = FollowRunCoordinator().get_state()
+    if type(state) is not dict or state.get("fee_approval_id") != approval_id:
+        return None
+    policy = database.get_active_follow_run_policy()
+    if policy is None:
+        raise ValueError("FOLLOW_RUN_PREP_FEE_BINDING_REQUIRED")
+    if approved_snapshot is None:
+        approved_snapshot = read_approved_prep_fee_snapshot(approval_id)
+    from confidence_override import current_configuration_digest
+    from follow_prep_fee_authority import verified_prep_fee_cap
+
+    return verified_prep_fee_cap(
+        policy=policy,
+        coordinator_state=state,
+        current_configuration_sha256=current_configuration_digest(),
+        approved_snapshot=approved_snapshot,
+        requested_approval_id=approval_id,
+        run_session_id=state.get("session_id"),
+    )
+
+
 def _verify_current_inventory(context, saved_snapshot, plan, operation_id, claim):
     fee_ids = [plan.fee_source_id] if plan.fee_source_id else []
     if not database.wallet_effect_claim_is_current(
@@ -147,6 +172,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
             "dispatch_authorized": False,
         }
     context = read_approved_prep_fee_snapshot(approval_id)
+    follow_fee_cap = _follow_prep_fee_cap(approval_id, context)
     recipe = context["recipe"]
     plan = recipe["economic_plan"]
     funding = prepare_fee_inventory(
@@ -161,6 +187,7 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         receive_address=context["receive_address"],
         cat_asset_id=context["identity"]["asset_id"],
         target_seconds=plan["target_seconds"],
+        maximum_fee_mojos=follow_fee_cap,
     )
     after = read_approved_prep_fee_snapshot(approval_id)
     if any(
@@ -185,6 +212,13 @@ def price_approved_prep_batch(approval_id: str) -> dict:
             pricing["reason"],
             diagnostic_stage="unsigned_pricing",
             provider_failures=fee_failure_diagnostics(pricing),
+        )
+    if pricing.get("fee_cap_warning"):
+        slog(
+            "coin_prep",
+            "Follow prep recommended fee exceeds approved per-transaction maximum; trying the approved maximum",
+            pricing["fee_cap_warning"],
+            level="warning",
         )
     if pricing["transaction_required"] is True:
         fee = pricing["plan"].fee_mojos
@@ -216,7 +250,14 @@ def price_approved_prep_batch(approval_id: str) -> dict:
                     plan["target_seconds"],
                     now=coin_prep_fee_pricing._now() + 10,
                 )
-                or fresh["fee_mojos"] != fee
+                or (
+                    fresh["fee_mojos"] != fee
+                    and not (
+                        follow_fee_cap is not None
+                        and fee == follow_fee_cap
+                        and fresh["fee_mojos"] > follow_fee_cap
+                    )
+                )
             ):
                 return _paused(
                     context,
@@ -253,6 +294,8 @@ def price_approved_prep_batch(approval_id: str) -> dict:
         "reason": pricing["reason"],
         "funding": funding,
         "pricing": pricing,
+        "follow_fee_cap_mojos": follow_fee_cap,
+        "fee_cap_warning": pricing.get("fee_cap_warning"),
         "dispatch_authorized": False,
     }
 
@@ -280,6 +323,7 @@ def reserve_approved_prep_dispatch(
     if type(priced_batch) is not dict or priced_batch.get("available") is not True:
         raise ValueError("FEE_DISPATCH_PLAN_MISMATCH")
     context = read_approved_prep_fee_snapshot(approval_id)
+    follow_fee_cap = _follow_prep_fee_cap(approval_id, context)
     if priced_batch.get("approval", {}).get("approval_id") != approval_id or any(
         priced_batch.get(key) != context[key]
         for key in (
@@ -350,9 +394,17 @@ def reserve_approved_prep_dispatch(
         raise ValueError("FEE_UNSIGNED_COST_UNAVAILABLE")
     quote = pricing.get("quote")
     cost = validated.get("_catalyst_exact_unsigned_cost")
+    capped_recommendation = (
+        follow_fee_cap is not None
+        and plan.fee_mojos == follow_fee_cap
+        and type(quote) is dict
+        and type(quote.get("fee_mojos")) is int
+        and quote.get("fee_mojos", 0) > follow_fee_cap
+    )
     if (
         not is_current_fee_quote(quote, cost, economics["target_seconds"])
-        or quote["fee_mojos"] != plan.fee_mojos
+        or (quote["fee_mojos"] != plan.fee_mojos and not capped_recommendation)
+        or priced_batch.get("follow_fee_cap_mojos") != follow_fee_cap
     ):
         slog(
             "coin_prep",
