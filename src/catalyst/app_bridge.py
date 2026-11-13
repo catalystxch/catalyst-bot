@@ -1479,6 +1479,69 @@ class AppBridge:
         return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
+    def get_single_approval_follow_run_defaults(self, _body=None):
+        """Return exact wallet-backed funding terms for a single native review."""
+        from follow_run_defaults import exact_funding_defaults
+
+        try:
+            identity, configuration_sha256, confidence_state, red_reasons = (
+                _server_follow_review_context()
+            )
+            defaults = exact_funding_defaults()
+            observed_identity = defaults.pop("wallet_identity")
+            observed_identity = {
+                **observed_identity,
+                "wallet_fingerprint": str(observed_identity["wallet_fingerprint"]),
+            }
+            if (
+                defaults.pop("configuration_sha256") != configuration_sha256
+                or observed_identity != identity
+            ):
+                raise ValueError("FOLLOW_RUN_DEFAULTS_CONTEXT_CHANGED")
+        except (TypeError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            if reason not in {
+                "FOLLOW_RUN_DEFAULTS_CONFIG_CHANGED",
+                "FOLLOW_RUN_DEFAULTS_CONFIG_INVALID",
+                "FOLLOW_RUN_DEFAULTS_INVENTORY_INVALID",
+                "FOLLOW_RUN_DEFAULTS_PRINCIPAL_INSUFFICIENT",
+                "FOLLOW_RUN_DEFAULTS_CONTEXT_CHANGED",
+            }:
+                reason = "FOLLOW_RUN_DEFAULTS_UNAVAILABLE"
+            return {"success": False, "reason": reason, "dispatch_authorized": False}
+        return {
+            "success": True,
+            "policy": defaults,
+            "market_confidence_state": confidence_state,
+            "red_reasons": red_reasons,
+            "fee_recommendation": _follow_fee_recommendation(),
+            "dispatch_authorized": False,
+        }
+
+    @_safe
+    @_mutation_guard("app_bridge:advance_single_approval_follow_run")
+    def advance_single_approval_follow_run(self, body=None):
+        """Advance only the exact run session recorded by native consent."""
+        from follow_run_automation import advance_approved_follow_run
+
+        if type(body) is not dict or set(body) != {"session_id"}:
+            return {
+                "success": False,
+                "reason": "FOLLOW_RUN_SESSION_REQUIRED",
+                "action_needed": True,
+            }
+        try:
+            return advance_approved_follow_run(
+                body["session_id"], permit=_bridge_mutation_permit.get()
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            return {
+                "success": False,
+                "reason": str(exc)[:128],
+                "action_needed": True,
+            }
+
+    @_safe
     @_mutation_guard("app_bridge:prepare_single_approval_follow_run_review")
     def prepare_single_approval_follow_run_review(self, body=None):
         """Prepare an exact native disclosure from client terms and trusted context."""
@@ -2712,6 +2775,7 @@ class AppBridge:
 _APP_BRIDGE_API_PROPERTY = vars(AppBridge)["api"]
 _APP_BRIDGE_API_SLOT = vars(AppBridge)["_api"]
 _APP_BRIDGE_MUTATION_METHODS = {
+    "advance_single_approval_follow_run",
     "activate_boost",
     "approve_coin_prep_fees",
     "apply_config",
@@ -2787,6 +2851,7 @@ _APP_BRIDGE_CONTROL_METHODS = {
     "toggle_console",
 }
 _APP_BRIDGE_READ_ONLY_METHODS = {
+    "get_single_approval_follow_run_defaults",
     "get_cancel_latch_review",
     "check_resume",
     "check_splash_setup",

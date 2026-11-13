@@ -34,6 +34,28 @@ def policy_terms(**changes):
     return values
 
 
+def test_native_defaults_keep_funding_server_owned(bridge_world, monkeypatch):
+    import app_bridge
+    import follow_run_defaults
+
+    monkeypatch.setattr(follow_run_defaults, "exact_funding_defaults", lambda: {
+        "buy_target": 24,
+        "sell_target": 24,
+        "fee_coin_principal_mojos": "1000000000000",
+        "xch_reserve_mojos": "100000000000",
+        "cat_reserve_atoms": "1000",
+        "maximum_trade_xch_mojos": "3000000000000",
+        "maximum_trade_cat_atoms": "500000",
+        "wallet_identity": {**IDENTITY, "wallet_fingerprint": 123},
+        "configuration_sha256": CONFIGURATION_SHA256,
+    })
+    result = app_bridge.AppBridge().get_single_approval_follow_run_defaults()
+    assert result["success"] is True
+    assert result["policy"]["maximum_trade_xch_mojos"] == "3000000000000"
+    assert result["red_reasons"] == ["THIN_BOOK", "STALE_PRICE"]
+    assert result["dispatch_authorized"] is False
+
+
 @pytest.fixture
 def bridge_world(monkeypatch):
     import app_bridge
