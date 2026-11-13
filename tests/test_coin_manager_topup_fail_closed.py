@@ -94,6 +94,14 @@ class CoinManagerTopupFailClosedTests(unittest.TestCase):
         # than Task 9 coin authority.  Grant the pre-effect authority check
         # explicitly; denial/race behavior is covered by the closure suite.
         self._wallet_effect_authority = ExitStack()
+        # These cases predate reviewed Follow runs. Supply the absence of an
+        # active coordinator rather than querying an uninitialized test DB.
+        self._wallet_effect_authority.enter_context(
+            patch(
+                "follow_run_coordinator.FollowRunCoordinator.read_state",
+                return_value=None,
+            )
+        )
         self._wallet_effect_authority.enter_context(
             patch.object(
                 coin_manager,
