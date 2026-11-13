@@ -1278,11 +1278,11 @@ def test_offer_history_reset_refuses_nonterminal_kernel_state(
     _assert_created_offer_is_protected()
 
 
-def test_session_fresh_start_does_not_mask_authoritative_reset_conflict(
+def test_session_fresh_start_preserves_authoritative_fill_with_downstream_fk(
     isolated_database,
     monkeypatch,
 ):
-    _insert_fill_with_downstream_fk()
+    fill_id = _insert_fill_with_downstream_fk()
     monkeypatch.setattr(api_server, "bot", None)
     monkeypatch.setattr(api_server, "_ensure_mutation_runtime", lambda: None)
     monkeypatch.setattr(
@@ -1300,9 +1300,22 @@ def test_session_fresh_start_does_not_mask_authoritative_reset_conflict(
         environ_base={"REMOTE_ADDR": "127.0.0.1"},
     )
 
-    assert response.status_code == 409
-    assert response.get_json()["error"] == "authoritative_state_conflict"
-    fresh_start_set.assert_not_called()
+    assert response.status_code == 200
+    assert response.get_json()["success"] is True
+    fresh_start_set.assert_called_once()
+    conn = database.get_connection()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM fills WHERE fill_id=?", (fill_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM offer_fill_hook_outbox WHERE fill_id=?", (fill_id,)
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_source_inventory_has_no_unfenced_terminal_or_reset_bypasses():
