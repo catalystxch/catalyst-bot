@@ -65,11 +65,20 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
                 {"coin_multiplier": "1", "target_seconds": 300}
             )
             if preview.get("available") is not True:
+                reason = preview.get("reason", "FEE_PREVIEW_UNAVAILABLE")
+                retryable = reason in {
+                    "FEE_PREVIEW_UNAVAILABLE",
+                    "FEE_ESTIMATE_UNAVAILABLE",
+                    "FEE_WALLET_INVENTORY_UNAVAILABLE",
+                    "FEE_WALLET_IDENTITY_UNAVAILABLE",
+                    "FEE_WALLET_ADDRESS_UNAVAILABLE",
+                }
                 return {
-                    "success": False,
+                    "success": retryable,
                     "state": "prep_pending",
-                    "reason": preview.get("reason", "FEE_PREVIEW_UNAVAILABLE"),
-                    "action_needed": True,
+                    "reason": reason,
+                    "message": "Waiting for a fresh wallet and fee estimate" if retryable else "Coin preparation needs attention",
+                    "action_needed": not retryable,
                 }
             approved = approve_coin_prep_fees(preview_id=preview["preview_id"])
             approval_id = approved["approval_id"]
@@ -107,10 +116,11 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
         status = _route_json(api_server.api_coin_prep_status, "/api/coin-prep/status")
         if status.get("success") is not True:
             return {
-                "success": False,
+                "success": True,
                 "state": "preparing",
                 "reason": "PREP_STATUS_UNAVAILABLE",
-                "action_needed": True,
+                "message": "Waiting for coin preparation status",
+                "action_needed": False,
             }
         if status.get("running") is True:
             return {

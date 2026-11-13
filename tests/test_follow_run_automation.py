@@ -116,3 +116,34 @@ def test_ready_run_binds_authority_then_starts_without_second_review(monkeypatch
     result = follow_run_automation.advance_approved_follow_run(state["session_id"], permit=object())
     assert result["state"] == "running"
     assert calls == [("authority", state["session_id"]), ("start", "/api/bot/start")]
+
+
+def test_temporary_fee_quote_gap_keeps_approved_setup_pending(monkeypatch):
+    import coin_prep_fee_approval
+    import confidence_override
+    import database
+    import follow_run_automation
+    import follow_run_coordinator
+
+    state = {
+        "session_id": "a" * 64,
+        "policy_digest": "b" * 64,
+        "configuration_sha256": "c" * 64,
+        "state": "prep_pending",
+        "fee_approval_id": None,
+    }
+
+    class Coordinator:
+        def get_state(self):
+            return dict(state)
+
+    monkeypatch.setattr(follow_run_coordinator, "FollowRunCoordinator", Coordinator)
+    monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: SimpleNamespace(digest=state["policy_digest"]))
+    monkeypatch.setattr(confidence_override, "current_configuration_digest", lambda: state["configuration_sha256"])
+    monkeypatch.setattr(coin_prep_fee_approval, "preview_coin_prep_fees", lambda _options: {
+        "available": False, "reason": "FEE_ESTIMATE_UNAVAILABLE"
+    })
+    result = follow_run_automation.advance_approved_follow_run(state["session_id"])
+    assert result["success"] is True
+    assert result["state"] == "prep_pending"
+    assert result["action_needed"] is False
