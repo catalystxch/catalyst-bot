@@ -113,7 +113,12 @@ def prepare_follow_run_fee_cap_grant(*, now_epoch: int | None = None) -> dict:
     state, policy, identity, config_digest = _active_context(now_epoch=now)
     recommendation = _fresh_recommendation(now_epoch=now)
     recommended_fee_mojos = recommendation["fee_mojos"]
-    prior = policy.maximum_fee_mojos_per_tx
+    prior_grant = get_follow_run_fee_cap_grant(run_id=state["run_id"], now_epoch=now)
+    prior = (
+        prior_grant["maximum_fee_mojos_per_tx"]
+        if prior_grant is not None
+        else policy.maximum_fee_mojos_per_tx
+    )
     if recommended_fee_mojos <= prior:
         raise ValueError("FOLLOW_FEE_CAP_GRANT_NOT_REQUIRED")
     terms = {
@@ -124,6 +129,9 @@ def prepare_follow_run_fee_cap_grant(*, now_epoch: int | None = None) -> dict:
         "configuration_sha256": config_digest,
         "wallet_identity": identity,
         "prior_maximum_fee_mojos_per_tx": prior,
+        "prior_grant_sha256": (
+            prior_grant["grant_sha256"] if prior_grant is not None else None
+        ),
         "recommended_fee_mojos": recommended_fee_mojos,
         "network_recommendation": recommendation,
         "proposed_maximum_fee_mojos_per_tx": recommended_fee_mojos,
@@ -180,6 +188,7 @@ def confirm_follow_run_fee_cap_grant(
             "configuration_sha256",
             "wallet_identity",
             "prior_maximum_fee_mojos_per_tx",
+            "prior_grant_sha256",
             "recommended_fee_mojos",
             "network_recommendation",
             "proposed_maximum_fee_mojos_per_tx",
@@ -208,12 +217,11 @@ def confirm_follow_run_fee_cap_grant(
             or review["policy_digest"] != policy.digest
             or review["configuration_sha256"] != config_digest
             or review["wallet_identity"] != identity
-            or review["prior_maximum_fee_mojos_per_tx"]
-            != policy.maximum_fee_mojos_per_tx
             or review["proposed_maximum_fee_mojos_per_tx"]
             != review["recommended_fee_mojos"]
             or type(review["recommended_fee_mojos"]) is not int
-            or review["recommended_fee_mojos"] <= policy.maximum_fee_mojos_per_tx
+            or review["recommended_fee_mojos"]
+            <= review["prior_maximum_fee_mojos_per_tx"]
         ):
             raise ValueError("FOLLOW_FEE_CAP_GRANT_REVIEW_CHANGED")
         current_recommendation = _fresh_recommendation(now_epoch=now)
@@ -223,6 +231,22 @@ def confirm_follow_run_fee_cap_grant(
             for key in ("fee_mojos", "source", "target_seconds", "cost")
         ):
             raise ValueError("FOLLOW_FEE_CAP_GRANT_REVIEW_CHANGED")
+        prior_grant = get_follow_run_fee_cap_grant(
+            run_id=state["run_id"], now_epoch=now
+        )
+        current_prior_cap = (
+            prior_grant["maximum_fee_mojos_per_tx"]
+            if prior_grant is not None
+            else policy.maximum_fee_mojos_per_tx
+        )
+        current_prior_digest = (
+            prior_grant["grant_sha256"] if prior_grant is not None else None
+        )
+        if (
+            review["prior_maximum_fee_mojos_per_tx"] != current_prior_cap
+            or review["prior_grant_sha256"] != current_prior_digest
+        ):
+            raise ValueError("FOLLOW_FEE_CAP_GRANT_REVIEW_CHANGED")
         grant_terms = {
             "version": 1,
             "run_id": state["run_id"],
@@ -230,7 +254,8 @@ def confirm_follow_run_fee_cap_grant(
             "policy_digest": policy.digest,
             "configuration_sha256": config_digest,
             "wallet_identity": identity,
-            "prior_maximum_fee_mojos_per_tx": policy.maximum_fee_mojos_per_tx,
+            "prior_maximum_fee_mojos_per_tx": current_prior_cap,
+            "prior_grant_sha256": current_prior_digest,
             "maximum_fee_mojos_per_tx": review["proposed_maximum_fee_mojos_per_tx"],
             "review_id": review_id,
             "review_sha256": review_sha256,
@@ -287,10 +312,21 @@ def get_follow_run_fee_cap_grant(
         or grant.get("policy_digest") != policy.digest
         or grant.get("configuration_sha256") != config_digest
         or grant.get("wallet_identity") != identity
-        or grant.get("prior_maximum_fee_mojos_per_tx")
-        != policy.maximum_fee_mojos_per_tx
+        or type(grant.get("prior_maximum_fee_mojos_per_tx")) is not int
+        or grant["prior_maximum_fee_mojos_per_tx"] < policy.maximum_fee_mojos_per_tx
+        or (
+            grant["prior_maximum_fee_mojos_per_tx"] == policy.maximum_fee_mojos_per_tx
+            and grant.get("prior_grant_sha256") is not None
+        )
+        or (
+            grant["prior_maximum_fee_mojos_per_tx"] > policy.maximum_fee_mojos_per_tx
+            and (
+                type(grant.get("prior_grant_sha256")) is not str
+                or _DIGEST.fullmatch(grant["prior_grant_sha256"]) is None
+            )
+        )
         or type(grant.get("maximum_fee_mojos_per_tx")) is not int
-        or grant["maximum_fee_mojos_per_tx"] <= policy.maximum_fee_mojos_per_tx
+        or grant["maximum_fee_mojos_per_tx"] <= grant["prior_maximum_fee_mojos_per_tx"]
     ):
         return None
     return grant

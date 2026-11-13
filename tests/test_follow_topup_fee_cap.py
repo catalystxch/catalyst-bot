@@ -17,6 +17,7 @@ def _patch_active_binding(monkeypatch, manager, *, run_id="a" * 64):
     import database
     import follow_run_coordinator
     import confidence_override
+    import follow_run_fee_cap_grant
 
     identity = {
         "network": "mainnet",
@@ -57,6 +58,11 @@ def _patch_active_binding(monkeypatch, manager, *, run_id="a" * 64):
             "identity": identity,
         },
     )
+    monkeypatch.setattr(
+        follow_run_fee_cap_grant,
+        "get_follow_run_fee_cap_grant",
+        lambda **_kwargs: None,
+    )
     manager._topup_follow_fee_binding = {
         "run_id": run_id,
         "policy_digest": policy.digest,
@@ -74,6 +80,28 @@ def test_runtime_topup_fee_uses_verified_follow_per_transaction_cap(monkeypatch)
     )
     monkeypatch.setattr(manager_module, "get_transaction_fee_mode", lambda: "auto")
     assert manager._tx_fee_mojos() == 123
+
+
+def test_runtime_topup_uses_separately_verified_run_grant(monkeypatch):
+    manager = _manager(None)
+    _patch_active_binding(monkeypatch, manager)
+    manager_module = import_module("coin_manager")
+    grant_service = import_module("follow_run_fee_cap_grant")
+    monkeypatch.setattr(
+        grant_service,
+        "get_follow_run_fee_cap_grant",
+        lambda *, run_id: {
+            "run_id": run_id,
+            "maximum_fee_mojos_per_tx": 321,
+            "dispatch_authorized": False,
+        },
+    )
+    monkeypatch.setattr(
+        manager_module, "get_effective_transaction_fee_mojos", lambda: 456
+    )
+    monkeypatch.setattr(manager_module, "get_transaction_fee_mode", lambda: "auto")
+    assert manager._verified_topup_follow_fee_cap() == 321
+    assert manager._tx_fee_mojos() == 321
 
 
 def test_runtime_topup_fails_closed_without_binding_during_active_follow(monkeypatch):

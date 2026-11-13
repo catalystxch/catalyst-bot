@@ -2475,6 +2475,10 @@ class CoinManager:
                 "follow_topup_fee_cap_below_recommendation",
                 "Runtime coin top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
                 data={
+                    "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+                    "run_id": (
+                        getattr(self, "_topup_follow_fee_binding", None) or {}
+                    ).get("run_id"),
                     "recommended_fee_mojos": fee_mojos,
                     "approved_maximum_fee_mojos": cap,
                 },
@@ -2531,6 +2535,12 @@ class CoinManager:
         ):
             raise ValueError("FOLLOW_TOPUP_FEE_AUTHORITY_MISMATCH")
         cap = policy.maximum_fee_mojos_per_tx
+        if state.get("state") == "running":
+            from follow_run_fee_cap_grant import get_follow_run_fee_cap_grant
+
+            grant = get_follow_run_fee_cap_grant(run_id=state["run_id"])
+            if grant is not None:
+                cap = grant["maximum_fee_mojos_per_tx"]
         if type(cap) is not int or cap <= 0:
             raise ValueError("FOLLOW_TOPUP_FEE_CAP_INVALID")
         return cap
@@ -9843,6 +9853,10 @@ class CoinManager:
                         "follow_topup_fee_cap_below_recommendation",
                         "Runtime fee-reserve top-up is being attempted at the approved per-transaction fee cap; raise the reviewed maximum if the wallet rejects this fee.",
                         data={
+                            "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+                            "run_id": (
+                                getattr(self, "_topup_follow_fee_binding", None) or {}
+                            ).get("run_id"),
                             "recommended_fee_mojos": quoted_fee,
                             "approved_maximum_fee_mojos": fee_cap,
                         },

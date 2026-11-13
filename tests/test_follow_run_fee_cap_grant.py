@@ -186,6 +186,33 @@ def test_confirmation_accepts_same_fresh_fee_with_new_observation_time(grant_wor
     assert result["success"] is True
 
 
+def test_active_run_can_confirm_a_later_increase_from_current_grant(grant_world):
+    policy, state, _identity, _saved, quote = grant_world
+    first_review = service.prepare_follow_run_fee_cap_grant(now_epoch=100)["review"]
+    service.confirm_follow_run_fee_cap_grant(
+        review_id=first_review["review_id"],
+        review_sha256=first_review["review_sha256"],
+        accepted=True,
+        now_epoch=101,
+    )
+    quote.update(fee_mojos=200, observed_at=102, cost=2345)
+    second_review = service.prepare_follow_run_fee_cap_grant(now_epoch=102)["review"]
+    assert second_review["prior_maximum_fee_mojos_per_tx"] == 150
+    service.confirm_follow_run_fee_cap_grant(
+        review_id=second_review["review_id"],
+        review_sha256=second_review["review_sha256"],
+        accepted=True,
+        now_epoch=103,
+    )
+    assert (
+        service.get_follow_run_fee_cap_grant(run_id=state["run_id"], now_epoch=104)[
+            "maximum_fee_mojos_per_tx"
+        ]
+        == 200
+    )
+    assert policy.maximum_fee_mojos_per_tx == 100
+
+
 def test_grant_read_fails_closed_for_other_run_or_modified_record(grant_world):
     policy, state, _identity, saved, _quote = grant_world
     review = service.prepare_follow_run_fee_cap_grant(now_epoch=100)["review"]

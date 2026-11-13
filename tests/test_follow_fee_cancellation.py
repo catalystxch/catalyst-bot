@@ -292,6 +292,8 @@ def test_follow_cancel_price_clamps_to_verified_active_per_transaction_cap(
     assert result["available"] is True
     assert result["fee_mojos"] == 50
     assert result["fee_cap_warning"] == {
+        "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+        "run_id": run_id,
         "reason": "FEE_CAP_BELOW_RECOMMENDATION",
         "recommended_fee_mojos": 81,
         "approved_maximum_fee_mojos": 50,

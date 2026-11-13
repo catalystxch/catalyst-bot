@@ -69,6 +69,21 @@ def test_approved_run_resumes_from_read_only_status_without_duplicate_pollers():
     assert "attempt < 120" not in polling
 
 
+def test_above_cap_warning_offers_scoped_native_confirmation_without_restart():
+    html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
+    prompt = html.split("async function reviewRaisedFollowFeeCap", 1)[1].split(
+        "async function advanceSingleApprovalRun", 1
+    )[0]
+    assert "prepare_follow_run_fee_cap_grant({})" in prompt
+    assert "confirm_follow_run_fee_cap_grant({" in prompt
+    assert "window.confirm(" in prompt
+    assert "The bot is still running" in prompt
+    assert "does not restart setup" in prompt
+    assert "review.proposed_maximum_fee_mojos_per_tx" in prompt
+    assert "state.fee_warning.run_id || sessionId" in html
+    assert "void reviewRaisedFollowFeeCap(" in html
+
+
 def test_smart_settings_retains_manual_targets_and_discloses_sizing_estimate():
     html = (ROOT / "bot_gui.html").read_text(encoding="utf-8")
     smart_settings = html.split("async function getSmartDefaults()", 1)[1].split(

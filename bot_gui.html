@@ -23843,6 +23843,13 @@
 
             const xchAvailable = Math.max(0, xchBalance - xchReserve);
             const catAvailable = Math.max(0, catBalance - catReserve);
+            // The plan is summed with JavaScript numbers. Compare whole CAT
+            // atomic units so a full-balance plan is not rejected by a tiny
+            // binary rounding excess (for example 4,031,802.7530000005).
+            const catDecimals = Math.max(0, Math.min(12,
+                parseInt(settingsCAT?.decimals ?? currentCAT?.decimals ?? 3, 10) || 0));
+            const catScale = 10 ** catDecimals;
+            const catUnits = amount => Math.round(amount * catScale);
 
             if (midPrice <= 0 && maxSell > 0) {
                 showInputWarning(coinPrepWarn, 'critical',
@@ -23881,11 +23888,11 @@
             }
 
             if (catPerCoin > 0 && maxSell > 0 && catBalance > 0) {
-                if (minCatForOffers > catBalance) {
+                if (catUnits(minCatForOffers) > catUnits(catBalance)) {
                     showInputWarning(maxSellWarn, 'critical',
                         `? ${maxSell} sell offers need ~${minCatForOffers.toLocaleString()} ${tokenName} in prepared coins, but you only have ${Math.floor(catBalance).toLocaleString()}`);
                     tradingSettingsImpossible = true;
-                } else if (minCatForOffers > catAvailable) {
+                } else if (catUnits(minCatForOffers) > catUnits(catAvailable)) {
                     showInputWarning(maxSellWarn, 'critical',
                         `? ${maxSell} sell offers need ~${minCatForOffers.toLocaleString()} ${tokenName} in prepared coins, but only ${Math.floor(catAvailable).toLocaleString()} is available after reserve`);
                     tradingSettingsImpossible = true;
@@ -23922,7 +23929,7 @@
                     `XCH: coin prep needs ${_botXchForCoinPrep.toFixed(4)} XCH across ${xchCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${xchAvailable.toFixed(4)} XCH is available after reserve.`
                 );
             }
-            if (_botCatForCoinPrep > catAvailable && catPerCoin > 0 && maxSell > 0) {
+            if (catUnits(_botCatForCoinPrep) > catUnits(catAvailable) && catPerCoin > 0 && maxSell > 0) {
                 coinPrepImpossible = true;
                 coinPrepImpossibleReasons.push(
                     `${tokenName}: coin prep needs ~${_botCatForCoinPrep.toLocaleString()} tokens across ${catCoinsNeeded} prepared coins (+${prepHeadroomPct}% headroom), but only ${Math.floor(catAvailable).toLocaleString()} is available after reserve.`
@@ -29517,6 +29524,19 @@
                 const evt = data.event_type || '';
                 const msg = data.message || '';
 
+                if ([
+                    'follow_cancel_fee_cap_below_recommendation',
+                    'follow_topup_fee_cap_below_recommendation',
+                ].includes(evt)) {
+                    const feeWarning = data.data || {};
+                    if (/^[0-9a-f]{64}$/.test(String(feeWarning.run_id || ''))) {
+                        void reviewRaisedFollowFeeCap(feeWarning.run_id, {
+                            ...feeWarning,
+                            code: 'FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP',
+                        });
+                    }
+                }
+
                 // Allowlist: event types worth showing in the system log
                 /*
                     // Bot lifecycle
@@ -33471,6 +33491,56 @@
             } finally { _singleApprovalRunBusy = false; }
         }
 
+        const _followFeeCapGrantPromptedRuns = new Set();
+
+        async function reviewRaisedFollowFeeCap(sessionId, warning) {
+            const currentMaximum = warning?.maximum_fee_mojos_per_tx
+                ?? warning?.approved_maximum_fee_mojos;
+            if (_followFeeCapGrantPromptedRuns.has(sessionId)
+                    || warning?.code !== 'FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP'
+                    || !Number.isSafeInteger(warning.recommended_fee_mojos)
+                    || !Number.isSafeInteger(currentMaximum)
+                    || warning.recommended_fee_mojos <= currentMaximum) return;
+            _followFeeCapGrantPromptedRuns.add(sessionId);
+            const api = window.pywebview?.api;
+            if (!api?.prepare_follow_run_fee_cap_grant || !api?.confirm_follow_run_fee_cap_grant) {
+                showToast('Network fee recommendation exceeds the approved per-transaction maximum. The bot is still running at the approved cap.', 'warning', 9000);
+                return;
+            }
+            try {
+                const prepared = await api.prepare_follow_run_fee_cap_grant({});
+                const review = prepared?.review;
+                if (prepared?.success !== true || !review
+                        || !Number.isSafeInteger(review.prior_maximum_fee_mojos_per_tx)
+                        || !Number.isSafeInteger(review.proposed_maximum_fee_mojos_per_tx)
+                        || review.proposed_maximum_fee_mojos_per_tx <= review.prior_maximum_fee_mojos_per_tx) {
+                    throw new Error(prepared?.reason || 'A fresh fee review is unavailable.');
+                }
+                const source = review.network_recommendation?.source || 'network estimator';
+                const observed = review.network_recommendation?.observed_at;
+                const observedText = Number.isSafeInteger(observed)
+                    ? `\nQuote observed at ${new Date(observed * 1000).toLocaleTimeString()}.` : '';
+                const accepted = window.confirm(
+                    `Network fee recommendation is above the approved per-transaction maximum. The bot continues running and affected actions keep trying at the current maximum.\n\n` +
+                    `Current maximum: ${formatFollowFeeMojos(review.prior_maximum_fee_mojos_per_tx)} XCH per transaction\n` +
+                    `Fresh recommendation and proposed maximum: ${formatFollowFeeMojos(review.proposed_maximum_fee_mojos_per_tx)} XCH per transaction\n` +
+                    `Source: ${source}${observedText}\n\nRaise the maximum for this active run? This applies to later transactions and does not restart setup.`,
+                );
+                if (!accepted) return;
+                const confirmed = await api.confirm_follow_run_fee_cap_grant({
+                    review_id: review.review_id,
+                    review_sha256: review.review_sha256,
+                    accepted: true,
+                });
+                if (confirmed?.success !== true) {
+                    throw new Error(confirmed?.reason || 'The fee maximum was not changed.');
+                }
+                showToast('Per-transaction fee maximum raised for this active run. The bot continues without restarting setup.', 'success', 7000);
+            } catch (error) {
+                showToast(`Fee maximum unchanged; the bot remains at its approved cap. ${error?.message || ''}`, 'warning', 9000);
+            }
+        }
+
         async function advanceSingleApprovalRun(sessionId) {
             const advance = window.pywebview?.api?.advance_single_approval_follow_run;
             if (!/^[0-9a-f]{64}$/.test(String(sessionId || ''))) {
@@ -33508,6 +33578,11 @@
                         );
                         showToast('Approved run setup needs attention.', 'warning');
                         return;
+                    }
+                    if (state.fee_warning) {
+                        void reviewRaisedFollowFeeCap(
+                            state.fee_warning.run_id || sessionId, state.fee_warning,
+                        );
                     }
                     const label = state.message || `Run setup: ${state.state || 'working'}`;
                     showSingleApprovalRunProgress(`${label}\nState: ${state.state || 'unknown'}`);

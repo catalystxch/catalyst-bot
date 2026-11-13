@@ -15,7 +15,9 @@ from follow_shutdown_funding import ONE_BLOCK_COST_LIMIT
 import wallet
 
 
-def _verified_active_transaction_fee_cap(*, run_id: str, identity: dict) -> int | None:
+def _verified_active_transaction_fee_cap(
+    *, run_id: str, identity: dict, now_epoch: int | None = None
+) -> int | None:
     """Return the cap only when the active coordinator proves this exact run.
 
     Stopped-run recovery deliberately has no coordinator binding and therefore
@@ -58,7 +60,13 @@ def _verified_active_transaction_fee_cap(*, run_id: str, identity: dict) -> int 
         or str(identity.get("wallet_fingerprint")) != policy.wallet_fingerprint
     ):
         raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_MISMATCH")
-    return policy.maximum_fee_mojos_per_tx
+    cap = policy.maximum_fee_mojos_per_tx
+    from follow_run_fee_cap_grant import get_follow_run_fee_cap_grant
+
+    grant = get_follow_run_fee_cap_grant(run_id=run_id, now_epoch=now_epoch)
+    if grant is not None:
+        cap = grant["maximum_fee_mojos_per_tx"]
+    return cap
 
 
 def _refused(reason: str, authority: dict, **details) -> dict:
@@ -100,7 +108,7 @@ def price_follow_cancellation(
 
     try:
         transaction_fee_cap = _verified_active_transaction_fee_cap(
-            run_id=run_id, identity=identity
+            run_id=run_id, identity=identity, now_epoch=now_epoch
         )
     except ValueError as exc:
         return _refused(str(exc), authority)
@@ -163,6 +171,8 @@ def price_follow_cancellation(
                 "fee_cap_mojos": transaction_fee_cap,
                 "fee_cap_warning": (
                     {
+                        "code": "FOLLOW_FEE_RECOMMENDATION_ABOVE_POLICY_CAP",
+                        "run_id": run_id,
                         "reason": "FEE_CAP_BELOW_RECOMMENDATION",
                         "recommended_fee_mojos": quoted_fee,
                         "approved_maximum_fee_mojos": transaction_fee_cap,
