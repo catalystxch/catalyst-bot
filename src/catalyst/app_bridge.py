@@ -69,6 +69,158 @@ def _truthy_param(params, key):
     return value in {"1", "true", "yes", "on"}
 
 
+_FOLLOW_POLICY_CLIENT_FIELDS = frozenset(
+    {
+        "buy_target",
+        "sell_target",
+        "price_anchor",
+        "price_min",
+        "price_max",
+        "maximum_fee_mojos_per_tx",
+        "fee_coin_principal_mojos",
+        "xch_reserve_mojos",
+        "cat_reserve_atoms",
+        "maximum_trade_xch_mojos",
+        "maximum_trade_cat_atoms",
+    }
+)
+_FOLLOW_POLICY_ATOMIC_FIELDS = frozenset(
+    {
+        "maximum_fee_mojos_per_tx",
+        "fee_coin_principal_mojos",
+        "xch_reserve_mojos",
+        "cat_reserve_atoms",
+        "maximum_trade_xch_mojos",
+        "maximum_trade_cat_atoms",
+    }
+)
+
+
+def _server_follow_review_context():
+    """Derive exact identity, config digest and RED reasons on the server."""
+    import confidence_override
+    import database
+    from coin_prep_fee_runtime import _configuration, _verified_identity
+
+    configuration = _configuration()
+    configuration_sha256 = confidence_override.current_configuration_digest()
+    if (
+        type(configuration_sha256) is not str
+        or len(configuration_sha256) != 64
+        or confidence_override._configuration_digest(configuration)
+        != configuration_sha256
+    ):
+        raise ValueError("FOLLOW_RUN_REVIEW_CONFIGURATION_CHANGED")
+    observed_identity = _verified_identity(configuration)
+    identity = {
+        **observed_identity,
+        "wallet_fingerprint": str(observed_identity.get("wallet_fingerprint")),
+        "asset_id": str(configuration.get("CAT_ASSET_ID") or "")
+        .strip()
+        .lower()
+        .removeprefix("0x"),
+        "wallet_id": configuration.get("CAT_WALLET_ID"),
+        "xch_wallet_id": configuration.get("WALLET_ID_XCH"),
+        "ticker": configuration.get("CAT_TICKER_ID"),
+    }
+    if (
+        identity.get("network") != configuration.get("network")
+        or identity.get("wallet_type") != "sage"
+        or not identity["wallet_fingerprint"].isdigit()
+        or type(identity.get("wallet_id")) is not int
+        or type(identity.get("xch_wallet_id")) is not int
+        or type(identity.get("ticker")) is not str
+        or not identity["ticker"]
+        or not identity["asset_id"]
+    ):
+        raise ValueError("FOLLOW_RUN_REVIEW_WALLET_IDENTITY_UNAVAILABLE")
+
+    snapshot = database.get_latest_market_confidence_snapshot(identity["asset_id"])
+    if snapshot is None:
+        confidence_state = "RED"
+        red_reasons = ["market_evidence_warming"]
+    else:
+        if type(snapshot) is not dict or snapshot.get("asset_id") != identity["asset_id"]:
+            raise ValueError("FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE")
+        confidence_state = str(snapshot.get("state") or "RED").upper()
+        reasons = snapshot.get("reason_codes") or []
+        if type(reasons) is not list or any(
+            type(reason) is not str or not reason.strip() for reason in reasons
+        ):
+            raise ValueError("FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE")
+        red_reasons = list(reasons) if confidence_state == "RED" else []
+        if confidence_state == "RED" and not red_reasons:
+            red_reasons = ["market_confidence_red"]
+    return identity, configuration_sha256, confidence_state, red_reasons
+
+
+def _follow_policy_from_client_terms(terms, identity):
+    """Parse client-editable terms exactly; identity always comes from server."""
+    import re
+    from decimal import Decimal
+
+    from follow_run_policy import FollowRunPolicy
+
+    if type(terms) is not dict or set(terms) != _FOLLOW_POLICY_CLIENT_FIELDS:
+        raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
+    parsed = dict(terms)
+    for key in ("price_anchor", "price_min", "price_max"):
+        if type(parsed[key]) is not str:
+            raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
+        try:
+            parsed[key] = Decimal(parsed[key])
+        except Exception as exc:
+            raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID") from exc
+    for key in _FOLLOW_POLICY_ATOMIC_FIELDS:
+        if type(parsed[key]) is not str or re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", parsed[key]) is None:
+            raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
+        parsed[key] = int(parsed[key])
+    for key in ("buy_target", "sell_target"):
+        if type(parsed[key]) is not int:
+            raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID")
+    try:
+        return FollowRunPolicy(
+            wallet_fingerprint=str(identity["wallet_fingerprint"]),
+            network=identity["network"],
+            asset_id=identity["asset_id"],
+            **parsed,
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError("FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID") from exc
+
+
+def _follow_fee_recommendation() -> dict:
+    """Return informational quote provenance; it grants no fee authority."""
+    try:
+        import tx_fees
+
+        snapshot = tx_fees.get_fee_settings_snapshot()
+        suggested = snapshot.get("suggested") if type(snapshot) is dict else None
+        if type(suggested) is not dict:
+            raise ValueError("missing suggestion")
+        fee_mojos = suggested.get("fee_mojos")
+        available = suggested.get("available") is True and type(fee_mojos) is int and fee_mojos > 0
+        return {
+            "available": available,
+            "fee_mojos": str(fee_mojos) if available else None,
+            "fee_xch": suggested.get("fee_xch") if available else None,
+            "source": suggested.get("source"),
+            "observed_at": suggested.get("observed_at"),
+            "target_seconds": suggested.get("target_seconds"),
+            "authoritative": False,
+        }
+    except Exception:
+        return {
+            "available": False,
+            "fee_mojos": None,
+            "fee_xch": None,
+            "source": "unavailable",
+            "observed_at": None,
+            "target_seconds": None,
+            "authoritative": False,
+        }
+
+
 class DecimalEncoder(json.JSONEncoder):
     """JSON encoder that handles Decimal -> str for lossless PyWebView serialization.
 
@@ -1327,6 +1479,107 @@ class AppBridge:
         return {**result, "success": True, "dispatch_authorized": False}
 
     @_safe
+    @_mutation_guard("app_bridge:prepare_single_approval_follow_run_review")
+    def prepare_single_approval_follow_run_review(self, body=None):
+        """Prepare an exact native disclosure from client terms and trusted context."""
+        from follow_run_review_service import prepare_follow_run_policy_review
+
+        if type(body) is not dict or set(body) != {"policy"}:
+            return {
+                "success": False,
+                "reason": "FOLLOW_RUN_REVIEW_REQUEST_INVALID",
+                "dispatch_authorized": False,
+            }
+        try:
+            identity, configuration_sha256, confidence_state, red_reasons = (
+                _server_follow_review_context()
+            )
+            policy = _follow_policy_from_client_terms(body["policy"], identity)
+            review = prepare_follow_run_policy_review(
+                policy,
+                wallet_identity=identity,
+                configuration_sha256=configuration_sha256,
+                red_reasons=red_reasons,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            allowed = {
+                "FOLLOW_RUN_REVIEW_CONFIGURATION_CHANGED",
+                "FOLLOW_RUN_REVIEW_WALLET_IDENTITY_UNAVAILABLE",
+                "FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE",
+                "FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID",
+                "FOLLOW_RUN_REVIEW_CONFIGURATION_INVALID",
+                "FOLLOW_RUN_REVIEW_IDENTITY_INVALID",
+                "FOLLOW_RUN_REVIEW_IDENTITY_MISMATCH",
+                "FOLLOW_RUN_REVIEW_REASONS_INVALID",
+            }
+            return {
+                "success": False,
+                "reason": reason if reason in allowed else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        return {
+            **review,
+            "market_confidence_state": confidence_state,
+            "fee_recommendation": _follow_fee_recommendation(),
+            "dispatch_authorized": False,
+        }
+
+    @_safe
+    @_mutation_guard("app_bridge:confirm_single_approval_follow_run_review")
+    def confirm_single_approval_follow_run_review(self, body=None):
+        """Persist a reviewed policy after an explicit native confirmation only."""
+        import re
+
+        from follow_run_review_service import confirm_follow_run_policy_review
+
+        required = {"review_id", "review_sha256", "accepted", "policy"}
+        if (
+            type(body) is not dict
+            or set(body) != required
+            or body.get("accepted") is not True
+            or any(
+                type(body.get(key)) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", body[key]) is None
+                for key in ("review_id", "review_sha256")
+            )
+        ):
+            return {
+                "success": False,
+                "reason": "FOLLOW_RUN_REVIEW_CONFIRMATION_REQUIRED",
+                "dispatch_authorized": False,
+            }
+        try:
+            identity, configuration_sha256, _confidence_state, red_reasons = (
+                _server_follow_review_context()
+            )
+            current_policy = _follow_policy_from_client_terms(body["policy"], identity)
+            result = confirm_follow_run_policy_review(
+                review_id=body["review_id"],
+                review_sha256=body["review_sha256"],
+                accepted=True,
+                current_policy=current_policy,
+                current_wallet_identity=identity,
+                current_configuration_sha256=configuration_sha256,
+                current_red_reasons=red_reasons,
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            reason = str(exc)
+            allowed = {
+                "FOLLOW_RUN_REVIEW_CONFIGURATION_CHANGED",
+                "FOLLOW_RUN_REVIEW_WALLET_IDENTITY_UNAVAILABLE",
+                "FOLLOW_RUN_REVIEW_MARKET_EVIDENCE_UNAVAILABLE",
+                "FOLLOW_RUN_REVIEW_POLICY_TERMS_INVALID",
+                "FOLLOW_RUN_REVIEW_CONFIGURATION_INVALID",
+            }
+            return {
+                "success": False,
+                "reason": reason if reason in allowed else "FOLLOW_RUN_REVIEW_UNAVAILABLE",
+                "dispatch_authorized": False,
+            }
+        return {**result, "dispatch_authorized": False}
+
+    @_safe
     @_mutation_guard("app_bridge:prepare_follow_fee_ceiling_review")
     def prepare_follow_fee_ceiling_review(self, body=None):
         """Freeze the current run's proposed fee ceiling for native review."""
@@ -2462,6 +2715,8 @@ _APP_BRIDGE_MUTATION_METHODS = {
     "preview_follow_principal",
     "prepare_follow_run_review",
     "confirm_follow_run_review",
+    "prepare_single_approval_follow_run_review",
+    "confirm_single_approval_follow_run_review",
     "prepare_follow_fee_ceiling_review",
     "confirm_follow_fee_ceiling_review",
     "commit_external_cancellation",
