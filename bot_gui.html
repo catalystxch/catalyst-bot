@@ -33494,6 +33494,7 @@
             const output = document.getElementById('singleApprovalRunReviewText');
             if (_singleApprovalRunBusy || !current || !accept.checked || !api?.confirm_single_approval_follow_run_review) return;
             _singleApprovalRunBusy = true; confirm.disabled = true;
+            let approvalRecorded = false;
             output.textContent = 'Recording the approved run…';
             try {
                 const result = await api.confirm_single_approval_follow_run_review({
@@ -33503,11 +33504,17 @@
                     policy: current.policy,
                 });
                 if (result?.success !== true || !result.session_id) throw new Error(result?.reason || 'Run approval was not recorded.');
+                approvalRecorded = true;
                 accept.disabled = true;
                 showSingleApprovalRunProgress('Run approved. Starting automatic coin preparation…');
                 await advanceSingleApprovalRun(result.session_id);
             } catch (error) {
-                output.textContent = error?.message || 'Could not record and start the approved run.';
+                const message = error?.message || 'Could not record and start the approved run.';
+                if (approvalRecorded) {
+                    showSingleApprovalRunProgress(`Run approval was recorded, but setup needs attention.\nReason: ${message}`, true);
+                } else {
+                    output.textContent = message;
+                }
             } finally { _singleApprovalRunBusy = false; }
         }
 
@@ -33604,10 +33611,10 @@
                                 continue;
                             }
                         }
-                        showSingleApprovalRunProgress(
-                            `Run setup needs attention. State: ${state?.state || 'unknown'}\nReason: ${reason}`,
-                            true,
-                        );
+                        const detail = reason === 'OPEN_OFFERS_REQUIRE_CANCELLATION'
+                            ? `${Number.isSafeInteger(state?.open_offer_count) ? state.open_offer_count + ' ' : ''}live offers still lock coins. Coin preparation has not started. Review the live offers before cancelling or changing this run.`
+                            : (state?.message || reason);
+                        showSingleApprovalRunProgress(`Run setup needs attention.\n${detail}\nReason: ${reason}`, true);
                         showToast('Approved run setup needs attention.', 'warning');
                         return;
                     }

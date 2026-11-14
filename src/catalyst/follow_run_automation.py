@@ -117,6 +117,10 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
                 "success": False,
                 "state": "recoverable_error",
                 "reason": reason,
+                "message": str(result.get("message") or "")[:512],
+                "open_offer_count": result.get("open_offer_count")
+                if type(result.get("open_offer_count")) is int
+                else None,
                 "action_needed": True,
             }
         return {

@@ -44,10 +44,14 @@ def test_prep_rejection_with_no_dispatch_records_recoverable_reason(monkeypatch)
             "success": False,
             "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
             "dispatch_authorized": False,
+            "open_offer_count": 6,
+            "message": "Six open offers require cancellation before preparation.",
         },
     )
     result = follow_run_automation.advance_approved_follow_run(state["session_id"])
     assert result["reason"] == "OPEN_OFFERS_REQUIRE_CANCELLATION"
+    assert result["open_offer_count"] == 6
+    assert "cancellation" in result["message"]
     assert errors[0]["reason"] == "OPEN_OFFERS_REQUIRE_CANCELLATION"
     assert errors[0]["unknown_effect"] is False
 
