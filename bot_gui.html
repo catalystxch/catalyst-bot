@@ -8517,6 +8517,7 @@
             </div>
             <div class="follow-review-body">
                 <div id="singleApprovalRunProgress" role="status" aria-live="polite" style="display:none; white-space:pre-wrap; overflow-wrap:anywhere; padding:12px; border:1px solid var(--status-warning); border-radius:8px; color:var(--status-warning);"></div>
+                <button type="button" class="btn btn-secondary" id="singleApprovalRunProgressClose" style="display:none; margin-top:12px" onclick="closeSingleApprovalRunReview()">Close status</button>
                 <div id="singleApprovalRunReviewBody">
                 <div class="follow-review-grid">
                     <label class="follow-review-field"><span>BUY target</span><input id="singleRunBuyTarget" type="number" min="1" step="1" value="24" oninput="invalidateSingleApprovalRunReview()"></label>
@@ -33355,14 +33356,18 @@
             if (accept) { accept.checked = false; accept.disabled = true; }
             const confirm = document.getElementById('singleApprovalRunConfirm');
             if (confirm) confirm.disabled = true;
+            const progressClose = document.getElementById('singleApprovalRunProgressClose');
+            if (progressClose) progressClose.style.display = 'none';
         }
 
         function showSingleApprovalRunProgress(message, warning = false) {
             const modal = document.getElementById('singleApprovalRunReviewModal');
             const editor = document.getElementById('singleApprovalRunReviewBody');
             const progress = document.getElementById('singleApprovalRunProgress');
+            const progressClose = document.getElementById('singleApprovalRunProgressClose');
             if (modal) modal.style.display = 'flex';
             if (editor) editor.style.display = 'none';
+            if (progressClose) progressClose.style.display = 'inline-flex';
             if (progress) {
                 progress.style.display = 'block';
                 progress.style.color = warning ? 'var(--status-warning)' : 'var(--text-primary)';
@@ -33382,6 +33387,7 @@
             modal.style.display = 'flex';
             document.getElementById('singleApprovalRunReviewBody').style.display = '';
             document.getElementById('singleApprovalRunProgress').style.display = 'none';
+            document.getElementById('singleApprovalRunProgressClose').style.display = 'none';
             invalidateSingleApprovalRunReview();
             document.getElementById('singleApprovalRunReviewText').textContent = 'Loading exact wallet, reserve, fee-pool, and market details…';
             try {
