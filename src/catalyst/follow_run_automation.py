@@ -99,15 +99,24 @@ def advance_approved_follow_run(session_id: str, *, permit=None) -> dict:
             permit=permit,
         )
         if result.get("success") is not True:
-            # The route may have reached the worker before its response failed.
-            # Require independent status reconciliation before another launch.
+            # An explicit pre-dispatch rejection proves that no worker was
+            # launched. An ambiguous response still needs effect recovery.
+            no_dispatch = result.get("dispatch_authorized") is False
+            reason = result.get("reason") or result.get("error")
+            if (
+                type(reason) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", reason) is None
+            ):
+                reason = "PREP_START_REJECTED" if no_dispatch else "UNKNOWN_EFFECT"
             coordinator.record_recoverable_error(
-                **key, reason="PREP_START_UNVERIFIED", unknown_effect=True
+                **key,
+                reason=reason if no_dispatch else "UNKNOWN_EFFECT",
+                unknown_effect=not no_dispatch,
             )
             return {
                 "success": False,
                 "state": "recoverable_error",
-                "reason": result.get("reason", "PREP_START_UNVERIFIED"),
+                "reason": reason,
                 "action_needed": True,
             }
         return {

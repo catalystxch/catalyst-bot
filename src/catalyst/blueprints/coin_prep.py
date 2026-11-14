@@ -1056,6 +1056,7 @@ def _coin_prep_open_offer_conflict(
     result.update(
         {
             "success": False,
+            "dispatch_authorized": False,
             "error": error,
             "reason": reason,
             "message": message,
@@ -3182,6 +3183,7 @@ def _api_coin_prep_trigger_locked():
         if wallet_offer_snapshot.get("complete") is not True:
             unavailable = {
                 "success": False,
+                "dispatch_authorized": False,
                 "error": "coin_prep_wallet_offer_check_unavailable",
                 "reason": "WALLET_OFFER_BOOK_UNAVAILABLE",
                 "message": (

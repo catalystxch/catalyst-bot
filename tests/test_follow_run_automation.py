@@ -1,6 +1,57 @@
 from types import SimpleNamespace
 
 
+def test_prep_rejection_with_no_dispatch_records_recoverable_reason(monkeypatch):
+    import confidence_override
+    import database
+    import follow_run_automation
+    import follow_run_coordinator
+
+    state = {
+        "session_id": "a" * 64,
+        "policy_digest": "b" * 64,
+        "configuration_sha256": "c" * 64,
+        "state": "prep_pending",
+        "fee_approval_id": "d" * 64,
+    }
+    errors = []
+
+    class Coordinator:
+        def get_state(self):
+            return dict(state)
+
+        def mark_preparing(self, **_kwargs):
+            state["state"] = "preparing"
+
+        def record_recoverable_error(self, **kwargs):
+            errors.append(kwargs)
+
+    monkeypatch.setattr(follow_run_coordinator, "FollowRunCoordinator", Coordinator)
+    monkeypatch.setattr(
+        database,
+        "get_active_follow_run_policy",
+        lambda: SimpleNamespace(digest=state["policy_digest"]),
+    )
+    monkeypatch.setattr(
+        confidence_override,
+        "current_configuration_digest",
+        lambda: state["configuration_sha256"],
+    )
+    monkeypatch.setattr(
+        follow_run_automation,
+        "_route_json",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "reason": "OPEN_OFFERS_REQUIRE_CANCELLATION",
+            "dispatch_authorized": False,
+        },
+    )
+    result = follow_run_automation.advance_approved_follow_run(state["session_id"])
+    assert result["reason"] == "OPEN_OFFERS_REQUIRE_CANCELLATION"
+    assert errors[0]["reason"] == "OPEN_OFFERS_REQUIRE_CANCELLATION"
+    assert errors[0]["unknown_effect"] is False
+
+
 def test_approved_run_previews_binds_and_starts_prep_once(monkeypatch):
     import coin_prep_fee_approval
     import confidence_override
