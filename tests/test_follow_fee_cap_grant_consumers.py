@@ -39,6 +39,27 @@ def test_recoverable_cleanup_uses_matching_policy_cap_without_active_scope(monke
     ) == 7_473_753
 
 
+def test_stopped_cleanup_retains_cap_after_active_policy_clear(monkeypatch):
+    import database
+    import follow_fee_cancellation
+    import follow_run_coordinator
+
+    monkeypatch.setattr(
+        follow_run_coordinator.FollowRunCoordinator,
+        "read_state",
+        lambda _self: {"state": "stopped", "run_id": None},
+    )
+    monkeypatch.setattr(database, "get_active_follow_run_policy", lambda: None)
+    monkeypatch.setattr(
+        database,
+        "get_follow_cleanup_fee_cap",
+        lambda *, identity: 7_473_753 if identity.get("network") == "mainnet" else None,
+    )
+    assert follow_fee_cancellation._verified_active_transaction_fee_cap(
+        run_id="b" * 64, identity={"network": "mainnet"}
+    ) == 7_473_753
+
+
 def test_cancellation_fee_cap_uses_exact_run_bound_grant(monkeypatch):
     import confidence_override
     import database

@@ -36,18 +36,22 @@ def _verified_active_transaction_fee_cap(
     if type(coordinator) is not dict:
         raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_MISMATCH")
     if coordinator.get("state") != "running":
-        # Manual cleanup can follow a stopped or failed replacement run.  It
-        # has no active creation scope.  A persisted policy for this wallet
-        # may still lower the fee used by the older run's cleanup authority.
+        # Manual cleanup has no active creation scope.  Keep the last approved
+        # wallet ceiling after the active policy has been cleared at shutdown.
+        cap = database.get_follow_cleanup_fee_cap(identity=identity)
         if policy is None:
-            return None
+            return cap
         if (
             identity.get("network") == policy.network
             and identity.get("asset_id") == policy.asset_id
             and str(identity.get("wallet_fingerprint")) == policy.wallet_fingerprint
         ):
-            return policy.maximum_fee_mojos_per_tx
-        return None
+            return (
+                min(cap, policy.maximum_fee_mojos_per_tx)
+                if cap is not None
+                else policy.maximum_fee_mojos_per_tx
+            )
+        return cap
     try:
         from confidence_override import current_configuration_digest, current_scope
 

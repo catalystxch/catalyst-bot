@@ -21949,6 +21949,93 @@ def set_setting(key: str, value: str) -> bool:
 
 
 _ACTIVE_FOLLOW_RUN_POLICY_SETTING = "active_follow_run_policy_v1"
+_FOLLOW_CLEANUP_FEE_CAP_SETTING_PREFIX = "follow_cleanup_fee_cap_v1:"
+
+
+def _follow_cleanup_fee_cap_key(identity: dict) -> str:
+    import hashlib
+    import json
+
+    if type(identity) is not dict:
+        raise ValueError("FOLLOW_CLEANUP_FEE_CAP_INVALID")
+    scope = {
+        "network": identity.get("network"),
+        "asset_id": identity.get("asset_id"),
+        "wallet_fingerprint": str(identity.get("wallet_fingerprint") or ""),
+    }
+    if not all(type(x) is str and x for x in scope.values()):
+        raise ValueError("FOLLOW_CLEANUP_FEE_CAP_INVALID")
+    digest = hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return _FOLLOW_CLEANUP_FEE_CAP_SETTING_PREFIX + digest
+
+
+def record_follow_cleanup_fee_cap(*, identity: dict, maximum_fee_mojos_per_tx: int) -> bool:
+    """Keep the operator's wallet fee ceiling available for stopped-run cleanup."""
+    import json
+
+    if type(maximum_fee_mojos_per_tx) is not int or maximum_fee_mojos_per_tx <= 0:
+        raise ValueError("FOLLOW_CLEANUP_FEE_CAP_INVALID")
+    setting_key = _follow_cleanup_fee_cap_key(identity)
+    network = identity.get("network")
+    asset_id = identity.get("asset_id")
+    fingerprint = str(identity.get("wallet_fingerprint") or "")
+    if not all(type(x) is str and x for x in (network, asset_id, fingerprint)):
+        raise ValueError("FOLLOW_CLEANUP_FEE_CAP_INVALID")
+    value = json.dumps(
+        {
+            "version": 1,
+            "network": network,
+            "asset_id": asset_id,
+            "wallet_fingerprint": fingerprint,
+            "maximum_fee_mojos_per_tx": maximum_fee_mojos_per_tx,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return set_setting(setting_key, value) is True
+
+
+def get_follow_cleanup_fee_cap(*, identity: dict) -> int | None:
+    """Return only a strictly decoded ceiling for this exact wallet and CAT."""
+    import json
+
+    try:
+        raw = get_setting(_follow_cleanup_fee_cap_key(identity))
+
+        def without_duplicates(pairs):
+            result = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ValueError("duplicate cleanup cap key")
+                result[key] = item
+            return result
+
+        value = json.loads(raw, object_pairs_hook=without_duplicates)
+        if (
+            type(value) is not dict
+            or set(value)
+            != {
+                "version",
+                "network",
+                "asset_id",
+                "wallet_fingerprint",
+                "maximum_fee_mojos_per_tx",
+            }
+            or type(value["version"]) is not int
+            or value["version"] != 1
+            or type(value["maximum_fee_mojos_per_tx"]) is not int
+            or value["maximum_fee_mojos_per_tx"] <= 0
+            or value["network"] != identity.get("network")
+            or value["asset_id"] != identity.get("asset_id")
+            or value["wallet_fingerprint"]
+            != str(identity.get("wallet_fingerprint"))
+        ):
+            return None
+        return value["maximum_fee_mojos_per_tx"]
+    except Exception:
+        return None
 
 
 def record_active_follow_run_policy(policy) -> bool:
@@ -22044,7 +22131,17 @@ def _decode_follow_run_policy(raw):
 
 
 def clear_active_follow_run_policy() -> bool:
-    """Clear the active policy using the settings store's durable write path."""
+    """Retain its wallet fee ceiling before clearing active run authority."""
+    policy = get_active_follow_run_policy()
+    if policy is not None and not record_follow_cleanup_fee_cap(
+        identity={
+            "network": policy.network,
+            "asset_id": policy.asset_id,
+            "wallet_fingerprint": policy.wallet_fingerprint,
+        },
+        maximum_fee_mojos_per_tx=policy.maximum_fee_mojos_per_tx,
+    ):
+        return False
     return set_setting(_ACTIVE_FOLLOW_RUN_POLICY_SETTING, "") is True
 
 

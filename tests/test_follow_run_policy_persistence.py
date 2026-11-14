@@ -30,13 +30,13 @@ def make_policy(**changes):
 
 @pytest.fixture
 def saved_policy_setting(monkeypatch):
-    state = {"raw": None}
+    state = {"values": {}}
 
-    def get_setting(_key, default=None):
-        return state["raw"] if state["raw"] is not None else default
+    def get_setting(key, default=None):
+        return state["values"].get(key, default)
 
-    def set_setting(_key, value):
-        state["raw"] = value
+    def set_setting(key, value):
+        state["values"][key] = value
         return True
 
     monkeypatch.setattr(database, "get_setting", get_setting)
@@ -54,7 +54,7 @@ def test_active_policy_round_trips_through_canonical_durable_record(
 
     expected = make_policy()
     record_active_follow_run_policy(expected)
-    envelope = json.loads(saved_policy_setting["raw"])
+    envelope = json.loads(saved_policy_setting["values"]["active_follow_run_policy_v1"])
 
     assert envelope["version"] == 1
     assert envelope["digest"] == expected.digest
@@ -68,21 +68,54 @@ def test_clear_active_policy_disables_future_read(saved_policy_setting):
         record_active_follow_run_policy,
     )
 
-    record_active_follow_run_policy(make_policy())
+    policy = make_policy()
+    record_active_follow_run_policy(policy)
     assert clear_active_follow_run_policy() is True
     assert get_active_follow_run_policy() is None
+    assert database.get_follow_cleanup_fee_cap(
+        identity={
+            "network": policy.network,
+            "asset_id": policy.asset_id,
+            "wallet_fingerprint": policy.wallet_fingerprint,
+        }
+    ) == policy.maximum_fee_mojos_per_tx
+
+
+def test_cleanup_fee_cap_is_wallet_bound_and_survives_clear(saved_policy_setting):
+    policy = make_policy()
+    database.record_active_follow_run_policy(policy)
+    database.clear_active_follow_run_policy()
+    identity = {
+        "network": policy.network,
+        "asset_id": policy.asset_id,
+        "wallet_fingerprint": policy.wallet_fingerprint,
+    }
+    assert database.get_follow_cleanup_fee_cap(identity=identity) == 2_000_000
+    assert database.get_follow_cleanup_fee_cap(
+        identity={**identity, "wallet_fingerprint": "another-wallet"}
+    ) is None
+    cap_key = database._follow_cleanup_fee_cap_key(identity)
+    saved_policy_setting["values"][cap_key] = "{}"
+    assert database.get_follow_cleanup_fee_cap(identity=identity) is None
+    saved_policy_setting["values"][cap_key] = (
+        '{"version":1,"version":1,"network":"mainnet",'
+        '"asset_id":"' + policy.asset_id + '",'
+        '"wallet_fingerprint":"fingerprint-123",'
+        '"maximum_fee_mojos_per_tx":2000000}'
+    )
+    assert database.get_follow_cleanup_fee_cap(identity=identity) is None
 
 
 def test_policy_tampering_and_duplicate_keys_fail_closed(saved_policy_setting):
     from database import get_active_follow_run_policy, record_active_follow_run_policy
 
     record_active_follow_run_policy(make_policy())
-    envelope = json.loads(saved_policy_setting["raw"])
+    envelope = json.loads(saved_policy_setting["values"]["active_follow_run_policy_v1"])
     envelope["terms"]["buy_target"] = 24
-    saved_policy_setting["raw"] = json.dumps(envelope)
+    saved_policy_setting["values"]["active_follow_run_policy_v1"] = json.dumps(envelope)
     assert get_active_follow_run_policy() is None
 
-    saved_policy_setting["raw"] = (
+    saved_policy_setting["values"]["active_follow_run_policy_v1"] = (
         '{"version":1,"version":1,"terms":{},"digest":"' + "0" * 64 + '"}'
     )
     assert get_active_follow_run_policy() is None
@@ -101,7 +134,7 @@ def test_policy_tampering_and_duplicate_keys_fail_closed(saved_policy_setting):
 def test_malformed_active_policy_fails_closed(saved_policy_setting, raw):
     from database import get_active_follow_run_policy
 
-    saved_policy_setting["raw"] = raw
+    saved_policy_setting["values"]["active_follow_run_policy_v1"] = raw
     assert get_active_follow_run_policy() is None
 
 
