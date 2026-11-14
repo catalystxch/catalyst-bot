@@ -29,25 +29,34 @@ def _verified_active_transaction_fee_cap(
 
         coordinator = FollowRunCoordinator().read_state()
         policy = database.get_active_follow_run_policy()
+    except Exception as exc:
+        raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_UNAVAILABLE") from exc
+    if coordinator is None:
+        return None
+    if type(coordinator) is not dict:
+        raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_MISMATCH")
+    if coordinator.get("state") != "running":
+        # Manual cleanup can follow a stopped or failed replacement run.  It
+        # has no active creation scope.  A persisted policy for this wallet
+        # may still lower the fee used by the older run's cleanup authority.
+        if policy is None:
+            return None
+        if (
+            identity.get("network") == policy.network
+            and identity.get("asset_id") == policy.asset_id
+            and str(identity.get("wallet_fingerprint")) == policy.wallet_fingerprint
+        ):
+            return policy.maximum_fee_mojos_per_tx
+        return None
+    try:
         from confidence_override import current_configuration_digest, current_scope
 
         config_digest = current_configuration_digest()
         scope = current_scope()
     except Exception as exc:
         raise ValueError("FOLLOW_RUN_FEE_CAP_AUTHORITY_UNAVAILABLE") from exc
-    if coordinator is None:
-        return None
     if (
-        type(coordinator) is dict
-        and coordinator.get("state") == "stopped"
-        and coordinator.get("run_id") == run_id
-        and policy is None
-    ):
-        return None
-    if (
-        type(coordinator) is not dict
-        or coordinator.get("state") != "running"
-        or coordinator.get("run_id") != run_id
+        coordinator.get("run_id") != run_id
         or policy is None
         or coordinator.get("policy_digest") != policy.digest
         or coordinator.get("configuration_sha256") != config_digest
